@@ -1,0 +1,13 @@
+[package]
+name = "root-confirmed-initial-consumer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+[dependencies]
+chinwag-confirmed-initial-private = { path = "../confirmed-initial", features = ["private-probe"] }
+chinwag-snapshot-session-private = { path = "../chinwag-snapshot-session" }
+chinwag-snapshot-read-owner-private = { path = "../chinwag-snapshot-read-owner" }
+chinwag-signing = { path = "../chinwag-signing" }
+sha2 = "=0.10.9"

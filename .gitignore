@@ -1,0 +1,6 @@
+/target/
+.DS_Store
+.chinwag/*.crdb*
+.chinwag/private/
+*.key
+*.pem

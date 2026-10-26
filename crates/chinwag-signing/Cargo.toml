@@ -1,0 +1,23 @@
+[package]
+name = "chinwag-signing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ed25519 OpenSSH keys and repository-scoped Git signing config."
+
+[dependencies]
+getrandom = "=0.3.4"
+sha2.workspace = true
+ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "ed25519"] }
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+chinwag-host-process = { path = "../chinwag-host-process" }
+
+[dev-dependencies]
+tempfile = "3"

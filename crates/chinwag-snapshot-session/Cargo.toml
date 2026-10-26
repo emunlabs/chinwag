@@ -1,0 +1,18 @@
+[package]
+name = "chinwag-snapshot-session-private"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+[dependencies]
+chinwag-snapshot-read-owner-private = { path = "../chinwag-snapshot-read-owner" }
+
+rustix = { version = "=1.1.5", features = ["fs", "process", "try_close"] }
+sha2 = "=0.10.9"
+serde_json = "=1.0.154"
+serde = { version = "=1.0.229", features = ["derive"] }
+
+[features]
+private-probe = []

@@ -1,0 +1,15 @@
+[package]
+name = "chinwag-confirmed-initial-private"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+[dependencies]
+chinwag-host-process = { path = "../chinwag-host-process" }
+chinwag-signing = { path = "../chinwag-signing" }
+chinwag-snapshot-session-private = { path = "../chinwag-snapshot-session" }
+rustix = { version = "=1.1.5", features = ["fs", "process", "try_close"] }
+sha2 = "=0.10.9"
+[features]
+private-probe = []

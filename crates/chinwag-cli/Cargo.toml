@@ -1,0 +1,21 @@
+[package]
+name = "chinwag-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chinwag"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+chinwag-signing = { path = "../chinwag-signing" }
+chinwag-confirmed-initial-private = { path = "../confirmed-initial" }
+chinwag-mcp-private-anchored = { path = "../chinwag-mcp", features = ["private-loopback"] }
+chinwag-editor-config-private = { path = "../chinwag-editor-config" }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "ed25519"] }

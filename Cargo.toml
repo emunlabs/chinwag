@@ -1,0 +1,28 @@
+[workspace]
+members = ["crates/chinwag-seed", "crates/chinwag-swarm", "crates/chinwag-claim", "crates/chinwag-host-process", "crates/chinwag-cli", "crates/chinwag-signing", "crates/chinwag-snapshot-read-owner", "crates/chinwag-snapshot-session", "crates/confirmed-initial", "crates/confirmed-initial-consumer", "crates/chinwag-mcp", "crates/chinwag-editor-config"]
+exclude = ["vendor/swarm-discovery"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97.1"
+license = "Apache-2.0"
+repository = "https://github.com/emunlabs/chinwag"
+
+[workspace.dependencies]
+chacha20poly1305 = "=0.10.1"
+hpke = { version = "=0.13.0", default-features = false, features = ["alloc", "x25519"] }
+rand = "=0.9.5"
+sha2 = "=0.10.9"
+thiserror = "2"
+zeroize = "1"
+zstd = "0.13"
+
+[patch.crates-io]
+swarm-discovery = { path = "vendor/swarm-discovery" }
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
