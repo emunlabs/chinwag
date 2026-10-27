@@ -65,6 +65,8 @@ pub enum Exit {
     InitHelp(Invocation),
     ServeHelp(Invocation),
     ConfigureHelp(Invocation),
+    AgentDispatchHelp(Invocation),
+    MemoryHelp(Invocation),
     Rejected(Rejection),
 }
 
@@ -75,7 +77,9 @@ impl Exit {
             | Self::Version
             | Self::InitHelp(_)
             | Self::ServeHelp(_)
-            | Self::ConfigureHelp(_) => 0,
+            | Self::ConfigureHelp(_)
+            | Self::AgentDispatchHelp(_)
+            | Self::MemoryHelp(_) => 0,
             Self::Rejected(_) => 2,
         }
     }
@@ -86,6 +90,8 @@ impl Exit {
             Self::InitHelp(invocation) => invocation.init_help(),
             Self::ServeHelp(invocation) => invocation.serve_help(),
             Self::ConfigureHelp(invocation) => invocation.configure_help(),
+            Self::AgentDispatchHelp(invocation) => invocation.agent_dispatch_help(),
+            Self::MemoryHelp(invocation) => invocation.memory_help(),
             Self::Version => concat!(
                 "chinwag ",
                 env!("CARGO_PKG_VERSION"),
@@ -101,7 +107,9 @@ impl Exit {
             | Self::Version
             | Self::InitHelp(_)
             | Self::ServeHelp(_)
-            | Self::ConfigureHelp(_) => "",
+            | Self::ConfigureHelp(_)
+            | Self::AgentDispatchHelp(_)
+            | Self::MemoryHelp(_) => "",
             Self::Rejected(Rejection::UnknownInvocation) => "chinwag: unknown_invocation\n",
             Self::Rejected(Rejection::NotInThisCandidate) => "chinwag: not_in_this_candidate\n",
             Self::Rejected(Rejection::InvalidArguments) => "chinwag: invalid_arguments\n",
@@ -137,6 +145,60 @@ pub enum Dispatch {
     Serve(ServeRequest),
     ServeHttp(ServeRequest),
     Configure(ConfigureRequest),
+    AgentDispatch(AgentDispatchRequest),
+    Memory(MemoryRequest),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentDispatchRequest {
+    pub(crate) agent: Option<String>,
+    pub(crate) item: Option<String>,
+    pub(crate) sender: Option<String>,
+    pub(crate) body: Option<String>,
+    pub(crate) crdb: Option<PathBuf>,
+    pub(crate) stdin_json: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MemoryAction {
+    Retain {
+        id: Option<String>,
+        bank: String,
+        context: String,
+        content: String,
+        commit: Option<String>,
+        file_scope: Option<String>,
+        agent: Option<String>,
+        tags: Option<String>,
+    },
+    Recall {
+        query: String,
+        limit: usize,
+        bank: Option<String>,
+        file_scope: Option<String>,
+    },
+    Tombstone {
+        id: String,
+        file_scope: String,
+        reason: String,
+        commit: Option<String>,
+        attempted_action: Option<String>,
+        failure: Option<String>,
+        alternative: Option<String>,
+    },
+    Stats {
+        bank: Option<String>,
+    },
+    MigrateHindsight {
+        url: Option<String>,
+        bank: Option<String>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MemoryRequest {
+    pub(crate) action: MemoryAction,
+    pub(crate) crdb: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -279,6 +341,24 @@ where
             None => Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments)),
         };
     }
+    if args.first().is_some_and(|arg| arg == "agent-dispatch") {
+        if args.len() == 2 && args[1] == "--help" {
+            return Dispatch::Immediate(Exit::AgentDispatchHelp(invocation));
+        }
+        return match parse_agent_dispatch(&args[1..]) {
+            Some(request) => Dispatch::AgentDispatch(request),
+            None => Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments)),
+        };
+    }
+    if args.first().is_some_and(|arg| arg == "memory") {
+        if args.len() == 1 || (args.len() == 2 && args[1] == "--help") {
+            return Dispatch::Immediate(Exit::MemoryHelp(invocation));
+        }
+        return match parse_memory(&args[1..]) {
+            Some(request) => Dispatch::Memory(request),
+            None => Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments)),
+        };
+    }
     let result = match args.as_slice() {
         [] => Exit::Help(invocation),
         [arg] if arg == "--help" => Exit::Help(invocation),
@@ -394,6 +474,189 @@ fn public_pin(value: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(pin)
+}
+
+impl Invocation {
+    fn agent_dispatch_help(self) -> &'static str {
+        match self {
+            Self::Chinwag => {
+                "Usage: chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SENDER>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\n"
+            }
+            Self::GitChinwag => {
+                "Usage: git chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SENDER>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\n"
+            }
+            Self::GitEmun => {
+                "Usage: git emun agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SENDER>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\n"
+            }
+            Self::GhChinwag => {
+                "Usage: gh chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SENDER>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\n"
+            }
+            Self::GhEmun => {
+                "Usage: gh emun agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SENDER>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\n"
+            }
+        }
+    }
+
+    fn memory_help(self) -> &'static str {
+        let _ = self;
+        "Usage: chinwag memory retain --bank <bank> --context <ctx> --content <text> [--commit <sha>] [--file-scope <glob>] [--id <id>]\n       chinwag memory recall --query <q> [--limit <n>] [--bank <bank>] [--file-scope <glob>]\n       chinwag memory tombstone --id <id> --file-scope <glob> --reason <why-killed> [--commit <sha>] [--alternative <alt>]\n       chinwag memory stats [--bank <bank>]\n       chinwag memory migrate-hindsight [--url <url>] [--bank <bank>]\n\nNative Chinwag 3-Tier Memory (Verified Invariants + Negative Architectural Tombstones + Commit-Anchored LEANN CSR Graph in .chinwag/state.crdb).\n"
+    }
+}
+
+fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
+    let mut agent = None;
+    let mut item = None;
+    let mut sender = None;
+    let mut body = None;
+    let mut crdb = None;
+    let mut stdin_json = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        let flag = args[idx].to_str()?;
+        if flag == "--stdin" || flag == "--stdin-json" {
+            stdin_json = true;
+            idx += 1;
+            continue;
+        }
+        idx += 1;
+        let val = args.get(idx)?.to_str()?.to_owned();
+        match flag {
+            "--agent" => agent = Some(val),
+            "--item" | "--item-key" => item = Some(val),
+            "--sender" => sender = Some(val),
+            "--body" | "--message" => body = Some(val),
+            "--crdb" | "--repo" => crdb = Some(PathBuf::from(val)),
+            _ => return None,
+        }
+        idx += 1;
+    }
+    if !stdin_json && (agent.is_none() || body.is_none()) {
+        return None;
+    }
+    Some(AgentDispatchRequest {
+        agent,
+        item,
+        sender,
+        body,
+        crdb,
+        stdin_json,
+    })
+}
+
+fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
+    let sub = args.first()?.to_str()?;
+    let rest = &args[1..];
+    let mut id = None;
+    let mut bank = None;
+    let mut context = None;
+    let mut content = None;
+    let mut commit = None;
+    let mut file_scope = None;
+    let mut agent = None;
+    let mut tags = None;
+    let mut query = None;
+    let mut limit: Option<usize> = None;
+    let mut reason = None;
+    let mut attempted_action = None;
+    let mut failure = None;
+    let mut alternative = None;
+    let mut url = None;
+    let mut crdb = None;
+
+    let mut idx = 0;
+    while idx < rest.len() {
+        let raw_flag = rest[idx].to_str()?;
+        let (flag, val) = if let Some((f, v)) = raw_flag.split_once('=') {
+            idx += 1;
+            (f, v.to_owned())
+        } else {
+            idx += 1;
+            let v = rest.get(idx)?.to_str()?.to_owned();
+            idx += 1;
+            (raw_flag, v)
+        };
+        match flag {
+            "--id" => id = Some(val),
+            "--bank" => bank = Some(val),
+            "--context" | "--ctx" | "--category" => context = Some(val),
+            "--content" | "--text" | "--body" => content = Some(val),
+            "--commit" | "--source-commit" => commit = Some(val),
+            "--file-scope" | "--file-path" | "--scope" => file_scope = Some(val),
+            "--agent" | "--author" => agent = Some(val),
+            "--tags" => tags = Some(val),
+            "--query" | "-q" => query = Some(val),
+            "--limit" | "-n" => limit = Some(val.parse().ok()?),
+            "--reason" | "--why-killed" => reason = Some(val),
+            "--attempted-action" | "--action" => attempted_action = Some(val),
+            "--failure" => failure = Some(val),
+            "--alternative" | "--alt" => alternative = Some(val),
+            "--url" => url = Some(val),
+            "--crdb" | "--repo" => crdb = Some(PathBuf::from(val)),
+            _ => return None,
+        }
+    }
+
+    let action = match sub {
+        "retain" => MemoryAction::Retain {
+            id,
+            bank: bank.unwrap_or_else(|| "spector-fleet".to_owned()),
+            context: context.unwrap_or_else(|| "chinwag-memory".to_owned()),
+            content: content?,
+            commit,
+            file_scope,
+            agent,
+            tags,
+        },
+        "recall" => MemoryAction::Recall {
+            query: query.unwrap_or_else(|| file_scope.clone().unwrap_or_default()),
+            limit: limit.unwrap_or(10),
+            bank,
+            file_scope,
+        },
+        "tombstone" => MemoryAction::Tombstone {
+            id: id?,
+            file_scope: file_scope?,
+            reason: reason.or(content)?,
+            commit,
+            attempted_action,
+            failure,
+            alternative,
+        },
+        "stats" => MemoryAction::Stats { bank },
+        "migrate-hindsight" => MemoryAction::MigrateHindsight { url, bank },
+        _ => return None,
+    };
+
+    Some(MemoryRequest { action, crdb })
+}
+
+#[cfg(target_os = "macos")]
+mod agent_dispatch_run;
+#[cfg(target_os = "macos")]
+pub use agent_dispatch_run::run_agent_dispatch;
+#[cfg(not(target_os = "macos"))]
+pub fn run_agent_dispatch(
+    _request: AgentDispatchRequest,
+    _input: &mut dyn std::io::Read,
+    _out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> u8 {
+    let _ = err.write_all(b"chinwag: unsupported_os\n");
+    2
+}
+
+#[cfg(target_os = "macos")]
+mod memory_run;
+#[cfg(target_os = "macos")]
+pub use memory_run::run_memory;
+#[cfg(not(target_os = "macos"))]
+pub fn run_memory(
+    _request: MemoryRequest,
+    _out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> u8 {
+    let _ = err.write_all(b"chinwag: unsupported_os\n");
+    2
 }
 
 #[cfg(target_os = "macos")]

@@ -1,3 +1,11 @@
+---
+title: "`chinwag`"
+description: "1. Chinwag PRDs & Specs — projects/Chinwag/prd-mkt/chinwag-github-readme-v0.1.0.md"
+category: "1. Chinwag PRDs & Specs"
+stage: "canonical-active"
+source_commit: "8123089ce0a26e94052babb94d946ef14d0ad462"
+status: "VERIFIED CURRENT"
+---
 <div align="center">
 
 # `chinwag`
