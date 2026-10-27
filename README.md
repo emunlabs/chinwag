@@ -124,9 +124,9 @@ git chinwag mcp-serve --repo "$PWD" --transport stdio
 
 ---
 
-### Killer Feature #5: `chinwag.sh · Mission Control` & Commit-Anchored Wiki (`chinwag wiki-sync`)
+### Killer Feature #5: `chinwag.sh · Mission Control` & Commit-Anchored Wiki (`v0.1.1`)
 
-> **Why it matters:** Terminal logs aren't enough when you're orchestrating a fleet of autonomous agents across branches and machines. **`chinwag.sh · Mission Control`** (available locally on `:5487` and hosted at `app.chinwag.sh`) gives engineering leads a live visual command center over `.chinwag/state.crdb` and `refs/notes/emun-vault`.
+> **Why it matters:** Terminal logs aren't enough when you're orchestrating a fleet of autonomous agents across branches and machines. **`chinwag.sh · Mission Control`** (available locally on `:5487`, bundling into the `v0.1.1` CLI, and hosted at `app.chinwag.sh`) gives engineering leads a live visual command center over `.chinwag/state.crdb` and `refs/notes/emun-vault`.
 
 - **Visual Swarm Command Center:** Interactive **Gantt** (critical-path & dependency drawing), **Kanban**, **Calendar**, and **Agents · Swarm Chat** (`■ GEMINI-PM`, `■ ARCHITECT`, `■ RUST`, `■ TYPE`, `■ VENTURE`, `■ MO`, `■ EAGLE-EYE`, `■ DECLARATION`).
 - **Commit-Anchored Provenance Wiki (`source_commit === HEAD`):** Every specification and architecture doc carries an anchored `source_commit` header. When code advances ahead of documentation, Mission Control automatically badges stale pages as `DRIFTED FROM HEAD`.
