@@ -401,7 +401,11 @@ dependencies = [
  "chinwag-editor-config-private",
  "chinwag-mcp-private-anchored",
  "chinwag-signing",
+ "chinwag-snapshot-read-owner-private",
+ "chinwag-snapshot-session-private",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "ssh-key",
 ]
 

@@ -377,10 +377,220 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
             0
         }
+        "reply" | "post" => {
+            let mut channel = "#mgmt".to_string();
+            let mut from_seat = "ENG".to_string();
+            let mut message = String::new();
+            let mut run_id = format!("chinwag-reply-{}", now_ms());
+            let mut item_key = "CHWG-BRIDGE-1".to_string();
+
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--channel" | "-c" if i + 1 < args.len() => {
+                        channel = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--from" | "--seat" | "-f" if i + 1 < args.len() => {
+                        from_seat = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--message" | "--body" | "-m" if i + 1 < args.len() => {
+                        message = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--run" | "-r" if i + 1 < args.len() => {
+                        run_id = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--item" | "--ticket" | "-t" if i + 1 < args.len() => {
+                        item_key = args[i + 1].clone();
+                        i += 2;
+                    }
+                    other => {
+                        if message.is_empty() {
+                            message = other.to_string();
+                        } else {
+                            message.push(' ');
+                            message.push_str(other);
+                        }
+                        i += 1;
+                    }
+                }
+            }
+
+            if message.trim().is_empty() {
+                let _ = writeln!(
+                    stderr,
+                    "Usage: chinwag reply --channel <#mgmt|#eng-swarm|#product-studio|#bizfin-legal|#s-and-m-growth|#infra-cleanroom|#pa-private> --from <SEAT> --message \"<text>\" [--run <run-id>] [--ticket <CHWG-id>]"
+                );
+                return 2;
+            }
+
+            let post_payload = json!({
+                "channelId": channel,
+                "sender": format!("[{}]", from_seat.trim_matches(|c| c == '[' || c == ']').to_uppercase()),
+                "senderCast": "■",
+                "role": format!("GrokBot Seat {} · Native Chinwag UI Reply (run={})", from_seat.to_uppercase(), run_id),
+                "engine": "GrokBot -> chinwag reply (:5487)",
+                "body": format!("{} `[relay-receipt run={}]`", message.trim(), run_id),
+                "itemKey": item_key
+            });
+
+            let payload_str = post_payload.to_string();
+            let http_out = Command::new("/usr/bin/curl")
+                .args([
+                    "-sS",
+                    "-m",
+                    "5",
+                    "-X",
+                    "POST",
+                    "-H",
+                    "Content-Type: application/json",
+                    "--data",
+                    &payload_str,
+                    "http://127.0.0.1:5487/api/comms/channels",
+                ])
+                .output();
+
+            let http_ok = http_out.as_ref().map(|o| o.status.success()).unwrap_or(false);
+
+            let out = json!({
+                "ok": true,
+                "action": "reply",
+                "channel": channel,
+                "from": from_seat,
+                "run_id": run_id,
+                "item_key": item_key,
+                "delivered_to_mission_control_5487": http_ok,
+                "ui_url": "https://brians-mac-studio-468.tail23ad5.ts.net:5487/"
+            });
+            let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            0
+        }
+        "send" | "dispatch" => {
+            let mut target_seat = "ALL".to_string();
+            let mut ticket = "CHWG-BRIDGE-1".to_string();
+            let mut title = "Founder Message from Chinwag Mission Control (:5487)".to_string();
+            let mut message = String::new();
+            let mut reply_channel = "#mgmt".to_string();
+
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--seat" | "--to" | "-s" if i + 1 < args.len() => {
+                        target_seat = args[i + 1].to_uppercase();
+                        i += 2;
+                    }
+                    "--ticket" | "--item" | "-t" if i + 1 < args.len() => {
+                        ticket = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--title" if i + 1 < args.len() => {
+                        title = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--channel" | "-c" if i + 1 < args.len() => {
+                        reply_channel = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--message" | "--body" | "-m" if i + 1 < args.len() => {
+                        message = args[i + 1].clone();
+                        i += 2;
+                    }
+                    other => {
+                        if message.is_empty() {
+                            message = other.to_string();
+                        } else {
+                            message.push(' ');
+                            message.push_str(other);
+                        }
+                        i += 1;
+                    }
+                }
+            }
+
+            let run_ts = now_ms();
+            let mut receipts = Vec::new();
+            for seat in GROKBOT_MGMT_ROSTER {
+                let seat_upper = seat.seat.to_uppercase();
+                let matches = target_seat == "ALL"
+                    || target_seat == "#MGMT"
+                    || target_seat == "MGMT"
+                    || target_seat == seat_upper
+                    || (target_seat == "HOUSEKEEPING" && seat_upper == "INFRA");
+                if !matches {
+                    continue;
+                }
+                let listener_prefix = if seat_upper == "INFRA" {
+                    "HOUSEKEEPING"
+                } else if seat_upper == "PA" {
+                    "PRODUCT"
+                } else {
+                    seat.seat
+                };
+                let run_id = format!("chinwag-ui-{}-{}-{}", seat.seat.to_lowercase(), ticket.to_lowercase(), run_ts);
+                let subj = format!("[Paperclip] {} | {}: {}", listener_prefix, ticket, title);
+                let msg = format!(
+                    "{}\n\
+                    Run: {}   Wake reason: issue_assigned (chinwag-rust-relay)\n\
+                    Receipt marker (include in any receipt comment): [relay-receipt run={}]\n\
+                    Task: {} — https://brians-mac-studio-468.tail23ad5.ts.net:5487/\n\n\
+                    MESSAGE FROM BRIAN SPECTOR (CEO) IN CHINWAG MISSION CONTROL (:5487):\n\
+                    {}\n\n\
+                    HOW TO REPLY DIRECTLY IN CHINWAG UI (SO BRIAN DOES NOT HAVE TO OPEN GROK BOT):\n\
+                    Run this command on Mac Studio to post your reply directly into Chinwag Mission Control (:5487):\n\
+                    `/Users/brianspector/.local/bin/chinwag reply --channel \"{}\" --from \"{}\" --run \"{}\" --ticket \"{}\" --message \"<your reply>\"`",
+                    subj,
+                    run_id,
+                    run_id,
+                    ticket,
+                    message,
+                    reply_channel,
+                    seat.seat,
+                    run_id,
+                    ticket
+                );
+
+                let (slack_delivered, slack_http_code) = if let Some(url) = read_webhook_url(seat.webhook_env) {
+                    post_slack_webhook(&url, &msg)
+                } else {
+                    (false, 0)
+                };
+
+                let (email_delivered, email_http_code) = if seat.agentmail_inbox.contains("@agentmail.to") || seat.agentmail_inbox.contains("@mail.grokbot.com") {
+                    send_agentmail(seat.agentmail_inbox, &subj, &msg)
+                } else {
+                    (false, 0)
+                };
+
+                receipts.push(json!({
+                    "seat": seat.seat,
+                    "listener_prefix": listener_prefix,
+                    "run_id": run_id,
+                    "ticket": ticket,
+                    "slack_delivered": slack_delivered,
+                    "slack_http_status": slack_http_code,
+                    "agentmail_delivered": email_delivered,
+                    "agentmail_http_status": email_http_code
+                }));
+            }
+
+            let out = json!({
+                "ok": true,
+                "action": "send",
+                "target": target_seat,
+                "ticket": ticket,
+                "reply_channel": reply_channel,
+                "receipts": receipts
+            });
+            let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            0
+        }
         _ => {
             let _ = writeln!(
                 stderr,
-                "Usage: chinwag relay <status | brief-mgmt>"
+                "Usage: chinwag relay <status | brief-mgmt | send | reply> OR chinwag reply --channel <#mgmt> --from <SEAT> --message \"<text>\""
             );
             2
         }
