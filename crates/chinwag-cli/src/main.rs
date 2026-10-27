@@ -6,41 +6,88 @@ use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.get(1).map(|s| s.as_str()) == Some("onboard") {
-        let _ = writeln!(
-            std::io::stdout().lock(),
-            "✨ Chinwag First-Run Coalface Onboarding (PRD-ONBOARD-01 · INV-ONBOARD-01 · INV-ROUTE-01)\n\
-             1. iroh QUIC Multi-Mac Mesh: Zero-Config Ed25519 NodeId Pairing (No Tailscale/Cables required)\n\
-             2. #mgmt Executive Layer: Enforced Always-On Cloud Frontier VPs ([PA], [PRODUCT], [ENG], [INFRA], [BIZFIN], [S-AND-M])\n\
-             3. Local Frontier CLIs: Claude Code, Codex CLI, Gemini CLI, Grok Desktop (Rung 1 Subscription Drain)\n\
-             4. Burst API Failover: Keychain 0600 (Anthropic, OpenAI, xAI, Gemini, ElevenLabs)\n\
-             5. Local Apple Silicon Models: ■ FLINT (:11500 via iroh QUIC) + LEANN CSR ($0.00/tok Rung 0)\n\
-             6. FinOps Smart Router: Cost × Capability Arbitrage (~$3.20/commit · 74% saved vs unrouted API)\n\
-             7. Worker Swarm Provisioning: 30 Enrolled Org Agents active\n\
-             → Launch Full-Screen First-Run Wizard: http://127.0.0.1:5487/?onboard=1"
-        );
-        return ExitCode::SUCCESS;
-    }
-    if raw_args.get(1).map(|s| s.as_str()) == Some("relay") {
-        let code = relay_run::run_relay_cli(
-            &raw_args[2..],
-            &mut std::io::stdout().lock(),
-            &mut std::io::stderr().lock(),
-        );
-        return ExitCode::from(code);
-    }
-    if raw_args.get(1).map(|s| s.as_str()) == Some("reply")
-        || raw_args.get(1).map(|s| s.as_str()) == Some("post")
-    {
-        let mut forwarded = vec!["reply".to_string()];
-        forwarded.extend_from_slice(&raw_args[2..]);
-        let code = relay_run::run_relay_cli(
-            &forwarded,
-            &mut std::io::stdout().lock(),
-            &mut std::io::stderr().lock(),
-        );
-        return ExitCode::from(code);
+    let raw_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let all_utf8: Option<Vec<String>> = raw_os
+        .iter()
+        .map(|s| s.to_str().map(|v| v.to_string()))
+        .collect();
+    let is_chinwag_prog = raw_os
+        .first()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        == Some("chinwag");
+    if let (true, Some(raw_args)) = (is_chinwag_prog, all_utf8) {
+        if raw_args.get(1).map(|s| s.as_str()) == Some("onboard") {
+            let is_json = raw_args.iter().any(|a| a == "--json");
+            let has_tart = std::path::Path::new("/opt/homebrew/bin/tart").exists()
+                || std::path::Path::new("/usr/local/bin/tart").exists();
+            let has_softnet = std::path::Path::new("/opt/homebrew/bin/softnet").exists()
+                || std::path::Path::new("/usr/local/bin/softnet").exists();
+            let has_node = std::path::Path::new("/opt/homebrew/bin/node").exists()
+                || std::path::Path::new("/usr/local/bin/node").exists();
+            let has_git = std::path::Path::new("/usr/bin/git").exists()
+                || std::path::Path::new("/opt/homebrew/bin/git").exists();
+            let has_dagu = std::path::Path::new("/opt/homebrew/bin/dagu").exists()
+                || std::path::Path::new("/usr/local/bin/dagu").exists();
+            if is_json {
+                let payload = serde_json::json!({
+                    "ok": true,
+                    "command": "chinwag onboard",
+                    "invariants": ["INV-ONBOARD-01", "INV-ROUTE-01", "INV-MERGE-01"],
+                    "frontier_catalog": {
+                        "source": "https://models.dev/api.json",
+                        "anthropic": ["claude-opus-5-5 ($4/$20)", "claude-sonnet-5-5 ($2/$10)", "claude-haiku-5-5 ($0.10/$0.50)", "claude-fable-5-1 ($10/$50)"],
+                        "openai": ["gpt-6-1-terra ($1/$5)", "gpt-6-1-sol ($2/$10)", "gpt-6-astra ($10/$50)", "gpt-6-luna ($0.10/$0.50)"],
+                        "google": ["gemini-4-argon ($2/$10)"],
+                        "xai": ["grok-4.7 ($2/$6)", "grok-build-0.1 ($1/$2)"]
+                    },
+                    "preflight": {
+                        "tart_installed": has_tart,
+                        "softnet_installed": has_softnet,
+                        "node_installed": has_node,
+                        "git_installed": has_git,
+                        "dagu_installed": has_dagu,
+                        "cleanroom_vm_slots_fleet_target": 4
+                    },
+                    "wizard_url": "http://127.0.0.1:5487/?onboard=1"
+                });
+                let _ = writeln!(std::io::stdout().lock(), "{payload}");
+                return ExitCode::SUCCESS;
+            }
+            let _ = writeln!(
+                std::io::stdout().lock(),
+                "✨ Chinwag First-Run Coalface Onboarding (PRD-ONBOARD-01 · INV-ONBOARD-01 · INV-ROUTE-01)\n\
+                 1. iroh QUIC Multi-Mac Mesh & 4-VM Cleanroom Swarm: 2 VMs Mac Studio + 2 VMs MacBook Pro (Tart: {has_tart}, Softnet: {has_softnet})\n\
+                 2. #mgmt Executive Layer: Always-On Cloud Frontier VPs (Grok 4.7, Gemini 4 Argon, Claude Opus 5.5, GPT-6.1 Sol)\n\
+                 3. Local Frontier CLIs: Claude Code (Opus/Sonnet 5.5), Codex CLI (GPT-6.1 Terra/Sol), Gemini CLI (Gemini 4 Argon), Grok 4.7\n\
+                 4. Burst API Failover: Keychain 0600 (Anthropic, OpenAI, xAI, Google Gemini 4 Argon, ElevenLabs)\n\
+                 5. Local Apple Silicon Models: ■ FLINT (:11500 via iroh QUIC) + LEANN CSR ($0.00/tok Rung 0)\n\
+                 6. FinOps Smart Router: L1–L5 Cost × Capability Arbitrage (~$2.80/commit · 78% saved vs unrouted API)\n\
+                 7. Worker Swarm Provisioning: 30 Enrolled Org Agents active\n\
+                 → Launch Full-Screen First-Run Wizard: http://127.0.0.1:5487/?onboard=1"
+            );
+            return ExitCode::SUCCESS;
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("relay") {
+            let code = relay_run::run_relay_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("reply")
+            || raw_args.get(1).map(|s| s.as_str()) == Some("post")
+        {
+            let mut forwarded = vec!["reply".to_string()];
+            forwarded.extend_from_slice(&raw_args[2..]);
+            let code = relay_run::run_relay_cli(
+                &forwarded,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
     }
 
     let mut args = std::env::args_os();

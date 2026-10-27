@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[allow(dead_code)]
 pub struct GrokBotSeat {
     pub seat: &'static str,
     pub grokbot_uuid: &'static str,

@@ -354,3 +354,499 @@ pub(super) fn seed(native: &Connection, request: SeedThread) -> Result<Decision>
     }
     Ok(response)
 }
+
+pub struct AgentDispatchRecord {
+    thread_id: String,
+    repo_id: String,
+    branch_ref: String,
+    thread_title: String,
+    inbound_id: String,
+    inbound_author: String,
+    inbound_role: String,
+    inbound_body: String,
+    outbound_id: String,
+    outbound_author: String,
+    outbound_role: String,
+    outbound_body: String,
+    created_at_ms: i64,
+}
+impl AgentDispatchRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        thread_id: String,
+        repo_id: String,
+        branch_ref: String,
+        thread_title: String,
+        inbound_id: String,
+        inbound_author: String,
+        inbound_role: String,
+        inbound_body: String,
+        outbound_id: String,
+        outbound_author: String,
+        outbound_role: String,
+        outbound_body: String,
+        created_at_ms: i64,
+    ) -> std::result::Result<Self, &'static str> {
+        if [&thread_id, &inbound_id, &outbound_id]
+            .iter()
+            .any(|s| s.is_empty())
+            || created_at_ms < 0
+        {
+            return Err("agent_dispatch_required_fields");
+        }
+        if [
+            &thread_id,
+            &repo_id,
+            &branch_ref,
+            &thread_title,
+            &inbound_id,
+            &inbound_author,
+            &inbound_role,
+            &inbound_body,
+            &outbound_id,
+            &outbound_author,
+            &outbound_role,
+            &outbound_body,
+        ]
+        .iter()
+        .any(|s| s.len() > crate::MAX_VALUE_BYTES)
+        {
+            return Err("agent_dispatch_value_limit");
+        }
+        Ok(Self {
+            thread_id,
+            repo_id,
+            branch_ref,
+            thread_title,
+            inbound_id,
+            inbound_author,
+            inbound_role,
+            inbound_body,
+            outbound_id,
+            outbound_author,
+            outbound_role,
+            outbound_body,
+            created_at_ms,
+        })
+    }
+    pub(super) fn digest(&self) -> [u8; 32] {
+        digest(
+            "agent_dispatch_v1",
+            &[
+                &self.thread_id,
+                &self.repo_id,
+                &self.branch_ref,
+                &self.thread_title,
+                &self.inbound_id,
+                &self.inbound_author,
+                &self.inbound_role,
+                &self.inbound_body,
+                &self.outbound_id,
+                &self.outbound_author,
+                &self.outbound_role,
+                &self.outbound_body,
+            ],
+            &[self.created_at_ms],
+        )
+    }
+}
+pub(super) fn agent_dispatch(native: &Connection, r: AgentDispatchRecord) -> Result<Decision> {
+    let mut decision = bound(Decision {
+        dirty: false,
+        response: json!({
+            "thread_id": &r.thread_id,
+            "inbound_id": &r.inbound_id,
+            "outbound_id": &r.outbound_id
+        }),
+        outcome: "agent_dispatch_replayed",
+        is_error: false,
+    })?;
+    if decision.is_error {
+        return Ok(decision);
+    }
+    let existing_thread = one_row(native.query(
+        c"SELECT id FROM threads WHERE id=?1",
+        &[Value::Text(r.thread_id.clone())],
+    )?)?;
+    if existing_thread.is_none() {
+        native.query(
+            c"INSERT INTO threads(id,repo_id,branch_ref,title,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+            &[
+                Value::Text(r.thread_id.clone()),
+                Value::Text(r.repo_id),
+                Value::Text(r.branch_ref),
+                Value::Text(r.thread_title),
+                Value::Integer(r.created_at_ms),
+                Value::Integer(r.created_at_ms),
+            ],
+        )?;
+        decision.dirty = true;
+    } else {
+        native.query(
+            c"UPDATE threads SET updated_at_ms=?2 WHERE id=?1",
+            &[
+                Value::Text(r.thread_id.clone()),
+                Value::Integer(r.created_at_ms),
+            ],
+        )?;
+        decision.dirty = true;
+    }
+    for (id, author, role, body) in [
+        (r.inbound_id, r.inbound_author, r.inbound_role, r.inbound_body),
+        (r.outbound_id, r.outbound_author, r.outbound_role, r.outbound_body),
+    ] {
+        let existing_msg = one_row(native.query(
+            c"SELECT id FROM messages WHERE id=?1",
+            &[Value::Text(id.clone())],
+        )?)?;
+        if existing_msg.is_none() {
+            native.query(
+                c"INSERT INTO messages(id,thread_id,author_key_id,role,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                &[
+                    Value::Text(id),
+                    Value::Text(r.thread_id.clone()),
+                    Value::Text(author),
+                    Value::Text(role),
+                    Value::Text(body),
+                    Value::Integer(r.created_at_ms),
+                ],
+            )?;
+            decision.dirty = true;
+            decision.outcome = "agent_dispatch_stored";
+        }
+    }
+    Ok(decision)
+}
+
+pub struct TombstoneRecord {
+    id: String,
+    repo_id: String,
+    branch_ref: String,
+    source_commit: String,
+    file_path: String,
+    symbol_hash: String,
+    attempted_action: String,
+    failure: String,
+    reason: String,
+    alternative: String,
+    evidence_hash: String,
+    created_at_ms: i64,
+}
+impl TombstoneRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        id: String,
+        repo_id: String,
+        branch_ref: String,
+        source_commit: String,
+        file_path: String,
+        symbol_hash: String,
+        attempted_action: String,
+        failure: String,
+        reason: String,
+        alternative: String,
+        evidence_hash: String,
+        created_at_ms: i64,
+    ) -> std::result::Result<Self, &'static str> {
+        if id.is_empty() || file_path.is_empty() || reason.is_empty() || created_at_ms < 0 {
+            return Err("tombstone_required_fields");
+        }
+        if [
+            &id,
+            &repo_id,
+            &branch_ref,
+            &source_commit,
+            &file_path,
+            &symbol_hash,
+            &attempted_action,
+            &failure,
+            &reason,
+            &alternative,
+            &evidence_hash,
+        ]
+        .iter()
+        .any(|s| s.len() > crate::MAX_VALUE_BYTES)
+        {
+            return Err("tombstone_value_limit");
+        }
+        Ok(Self {
+            id,
+            repo_id,
+            branch_ref,
+            source_commit,
+            file_path,
+            symbol_hash,
+            attempted_action,
+            failure,
+            reason,
+            alternative,
+            evidence_hash,
+            created_at_ms,
+        })
+    }
+    pub(super) fn digest(&self) -> [u8; 32] {
+        digest(
+            "tombstone_record_v1",
+            &[
+                &self.id,
+                &self.repo_id,
+                &self.branch_ref,
+                &self.source_commit,
+                &self.file_path,
+                &self.symbol_hash,
+                &self.attempted_action,
+                &self.failure,
+                &self.reason,
+                &self.alternative,
+                &self.evidence_hash,
+            ],
+            &[self.created_at_ms],
+        )
+    }
+}
+pub(super) fn record_tombstone(native: &Connection, r: TombstoneRecord) -> Result<Decision> {
+    let pin_id = format!("pin-tmb-{}", r.id);
+    let thread_id = "chinwag-memory-tombstones".to_owned();
+    let pin_body = format!(
+        "[TOMBSTONE DO NOT REPEAT] [{}] {}: {} (Alternative: {})",
+        r.file_path, r.id, r.reason, r.alternative
+    );
+    let mut decision = bound(Decision {
+        dirty: false,
+        response: json!({
+            "tombstone_id": &r.id,
+            "pin_id": &pin_id,
+            "file_scope": &r.file_path,
+            "source_commit": &r.source_commit
+        }),
+        outcome: "tombstone_stored",
+        is_error: false,
+    })?;
+    if decision.is_error {
+        return Ok(decision);
+    }
+    let existing_thread = one_row(native.query(
+        c"SELECT id FROM threads WHERE id=?1",
+        &[Value::Text(thread_id.clone())],
+    )?)?;
+    if existing_thread.is_none() {
+        native.query(
+            c"INSERT INTO threads(id,repo_id,branch_ref,title,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+            &[
+                Value::Text(thread_id.clone()),
+                Value::Text(r.repo_id.clone()),
+                Value::Text(r.branch_ref.clone()),
+                Value::Text("Chinwag Negative Architectural Tombstones".to_owned()),
+                Value::Integer(r.created_at_ms),
+                Value::Integer(r.created_at_ms),
+            ],
+        )?;
+    } else {
+        native.query(
+            c"UPDATE threads SET updated_at_ms=?2 WHERE id=?1",
+            &[
+                Value::Text(thread_id.clone()),
+                Value::Integer(r.created_at_ms),
+            ],
+        )?;
+    }
+    let existing_tmb = one_row(native.query(
+        c"SELECT id FROM tombstones WHERE id=?1",
+        &[Value::Text(r.id.clone())],
+    )?)?;
+    let tmb_vals = [
+        Value::Text(r.id.clone()),
+        Value::Text(r.repo_id),
+        Value::Text(r.branch_ref),
+        Value::Text(r.source_commit.clone()),
+        Value::Text(r.file_path.clone()),
+        Value::Text(r.symbol_hash.clone()),
+        Value::Text(r.attempted_action),
+        Value::Text(r.failure),
+        Value::Text(r.reason),
+        Value::Text(r.alternative),
+        Value::Text(r.evidence_hash),
+        Value::Integer(r.created_at_ms),
+    ];
+    if existing_tmb.is_none() {
+        native.query(
+            c"INSERT INTO tombstones(id,repo_id,branch_ref,source_commit,file_path,symbol_hash,attempted_action,failure,reason,alternative,evidence_hash,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            &tmb_vals,
+        )?;
+    } else {
+        native.query(
+            c"UPDATE tombstones SET repo_id=?2,branch_ref=?3,source_commit=?4,file_path=?5,symbol_hash=?6,attempted_action=?7,failure=?8,reason=?9,alternative=?10,evidence_hash=?11,created_at_ms=?12 WHERE id=?1",
+            &tmb_vals,
+        )?;
+    }
+    let existing_pin = one_row(native.query(
+        c"SELECT id FROM context_pins WHERE id=?1",
+        &[Value::Text(pin_id.clone())],
+    )?)?;
+    let pin_vals = [
+        Value::Text(pin_id),
+        Value::Text(thread_id),
+        Value::Text(r.file_path),
+        Value::Text(r.symbol_hash),
+        Value::Text(r.source_commit),
+        Value::Text(pin_body),
+        Value::Integer(r.created_at_ms),
+    ];
+    if existing_pin.is_none() {
+        native.query(
+            c"INSERT INTO context_pins(id,thread_id,file_path,symbol_hash,source_commit,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            &pin_vals,
+        )?;
+    } else {
+        native.query(
+            c"UPDATE context_pins SET thread_id=?2,file_path=?3,symbol_hash=?4,source_commit=?5,body=?6,created_at_ms=?7 WHERE id=?1",
+            &pin_vals,
+        )?;
+    }
+    decision.dirty = true;
+    Ok(decision)
+}
+
+pub struct MemoryPinRecord {
+    id: String,
+    thread_id: String,
+    repo_id: String,
+    branch_ref: String,
+    thread_title: String,
+    file_path: String,
+    symbol_hash: String,
+    source_commit: String,
+    body: String,
+    created_at_ms: i64,
+}
+impl MemoryPinRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        id: String,
+        thread_id: String,
+        repo_id: String,
+        branch_ref: String,
+        thread_title: String,
+        file_path: String,
+        symbol_hash: String,
+        source_commit: String,
+        body: String,
+        created_at_ms: i64,
+    ) -> std::result::Result<Self, &'static str> {
+        if id.is_empty() || thread_id.is_empty() || created_at_ms < 0 {
+            return Err("memory_pin_required_fields");
+        }
+        if [
+            &id,
+            &thread_id,
+            &repo_id,
+            &branch_ref,
+            &thread_title,
+            &file_path,
+            &symbol_hash,
+            &source_commit,
+            &body,
+        ]
+        .iter()
+        .any(|s| s.len() > crate::MAX_VALUE_BYTES)
+        {
+            return Err("memory_pin_value_limit");
+        }
+        Ok(Self {
+            id,
+            thread_id,
+            repo_id,
+            branch_ref,
+            thread_title,
+            file_path,
+            symbol_hash,
+            source_commit,
+            body,
+            created_at_ms,
+        })
+    }
+    pub(super) fn digest(&self) -> [u8; 32] {
+        digest(
+            "memory_pin_v1",
+            &[
+                &self.id,
+                &self.thread_id,
+                &self.repo_id,
+                &self.branch_ref,
+                &self.thread_title,
+                &self.file_path,
+                &self.symbol_hash,
+                &self.source_commit,
+                &self.body,
+            ],
+            &[self.created_at_ms],
+        )
+    }
+}
+pub(super) fn record_memory_pin(native: &Connection, r: MemoryPinRecord) -> Result<Decision> {
+    let mut decision = bound(Decision {
+        dirty: false,
+        response: json!({
+            "pin_id": &r.id,
+            "thread_id": &r.thread_id,
+            "file_scope": &r.file_path,
+            "source_commit": &r.source_commit
+        }),
+        outcome: "memory_pin_stored",
+        is_error: false,
+    })?;
+    if decision.is_error {
+        return Ok(decision);
+    }
+    let existing_thread = one_row(native.query(
+        c"SELECT id FROM threads WHERE id=?1",
+        &[Value::Text(r.thread_id.clone())],
+    )?)?;
+    if existing_thread.is_none() {
+        native.query(
+            c"INSERT INTO threads(id,repo_id,branch_ref,title,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+            &[
+                Value::Text(r.thread_id.clone()),
+                Value::Text(r.repo_id),
+                Value::Text(r.branch_ref),
+                Value::Text(r.thread_title),
+                Value::Integer(r.created_at_ms),
+                Value::Integer(r.created_at_ms),
+            ],
+        )?;
+    } else {
+        native.query(
+            c"UPDATE threads SET updated_at_ms=?2 WHERE id=?1",
+            &[
+                Value::Text(r.thread_id.clone()),
+                Value::Integer(r.created_at_ms),
+            ],
+        )?;
+    }
+    let existing_pin = one_row(native.query(
+        c"SELECT id FROM context_pins WHERE id=?1",
+        &[Value::Text(r.id.clone())],
+    )?)?;
+    let pin_vals = [
+        Value::Text(r.id),
+        Value::Text(r.thread_id),
+        Value::Text(r.file_path),
+        Value::Text(r.symbol_hash),
+        Value::Text(r.source_commit),
+        Value::Text(r.body),
+        Value::Integer(r.created_at_ms),
+    ];
+    if existing_pin.is_none() {
+        native.query(
+            c"INSERT INTO context_pins(id,thread_id,file_path,symbol_hash,source_commit,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            &pin_vals,
+        )?;
+    } else {
+        native.query(
+            c"UPDATE context_pins SET thread_id=?2,file_path=?3,symbol_hash=?4,source_commit=?5,body=?6,created_at_ms=?7 WHERE id=?1",
+            &pin_vals,
+        )?;
+    }
+    decision.dirty = true;
+    Ok(decision)
+}

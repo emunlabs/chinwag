@@ -143,6 +143,38 @@ impl SnapshotSession {
             pins: connection.query(c"SELECT id,thread_id,file_path,symbol_hash,source_commit,body,created_at_ms FROM context_pins WHERE thread_id=?1 ORDER BY id", &values).map_err(SessionError::Native)?,
         })
     }
+    pub fn tombstones(&self) -> SessionResult<Rows> {
+        self.connection()?
+            .query(
+                c"SELECT id,repo_id,branch_ref,source_commit,file_path,symbol_hash,attempted_action,failure,reason,alternative,evidence_hash,created_at_ms FROM tombstones ORDER BY created_at_ms DESC, id",
+                &[],
+            )
+            .map_err(SessionError::Native)
+    }
+    pub fn verified_invariants(&self) -> SessionResult<Rows> {
+        self.connection()?
+            .query(
+                c"SELECT id,repo_id,branch_ref,source_commit,file_path,symbol_hash,invariant,ci_run_id,ci_receipt_hash,verified_at_ms FROM verified_invariants ORDER BY verified_at_ms DESC, id",
+                &[],
+            )
+            .map_err(SessionError::Native)
+    }
+    pub fn all_pins(&self) -> SessionResult<Rows> {
+        self.connection()?
+            .query(
+                c"SELECT id,thread_id,file_path,symbol_hash,source_commit,body,created_at_ms FROM context_pins ORDER BY created_at_ms DESC, id",
+                &[],
+            )
+            .map_err(SessionError::Native)
+    }
+    pub fn crdb_stats(&self) -> SessionResult<Rows> {
+        self.connection()?
+            .query(
+                c"SELECT (SELECT count(*) FROM threads), (SELECT count(*) FROM messages), (SELECT count(*) FROM context_pins), (SELECT count(*) FROM tombstones), (SELECT count(*) FROM verified_invariants), crsql_db_version()",
+                &[],
+            )
+            .map_err(SessionError::Native)
+    }
     pub fn finish(mut self) -> SessionResult<SessionReceipt> {
         let mut native = self
             .native

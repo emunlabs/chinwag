@@ -10,7 +10,7 @@ mod owner;
 use crate::{Error, NativeCounts, Rows, Value, native::Connection};
 #[cfg(feature = "private-probe")]
 pub use domain::SeedThread;
-pub use domain::{PinRequest, ThreadStart};
+pub use domain::{AgentDispatchRecord, MemoryPinRecord, PinRequest, ThreadStart, TombstoneRecord};
 pub use owner::WriteOwner;
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -309,6 +309,45 @@ impl WriteSession {
             "pin_context",
             digest,
             |native| domain::pin(native, request),
+            cancelled,
+        )
+    }
+    pub fn prepare_agent_dispatch(
+        self,
+        request: AgentDispatchRecord,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedOutcome> {
+        let digest = request.digest();
+        self.prepare(
+            "agent_dispatch_v1",
+            digest,
+            |native| domain::agent_dispatch(native, request),
+            cancelled,
+        )
+    }
+    pub fn prepare_tombstone(
+        self,
+        request: TombstoneRecord,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedOutcome> {
+        let digest = request.digest();
+        self.prepare(
+            "tombstone_record_v1",
+            digest,
+            |native| domain::record_tombstone(native, request),
+            cancelled,
+        )
+    }
+    pub fn prepare_memory_pin(
+        self,
+        request: MemoryPinRecord,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedOutcome> {
+        let digest = request.digest();
+        self.prepare(
+            "memory_pin_v1",
+            digest,
+            |native| domain::record_memory_pin(native, request),
             cancelled,
         )
     }
