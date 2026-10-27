@@ -128,7 +128,7 @@ git chinwag mcp-serve --repo "$PWD" --transport stdio
 
 > **Why it matters:** Terminal logs aren't enough when you're orchestrating a fleet of autonomous agents across branches and machines. **`chinwag.sh · Mission Control`** (available locally on `:5487`, bundling into the `v0.1.1` CLI, and hosted at `app.chinwag.sh`) gives engineering leads a live visual command center over `.chinwag/state.crdb` and `refs/notes/emun-vault`.
 
-- **Visual Swarm Command Center:** Interactive **Gantt** (critical-path & dependency drawing), **Kanban**, **Calendar**, and **Agents · Swarm Chat** (`■ GEMINI-PM`, `■ ARCHITECT`, `■ RUST`, `■ TYPE`, `■ VENTURE`, `■ MO`, `■ EAGLE-EYE`, `■ DECLARATION`).
+- **Visual Swarm Command Center:** Interactive **Gantt** (critical-path & dependency drawing), **Kanban**, **Calendar**, and **Agents · Swarm Chat** where you can register and orchestrate your own custom specialist agents (`+ Create Agent`) or auto-discover connected MCP sessions across Claude Code, Codex, Cursor, Gemini, and Grok.
 - **Commit-Anchored Provenance Wiki (`source_commit === HEAD`):** Every specification and architecture doc carries an anchored `source_commit` header. When code advances ahead of documentation, Mission Control automatically badges stale pages as `DRIFTED FROM HEAD`.
 - **Agent Cost & Lease Telemetry (`$ / Verified Commit`):** Tracks input, output, and cached token usage per commit across Claude Code, Codex, Cursor, Gemini, and Grok, and highlights duplicate agent runs prevented by atomic `chinwag-claim` leases.
 
