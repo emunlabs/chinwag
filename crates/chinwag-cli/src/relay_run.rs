@@ -284,8 +284,9 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         "brief-mgmt" => {
             let run_ts = now_ms();
             let mut receipts = Vec::new();
-            let planner_db = &format!("{}/WORKSPACE/delivery-planner/data/planner.sqlite", home_dir().display());
-            let crdb_path = &format!("{}/WORKSPACE/chinwag/.chinwag/state.crdb", home_dir().display());
+            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
+            let planner_db = &format!("{home}/WORKSPACE/delivery-planner/data/planner.sqlite");
+            let crdb_path = &format!("{home}/WORKSPACE/chinwag/.chinwag/state.crdb");
 
             for seat in GROKBOT_MGMT_ROSTER {
                 let run_id = format!("chinwag-rust-mgmt-{}-{}", seat.seat.to_lowercase(), run_ts);
