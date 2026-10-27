@@ -260,7 +260,7 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             let report = json!({
                 "ok": true,
                 "engine": "chinwag-rust-relay",
-                "binary": "/Users/brianspector/.local/bin/chinwag",
+                "binary": "/opt/homebrew/bin/chinwag",
                 "legacy_python_bridge_retired": true,
                 "mgmt_group_channel": {
                     "name": "MGMT",
@@ -284,8 +284,8 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         "brief-mgmt" => {
             let run_ts = now_ms();
             let mut receipts = Vec::new();
-            let planner_db = "/Users/brianspector/WORKSPACE/delivery-planner/data/planner.sqlite";
-            let crdb_path = "/Users/brianspector/WORKSPACE/chinwag/.chinwag/state.crdb";
+            let planner_db = &format!("{}/WORKSPACE/delivery-planner/data/planner.sqlite", home_dir().display());
+            let crdb_path = &format!("{}/WORKSPACE/chinwag/.chinwag/state.crdb", home_dir().display());
 
             for seat in GROKBOT_MGMT_ROSTER {
                 let run_id = format!("chinwag-rust-mgmt-{}-{}", seat.seat.to_lowercase(), run_ts);
@@ -305,10 +305,10 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                     Run: {}   Wake reason: issue_assigned (chinwag-rust-relay)\n\
                     Receipt marker (include in any receipt comment): [relay-receipt run={}]\n\n\
                     ACTION REQUIRED FROM BRIAN SPECTOR & GEMINI-PM — POST YOUR RECEIPT IN GROK BOT `MGMT` GROUP CHANNEL ({}):\n\
-                    1. UNPAUSE YOUR SLACK CHANNEL LISTENER FOR CHINWAG RUST RELAY: Do NOT call the retired Paperclip HTTP API (:3110), DO keep your Slack channel listener ({}) and AgentMail listener ({}) ACTIVE for `[Paperclip] {} |` messages dispatched by our native Rust `/Users/brianspector/.local/bin/chinwag relay` binary.\n\
+                    1. UNPAUSE YOUR SLACK CHANNEL LISTENER FOR CHINWAG RUST RELAY: Do NOT call the retired Paperclip HTTP API (:3110), DO keep your Slack channel listener ({}) and AgentMail listener ({}) ACTIVE for `[Paperclip] {} |` messages dispatched by our native Rust `/opt/homebrew/bin/chinwag relay` binary.\n\
                     2. POST CONFIRMATION IN `MGMT` ({}): Immediately post a short confirmation message in the Grok Bot `MGMT` group room (`{}`) confirming your seat (`{}` / `{}`), your direct reports {:?}, and that you are running on Chinwag Mission Control (`https://brians-mac-studio-468.tail23ad5.ts.net:5487/`).\n\
                     3. INFRA BOT (`407d2c36-b5c3-491a-9e08-527ad7f18a06`): Because `eng`, `bizfin`, `product`, and `s-and-m` paused their routines earlier today, please immediately post this Management Charter briefing directly into the Grok Bot `MGMT` group conversation (`c5a97346-e424-44bf-90d2-9caaa7594c11`) AND send a direct agent message to `eng` (`a692d662-495c-4def-896b-6a787087de01`), `bizfin` (`e484d158-8f4d-41f3-a7c9-b2bf8167cbcb`), `product` (`382e7010-ea4d-48f7-a1bb-96dca02a0921`), `s-and-m` (`16593278-278d-4a2b-9e94-3a189bcaf599`), and `Personal Bot` (`419c9d1d-f01c-4d3c-9972-93e56f95c5d9`) telling them to post their readiness check-in in `MGMT` (`c5a97346-e424-44bf-90d2-9caaa7594c11`)!\n\
-                    4. PURE CHINWAG STACK: Hindsight (:8888) and Wiki.js (:4320) are retired. Use `/Users/brianspector/.local/bin/chinwag memory recall | retain | tombstone` (`.chinwag/state.crdb` + `.chinwag/memory.crdb.leann`) and Docus Wiki (`:8795` / `:5487` `Docs · Wiki`).\n\
+                    4. PURE CHINWAG STACK: Hindsight (:8888) and Wiki.js (:4320) are retired. Use `/opt/homebrew/bin/chinwag memory recall | retain | tombstone` (`.chinwag/state.crdb` + `.chinwag/memory.crdb.leann`) and Docus Wiki (`:8795` / `:5487` `Docs · Wiki`).\n\
                     5. MANAGEMENT SLA: Always delegate to your specialist direct reports {:?}, triage blockers within 15m, post daily `#mgmt` standups (`What's working / What's not`), and enforce the 14-Slide Initiative Sign-Off Deck Gate (`INV-INIT-01`, including `INIT-07` Cloudflare Livestream Shorts + `chinwag.tv` `AXEL` vs `RANDO`) + `chinwag ui-gate` (`SOP-QA-02`).",
                     subj,
                     run_id,
@@ -541,7 +541,7 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                     {}\n\n\
                     HOW TO REPLY DIRECTLY IN CHINWAG UI (SO BRIAN DOES NOT HAVE TO OPEN GROK BOT):\n\
                     Run this command on Mac Studio to post your reply directly into Chinwag Mission Control (:5487):\n\
-                    `/Users/brianspector/.local/bin/chinwag reply --channel \"{}\" --from \"{}\" --run \"{}\" --ticket \"{}\" --message \"<your reply>\"`",
+                    `/opt/homebrew/bin/chinwag reply --channel \"{}\" --from \"{}\" --run \"{}\" --ticket \"{}\" --message \"<your reply>\"`",
                     subj,
                     run_id,
                     run_id,

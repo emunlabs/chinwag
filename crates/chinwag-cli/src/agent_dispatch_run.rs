@@ -26,10 +26,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_REPO_ROOT: &str = "/Users/brianspector/WORKSPACE/chinwag";
-const WIKI_AGENTS_DIR: &str = "/Users/brianspector/WORKSPACE/paperclip-wiki/wiki/agents";
-const PILOT_COMPANY_AGENTS_DIR: &str = "/Users/brianspector/.paperclip-pilot/control/instances/pilot/companies/055c2eb5-1b6e-4255-9c29-5a562c0be9e9/agents";
 const MAX_CRDB_TEXT_BYTES: usize = 60_000;
+
+fn user_home() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned())
+}
+
+fn default_repo_root() -> PathBuf {
+    PathBuf::from(user_home()).join("WORKSPACE/chinwag")
+}
+
+fn wiki_agents_dir() -> PathBuf {
+    PathBuf::from(user_home()).join("WORKSPACE/paperclip-wiki/wiki/agents")
+}
+
+fn pilot_company_agents_dir() -> PathBuf {
+    PathBuf::from(user_home())
+        .join(".paperclip-pilot/control/instances/pilot/companies/055c2eb5-1b6e-4255-9c29-5a562c0be9e9/agents")
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct StdinDispatchPayload {
@@ -163,7 +177,7 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
         ));
     }
 
-    let wiki_dir = Path::new(WIKI_AGENTS_DIR).join(&agent_lower);
+    let wiki_dir = wiki_agents_dir().join(&agent_lower);
     for fname in ["SOUL.md", "AGENT.md", "AGENTS.md", "SKILLS.md", "MEMORY.md", "TOOLS.md"] {
         let fpath = wiki_dir.join(fname);
         if let Ok(content) = fs::read_to_string(&fpath) {
@@ -175,7 +189,7 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
     }
 
     if let Some(uid) = agent_uuid(agent_upper) {
-        let inst_dir = Path::new(PILOT_COMPANY_AGENTS_DIR)
+        let inst_dir = pilot_company_agents_dir()
             .join(uid)
             .join("instructions");
         for fname in ["SOUL.md", "AGENT.md", "AGENTS.md", "MEMORY.md"] {
@@ -235,7 +249,7 @@ fn notify_grokbot_department_relay(
     reply: &str,
 ) {
     let dept = grokbot_dept(agent_upper);
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/brianspector".to_owned());
+    let home = user_home();
     let env_path = Path::new(&home)
         .join(".paperclip-pilot/secrets/relay-webhooks")
         .join(format!("{dept}.env"));
@@ -305,11 +319,14 @@ fn dispatch_to_engine(
         return (mock, "mock-engine");
     }
 
-    let path_env = "/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-    let default_cwd = if Path::new("/Users/brianspector/WORKSPACE/chinwag").exists() {
-        "/Users/brianspector/WORKSPACE/chinwag"
+    let home = user_home();
+    let local_bin = format!("{home}/.local/bin");
+    let path_env = format!("{local_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    let repo_dir = default_repo_root();
+    let default_cwd: PathBuf = if repo_dir.exists() {
+        repo_dir.clone()
     } else {
-        "/Users/brianspector"
+        PathBuf::from(&home)
     };
 
     let engine_hint = custom
@@ -325,16 +342,17 @@ fn dispatch_to_engine(
         || engine_hint.contains("gemini-cli");
 
     // 1. Recursive Flint (Local MLX 262k on MacBook Pro 100.108.108.25:11500)
-    if is_flint && Path::new("/Users/brianspector/.local/bin/flint-agent").exists() {
-        if let Ok(out) = Command::new("/Users/brianspector/.local/bin/flint-agent")
+    let flint_bin = Path::new(&local_bin).join("flint-agent");
+    if is_flint && flint_bin.exists() {
+        if let Ok(out) = Command::new(&flint_bin)
             .args([
                 "run",
                 full_prompt,
                 "--cwd",
-                "/Users/brianspector/WORKSPACE/chinwag",
+                &repo_dir.to_string_lossy(),
             ])
-            .current_dir(default_cwd)
-            .env("PATH", path_env)
+            .current_dir(&default_cwd)
+            .env("PATH", &path_env)
             .output()
         {
             let text = strip_flint_banner(&String::from_utf8_lossy(&out.stdout));
@@ -348,8 +366,8 @@ fn dispatch_to_engine(
     if is_gemini && Path::new("/opt/homebrew/bin/gemini").exists() {
         if let Ok(out) = Command::new("/opt/homebrew/bin/node")
             .args(["/opt/homebrew/bin/gemini", "-p", full_prompt, "--yolo"])
-            .current_dir(default_cwd)
-            .env("PATH", path_env)
+            .current_dir(&default_cwd)
+            .env("PATH", &path_env)
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -360,13 +378,14 @@ fn dispatch_to_engine(
     }
 
     // 3. OpenAI Codex / ChatGPT Engine for ARCHITECT, RUST, DEV-1
+    let codex_bin = Path::new(&local_bin).join("codex");
     if (matches!(agent_upper, "ARCHITECT" | "RUST" | "DEV-1") || engine_hint.contains("codex"))
-        && Path::new("/Users/brianspector/.local/bin/codex").exists()
+        && codex_bin.exists()
     {
-        if let Ok(out) = Command::new("/Users/brianspector/.local/bin/codex")
+        if let Ok(out) = Command::new(&codex_bin)
             .args(["exec", "--skip-git-repo-check", full_prompt])
-            .current_dir(default_cwd)
-            .env("PATH", path_env)
+            .current_dir(&default_cwd)
+            .env("PATH", &path_env)
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -377,16 +396,17 @@ fn dispatch_to_engine(
     }
 
     // 4. Grok CLI Engine for DELIVERY, SPARK, GROWTH, HOUSEKEEPING, INFRA BOT (GROK)
+    let grok_bin = Path::new(&local_bin).join("grok");
     if (matches!(
         agent_upper,
         "DELIVERY" | "SPARK" | "GROWTH" | "HOUSEKEEPING" | "INFRA BOT (GROK)"
     ) || engine_hint.contains("grok"))
-        && Path::new("/Users/brianspector/.local/bin/grok").exists()
+        && grok_bin.exists()
     {
-        if let Ok(out) = Command::new("/Users/brianspector/.local/bin/grok")
+        if let Ok(out) = Command::new(&grok_bin)
             .args(["agent", "--always-approve", full_prompt])
-            .current_dir(default_cwd)
-            .env("PATH", path_env)
+            .current_dir(&default_cwd)
+            .env("PATH", &path_env)
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -397,15 +417,16 @@ fn dispatch_to_engine(
     }
 
     // 5. Claude Code Engine (Primary for MO, TYPE, VENTURE, EAGLE-EYE, DECLARATION, ALISTAIR, SCRIBE & Fallback)
-    let claude_bin = if Path::new("/Users/brianspector/.local/bin/claude").exists() {
-        "/Users/brianspector/.local/bin/claude"
+    let local_claude = Path::new(&local_bin).join("claude");
+    let claude_bin: PathBuf = if local_claude.exists() {
+        local_claude
     } else {
-        "/opt/homebrew/bin/claude"
+        PathBuf::from("/opt/homebrew/bin/claude")
     };
-    if let Ok(out) = Command::new(claude_bin)
+    if let Ok(out) = Command::new(&claude_bin)
         .args(["--print", "--dangerously-skip-permissions", full_prompt])
-        .current_dir(default_cwd)
-        .env("PATH", path_env)
+        .current_dir(&default_cwd)
+        .env("PATH", &path_env)
         .output()
     {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -431,7 +452,7 @@ fn dispatch_to_engine(
 
 fn resolve_repo_root(crdb_path: Option<&Path>) -> PathBuf {
     let Some(path) = crdb_path else {
-        return PathBuf::from(DEFAULT_REPO_ROOT);
+        return default_repo_root();
     };
     if path.file_name().is_some_and(|n| n == "state.crdb")
         && let Some(chinwag_dir) = path.parent()

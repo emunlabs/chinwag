@@ -28,9 +28,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_REPO_ROOT: &str = "/Users/brianspector/WORKSPACE/chinwag";
-const DEFAULT_PLANNER_DB: &str = "/Users/brianspector/WORKSPACE/delivery-planner/data/planner.sqlite";
-const DEFAULT_LEANN_PATH: &str = "/Users/brianspector/WORKSPACE/chinwag/.chinwag/memory.crdb.leann";
+fn user_home() -> String { std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned()) }
+fn default_repo_root() -> String { format!("{}/WORKSPACE/chinwag", user_home()) }
+fn default_planner_db() -> String { format!("{}/WORKSPACE/delivery-planner/data/planner.sqlite", user_home()) }
+fn default_leann_path() -> String { format!("{}/WORKSPACE/chinwag/.chinwag/memory.crdb.leann", user_home()) }
 const DEFAULT_COMMIT_SHA: &str = "b1745094d9cb9014361fca30c7de3535c140dd20";
 const MAX_CRDB_TEXT_BYTES: usize = 60_000;
 
@@ -65,7 +66,7 @@ fn short_hash(parts: &[&str], ts_ms: i64) -> String {
 
 fn resolve_repo_root(crdb_path: Option<&Path>) -> PathBuf {
     let Some(path) = crdb_path else {
-        return PathBuf::from(DEFAULT_REPO_ROOT);
+        return PathBuf::from(default_repo_root());
     };
     if path.file_name().is_some_and(|n| n == "state.crdb")
         && let Some(chinwag_dir) = path.parent()
@@ -780,7 +781,7 @@ pub fn recall_for_agent_prompt(agent_lower: &str, query: &str, repo_root: &Path)
         .unwrap_or_default();
     let payload = json!({
         "op": "recall",
-        "db_path": DEFAULT_PLANNER_DB,
+        "db_path": &default_planner_db(),
         "query": format!("{agent_lower} {}", truncate_utf8(query, 400)),
         "limit": 8,
         "crdb_tombstones": crdb_tombstones
@@ -835,7 +836,7 @@ pub fn retain_from_agent_dispatch(
     );
     let payload = json!({
         "op": "retain",
-        "db_path": DEFAULT_PLANNER_DB,
+        "db_path": &default_planner_db(),
         "memory": {
             "id": mid,
             "bank": "spector-fleet",
@@ -903,7 +904,7 @@ pub fn run_memory(
 
             let payload = json!({
                 "op": "retain",
-                "db_path": DEFAULT_PLANNER_DB,
+                "db_path": &default_planner_db(),
                 "memory": {
                     "id": mem_id,
                     "bank": bank,
@@ -988,7 +989,7 @@ pub fn run_memory(
 
             let payload = json!({
                 "op": "tombstone",
-                "db_path": DEFAULT_PLANNER_DB,
+                "db_path": &default_planner_db(),
                 "tombstone": {
                     "id": id,
                     "source_commit": source_commit,
@@ -1040,7 +1041,7 @@ pub fn run_memory(
                 read_crdb_snapshot(&repo_root).unwrap_or_default();
             let payload = json!({
                 "op": "recall",
-                "db_path": DEFAULT_PLANNER_DB,
+                "db_path": &default_planner_db(),
                 "query": query,
                 "limit": limit,
                 "bank": bank,
@@ -1087,9 +1088,9 @@ pub fn run_memory(
             let (_, _, crdb_stats) = read_crdb_snapshot(&repo_root).unwrap_or_default();
             let payload = json!({
                 "op": "stats",
-                "db_path": DEFAULT_PLANNER_DB,
+                "db_path": &default_planner_db(),
                 "bank": bank,
-                "leann_path": DEFAULT_LEANN_PATH
+                "leann_path": &default_leann_path()
             });
             let sqlite_res = match run_python_sqlite(PY_SCHEMA_AND_OPS, &payload) {
                 Ok(v) => v,
@@ -1114,11 +1115,11 @@ pub fn run_memory(
             let hs_url = url.unwrap_or_else(|| "http://127.0.0.1:8888".to_owned());
             let payload = json!({
                 "op": "migrate_hindsight",
-                "db_path": DEFAULT_PLANNER_DB,
+                "db_path": &default_planner_db(),
                 "url": hs_url,
                 "bank": bank,
                 "source_commit": DEFAULT_COMMIT_SHA,
-                "leann_path": DEFAULT_LEANN_PATH
+                "leann_path": &default_leann_path()
             });
             let sqlite_res = match run_python_sqlite(PY_SCHEMA_AND_OPS, &payload) {
                 Ok(v) => v,
@@ -1149,7 +1150,7 @@ pub fn run_memory(
                     "wiki/**",
                     "Writing documentation to legacy Wiki.js (:4320) GraphQL API",
                     "Retired Wiki.js (:4320) container in favor of commit-anchored Docus (:8795) and Mission Control (:5487)",
-                    "Write commit-anchored Markdown directly to /Users/brianspector/WORKSPACE/paperclip-wiki/wiki/ with source_commit frontmatter",
+                    "Write commit-anchored Markdown directly to ~/WORKSPACE/paperclip-wiki/wiki/ with source_commit frontmatter",
                 ),
             ];
             let mut last_crdb_version = 0;
@@ -1169,7 +1170,7 @@ pub fn run_memory(
                 }
                 let t_payload = json!({
                     "op": "tombstone",
-                    "db_path": DEFAULT_PLANNER_DB,
+                    "db_path": &default_planner_db(),
                     "tombstone": {
                         "id": tid,
                         "source_commit": DEFAULT_COMMIT_SHA,
@@ -1216,7 +1217,7 @@ pub fn run_memory(
                 "canonical_tombstones_seeded": 3,
                 "crdb_migration_pin": "chinwag-hindsight-migration-v1",
                 "crdb_db_version": last_crdb_version,
-                "leann_path": DEFAULT_LEANN_PATH
+                "leann_path": &default_leann_path()
             });
             let _ = serde_json::to_writer(&mut *out, &output);
             let _ = out.write_all(b"\n");
