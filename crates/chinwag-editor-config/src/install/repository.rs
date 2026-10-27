@@ -108,6 +108,7 @@ fn layout(editor: Editor) -> (Option<&'static str>, &'static str, &'static str) 
         Editor::ClaudeCode => (None, ".mcp.json", "editor-claude-code.pending"),
         Editor::Cursor => (Some(".cursor"), "mcp.json", "editor-cursor.pending"),
         Editor::Codex => (Some(".codex"), "config.toml", "editor-codex.pending"),
+        Editor::Gemini => (Some(".gemini"), "settings.json", "editor-gemini.pending"),
     }
 }
 struct OriginalGuard {

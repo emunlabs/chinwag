@@ -17,7 +17,7 @@ impl Fixture {
         let repo = PathBuf::from(root).join(label);
         fs::create_dir(&repo).unwrap();
         fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
-        for name in [".cursor", ".codex"] {
+        for name in [".cursor", ".codex", ".gemini"] {
             fs::create_dir(repo.join(name)).unwrap();
             fs::set_permissions(repo.join(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -72,10 +72,15 @@ fn private_file(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
-fn three_editor_installs_read_back_and_retained_intent_prevents_replay() {
-    for (i, editor) in [Editor::ClaudeCode, Editor::Cursor, Editor::Codex]
-        .into_iter()
-        .enumerate()
+fn four_editor_installs_read_back_and_retained_intent_prevents_replay() {
+    for (i, editor) in [
+        Editor::ClaudeCode,
+        Editor::Cursor,
+        Editor::Codex,
+        Editor::Gemini,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let fixture = Fixture::new(&format!("three-editors-{i}"), editor);
         let original: &[u8] = if matches!(editor, Editor::Codex) {
@@ -325,4 +330,58 @@ fn before_and_after_rename_faults_keep_distinct_outcomes_and_intent() {
         assert!(f.parent().join(INTENT).exists());
         assert!(f.target().inspect().is_err());
     }
+}
+
+#[test]
+fn gemini_symlinked_parent_refuses_without_touching_settings() {
+    let fixture = Fixture::new("gemini-symlinked-parent", Editor::Gemini);
+    fixture.seed(b"{\"general\":{\"preferredEditor\":\"vscode\"}}");
+    let retained = fixture.repo.join("retained-gemini");
+    fs::rename(fixture.repo.join(".gemini"), &retained).unwrap();
+    symlink("retained-gemini", fixture.repo.join(".gemini")).unwrap();
+    let before = fs::read(retained.join("settings.json")).unwrap();
+    assert!(FixtureTarget::open(&fixture.repo, Editor::Gemini).is_err());
+    assert_eq!(fs::read(retained.join("settings.json")).unwrap(), before);
+    assert!(!retained.join(LOCK).exists() && !retained.join(INTENT).exists());
+}
+
+#[test]
+fn gemini_stale_preimage_and_custom_entry_preserve_originals() {
+    let stale = Fixture::new("gemini-stale-preimage", Editor::Gemini);
+    stale.seed(b"{}");
+    let target = stale.target();
+    let observation = target.inspect().unwrap();
+    let newer = b"{\"general\":{\"preferredEditor\":\"vscode\"}}";
+    fs::write(stale.path(), newer).unwrap();
+    assert!(
+        target
+            .prepare(
+                observation,
+                Launch {
+                    command: "/fixture/chinwag",
+                    args: &[]
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(fs::read(stale.path()).unwrap(), newer);
+    assert!(!stale.parent().join(LOCK).exists() && !stale.parent().join(INTENT).exists());
+    let custom = Fixture::new("gemini-custom-entry", Editor::Gemini);
+    let original = b"{\"mcpServers\":{\"chinwag\":{\"command\":\"/custom\",\"args\":[]}}}";
+    custom.seed(original);
+    let target = custom.target();
+    let observation = target.inspect().unwrap();
+    assert!(
+        target
+            .prepare(
+                observation,
+                Launch {
+                    command: "/fixture/chinwag",
+                    args: &[]
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(fs::read(custom.path()).unwrap(), original);
+    assert!(!custom.parent().join(LOCK).exists() && !custom.parent().join(INTENT).exists());
 }

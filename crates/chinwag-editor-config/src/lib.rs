@@ -13,6 +13,7 @@ pub enum Editor {
     ClaudeCode,
     Cursor,
     Codex,
+    Gemini,
 }
 impl Editor {
     pub fn relative_path(self) -> &'static str {
@@ -20,6 +21,7 @@ impl Editor {
             Self::ClaudeCode => ".mcp.json",
             Self::Cursor => ".cursor/mcp.json",
             Self::Codex => ".codex/config.toml",
+            Self::Gemini => ".gemini/settings.json",
         }
     }
 }

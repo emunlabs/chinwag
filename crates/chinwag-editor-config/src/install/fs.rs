@@ -199,7 +199,7 @@ impl Anchor {
         name: &'static str,
         guard: &mut super::repository::OuterGuard,
     ) -> Result<Self> {
-        if self.policy != Policy::Repository || !matches!(name, ".cursor" | ".codex") {
+        if self.policy != Policy::Repository || !matches!(name, ".cursor" | ".codex" | ".gemini") {
             return Err("invalid_repository_child");
         }
         self.check()?;

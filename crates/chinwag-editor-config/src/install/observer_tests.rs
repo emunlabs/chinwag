@@ -22,7 +22,7 @@ impl Fixture {
         let repo = PathBuf::from(root).join(format!("observer-{label}"));
         fs::create_dir(&repo).unwrap();
         fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
-        for name in [".cursor", ".codex"] {
+        for name in [".cursor", ".codex", ".gemini"] {
             fs::create_dir(repo.join(name)).unwrap();
             fs::set_permissions(repo.join(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -162,10 +162,15 @@ fn expect_ambiguous(fixture: &Fixture) {
 }
 
 #[test]
-fn three_fixed_editors_all_consistent_states_are_readonly_and_guards_remain() {
-    for (index, editor) in [Editor::ClaudeCode, Editor::Cursor, Editor::Codex]
-        .into_iter()
-        .enumerate()
+fn four_fixed_editors_all_consistent_states_are_readonly_and_guards_remain() {
+    for (index, editor) in [
+        Editor::ClaudeCode,
+        Editor::Cursor,
+        Editor::Codex,
+        Editor::Gemini,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let original = Fixture::new(&format!("states-{index}"), editor);
         let target = original.target();

@@ -36,11 +36,12 @@ fn proposed(editor: Editor, input: Option<&[u8]>, args: &[String]) -> Vec<u8> {
 }
 
 #[test]
-fn three_current_project_formats_and_idempotency() {
+fn four_current_project_formats_and_idempotency() {
     let args = vec!["serve-private-fixture".into(), "literal fixture 🌱".into()];
     for (editor, path) in [
         (Editor::ClaudeCode, ".mcp.json"),
         (Editor::Cursor, ".cursor/mcp.json"),
+        (Editor::Gemini, ".gemini/settings.json"),
     ] {
         assert_eq!(editor.relative_path(), path);
         let bytes = proposed(editor, None, &args);
@@ -246,5 +247,48 @@ fn launch_is_literal_bounded_and_never_expands_environment() {
             ),
             Err(Refusal::InvalidLaunch)
         );
+    }
+}
+
+#[test]
+fn gemini_settings_preserve_unrelated_settings_and_do_not_add_trust() {
+    let original = br#" {
+  "security": {"folderTrust": {"enabled": true}},
+  "general": {"preferredEditor": "vscode"},
+  "mcpServers": {"other": {"command": "kept", "args": []} }
+}
+"#;
+    let args = vec![
+        "mcp-serve".to_owned(),
+        "--repo".to_owned(),
+        "/owned/repo".to_owned(),
+    ];
+    let actual = proposed(Editor::Gemini, Some(original), &args);
+    let original = std::str::from_utf8(original).unwrap();
+    let at = original.find("} }\n").unwrap() + 2;
+    let text = std::str::from_utf8(&actual).unwrap();
+    assert!(text.starts_with(&original[..at]) && text.ends_with(&original[at..]));
+    let actual: serde_json::Value = serde_json::from_slice(&actual).unwrap();
+    assert_eq!(actual["security"]["folderTrust"]["enabled"], true);
+    assert_eq!(actual["general"]["preferredEditor"], "vscode");
+    assert_eq!(actual["mcpServers"]["other"]["command"], "kept");
+    assert_eq!(
+        actual["mcpServers"]["chinwag"],
+        serde_json::json!({"type":"stdio", "command":COMMAND, "args":args})
+    );
+}
+
+#[test]
+fn gemini_conflicting_and_malformed_settings_are_refused() {
+    for original in [
+        br#"{"mcpServers":{"chinwag":{"command":"/custom","args":[]}}}"#.as_slice(),
+        br#"{"mcpServers":{"chinwag":{"type":"stdio","command":"/private fixture/bin/chinwag","args":[],"trust":true}}}"#.as_slice(),
+        br#"{"mcpServers":null}"#.as_slice(),
+        br#"{"mcpServers":{},"mcpServers":{}}"#.as_slice(),
+        b"[ ]".as_slice(),
+    ] {
+        let before = original.to_vec();
+        assert!(plan(Editor::Gemini, Some(original), Launch { command: COMMAND, args: &[] }).is_err());
+        assert_eq!(original, before);
     }
 }

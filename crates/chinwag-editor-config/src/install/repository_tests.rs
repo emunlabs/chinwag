@@ -279,3 +279,31 @@ fn normal_opaque_request_rejects_expansion_parent_and_relative_paths() {
     }
     assert!(RepositoryRequest::new(Path::new("/owned/valid"), Editor::Cursor).is_ok());
 }
+
+#[test]
+fn normal_gemini_parent_creation_and_unchanged_call_keep_original_inode() {
+    let path = repo("unit-gemini-unchanged");
+    assert!(!path.join(".gemini").exists());
+    let one = configure(RepositoryRequest::new(&path, Editor::Gemini).unwrap()).unwrap();
+    assert_eq!(one.value()["result"], "installed");
+    assert_eq!(one.value()["target"], ".gemini/settings.json");
+    let settings = path.join(".gemini/settings.json");
+    let before = std::fs::metadata(&settings).unwrap();
+    let bytes = std::fs::read(&settings).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(path.join(".gemini")).unwrap().mode() & 0o7777,
+        0o700
+    );
+    assert_eq!(before.mode() & 0o7777, 0o600);
+    let two = configure(RepositoryRequest::new(&path, Editor::Gemini).unwrap()).unwrap();
+    assert_eq!(two.value()["result"], "unchanged");
+    let after = std::fs::metadata(&settings).unwrap();
+    assert_eq!(
+        (before.dev(), before.ino(), before.mode()),
+        (after.dev(), after.ino(), after.mode())
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), bytes);
+    assert!(!path.join(".chinwag/editor-gemini.pending").exists());
+    assert!(!path.join(".chinwag/state.crdb.lock").exists());
+}

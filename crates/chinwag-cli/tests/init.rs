@@ -196,7 +196,7 @@ fn unsupported_default_reuse_refuses_before_working_directory_resolution() {
 #[test]
 fn init_editor_selection_is_exact_and_parse_only_for_all_aliases() {
     for alias in ALIASES {
-        for editor in ["claude-code", "cursor", "codex"] {
+        for editor in ["claude-code", "cursor", "codex", "gemini"] {
             assert!(matches!(
                 dispatch(
                     OsStr::new(alias),

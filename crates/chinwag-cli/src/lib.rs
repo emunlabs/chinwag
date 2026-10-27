@@ -33,19 +33,19 @@ impl Invocation {
     fn help(self) -> &'static str {
         match self {
             Self::Chinwag => {
-                "Usage: chinwag [--help | --version]\n       chinwag init --help\n       chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]\n       chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
+                "Usage: chinwag [--help | --version]\n       chinwag init --help\n       chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]\n       chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
             }
             Self::GitChinwag => {
-                "Usage: git chinwag [--help | --version]\n       git chinwag init --help\n       git chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]\n       git chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
+                "Usage: git chinwag [--help | --version]\n       git chinwag init --help\n       git chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]\n       git chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
             }
             Self::GitEmun => {
-                "Usage: git emun [--help | --version]\n       git emun init --help\n       git emun mcp-serve --repo <absolute-path> [--transport stdio|http]\n       git emun configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
+                "Usage: git emun [--help | --version]\n       git emun init --help\n       git emun mcp-serve --repo <absolute-path> [--transport stdio|http]\n       git emun configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
             }
             Self::GhChinwag => {
-                "Usage: gh chinwag [--help | --version]\n       gh chinwag init --help\n       gh chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]\n       gh chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
+                "Usage: gh chinwag [--help | --version]\n       gh chinwag init --help\n       gh chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]\n       gh chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
             }
             Self::GhEmun => {
-                "Usage: gh emun [--help | --version]\n       gh emun init --help\n       gh emun mcp-serve --repo <absolute-path> [--transport stdio|http]\n       gh emun configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
+                "Usage: gh emun [--help | --version]\n       gh emun init --help\n       gh emun mcp-serve --repo <absolute-path> [--transport stdio|http]\n       gh emun configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
             }
         }
     }
@@ -149,6 +149,7 @@ pub(crate) enum EditorSelection {
     ClaudeCode,
     Cursor,
     Codex,
+    Gemini,
 }
 #[cfg(target_os = "macos")]
 impl EditorSelection {
@@ -157,6 +158,7 @@ impl EditorSelection {
             Self::ClaudeCode => chinwag_editor_config_private::Editor::ClaudeCode,
             Self::Cursor => chinwag_editor_config_private::Editor::Cursor,
             Self::Codex => chinwag_editor_config_private::Editor::Codex,
+            Self::Gemini => chinwag_editor_config_private::Editor::Gemini,
         }
     }
 }
@@ -165,6 +167,7 @@ fn editor_selection(value: &str) -> Option<EditorSelection> {
         "claude-code" => Some(EditorSelection::ClaudeCode),
         "cursor" => Some(EditorSelection::Cursor),
         "codex" => Some(EditorSelection::Codex),
+        "gemini" => Some(EditorSelection::Gemini),
         _ => None,
     }
 }
@@ -177,19 +180,19 @@ impl Invocation {
     fn configure_help(self) -> &'static str {
         match self {
             Self::GitChinwag => {
-                "Usage: git chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nConfigure one editor for this initialized repository.\n"
+                "Usage: git chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nConfigure one editor for this initialized repository.\n"
             }
             Self::GitEmun => {
-                "Usage: git emun configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nConfigure one editor for this initialized repository.\n"
+                "Usage: git emun configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nConfigure one editor for this initialized repository.\n"
             }
             Self::GhChinwag => {
-                "Usage: gh chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nConfigure one editor for this initialized repository.\n"
+                "Usage: gh chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nConfigure one editor for this initialized repository.\n"
             }
             Self::GhEmun => {
-                "Usage: gh emun configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nConfigure one editor for this initialized repository.\n"
+                "Usage: gh emun configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nConfigure one editor for this initialized repository.\n"
             }
             Self::Chinwag => {
-                "Usage: chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nConfigure one editor for this initialized repository.\n"
+                "Usage: chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nConfigure one editor for this initialized repository.\n"
             }
         }
     }
@@ -221,19 +224,19 @@ impl Invocation {
     fn init_help(self) -> &'static str {
         match self {
             Self::Chinwag => {
-                "Usage: chinwag init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
+                "Usage: chinwag init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex|gemini>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
             }
             Self::GitChinwag => {
-                "Usage: git chinwag init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
+                "Usage: git chinwag init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex|gemini>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
             }
             Self::GitEmun => {
-                "Usage: git emun init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
+                "Usage: git emun init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex|gemini>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
             }
             Self::GhChinwag => {
-                "Usage: gh chinwag init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
+                "Usage: gh chinwag init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex|gemini>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
             }
             Self::GhEmun => {
-                "Usage: gh emun init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
+                "Usage: gh emun init [--principal <email>] [--repo <absolute-path>] [--private-dir <absolute-path>] [--editor <claude-code|cursor|codex|gemini>]\n\nInitialize local Git SSH signing and an offline store in <repo>/.chinwag.\nRun from the repository root or pass --repo. Without --principal, use exactly one\nrepo-local user.email. Global and included identity profiles are unavailable.\n--private-dir defaults to\n<repo>/.chinwag and must name that directory. --editor configures one editor after local\ninitialization, with the original live identity retained. Existing identities cannot be reused\n(--reuse-public is unavailable). Hosted registration is not available.\n"
             }
         }
     }

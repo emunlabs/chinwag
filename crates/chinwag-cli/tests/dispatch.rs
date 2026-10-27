@@ -106,7 +106,7 @@ fn all_five_names_use_one_binary_and_their_own_usage() {
             assert_eq!(
                 output.stdout,
                 format!(
-                    "Usage: {display} [--help | --version]\n       {display} init --help\n       {display} mcp-serve --repo <absolute-path> [--transport stdio|http]\n       {display} configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
+                    "Usage: {display} [--help | --version]\n       {display} init --help\n       {display} mcp-serve --repo <absolute-path> [--transport stdio|http]\n       {display} configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>\n\nLocal Git SSH signing and an offline store for a new repository.\n"
                 )
                 .as_bytes()
             );

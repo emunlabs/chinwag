@@ -111,6 +111,7 @@ impl FixtureTarget {
             Editor::ClaudeCode => (None, ".mcp.json"),
             Editor::Cursor => (Some(".cursor"), "mcp.json"),
             Editor::Codex => (Some(".codex"), "config.toml"),
+            Editor::Gemini => (Some(".gemini"), "settings.json"),
         };
         Ok(Self {
             inner: Target {

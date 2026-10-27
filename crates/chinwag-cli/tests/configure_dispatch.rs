@@ -9,7 +9,7 @@ fn all_aliases_parse_only_the_explicit_editor_request() {
         "gh-chinwag",
         "gh-emun",
     ] {
-        for editor in ["claude-code", "cursor", "codex"] {
+        for editor in ["claude-code", "cursor", "codex", "gemini"] {
             assert!(matches!(
                 dispatch(
                     OsStr::new(alias),

@@ -25,7 +25,7 @@ impl Fixture {
         let repo = PathBuf::from(root).join(format!("completion-{label}"));
         fs::create_dir(&repo).unwrap();
         fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
-        for name in [".cursor", ".codex"] {
+        for name in [".cursor", ".codex", ".gemini"] {
             fs::create_dir(repo.join(name)).unwrap();
             fs::set_permissions(repo.join(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -147,10 +147,15 @@ fn refused_without_write(fixture: &Fixture, completed: Box<Completed>) {
 }
 
 #[test]
-fn all_three_editor_original_success_tokens_write_literal_bounded_records() {
-    for (i, editor) in [Editor::ClaudeCode, Editor::Cursor, Editor::Codex]
-        .into_iter()
-        .enumerate()
+fn all_four_editor_original_success_tokens_write_literal_bounded_records() {
+    for (i, editor) in [
+        Editor::ClaudeCode,
+        Editor::Cursor,
+        Editor::Codex,
+        Editor::Gemini,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let fixture = Fixture::new(&format!("recorded-{i}"), editor);
         let completed = fixture.complete();
