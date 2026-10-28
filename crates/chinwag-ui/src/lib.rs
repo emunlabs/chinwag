@@ -10,9 +10,12 @@
 //! `docs/chwg-dioxus-1/DESIGN.md`.
 #![forbid(unsafe_code)]
 
+pub mod api;
 mod app;
 pub mod contracts;
 mod health;
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+pub mod planner;
 mod theme;
 pub mod view_model;
 

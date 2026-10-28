@@ -910,10 +910,13 @@ dependencies = [
 name = "chinwag-ui"
 version = "0.0.1"
 dependencies = [
+ "axum",
  "dioxus",
  "dioxus-ssr",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1648,8 +1651,10 @@ dependencies = [
  "dioxus-core",
  "dioxus-core-macro",
  "dioxus-desktop",
+ "dioxus-document",
  "dioxus-fullstack",
  "dioxus-fullstack-macro",
+ "dioxus-history",
  "dioxus-hooks",
  "dioxus-html",
  "dioxus-liveview",
