@@ -1,0 +1,35 @@
+# Copyright 2026 Emun Labs, Inc.
+# 1401 Lavaca St STE 81335, Austin, TX 78701
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "chinwag-ui"
+description = "Chinwag Mission Control in pure Rust Dioxus (CHWG-DIOXUS-1). Zero Node.js."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "chinwag_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chinwag-ui"
+path = "src/main.rs"
+
+[features]
+# `server` is the default so `cargo build --workspace` stays native-only and light.
+default = ["server"]
+server = ["dioxus/server"]
+web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
+
+[dependencies]
+dioxus = { version = "=0.7.10", default-features = false, features = ["fullstack", "router", "macro", "html", "signals", "hooks", "launch"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+
+[dev-dependencies]
+dioxus-ssr = "=0.7.10"

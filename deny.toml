@@ -1,0 +1,31 @@
+# Copyright 2026 Emun Labs, Inc.
+# 1401 Lavaca St STE 81335, Austin, TX 78701
+# SPDX-License-Identifier: Apache-2.0
+#
+# License gate for crates/chinwag-ui (CHWG-DIOXUS-1). Mirrors CONTRIBUTING.md section 3 (INV-LIC-01).
+# Run: cargo deny --manifest-path crates/chinwag-ui/Cargo.toml --all-features check licenses
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "wasm32-unknown-unknown",
+]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+]
+# Explicitly forbidden by policy: GPL-*, AGPL-*, LGPL-*, SSPL, BUSL, Commons Clause, Fair-Source.
+# Anything not in `allow` is rejected.
+#
+# Known findings (CHWG-DIOXUS-1, 2026-10-28), deliberately NOT allowed pending a decision:
+#   xxhash-rust 0.8.19 (BSL-1.0), webpki-roots 1.0.11 (CDLA-Permissive-2.0), option-ext 0.2.0 (MPL-2.0, desktop only).
