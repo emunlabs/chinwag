@@ -1,0 +1,21 @@
+# DRAFT ONLY — not installed, not scheduled, not executed.
+# Current Dagu YAML reference: https://docs.dagu.sh/writing-workflows/yaml-specification
+# Replace every /REVIEW/ path, both endpoint pins, and the selected local IPv4.
+# Run on a macOS peer with an admitted identity and an already reviewed request
+# JSON file. Start the Studio listener separately; both must rendezvous in-room.
+# Do not add retries: a lost reply can still mean the agent already ran.
+name: iroh-agent-dispatch-draft
+description: "DRAFT: one pinned, room-verified signed dispatch to the Studio"
+steps:
+  - name: dispatch-on-studio
+    run: >-
+      /REVIEW/bin/chinwag agent-dispatch-remote
+      --stdin
+      --key /REVIEW/client-signing-key
+      --peer REPLACE_WITH_64_LOWERCASE_HEX_STUDIO_PIN
+      --coordinator REPLACE_WITH_64_LOWERCASE_HEX_COORDINATOR_PIN
+      --room https://bootstrap.chinwag.sh
+      --local-ipv4 192.0.2.10
+      --repo /REVIEW/client-repository
+    stdin: /REVIEW/request.json
+    timeout_sec: 660
