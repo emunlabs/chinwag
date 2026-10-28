@@ -11,8 +11,10 @@
 #![forbid(unsafe_code)]
 
 mod app;
+pub mod contracts;
 mod health;
 mod theme;
+pub mod view_model;
 
 pub use app::{App, Route};
 pub use health::{Health, health};
