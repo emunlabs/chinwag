@@ -23,9 +23,15 @@ allow = [
   "Unicode-3.0",
   "Zlib",
   "CC0-1.0",
+  "BSL-1.0",              # Brian approved 2026-10-28 3:24 PM CT (EAGLE-EYE review)
+  "CDLA-Permissive-2.0",  # Brian approved 2026-10-28; keep license text in third-party notices
+]
+# One-off MPL-2.0 exception, approved by Brian 2026-10-28 3:24 PM CT. option-ext must stay
+# unmodified and be listed, with a source link, in the desktop app's third-party notices.
+exceptions = [
+  { name = "option-ext", allow = ["MPL-2.0"] },
 ]
 # Explicitly forbidden by policy: GPL-*, AGPL-*, LGPL-*, SSPL, BUSL, Commons Clause, Fair-Source.
 # Anything not in `allow` is rejected.
 #
-# Known findings (CHWG-DIOXUS-1, 2026-10-28), deliberately NOT allowed pending a decision:
-#   xxhash-rust 0.8.19 (BSL-1.0), webpki-roots 1.0.11 (CDLA-Permissive-2.0), option-ext 0.2.0 (MPL-2.0, desktop only).
+# Resolved 2026-10-28: xxhash-rust (BSL-1.0), webpki-roots (CDLA-Permissive-2.0), option-ext (MPL-2.0 exception).
