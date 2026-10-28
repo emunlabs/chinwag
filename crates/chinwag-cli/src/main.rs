@@ -18,6 +18,18 @@ fn main() -> ExitCode {
         == Some("chinwag");
     if let (true, Some(raw_args)) = (is_chinwag_prog, all_utf8) {
         if raw_args.get(1).map(|s| s.as_str()) == Some("onboard") {
+            let identity = relay_run::resolve_identity_config();
+            let mut mission_control_url = identity.mission_control_url.clone();
+            let mut idx = 2;
+            while idx < raw_args.len() {
+                if (raw_args[idx] == "--url" || raw_args[idx] == "-u") && idx + 1 < raw_args.len() {
+                    mission_control_url = raw_args[idx + 1].trim_end_matches('/').to_string();
+                    idx += 2;
+                } else {
+                    idx += 1;
+                }
+            }
+            let wizard_url = format!("{}/?onboard=1", mission_control_url.trim_end_matches('/'));
             let is_json = raw_args.iter().any(|a| a == "--json");
             let has_tart = std::path::Path::new("/opt/homebrew/bin/tart").exists()
                 || std::path::Path::new("/usr/local/bin/tart").exists();
@@ -33,6 +45,10 @@ fn main() -> ExitCode {
                 let payload = serde_json::json!({
                     "ok": true,
                     "command": "chinwag onboard",
+                    "actor": identity.handle,
+                    "actor_id": identity.actor_id,
+                    "machine_name": identity.machine_name,
+                    "mission_control_url": mission_control_url,
                     "invariants": ["INV-ONBOARD-01", "INV-ROUTE-01", "INV-MERGE-01"],
                     "frontier_catalog": {
                         "source": "https://models.dev/api.json",
@@ -49,7 +65,7 @@ fn main() -> ExitCode {
                         "dagu_installed": has_dagu,
                         "cleanroom_vm_slots_fleet_target": 4
                     },
-                    "wizard_url": "http://127.0.0.1:5487/?onboard=1"
+                    "wizard_url": wizard_url
                 });
                 let _ = writeln!(std::io::stdout().lock(), "{payload}");
                 return ExitCode::SUCCESS;
@@ -64,9 +80,17 @@ fn main() -> ExitCode {
                  5. Local Apple Silicon Models: ■ FLINT (:11500 via iroh QUIC) + LEANN CSR ($0.00/tok Rung 0)\n\
                  6. FinOps Smart Router: L1–L5 Cost × Capability Arbitrage (~$2.80/commit · 78% saved vs unrouted API)\n\
                  7. Worker Swarm Provisioning: 30 Enrolled Org Agents active\n\
-                 → Launch Full-Screen First-Run Wizard: http://127.0.0.1:5487/?onboard=1"
+                 → Launch Full-Screen First-Run Wizard: {wizard_url}"
             );
             return ExitCode::SUCCESS;
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("beam") {
+            let code = relay_run::run_beam_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("relay") {
             let code = relay_run::run_relay_cli(
