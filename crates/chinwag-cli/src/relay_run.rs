@@ -273,7 +273,7 @@ pub fn resolve_identity_config() -> IdentityConfig {
     mission_control_url = mission_control_url.trim_end_matches('/').to_string();
 
     if fallback_hub_url.is_empty() {
-        fallback_hub_url = "http://100.66.156.76:5487".to_string();
+        fallback_hub_url = "http://192.168.1.166:5487".to_string();
     } else {
         fallback_hub_url = fallback_hub_url.trim_end_matches('/').to_string();
     }
@@ -319,6 +319,8 @@ fn curl_post_json_endpoint(
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
         "-sS",
+        "--connect-timeout",
+        "2",
         "-m",
         "6",
         "-o",
@@ -339,10 +341,8 @@ fn curl_post_json_endpoint(
     if !identity.api_key.is_empty() {
         cmd.args(["-H", &format!("Authorization: Bearer {}", identity.api_key)]);
     }
-    if !identity.handle.is_empty() {
-        cmd.args(["-H", &format!("X-Chinwag-Actor: {}", identity.handle)]);
-    }
     if !identity.actor_id.is_empty() {
+        cmd.args(["-H", &format!("X-Chinwag-Actor: {}", identity.actor_id)]);
         cmd.args(["-H", &format!("X-Chinwag-Actor-Id: {}", identity.actor_id)]);
     }
     if !identity.machine_name.is_empty() {
@@ -373,28 +373,25 @@ fn post_mission_control_with_fallback(
         return (true, code, primary_endpoint);
     }
 
-    if primary_endpoint.contains("brians-mac-studio-468.tail23ad5.ts.net:5487") {
-        let (ok_res, code_res) =
-            curl_post_json_endpoint(&primary_endpoint, payload_str, identity, true);
-        if ok_res {
-            return (true, code_res, primary_endpoint);
+    let mut fallbacks: Vec<(String, bool)> = Vec::new();
+    let fb_base = identity.fallback_hub_url.trim_end_matches('/');
+    if !fb_base.is_empty() {
+        let fb_ep = format!("{fb_base}{path}");
+        if fb_ep != primary_endpoint {
+            fallbacks.push((fb_ep, false));
         }
     }
-
-    let mut fallbacks: Vec<(String, bool)> = Vec::new();
-    let raw_ts_endpoint = format!(
-        "{}{}",
-        identity.fallback_hub_url.trim_end_matches('/'),
-        path
-    );
-    if raw_ts_endpoint != primary_endpoint {
-        fallbacks.push((raw_ts_endpoint, false));
-    }
-    let ts_https_endpoint = format!("https://brians-mac-studio-468.tail23ad5.ts.net:5487{path}");
-    fallbacks.push((ts_https_endpoint, true));
-    let local_endpoint = format!("http://127.0.0.1:5487{path}");
-    if local_endpoint != primary_endpoint {
-        fallbacks.push((local_endpoint, false));
+    for lan_base in [
+        "http://192.168.1.166:5487",
+        "http://192.168.1.161:5487",
+        "https://brians-mac-studio-468.tail23ad5.ts.net:5487",
+        "http://127.0.0.1:5487",
+    ] {
+        let ep = format!("{lan_base}{path}");
+        let use_resolve = lan_base.starts_with("https://");
+        if ep != primary_endpoint || use_resolve {
+            fallbacks.push((ep, use_resolve));
+        }
     }
 
     let mut last_code = code;
@@ -562,6 +559,7 @@ fn beam_curl_exchange(
     path_and_query: &str,
     req_content_type: Option<&str>,
     req_accept: Option<&str>,
+    req_actor_override: Option<&str>,
     req_body: &[u8],
     identity: &IdentityConfig,
     use_tailnet_resolve: bool,
@@ -573,15 +571,20 @@ fn beam_curl_exchange(
         "--http1.1",
         "-sS",
         "-i",
+        "--connect-timeout",
+        "1.5",
         "-m",
-        "12",
-        "-X",
-        method,
+        "10",
         "-H",
         "Expect:",
         "-H",
         "X-Chinwag-Beam: iroh-twine-spoke",
     ]);
+    if method.eq_ignore_ascii_case("HEAD") {
+        cmd.arg("-I");
+    } else {
+        cmd.args(["-X", method]);
+    }
     if use_tailnet_resolve && url.contains("brians-mac-studio-468.tail23ad5.ts.net:5487") {
         cmd.args([
             "--resolve",
@@ -591,9 +594,16 @@ fn beam_curl_exchange(
     if !identity.api_key.is_empty() {
         cmd.args(["-H", &format!("Authorization: Bearer {}", identity.api_key)]);
     }
-    if !identity.handle.is_empty() {
-        cmd.args(["-H", &format!("X-Chinwag-Actor: {}", identity.handle)]);
-    }
+    let ascii_actor = req_actor_override
+        .filter(|s| !s.is_empty() && s.is_ascii())
+        .unwrap_or_else(|| {
+            if !identity.actor_id.is_empty() {
+                identity.actor_id.as_str()
+            } else {
+                "actor-nic"
+            }
+        });
+    cmd.args(["-H", &format!("X-Chinwag-Actor: {ascii_actor}")]);
     if !identity.actor_id.is_empty() {
         cmd.args(["-H", &format!("X-Chinwag-Actor-Id: {}", identity.actor_id)]);
     }
@@ -610,11 +620,11 @@ fn beam_curl_exchange(
             cmd.args(["-H", &format!("Accept: {acc}")]);
         }
     }
-    if !req_body.is_empty() {
+    if !req_body.is_empty() && !method.eq_ignore_ascii_case("HEAD") {
         cmd.args(["--data-binary", "@-"]);
     }
     cmd.arg(&url);
-    cmd.stdin(if req_body.is_empty() {
+    cmd.stdin(if req_body.is_empty() || method.eq_ignore_ascii_case("HEAD") {
         Stdio::null()
     } else {
         Stdio::piped()
@@ -623,7 +633,7 @@ fn beam_curl_exchange(
     cmd.stderr(Stdio::null());
 
     let mut child = cmd.spawn().ok()?;
-    if !req_body.is_empty() {
+    if !req_body.is_empty() && !method.eq_ignore_ascii_case("HEAD") {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(req_body);
         }
@@ -634,7 +644,11 @@ fn beam_curl_exchange(
     }
     let sep = find_double_crlf(&out.stdout)?;
     let header_block = String::from_utf8_lossy(&out.stdout[..sep]).to_string();
-    let body = out.stdout[sep + 4..].to_vec();
+    let body = if method.eq_ignore_ascii_case("HEAD") {
+        Vec::new()
+    } else {
+        out.stdout[sep + 4..].to_vec()
+    };
     let mut lines = header_block.lines();
     let status_line = lines.next()?.trim().to_string();
     if status_line.contains(" 400 ") && body.windows(12).any(|w| w == b"HTTPS server") {
@@ -665,21 +679,42 @@ fn forward_beam_http_request(
     path_and_query: &str,
     req_content_type: Option<&str>,
     req_accept: Option<&str>,
+    req_actor_override: Option<&str>,
     req_body: &[u8],
     identity: &IdentityConfig,
 ) -> (String, Vec<(String, String)>, Vec<u8>, String) {
-    let mut candidates: Vec<(String, bool)> = vec![(hub_url.to_string(), false)];
-    if hub_url.contains("brians-mac-studio-468.tail23ad5.ts.net:5487") {
-        candidates.push((hub_url.to_string(), true));
+    let mut candidates: Vec<(String, bool)> = Vec::new();
+    let push_candidate = |list: &mut Vec<(String, bool)>, url: &str, use_resolve: bool| {
+        let clean = url.trim_end_matches('/').to_string();
+        if clean.is_empty()
+            || clean.contains("127.0.0.1:5487")
+            || clean.contains("localhost:5487")
+            || clean.contains("[::1]:5487")
+        {
+            return;
+        }
+        if !list.iter().any(|(u, r)| u == &clean && *r == use_resolve) {
+            list.push((clean, use_resolve));
+        }
+    };
+
+    if !hub_url.contains("tail23ad5.ts.net") {
+        push_candidate(&mut candidates, hub_url, false);
     }
-    candidates.push((
-        "https://brians-mac-studio-468.tail23ad5.ts.net:5487".to_string(),
-        true,
-    ));
     if !fallback_hub_url.is_empty() {
-        candidates.push((fallback_hub_url.to_string(), false));
+        push_candidate(&mut candidates, fallback_hub_url, false);
     }
-    candidates.push(("http://127.0.0.1:5487".to_string(), false));
+    push_candidate(&mut candidates, "http://192.168.1.166:5487", false);
+    push_candidate(&mut candidates, "http://192.168.1.161:5487", false);
+    if hub_url.contains("tail23ad5.ts.net") {
+        push_candidate(&mut candidates, hub_url, true);
+        push_candidate(&mut candidates, hub_url, false);
+    }
+    push_candidate(
+        &mut candidates,
+        "https://brians-mac-studio-468.tail23ad5.ts.net:5487",
+        true,
+    );
 
     for (cand, use_resolve) in candidates {
         if let Some((status_line, headers, body)) = beam_curl_exchange(
@@ -688,6 +723,7 @@ fn forward_beam_http_request(
             path_and_query,
             req_content_type,
             req_accept,
+            req_actor_override,
             req_body,
             identity,
             use_resolve,
@@ -721,7 +757,7 @@ fn handle_beam_stream(
 ) {
     use std::io::Read;
     use std::time::Duration;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
 
     let mut buf = Vec::with_capacity(8192);
@@ -730,6 +766,10 @@ fn handle_beam_stream(
         match stream.read(&mut chunk) {
             Ok(0) => return,
             Ok(n) => {
+                if buf.is_empty() && n > 0 && chunk[0] == 0x16 {
+                    // Reject TLS ClientHello immediately so browsers fall back to HTTP in <1ms
+                    return;
+                }
                 buf.extend_from_slice(&chunk[..n]);
                 if let Some(pos) = find_double_crlf(&buf) {
                     break pos;
@@ -760,6 +800,7 @@ fn handle_beam_stream(
     let mut content_length: usize = 0;
     let mut req_content_type: Option<String> = None;
     let mut req_accept: Option<String> = None;
+    let mut req_actor_override: Option<String> = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let lower = k.trim().to_ascii_lowercase();
@@ -768,6 +809,7 @@ fn handle_beam_stream(
                 "content-length" => content_length = val.parse::<usize>().unwrap_or(0),
                 "content-type" => req_content_type = Some(val),
                 "accept" => req_accept = Some(val),
+                "x-chinwag-actor" => req_actor_override = Some(val),
                 _ => {}
             }
         }
@@ -795,6 +837,7 @@ fn handle_beam_stream(
         &path_and_query,
         req_content_type.as_deref(),
         req_accept.as_deref(),
+        req_actor_override.as_deref(),
         req_body,
         identity,
     );
@@ -805,7 +848,12 @@ fn handle_beam_stream(
     }
     resp_head.push_str("X-Chinwag-Beam: iroh-twine-spoke\r\n");
     resp_head.push_str(&format!("X-Chinwag-Beam-Hub: {effective_hub}\r\n"));
-    resp_head.push_str(&format!("X-Chinwag-Beam-Actor: {}\r\n", identity.handle));
+    let ascii_beam_actor = if !identity.actor_id.is_empty() && identity.actor_id.is_ascii() {
+        identity.actor_id.as_str()
+    } else {
+        "actor-nic"
+    };
+    resp_head.push_str(&format!("X-Chinwag-Beam-Actor: {ascii_beam_actor}\r\n"));
     resp_head.push_str(&format!(
         "X-Chinwag-Beam-Machine: {}\r\n",
         identity.machine_name
@@ -814,7 +862,9 @@ fn handle_beam_stream(
     resp_head.push_str("Connection: close\r\n\r\n");
 
     let _ = stream.write_all(resp_head.as_bytes());
-    let _ = stream.write_all(&resp_body);
+    if !method.eq_ignore_ascii_case("HEAD") {
+        let _ = stream.write_all(&resp_body);
+    }
     let _ = stream.flush();
 }
 
@@ -875,6 +925,7 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
             "/api/auth/whoami",
             None,
             Some("application/json"),
+            None,
             &[],
             &identity,
         );
@@ -1005,6 +1056,26 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
     });
     let _ = writeln!(stdout, "{banner}");
     let _ = stdout.flush();
+
+    if listen_addr == "127.0.0.1:5487" {
+        if let Ok(v6_listener) = std::net::TcpListener::bind("[::1]:5487") {
+            let hub_v6 = hub_url.clone();
+            let fb_v6 = identity.fallback_hub_url.clone();
+            let id_v6 = identity.clone();
+            std::thread::spawn(move || {
+                for incoming in v6_listener.incoming() {
+                    if let Ok(stream) = incoming {
+                        let hc = hub_v6.clone();
+                        let fc = fb_v6.clone();
+                        let ic = id_v6.clone();
+                        std::thread::spawn(move || {
+                            handle_beam_stream(stream, &hc, &fc, &ic);
+                        });
+                    }
+                }
+            });
+        }
+    }
 
     for incoming in listener.incoming() {
         if let Ok(stream) = incoming {
