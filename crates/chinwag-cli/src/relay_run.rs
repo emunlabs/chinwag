@@ -1247,12 +1247,25 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "■"
             };
 
+            let mut role_str = format!(
+                "Seat {} · Chinwag Reply ({})",
+                from_seat.to_uppercase(),
+                identity.machine_name
+            );
+            if role_str.len() > 76 {
+                role_str.truncate(76);
+            }
+            let mut engine_str = format!("chinwag reply ({})", identity.machine_name);
+            if engine_str.len() > 76 {
+                engine_str.truncate(76);
+            }
+
             let post_payload = json!({
                 "channelId": channel,
                 "sender": sender_label,
                 "senderCast": sender_cast,
-                "role": format!("GrokBot Seat {} · Native Chinwag UI Reply (run={} · machine={})", from_seat.to_uppercase(), run_id, identity.machine_name),
-                "engine": format!("GrokBot -> chinwag reply ({})", mission_control_url),
+                "role": role_str,
+                "engine": engine_str,
                 "body": format!("{} `[relay-receipt run={}]`", message.trim(), run_id),
                 "itemKey": item_key
             });
@@ -1261,14 +1274,14 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             let (mut http_ok, mut http_code, mut effective_endpoint) =
                 post_mission_control_with_fallback(
                     &mission_control_url,
-                    "/api/comms/channels",
+                    "/api/comms/channel",
                     &payload_str,
                     &identity,
                 );
             if !http_ok {
                 let (ok2, code2, ep2) = post_mission_control_with_fallback(
                     &mission_control_url,
-                    "/api/comms/channel",
+                    "/api/comms/channels",
                     &payload_str,
                     &identity,
                 );
