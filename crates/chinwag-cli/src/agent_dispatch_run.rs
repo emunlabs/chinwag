@@ -130,8 +130,8 @@ fn agent_uuid(agent_upper: &str) -> Option<&'static str> {
 
 fn grokbot_dept(agent_upper: &str) -> &'static str {
     match agent_upper {
-        "ALISTAIR" | "HOUSEKEEPING" | "INFRA BOT (GROK)" | "INFRAJR" | "QA" | "FLINT" | "DOCS" | "MGMT-INFRA" | "INFRA" => "infra",
-        "ARCHITECT" | "RUST" | "INDEX" | "DEV-1" | "DEV-2" | "DEV-3" | "ENG" | "MGMT-ENG" => "eng",
+        "ALISTAIR" | "HOUSEKEEPING" | "INFRA BOT (GROK)" | "INFRAJR" | "QA" | "FLINT" | "DOCS" | "MGMT-INFRA" | "INFRA" | "EPHEMERAL-QA" => "infra",
+        "ARCHITECT" | "RUST" | "INDEX" | "DEV-1" | "DEV-2" | "DEV-3" | "ENG" | "MGMT-ENG" | "EPHEMERAL-DEV" => "eng",
         "VENTURE" | "MO" | "EAGLE-EYE" | "BIZFIN" | "INVESTIGATIONS" | "RECORD" | "DEX" | "MGMT-BIZFIN" => "bizfin",
         "DECLARATION" | "GROWTH" | "SOCIAL" | "S-AND-M" | "SALES" | "MGMT-S-AND-M" => "s-and-m",
         _ => "product",
@@ -317,6 +317,16 @@ fn dispatch_to_engine(
         && !mock.trim().is_empty()
     {
         return (mock, "mock-engine");
+    }
+
+    // 0. Ephemeral worker pools (EPHEMERAL-DEV / EPHEMERAL-QA) use Cloudflare
+    //    Workers AI DeepSeek v4.1 Flash once the credential file exists. The
+    //    kill switch, 10-slot concurrency cap and spend ledger live in
+    //    deepseek_pool. Once active there is no fallback to another engine.
+    if let Some(pool) = crate::deepseek_pool::pool_for_agent(agent_upper)
+        && crate::deepseek_pool::enabled()
+    {
+        return crate::deepseek_pool::run(pool, agent_upper, full_prompt);
     }
 
     let home = user_home();

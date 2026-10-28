@@ -631,6 +631,8 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
 }
 
 #[cfg(target_os = "macos")]
+mod deepseek_pool;
+#[cfg(target_os = "macos")]
 mod agent_dispatch_run;
 #[cfg(target_os = "macos")]
 pub use agent_dispatch_run::run_agent_dispatch;
