@@ -310,6 +310,51 @@ pub fn resolve_identity_config() -> IdentityConfig {
     }
 }
 
+pub fn resolve_agent_relay_identity(seat: &str, base: &IdentityConfig) -> IdentityConfig {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let clean_seat = seat
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_start_matches("■ ")
+        .trim()
+        .to_ascii_uppercase();
+    let seat_slug = clean_seat
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>();
+
+    let mut agent_key = env::var("CHINWAG_AGENT_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if agent_key.is_empty() {
+        let studio_agent_key =
+            PathBuf::from(&home).join("WORKSPACE/delivery-planner/data/agent-relay.key");
+        if let Ok(k) = fs::read_to_string(studio_agent_key) {
+            agent_key = k.trim().to_string();
+        }
+    }
+    if agent_key.is_empty() {
+        let local_agent_key = PathBuf::from(&home).join(".chinwag/agent-relay.key");
+        if let Ok(k) = fs::read_to_string(local_agent_key) {
+            agent_key = k.trim().to_string();
+        }
+    }
+    if agent_key.is_empty() {
+        agent_key = base.api_key.clone();
+    }
+
+    IdentityConfig {
+        actor_id: format!("agent-{seat_slug}"),
+        handle: format!("[{clean_seat}]"),
+        display_name: format!("■ {clean_seat} Seat Relay"),
+        machine_name: base.machine_name.clone(),
+        mission_control_url: base.mission_control_url.clone(),
+        fallback_hub_url: base.fallback_hub_url.clone(),
+        api_key: agent_key,
+    }
+}
+
 fn curl_post_json_endpoint(
     endpoint_url: &str,
     payload_str: &str,
@@ -341,7 +386,11 @@ fn curl_post_json_endpoint(
     if !identity.api_key.is_empty() {
         cmd.args(["-H", &format!("Authorization: Bearer {}", identity.api_key)]);
     }
-    if !identity.actor_id.is_empty() {
+    if identity.actor_id.starts_with("agent-") {
+        let seat_clean = identity.handle.trim_matches(|c| c == '[' || c == ']');
+        cmd.args(["-H", &format!("X-Chinwag-Agent-Seat: {seat_clean}")]);
+        cmd.args(["-H", &format!("X-Chinwag-Actor-Id: {}", identity.actor_id)]);
+    } else if !identity.actor_id.is_empty() {
         cmd.args(["-H", &format!("X-Chinwag-Actor: {}", identity.actor_id)]);
         cmd.args(["-H", &format!("X-Chinwag-Actor-Id: {}", identity.actor_id)]);
     }
@@ -1341,20 +1390,33 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "itemKey": item_key
             });
 
+            let effective_identity = if sender_cast == "■" {
+                resolve_agent_relay_identity(&from_seat, &identity)
+            } else {
+                identity.clone()
+            };
+            let auth_key_scope = if sender_cast == "■" {
+                "agent-relay.key (non-human seat credential)"
+            } else if effective_identity.actor_id == "actor-nic" {
+                "nic-api.key (co-founder credential)"
+            } else {
+                "delivery-api.key (founder credential)"
+            };
+
             let payload_str = post_payload.to_string();
             let (mut http_ok, mut http_code, mut effective_endpoint) =
                 post_mission_control_with_fallback(
                     &mission_control_url,
                     "/api/comms/channel",
                     &payload_str,
-                    &identity,
+                    &effective_identity,
                 );
             if !http_ok {
                 let (ok2, code2, ep2) = post_mission_control_with_fallback(
                     &mission_control_url,
                     "/api/comms/channels",
                     &payload_str,
-                    &identity,
+                    &effective_identity,
                 );
                 if ok2 {
                     http_ok = ok2;
@@ -1368,9 +1430,10 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "action": "reply",
                 "channel": channel,
                 "from": from_seat,
-                "actor": identity.handle,
-                "actor_id": identity.actor_id,
-                "machine_name": identity.machine_name,
+                "actor": effective_identity.handle,
+                "actor_id": effective_identity.actor_id,
+                "auth_key_scope": auth_key_scope,
+                "machine_name": effective_identity.machine_name,
                 "run_id": run_id,
                 "item_key": item_key,
                 "mission_control_url": mission_control_url,
@@ -1565,5 +1628,23 @@ mod tests {
         assert_eq!(code, 0);
         assert!(String::from_utf8_lossy(&out).contains("Usage: chinwag beam"));
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn agent_relay_identity_never_impersonates_brian() {
+        let base = IdentityConfig {
+            actor_id: "actor-brian".to_string(),
+            handle: "● Brian".to_string(),
+            display_name: "Brian Spector".to_string(),
+            machine_name: "brians-mac-studio-468".to_string(),
+            mission_control_url: "http://127.0.0.1:5487".to_string(),
+            fallback_hub_url: "http://192.168.1.166:5487".to_string(),
+            api_key: "fallback-test-key".to_string(),
+        };
+        let infra_id = resolve_agent_relay_identity("INFRA", &base);
+        assert_eq!(infra_id.actor_id, "agent-infra");
+        assert_eq!(infra_id.handle, "[INFRA]");
+        assert!(!infra_id.actor_id.contains("brian"));
+        assert!(!infra_id.handle.contains("Brian"));
     }
 }
