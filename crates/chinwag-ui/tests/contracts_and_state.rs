@@ -163,3 +163,13 @@ fn send_request_drops_client_supplied_actor_fields() {
     let wire = serde_json::to_value(&input).unwrap();
     assert_eq!(wire, serde_json::json!({"channelId": "test", "body": "hi"}));
 }
+
+#[test]
+fn browser_view_drops_planner_telemetry_but_keeps_channels() {
+    let data: WiretapsData = serde_json::from_str(include_str!("fixtures/wiretaps.json")).unwrap();
+    assert!(!data.sessions.is_empty() && !data.summary.is_null());
+    let channels = data.channels.clone();
+    let view = data.browser_view();
+    assert!(view.sessions.is_empty() && view.summary.is_null());
+    assert_eq!(view.channels, channels);
+}

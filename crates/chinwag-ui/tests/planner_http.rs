@@ -135,6 +135,30 @@ fn configuration_rejects_credentials_and_ambiguous_origins() {
     assert!(PlannerClient::new("https://localhost:5598/").is_ok());
 }
 
+#[test]
+fn plain_http_is_accepted_only_for_loopback_hosts() {
+    for value in [
+        "http://localhost:5598",
+        "http://127.0.0.1:5598",
+        "http://127.8.9.10:5598",
+        "http://[::1]:5598",
+        "http://planner.localhost:5598",
+        "https://planner.example.com",
+    ] {
+        assert!(PlannerClient::new(value).is_ok(), "{value}");
+    }
+    for value in [
+        "http://planner.example.com",
+        "http://192.168.1.10:5598",
+        "http://10.0.0.1",
+        "http://[2001:db8::1]:5598",
+        "http://localhost.example.com",
+        "http://0.0.0.0:5598",
+    ] {
+        assert!(PlannerClient::new(value).is_err(), "{value}");
+    }
+}
+
 #[tokio::test]
 async fn forged_sender_in_browser_request_is_not_forwarded_to_planner() {
     let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));

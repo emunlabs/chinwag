@@ -14,6 +14,16 @@ pub struct WiretapsData {
     pub summary: serde_json::Value,
 }
 
+impl WiretapsData {
+    /// What the browser may see: channels only. Planner `sessions`/`summary`
+    /// telemetry is never forwarded, since the UI does not display it.
+    pub fn browser_view(mut self) -> Self {
+        self.sessions.clear();
+        self.summary = serde_json::Value::Null;
+        self
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CommsChannel {
     pub id: String,

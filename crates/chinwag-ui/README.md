@@ -52,8 +52,9 @@ Open `http://127.0.0.1:5599`, select a fixture channel, enter text, and send. Us
 is performed. Stop both processes with Ctrl-C. Do not use the live planner or
 `:5487` for send tests.
 
-`CHINWAG_PLANNER_URL` is required by the **server**, and must be an HTTP(S) origin
-without credentials, a path, query, or fragment. There is no default planner host.
+`CHINWAG_PLANNER_URL` is required by the **server**, and must be an origin
+without credentials, a path, query, or fragment: `https` for any host, `http` only
+for loopback (`localhost`, `127.0.0.0/8`, `::1`). There is no default planner host.
 Keep this unauthenticated development UI on loopback with a test planner. A real
 planner may reject writes under its authorization policy; the UI shows the failure
 and retains the draft. This slice does not read credentials or impersonate an actor.
@@ -70,12 +71,21 @@ check verifies compilation only; it does not produce the browser glue or bundle.
   unknown fields are accepted. Sessions and summary are retained as uninterpreted
   JSON because this slice only displays channel messages.
 - `planner.rs`: native HTTP adapter using `CHINWAG_PLANNER_URL`, GET
-  `/api/comms/wiretap` and POST `/api/comms/channel`. Sends use the bare
-  `ChannelInput` JSON object. Redirects are rejected, requests time out after 15
+  `/api/comms/wiretap` and POST `/api/comms/channel`. Sends build the bare
+  `ChannelInput` JSON object server-side from the client's `SendRequest`, with no
+  client-supplied actor fields. Plain `http` is accepted only for loopback hosts
+  (`localhost`, `127.0.0.0/8`, `::1`); other hosts need `https`. One `reqwest`
+  client is built once and reused. Redirects are rejected, requests time out after 15
   seconds, and responses are capped at 5 MB. Errors omit response bodies and URLs.
 - `api.rs`: same-origin Dioxus server functions at GET `/api/ui/comms` and POST
   `/api/ui/comms/send`. The latter's Dioxus transport wraps the payload in
-  `{"input":{...}}`; this does not change the planner's plain JSON protocol.
+  `{"request":{...}}`; this does not change the planner's plain JSON protocol.
+- `guard.rs`: server-only. Refuses to start on a non-loopback `IP`; requires `Host`
+  to be this loopback listener (DNS rebinding); requires a matching `Origin` on
+  non-GET requests and rejects `Sec-Fetch-Site: cross-site`; adds CSP,
+  `X-Content-Type-Options`, `X-Frame-Options` and `Referrer-Policy`. The CSP still
+  allows inline scripts until nonces are verified in a browser. Planner
+  `sessions`/`summary` telemetry is stripped before it reaches the browser.
 - `view_model.rs`: selection, draft validation, and send lifecycle. Planner order
   is preserved. Validation counts UTF-16 units to match the planner's JS limit.
 - `app.rs`: routing, async load/send controller, explicit refresh. Each channel

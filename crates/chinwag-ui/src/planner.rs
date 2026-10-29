@@ -3,7 +3,58 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Native planner adapter; configuration and errors never expose URLs or response bodies.
 use crate::contracts::{ChannelResponse, SendRequest, WiretapsData};
-use std::time::Duration;
+use std::{
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+/// Upper bound on concurrent outbound planner requests from this process.
+const MAX_IN_FLIGHT: usize = 16;
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct InFlight;
+impl InFlight {
+    fn acquire() -> Result<Self, String> {
+        if IN_FLIGHT.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
+            IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+            return Err("Planner is busy. Try again shortly.".to_owned());
+        }
+        Ok(Self)
+    }
+}
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One shared client: building a `reqwest::Client` per request repeats TLS setup
+/// and discards the connection pool. `Client` is a cheap handle (`Arc` inside).
+fn shared_client() -> Result<reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "Could not initialize planner HTTP client.".to_owned())
+        })
+        .clone()
+}
+
+/// Plain `http` is only for loopback; every other host must use `https`.
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    let name = host.to_ascii_lowercase();
+    name == "localhost" || name.ends_with(".localhost")
+}
 
 #[derive(Clone)]
 pub struct PlannerClient {
@@ -21,7 +72,8 @@ impl PlannerClient {
     pub fn new(base: &str) -> Result<Self, String> {
         let base =
             reqwest::Url::parse(base).map_err(|_| "Invalid planner HTTP origin.".to_owned())?;
-        if !matches!(base.scheme(), "http" | "https")
+        if !(base.scheme() == "https"
+            || base.scheme() == "http" && base.host_str().is_some_and(is_loopback))
             || base.host_str().is_none()
             || !base.username().is_empty()
             || base.password().is_some()
@@ -29,14 +81,12 @@ impl PlannerClient {
             || base.fragment().is_some()
             || base.path() != "/"
         {
-            return Err("Planner URL must be an HTTP(S) origin without credentials, path, query or fragment.".into());
+            return Err("Planner URL must be an https origin (http only for loopback) without credentials, path, query or fragment.".into());
         }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| "Could not initialize planner HTTP client.".to_owned())?;
-        Ok(Self { base, http })
+        Ok(Self {
+            base,
+            http: shared_client()?,
+        })
     }
 
     fn endpoint(&self, path: &str) -> Result<reqwest::Url, String> {
@@ -71,6 +121,7 @@ impl PlannerClient {
     }
 
     pub async fn wiretaps(&self) -> Result<WiretapsData, String> {
+        let _permit = InFlight::acquire()?;
         let response = self
             .http
             .get(self.endpoint("/api/comms/wiretap")?)
@@ -85,6 +136,7 @@ impl PlannerClient {
     /// Builds the planner request here, with no client-supplied actor fields.
     pub async fn send(&self, request: SendRequest) -> Result<ChannelResponse, String> {
         let input = request.into_channel_input().normalized()?;
+        let _permit = InFlight::acquire()?;
         let response = self.http.post(self.endpoint("/api/comms/channel")?).json(&input).send().await
             .map_err(|_| "Send was not confirmed. Check the channel before retrying; the planner may have accepted it.".to_owned())?;
         let result: ChannelResponse = Self::decode(response).await?;

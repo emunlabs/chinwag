@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # License gate for crates/chinwag-ui (CHWG-DIOXUS-1). Mirrors CONTRIBUTING.md section 3 (INV-LIC-01).
-# Run: cargo deny --manifest-path crates/chinwag-ui/Cargo.toml --all-features check licenses
+# Run: cargo deny --manifest-path crates/chinwag-ui/Cargo.toml --all-features check licenses bans sources advisories
 [graph]
 targets = [
   "aarch64-apple-darwin",
@@ -26,13 +26,15 @@ allow = [
   "Unicode-3.0",
   "Zlib",
   "CC0-1.0",
-  "BSL-1.0",              # Brian approved 2026-10-28 3:24 PM CT (EAGLE-EYE review)
-  "CDLA-Permissive-2.0",  # Brian approved 2026-10-28; keep license text in third-party notices
 ]
 # One-off MPL-2.0 exception, approved by Brian 2026-10-28 3:24 PM CT. option-ext must stay
 # unmodified and be listed, with a source link, in the desktop app's third-party notices.
 exceptions = [
   { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
+  # BSL-1.0 and CDLA-Permissive-2.0 are approved per crate, not globally (Brian, 2026-10-28; keep
+  # their license text in third-party notices).
+  { crate = "xxhash-rust@0.8.19", allow = ["BSL-1.0"] },
+  { crate = "webpki-roots@1.0.11", allow = ["CDLA-Permissive-2.0"] },
   # Added with the Linux/Windows targets (FLINT fix). Build-time-only dependency of the GTK stack;
   # Apache-2.0 plus the LLVM exception is strictly more permissive than Apache-2.0. Brian approved
   # this scoped exception on 2026-10-28 (target-lexicon@0.12.16 only, build-time GTK stack).
@@ -45,3 +47,19 @@ exceptions = [
 # Anything not in `allow` is rejected.
 #
 # Resolved 2026-10-28: xxhash-rust (BSL-1.0), webpki-roots (CDLA-Permissive-2.0), option-ext (MPL-2.0 exception).
+
+# Added for CHWG-MAIN-HYGIENE-1 (ALISTAIR S1): the gate used to check licenses only.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[advisories]
+yanked = "deny"
+# paste and proc-macro-error are flagged unmaintained (not vulnerable) deep in the Dioxus desktop/GTK
+# tree. Only unmaintained crates that the workspace itself depends on fail the gate.
+unmaintained = "workspace"
+
+[bans]
+wildcards = "deny"

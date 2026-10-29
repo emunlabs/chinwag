@@ -11,6 +11,7 @@ pub async fn load_comms() -> Result<WiretapsData, ServerFnError> {
         .map_err(ServerFnError::new)?
         .wiretaps()
         .await
+        .map(WiretapsData::browser_view)
         .map_err(ServerFnError::new)
 }
 
@@ -20,5 +21,9 @@ pub async fn send_comms(request: SendRequest) -> Result<ChannelResponse, ServerF
         .map_err(ServerFnError::new)?
         .send(request)
         .await
+        .map(|mut response| {
+            response.wiretaps = response.wiretaps.browser_view();
+            response
+        })
         .map_err(ServerFnError::new)
 }

@@ -25,13 +25,13 @@ The inventories below use these roots.
 
 | Prefix | Absolute path |
 |---|---|
-| `P` | `/Users/brianspector/WORKSPACE/delivery-planner` |
-| `W` | `/Users/brianspector/WORKSPACE/chinwag-dioxus` |
-| `D` | `/Users/brianspector/WORKSPACE/docuswiki/wiki/projects/Chinwag` |
+| `P` | `<WORKSPACE>/delivery-planner` |
+| `W` | `<WORKSPACE>/chinwag-dioxus` |
+| `D` | `<WORKSPACE>/docuswiki/wiki/projects/Chinwag` |
 
 The source application was inspected at `cbac271`. The target branch is `feat/chwg-dioxus-1`, based on `eafe65e`. Another worker added an uncommitted scaffold during this review. Its observed files are `Cargo.toml`, `README.md`, and `src/{lib,main,app,health,theme}.rs` under `W/crates/chinwag-ui`. This document does not certify that scaffold’s build or tests.
 
-The governing product inputs are the [Dioxus PRD](/Users/brianspector/WORKSPACE/docuswiki/wiki/projects/Chinwag/prd/dioxus-mission-control-zero-node-prd.md) and [CHWG-AUTH-1 PRD](/Users/brianspector/WORKSPACE/docuswiki/wiki/projects/Chinwag/prd/auth-v.0.1.0-prd.md).
+The governing product inputs are the [Dioxus PRD](<WORKSPACE>/docuswiki/wiki/projects/Chinwag/prd/dioxus-mission-control-zero-node-prd.md) and [CHWG-AUTH-1 PRD](<WORKSPACE>/docuswiki/wiki/projects/Chinwag/prd/auth-v.0.1.0-prd.md).
 
 ### Scope corrections
 
@@ -638,7 +638,7 @@ Its actual precedence is (first match wins):
 
 1. A bearer token that matches the Nic key selects Nic (`authMethod` `bearer-nic-key`).
 2. `X-Chinwag-Actor`, then `?actor=` when the header is empty, selects an actor (`header-x-chinwag-actor` or `query-actor`). The value is lower-cased and matched against fixed Nic and Brian alias lists, then by substring: any value containing `nic` selects Nic, checked before any value containing `brian` selects Brian. An unrecognized value is ignored and resolution continues.
-3. A source address of `100.89.25.127` or `192.168.1.111` selects Nic (`tailscale-ip`). The source address is the first `X-Forwarded-For` entry when present, otherwise the socket peer address, with any `::ffff:` prefix removed.
+3. A source address of `<NIC_TAILSCALE_IP>` or `<NIC_LAN_IP>` selects Nic (`tailscale-ip`). The source address is the first `X-Forwarded-For` entry when present, otherwise the socket peer address, with any `::ffff:` prefix removed.
 4. Otherwise the resolver defaults to Brian. `authMethod` is `bearer-brian-key` when the bearer token matches the Brian key, and `tailscale-ip` otherwise.
 
 The Brian key is checked only in step 4. A matching Brian token never overrides an actor header, `?actor=`, or a Nic source address; it only changes the `authMethod` label of the default result. A Brian token sent with `X-Chinwag-Actor: nic`, or from a Nic address, therefore resolves to Nic. The Auth PRD states that the Brian token resolves to Brian unless a verified co-founder client supplies the actor header. The code never verifies that header, so the two differ.
@@ -649,7 +649,7 @@ Current write authorization is a separate check at `server.ts:640–650`. Either
 
 The current server does not implement browser session cookies, Better-Auth, or WebAuthn verification. UI “TouchID Passkey” text does not establish an authentication ceremony.
 
-The server registry and store seed also disagree on Brian’s Studio address. The source registry uses `100.123.161.18`; the Auth PRD and store seed include `100.66.156.76`. Resolve this through configuration, not another hardcoded inference.
+The server registry and store seed also disagree on Brian’s Studio address. The source registry uses `<STUDIO_TAILSCALE_IP_A>`; the Auth PRD and store seed include `<STUDIO_TAILSCALE_IP_B>`. Resolve this through configuration, not another hardcoded inference.
 
 ### Rust identity model
 
@@ -746,7 +746,7 @@ The “listener pool” is currently a state map plus request-launched workflows
 The conversational model request goes to:
 
 - Configured `CHINWAG_FLINT_URL`.
-- `http://100.108.108.25:11500/v1/chat/completions`.
+- `http://<MACBOOK_TAILSCALE_IP>:11500/v1/chat/completions`.
 - `http://127.0.0.1:11500/v1/chat/completions`.
 
 The source sends model `flint`, recent turns, `max_tokens:240`, `temperature:0.2`, and `enable_thinking:false`. Each attempted endpoint has a 2.2-second timeout. It requests a completed JSON response, not a token stream. Multiple sequential attempts can exceed the stated two-second objective. See `server.ts:1577–1647`.
