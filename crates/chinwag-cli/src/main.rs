@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod bus_run;
 mod relay_run;
 mod ui_gate_run;
 
@@ -84,6 +85,14 @@ fn main() -> ExitCode {
                  → Launch Full-Screen First-Run Wizard: {wizard_url}"
             );
             return ExitCode::SUCCESS;
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("bus") {
+            let code = bus_run::run_bus_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("ui-gate") {
             let code = ui_gate_run::run_ui_gate(
