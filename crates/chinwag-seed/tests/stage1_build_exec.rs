@@ -15,7 +15,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str, body: &str) -> Self {
-        let base = chinwag_test_fixtures::namespace("CHINWAG_STAGE1_BUILD_FIXTURES");
+        let base = chinwag_test_fixtures::serialized_namespace(
+            "CHINWAG_STAGE1_BUILD_FIXTURES",
+            &std::env::temp_dir(),
+        );
         let base = base.as_path();
         assert!(base.is_absolute());
         let root = tempfile::Builder::new()
@@ -37,7 +40,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(root.join("src/main.rs"), body).unwrap();
-        let rustc = PathBuf::from(chinwag_test_fixtures::rustc());
+        let rustc = chinwag_test_fixtures::rustc();
         let recipe = root.join("recipe.json");
         fs::write(
             &recipe,

@@ -5,7 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -20,7 +20,12 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let base = chinwag_test_fixtures::namespace("CHINWAG_STAGE1_FIXTURES");
+        // These cases verify every ancestor directory of the fixture, link counts
+        // included, so they run one at a time in a quiet parent.
+        let base = chinwag_test_fixtures::serialized_namespace(
+            "CHINWAG_STAGE1_FIXTURES",
+            Path::new(env!("CARGO_TARGET_TMPDIR")),
+        );
         let base = base.as_path();
         assert!(base.is_absolute());
         let root = tempfile::Builder::new()

@@ -94,8 +94,16 @@ impl FileId {
     }
     /// Same file instance and ownership, ignoring size and timestamps.
     fn same_instance(&self, other: &Self) -> bool {
-        (self.dev, self.ino, self.uid, self.gid, self.mode, self.nlink)
-            == (other.dev, other.ino, other.uid, other.gid, other.mode, other.nlink)
+        (
+            self.dev, self.ino, self.uid, self.gid, self.mode, self.nlink,
+        ) == (
+            other.dev,
+            other.ino,
+            other.uid,
+            other.gid,
+            other.mode,
+            other.nlink,
+        )
     }
 }
 #[derive(PartialEq, Eq)]

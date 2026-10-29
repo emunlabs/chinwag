@@ -16,6 +16,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 /// Principal written into seeded repositories, matching the operator fixtures.
@@ -47,6 +48,57 @@ fn fresh_directory() -> PathBuf {
 /// The directory named by `var`, or a fresh private temp directory when unset.
 pub fn namespace(var: &str) -> PathBuf {
     supplied(var).unwrap_or_else(fresh_directory)
+}
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// What a serialized test thread holds. `Drop` removes the seeded directories
+/// first and only then do the fields release the lock, so the next test never
+/// observes this one's teardown.
+struct Exclusive {
+    dirs: Vec<tempfile::TempDir>,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        self.dirs.clear();
+    }
+}
+
+thread_local! {
+    static EXCLUSIVE: RefCell<Option<Exclusive>> = const { RefCell::new(None) };
+}
+
+/// Like [`namespace`], but the calling test thread also takes a process-wide lock
+/// that it keeps, together with its seeded directory, until the thread exits.
+///
+/// For tests whose subject verifies every ancestor directory of the fixture,
+/// link counts included: while one such test runs, no sibling test in the same
+/// binary creates or removes a directory next to it. A seeded directory goes
+/// under `parent`, which should be quiet (for example cargo's per-package
+/// `CARGO_TARGET_TMPDIR`, or the system temp directory when the subject needs a
+/// location outside the repository). Further calls on the same thread reuse the lock.
+pub fn serialized_namespace(var: &str, parent: &Path) -> PathBuf {
+    EXCLUSIVE.with(|held| {
+        let mut held = held.borrow_mut();
+        let exclusive = held.get_or_insert_with(|| Exclusive {
+            _guard: SERIAL.lock().unwrap_or_else(PoisonError::into_inner),
+            dirs: Vec::new(),
+        });
+        if let Some(path) = supplied(var) {
+            return path;
+        }
+        let base = fs::canonicalize(parent).expect("canonical fixture parent");
+        let dir = tempfile::Builder::new()
+            .prefix("chinwag-fixture-")
+            .tempdir_in(base)
+            .expect("create fixture namespace");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("private mode");
+        let path = fs::canonicalize(dir.path()).expect("canonical fixture namespace");
+        exclusive.dirs.push(dir);
+        path
+    })
 }
 
 /// `<namespace>/<name>` as a git repository whose local config carries

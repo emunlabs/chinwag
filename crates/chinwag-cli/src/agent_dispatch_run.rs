@@ -16,7 +16,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::AgentDispatchRequest;
-use chinwag_snapshot_session_private::replacement::{AgentDispatchRecord, WriteOwner, WriteSession};
+use chinwag_snapshot_session_private::replacement::{
+    AgentDispatchRecord, WriteOwner, WriteSession,
+};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -130,9 +132,11 @@ fn agent_uuid(agent_upper: &str) -> Option<&'static str> {
 
 fn grokbot_dept(agent_upper: &str) -> &'static str {
     match agent_upper {
-        "ALISTAIR" | "HOUSEKEEPING" | "INFRA BOT (GROK)" | "INFRAJR" | "QA" | "FLINT" | "DOCS" | "MGMT-INFRA" | "INFRA" => "infra",
+        "ALISTAIR" | "HOUSEKEEPING" | "INFRA BOT (GROK)" | "INFRAJR" | "QA" | "FLINT" | "DOCS"
+        | "MGMT-INFRA" | "INFRA" => "infra",
         "ARCHITECT" | "RUST" | "INDEX" | "DEV-1" | "DEV-2" | "DEV-3" | "ENG" | "MGMT-ENG" => "eng",
-        "VENTURE" | "MO" | "EAGLE-EYE" | "BIZFIN" | "INVESTIGATIONS" | "RECORD" | "DEX" | "MGMT-BIZFIN" => "bizfin",
+        "VENTURE" | "MO" | "EAGLE-EYE" | "BIZFIN" | "INVESTIGATIONS" | "RECORD" | "DEX"
+        | "MGMT-BIZFIN" => "bizfin",
         "DECLARATION" | "GROWTH" | "SOCIAL" | "S-AND-M" | "SALES" | "MGMT-S-AND-M" => "s-and-m",
         _ => "product",
     }
@@ -178,7 +182,14 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
     }
 
     let wiki_dir = wiki_agents_dir().join(&agent_lower);
-    for fname in ["SOUL.md", "AGENT.md", "AGENTS.md", "SKILLS.md", "MEMORY.md", "TOOLS.md"] {
+    for fname in [
+        "SOUL.md",
+        "AGENT.md",
+        "AGENTS.md",
+        "SKILLS.md",
+        "MEMORY.md",
+        "TOOLS.md",
+    ] {
         let fpath = wiki_dir.join(fname);
         if let Ok(content) = fs::read_to_string(&fpath) {
             parts.push(format!(
@@ -189,9 +200,7 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
     }
 
     if let Some(uid) = agent_uuid(agent_upper) {
-        let inst_dir = pilot_company_agents_dir()
-            .join(uid)
-            .join("instructions");
+        let inst_dir = pilot_company_agents_dir().join(uid).join("instructions");
         for fname in ["SOUL.md", "AGENT.md", "AGENTS.md", "MEMORY.md"] {
             let fpath = inst_dir.join(fname);
             if let Ok(content) = fs::read_to_string(&fpath) {
@@ -346,12 +355,7 @@ fn dispatch_to_engine(
     if is_flint
         && flint_bin.exists()
         && let Ok(out) = Command::new(&flint_bin)
-            .args([
-                "run",
-                full_prompt,
-                "--cwd",
-                &repo_dir.to_string_lossy(),
-            ])
+            .args(["run", full_prompt, "--cwd", &repo_dir.to_string_lossy()])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .output()
@@ -498,11 +502,17 @@ fn persist_to_crdb(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<
         "refs/heads/feat/v0.1.1-invariants-and-memory".to_owned(),
         format!("Chinwag Agent Comms · {thread_id}"),
         inbound_id.to_owned(),
-        format!("{}@chinwag.sh", sender.to_ascii_lowercase().replace(' ', "-")),
+        format!(
+            "{}@chinwag.sh",
+            sender.to_ascii_lowercase().replace(' ', "-")
+        ),
         "user".to_owned(),
         truncate_utf8(inbound_body, MAX_CRDB_TEXT_BYTES),
         outbound_id.to_owned(),
-        format!("{}@chinwag.sh", agent_upper.to_ascii_lowercase().replace(' ', "-")),
+        format!(
+            "{}@chinwag.sh",
+            agent_upper.to_ascii_lowercase().replace(' ', "-")
+        ),
         "assistant".to_owned(),
         truncate_utf8(outbound_body, MAX_CRDB_TEXT_BYTES),
         now_ms,
@@ -614,8 +624,11 @@ pub fn run_agent_dispatch(
     ));
     let full_prompt = prompt_parts.join("\n");
 
-    let (reply, engine_used) =
-        dispatch_to_engine(&agent_upper, &full_prompt, stdin_payload.custom_agent.as_ref());
+    let (reply, engine_used) = dispatch_to_engine(
+        &agent_upper,
+        &full_prompt,
+        stdin_payload.custom_agent.as_ref(),
+    );
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -646,7 +659,15 @@ pub fn run_agent_dispatch(
     };
 
     notify_grokbot_department_relay(&agent_upper, &sender, &item_key, &body, &reply);
-    retain_native_memory(&repo_root, &agent_upper, engine_used, &sender, &item_key, &body, &reply);
+    retain_native_memory(
+        &repo_root,
+        &agent_upper,
+        engine_used,
+        &sender,
+        &item_key,
+        &body,
+        &reply,
+    );
 
     let output = json!({
         "ok": true,

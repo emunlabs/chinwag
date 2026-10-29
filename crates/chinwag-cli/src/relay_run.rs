@@ -35,7 +35,14 @@ pub const GROKBOT_MGMT_ROSTER: &[GrokBotSeat] = &[
         slack_channel: "#infra (C0AERHZ1XB4)",
         webhook_env: "infra.env",
         agentmail_inbox: "infra-bot@mail.grokbot.com",
-        direct_reports: &["QA", "FLINT", "ALISTAIR", "DOCS", "HOUSEKEEPING", "EPHEMERAL-QA"],
+        direct_reports: &[
+            "QA",
+            "FLINT",
+            "ALISTAIR",
+            "DOCS",
+            "HOUSEKEEPING",
+            "EPHEMERAL-QA",
+        ],
     },
     GrokBotSeat {
         seat: "BIZFIN",
@@ -65,7 +72,15 @@ pub const GROKBOT_MGMT_ROSTER: &[GrokBotSeat] = &[
         slack_channel: "#product (C0C9VRFBFKJ)",
         webhook_env: "product.env",
         agentmail_inbox: "spector-product@agentmail.to",
-        direct_reports: &["GEMINI-PM", "TYPE", "SCRIBE", "MOTION", "FREQUENCY", "DELIVERY", "EPHEMERAL-RENDER"],
+        direct_reports: &[
+            "GEMINI-PM",
+            "TYPE",
+            "SCRIBE",
+            "MOTION",
+            "FREQUENCY",
+            "DELIVERY",
+            "EPHEMERAL-RENDER",
+        ],
     },
     GrokBotSeat {
         seat: "S-AND-M",
@@ -134,7 +149,9 @@ fn detect_local_hostname() -> String {
 pub fn resolve_identity_config() -> IdentityConfig {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let local_host = detect_local_hostname();
-    let is_studio_host = local_host.to_ascii_lowercase().starts_with("brians-mac-studio");
+    let is_studio_host = local_host
+        .to_ascii_lowercase()
+        .starts_with("brians-mac-studio");
 
     let identity_path = env::var("CHINWAG_IDENTITY_FILE")
         .ok()
@@ -158,7 +175,12 @@ pub fn resolve_identity_config() -> IdentityConfig {
             }
             if let Some((k, v)) = trimmed.split_once('=') {
                 let key = k.trim();
-                let val = v.trim().trim_matches('"').trim_matches('\'').trim().to_string();
+                let val = v
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .trim()
+                    .to_string();
                 match key {
                     "actor_id" => actor_id = val,
                     "handle" => handle = val,
@@ -320,7 +342,13 @@ pub fn resolve_agent_relay_identity(seat: &str, base: &IdentityConfig) -> Identi
         .to_ascii_uppercase();
     let seat_slug = clean_seat
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>();
 
     let mut agent_key = env::var("CHINWAG_AGENT_API_KEY")
@@ -395,7 +423,10 @@ fn curl_post_json_endpoint(
         cmd.args(["-H", &format!("X-Chinwag-Actor-Id: {}", identity.actor_id)]);
     }
     if !identity.machine_name.is_empty() {
-        cmd.args(["-H", &format!("X-Chinwag-Machine: {}", identity.machine_name)]);
+        cmd.args([
+            "-H",
+            &format!("X-Chinwag-Machine: {}", identity.machine_name),
+        ]);
     }
     cmd.args(["--data", payload_str, endpoint_url]);
     match cmd.output() {
@@ -541,7 +572,10 @@ fn send_agentmail(to_inbox: &str, subject: &str, text: &str) -> (bool, u16) {
         return (false, 0);
     }
     let encoded_inbox = from_inbox.replace('@', "%40");
-    let url = format!("https://api.agentmail.to/v0/inboxes/{}/messages/send", encoded_inbox);
+    let url = format!(
+        "https://api.agentmail.to/v0/inboxes/{}/messages/send",
+        encoded_inbox
+    );
     let payload = json!({
         "to": [to_inbox],
         "subject": subject,
@@ -673,7 +707,10 @@ fn beam_curl_exchange(
         cmd.args(["-H", &format!("X-Chinwag-Actor-Id: {}", identity.actor_id)]);
     }
     if !identity.machine_name.is_empty() {
-        cmd.args(["-H", &format!("X-Chinwag-Machine: {}", identity.machine_name)]);
+        cmd.args([
+            "-H",
+            &format!("X-Chinwag-Machine: {}", identity.machine_name),
+        ]);
     }
     if let Some(ct) = req_content_type
         && !ct.is_empty()
@@ -689,11 +726,13 @@ fn beam_curl_exchange(
         cmd.args(["--data-binary", "@-"]);
     }
     cmd.arg(&url);
-    cmd.stdin(if req_body.is_empty() || method.eq_ignore_ascii_case("HEAD") {
-        Stdio::null()
-    } else {
-        Stdio::piped()
-    });
+    cmd.stdin(
+        if req_body.is_empty() || method.eq_ignore_ascii_case("HEAD") {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        },
+    );
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
 
@@ -924,7 +963,10 @@ fn handle_beam_stream(
 }
 
 pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
-    if args.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
+    if args
+        .iter()
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+    {
         let _ = writeln!(
             stdout,
             "Usage: chinwag beam [--listen 127.0.0.1:5487] [--hub <mission-control-url>] [--status | --once]"
@@ -1013,7 +1055,11 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
             ],
             "whoami": whoami_json
         });
-        let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&out).unwrap_or_default()
+        );
         return if hub_ok { 0 } else { 1 };
     }
 
@@ -1072,7 +1118,11 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
             "machine_name": identity.machine_name,
             "whoami": whoami_val
         });
-        let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&out).unwrap_or_default()
+        );
         return if probe_ok { 0 } else { 1 };
     }
 
@@ -1144,7 +1194,10 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
 }
 
 pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
-    if args.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
+    if args
+        .iter()
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+    {
         let _ = writeln!(
             stdout,
             "Usage:\n  \
@@ -1196,7 +1249,11 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 ],
                 "seats": seats
             });
-            let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            );
             0
         }
         "brief-mgmt" => {
@@ -1244,17 +1301,21 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                     seat.direct_reports
                 );
 
-                let (slack_delivered, slack_http_code) = if let Some(url) = read_webhook_url(seat.webhook_env) {
-                    post_slack_webhook(&url, &msg)
-                } else {
-                    (false, 0)
-                };
+                let (slack_delivered, slack_http_code) =
+                    if let Some(url) = read_webhook_url(seat.webhook_env) {
+                        post_slack_webhook(&url, &msg)
+                    } else {
+                        (false, 0)
+                    };
 
-                let (email_delivered, email_http_code) = if seat.agentmail_inbox.contains("@agentmail.to") || seat.agentmail_inbox.contains("@mail.grokbot.com") {
-                    send_agentmail(seat.agentmail_inbox, &subj, &msg)
-                } else {
-                    (false, 0)
-                };
+                let (email_delivered, email_http_code) =
+                    if seat.agentmail_inbox.contains("@agentmail.to")
+                        || seat.agentmail_inbox.contains("@mail.grokbot.com")
+                    {
+                        send_agentmail(seat.agentmail_inbox, &subj, &msg)
+                    } else {
+                        (false, 0)
+                    };
 
                 let escaped_msg = msg.replace('\'', "''");
                 let sql = format!(
@@ -1286,7 +1347,10 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "INSERT OR REPLACE INTO context_pins (id, author_cast, author_handle, file_scope, summary, source_commit, created_at) VALUES ('chinwag-rust-relay-mgmt-brief-v1', 'infra', 'CHINWAG-RUST-RELAY', 'rust-comms/src/relay_run.rs', 'All 6 GrokBot MGMT seats in channel {} briefed via native Rust chinwag relay brief-mgmt (INFRA 407d2c36, BIZFIN e484d158, ENG a692d662, PRODUCT 382e7010, S-AND-M 16593278, PA 419c9d1d). SUPPORT + EPHEMERAL-SUPPORT spun up under S-AND-M.', 'b1745094d9cb9014361fca30c7de3535c140dd20', datetime('now'));",
                 MGMT_CHANNEL_UUID
             );
-            let _ = Command::new("sqlite3").arg(crdb_path).arg(&pin_sql).output();
+            let _ = Command::new("sqlite3")
+                .arg(crdb_path)
+                .arg(&pin_sql)
+                .output();
 
             let out = json!({
                 "ok": true,
@@ -1294,7 +1358,11 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "mgmt_channel_uuid": MGMT_CHANNEL_UUID,
                 "receipts": receipts
             });
-            let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_default()
+            );
             0
         }
         "reply" | "post" => {
@@ -1362,7 +1430,9 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             } else {
                 format!(
                     "[{}]",
-                    from_seat.trim_matches(|c| c == '[' || c == ']').to_uppercase()
+                    from_seat
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .to_uppercase()
                 )
             };
             let sender_cast = if sender_label.starts_with("● ") {
@@ -1446,7 +1516,11 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "delivered_to_mission_control_5487": http_ok,
                 "ui_url": mission_control_url
             });
-            let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_default()
+            );
             0
         }
         "send" | "dispatch" => {
@@ -1518,7 +1592,12 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 } else {
                     seat.seat
                 };
-                let run_id = format!("chinwag-ui-{}-{}-{}", seat.seat.to_lowercase(), ticket.to_lowercase(), run_ts);
+                let run_id = format!(
+                    "chinwag-ui-{}-{}-{}",
+                    seat.seat.to_lowercase(),
+                    ticket.to_lowercase(),
+                    run_ts
+                );
                 let subj = format!("[Paperclip] {} | {}: {}", listener_prefix, ticket, title);
                 let msg = format!(
                     "{}\n\
@@ -1530,28 +1609,24 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                     HOW TO REPLY DIRECTLY IN CHINWAG UI (SO BRIAN DOES NOT HAVE TO OPEN GROK BOT):\n\
                     Run this command on Mac Studio to post your reply directly into Chinwag Mission Control (:5487):\n\
                     `/opt/homebrew/bin/chinwag reply --channel \"{}\" --from \"{}\" --run \"{}\" --ticket \"{}\" --message \"<your reply>\"`",
-                    subj,
-                    run_id,
-                    run_id,
-                    ticket,
-                    message,
-                    reply_channel,
-                    seat.seat,
-                    run_id,
-                    ticket
+                    subj, run_id, run_id, ticket, message, reply_channel, seat.seat, run_id, ticket
                 );
 
-                let (slack_delivered, slack_http_code) = if let Some(url) = read_webhook_url(seat.webhook_env) {
-                    post_slack_webhook(&url, &msg)
-                } else {
-                    (false, 0)
-                };
+                let (slack_delivered, slack_http_code) =
+                    if let Some(url) = read_webhook_url(seat.webhook_env) {
+                        post_slack_webhook(&url, &msg)
+                    } else {
+                        (false, 0)
+                    };
 
-                let (email_delivered, email_http_code) = if seat.agentmail_inbox.contains("@agentmail.to") || seat.agentmail_inbox.contains("@mail.grokbot.com") {
-                    send_agentmail(seat.agentmail_inbox, &subj, &msg)
-                } else {
-                    (false, 0)
-                };
+                let (email_delivered, email_http_code) =
+                    if seat.agentmail_inbox.contains("@agentmail.to")
+                        || seat.agentmail_inbox.contains("@mail.grokbot.com")
+                    {
+                        send_agentmail(seat.agentmail_inbox, &subj, &msg)
+                    } else {
+                        (false, 0)
+                    };
 
                 receipts.push(json!({
                     "seat": seat.seat,
@@ -1573,7 +1648,11 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "reply_channel": reply_channel,
                 "receipts": receipts
             });
-            let _ = writeln!(stdout, "{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_default()
+            );
             0
         }
         _ => {

@@ -28,10 +28,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn user_home() -> String { std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned()) }
-fn default_repo_root() -> String { format!("{}/WORKSPACE/chinwag", user_home()) }
-fn default_planner_db() -> String { format!("{}/WORKSPACE/delivery-planner/data/planner.sqlite", user_home()) }
-fn default_leann_path() -> String { format!("{}/WORKSPACE/chinwag/.chinwag/memory.crdb.leann", user_home()) }
+fn user_home() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned())
+}
+fn default_repo_root() -> String {
+    format!("{}/WORKSPACE/chinwag", user_home())
+}
+fn default_planner_db() -> String {
+    format!(
+        "{}/WORKSPACE/delivery-planner/data/planner.sqlite",
+        user_home()
+    )
+}
+fn default_leann_path() -> String {
+    format!(
+        "{}/WORKSPACE/chinwag/.chinwag/memory.crdb.leann",
+        user_home()
+    )
+}
 const DEFAULT_COMMIT_SHA: &str = "b1745094d9cb9014361fca30c7de3535c140dd20";
 const MAX_CRDB_TEXT_BYTES: usize = 60_000;
 
@@ -817,11 +831,17 @@ pub fn recall_for_agent_prompt(agent_lower: &str, query: &str, repo_root: &Path)
     };
     let mut lines = Vec::new();
     for item in items.iter().take(8) {
-        let cat = item.get("category").and_then(Json::as_str).unwrap_or("memory");
+        let cat = item
+            .get("category")
+            .and_then(Json::as_str)
+            .unwrap_or("memory");
         let scope = item.get("file_scope").and_then(Json::as_str).unwrap_or("*");
         let text = item.get("content").and_then(Json::as_str).unwrap_or("");
         if !text.is_empty() {
-            lines.push(format!("- [{cat} | scope:{scope}] {}", truncate_utf8(text, 360)));
+            lines.push(format!(
+                "- [{cat} | scope:{scope}] {}",
+                truncate_utf8(text, 360)
+            ));
         }
     }
     lines.join("\n")
@@ -880,11 +900,7 @@ pub fn retain_from_agent_dispatch(
     let _ = run_python_sqlite(PY_SCHEMA_AND_OPS, &payload);
 }
 
-pub fn run_memory(
-    request: MemoryRequest,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> u8 {
+pub fn run_memory(request: MemoryRequest, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     let repo_root = resolve_repo_root(request.crdb.as_deref());
     let ts_ms = now_ms();
 
@@ -988,8 +1004,9 @@ pub fn run_memory(
             let act = attempted_action
                 .unwrap_or_else(|| format!("Modifying {file_scope} with rejected pattern"));
             let fail = failure.unwrap_or_else(|| reason.clone());
-            let alt = alternative
-                .unwrap_or_else(|| "Follow active verified_invariants in .chinwag/state.crdb".to_owned());
+            let alt = alternative.unwrap_or_else(|| {
+                "Follow active verified_invariants in .chinwag/state.crdb".to_owned()
+            });
             let ev_hash = format!(
                 "sha256:{}",
                 short_hash(&[&id, &file_scope, &reason, &source_commit], ts_ms)

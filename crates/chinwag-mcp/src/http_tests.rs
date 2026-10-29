@@ -15,7 +15,8 @@ use zeroize::Zeroizing;
 /// asserts on them must run alone. Fixtures hold this guard for their lifetime.
 pub(crate) fn serialize_native_probe() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 struct Fixture {
