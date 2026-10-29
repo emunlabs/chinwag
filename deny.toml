@@ -34,8 +34,8 @@ allow = [
 exceptions = [
   { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
   # Added with the Linux/Windows targets (FLINT fix). Build-time-only dependency of the GTK stack;
-  # Apache-2.0 plus the LLVM exception is strictly more permissive than Apache-2.0. Needs Brian's
-  # sign-off like the other entries here; drop it if the policy should not admit this license.
+  # Apache-2.0 plus the LLVM exception is strictly more permissive than Apache-2.0. Brian approved
+  # this scoped exception on 2026-10-28 (target-lexicon@0.12.16 only, build-time GTK stack).
   { crate = "target-lexicon@0.12.16", allow = ["Apache-2.0 WITH LLVM-exception"] },
 ]
 # Forbidden by policy (cargo-deny has no deny list for licenses, so this is enforced by omission):

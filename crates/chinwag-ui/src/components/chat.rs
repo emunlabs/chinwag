@@ -1,4 +1,5 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 use crate::{contracts::CommsChannelMessage, view_model::LoadState};
 use dioxus::prelude::*;

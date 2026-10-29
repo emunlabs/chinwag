@@ -1,4 +1,5 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 //! Typed routing and the comms controller. Components contain no HTTP calls.
 use crate::{
@@ -103,11 +104,11 @@ fn CommsPage(selected: Option<String>) -> Element {
         let Some(channel_id) = send_channel.as_deref() else {
             return;
         };
-        let Ok(input) = composer.write().begin(channel_id) else {
+        let Ok(request) = composer.write().begin(channel_id) else {
             return;
         };
         spawn(async move {
-            match send_comms(input).await {
+            match send_comms(request).await {
                 Ok(response) => {
                     snapshot.set(Some(response.wiretaps));
                     composer.write().finish(Ok(()));

@@ -1,4 +1,5 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 //! Pure view state; no renderer or network dependencies.
 #[derive(Clone, Debug, PartialEq)]
@@ -8,7 +9,7 @@ pub enum LoadState<T> {
     Ready(T),
 }
 
-use crate::contracts::{ChannelInput, CommsChannel, WiretapsData};
+use crate::contracts::{CommsChannel, SendRequest, WiretapsData};
 
 pub fn selected_channel<'a>(data: &'a WiretapsData, id: &str) -> Option<&'a CommsChannel> {
     data.channels.iter().find(|channel| channel.id == id)
@@ -28,18 +29,13 @@ impl ComposerState {
             && self.draft.trim().encode_utf16().count() <= 8_000
     }
 
-    pub fn begin(&mut self, channel_id: &str) -> Result<ChannelInput, String> {
+    pub fn begin(&mut self, channel_id: &str) -> Result<SendRequest, String> {
         if self.sending {
             return Err("A message is already being sent.".into());
         }
-        let input = ChannelInput {
+        let input = SendRequest {
             channel_id: channel_id.into(),
             body: self.draft.clone(),
-            sender: None,
-            sender_cast: None,
-            role: None,
-            engine: None,
-            item_key: None,
         }
         .normalized();
         match input {

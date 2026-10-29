@@ -1,7 +1,8 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 //! Native planner adapter; configuration and errors never expose URLs or response bodies.
-use crate::contracts::{ChannelInput, ChannelResponse, WiretapsData};
+use crate::contracts::{ChannelResponse, SendRequest, WiretapsData};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -81,8 +82,9 @@ impl PlannerClient {
         Self::decode(response).await
     }
 
-    pub async fn send(&self, input: ChannelInput) -> Result<ChannelResponse, String> {
-        let input = input.normalized()?;
+    /// Builds the planner request here, with no client-supplied actor fields.
+    pub async fn send(&self, request: SendRequest) -> Result<ChannelResponse, String> {
+        let input = request.into_channel_input().normalized()?;
         let response = self.http.post(self.endpoint("/api/comms/channel")?).json(&input).send().await
             .map_err(|_| "Send was not confirmed. Check the channel before retrying; the planner may have accepted it.".to_owned())?;
         let result: ChannelResponse = Self::decode(response).await?;

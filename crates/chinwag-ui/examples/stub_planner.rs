@@ -1,4 +1,5 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 //! Synthetic, in-memory planner on loopback only. Never contacts another service.
 #[cfg(not(target_arch = "wasm32"))]

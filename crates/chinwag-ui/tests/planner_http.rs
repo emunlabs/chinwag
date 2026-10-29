@@ -1,4 +1,5 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 #![cfg(all(feature = "server", not(target_arch = "wasm32")))]
 use axum::{
@@ -9,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use chinwag_ui::{
-    contracts::{ChannelInput, ChannelResponse, WiretapsData},
+    contracts::{ChannelInput, ChannelResponse, SendRequest, WiretapsData},
     planner::PlannerClient,
     view_model::ComposerState,
 };
@@ -132,4 +133,49 @@ fn configuration_rejects_credentials_and_ambiguous_origins() {
         assert!(PlannerClient::new(value).is_err());
     }
     assert!(PlannerClient::new("https://localhost:5598/").is_ok());
+}
+
+#[tokio::test]
+async fn forged_sender_in_browser_request_is_not_forwarded_to_planner() {
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    async fn capture(
+        State(seen): State<Arc<Mutex<Option<serde_json::Value>>>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> StatusCode {
+        *seen.lock().unwrap() = Some(body);
+        StatusCode::UNPROCESSABLE_ENTITY
+    }
+    let app = Router::new()
+        .route("/api/comms/channel", post(capture))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    // Exactly what a hand-crafted browser POST could carry.
+    let forged: SendRequest = serde_json::from_value(serde_json::json!({
+        "channelId": "fixture-mgmt",
+        "body": "hello",
+        "sender": "BRIAN",
+        "senderCast": "■",
+        "role": "owner",
+        "engine": "forged-engine",
+        "itemKey": "forged-key"
+    }))
+    .unwrap();
+    let _ = PlannerClient::new(&origin).unwrap().send(forged).await;
+    server.abort();
+    let wire = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("planner got a request");
+    assert_eq!(
+        wire,
+        serde_json::json!({"channelId": "fixture-mgmt", "body": "hello"})
+    );
+    for field in ["sender", "senderCast", "role", "engine", "itemKey"] {
+        assert!(wire.get(field).is_none(), "{field} must not be forwarded");
+    }
 }

@@ -1,4 +1,5 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 //! Planner wire contracts. Unknown fields are intentionally accepted by serde.
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,39 @@ pub struct CommsChannelMessage {
     pub body: String,
     pub item_key: Option<String>,
     pub created_at: String,
+}
+
+/// The only message fields a browser may supply. Attribution (sender, cast, role, engine and
+/// item key) is never client-controlled; unknown fields in a request are ignored, not forwarded.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendRequest {
+    pub channel_id: String,
+    pub body: String,
+}
+
+impl SendRequest {
+    /// Build the planner wire request on the server with every actor field unset.
+    pub fn into_channel_input(self) -> ChannelInput {
+        ChannelInput {
+            channel_id: self.channel_id,
+            body: self.body,
+            sender: None,
+            sender_cast: None,
+            role: None,
+            engine: None,
+            item_key: None,
+        }
+    }
+
+    /// Validate and trim at the transport boundary.
+    pub fn normalized(&self) -> Result<Self, String> {
+        let input = self.clone().into_channel_input().normalized()?;
+        Ok(Self {
+            channel_id: input.channel_id,
+            body: input.body,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

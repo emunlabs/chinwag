@@ -1,7 +1,8 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 //! The browser uses same-origin Dioxus calls; only the server contacts the planner.
-use crate::contracts::{ChannelInput, ChannelResponse, WiretapsData};
+use crate::contracts::{ChannelResponse, SendRequest, WiretapsData};
 use dioxus::prelude::*;
 
 #[get("/api/ui/comms")]
@@ -14,10 +15,10 @@ pub async fn load_comms() -> Result<WiretapsData, ServerFnError> {
 }
 
 #[post("/api/ui/comms/send")]
-pub async fn send_comms(input: ChannelInput) -> Result<ChannelResponse, ServerFnError> {
+pub async fn send_comms(request: SendRequest) -> Result<ChannelResponse, ServerFnError> {
     crate::planner::PlannerClient::from_env()
         .map_err(ServerFnError::new)?
-        .send(input)
+        .send(request)
         .await
         .map_err(ServerFnError::new)
 }

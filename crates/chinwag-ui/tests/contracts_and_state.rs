@@ -1,7 +1,8 @@
 // Copyright 2026 Emun Labs, Inc.
+// 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 use chinwag_ui::{
-    contracts::{ChannelInput, ChannelResponse, WiretapsData},
+    contracts::{ChannelInput, ChannelResponse, SendRequest, WiretapsData},
     view_model::{ComposerState, selected_channel},
 };
 
@@ -138,4 +139,27 @@ fn transport_validates_optional_metadata_even_when_constructed_directly() {
     input.sender = None;
     input.sender_cast = Some("invalid".into());
     assert!(input.normalized().is_err());
+}
+
+#[test]
+fn send_request_drops_client_supplied_actor_fields() {
+    let forged: SendRequest = serde_json::from_value(serde_json::json!({
+        "channelId": " test ",
+        "body": " hi ",
+        "sender": "BRIAN",
+        "senderCast": "●",
+        "role": "admin",
+        "engine": "forged",
+        "itemKey": "x"
+    }))
+    .unwrap();
+    let input = forged.normalized().unwrap().into_channel_input();
+    assert_eq!(
+        (input.channel_id.as_str(), input.body.as_str()),
+        ("test", "hi")
+    );
+    assert!(input.sender.is_none() && input.sender_cast.is_none());
+    assert!(input.role.is_none() && input.engine.is_none() && input.item_key.is_none());
+    let wire = serde_json::to_value(&input).unwrap();
+    assert_eq!(wire, serde_json::json!({"channelId": "test", "body": "hi"}));
 }
