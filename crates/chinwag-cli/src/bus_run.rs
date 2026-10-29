@@ -508,6 +508,33 @@ fn compute_message_digest(
 }
 
 fn read_daemon_state(repo_root: &Path) -> Option<DaemonState> {
+    if let Ok(remote_addr) = std::env::var("CHINWAG_BUS_ADDR") {
+        let trimmed = remote_addr.trim();
+        if !trimmed.is_empty() {
+            let endpoint_id = std::env::var("CHINWAG_BUS_ENDPOINT_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| load_or_create_daemon_secret(repo_root).public().to_string());
+            return Some(DaemonState {
+                ok: true,
+                pid: 0,
+                endpoint_id,
+                bound_sockets: vec![trimmed.to_string()],
+                alpns: vec![
+                    "chinwag/bus/1".to_string(),
+                    "chinwag/agent-dispatch/1".to_string(),
+                ],
+                repo_root: repo_root.to_string_lossy().to_string(),
+                tasks_md: repo_root.join("TASKS.md").to_string_lossy().to_string(),
+                messages_jsonl: messages_jsonl_path(repo_root).to_string_lossy().to_string(),
+                started_at: 0,
+                last_heartbeat: unix_now(),
+                total_messages: 0,
+                product_governor: "REMOTE".to_string(),
+                delivery_router: format!("REMOTE ({trimmed})"),
+            });
+        }
+    }
     let raw = fs::read_to_string(daemon_json_path(repo_root)).ok()?;
     let state: DaemonState = serde_json::from_str(&raw).ok()?;
     let status = Command::new("/bin/kill")
