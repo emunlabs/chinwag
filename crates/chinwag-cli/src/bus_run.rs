@@ -237,28 +237,27 @@ fn actor_transport_secret(actor: &str) -> SecretKey {
     SecretKey::from_bytes(&arr)
 }
 
-/// 7-field canonical signing payload binding `id`, `ts_unix`, `sender`, `to`, `room`, `task_id`, and `body` (`BUS-HARDEN-04`).
+/// Unambiguous length-prefixed 7-field canonical signing payload binding
+/// `id`, `ts_unix`, `sender`, `to`, `room`, `task_id`, and `body` (`BUS-HARDEN-04`).
 pub fn canonical_signing_payload(msg: &BusMessage) -> String {
+    let to = msg.to.as_deref().unwrap_or("");
+    let task = msg.task_id.as_deref().unwrap_or("");
+    let ts = msg.ts_unix.to_string();
     format!(
-        "{}:{}:{}:{}:{}:{}:{}",
+        "chinwag-bus-sig-v2|{}:{}|{}:{}|{}:{}|{}:{}|{}:{}|{}:{}|{}:{}",
+        msg.id.len(),
         msg.id,
-        msg.ts_unix,
+        ts.len(),
+        ts,
+        msg.sender.len(),
         msg.sender,
-        msg.to.as_deref().unwrap_or(""),
+        to.len(),
+        to,
+        msg.room.len(),
         msg.room,
-        msg.task_id.as_deref().unwrap_or(""),
-        msg.body
-    )
-}
-
-fn legacy_6_field_signing_payload(msg: &BusMessage) -> String {
-    format!(
-        "{}:{}:{}:{}:{}:{}",
-        msg.id,
-        msg.ts_unix,
-        msg.sender,
-        msg.to.as_deref().unwrap_or(""),
-        msg.room,
+        task.len(),
+        task,
+        msg.body.len(),
         msg.body
     )
 }
@@ -295,8 +294,9 @@ pub fn sign_bus_message(msg: &mut BusMessage, secret: &SecretKey) {
     msg.sig_verified = true;
 }
 
-/// Verifies both (a) the detached Ed25519 signature over `canonical_signing_payload` and
+/// Verifies both (a) the detached Ed25519 signature over the 7-field `canonical_signing_payload` and
 /// (b) that `pubkey_ed25519` is registered for `msg.sender` in `<repo_root>/.chinwag/allowed_signers` (`BUS-HARDEN-04`).
+/// Fails closed if `.chinwag/allowed_signers` is missing, unreadable, empty, or does not map `pubkey` to `msg.sender`.
 pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> bool {
     let (Some(pub_str), Some(sig_str)) = (
         msg.pubkey_ed25519.as_deref(),
@@ -315,35 +315,31 @@ pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> 
     };
     let sig = Signature::from_bytes(&sig_bytes);
     let payload7 = canonical_signing_payload(msg);
-    let crypto_ok = if pubkey.verify(payload7.as_bytes(), &sig).is_ok() {
-        true
-    } else {
-        let payload6 = legacy_6_field_signing_payload(msg);
-        pubkey.verify(payload6.as_bytes(), &sig).is_ok()
-    };
-    if !crypto_ok {
+    if pubkey.verify(payload7.as_bytes(), &sig).is_err() {
         msg.sig_verified = false;
         return false;
     }
 
     let allowed_path = repo_root.join(".chinwag").join("allowed_signers");
-    if allowed_path.is_file()
-        && let Ok(allowed_raw) = fs::read_to_string(&allowed_path)
-    {
-        let signers = chinwag_swarm::identity::parse_allowed_signers(&allowed_raw);
-        if !signers.is_empty() {
-            let sender_norm = msg.sender.trim().to_uppercase();
-            let in_allowed = signers.iter().any(|(seat_opt, bytes)| {
-                bytes == pubkey.as_bytes()
-                    && seat_opt
-                        .as_deref()
-                        .is_none_or(|s| s.eq_ignore_ascii_case(&sender_norm))
-            });
-            if !in_allowed {
-                msg.sig_verified = false;
-                return false;
-            }
-        }
+    let Ok(allowed_raw) = fs::read_to_string(&allowed_path) else {
+        msg.sig_verified = false;
+        return false;
+    };
+    let signers = chinwag_swarm::identity::parse_allowed_signers(&allowed_raw);
+    if signers.is_empty() {
+        msg.sig_verified = false;
+        return false;
+    }
+    let sender_norm = msg.sender.trim().to_uppercase();
+    let in_allowed = signers.iter().any(|(seat_opt, bytes)| {
+        bytes == pubkey.as_bytes()
+            && seat_opt
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&sender_norm))
+    });
+    if !in_allowed {
+        msg.sig_verified = false;
+        return false;
     }
 
     msg.sig_verified = true;
@@ -557,19 +553,33 @@ fn write_daemon_state(repo_root: &Path, state: &DaemonState) {
     }
 }
 
-/// Dynamically discovers active non-loopback IPv4 addresses on this host via `/sbin/ifconfig` (`BUS-HARDEN-05`).
+/// Dynamically discovers active (`UP` + `RUNNING`) non-loopback IPv4 addresses on this host via `/sbin/ifconfig` (`BUS-HARDEN-05`).
 pub fn discover_non_loopback_ipv4() -> Vec<String> {
     let mut ips = Vec::new();
     let Ok(out) = Command::new("/sbin/ifconfig").output() else {
         return ips;
     };
+    if !out.status.success() {
+        return ips;
+    }
     let text = String::from_utf8_lossy(&out.stdout);
+    let mut iface_active = false;
     for line in text.lines() {
+        if !line.starts_with('\t') && !line.starts_with(' ') && line.contains("flags=") {
+            let has_up =
+                line.contains("<UP,") || line.contains(",UP,") || line.contains(",UP>");
+            let has_running = line.contains("RUNNING");
+            iface_active = has_up && has_running;
+        }
+        if !iface_active {
+            continue;
+        }
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("inet ")
             && let Some(ip_tok) = rest.split_whitespace().next()
-            && ip_tok != "127.0.0.1"
-            && ip_tok.parse::< std::net::Ipv4Addr>().is_ok()
+            && let Ok(ipv4) = ip_tok.parse::<std::net::Ipv4Addr>()
+            && !ipv4.is_loopback()
+            && !ipv4.is_unspecified()
             && !ips.iter().any(|existing| existing == ip_tok)
         {
             ips.push(ip_tok.to_string());
@@ -585,10 +595,7 @@ async fn bind_bus_endpoint(
     port: u16,
     lookup: MemoryLookup,
 ) -> Result<Endpoint, String> {
-    let addr: SocketAddr = format!("0.0.0.0:{port}")
-        .parse()
-        .map_err(|e| format!("invalid socket addr: {e}"))?;
-    Endpoint::builder(presets::Minimal)
+    let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .clear_address_lookup()
         .address_lookup(lookup)
@@ -596,13 +603,20 @@ async fn bind_bus_endpoint(
         .alpns(vec![
             BUS_ALPN.to_vec(),
             chinwag_swarm::dispatch_wire::ALPN.to_vec(),
-        ])
-        .clear_ip_transports()
-        .bind_addr(addr)
-        .map_err(|e| format!("bind_addr failed on {addr}: {e}"))?
+        ]);
+    if port != 0 {
+        let addr: SocketAddr = format!("0.0.0.0:{port}")
+            .parse()
+            .map_err(|e| format!("invalid socket addr: {e}"))?;
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr(addr)
+            .map_err(|e| format!("bind_addr failed on {addr}: {e}"))?;
+    }
+    builder
         .bind()
         .await
-        .map_err(|e| format!("endpoint bind failed on {addr}: {e}"))
+        .map_err(|e| format!("endpoint bind failed on port {port}: {e}"))
 }
 
 async fn publish_over_iroh_quic(
@@ -1175,7 +1189,7 @@ fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) ->
         &format!("COMPLETED {task_id}: {summary}"),
     );
 
-    let short_summary: String = collapsed.chars().take(600).collect();
+    let short_summary: String = collapsed.chars().take(1800).collect();
     let _ = send_bus_message_sync(
         repo_root,
         "DELIVERY",
@@ -1214,6 +1228,7 @@ fn spawn_seat_workstream(repo_root: &Path, seat: &str, task_id: &str, prompt: &s
                 "PATH",
                 "/opt/homebrew/opt/rustup/bin:/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/bin:/bin",
             )
+            .env("RUSTUP_TOOLCHAIN", "1.97.1")
             .env("RUSTC", "/opt/homebrew/opt/rustup/bin/rustc")
             .env("CARGO", "/opt/homebrew/opt/rustup/bin/cargo")
             .env(
@@ -1638,12 +1653,36 @@ mod tests {
             sig_verified: false,
         };
         sign_bus_message(&mut msg, &secret);
+
+        // Missing .chinwag/allowed_signers -> must fail closed
+        assert!(!verify_detached_bus_signature(temp.path(), &mut msg));
+
+        // Populate .chinwag/allowed_signers for ARCHITECT
+        let ssh_pub = ssh_key::PublicKey::from(
+            ssh_key::public::Ed25519PublicKey(*secret.public().as_bytes()),
+        );
+        let openssh_line = ssh_pub.to_openssh().unwrap();
+        let chinwag_dir = temp.path().join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::write(
+            chinwag_dir.join("allowed_signers"),
+            format!("architect-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ARCHITECT\n"),
+        )
+        .unwrap();
+
+        // Valid 7-field signature + registered seat in allowed_signers passes
         assert!(verify_detached_bus_signature(temp.path(), &mut msg));
 
         // Tamper with task_id -> 7-field signature must fail closed
         let mut tampered_task = msg.clone();
         tampered_task.task_id = Some("TASK-99".to_string());
         assert!(!verify_detached_bus_signature(temp.path(), &mut tampered_task));
+
+        // Colon-shifting between task_id and body -> length-prefixed payload must fail closed
+        let mut colon_shift = msg.clone();
+        colon_shift.task_id = Some("TASK-15:Verified".to_string());
+        colon_shift.body = " detached Ed25519 signature + allowed_signers".to_string();
+        assert!(!verify_detached_bus_signature(temp.path(), &mut colon_shift));
 
         // Tamper with body -> verification must fail closed
         msg.body.push_str(" tampered");

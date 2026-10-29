@@ -282,23 +282,22 @@ pub fn verify_plugin_manifest_json(repo_root: &Path, raw_json: &str) -> Result<V
         .map_err(|_| "Ed25519 signature verification failed".to_string())?;
 
     let allowed_path = repo_root.join(".chinwag").join("allowed_signers");
-    if allowed_path.is_file()
-        && let Ok(allowed_raw) = fs::read_to_string(&allowed_path)
-    {
-        let signers = chinwag_swarm::identity::parse_allowed_signers(&allowed_raw);
-        if !signers.is_empty() {
-            let matched = signers.iter().any(|(seat_opt, bytes)| {
-                bytes == pubkey.as_bytes()
-                    && seat_opt
-                        .as_deref()
-                        .is_none_or(|s| s.eq_ignore_ascii_case(signer_seat))
-            });
-            if !matched {
-                return Err(format!(
-                    "signer_pubkey_ed25519 for {signer_seat} is not registered in .chinwag/allowed_signers"
-                ));
-            }
-        }
+    let allowed_raw = fs::read_to_string(&allowed_path)
+        .map_err(|_| "missing or unreadable .chinwag/allowed_signers".to_string())?;
+    let signers = chinwag_swarm::identity::parse_allowed_signers(&allowed_raw);
+    if signers.is_empty() {
+        return Err(".chinwag/allowed_signers contains no valid signers".to_string());
+    }
+    let matched = signers.iter().any(|(seat_opt, bytes)| {
+        bytes == pubkey.as_bytes()
+            && seat_opt
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(signer_seat))
+    });
+    if !matched {
+        return Err(format!(
+            "signer_pubkey_ed25519 for {signer_seat} is not registered in .chinwag/allowed_signers"
+        ));
     }
 
     Ok(v)
@@ -315,26 +314,44 @@ pub fn run_plugin_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
         .join(".chinwag")
         .join("plugins")
         .join("com.emunlabs.breakroom.cwplugin");
-    let _ = fs::create_dir_all(&repo_plugin_dir);
     let manifest_path = repo_plugin_dir.join("manifest.json");
 
-    // Ensure a cryptographically signed manifest exists (upgrading any unsigned legacy stub)
-    let needs_init = match fs::read_to_string(&manifest_path) {
-        Ok(existing) => verify_plugin_manifest_json(&repo_root, &existing).is_err(),
-        Err(_) => true,
-    };
-    if needs_init {
+    if sub == "init" && !manifest_path.exists() {
+        let _ = fs::create_dir_all(&repo_plugin_dir);
         let signed_manifest = build_signed_breakroom_manifest("ALISTAIR");
         if let Ok(text) = serde_json::to_string_pretty(&signed_manifest) {
             let _ = fs::write(&manifest_path, &text);
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let user_plugin_dir = PathBuf::from(format!("{home}/.chinwag/plugins/breakroom"));
-            let _ = fs::create_dir_all(&user_plugin_dir);
-            let _ = fs::write(user_plugin_dir.join("manifest.json"), &text);
         }
     }
 
-    let raw_manifest = fs::read_to_string(&manifest_path).unwrap_or_default();
+    let raw_manifest = match fs::read_to_string(&manifest_path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            if is_json {
+                let payload = json!({
+                    "ok": false,
+                    "command": format!("chinwag plugin {sub}"),
+                    "plugin_id": "com.emunlabs.breakroom",
+                    "manifest_path": manifest_path.to_string_lossy(),
+                    "ed25519_verified": false,
+                    "allowed_signers_verified": false,
+                    "error": format!("missing or unreadable manifest.json: {e}")
+                });
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(
+                    stderr,
+                    "chinwag plugin {sub}: missing or unreadable manifest at {}",
+                    manifest_path.display()
+                );
+            }
+            return 1;
+        }
+    };
     let verification = verify_plugin_manifest_json(&repo_root, &raw_manifest);
 
     let enterprise_policy = Path::new("/etc/chinwag/enterprise-policy.toml");
@@ -404,7 +421,24 @@ pub fn run_plugin_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
                 if airgap_locked { 1 } else { 0 }
             }
             Err(err_msg) => {
-                let _ = writeln!(stderr, "chinwag plugin {sub} failed: {err_msg}");
+                if is_json {
+                    let payload = json!({
+                        "ok": false,
+                        "command": format!("chinwag plugin {sub}"),
+                        "plugin_id": "com.emunlabs.breakroom",
+                        "manifest_path": manifest_path.to_string_lossy(),
+                        "ed25519_verified": false,
+                        "allowed_signers_verified": false,
+                        "error": err_msg
+                    });
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    );
+                } else {
+                    let _ = writeln!(stderr, "chinwag plugin {sub} failed: {err_msg}");
+                }
                 1
             }
         },
@@ -584,14 +618,57 @@ mod tests {
         let manifest = build_signed_breakroom_manifest("ALISTAIR");
         let raw = serde_json::to_string_pretty(&manifest).unwrap();
 
-        // Valid signed manifest passes verification
+        // Missing .chinwag/allowed_signers -> fails closed
+        assert!(verify_plugin_manifest_json(temp.path(), &raw).is_err());
+
+        // Populate .chinwag/allowed_signers with ALISTAIR's public key
+        let pub_hex = manifest["signer_pubkey_ed25519"].as_str().unwrap();
+        let endpoint_id: EndpointId = pub_hex.parse().unwrap();
+        let ssh_pub = ssh_key::PublicKey::from(
+            ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()),
+        );
+        let openssh_line = ssh_pub.to_openssh().unwrap();
+        let chinwag_dir = temp.path().join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::write(
+            chinwag_dir.join("allowed_signers"),
+            format!("alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"),
+        )
+        .unwrap();
+
+        // Valid signed manifest + registered signer passes verification
         assert!(verify_plugin_manifest_json(temp.path(), &raw).is_ok());
 
-        // Tamper with version -> fails closed
+        // Tamper with version on disk and verify run_plugin_cli fails closed WITHOUT overwriting it
+        let plugin_dir = chinwag_dir
+            .join("plugins")
+            .join("com.emunlabs.breakroom.cwplugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
         let mut tampered_ver = manifest.clone();
         tampered_ver["version"] = json!("9.9.9-rogue");
-        let raw_ver = serde_json::to_string(&tampered_ver).unwrap();
-        assert!(verify_plugin_manifest_json(temp.path(), &raw_ver).is_err());
+        let raw_ver = serde_json::to_string_pretty(&tampered_ver).unwrap();
+        let manifest_file = plugin_dir.join("manifest.json");
+        fs::write(&manifest_file, &raw_ver).unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_plugin_cli(
+            &[
+                "verify".to_string(),
+                "--repo".to_string(),
+                temp.path().to_string_lossy().to_string(),
+                "--json".to_string(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 1);
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["ed25519_verified"], false);
+        // Ensure tampered manifest on disk was NOT overwritten
+        let disk_after = fs::read_to_string(&manifest_file).unwrap();
+        assert!(disk_after.contains("9.9.9-rogue"));
 
         // Tamper with signature bytes -> fails closed
         let mut tampered_sig = manifest.clone();
