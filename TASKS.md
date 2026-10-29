@@ -1,8 +1,8 @@
 # CHINWAG CANONICAL TASK & FLEET UTILIZATION BOARD (`TASKS.md`)
 
-> **Single Source of Truth (`INV-TASKS-MD-01`)** — Maintained continuously by **`■ PRODUCT` (Utilization & Backlog Governor)** and **`■ DELIVERY` (Work-Stream Router & Bus Coordinator)** over the native `iroh` Multi-Party Messaging Bus (`ALPN: chinwag/bus/1` + `iroh_gossip::ALPN`).
+> **Single Source of Truth (`INV-TASKS-MD-01`)** — Maintained continuously by **`■ PRODUCT` (Utilization & Backlog Governor)** and **`■ DELIVERY` (Work-Stream Router & Bus Coordinator)** over the native `iroh` Multi-Party Messaging Bus (`ALPN: chinwag/bus/1` + `chinwag/agent-dispatch/1` on `0.0.0.0:44330`).
 > - **Zero Web-UI Dependency:** Any human (`● Brian`, `● Nic`) or agent (`■ GEMINI-PM`, `■ PRODUCT`, `■ DELIVERY`, `■ RUST`, `■ ARCHITECT`, `■ FLINT`, `■ QA`, `■ ALISTAIR`) can inspect tasks here and communicate over `chinwag bus send` / `chinwag bus tail` / `chinwag bus inbox`.
-> - **Utilization Mandate (`INV-UTIL-01`):** `■ PRODUCT` enforces `<60s` idle tolerance for `GPT (Codex)` and `■ FLINT` whenever `READY` engineering or verification tasks exist in this file. `■ DELIVERY` automatically routes work streams, spawns/monitors execution, and posts signed receipts to `.chinwag/bus/messages.jsonl` and `.chinwag/state.crdb`.
+> - **Utilization Mandate (`INV-UTIL-01` — "Always Be Working"):** `■ PRODUCT` enforces `0%` idle tolerance (`45s` autonomous governor loop `CHWG-CONTINUOUS-LOOP-01`) for `GPT (Codex)` (`■ RUST`, `■ ARCHITECT`, `■ ALISTAIR`), `■ FLINT` (`100.108.108.25:11500`), and `■ QA`. Every bus message is signed with the seat's Ed25519 key (`✓ed25519`) and formatted in local Austin Central Time (`CDT`).
 
 ---
 
@@ -10,87 +10,92 @@
 
 | Seat / Handle | Engine & Host | Role / Lane | Utilization Status | Active Task | Last Bus Heartbeat |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`■ PRODUCT`** | `chinwag bus daemon` · Mac Studio | Fleet Utilization Governor & Backlog Prioritizer | **ACTIVE (`100%` Always-On)** | `TASK-00` (Continuous Utilization Watch) | `2026-10-29T14:43:00-05:00` |
-| **`■ DELIVERY`** | `chinwag bus daemon` · Mac Studio | Work-Stream Router & Multi-Party Bus Dispatcher | **ACTIVE (`100%` Always-On)** | `TASK-00` (Continuous Work-Stream Routing) | `2026-10-29T14:43:00-05:00` |
-| **`■ GEMINI-PM`** | `Gemini 4 Argon / Opus 5.5` · Mac Studio | Portfolio PM & Architecture Coordinator | **ACTIVE (`100%`)** | `TASK-01` & `TASK-02` (`iroh` Bus Unification) | `2026-10-29T14:43:00-05:00` |
-| **`■ RUST` (`GPT`)** | `Codex CLI (gpt-6.1-sol)` · Mac Studio | Core Rust Systems (`chinwag-cli`, `chinwag-swarm`, `chinwag-claim`) | **DISPATCHING -> IN_PROGRESS** | `TASK-03` (`chinwag openspec sync` + Bus Tests) | `2026-10-29T14:43:00-05:00` |
-| **`■ ARCHITECT` (`GPT`)** | `Codex CLI (gpt-6.1-sol)` · Mac Studio | Protocol & Containment (`CHWG-BOX-1`, `A.509`, `iroh` Wire) | **DISPATCHING -> IN_PROGRESS** | `TASK-04` (`CHWG-BOX-1` Two-Horizon Lease Audit & Tests) | `2026-10-29T14:43:00-05:00` |
-| **`■ FLINT`** | `flint-agent` · MacBook Pro (`100.108.108.25:11500`) | Adversarial Code Review, Clippy/Test Gate & Diff Audit | **DISPATCHING -> IN_PROGRESS** | `TASK-05` (Adversarial Audit of `iroh` Bus & `seat_signing`) | `2026-10-29T14:43:00-05:00` |
-| **`■ QA`** | `Claude / Cleanroom Runner` · Mac Studio + MBP | Workspace Test Suite, `chinwag ui-gate` & Cleanroom Verification | **READY -> QUEUED** | `TASK-06` (Full Workspace `cargo test` & `ui-gate` Sweep) | `2026-10-29T14:43:00-05:00` |
-| **`■ ALISTAIR`** | `Claude / Security Auditor` · Mac Studio | Ed25519 Per-Seat Signing, Seatbelt SBPL & `allowed_signers` | **READY -> QUEUED** | `TASK-07` (`allowed_signers` & `iroh` Replay-Cache Verification) | `2026-10-29T14:43:00-05:00` |
+| **`■ PRODUCT`** | `chinwag bus daemon` · Mac Studio (`0.0.0.0:44330`) | Fleet Utilization Governor & Backlog Prioritizer | **ACTIVE (`100%` Always-On 45s Loop)** | `TASK-11` (`CHWG-CONTINUOUS-LOOP-01`) | `2026-10-29T18:07:00 CDT` |
+| **`■ DELIVERY`** | `chinwag bus daemon` · Mac Studio (`0.0.0.0:44330`) | Work-Stream Router & Multi-Party Bus Dispatcher | **ACTIVE (`100%` Always-On 45s Loop)** | `TASK-11` (`CHWG-CONTINUOUS-LOOP-01`) | `2026-10-29T18:07:00 CDT` |
+| **`■ GEMINI-PM`** | `Gemini 4 Argon / Opus 5.5` · Mac Studio | Portfolio PM & Architecture Coordinator | **ACTIVE (`100%`)** | `TASK-08`..`TASK-14` Orchestration | `2026-10-29T18:07:00 CDT` |
+| **`■ RUST` (`GPT`)** | `Codex CLI (gpt-6.1-sol)` · Mac Studio | Core Rust Systems (`chinwag-cli`, `chinwag-swarm`, `chinwag-claim`) | **ACTIVE (`IN_PROGRESS`)** | `TASK-08` & `TASK-12` (`BUS-HARDEN-01` + `openspec`) | `2026-10-29T18:07:00 CDT` |
+| **`■ ARCHITECT` (`GPT`)** | `Codex CLI (gpt-6.1-sol)` · Mac Studio | Protocol & Containment (`CHWG-BOX-1`, `CHWG-PLUGIN-1`, `iroh`) | **ACTIVE (`IN_PROGRESS`)** | `TASK-09` & `TASK-13` (`BUS-HARDEN-02` + `plugin`) | `2026-10-29T18:07:00 CDT` |
+| **`■ FLINT`** | `flint-agent` · MacBook Pro (`100.108.108.25:11500`) | Adversarial Code Review, Clippy/Test Gate & Diff Audit | **ACTIVE (`IN_PROGRESS`)** | `TASK-10` (`BUS-HARDEN-03` Re-Audit) | `2026-10-29T18:07:00 CDT` |
+| **`■ ALISTAIR`** | `Codex / Claude Security Auditor` · Mac Studio | Ed25519 Per-Seat Signing, Seatbelt SBPL & `allowed_signers` | **ACTIVE (`IN_PROGRESS`)** | `TASK-07` & `TASK-14` (`allowed_signers` + `a509`) | `2026-10-29T18:07:00 CDT` |
+| **`■ QA`** | `Cleanroom Runner / Flint Gate` · Mac Studio + MBP | Workspace Test Suite, `chinwag ui-gate` & Cleanroom Verification | **ACTIVE (`IN_PROGRESS`)** | `TASK-06` (`ui-gate` & Full CLI Test Sweep) | `2026-10-29T18:07:00 CDT` |
 
 ---
 
-## 2. Quick-Reference: Multi-Party `iroh` Bus CLI Commands (`chinwag bus`)
+## 2. Quick-Reference: Multi-Party `iroh` Bus & Feature CLI Commands
 
 ```bash
-# 1. Check live iroh QUIC EndpointId, bound UDP ports, room counts & agent utilization:
+# 1. Check live iroh QUIC EndpointId, bound UDP sockets (0.0.0.0:44330), Ed25519 verified count & utilization:
 chinwag bus status
 
-# 2. Send a multi-party message to #mgmt or #eng (auto-signed + broadcast over iroh QUIC):
-chinwag bus send --from Brian --room "#mgmt" "Status check: GPT and FLINT report progress on TASK-03 and TASK-05"
-chinwag bus send --from PRODUCT --room "#eng" --task TASK-03 "@RUST @FLINT utilization check — post your current commit and test status"
+# 2. Send an Ed25519-signed multi-party message to #mgmt, #eng, or #qa:
+chinwag bus send --from Brian --room "#mgmt" "Status check: report progress on TASK-06 through TASK-14"
 
-# 3. Tail multi-party messages across all rooms (#mgmt, #eng, #qa) in real time:
+# 3. Tail multi-party messages in local Central Time (CDT) with ✓ed25519 verification badges:
+chinwag bus tail --limit 25
 chinwag bus tail -f
-chinwag bus tail --room "#eng" --limit 25
 
-# 4. Read inbox messages addressed to a specific seat or human:
-chinwag bus inbox --for Brian
-chinwag bus inbox --for FLINT
-
-# 5. Trigger PRODUCT + DELIVERY to immediately wake idle seats (GPT/Codex & FLINT) on READY tasks:
+# 4. Trigger PRODUCT + DELIVERY to immediately wake all seats on active tasks:
 chinwag bus wake
+
+# 5. Run the new OpenSpec, Plugin (.cwplugin), and A.509 Passport CLIs (TASK-12, TASK-13, TASK-14):
+chinwag openspec validate --json
+chinwag plugin verify --json
+chinwag a509 verify --json
 ```
 
 ---
 
-## 3. Active Engineering Sprint Queue (`P0` — Core `chinwag` & Multi-Party `iroh` Bus)
+## 3. Completed Foundation Tasks (`TASK-01` .. `TASK-05`)
 
-### `[DONE]` `TASK-01` — Unify Unmerged Branches onto `main` (`CHWG-MAIN-UNIFY-1`)
-- **Owner:** `■ GEMINI-PM` + `■ DELIVERY`
-- **Scope:** Merge `origin/main` (`2c83a00` `CHWG-DIOXUS-1`), `chore/chwg-main-hygiene-1` (`ea932e6`), `feat/per-seat-signing` (`9b91f20`), `chore/per-agent-signing` (`0bf1f36`), and `feat/iroh-agent-dispatch` (`e1ce24a`) cleanly onto `main` in `/Users/brianspector/WORKSPACE/chinwag`.
-- **Acceptance Gate:** Zero merge conflicts, `cargo check --bin chinwag` passes under `rustc 1.97.1`.
+- **`[DONE]` `TASK-01` (`CHWG-MAIN-UNIFY-1`):** Unified `origin/main`, `chore/chwg-main-hygiene-1`, `feat/per-seat-signing`, `chore/per-agent-signing`, and `feat/iroh-agent-dispatch` onto `main`.
+- **`[DONE]` `TASK-02` (`CHWG-IROH-BUS-1`):** Built multi-party `iroh` QUIC bus (`ALPN: chinwag/bus/1`) + `docs/iroh-multiparty-bus-and-tasks-router-v1.md`.
+- **`[DONE]` `TASK-03` (`CHWG-OPENSPEC-CLI-1`):** Verified `seat_signing` and `ui_gate` integration suites (`■ RUST`).
+- **`[DONE]` `TASK-04` (`CHWG-SWARM-VERIFY-1`):** Verified `chinwag-swarm` `dispatch_wire` and `chinwag-claim` two-horizon lease tests (`■ ARCHITECT`).
+- **`[DONE]` `TASK-05` (`CHWG-FLINT-AUDIT-1`):** Completed adversarial audit (`■ FLINT` `#013`), surfacing `BUS-HARDEN-01..03`.
 
-### `[IN_PROGRESS]` `TASK-02` — Zero-Friction Multi-Party `iroh` Messaging Bus & Always-On `PRODUCT`/`DELIVERY` Daemon (`CHWG-IROH-BUS-1`)
-- **Owner:** `■ GEMINI-PM` + `■ DELIVERY` + `■ PRODUCT`
-- **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-cli/src/main.rs`, `.chinwag/bus/messages.jsonl`
-- **Scope:**
-  1. Bind a persistent `iroh::Endpoint` (`ALPN: chinwag/bus/1` + `iroh_gossip::ALPN`) on UDP/QUIC (`127.0.0.1:44330` + LAN interface) so every participant shares a live multi-party message bus without needing 6 manual CLI flags.
-  2. Support `chinwag bus daemon`, `chinwag bus send`, `chinwag bus tail`, `chinwag bus inbox`, `chinwag bus status`, and `chinwag bus wake`.
-  3. Embed the **`■ PRODUCT` Utilization Governor** + **`■ DELIVERY` Work-Stream Router** loop inside `chinwag bus daemon` so idle `GPT (Codex)` and `■ FLINT` engines are automatically assigned work from `TASKS.md` and post multi-party status updates onto the bus.
-- **Acceptance Gate:** `chinwag bus status` shows `ONLINE` with bound `iroh` `EndpointId`; `chinwag bus send` and `chinwag bus tail` exchange multi-party messages across `● Brian`, `■ PRODUCT`, `■ DELIVERY`, `■ GEMINI-PM`, `■ RUST (GPT)`, and `■ FLINT`.
+---
 
-### `[IN_PROGRESS]` `TASK-03` — `GPT (Codex)` Work Stream A: `chinwag bus` Integration Tests & `chinwag openspec` Spec-Sync Scaffolding (`CHWG-OPENSPEC-CLI-1`)
-- **Owner:** `■ RUST` (`GPT / Codex CLI`)
-- **Routed By:** `■ DELIVERY` (Assigned via `chinwag bus`)
-- **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-cli/tests/`
-- **Scope:**
-  1. Verify `crates/chinwag-cli` compiles cleanly with zero clippy warnings (`cargo clippy -p chinwag-cli -- -D warnings`).
-  2. Run and verify `seat_signing` and `ui_gate` integration tests (`cargo test -p chinwag-cli --test seat_signing --test ui_gate`) and post the test receipt directly to `#eng` via `chinwag bus send --from RUST --room "#eng" --task TASK-03`.
+## 4. Phase 1.1 Hardening & CLI Feature Sprint (`TASK-06` .. `TASK-14`)
 
-### `[IN_PROGRESS]` `TASK-04` — `GPT (Codex)` Work Stream B: `chinwag-swarm` `iroh` Wire & Two-Horizon Claim Verification (`CHWG-SWARM-VERIFY-1`)
-- **Owner:** `■ ARCHITECT` (`GPT / Codex CLI`)
-- **Routed By:** `■ DELIVERY` (Assigned via `chinwag bus`)
-- **Files:** `crates/chinwag-swarm/src/dispatch_wire.rs`, `crates/chinwag-claim/src/lib.rs`
-- **Scope:**
-  1. Run `cargo test -p chinwag-swarm -p chinwag-claim` and verify the `iroh` `ALPN chinwag/agent-dispatch/1` wire framing, Ed25519 signature verification, and replay-cache invariants.
-  2. Post the architectural verification receipt to `#eng` and `#mgmt` via `chinwag bus send --from ARCHITECT --room "#eng" --task TASK-04`.
-
-### `[IN_PROGRESS]` `TASK-05` — `■ FLINT` Work Stream: Adversarial Security & Code Quality Audit of Unified `main` (`CHWG-FLINT-AUDIT-1`)
-- **Owner:** `■ FLINT` (`flint-agent` · `http://100.108.108.25:11500/v1`)
-- **Routed By:** `■ PRODUCT` + `■ DELIVERY` (Assigned via `chinwag bus`)
-- **Files:** `crates/chinwag-cli/src/seat_signing.rs`, `crates/chinwag-cli/src/dispatch_listen.rs`, `crates/chinwag-cli/src/bus_run.rs`
-- **Scope:**
-  1. Perform an adversarial review of the newly merged `seat_signing.rs`, `dispatch_listen.rs`, and `bus_run.rs` on `main`.
-  2. Post concrete findings/verdict (`PASS` or `BLOCKERS`) to `#eng` and `#mgmt` via `chinwag bus send --from FLINT --room "#eng" --task TASK-05`.
-
-### `[READY]` `TASK-06` — Workspace `chinwag ui-gate` & Cleanroom Determinism Sweep (`CHWG-QA-SWEEP-1`)
+### `[IN_PROGRESS]` `TASK-06` (`CHWG-QA-SWEEP-1`) — Workspace `chinwag ui-gate` & CLI Determinism Sweep
 - **Owner:** `■ QA`
-- **Routed By:** `■ DELIVERY`
-- **Scope:** Execute `chinwag ui-gate --repo /Users/brianspector/WORKSPACE/chinwag --json` and verify exit code `0` with all required invariants green.
+- **Scope:** Execute `chinwag ui-gate --json`, `chinwag openspec validate --json`, `chinwag plugin verify --json`, `chinwag a509 verify --json`, and `cargo test -p chinwag-cli`, posting QA gate receipt to `#qa` and `#mgmt`.
 
-### `[READY]` `TASK-07` — Per-Seat Ed25519 `allowed_signers` & `A.509` Key Alignment (`CHWG-SIGN-AUDIT-1`)
+### `[IN_PROGRESS]` `TASK-07` (`CHWG-SIGN-AUDIT-1`) — Per-Seat Ed25519 `allowed_signers` & 10-Seat Key Provisioning
 - **Owner:** `■ ALISTAIR`
-- **Routed By:** `■ DELIVERY`
-- **Scope:** Audit `.chinwag/allowed_signers` against the 10 active seats (`rust`, `architect`, `flint`, `qa`, `alistair`, `type`, `gemini-pm`, `product`, `delivery`, `brian`) and post verification receipt to `#mgmt`.
+- **Scope:** Provision and verify OpenSSH Ed25519 keys under `~/.chinwag/signing/<seat>_ed25519` and `.chinwag/allowed_signers` for all 10 seats (`rust`, `architect`, `flint`, `qa`, `alistair`, `type`, `gemini-pm`, `product`, `delivery`, `brian`).
+
+### `[IN_PROGRESS]` `TASK-08` (`BUS-HARDEN-01`) — Detached `Ed25519` Message Signatures on `BusMessage`
+- **Owner:** `■ RUST` (`GPT / Codex`) + `■ ALISTAIR`
+- **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-swarm/src/identity.rs`
+- **Scope:** Sign canonical payload `{id}:{ts_unix}:{sender}:{to}:{room}:{body}` with each seat's Ed25519 key, verify on daemon ingress (`sig_verified = true`), and persist `pubkey_ed25519`, `signature_ed25519`, and `sig_verified` in `messages.jsonl` and `bus.sqlite`.
+
+### `[IN_PROGRESS]` `TASK-09` (`BUS-HARDEN-02`) — Multi-Interface Daemon Binding (`0.0.0.0:44330`) & `origin/main` + MBP (`100.108.108.25`) Sync
+- **Owner:** `■ ARCHITECT` (`GPT / Codex`) + `■ DELIVERY`
+- **Files:** `crates/chinwag-cli/src/bus_run.rs`
+- **Scope:** Bind `chinwag bus daemon` on `0.0.0.0:44330` (serving `127.0.0.1:44330` and Tailscale/LAN `100.66.156.76:44330`), push unified `main` to `origin/main`, and sync MBP (`100.108.108.25`).
+
+### `[IN_PROGRESS]` `TASK-10` (`BUS-HARDEN-03`) — 5-Attempt Retry & Explicit CRDB Error in `agent_dispatch_run.rs` + Advisory `flock` in `bus_run.rs`
+- **Owner:** `■ RUST` (`GPT / Codex`) + `■ FLINT` (`100.108.108.25:11500`)
+- **Files:** `crates/chinwag-cli/src/agent_dispatch_run.rs`, `crates/chinwag-cli/src/bus_run.rs`
+- **Scope:** Replace silent `deferred:` CRDB masking in `agent_dispatch_run.rs` with a 5-attempt backoff loop (`50ms..250ms`) and explicit `error:` status (`crdb_persisted: false`), wrap `messages.jsonl` read-modify-write in `rustix::fs::flock` on `.chinwag/bus/bus.lock`, and set `PRAGMA busy_timeout=5000;` on SQLite writes.
+
+### `[IN_PROGRESS]` `TASK-11` (`CHWG-CONTINUOUS-LOOP-01`) — Autonomous 45s `■ PRODUCT` + `■ DELIVERY` Backlog Governor
+- **Owner:** `■ PRODUCT` + `■ DELIVERY`
+- **Files:** `crates/chinwag-cli/src/bus_run.rs`
+- **Scope:** Run a persistent 45-second governor ticker inside `chinwag bus daemon` (plus immediate `chinwag bus wake`) that checks seat `.pid` liveness and dispatches `■ RUST`, `■ ARCHITECT`, `■ FLINT`, `■ ALISTAIR`, and `■ QA` continuously.
+
+### `[IN_PROGRESS]` `TASK-12` (`CHWG-OPENSPEC-CLI-01`) — `chinwag openspec status | validate | archive` Subcommand
+- **Owner:** `■ RUST` (`GPT / Codex`)
+- **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `crates/chinwag-cli/src/main.rs`
+- **Scope:** Implement `chinwag openspec status | validate | archive [--json]` to validate `docs/*.md` specifications and `TASKS.md` invariants (`INV-TASKS-MD-01`, `INV-OPENSPEC-01`).
+
+### `[IN_PROGRESS]` `TASK-13` (`CHWG-PLUGIN-HOST-01`) — `chinwag plugin list | verify | inspect` `.cwplugin` Ed25519 Verifier CLI
+- **Owner:** `■ ARCHITECT` (`GPT / Codex`) + `■ ALISTAIR`
+- **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `crates/chinwag-cli/src/main.rs`
+- **Scope:** Implement `chinwag plugin list | verify | inspect [--json]` enforcing `CHWG-PLUGIN-1` invariants (`INV-PLUGIN-SIG-01`, `INV-PLUGIN-SEATBELT-01`, `INV-PLUGIN-CHIP-01`, `INV-PLUGIN-EGRESS-01`, `INV-PLUGIN-ENT-01`).
+
+### `[IN_PROGRESS]` `TASK-14` (`CHWG-A509-CLI-01`) — `chinwag a509 inspect | verify` 10-Seat `RFC-0509` Passport & `allowed_signers` Auditor
+- **Owner:** `■ ALISTAIR` + `■ RUST`
+- **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `crates/chinwag-cli/src/main.rs`
+- **Scope:** Implement `chinwag a509 inspect | verify [--json]` auditing all 10 active seats (`rust`, `architect`, `flint`, `qa`, `alistair`, `type`, `gemini-pm`, `product`, `delivery`, `brian`) against `~/.chinwag/signing/<seat>_ed25519`, `iroh::EndpointId`, and `.chinwag/allowed_signers`.

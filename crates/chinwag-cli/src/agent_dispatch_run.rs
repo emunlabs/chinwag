@@ -488,7 +488,7 @@ struct DispatchExchange<'a> {
     now_ms: i64,
 }
 
-fn persist_to_crdb(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<(), String> {
+fn persist_to_crdb_once(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<(), String> {
     let DispatchExchange {
         thread_id,
         inbound_id,
@@ -535,6 +535,23 @@ fn persist_to_crdb(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<
         return Err(format!("crdb_refused: {}", completion.response()));
     }
     Ok(())
+}
+
+fn persist_to_crdb(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<(), String> {
+    let backoff_ms = [50_u64, 100, 150, 200, 250];
+    let mut last_err = String::new();
+    for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
+        match persist_to_crdb_once(repo_root, exchange) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = format!("attempt_{}:{e}", attempt + 1);
+                if attempt + 1 < backoff_ms.len() {
+                    std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+                }
+            }
+        }
+    }
+    Err(format!("crdb_persist_failed_after_5_attempts ({last_err})"))
 }
 
 pub fn run_agent_dispatch(
@@ -656,7 +673,7 @@ pub fn run_agent_dispatch(
     let inbound_id = format!("msg-in-{now_ms}-{hash_suffix}");
     let outbound_id = format!("msg-out-{now_ms}-{hash_suffix}");
 
-    let crdb_status = match persist_to_crdb(
+    let (crdb_status, crdb_persisted) = match persist_to_crdb(
         &repo_root,
         &DispatchExchange {
             thread_id: &item_key,
@@ -669,10 +686,10 @@ pub fn run_agent_dispatch(
             now_ms,
         },
     ) {
-        Ok(()) => "stored".to_owned(),
+        Ok(()) => ("stored".to_owned(), true),
         Err(reason) => {
-            let _ = writeln!(err, "chinwag: crdb_notice: {reason}");
-            format!("deferred:{reason}")
+            let _ = writeln!(err, "chinwag: crdb_error: {reason}");
+            (format!("error:{reason}"), false)
         }
     };
 
@@ -695,6 +712,7 @@ pub fn run_agent_dispatch(
         "crdb_message_id": outbound_id,
         "crdb_inbound_id": inbound_id,
         "crdb_thread_id": item_key,
+        "crdb_persisted": crdb_persisted,
         "crdb_status": crdb_status
     });
     if serde_json::to_writer(&mut *out, &output).is_err()

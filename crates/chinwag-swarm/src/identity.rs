@@ -98,6 +98,10 @@ impl Identity {
         self.key.clone()
     }
 
+    pub fn iroh_secret_key(&self) -> SecretKey {
+        self.key.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn test_identity(seed: [u8; 32]) -> Self {
         let key = SecretKey::from_bytes(&seed);

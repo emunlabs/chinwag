@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bus_run;
+mod feature_cli_run;
 mod relay_run;
 mod ui_gate_run;
 
@@ -88,6 +89,30 @@ fn main() -> ExitCode {
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("bus") {
             let code = bus_run::run_bus_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("openspec") {
+            let code = feature_cli_run::run_openspec_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("plugin") {
+            let code = feature_cli_run::run_plugin_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("a509") {
+            let code = feature_cli_run::run_a509_cli(
                 &raw_args[2..],
                 &mut std::io::stdout().lock(),
                 &mut std::io::stderr().lock(),
