@@ -13,3 +13,5 @@ rustix = { version = "=1.1.5", features = ["fs", "process", "try_close"] }
 sha2 = "=0.10.9"
 [features]
 private-probe = []
+[dev-dependencies]
+chinwag-test-fixtures = { path = "../chinwag-test-fixtures" }

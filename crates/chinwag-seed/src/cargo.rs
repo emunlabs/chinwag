@@ -203,8 +203,7 @@ mod tests {
             "#[test] fn actual_test() { assert_eq!(2 + 2, 4); }\n",
         )
         .unwrap();
-        let rustc =
-            PathBuf::from(std::env::var_os("RUSTC").expect("test needs the declared RUSTC path"));
+        let rustc = chinwag_test_fixtures::rustc();
         let verifier =
             CargoVerifier::new(root, rustc.parent().unwrap(), &cache, &root.join("target"))
                 .unwrap();

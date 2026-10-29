@@ -351,7 +351,7 @@ mod tests {
         f.write(&f.json);
         assert!(matches!(serve(&f.path).await, Err(Error::Cargo)));
         f.assert_no_start();
-        let chain = PathBuf::from(std::env::var_os("RUSTC").unwrap());
+        let chain = chinwag_test_fixtures::rustc();
         let mut configured = f.json.clone();
         configured["toolchain"] = json!(chain.parent().unwrap().canonicalize().unwrap());
         f.write(&configured);

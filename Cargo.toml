@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/chinwag-seed", "crates/chinwag-swarm", "crates/chinwag-claim", "crates/chinwag-host-process", "crates/chinwag-cli", "crates/chinwag-signing", "crates/chinwag-snapshot-read-owner", "crates/chinwag-snapshot-session", "crates/confirmed-initial", "crates/confirmed-initial-consumer", "crates/chinwag-mcp", "crates/chinwag-editor-config", "crates/chinwag-ui"]
+members = ["crates/chinwag-seed", "crates/chinwag-swarm", "crates/chinwag-claim", "crates/chinwag-host-process", "crates/chinwag-cli", "crates/chinwag-signing", "crates/chinwag-snapshot-read-owner", "crates/chinwag-snapshot-session", "crates/confirmed-initial", "crates/confirmed-initial-consumer", "crates/chinwag-mcp", "crates/chinwag-editor-config", "crates/chinwag-ui", "crates/chinwag-test-fixtures"]
 exclude = ["vendor/swarm-discovery"]
 resolver = "3"
 

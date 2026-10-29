@@ -18,3 +18,6 @@ chinwag-snapshot-read-owner-private = { path = "../chinwag-snapshot-read-owner" 
 chinwag-snapshot-session-private = { path = "../chinwag-snapshot-session" }
 
 chinwag-confirmed-initial-private = { path = "../confirmed-initial" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+chinwag-test-fixtures = { path = "../chinwag-test-fixtures" }

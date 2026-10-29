@@ -31,6 +31,7 @@ tokio = { version = "1", features = ["macros", "rt", "io-util", "io-std", "time"
 
 [dev-dependencies]
 iroh-blobs = { version = "=0.103.1", default-features = false }
+chinwag-test-fixtures = { path = "../chinwag-test-fixtures" }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 

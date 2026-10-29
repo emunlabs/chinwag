@@ -55,3 +55,6 @@ version = "=0.1.21"
 default-features = false
 features = ["tokio"]
 optional = true
+
+[dev-dependencies]
+chinwag-test-fixtures = { path = "../chinwag-test-fixtures" }

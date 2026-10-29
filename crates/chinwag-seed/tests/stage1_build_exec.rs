@@ -4,7 +4,7 @@ use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions},
     os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
 };
 
@@ -15,9 +15,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str, body: &str) -> Self {
-        let base = std::env::var_os("CHINWAG_STAGE1_BUILD_FIXTURES")
-            .expect("operator supplies a NEW fixture directory");
-        let base = Path::new(&base);
+        let base = chinwag_test_fixtures::namespace("CHINWAG_STAGE1_BUILD_FIXTURES");
+        let base = base.as_path();
         assert!(base.is_absolute());
         let root = tempfile::Builder::new()
             .prefix(label)
@@ -38,7 +37,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(root.join("src/main.rs"), body).unwrap();
-        let rustc = PathBuf::from(std::env::var_os("RUSTC").unwrap());
+        let rustc = PathBuf::from(chinwag_test_fixtures::rustc());
         let recipe = root.join("recipe.json");
         fs::write(
             &recipe,

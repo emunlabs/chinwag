@@ -216,7 +216,7 @@ async fn verified_commit_materializes_and_actual_received_source_passes_offline_
         let cache = fixture.root.join("empty-cargo-cache");
         empty_private_directory(&target);
         empty_private_directory(&cache);
-        let rustc = PathBuf::from(std::env::var_os("RUSTC").unwrap());
+        let rustc = chinwag_test_fixtures::rustc();
         let cargo = crate::cargo::CargoVerifier::new(
             received.path(),
             rustc.parent().unwrap(),

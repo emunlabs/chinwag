@@ -10,14 +10,15 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 struct Fixture {
+    _serial: std::sync::MutexGuard<'static, ()>,
     repo: PathBuf,
     secret: Zeroizing<[u8; 32]>,
     header: HeaderValue,
 }
 impl Fixture {
     fn new() -> Self {
-        let repo =
-            PathBuf::from(std::env::var_os("CHINWAG_HTTP_FIXTURE").expect("new private fixture"));
+        let serial = crate::http_tests::serialize_native_probe();
+        let repo = chinwag_test_fixtures::initialized_repo_at("CHINWAG_HTTP_FIXTURE");
         assert!(repo.is_absolute() && repo.join(".chinwag/state.crdb").is_file());
         let mut secret = Zeroizing::new([0u8; 32]);
         std::fs::File::open("/dev/urandom")
@@ -31,6 +32,7 @@ impl Fixture {
         }
         let header = HeaderValue::from_str(&text).unwrap();
         Self {
+            _serial: serial,
             repo,
             secret,
             header,

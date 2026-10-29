@@ -7,10 +7,7 @@ use std::{
 };
 
 fn fixture(name: &str, mode: u32) -> PathBuf {
-    let root = PathBuf::from(
-        std::env::var_os("CHINWAG_PACKAGED_ALIAS_QA_ROOT")
-            .expect("new once-only packaged alias fixture namespace required"),
-    );
+    let root = chinwag_test_fixtures::namespace("CHINWAG_PACKAGED_ALIAS_QA_ROOT");
     assert!(root.is_absolute() && root.is_dir());
     let path = root.join(name);
     fs::create_dir(&path).unwrap();

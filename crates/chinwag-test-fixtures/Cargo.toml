@@ -1,0 +1,14 @@
+[package]
+name = "chinwag-test-fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Dev-only helpers that seed self-contained temp repositories and directories for tests."
+
+[dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+chinwag-snapshot-session-private = { path = "../chinwag-snapshot-session" }

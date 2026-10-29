@@ -4,13 +4,10 @@ use std::{fs as stdfs, io::Write, os::unix::fs::MetadataExt};
 
 #[test]
 fn each_bound_snapshot_restriction_refuses_before_any_signing_git_child() {
-    let root = PathBuf::from(
-        std::env::var_os("CHINWAG_PRINCIPAL_QA_REPOSITORIES")
-            .expect("fresh once-operator namespace required"),
-    );
     for kind in ["repo", "git", "config", "hash"] {
         let name = format!("principal-bound-{kind}");
-        let repo = root.join(&name);
+        // Operator-supplied namespace when set, else a freshly seeded temp git repository.
+        let repo = chinwag_test_fixtures::git_repo("CHINWAG_PRINCIPAL_QA_REPOSITORIES", &name);
         assert!(repo.is_absolute() && !repo.join(".chinwag").exists());
         let config_path = repo.join(".git/config");
         let before = stdfs::read(&config_path).unwrap();
@@ -60,7 +57,11 @@ fn each_bound_snapshot_restriction_refuses_before_any_signing_git_child() {
         let mut out = stdfs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(root.join(format!("{name}.principal-observation.json")))
+            .open(
+                repo.parent()
+                    .unwrap()
+                    .join(format!("{name}.principal-observation.json")),
+            )
             .unwrap();
         writeln!(out, "{{\"case\":\"{name}\",\"outcome\":{{\"query_pid\":null,\"signing_child_pid\":0,\"bound_restriction\":\"{kind}\",\"reason\":\"signing_preimage_changed\",\"partial_material\":true,\"original_config_unchanged\":true,\"no_scratch_or_store\":true}},\"Genesis_complete\":false}}").unwrap();
         out.sync_all().unwrap();

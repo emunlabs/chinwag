@@ -11,15 +11,23 @@ use std::{io::Read, num::NonZeroU16, path::PathBuf};
 use tokio::runtime::Runtime;
 use zeroize::Zeroizing;
 
+/// The native open/close counters are process-global, so every test that
+/// asserts on them must run alone. Fixtures hold this guard for their lifetime.
+pub(crate) fn serialize_native_probe() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Fixture {
+    _serial: std::sync::MutexGuard<'static, ()>,
     repo: PathBuf,
     secret: Zeroizing<[u8; 32]>,
     header: HeaderValue,
 }
 impl Fixture {
     fn new() -> Self {
-        let repo =
-            PathBuf::from(std::env::var_os("CHINWAG_HTTP_FIXTURE").expect("new owned fixture"));
+        let serial = serialize_native_probe();
+        let repo = chinwag_test_fixtures::initialized_repo_at("CHINWAG_HTTP_FIXTURE");
         assert!(repo.is_absolute() && repo.join(".chinwag/state.crdb").is_file());
         let mut secret = Zeroizing::new([0u8; 32]);
         std::fs::File::open("/dev/urandom")
@@ -37,6 +45,7 @@ impl Fixture {
             "AccessSecret(<redacted>)"
         );
         Self {
+            _serial: serial,
             repo,
             secret,
             header,

@@ -5,7 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -20,9 +20,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let base = std::env::var_os("CHINWAG_STAGE1_FIXTURES")
-            .expect("operator supplies a fresh fixture directory");
-        let base = Path::new(&base);
+        let base = chinwag_test_fixtures::namespace("CHINWAG_STAGE1_FIXTURES");
+        let base = base.as_path();
         assert!(base.is_absolute());
         let root = tempfile::Builder::new()
             .prefix(label)

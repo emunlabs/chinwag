@@ -92,6 +92,11 @@ impl FileId {
     pub fn read(file: &File) -> Result<Self> {
         file_id(&fstat(file).map_err(|_| "file_stat")?)
     }
+    /// Same file instance and ownership, ignoring size and timestamps.
+    fn same_instance(&self, other: &Self) -> bool {
+        (self.dev, self.ino, self.uid, self.gid, self.mode, self.nlink)
+            == (other.dev, other.ino, other.uid, other.gid, other.mode, other.nlink)
+    }
 }
 #[derive(PartialEq, Eq)]
 pub(super) struct Image {
@@ -383,5 +388,20 @@ impl Anchor {
             return Err("held_named_file_changed");
         }
         Ok(before)
+    }
+    /// Like [`Self::identify_named`] for a file that a live original child is
+    /// still writing: its size and timestamps may legitimately move between the
+    /// two stats, so only the file instance (device, inode, owner, mode, link
+    /// count) must match. A comparison of every attribute raced the child.
+    pub fn identify_named_live(&self, file: &File, name: &str) -> Result<FileId> {
+        let held = FileId::read(file)?;
+        let named = file_id(
+            &statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| "named_file_metadata")?,
+        )?;
+        if !held.same_instance(&named) {
+            return Err("held_named_file_changed");
+        }
+        Ok(named)
     }
 }

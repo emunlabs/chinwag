@@ -58,7 +58,7 @@ impl QueryFile {
     }
     pub fn check_instance(&self, anchor: &Anchor) -> Result<()> {
         anchor.check()?;
-        let id = anchor.identify_named(&self.file, self.artifact.name())?;
+        let id = anchor.identify_named_live(&self.file, self.artifact.name())?;
         if id.dev != self.created.dev
             || id.ino != self.created.ino
             || id.uid != self.created.uid

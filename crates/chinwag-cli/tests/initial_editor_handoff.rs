@@ -13,11 +13,8 @@ use std::{
 };
 
 fn repo(name: &str) -> PathBuf {
-    let root = PathBuf::from(
-        std::env::var_os("CHINWAG_ONBOARDING_QA_REPOSITORIES")
-            .expect("new once-operator repository namespace required"),
-    );
-    let repo = root.join(name);
+    // Operator-supplied namespace when set, else a freshly seeded temp git repository.
+    let repo = chinwag_test_fixtures::git_repo("CHINWAG_ONBOARDING_QA_REPOSITORIES", name);
     assert!(repo.is_absolute() && repo.join(".git").is_dir() && !repo.join(".chinwag").exists());
     repo
 }

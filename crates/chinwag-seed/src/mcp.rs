@@ -360,9 +360,7 @@ mod tests {
                 "#[test] fn real_assertion() { assert_eq!(6 * 7, 42); }\n",
             )
             .unwrap();
-            let rustc = std::path::PathBuf::from(
-                std::env::var_os("RUSTC").expect("test needs declared RUSTC"),
-            );
+            let rustc = chinwag_test_fixtures::rustc();
             let server = VerifyServer::open(
                 root,
                 vec!["src/lib.rs".into()],

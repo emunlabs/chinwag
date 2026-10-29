@@ -17,9 +17,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new(label: &str, editor: Editor) -> Self {
-        let root = std::env::var_os("CHINWAG_PRIVATE_INSTALL_FIXTURES")
-            .expect("Explicit new Root fixture namespace required");
-        let repo = PathBuf::from(root).join(format!("observer-{label}"));
+        let root = chinwag_test_fixtures::namespace("CHINWAG_PRIVATE_INSTALL_FIXTURES");
+        let repo = root.join(format!("observer-{label}"));
         fs::create_dir(&repo).unwrap();
         fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
         for name in [".cursor", ".codex", ".gemini"] {

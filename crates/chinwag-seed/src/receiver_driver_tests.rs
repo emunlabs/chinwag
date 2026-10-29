@@ -37,7 +37,7 @@ impl Fixture {
         }
         private_write(&root.join("key"), b"not a real key");
         private_write(&root.join("signers"), b"not a real signers file");
-        let rustc = PathBuf::from(std::env::var_os("RUSTC").unwrap());
+        let rustc = chinwag_test_fixtures::rustc();
         let config = json!({
             "schema":"chinwag-architect-receive/v3", "relay":{"mode":"disabled"}, "own_key":root.join("key"),
             "lan_ipv4":"192.0.2.10", "run":"11".repeat(32),

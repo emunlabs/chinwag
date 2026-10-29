@@ -748,6 +748,7 @@ dependencies = [
  "chinwag-signing",
  "chinwag-snapshot-read-owner-private",
  "chinwag-snapshot-session-private",
+ "chinwag-test-fixtures",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -761,6 +762,7 @@ dependencies = [
  "chinwag-host-process",
  "chinwag-signing",
  "chinwag-snapshot-session-private",
+ "chinwag-test-fixtures",
  "rustix",
  "sha2 0.10.9",
 ]
@@ -772,6 +774,7 @@ dependencies = [
  "chinwag-confirmed-initial-private",
  "chinwag-snapshot-read-owner-private",
  "chinwag-snapshot-session-private",
+ "chinwag-test-fixtures",
  "rustix",
  "serde",
  "serde_json",
@@ -796,6 +799,7 @@ dependencies = [
  "bytes",
  "chinwag-snapshot-read-owner-private",
  "chinwag-snapshot-session-private",
+ "chinwag-test-fixtures",
  "http",
  "http-body",
  "http-body-util",
@@ -819,6 +823,7 @@ dependencies = [
  "chacha20poly1305",
  "chinwag-host-process",
  "chinwag-swarm",
+ "chinwag-test-fixtures",
  "futures-util",
  "hpke",
  "iroh",
@@ -904,6 +909,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "chinwag-test-fixtures"
+version = "0.0.1"
+dependencies = [
+ "chinwag-snapshot-session-private",
+ "tempfile",
 ]
 
 [[package]]

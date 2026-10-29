@@ -12,9 +12,8 @@ struct Fixture {
 impl Fixture {
     fn new(label: &str, editor: Editor) -> Self {
         // Required owned operator namespace, never the user's editor configuration.
-        let root = std::env::var_os("CHINWAG_PRIVATE_INSTALL_FIXTURES")
-            .expect("Root-owned fixture namespace must be supplied explicitly");
-        let repo = PathBuf::from(root).join(label);
+        let root = chinwag_test_fixtures::namespace("CHINWAG_PRIVATE_INSTALL_FIXTURES");
+        let repo = root.join(label);
         fs::create_dir(&repo).unwrap();
         fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
         for name in [".cursor", ".codex", ".gemini"] {

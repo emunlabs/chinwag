@@ -2,9 +2,8 @@ use super::super::{COMPLETED, Fault, INTENT, LOCK, Prepared};
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 fn repo(name: &str) -> PathBuf {
-    let root = std::env::var_os("CHINWAG_EDITOR_QA_REPOSITORIES")
-        .expect("owned once operator fixture root");
-    let repo = PathBuf::from(root).join(name);
+    // Operator-supplied namespace when set, else a freshly initialized temp repository.
+    let repo = chinwag_test_fixtures::initialized_repo("CHINWAG_EDITOR_QA_REPOSITORIES", name);
     assert!(repo.join(".git").is_dir() && repo.join(".chinwag/state.crdb").is_file());
     repo
 }

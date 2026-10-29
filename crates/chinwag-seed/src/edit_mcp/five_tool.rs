@@ -147,7 +147,7 @@ mod tests {
             fs::write(root.join("Cargo.lock"), "version = 4\n\n[[package]]\nname=\"five-tool-fixture\"\nversion=\"0.0.0\"\n").unwrap();
             let cargo_source = b"#[test] fn actual_assertion() { assert_eq!(6 * 7, 42); }\n";
             fs::write(root.join("src/lib.rs"), cargo_source).unwrap();
-            let rustc = std::path::PathBuf::from(std::env::var_os("RUSTC").unwrap());
+            let rustc = chinwag_test_fixtures::rustc();
             let verify = VerifyServer::open(
                 root,
                 vec!["README.md".into()],
