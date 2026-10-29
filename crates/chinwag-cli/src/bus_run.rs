@@ -585,8 +585,7 @@ async fn bind_bus_endpoint(
     port: u16,
     lookup: MemoryLookup,
 ) -> Result<Endpoint, String> {
-    let bind_host = if port == 0 { "127.0.0.1" } else { "0.0.0.0" };
-    let addr: SocketAddr = format!("{bind_host}:{port}")
+    let addr: SocketAddr = format!("0.0.0.0:{port}")
         .parse()
         .map_err(|e| format!("invalid socket addr: {e}"))?;
     Endpoint::builder(presets::Minimal)
