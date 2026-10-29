@@ -4,6 +4,7 @@
 //! mDNS/Mainline into separate crates. No n0 preset is used here.
 
 pub mod attempt_journal;
+pub mod dispatch_wire;
 pub mod identity;
 pub mod lan;
 pub mod relay_policy;

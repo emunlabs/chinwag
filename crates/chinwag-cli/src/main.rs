@@ -169,6 +169,21 @@ fn main() -> ExitCode {
             &mut std::io::stdout().lock(),
             &mut std::io::stderr().lock(),
         )),
+        chinwag_cli::Dispatch::AgentDispatchStatus(repo) => {
+            ExitCode::from(chinwag_cli::run_agent_dispatch_status(
+                repo,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            ))
+        }
+        chinwag_cli::Dispatch::AgentDispatchNetwork(request) => {
+            ExitCode::from(chinwag_cli::run_agent_dispatch_network(
+                request,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            ))
+        }
         chinwag_cli::Dispatch::AgentDispatch(request) => {
             ExitCode::from(chinwag_cli::run_agent_dispatch(
                 request,

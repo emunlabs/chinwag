@@ -748,11 +748,17 @@ dependencies = [
  "chinwag-signing",
  "chinwag-snapshot-read-owner-private",
  "chinwag-snapshot-session-private",
+ "chinwag-swarm",
  "chinwag-test-fixtures",
+ "iroh",
+ "rand 0.9.5",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "ssh-key",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

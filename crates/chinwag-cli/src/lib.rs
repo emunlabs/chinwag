@@ -146,7 +146,64 @@ pub enum Dispatch {
     ServeHttp(ServeRequest),
     Configure(ConfigureRequest),
     AgentDispatch(AgentDispatchRequest),
+    AgentDispatchNetwork(DispatchNetworkRequest),
+    AgentDispatchStatus(PathBuf),
     Memory(MemoryRequest),
+}
+
+/// Network dispatch requires explicit local identity, remote pin, coordinator
+/// pin, room origin and LAN interface. Address discovery grants no authority.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DispatchNetworkRequest {
+    pub(crate) listen: bool,
+    pub(crate) key: PathBuf,
+    pub(crate) peer: String,
+    pub(crate) coordinator: String,
+    pub(crate) room: String,
+    pub(crate) local_ipv4: String,
+    pub(crate) repo: PathBuf,
+}
+
+fn parse_dispatch_network(args: &[OsString], listen: bool) -> Option<DispatchNetworkRequest> {
+    let mut flags = std::collections::BTreeMap::new();
+    let mut stdin = false;
+    let mut index = 0;
+    while index < args.len() {
+        let name = args[index].to_str()?;
+        if name == "--stdin" && !listen && !stdin {
+            stdin = true;
+            index += 1;
+            continue;
+        }
+        if !matches!(
+            name,
+            "--key" | "--peer" | "--coordinator" | "--room" | "--local-ipv4" | "--repo"
+        ) {
+            return None;
+        }
+        let value = args.get(index + 1)?.to_str()?;
+        if value.is_empty() || value.starts_with("--") || flags.insert(name, value).is_some() {
+            return None;
+        }
+        index += 2;
+    }
+    if !listen && !stdin {
+        return None;
+    }
+    let key = PathBuf::from(*flags.get("--key")?);
+    let repo = PathBuf::from(*flags.get("--repo")?);
+    if !key.is_absolute() || !repo.is_absolute() {
+        return None;
+    }
+    Some(DispatchNetworkRequest {
+        listen,
+        key,
+        repo,
+        peer: flags.get("--peer")?.to_string(),
+        coordinator: flags.get("--coordinator")?.to_string(),
+        room: flags.get("--room")?.to_string(),
+        local_ipv4: flags.get("--local-ipv4")?.to_string(),
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -338,6 +395,28 @@ where
         }
         return match parse_init(&args[1..]) {
             Some(request) => Dispatch::Init(request),
+            None => Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments)),
+        };
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "agent-dispatch-status")
+    {
+        if args.len() == 4
+            && args[1] == "--repo"
+            && args[3] == "--json"
+            && Path::new(&args[2]).is_absolute()
+        {
+            return Dispatch::AgentDispatchStatus(PathBuf::from(&args[2]));
+        }
+        return Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments));
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "agent-dispatch-listen" || arg == "agent-dispatch-remote")
+    {
+        return match parse_dispatch_network(&args[1..], args[0] == "agent-dispatch-listen") {
+            Some(request) => Dispatch::AgentDispatchNetwork(request),
             None => Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments)),
         };
     }
@@ -714,4 +793,110 @@ pub fn run_mcp_http(
 ) -> u8 {
     let _ = writeln!(err, "chinwag: context_http_unsupported_platform");
     1
+}
+
+#[cfg(target_os = "macos")]
+mod dispatch_listen;
+#[cfg(target_os = "macos")]
+mod dispatch_remote;
+#[cfg(target_os = "macos")]
+pub use dispatch_remote::run_agent_dispatch_network;
+#[cfg(not(target_os = "macos"))]
+pub fn run_agent_dispatch_network(
+    _request: DispatchNetworkRequest,
+    _input: &mut dyn std::io::Read,
+    _out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> u8 {
+    let _ = err.write_all(b"chinwag: unsupported_os\n");
+    2
+}
+
+#[cfg(target_os = "macos")]
+mod dispatch_status;
+#[cfg(target_os = "macos")]
+pub use dispatch_status::{DispatchStatus, read_dispatch_status, run_agent_dispatch_status};
+#[cfg(not(target_os = "macos"))]
+pub fn run_agent_dispatch_status(
+    _repo: PathBuf,
+    _out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> u8 {
+    let _ = err.write_all(b"chinwag: unsupported_os\n");
+    2
+}
+
+#[cfg(test)]
+mod dispatch_network_parser_tests {
+    use super::*;
+    fn options() -> Vec<&'static str> {
+        vec![
+            "--key",
+            "/fixture/key",
+            "--peer",
+            "peer",
+            "--coordinator",
+            "coordinator",
+            "--room",
+            "https://room.invalid",
+            "--local-ipv4",
+            "192.0.2.1",
+            "--repo",
+            "/fixture/repository",
+        ]
+    }
+    #[test]
+    fn network_commands_require_explicit_options_and_stdin() {
+        let mut args = vec!["agent-dispatch-remote"];
+        args.extend(options());
+        assert!(matches!(
+            dispatch(OsStr::new("chinwag"), &args),
+            Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments))
+        ));
+        args.push("--stdin");
+        assert!(matches!(
+            dispatch(OsStr::new("chinwag"), &args),
+            Dispatch::AgentDispatchNetwork(DispatchNetworkRequest { listen: false, .. })
+        ));
+        args.extend(["--peer", "another"]);
+        assert!(matches!(
+            dispatch(OsStr::new("chinwag"), &args),
+            Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments))
+        ));
+        let mut args = vec!["agent-dispatch-listen"];
+        args.extend(options());
+        assert!(matches!(
+            dispatch(OsStr::new("chinwag"), &args),
+            Dispatch::AgentDispatchNetwork(DispatchNetworkRequest { listen: true, .. })
+        ));
+    }
+    #[test]
+    fn status_accepts_only_read_only_json_arguments() {
+        assert!(matches!(
+            dispatch(
+                OsStr::new("chinwag"),
+                [
+                    "agent-dispatch-status",
+                    "--repo",
+                    "/fixture/repository",
+                    "--json"
+                ]
+            ),
+            Dispatch::AgentDispatchStatus(_)
+        ));
+        for args in [
+            vec!["agent-dispatch-status", "--repo", "relative", "--json"],
+            vec![
+                "agent-dispatch-status",
+                "--repo",
+                "/fixture/repository",
+                "--write",
+            ],
+        ] {
+            assert!(matches!(
+                dispatch(OsStr::new("chinwag"), args),
+                Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments))
+            ));
+        }
+    }
 }
