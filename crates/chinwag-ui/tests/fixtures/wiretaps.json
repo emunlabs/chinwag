@@ -1,0 +1,22 @@
+{
+  "sessions": [{"id":"fixture-session","turns":[],"futureSessionField":true}],
+  "channels": [
+    {
+      "id": "fixture-mgmt", "name": "#fixture-mgmt", "kind": "mgmt",
+      "description": "Synthetic local planner data", "members": ["TEST", "RUST"],
+      "item_key": null, "updated_at": "2026-10-28T12:00:00Z",
+      "futureChannelField": "ignored",
+      "messages": [
+        {"id":"first","sender":"TEST","senderCast":"●","role":"tester","engine":"fixture",
+         "body":"First fixture message <script>alert(1)</script>","itemKey":null,"createdAt":"2026-10-28T12:00:00Z",
+         "slashCommand":"/test","slackBlocks":[],"futureMessageField":true},
+        {"id":"second","sender":"RUST","senderCast":"■","role":"engineer","engine":"fixture",
+         "body":"Second fixture message\nwith a second line", "itemKey":"CHWG-DIOXUS-1","createdAt":"2026-10-28T12:01:00Z"}
+      ]
+    },
+    {"id":"fixture-empty","name":"#fixture-empty","kind":"division","description":"Empty synthetic channel",
+     "members":[],"item_key":null,"messages":[],"updated_at":"2026-10-28T12:00:00Z"}
+  ],
+  "summary":{"totalSessions":1,"liveSessions":0,"totalTurns":0,"crdbContextPins":0,"activeChannels":2},
+  "futureTopLevelField": true
+}

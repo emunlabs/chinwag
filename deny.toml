@@ -1,0 +1,47 @@
+# Copyright 2026 Emun Labs, Inc.
+# 1401 Lavaca St STE 81335, Austin, TX 78701
+# SPDX-License-Identifier: Apache-2.0
+#
+# License gate for crates/chinwag-ui (CHWG-DIOXUS-1). Mirrors CONTRIBUTING.md section 3 (INV-LIC-01).
+# Run: cargo deny --manifest-path crates/chinwag-ui/Cargo.toml --all-features check licenses
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "wasm32-unknown-unknown",
+]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "BSL-1.0",              # Brian approved 2026-10-28 3:24 PM CT (EAGLE-EYE review)
+  "CDLA-Permissive-2.0",  # Brian approved 2026-10-28; keep license text in third-party notices
+]
+# One-off MPL-2.0 exception, approved by Brian 2026-10-28 3:24 PM CT. option-ext must stay
+# unmodified and be listed, with a source link, in the desktop app's third-party notices.
+exceptions = [
+  { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
+  # Added with the Linux/Windows targets (FLINT fix). Build-time-only dependency of the GTK stack;
+  # Apache-2.0 plus the LLVM exception is strictly more permissive than Apache-2.0. Brian approved
+  # this scoped exception on 2026-10-28 (target-lexicon@0.12.16 only, build-time GTK stack).
+  { crate = "target-lexicon@0.12.16", allow = ["Apache-2.0 WITH LLVM-exception"] },
+]
+# Forbidden by policy (cargo-deny has no deny list for licenses, so this is enforced by omission):
+# GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later,
+# LGPL-2.1-only, LGPL-2.1-or-later, LGPL-3.0-only, LGPL-3.0-or-later, SSPL-1.0, BUSL-1.1.
+# Commons Clause and Fair-Source terms have no SPDX identifier; they are rejected as unrecognized licenses.
+# Anything not in `allow` is rejected.
+#
+# Resolved 2026-10-28: xxhash-rust (BSL-1.0), webpki-roots (CDLA-Permissive-2.0), option-ext (MPL-2.0 exception).
