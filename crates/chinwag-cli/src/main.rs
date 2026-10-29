@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod relay_run;
+mod ui_gate_run;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -83,6 +84,14 @@ fn main() -> ExitCode {
                  → Launch Full-Screen First-Run Wizard: {wizard_url}"
             );
             return ExitCode::SUCCESS;
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("ui-gate") {
+            let code = ui_gate_run::run_ui_gate(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("beam") {
             let code = relay_run::run_beam_cli(
