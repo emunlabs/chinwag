@@ -343,8 +343,9 @@ fn dispatch_to_engine(
 
     // 1. Recursive Flint (Local MLX 262k on MacBook Pro 100.108.108.25:11500)
     let flint_bin = Path::new(&local_bin).join("flint-agent");
-    if is_flint && flint_bin.exists() {
-        if let Ok(out) = Command::new(&flint_bin)
+    if is_flint
+        && flint_bin.exists()
+        && let Ok(out) = Command::new(&flint_bin)
             .args([
                 "run",
                 full_prompt,
@@ -354,26 +355,25 @@ fn dispatch_to_engine(
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .output()
-        {
-            let text = strip_flint_banner(&String::from_utf8_lossy(&out.stdout));
-            if out.status.success() && !text.is_empty() {
-                return (text, "flint-agent");
-            }
+    {
+        let text = strip_flint_banner(&String::from_utf8_lossy(&out.stdout));
+        if out.status.success() && !text.is_empty() {
+            return (text, "flint-agent");
         }
     }
 
     // 2. Official Gemini CLI Engine for GEMINI-PM
-    if is_gemini && Path::new("/opt/homebrew/bin/gemini").exists() {
-        if let Ok(out) = Command::new("/opt/homebrew/bin/node")
+    if is_gemini
+        && Path::new("/opt/homebrew/bin/gemini").exists()
+        && let Ok(out) = Command::new("/opt/homebrew/bin/node")
             .args(["/opt/homebrew/bin/gemini", "-p", full_prompt, "--yolo"])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            if out.status.success() && !text.is_empty() {
-                return (text, "gemini-cli");
-            }
+    {
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if out.status.success() && !text.is_empty() {
+            return (text, "gemini-cli");
         }
     }
 
@@ -381,17 +381,15 @@ fn dispatch_to_engine(
     let codex_bin = Path::new(&local_bin).join("codex");
     if (matches!(agent_upper, "ARCHITECT" | "RUST" | "DEV-1") || engine_hint.contains("codex"))
         && codex_bin.exists()
-    {
-        if let Ok(out) = Command::new(&codex_bin)
+        && let Ok(out) = Command::new(&codex_bin)
             .args(["exec", "--skip-git-repo-check", full_prompt])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            if out.status.success() && !text.is_empty() {
-                return (text, "codex-chatgpt");
-            }
+    {
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if out.status.success() && !text.is_empty() {
+            return (text, "codex-chatgpt");
         }
     }
 
@@ -402,17 +400,15 @@ fn dispatch_to_engine(
         "DELIVERY" | "SPARK" | "GROWTH" | "HOUSEKEEPING" | "INFRA BOT (GROK)"
     ) || engine_hint.contains("grok"))
         && grok_bin.exists()
-    {
-        if let Ok(out) = Command::new(&grok_bin)
+        && let Ok(out) = Command::new(&grok_bin)
             .args(["agent", "--always-approve", full_prompt])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            if out.status.success() && !text.is_empty() {
-                return (text, "grok-cli");
-            }
+    {
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if out.status.success() && !text.is_empty() {
+            return (text, "grok-cli");
         }
     }
 
@@ -469,17 +465,29 @@ fn resolve_repo_root(crdb_path: Option<&Path>) -> PathBuf {
     path.to_path_buf()
 }
 
-fn persist_to_crdb(
-    repo_root: &Path,
-    thread_id: &str,
-    inbound_id: &str,
-    sender: &str,
-    inbound_body: &str,
-    outbound_id: &str,
-    agent_upper: &str,
-    outbound_body: &str,
+/// One inbound/outbound dispatch exchange to persist into the CRDB store.
+struct DispatchExchange<'a> {
+    thread_id: &'a str,
+    inbound_id: &'a str,
+    sender: &'a str,
+    inbound_body: &'a str,
+    outbound_id: &'a str,
+    agent_upper: &'a str,
+    outbound_body: &'a str,
     now_ms: i64,
-) -> Result<(), String> {
+}
+
+fn persist_to_crdb(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<(), String> {
+    let DispatchExchange {
+        thread_id,
+        inbound_id,
+        sender,
+        inbound_body,
+        outbound_id,
+        agent_upper,
+        outbound_body,
+        now_ms,
+    } = *exchange;
     let owner = WriteOwner::acquire_existing_private_fixture(repo_root)
         .map_err(|e| format!("acquire_write_owner: {}", e.reason))?;
     let session =
@@ -619,14 +627,16 @@ pub fn run_agent_dispatch(
 
     let crdb_status = match persist_to_crdb(
         &repo_root,
-        &item_key,
-        &inbound_id,
-        &sender,
-        &body,
-        &outbound_id,
-        &agent_upper,
-        &reply,
-        now_ms,
+        &DispatchExchange {
+            thread_id: &item_key,
+            inbound_id: &inbound_id,
+            sender: &sender,
+            inbound_body: &body,
+            outbound_id: &outbound_id,
+            agent_upper: &agent_upper,
+            outbound_body: &reply,
+            now_ms,
+        },
     ) {
         Ok(()) => "stored".to_owned(),
         Err(reason) => {

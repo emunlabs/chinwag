@@ -98,17 +98,40 @@ fn sql_i64(v: Option<&SqlValue>) -> i64 {
     }
 }
 
-fn persist_tombstone_to_crdb(
-    repo_root: &Path,
-    id: &str,
-    source_commit: &str,
-    file_scope: &str,
-    attempted_action: &str,
-    failure: &str,
-    reason: &str,
-    alternative: &str,
+/// Fields of one tombstone to persist into the CRDB store.
+struct TombstoneWrite<'a> {
+    id: &'a str,
+    source_commit: &'a str,
+    file_scope: &'a str,
+    attempted_action: &'a str,
+    failure: &'a str,
+    reason: &'a str,
+    alternative: &'a str,
     ts_ms: i64,
-) -> Result<i64, String> {
+}
+
+/// Fields of one memory pin to persist into the CRDB store.
+struct MemoryPinWrite<'a> {
+    id: &'a str,
+    bank: &'a str,
+    context: &'a str,
+    content: &'a str,
+    source_commit: &'a str,
+    file_scope: &'a str,
+    ts_ms: i64,
+}
+
+fn persist_tombstone_to_crdb(repo_root: &Path, write: &TombstoneWrite<'_>) -> Result<i64, String> {
+    let TombstoneWrite {
+        id,
+        source_commit,
+        file_scope,
+        attempted_action,
+        failure,
+        reason,
+        alternative,
+        ts_ms,
+    } = *write;
     let owner = WriteOwner::acquire_existing_private_fixture(repo_root)
         .map_err(|e| format!("acquire_write_owner: {}", e.reason))?;
     let session =
@@ -141,16 +164,16 @@ fn persist_tombstone_to_crdb(
     Ok(completion.observation().new_db_version())
 }
 
-fn persist_memory_pin_to_crdb(
-    repo_root: &Path,
-    id: &str,
-    bank: &str,
-    context: &str,
-    content: &str,
-    source_commit: &str,
-    file_scope: &str,
-    ts_ms: i64,
-) -> Result<i64, String> {
+fn persist_memory_pin_to_crdb(repo_root: &Path, write: &MemoryPinWrite<'_>) -> Result<i64, String> {
+    let MemoryPinWrite {
+        id,
+        bank,
+        context,
+        content,
+        source_commit,
+        file_scope,
+        ts_ms,
+    } = *write;
     let owner = WriteOwner::acquire_existing_private_fixture(repo_root)
         .map_err(|e| format!("acquire_write_owner: {}", e.reason))?;
     let session =
@@ -826,13 +849,15 @@ pub fn retain_from_agent_dispatch(
     );
     let _ = persist_memory_pin_to_crdb(
         repo_root,
-        &mid,
-        "spector-fleet",
-        &format!("agent-dispatch:{agent_lower}:{item_key}"),
-        &content,
-        DEFAULT_COMMIT_SHA,
-        "*",
-        ts_ms,
+        &MemoryPinWrite {
+            id: &mid,
+            bank: "spector-fleet",
+            context: &format!("agent-dispatch:{agent_lower}:{item_key}"),
+            content: &content,
+            source_commit: DEFAULT_COMMIT_SHA,
+            file_scope: "*",
+            ts_ms,
+        },
     );
     let payload = json!({
         "op": "retain",
@@ -886,13 +911,15 @@ pub fn run_memory(
 
             let crdb_res = persist_memory_pin_to_crdb(
                 &repo_root,
-                &mem_id,
-                &bank,
-                &context,
-                &content,
-                &source_commit,
-                &scope,
-                ts_ms,
+                &MemoryPinWrite {
+                    id: &mem_id,
+                    bank: &bank,
+                    context: &context,
+                    content: &content,
+                    source_commit: &source_commit,
+                    file_scope: &scope,
+                    ts_ms,
+                },
             );
             let (crdb_status, crdb_version) = match crdb_res {
                 Ok(v) => ("stored".to_owned(), v),
@@ -970,14 +997,16 @@ pub fn run_memory(
 
             let crdb_res = persist_tombstone_to_crdb(
                 &repo_root,
-                &id,
-                &source_commit,
-                &file_scope,
-                &act,
-                &fail,
-                &reason,
-                &alt,
-                ts_ms,
+                &TombstoneWrite {
+                    id: &id,
+                    source_commit: &source_commit,
+                    file_scope: &file_scope,
+                    attempted_action: &act,
+                    failure: &fail,
+                    reason: &reason,
+                    alternative: &alt,
+                    ts_ms,
+                },
             );
             let (crdb_status, crdb_version) = match crdb_res {
                 Ok(v) => ("stored".to_owned(), v),
@@ -1157,14 +1186,16 @@ pub fn run_memory(
             for (tid, scope, act, reason, alt) in canonical_tombstones {
                 if let Ok(v) = persist_tombstone_to_crdb(
                     &repo_root,
-                    tid,
-                    DEFAULT_COMMIT_SHA,
-                    scope,
-                    act,
-                    reason,
-                    reason,
-                    alt,
-                    ts_ms,
+                    &TombstoneWrite {
+                        id: tid,
+                        source_commit: DEFAULT_COMMIT_SHA,
+                        file_scope: scope,
+                        attempted_action: act,
+                        failure: reason,
+                        reason,
+                        alternative: alt,
+                        ts_ms,
+                    },
                 ) {
                     last_crdb_version = v;
                 }
@@ -1195,13 +1226,15 @@ pub fn run_memory(
             );
             if let Ok(v) = persist_memory_pin_to_crdb(
                 &repo_root,
-                "chinwag-hindsight-migration-v1",
-                "spector-fleet",
-                "cutover:chwg-mem-1:hindsight-migration",
-                &mig_summary,
-                DEFAULT_COMMIT_SHA,
-                "*",
-                ts_ms,
+                &MemoryPinWrite {
+                    id: "chinwag-hindsight-migration-v1",
+                    bank: "spector-fleet",
+                    context: "cutover:chwg-mem-1:hindsight-migration",
+                    content: &mig_summary,
+                    source_commit: DEFAULT_COMMIT_SHA,
+                    file_scope: "*",
+                    ts_ms,
+                },
             ) {
                 last_crdb_version = v;
             }

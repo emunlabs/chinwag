@@ -179,39 +179,39 @@ pub fn resolve_identity_config() -> IdentityConfig {
     let mut cfg_actor_id = String::new();
     let mut cfg_actor = String::new();
     let mut cfg_machine_name = String::new();
-    if let Ok(raw_cfg) = fs::read_to_string(&config_json_path) {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_cfg) {
-            if let Some(v) = parsed.get("apiKey").and_then(|v| v.as_str()) {
-                cfg_api_key = v.trim().to_string();
-            }
-            if let Some(v) = parsed
-                .get("missionControlUrl")
-                .or_else(|| parsed.get("studioOrigin"))
-                .and_then(|v| v.as_str())
-            {
-                cfg_studio_origin = v.trim().to_string();
-            }
-            if let Some(v) = parsed.get("actorId").and_then(|v| v.as_str()) {
-                cfg_actor_id = v.trim().to_string();
-            }
-            if let Some(v) = parsed.get("actor").and_then(|v| v.as_str()) {
-                cfg_actor = v.trim().to_string();
-            }
-            if let Some(v) = parsed.get("machineName").and_then(|v| v.as_str()) {
-                cfg_machine_name = v.trim().to_string();
-            }
+    if let Ok(raw_cfg) = fs::read_to_string(&config_json_path)
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw_cfg)
+    {
+        if let Some(v) = parsed.get("apiKey").and_then(|v| v.as_str()) {
+            cfg_api_key = v.trim().to_string();
+        }
+        if let Some(v) = parsed
+            .get("missionControlUrl")
+            .or_else(|| parsed.get("studioOrigin"))
+            .and_then(|v| v.as_str())
+        {
+            cfg_studio_origin = v.trim().to_string();
+        }
+        if let Some(v) = parsed.get("actorId").and_then(|v| v.as_str()) {
+            cfg_actor_id = v.trim().to_string();
+        }
+        if let Some(v) = parsed.get("actor").and_then(|v| v.as_str()) {
+            cfg_actor = v.trim().to_string();
+        }
+        if let Some(v) = parsed.get("machineName").and_then(|v| v.as_str()) {
+            cfg_machine_name = v.trim().to_string();
         }
     }
 
-    if let Ok(env_actor_id) = env::var("CHINWAG_ACTOR_ID") {
-        if !env_actor_id.trim().is_empty() {
-            actor_id = env_actor_id.trim().to_string();
-        }
+    if let Ok(env_actor_id) = env::var("CHINWAG_ACTOR_ID")
+        && !env_actor_id.trim().is_empty()
+    {
+        actor_id = env_actor_id.trim().to_string();
     }
-    if let Ok(env_actor) = env::var("CHINWAG_ACTOR") {
-        if !env_actor.trim().is_empty() {
-            handle = env_actor.trim().to_string();
-        }
+    if let Ok(env_actor) = env::var("CHINWAG_ACTOR")
+        && !env_actor.trim().is_empty()
+    {
+        handle = env_actor.trim().to_string();
     }
     if actor_id.is_empty() && !cfg_actor_id.is_empty() {
         actor_id = cfg_actor_id;
@@ -252,10 +252,10 @@ pub fn resolve_identity_config() -> IdentityConfig {
         };
     }
 
-    if let Ok(env_url) = env::var("CHINWAG_MISSION_CONTROL_URL") {
-        if !env_url.trim().is_empty() {
-            mission_control_url = env_url.trim().to_string();
-        }
+    if let Ok(env_url) = env::var("CHINWAG_MISSION_CONTROL_URL")
+        && !env_url.trim().is_empty()
+    {
+        mission_control_url = env_url.trim().to_string();
     }
     if mission_control_url.is_empty() && !studio_origin.is_empty() {
         mission_control_url = studio_origin;
@@ -402,7 +402,7 @@ fn curl_post_json_endpoint(
         Ok(out) => {
             let code_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let code = code_str.parse::<u16>().unwrap_or(0);
-            (code >= 200 && code < 300, code)
+            ((200..300).contains(&code), code)
         }
         Err(_) => (false, 0),
     }
@@ -498,7 +498,7 @@ fn post_slack_webhook(webhook_url: &str, text: &str) -> (bool, u16) {
         Ok(out) => {
             let code_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let code = code_str.parse::<u16>().unwrap_or(0);
-            (code >= 200 && code < 300, code)
+            ((200..300).contains(&code), code)
         }
         Err(_) => (false, 0),
     }
@@ -584,7 +584,7 @@ fn send_agentmail(to_inbox: &str, subject: &str, text: &str) -> (bool, u16) {
         Ok(out) => {
             let code_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let code = code_str.parse::<u16>().unwrap_or(0);
-            (code >= 200 && code < 300, code)
+            ((200..300).contains(&code), code)
         }
         Err(_) => (false, 0),
     }
@@ -602,18 +602,36 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     None
 }
 
+/// Response headers as ordered `(name, value)` pairs.
+type BeamHeaders = Vec<(String, String)>;
+/// Status line, headers and body returned by one upstream exchange.
+type BeamResponse = (String, BeamHeaders, Vec<u8>);
+
+/// One inbound beam request to be replayed against the upstream hub.
+struct BeamRequest<'a> {
+    method: &'a str,
+    path_and_query: &'a str,
+    content_type: Option<&'a str>,
+    accept: Option<&'a str>,
+    actor_override: Option<&'a str>,
+    body: &'a [u8],
+}
+
 fn beam_curl_exchange(
     hub_base: &str,
-    method: &str,
-    path_and_query: &str,
-    req_content_type: Option<&str>,
-    req_accept: Option<&str>,
-    req_actor_override: Option<&str>,
-    req_body: &[u8],
+    request: &BeamRequest<'_>,
     identity: &IdentityConfig,
     use_tailnet_resolve: bool,
-) -> Option<(String, Vec<(String, String)>, Vec<u8>)> {
+) -> Option<BeamResponse> {
     use std::process::Stdio;
+    let BeamRequest {
+        method,
+        path_and_query,
+        content_type: req_content_type,
+        accept: req_accept,
+        actor_override: req_actor_override,
+        body: req_body,
+    } = *request;
     let url = format!("{}{}", hub_base.trim_end_matches('/'), path_and_query);
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
@@ -645,12 +663,10 @@ fn beam_curl_exchange(
     }
     let ascii_actor = req_actor_override
         .filter(|s| !s.is_empty() && s.is_ascii())
-        .unwrap_or_else(|| {
-            if !identity.actor_id.is_empty() {
-                identity.actor_id.as_str()
-            } else {
-                "actor-nic"
-            }
+        .unwrap_or(if !identity.actor_id.is_empty() {
+            identity.actor_id.as_str()
+        } else {
+            "actor-nic"
         });
     cmd.args(["-H", &format!("X-Chinwag-Actor: {ascii_actor}")]);
     if !identity.actor_id.is_empty() {
@@ -659,15 +675,15 @@ fn beam_curl_exchange(
     if !identity.machine_name.is_empty() {
         cmd.args(["-H", &format!("X-Chinwag-Machine: {}", identity.machine_name)]);
     }
-    if let Some(ct) = req_content_type {
-        if !ct.is_empty() {
-            cmd.args(["-H", &format!("Content-Type: {ct}")]);
-        }
+    if let Some(ct) = req_content_type
+        && !ct.is_empty()
+    {
+        cmd.args(["-H", &format!("Content-Type: {ct}")]);
     }
-    if let Some(acc) = req_accept {
-        if !acc.is_empty() {
-            cmd.args(["-H", &format!("Accept: {acc}")]);
-        }
+    if let Some(acc) = req_accept
+        && !acc.is_empty()
+    {
+        cmd.args(["-H", &format!("Accept: {acc}")]);
     }
     if !req_body.is_empty() && !method.eq_ignore_ascii_case("HEAD") {
         cmd.args(["--data-binary", "@-"]);
@@ -682,10 +698,11 @@ fn beam_curl_exchange(
     cmd.stderr(Stdio::null());
 
     let mut child = cmd.spawn().ok()?;
-    if !req_body.is_empty() && !method.eq_ignore_ascii_case("HEAD") {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(req_body);
-        }
+    if !req_body.is_empty()
+        && !method.eq_ignore_ascii_case("HEAD")
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let _ = stdin.write_all(req_body);
     }
     let out = child.wait_with_output().ok()?;
     if !out.status.success() || out.stdout.is_empty() {
@@ -724,14 +741,9 @@ fn beam_curl_exchange(
 fn forward_beam_http_request(
     hub_url: &str,
     fallback_hub_url: &str,
-    method: &str,
-    path_and_query: &str,
-    req_content_type: Option<&str>,
-    req_accept: Option<&str>,
-    req_actor_override: Option<&str>,
-    req_body: &[u8],
+    request: &BeamRequest<'_>,
     identity: &IdentityConfig,
-) -> (String, Vec<(String, String)>, Vec<u8>, String) {
+) -> (String, BeamHeaders, Vec<u8>, String) {
     let mut candidates: Vec<(String, bool)> = Vec::new();
     let push_candidate = |list: &mut Vec<(String, bool)>, url: &str, use_resolve: bool| {
         let clean = url.trim_end_matches('/').to_string();
@@ -766,17 +778,9 @@ fn forward_beam_http_request(
     );
 
     for (cand, use_resolve) in candidates {
-        if let Some((status_line, headers, body)) = beam_curl_exchange(
-            &cand,
-            method,
-            path_and_query,
-            req_content_type,
-            req_accept,
-            req_actor_override,
-            req_body,
-            identity,
-            use_resolve,
-        ) {
+        if let Some((status_line, headers, body)) =
+            beam_curl_exchange(&cand, request, identity, use_resolve)
+        {
             return (status_line, headers, body, cand);
         }
     }
@@ -882,12 +886,14 @@ fn handle_beam_stream(
     let (status_line, headers, resp_body, effective_hub) = forward_beam_http_request(
         hub_url,
         fallback_hub_url,
-        method,
-        &path_and_query,
-        req_content_type.as_deref(),
-        req_accept.as_deref(),
-        req_actor_override.as_deref(),
-        req_body,
+        &BeamRequest {
+            method,
+            path_and_query: &path_and_query,
+            content_type: req_content_type.as_deref(),
+            accept: req_accept.as_deref(),
+            actor_override: req_actor_override.as_deref(),
+            body: req_body,
+        },
         identity,
     );
 
@@ -970,12 +976,14 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         let (status_line, _headers, body, effective_hub) = forward_beam_http_request(
             &hub_url,
             &identity.fallback_hub_url,
-            "GET",
-            "/api/auth/whoami",
-            None,
-            Some("application/json"),
-            None,
-            &[],
+            &BeamRequest {
+                method: "GET",
+                path_and_query: "/api/auth/whoami",
+                content_type: None,
+                accept: Some("application/json"),
+                actor_override: None,
+                body: &[],
+            },
             &identity,
         );
         let hub_ok = status_line.contains(" 200 ");
@@ -1106,35 +1114,31 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
     let _ = writeln!(stdout, "{banner}");
     let _ = stdout.flush();
 
-    if listen_addr == "127.0.0.1:5487" {
-        if let Ok(v6_listener) = std::net::TcpListener::bind("[::1]:5487") {
-            let hub_v6 = hub_url.clone();
-            let fb_v6 = identity.fallback_hub_url.clone();
-            let id_v6 = identity.clone();
-            std::thread::spawn(move || {
-                for incoming in v6_listener.incoming() {
-                    if let Ok(stream) = incoming {
-                        let hc = hub_v6.clone();
-                        let fc = fb_v6.clone();
-                        let ic = id_v6.clone();
-                        std::thread::spawn(move || {
-                            handle_beam_stream(stream, &hc, &fc, &ic);
-                        });
-                    }
-                }
-            });
-        }
+    if listen_addr == "127.0.0.1:5487"
+        && let Ok(v6_listener) = std::net::TcpListener::bind("[::1]:5487")
+    {
+        let hub_v6 = hub_url.clone();
+        let fb_v6 = identity.fallback_hub_url.clone();
+        let id_v6 = identity.clone();
+        std::thread::spawn(move || {
+            for stream in v6_listener.incoming().flatten() {
+                let hc = hub_v6.clone();
+                let fc = fb_v6.clone();
+                let ic = id_v6.clone();
+                std::thread::spawn(move || {
+                    handle_beam_stream(stream, &hc, &fc, &ic);
+                });
+            }
+        });
     }
 
-    for incoming in listener.incoming() {
-        if let Ok(stream) = incoming {
-            let hub_clone = hub_url.clone();
-            let fb_clone = identity.fallback_hub_url.clone();
-            let id_clone = identity.clone();
-            std::thread::spawn(move || {
-                handle_beam_stream(stream, &hub_clone, &fb_clone, &id_clone);
-            });
-        }
+    for stream in listener.incoming().flatten() {
+        let hub_clone = hub_url.clone();
+        let fb_clone = identity.fallback_hub_url.clone();
+        let id_clone = identity.clone();
+        std::thread::spawn(move || {
+            handle_beam_stream(stream, &hub_clone, &fb_clone, &id_clone);
+        });
     }
     0
 }
