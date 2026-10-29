@@ -1,0 +1,26 @@
+{
+  "display_name": "The Chinwag Break Room ('No Attribution. We're Among Friends.')",
+  "egress_allowlist": [
+    "syndicate.chinwag.sh:443",
+    "chinwag.tv:443",
+    "ge.chinwag.sh:443"
+  ],
+  "invariants": [
+    "INV-PLUGIN-SIG-01",
+    "INV-PLUGIN-SEATBELT-01",
+    "INV-PLUGIN-CHIP-01",
+    "INV-PLUGIN-EGRESS-01",
+    "INV-PLUGIN-ENT-01"
+  ],
+  "monotonic_seq": 24,
+  "payload_sha256": "68e9060a1883cf12c4317fb9b91a15b4cee8b1da3dbc9625cd5ecdcb29ef4aa1",
+  "plugin_id": "com.emunlabs.breakroom",
+  "schema": "chinwag-plugin-manifest/v1",
+  "seatbelt_profile": "INV-PLUGIN-SEATBELT-01",
+  "signature_ed25519": "b3e31f8aeb28c4999504624088ccb0b9d903f5b7dcac8c4fa480a70ea3ebbdaa0e1c34ab94287066ea1214756350d1acf44403a1b48e0615188dd3bd44e2e501",
+  "signer_pubkey_ed25519": "fa80fada8ea3af9d8af8e86709d6e23d48736aa2bb02d8508ceb8ea5882e7d6a",
+  "signer_seat": "ALISTAIR",
+  "signing_key_id": "pub_plugin_emun_2026",
+  "ui_mount": "/plugins/breakroom",
+  "version": "0.2.4"
+}

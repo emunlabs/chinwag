@@ -112,6 +112,41 @@ impl Identity {
     }
 }
 
+/// Parses an OpenSSH `allowed_signers` file and returns `(Option<seat_upper>, ed25519_pubkey_bytes)`.
+pub fn parse_allowed_signers(content: &str) -> Vec<(Option<String>, [u8; 32])> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let Some(alg_idx) = tokens.iter().position(|t| *t == "ssh-ed25519") else {
+            continue;
+        };
+        let Some(b64_key) = tokens.get(alg_idx + 1) else {
+            continue;
+        };
+        let openssh_str = format!("ssh-ed25519 {b64_key}");
+        let Ok(pub_key) = ssh_key::PublicKey::from_openssh(&openssh_str) else {
+            continue;
+        };
+        let Some(ed25519_pub) = pub_key.key_data().ed25519() else {
+            continue;
+        };
+        let mut seat_opt: Option<String> = None;
+        if alg_idx + 3 < tokens.len() && tokens[alg_idx + 2].eq_ignore_ascii_case("chinwag") {
+            seat_opt = Some(tokens[alg_idx + 3].to_uppercase());
+        } else if let Some(first) = tokens.first()
+            && let Some(prefix) = first.strip_suffix("-agent@chinwag.sh")
+        {
+            seat_opt = Some(prefix.to_uppercase());
+        }
+        out.push((seat_opt, ed25519_pub.0));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

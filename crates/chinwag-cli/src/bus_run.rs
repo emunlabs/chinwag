@@ -3,12 +3,15 @@
 //! Multi-party `iroh` QUIC messaging bus (`ALPN: chinwag/bus/1`) +
 //! `■ PRODUCT` Utilization Governor & `■ DELIVERY` Work-Stream Router.
 //!
-//! Includes Phase 1.1 Hardening (`TASK-08`..`TASK-11`):
-//! - `BUS-HARDEN-01`: Detached `Ed25519` message signatures (`pubkey_ed25519`, `signature_ed25519`, `sig_verified`).
-//! - `BUS-HARDEN-02`: Multi-interface daemon binding (`0.0.0.0:44330` -> `127.0.0.1:44330` + Tailscale/LAN `100.x:44330`).
+//! Includes Phase 1.1 & Phase 1.2 Hardening (`TASK-08`..`TASK-18`):
+//! - `BUS-HARDEN-01` & `BUS-HARDEN-04`: Detached `Ed25519` message signatures (`pubkey_ed25519`,
+//!   `signature_ed25519`, `sig_verified`) verified against `.chinwag/allowed_signers` over the
+//!   7-field canonical payload (`id`, `ts_unix`, `sender`, `to`, `room`, `task_id`, `body`).
+//! - `BUS-HARDEN-02` & `BUS-HARDEN-05`: Multi-interface `0.0.0.0:44330` QUIC binding with dynamic
+//!   non-loopback IPv4 discovery (`ifconfig`) and fail-loudly port binding.
 //! - `BUS-HARDEN-03`: Advisory `flock` on `.chinwag/bus/bus.lock` + `PRAGMA busy_timeout=5000;`.
-//! - `CHWG-CONTINUOUS-LOOP-01`: Autonomous 45s `■ PRODUCT` + `■ DELIVERY` backlog governor.
-//! - Local Central Time (`CDT` / `-05:00`) wall-clock formatting for operator logs.
+//! - `CHWG-CONTINUOUS-LOOP-01` & `CHWG-DYNAMIC-TASKS-PARSER-01`: Autonomous 45s governor that
+//!   dynamically parses `[IN_PROGRESS]` and `[READY]` items from `TASKS.md`.
 
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Signature, TransportAddr,
@@ -98,7 +101,7 @@ fn unix_now() -> u64 {
 }
 
 /// Returns local wall-clock timestamp with explicit timezone offset and zone name
-/// (e.g. `2026-10-29T18:06:12-0500 CDT`).
+/// (e.g. `2026-10-29T18:15:12-0500 CDT`).
 fn iso_now() -> String {
     let output = Command::new("/bin/date")
         .args(["+%Y-%m-%dT%H:%M:%S%z %Z"])
@@ -234,7 +237,21 @@ fn actor_transport_secret(actor: &str) -> SecretKey {
     SecretKey::from_bytes(&arr)
 }
 
+/// 7-field canonical signing payload binding `id`, `ts_unix`, `sender`, `to`, `room`, `task_id`, and `body` (`BUS-HARDEN-04`).
 pub fn canonical_signing_payload(msg: &BusMessage) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        msg.id,
+        msg.ts_unix,
+        msg.sender,
+        msg.to.as_deref().unwrap_or(""),
+        msg.room,
+        msg.task_id.as_deref().unwrap_or(""),
+        msg.body
+    )
+}
+
+fn legacy_6_field_signing_payload(msg: &BusMessage) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}",
         msg.id,
@@ -278,8 +295,9 @@ pub fn sign_bus_message(msg: &mut BusMessage, secret: &SecretKey) {
     msg.sig_verified = true;
 }
 
-/// Verifies the detached Ed25519 signature on `msg` (`BUS-HARDEN-01`).
-pub fn verify_bus_message_signature(msg: &mut BusMessage) -> bool {
+/// Verifies both (a) the detached Ed25519 signature over `canonical_signing_payload` and
+/// (b) that `pubkey_ed25519` is registered for `msg.sender` in `<repo_root>/.chinwag/allowed_signers` (`BUS-HARDEN-04`).
+pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> bool {
     let (Some(pub_str), Some(sig_str)) = (
         msg.pubkey_ed25519.as_deref(),
         msg.signature_ed25519.as_deref(),
@@ -296,10 +314,40 @@ pub fn verify_bus_message_signature(msg: &mut BusMessage) -> bool {
         return false;
     };
     let sig = Signature::from_bytes(&sig_bytes);
-    let payload = canonical_signing_payload(msg);
-    let ok = pubkey.verify(payload.as_bytes(), &sig).is_ok();
-    msg.sig_verified = ok;
-    ok
+    let payload7 = canonical_signing_payload(msg);
+    let crypto_ok = if pubkey.verify(payload7.as_bytes(), &sig).is_ok() {
+        true
+    } else {
+        let payload6 = legacy_6_field_signing_payload(msg);
+        pubkey.verify(payload6.as_bytes(), &sig).is_ok()
+    };
+    if !crypto_ok {
+        msg.sig_verified = false;
+        return false;
+    }
+
+    let allowed_path = repo_root.join(".chinwag").join("allowed_signers");
+    if allowed_path.is_file()
+        && let Ok(allowed_raw) = fs::read_to_string(&allowed_path)
+    {
+        let signers = chinwag_swarm::identity::parse_allowed_signers(&allowed_raw);
+        if !signers.is_empty() {
+            let sender_norm = msg.sender.trim().to_uppercase();
+            let in_allowed = signers.iter().any(|(seat_opt, bytes)| {
+                bytes == pubkey.as_bytes()
+                    && seat_opt
+                        .as_deref()
+                        .is_none_or(|s| s.eq_ignore_ascii_case(&sender_norm))
+            });
+            if !in_allowed {
+                msg.sig_verified = false;
+                return false;
+            }
+        }
+    }
+
+    msg.sig_verified = true;
+    true
 }
 
 fn normalize_actor(raw: &str) -> (String, String) {
@@ -343,8 +391,8 @@ fn read_all_messages_unlocked(repo_root: &Path) -> Vec<BusMessage> {
             continue;
         }
         if let Ok(mut msg) = serde_json::from_str::<BusMessage>(trimmed) {
-            if msg.signature_ed25519.is_some() && !msg.sig_verified {
-                let _ = verify_bus_message_signature(&mut msg);
+            if msg.signature_ed25519.is_some() {
+                let _ = verify_detached_bus_signature(repo_root, &mut msg);
             }
             out.push(msg);
         }
@@ -361,9 +409,8 @@ fn append_message_to_disk_and_crdb(repo_root: &Path, msg: &BusMessage) -> u64 {
     if verified_msg.signature_ed25519.is_none() {
         let sign_key = actor_signing_secret(&verified_msg.sender);
         sign_bus_message(&mut verified_msg, &sign_key);
-    } else {
-        let _ = verify_bus_message_signature(&mut verified_msg);
     }
+    let _ = verify_detached_bus_signature(repo_root, &mut verified_msg);
 
     with_bus_file_lock(repo_root, || {
         let existing = read_all_messages_unlocked(repo_root);
@@ -390,32 +437,7 @@ fn append_message_to_disk_and_crdb(repo_root: &Path, msg: &BusMessage) -> u64 {
         let pubkey_str = verified_msg.pubkey_ed25519.clone().unwrap_or_default();
         let sig_str = verified_msg.signature_ed25519.clone().unwrap_or_default();
         let sig_ok_int = if verified_msg.sig_verified { 1 } else { 0 };
-        let sql = format!(
-            "PRAGMA busy_timeout=5000; \
-             CREATE TABLE IF NOT EXISTS bus_messages (id TEXT PRIMARY KEY, seq INTEGER, ts_iso TEXT, room TEXT, sender TEXT, sender_endpoint_id TEXT, recipient TEXT, task_id TEXT, body TEXT, digest_sha256 TEXT, pubkey_ed25519 TEXT, signature_ed25519 TEXT, sig_verified INTEGER DEFAULT 0); \
-             ALTER TABLE bus_messages ADD COLUMN pubkey_ed25519 TEXT; \
-             ALTER TABLE bus_messages ADD COLUMN signature_ed25519 TEXT; \
-             ALTER TABLE bus_messages ADD COLUMN sig_verified INTEGER DEFAULT 0; \
-             INSERT OR REPLACE INTO bus_messages (id, seq, ts_iso, room, sender, sender_endpoint_id, recipient, task_id, body, digest_sha256, pubkey_ed25519, signature_ed25519, sig_verified) VALUES ('{}', {}, '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', {});",
-            verified_msg.id.replace('\'', "''"),
-            verified_msg.seq,
-            verified_msg.ts_iso.replace('\'', "''"),
-            verified_msg.room.replace('\'', "''"),
-            sender_display.replace('\'', "''"),
-            verified_msg.sender_endpoint_id.replace('\'', "''"),
-            verified_msg
-                .to
-                .clone()
-                .unwrap_or_default()
-                .replace('\'', "''"),
-            item_key.replace('\'', "''"),
-            verified_msg.body.replace('\'', "''"),
-            verified_msg.digest_sha256.replace('\'', "''"),
-            pubkey_str.replace('\'', "''"),
-            sig_str.replace('\'', "''"),
-            sig_ok_int,
-        );
-        // Execute CREATE + INSERT cleanly even if columns already exist
+
         let init_sql = "PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS bus_messages (id TEXT PRIMARY KEY, seq INTEGER, ts_iso TEXT, room TEXT, sender TEXT, sender_endpoint_id TEXT, recipient TEXT, task_id TEXT, body TEXT, digest_sha256 TEXT, pubkey_ed25519 TEXT, signature_ed25519 TEXT, sig_verified INTEGER DEFAULT 0);";
         let _ = Command::new("/usr/bin/sqlite3")
             .arg(&bus_db)
@@ -461,7 +483,6 @@ fn append_message_to_disk_and_crdb(repo_root: &Path, msg: &BusMessage) -> u64 {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        let _ = sql;
 
         next_seq
     })
@@ -509,8 +530,29 @@ fn write_daemon_state(repo_root: &Path, state: &DaemonState) {
     }
 }
 
-/// Binds on `0.0.0.0:{port}` when `port != 0` (`BUS-HARDEN-02` — accepting connections on
-/// both `127.0.0.1:44330` and Tailscale/LAN `100.x:44330`), and `127.0.0.1:0` for ephemeral clients.
+/// Dynamically discovers active non-loopback IPv4 addresses on this host via `/sbin/ifconfig` (`BUS-HARDEN-05`).
+pub fn discover_non_loopback_ipv4() -> Vec<String> {
+    let mut ips = Vec::new();
+    let Ok(out) = Command::new("/sbin/ifconfig").output() else {
+        return ips;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("inet ")
+            && let Some(ip_tok) = rest.split_whitespace().next()
+            && ip_tok != "127.0.0.1"
+            && ip_tok.parse::< std::net::Ipv4Addr>().is_ok()
+            && !ips.iter().any(|existing| existing == ip_tok)
+        {
+            ips.push(ip_tok.to_string());
+        }
+    }
+    ips
+}
+
+/// Binds on `0.0.0.0:{port}` when `port != 0` and fails loudly if the requested port
+/// cannot be bound (`BUS-HARDEN-05` — no silent fallback to an unrequested random port).
 async fn bind_bus_endpoint(
     secret: SecretKey,
     port: u16,
@@ -520,10 +562,10 @@ async fn bind_bus_endpoint(
     let addr: SocketAddr = format!("{bind_host}:{port}")
         .parse()
         .map_err(|e| format!("invalid socket addr: {e}"))?;
-    let builder = Endpoint::builder(presets::Minimal)
-        .secret_key(secret.clone())
+    Endpoint::builder(presets::Minimal)
+        .secret_key(secret)
         .clear_address_lookup()
-        .address_lookup(lookup.clone())
+        .address_lookup(lookup)
         .relay_mode(RelayMode::Disabled)
         .alpns(vec![
             BUS_ALPN.to_vec(),
@@ -531,30 +573,10 @@ async fn bind_bus_endpoint(
         ])
         .clear_ip_transports()
         .bind_addr(addr)
-        .map_err(|e| format!("bind_addr failed: {e}"))?;
-
-    match builder.bind().await {
-        Ok(ep) => Ok(ep),
-        Err(_) if port != 0 => {
-            let fallback: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            Endpoint::builder(presets::Minimal)
-                .secret_key(secret)
-                .clear_address_lookup()
-                .address_lookup(lookup)
-                .relay_mode(RelayMode::Disabled)
-                .alpns(vec![
-                    BUS_ALPN.to_vec(),
-                    chinwag_swarm::dispatch_wire::ALPN.to_vec(),
-                ])
-                .clear_ip_transports()
-                .bind_addr(fallback)
-                .map_err(|e| format!("fallback bind_addr failed: {e}"))?
-                .bind()
-                .await
-                .map_err(|e| format!("endpoint bind failed: {e}"))
-        }
-        Err(e) => Err(format!("endpoint bind failed: {e}")),
-    }
+        .map_err(|e| format!("bind_addr failed on {addr}: {e}"))?
+        .bind()
+        .await
+        .map_err(|e| format!("endpoint bind failed on {addr}: {e}"))
 }
 
 async fn publish_over_iroh_quic(
@@ -621,8 +643,6 @@ async fn publish_over_iroh_quic(
     serde_json::from_slice::<BusAck>(&resp_bytes).map_err(|e| format!("invalid ack json: {e}"))
 }
 
-/// Formats `m.ts_iso` in local Central Time (`[18:06:12 CDT]`), automatically converting
-/// any legacy UTC (`Z`) timestamps so operators always see local wall-clock time.
 fn format_local_wall_clock(ts_iso: &str) -> String {
     if ts_iso.len() >= 19 {
         let hms = &ts_iso[11..19];
@@ -679,50 +699,109 @@ fn format_bus_line(m: &BusMessage) -> String {
     )
 }
 
-/// Autonomous `■ PRODUCT` + `■ DELIVERY` Backlog Governor (`CHWG-CONTINUOUS-LOOP-01`).
-/// Dispatches active engineering, security, and QA work streams across all seats.
+/// Dynamically parses `[IN_PROGRESS]` and `[READY]` tasks (`(seat, task_id, prompt)`) from `TASKS.md`
+/// (`TASK-18` / `CHWG-DYNAMIC-TASKS-PARSER-01`).
+pub fn parse_active_tasks_from_markdown(repo_root: &Path) -> Vec<(String, String, String)> {
+    let tasks_path = repo_root.join("TASKS.md");
+    let Ok(raw) = fs::read_to_string(&tasks_path) else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    let mut current_task_id: Option<String> = None;
+    let mut current_title = String::new();
+    let mut current_seat: Option<String> = None;
+    let mut current_scope = Vec::new();
+
+    let flush = |results: &mut Vec<(String, String, String)>,
+                 task_id: &mut Option<String>,
+                 title: &mut String,
+                 seat: &mut Option<String>,
+                 scope: &mut Vec<String>| {
+        if let (Some(tid), Some(s)) = (task_id.take(), seat.take()) {
+            let scope_str = scope.join(" ");
+            let prompt = format!(
+                "{tid} from TASKS.md ({title}): {scope_str} Execute verification and return a concise technical receipt."
+            );
+            results.push((s, tid, prompt));
+        }
+        title.clear();
+        scope.clear();
+    };
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("### ") {
+            flush(
+                &mut results,
+                &mut current_task_id,
+                &mut current_title,
+                &mut current_seat,
+                &mut current_scope,
+            );
+            let is_active =
+                trimmed.contains("`[IN_PROGRESS]`") || trimmed.contains("`[READY]`");
+            if is_active {
+                // Extract `TASK-XX` token
+                for part in trimmed.split('`') {
+                    if part.starts_with("TASK-") {
+                        current_task_id = Some(part.to_string());
+                        break;
+                    }
+                }
+                current_title = trimmed.trim_start_matches("### ").to_string();
+            }
+            continue;
+        }
+        if current_task_id.is_some() {
+            if trimmed.starts_with("- **Owner:**") {
+                let upper = trimmed.to_uppercase();
+                for candidate in ["RUST", "ARCHITECT", "FLINT", "ALISTAIR", "QA"] {
+                    if upper.contains(candidate) {
+                        current_seat = Some(candidate.to_string());
+                        break;
+                    }
+                }
+            } else if trimmed.starts_with("- **Scope:**")
+                || trimmed.starts_with("- **Files:**")
+                || trimmed.starts_with("1.")
+                || trimmed.starts_with("2.")
+            {
+                current_scope.push(trimmed.to_string());
+            }
+        }
+    }
+    flush(
+        &mut results,
+        &mut current_task_id,
+        &mut current_title,
+        &mut current_seat,
+        &mut current_scope,
+    );
+    results
+}
+
+/// Autonomous `■ PRODUCT` + `■ DELIVERY` Backlog Governor (`CHWG-CONTINUOUS-LOOP-01` + `CHWG-DYNAMIC-TASKS-PARSER-01`).
 fn dispatch_continuous_backlog_wave(repo_root: &Path, target_seat: &str) -> Vec<String> {
     let mut spawned = Vec::new();
     let target = target_seat.to_uppercase();
+    let parsed_tasks = parse_active_tasks_from_markdown(repo_root);
 
-    let work_matrix = [
-        (
-            "RUST",
-            "TASK-08",
-            "TASK-08 & TASK-12 (BUS-HARDEN-01 + CHWG-OPENSPEC-CLI-01): Verify detached Ed25519 message signing in crates/chinwag-cli/src/bus_run.rs and OpenSpec CLI subcommands in crates/chinwag-cli/src/feature_cli_run.rs. Run cargo test -p chinwag-cli --lib and return your concise verification summary.",
-        ),
-        (
-            "ARCHITECT",
-            "TASK-09",
-            "TASK-09 & TASK-13 (BUS-HARDEN-02 + CHWG-PLUGIN-HOST-01): Verify multi-interface 0.0.0.0:44330 QUIC binding in crates/chinwag-cli/src/bus_run.rs and .cwplugin Ed25519 manifest verifier (chinwag plugin verify --json). Return your concise architectural verification summary.",
-        ),
-        (
-            "FLINT",
-            "TASK-10",
-            "TASK-10 (BUS-HARDEN-03 Re-Audit): Verify that crates/chinwag-cli/src/agent_dispatch_run.rs now retries persist_to_crdb 5 times with backoff and surfaces crdb_error instead of silent deferred:, and bus_run.rs enforces advisory flock on .chinwag/bus/bus.lock + PRAGMA busy_timeout=5000. Return your adversarial PASS/FAIL verdict.",
-        ),
-        (
-            "ALISTAIR",
-            "TASK-07",
-            "TASK-07 & TASK-14 (CHWG-SIGN-AUDIT-1 + CHWG-A509-CLI-01): Audit .chinwag/allowed_signers and all 10 seat Ed25519 keys (rust, architect, flint, qa, alistair, type, gemini-pm, product, delivery, brian) plus detached Ed25519 bus signatures. Return your CISO verification verdict.",
-        ),
-        (
-            "QA",
-            "TASK-06",
-            "TASK-06 (CHWG-QA-SWEEP-1): Verify workspace determinism for chinwag ui-gate --json, chinwag openspec validate --json, chinwag plugin verify --json, and chinwag a509 verify --json. Return your QA gate receipt.",
-        ),
-    ];
-
-    for (seat, task_id, prompt) in work_matrix {
+    let mut dispatched_seats = std::collections::BTreeSet::new();
+    for (seat, task_id, prompt) in parsed_tasks {
+        if dispatched_seats.contains(&seat) {
+            continue;
+        }
         if target == "ALL"
             || target == seat
             || (target == "GPT" && (seat == "RUST" || seat == "ARCHITECT" || seat == "ALISTAIR"))
         {
-            if is_seat_worker_active(repo_root, seat) {
+            if is_seat_worker_active(repo_root, &seat) {
+                dispatched_seats.insert(seat);
                 continue;
             }
-            if spawn_seat_workstream(repo_root, seat, task_id, prompt) {
+            if spawn_seat_workstream(repo_root, &seat, &task_id, &prompt) {
                 spawned.push(format!("■ {seat} (-> {task_id})"));
+                dispatched_seats.insert(seat);
             }
         }
     }
@@ -764,22 +843,25 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
     };
 
     let endpoint_id = endpoint.id().to_string();
-    let mut bound_sockets: Vec<String> = endpoint
-        .bound_sockets()
+    let actual_sockets = endpoint.bound_sockets();
+    let actual_port = actual_sockets
+        .first()
+        .map(|s| s.port())
+        .unwrap_or(port);
+
+    let mut bound_sockets: Vec<String> = actual_sockets
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-    let local_loopback = format!("127.0.0.1:{port}");
-    let wildcard_bind = format!("0.0.0.0:{port}");
-    let tailscale_bind = format!("100.66.156.76:{port}");
-    if !bound_sockets.contains(&wildcard_bind) {
-        bound_sockets.insert(0, wildcard_bind);
+    let loopback_sock = format!("127.0.0.1:{actual_port}");
+    if !bound_sockets.contains(&loopback_sock) {
+        bound_sockets.push(loopback_sock);
     }
-    if !bound_sockets.contains(&local_loopback) {
-        bound_sockets.push(local_loopback);
-    }
-    if !bound_sockets.contains(&tailscale_bind) {
-        bound_sockets.push(tailscale_bind);
+    for ip in discover_non_loopback_ipv4() {
+        let candidate = format!("{ip}:{actual_port}");
+        if !bound_sockets.contains(&candidate) {
+            bound_sockets.push(candidate);
+        }
     }
 
     let started_at = unix_now();
@@ -805,9 +887,9 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
         last_heartbeat: started_at,
         total_messages: initial_count,
         product_governor:
-            "ACTIVE (CHWG-CONTINUOUS-LOOP-01 · 45s Autonomous Utilization Governor)".to_string(),
+            "ACTIVE (CHWG-CONTINUOUS-LOOP-01 · Dynamic TASKS.md 45s Governor)".to_string(),
         delivery_router:
-            "ACTIVE (Ed25519-Verified Multi-Party Work-Stream Router on 0.0.0.0:44330)".to_string(),
+            "ACTIVE (Ed25519+allowed_signers Verified Router on 0.0.0.0:44330)".to_string(),
     }));
     if let Ok(guard) = state.lock() {
         write_daemon_state(&repo_root, &guard);
@@ -828,7 +910,6 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
     let (tx, _rx) = broadcast::channel::<BusMessage>(256);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut governor_tick = tokio::time::interval(Duration::from_secs(45));
-    // Consume immediate first tick so daemon finishes binding before first autonomous wave
     governor_tick.tick().await;
 
     loop {
@@ -854,9 +935,9 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
                             "PRODUCT",
                             "#mgmt",
                             Some("DELIVERY".to_string()),
-                            Some("TASK-11".to_string()),
+                            Some("TASK-18".to_string()),
                             &format!(
-                                "■ PRODUCT × ■ DELIVERY Autonomous Governor (CHWG-CONTINUOUS-LOOP-01): Re-dispatched {} idle seat(s) ({}) under 0% idle tolerance.",
+                                "■ PRODUCT × ■ DELIVERY Autonomous Governor (CHWG-DYNAMIC-TASKS-PARSER-01): Dynamically parsed TASKS.md and dispatched {} seat(s) ({}) under 0% idle tolerance.",
                                 spawned.len(),
                                 spawned.join(", ")
                             ),
@@ -884,7 +965,7 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
                         return;
                     };
                     if let Ok(BusFrame::Publish { mut message }) = serde_json::from_slice::<BusFrame>(&bytes) {
-                        let sig_ok = verify_bus_message_signature(&mut message);
+                        let sig_ok = verify_detached_bus_signature(&repo_clone, &mut message);
                         let seq = append_message_to_disk_and_crdb(&repo_clone, &message);
                         message.seq = seq;
                         let subs = tx_clone.send(message.clone()).unwrap_or(0);
@@ -962,8 +1043,8 @@ pub fn send_bus_message_sync(
         sig_verified: false,
     };
     sign_bus_message(&mut msg, &signing_secret);
+    let _ = verify_detached_bus_signature(repo_root, &mut msg);
 
-    // If daemon is online, publish over live iroh QUIC (`ALPN: chinwag/bus/1`)
     if let Some(daemon) = read_daemon_state(repo_root)
         && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -971,10 +1052,10 @@ pub fn send_bus_message_sync(
         && let Ok(ack) = rt.block_on(publish_over_iroh_quic(&daemon, transport_secret, &msg))
     {
         msg.seq = ack.seq;
+        msg.sig_verified = ack.sig_verified;
         return (msg, ack);
     }
 
-    // Fallback direct persistence if daemon is still starting
     let seq = append_message_to_disk_and_crdb(repo_root, &msg);
     msg.seq = seq;
     let ack = BusAck {
@@ -1051,7 +1132,8 @@ fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) ->
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let summary: String = collapsed.chars().take(480).collect();
+    // Full-length 1800-char bus receipt so engineering/audit findings are never clipped (`TASK-15`)
+    let summary: String = collapsed.chars().take(1800).collect();
 
     let target_room = if seat.eq_ignore_ascii_case("QA") {
         "#qa"
@@ -1067,7 +1149,7 @@ fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) ->
         &format!("COMPLETED {task_id}: {summary}"),
     );
 
-    let short_summary: String = collapsed.chars().take(240).collect();
+    let short_summary: String = collapsed.chars().take(600).collect();
     let _ = send_bus_message_sync(
         repo_root,
         "DELIVERY",
@@ -1106,6 +1188,8 @@ fn spawn_seat_workstream(repo_root: &Path, seat: &str, task_id: &str, prompt: &s
                 "PATH",
                 "/opt/homebrew/opt/rustup/bin:/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/bin:/bin",
             )
+            .env("RUSTC", "/opt/homebrew/opt/rustup/bin/rustc")
+            .env("CARGO", "/opt/homebrew/opt/rustup/bin/cargo")
             .env(
                 "CHINWAG_PRIVATE_CRSQL_INPUTS",
                 "/Users/brianspector/.chinwag-native-inputs",
@@ -1214,7 +1298,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             let seat = seat_arg
                 .or_else(|| from_arg.clone())
                 .unwrap_or_else(|| "RUST".to_string());
-            let task = task_arg.unwrap_or_else(|| "TASK-08".to_string());
+            let task = task_arg.unwrap_or_else(|| "TASK-15".to_string());
             let prompt = positionals.join(" ").trim().to_string();
             run_worker_sync(&repo_root, &seat, &task, &prompt)
         }
@@ -1372,9 +1456,9 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 "PRODUCT",
                 "#mgmt",
                 Some("DELIVERY".to_string()),
-                Some("TASK-11".to_string()),
+                Some("TASK-18".to_string()),
                 &format!(
-                    "■ PRODUCT Utilization Governor (CHWG-CONTINUOUS-LOOP-01): Enforcing 0% idle tolerance on TASKS.md (target={target_seat}). Routing Phase 1.1 & CLI backlog work streams to ■ RUST, ■ ARCHITECT, ■ FLINT, ■ ALISTAIR, and ■ QA now."
+                    "■ PRODUCT Utilization Governor (CHWG-DYNAMIC-TASKS-PARSER-01): Dynamically parsed TASKS.md (target={target_seat}) and enforcing 0% idle tolerance across ■ RUST, ■ ARCHITECT, ■ FLINT, ■ ALISTAIR, and ■ QA."
                 ),
             );
 
@@ -1385,9 +1469,9 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 "DELIVERY",
                 "#eng",
                 None,
-                Some("TASK-11".to_string()),
+                Some("TASK-18".to_string()),
                 &format!(
-                    "■ DELIVERY Work-Stream Router: Dispatched {} live worker stream(s) ({}). Streaming Ed25519-verified progress to #eng, #qa, and #mgmt over iroh/bus/1 (0.0.0.0:44330).",
+                    "■ DELIVERY Work-Stream Router: Dispatched {} live worker stream(s) ({}). Streaming Ed25519+allowed_signers verified progress (1800-char full receipts) to #eng, #qa, and #mgmt.",
                     spawned.len(),
                     if spawned.is_empty() {
                         "all target seats already executing".to_string()
@@ -1507,33 +1591,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detached_ed25519_bus_signature_verifies_and_rejects_tampering() {
-        let secret = SecretKey::from_bytes(&[0x42; 32]);
+    fn detached_ed25519_bus_signature_verifies_allowed_signers_and_rejects_tampering() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret = actor_signing_secret("ARCHITECT");
         let mut msg = BusMessage {
             id: "bus-1793250000-deadbeef".to_string(),
             seq: 1,
             ts_unix: 1_793_250_000,
-            ts_iso: "2026-10-29T18:06:00-0500 CDT".to_string(),
+            ts_iso: "2026-10-29T18:15:00-0500 CDT".to_string(),
             room: "#eng".to_string(),
             sender: "ARCHITECT".to_string(),
             sender_cast: "■".to_string(),
             sender_endpoint_id: secret.public().to_string(),
             to: Some("RUST".to_string()),
-            task_id: Some("TASK-08".to_string()),
-            body: "Verified detached Ed25519 signature on BusMessage".to_string(),
+            task_id: Some("TASK-15".to_string()),
+            body: "Verified detached Ed25519 signature + allowed_signers".to_string(),
             digest_sha256: "deadbeef".repeat(8),
             pubkey_ed25519: None,
             signature_ed25519: None,
             sig_verified: false,
         };
         sign_bus_message(&mut msg, &secret);
-        assert!(msg.sig_verified);
-        assert!(verify_bus_message_signature(&mut msg));
+        assert!(verify_detached_bus_signature(temp.path(), &mut msg));
+
+        // Tamper with task_id -> 7-field signature must fail closed
+        let mut tampered_task = msg.clone();
+        tampered_task.task_id = Some("TASK-99".to_string());
+        assert!(!verify_detached_bus_signature(temp.path(), &mut tampered_task));
 
         // Tamper with body -> verification must fail closed
         msg.body.push_str(" tampered");
-        assert!(!verify_bus_message_signature(&mut msg));
-        assert!(!msg.sig_verified);
+        assert!(!verify_detached_bus_signature(temp.path(), &mut msg));
+    }
+
+    #[test]
+    fn dynamic_tasks_md_parser_extracts_in_progress_and_ready_items() {
+        let temp = tempfile::tempdir().unwrap();
+        let sample = "# TASKS\n\
+            ### `[DONE]` `TASK-01` — Old Task\n\
+            - **Owner:** `■ RUST`\n\
+            ### `[IN_PROGRESS]` `TASK-15` — Hardened Bus Signatures\n\
+            - **Owner:** `■ RUST` (`GPT / Codex`)\n\
+            - **Scope:** Verify 7-field Ed25519 signature and allowed_signers.\n\
+            ### `[READY]` `TASK-16` — Dynamic Interface Discovery\n\
+            - **Owner:** `■ ARCHITECT`\n\
+            - **Scope:** Discover active non-loopback IPv4 interfaces.\n";
+        fs::write(temp.path().join("TASKS.md"), sample).unwrap();
+        let parsed = parse_active_tasks_from_markdown(temp.path());
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "RUST");
+        assert_eq!(parsed[0].1, "TASK-15");
+        assert_eq!(parsed[1].0, "ARCHITECT");
+        assert_eq!(parsed[1].1, "TASK-16");
     }
 
     #[test]
