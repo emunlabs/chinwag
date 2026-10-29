@@ -633,6 +633,8 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
 #[cfg(target_os = "macos")]
 mod agent_dispatch_run;
 #[cfg(target_os = "macos")]
+pub mod seat_signing;
+#[cfg(target_os = "macos")]
 pub use agent_dispatch_run::run_agent_dispatch;
 #[cfg(not(target_os = "macos"))]
 pub fn run_agent_dispatch(

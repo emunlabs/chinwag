@@ -16,6 +16,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::AgentDispatchRequest;
+use crate::seat_signing;
 use chinwag_snapshot_session_private::replacement::{
     AgentDispatchRecord, WriteOwner, WriteSession,
 };
@@ -321,6 +322,7 @@ fn dispatch_to_engine(
     agent_upper: &str,
     full_prompt: &str,
     custom: Option<&CustomAgentMeta>,
+    signing_env: &[(String, String)],
 ) -> (String, &'static str) {
     if let Ok(mock) = std::env::var("CHINWAG_AGENT_MOCK_REPLY")
         && !mock.trim().is_empty()
@@ -358,6 +360,7 @@ fn dispatch_to_engine(
             .args(["run", full_prompt, "--cwd", &repo_dir.to_string_lossy()])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
+            .envs(signing_env.iter().cloned())
             .output()
     {
         let text = strip_flint_banner(&String::from_utf8_lossy(&out.stdout));
@@ -373,6 +376,7 @@ fn dispatch_to_engine(
             .args(["/opt/homebrew/bin/gemini", "-p", full_prompt, "--yolo"])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
+            .envs(signing_env.iter().cloned())
             .output()
     {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -389,6 +393,7 @@ fn dispatch_to_engine(
             .args(["exec", "--skip-git-repo-check", full_prompt])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
+            .envs(signing_env.iter().cloned())
             .output()
     {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -408,6 +413,7 @@ fn dispatch_to_engine(
             .args(["agent", "--always-approve", full_prompt])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
+            .envs(signing_env.iter().cloned())
             .output()
     {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -427,6 +433,7 @@ fn dispatch_to_engine(
         .args(["--print", "--dangerously-skip-permissions", full_prompt])
         .current_dir(&default_cwd)
         .env("PATH", &path_env)
+        .envs(signing_env.iter().cloned())
         .output()
     {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -619,6 +626,16 @@ pub fn run_agent_dispatch(
             transcript.join("\n\n")
         ));
     }
+    // Per-seat commit signing for the engine process. Fails safe: with no key
+    // pair for the seat nothing is injected and only a warning is logged.
+    let signing =
+        seat_signing::resolve(&agent_upper, Path::new(&user_home()), &default_repo_root());
+    if let Some(warning) = &signing.warning {
+        let _ = writeln!(err, "chinwag: warning: {warning}");
+    }
+    if signing.is_active() {
+        prompt_parts.push(seat_signing::brief_note(&agent_upper));
+    }
     prompt_parts.push(format!(
         "\n--- New Message from {sender} ---\n{body}\n\nReply directly as {agent_upper}:"
     ));
@@ -628,6 +645,7 @@ pub fn run_agent_dispatch(
         &agent_upper,
         &full_prompt,
         stdin_payload.custom_agent.as_ref(),
+        &signing.env,
     );
 
     let now_ms = SystemTime::now()
