@@ -38,6 +38,14 @@ impl fmt::Display for Theme {
 #[derive(Debug, Eq, PartialEq)]
 pub struct UnknownTheme;
 
+impl fmt::Display for UnknownTheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unknown theme; expected one of: midnight, daylight, graphite")
+    }
+}
+
+impl std::error::Error for UnknownTheme {}
+
 impl FromStr for Theme {
     type Err = UnknownTheme;
 
@@ -104,5 +112,28 @@ mod tests {
     #[test]
     fn unknown_theme_is_rejected() {
         assert_eq!("solarized".parse::<Theme>(), Err(UnknownTheme));
+    }
+
+    #[test]
+    fn unknown_theme_displays_and_is_an_error() {
+        assert_eq!(
+            UnknownTheme.to_string(),
+            "unknown theme; expected one of: midnight, daylight, graphite"
+        );
+        let boxed: Box<dyn std::error::Error> = Box::new(UnknownTheme);
+        assert!(boxed.source().is_none());
+        // Usable with `?` in a function returning a boxed error.
+        fn parse(s: &str) -> Result<Theme, Box<dyn std::error::Error>> {
+            Ok(s.parse::<Theme>()?)
+        }
+        assert_eq!(parse("daylight").unwrap(), Theme::Daylight);
+        assert!(parse("nope").is_err());
+    }
+
+    #[test]
+    fn display_matches_slug() {
+        for theme in Theme::ALL {
+            assert_eq!(theme.to_string(), theme.slug());
+        }
     }
 }

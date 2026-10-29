@@ -30,12 +30,10 @@ desktop = ["dioxus/desktop"]
 dioxus = { version = "=0.7.10", default-features = false, features = ["fullstack", "router", "macro", "html", "signals", "hooks", "launch", "document"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+dioxus-ssr = "=0.7.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"], optional = true }
-
-[dev-dependencies]
-dioxus-ssr = "=0.7.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 axum = "=0.8.9"

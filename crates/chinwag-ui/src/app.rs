@@ -159,3 +159,59 @@ fn CommsPage(selected: Option<String>) -> Element {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(app: fn() -> Element) -> String {
+        let mut dom = VirtualDom::new(app);
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn root_route_parses_to_home() {
+        assert_eq!("/".parse::<Route>().ok(), Some(Route::Home {}));
+    }
+
+    #[test]
+    fn channel_route_captures_the_id_and_round_trips() {
+        let route = "/comms/fixture-mgmt".parse::<Route>().expect("route");
+        assert_eq!(
+            route,
+            Route::Channel {
+                channel_id: "fixture-mgmt".into()
+            }
+        );
+        assert_eq!(route.to_string(), "/comms/fixture-mgmt");
+    }
+
+    #[test]
+    fn unknown_paths_fall_through_to_not_found() {
+        assert_eq!(
+            "/no/such/page".parse::<Route>().ok(),
+            Some(Route::NotFound {
+                segments: vec!["no".into(), "such".into(), "page".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn app_renders_the_real_shell_with_styles_and_loading_state() {
+        let html = render(App);
+        for expected in [
+            "<style>",
+            "--bg:",
+            "Chinwag Mission Control",
+            "<aside",
+            "<main",
+            "Loading channels",
+            "Comms",
+        ] {
+            assert!(html.contains(expected), "{expected}: {html}");
+        }
+        // Nothing is composable until a channel is loaded and selected.
+        assert!(!html.contains("<textarea"), "{html}");
+    }
+}

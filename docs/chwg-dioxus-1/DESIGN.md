@@ -634,14 +634,14 @@ Do not register fake `crsql_*` functions to bypass CRSQL behavior. The legacy st
 
 `resolveHumanActor()` is implemented at `P/server/server.ts:558–613`.
 
-Its actual precedence is:
+Its actual precedence is (first match wins):
 
-1. Matching Nic bearer token selects Nic.
-2. `X-Chinwag-Actor`, then `?actor=`, selects an actor.
-3. Nic’s recognized peer address selects Nic.
-4. Otherwise the resolver defaults to Brian, optionally marking a Brian token match.
+1. A bearer token that matches the Nic key selects Nic (`authMethod` `bearer-nic-key`).
+2. `X-Chinwag-Actor`, then `?actor=` when the header is empty, selects an actor (`header-x-chinwag-actor` or `query-actor`). The value is lower-cased and matched against fixed Nic and Brian alias lists, then by substring: any value containing `nic` selects Nic, checked before any value containing `brian` selects Brian. An unrecognized value is ignored and resolution continues.
+3. A source address of `100.89.25.127` or `192.168.1.111` selects Nic (`tailscale-ip`). The source address is the first `X-Forwarded-For` entry when present, otherwise the socket peer address, with any `::ffff:` prefix removed.
+4. Otherwise the resolver defaults to Brian. `authMethod` is `bearer-brian-key` when the bearer token matches the Brian key, and `tailscale-ip` otherwise.
 
-This differs from the Auth PRD’s stated precedence. A Brian token does not necessarily override an actor header or Nic-address attribution.
+The Brian key is checked only in step 4. A matching Brian token never overrides an actor header, `?actor=`, or a Nic source address; it only changes the `authMethod` label of the default result. A Brian token sent with `X-Chinwag-Actor: nic`, or from a Nic address, therefore resolves to Nic. The Auth PRD states that the Brian token resolves to Brian unless a verified co-founder client supplies the actor header. The code never verifies that header, so the two differ.
 
 The resolver trusts `X-Forwarded-For` without an explicit trusted-proxy boundary. Actor and machine headers are not cryptographically verified. The registry’s public-key fingerprint strings are metadata, not proof of possession.
 
