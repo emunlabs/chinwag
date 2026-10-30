@@ -1,7 +1,7 @@
 //! Explicit owner-local HTTP inbox enrollment and private capability export.
 //! No live client configuration, account, model or application is consulted.
 
-use chinwag_bus_client::BusClient;
+use chinwag_bus_client::{BusClient, HttpMcpSetupOffer};
 use chinwag_bus_mcp::{
     InboxServer,
     http::{HttpCapability, HttpInbox, HttpInboxConfig},
@@ -77,6 +77,7 @@ pub type Result<T> = std::result::Result<T, McpOwnerError>;
 pub struct HttpMcpOwner {
     transport: Arc<HttpInbox>,
     enrollment: Enrollment,
+    setup_offer: HttpMcpSetupOffer,
 }
 
 impl HttpMcpOwner {
@@ -108,6 +109,10 @@ impl HttpMcpOwner {
         getrandom::fill(&mut secret).map_err(|_| McpOwnerError::RandomUnavailable)?;
         getrandom::fill(&mut connection_nonce).map_err(|_| McpOwnerError::RandomUnavailable)?;
         let capability = HttpCapability::from_bytes(secret);
+        // Configuration names use the existing independent connection nonce,
+        // never the bearer or a hash of it. No new enrollment is created.
+        let setup_offer = HttpMcpSetupOffer::new(&endpoint, &hex(&connection_nonce))
+            .map_err(|_| McpOwnerError::InvalidEndpoint)?;
         let connection = ConnectionId::new(format!("owner-http-{}", hex(&connection_nonce)))
             .map_err(|_| McpOwnerError::AdmissionUnavailable)?;
         let destination = Destination::new(&endpoint, NativeRoom::Mgmt)
@@ -166,6 +171,7 @@ impl HttpMcpOwner {
             Ok(transport) => Ok(Self {
                 transport,
                 enrollment,
+                setup_offer,
             }),
             Err(error) => {
                 enrollment.0.revoke().await?;
@@ -176,6 +182,10 @@ impl HttpMcpOwner {
 
     pub fn transport(&self) -> Arc<HttpInbox> {
         self.transport.clone()
+    }
+
+    pub fn setup_offer(&self) -> &HttpMcpSetupOffer {
+        &self.setup_offer
     }
 
     pub async fn shutdown(&self) -> Result<()> {

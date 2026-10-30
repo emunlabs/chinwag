@@ -6,11 +6,15 @@ mod drafts;
 #[cfg(test)]
 mod interaction_tests;
 #[cfg(test)]
+mod mcp_http_interaction_tests;
+mod mcp_http_ui;
+#[cfg(test)]
 mod opening_interaction_tests;
 mod openings;
 mod outbox;
 use discovery_ui::{DiscoveryPanel, InventoryState};
 use drafts::DraftFile;
+use mcp_http_ui::{McpHttpPanel, McpHttpRequestKind, McpHttpState};
 use openings::{OpeningAction, OpeningAttempt, OpeningStore};
 use outbox::{Attempt, AttemptState, Outbox};
 
@@ -26,10 +30,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext, Bounds, Context, Div, Entity, FontWeight, InteractiveElement, IntoElement,
-    KeyBinding, KeyUpEvent, Menu, MenuItem, ParentElement, Render, StatefulInteractiveElement,
-    Styled, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, application,
-    assets, div, init, open_window, px, size,
+    App, AppContext, Bounds, ClipboardItem, Context, Div, Entity, FontWeight, InteractiveElement,
+    IntoElement, KeyBinding, KeyUpEvent, Menu, MenuItem, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, application, assets, div, init, open_window, px, size,
 };
 
 gpui_kit::actions!(chinwag_alpha, [Quit]);
@@ -207,6 +211,10 @@ struct Workbench {
     connection_generation: u64,
     client_inventory: DiscoveryPanel,
     inventory_task: Option<Task<()>>,
+    mcp_http_panel: McpHttpPanel,
+    mcp_http_task: Option<Task<()>>,
+    mcp_http_copy_notice: Option<String>,
+    mcp_http_details_expanded: bool,
     openings: Option<OpeningStore>,
     opening_warning: Option<String>,
     opening_tasks: HashMap<String, Task<()>>,
@@ -306,6 +314,7 @@ impl Workbench {
                 this.load_task = None;
                 this.inventory_task = None;
                 this.client_inventory.clear();
+                this.clear_mcp_http();
                 this.selected_cursor_copy = None;
                 this.cursor_setup_options = None;
                 this.opening_epoch = this.opening_epoch.wrapping_add(1);
@@ -358,6 +367,10 @@ impl Workbench {
             connection_generation: 0,
             client_inventory: DiscoveryPanel::default(),
             inventory_task: None,
+            mcp_http_panel: McpHttpPanel::default(),
+            mcp_http_task: None,
+            mcp_http_copy_notice: None,
+            mcp_http_details_expanded: false,
             openings,
             opening_warning,
             opening_tasks: HashMap::new(),
@@ -490,6 +503,7 @@ impl Workbench {
         if self.sending() {
             return;
         }
+        self.clear_mcp_http();
         let endpoint = self.endpoint.read(cx).value().to_string();
         if let Err(error) = BusClient::new(&endpoint) {
             self.inventory_task = None;
@@ -547,6 +561,157 @@ impl Workbench {
                 cx.notify();
             });
         }));
+    }
+
+    fn clear_mcp_http(&mut self) {
+        self.mcp_http_task = None;
+        self.mcp_http_panel.clear();
+        self.mcp_http_copy_notice = None;
+        self.mcp_http_details_expanded = false;
+    }
+
+    fn check_mcp_http(&mut self, kind: McpHttpRequestKind, cx: &mut Context<Self>) {
+        if self.mode != AppMode::Workbench
+            || matches!(self.mcp_http_panel.state(), McpHttpState::Loading { .. })
+            || (kind == McpHttpRequestKind::Copy && !self.mcp_http_panel.copy_eligible())
+        {
+            return;
+        }
+        let endpoint = self.endpoint.read(cx).value().to_string();
+        let request = self
+            .mcp_http_panel
+            .begin(kind, endpoint, self.connection_generation);
+        self.mcp_http_copy_notice = None;
+        let requested_endpoint = request.endpoint().to_owned();
+        self.mcp_http_task = Some(cx.spawn(async move |this, cx| {
+            // The typed client validates this result against its own canonical
+            // endpoint. Both explicit actions perform exactly one fresh GET.
+            let result = cx.background_spawn(async move {
+                BusClient::new(&requested_endpoint)
+                    .and_then(|client| client.mcp_http_status())
+                    .map_err(|_| "Runtime inbox observation unavailable".to_owned())
+            }).await;
+            let checked_at = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+            let _ = this.update(cx, |this, cx| {
+                let endpoint = this.endpoint.read(cx).value().to_string();
+                let configuration = this.mcp_http_panel.complete(
+                    &request, &endpoint, this.connection_generation, checked_at, result,
+                );
+                if let Some(configuration) = configuration {
+                    cx.write_to_clipboard(ClipboardItem::new_string(configuration));
+                    this.mcp_http_copy_notice = Some(
+                        "Configuration copied. In VS Code Local, use MCP: Open User Configuration and merge the new server and input entries. Enter the owner token only in VS Code’s password prompt. Copying does not install or reserve access.".into()
+                    );
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn render_mcp_http(&self, cx: &mut Context<Self>) -> Div {
+        let loading = matches!(self.mcp_http_panel.state(), McpHttpState::Loading { .. });
+        let lines = self.mcp_http_panel.sample_lines();
+        let endpoint = self.endpoint.read(cx).value().to_string();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .pt_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Runtime HTTP inbox"),
+                    )
+                    .child(
+                        Button::new("check-mcp-http")
+                            .small()
+                            .label(if loading {
+                                "Checking…"
+                            } else {
+                                "Check MCP status"
+                            })
+                            .disabled(loading)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_mcp_http(McpHttpRequestKind::Check, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("copy-mcp-http-configuration")
+                            .small()
+                            .label("Copy VS Code setup")
+                            .disabled(loading || !self.mcp_http_panel.copy_eligible())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_mcp_http(McpHttpRequestKind::Copy, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.mcp_http_panel.message()),
+            )
+            .when(!lines.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(lines[0].clone()),
+                )
+                .child(
+                    Button::new("mcp-http-details")
+                        .small()
+                        .label(if self.mcp_http_details_expanded {
+                            "Hide MCP details"
+                        } else {
+                            "MCP details"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.mcp_http_details_expanded = !this.mcp_http_details_expanded;
+                            cx.notify();
+                        })),
+                )
+                .when(self.mcp_http_details_expanded, |this| {
+                    this.child(
+                        div()
+                            .id("mcp-http-observation")
+                            .max_h(px(145.))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .child(format!("Checked endpoint: {endpoint}")),
+                            )
+                            .children(lines.into_iter().skip(1).map(|line| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(line)
+                            })),
+                    )
+                })
+            })
+            .when_some(self.mcp_http_copy_notice.clone(), |this, notice| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(notice),
+                )
+            })
     }
 
     fn load_client_inventory(
@@ -911,6 +1076,7 @@ impl Workbench {
         self.persist_drafts();
         let should_load = self.connected_endpoint().is_some()
             || matches!(self.connection, Connection::Connecting);
+        self.clear_mcp_http();
         self.connection_generation = self.connection_generation.wrapping_add(1);
         self.load_task = None;
         self.inventory_task = None;
@@ -1962,6 +2128,7 @@ impl Render for Workbench {
         let connected = self.connected_endpoint().is_some();
         let can_send = self.can_send();
         let client_inventory = self.render_client_inventory(cx);
+        let mcp_http = self.render_mcp_http(cx);
         let (connection_title, connection_detail) = match &self.connection {
             Connection::Disconnected => (
                 "Disconnected",
@@ -2157,7 +2324,8 @@ impl Render for Workbench {
                                     .child(div().font_weight(FontWeight::SEMIBOLD).child(connection_title))
                                     .child(div().flex_1().text_color(cx.theme().muted_foreground).child(connection_detail)),
                             )
-                            .child(client_inventory),
+                            .child(client_inventory)
+                            .child(mcp_http),
                     )
                     .child(
                         div()

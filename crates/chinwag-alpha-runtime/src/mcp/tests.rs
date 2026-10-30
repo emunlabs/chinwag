@@ -80,6 +80,11 @@ async fn explicit_owner_export_is_private_fixed_scope_and_shutdown_really_drains
     assert_eq!(value.as_object().unwrap().len(), 5);
     let authorization = value["headers"]["Authorization"].as_str().unwrap();
     let token = authorization.strip_prefix("Bearer ").unwrap();
+    let offer = owner.setup_offer().clone();
+    offer.validate().unwrap();
+    let safe_setup = serde_json::to_string(&offer.vscode_configuration().unwrap()).unwrap();
+    assert!(!safe_setup.contains(token));
+    assert!(safe_setup.contains("${input:chinwag-http-token-"));
     assert!(
         token.len() == 64
             && token
@@ -87,6 +92,27 @@ async fn explicit_owner_export_is_private_fixed_scope_and_shutdown_really_drains
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     );
     let binding = owner.enrollment.0.binding.clone();
+    let nonce = binding
+        .connection
+        .as_str()
+        .strip_prefix("owner-http-")
+        .unwrap();
+    assert_eq!(
+        offer.server_name,
+        format!("chinwag-native-inbox-mgmt-http-{nonce}")
+    );
+    assert_eq!(offer.input_id, format!("chinwag-http-token-{nonce}"));
+    for _ in 0..4 {
+        assert_eq!(owner.setup_offer(), &offer);
+        let _ = owner.transport().lifecycle_snapshot();
+    }
+    let unchanged = host
+        .lock()
+        .unwrap()
+        .inspect_binding(binding.id, Instant::now())
+        .unwrap();
+    assert_eq!(unchanged.lease_expires_at, binding.lease_expires_at);
+    assert_eq!(unchanged.grant_expires_at, binding.grant_expires_at);
     assert_eq!(
         binding.authority,
         AuthorityKind::OwnerLocalHttpCapabilityUnattributed
@@ -142,6 +168,27 @@ async fn explicit_owner_export_is_private_fixed_scope_and_shutdown_really_drains
         );
     }
     assert_eq!(fs::read(&output).unwrap(), bytes);
+    assert_no_request(&listener);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_explicit_owner_has_a_fresh_nonsecret_setup_prompt_identity() {
+    let (_temporary, root) = root();
+    let (listener, endpoint) = endpoint();
+    let host = host();
+    let first = HttpMcpOwner::start(&endpoint, host.clone(), &root.join("first.json"))
+        .await
+        .unwrap();
+    let first_offer = first.setup_offer().clone();
+    first.shutdown().await.unwrap();
+    let second = HttpMcpOwner::start(&endpoint, host, &root.join("second.json"))
+        .await
+        .unwrap();
+    assert_ne!(second.setup_offer().server_name, first_offer.server_name);
+    assert_ne!(second.setup_offer().input_id, first_offer.input_id);
+    assert_eq!(second.setup_offer().url, first_offer.url);
+    assert!(!second.transport().lifecycle_snapshot().session_started);
+    second.shutdown().await.unwrap();
     assert_no_request(&listener);
 }
 

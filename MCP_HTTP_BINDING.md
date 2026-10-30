@@ -2,7 +2,7 @@
 
 The optional Streamable HTTP inbox runs inside the Rust runtime. Its reader and public observation share the same `InboxServer`, `ConnectorHost` and admission registry. It does not attach to an existing stdio child or identify a particular application, account or conversation.
 
-This source unit is compiled and staged only. Existing runtime services, installed clients, sidecars, installation artifacts and GPUI windows retain their previous behavior. The current GPUI does not request this new observation route.
+This source unit is compiled and staged only. Existing runtime services, installed clients, sidecars, installation artifacts and GPUI windows retain their previous behavior. The workbench source includes an explicit observation check and a secretless manual VS Code setup copy. Existing live previews have not been replaced.
 
 ## Owner opt-in
 
@@ -34,9 +34,25 @@ The tool catalogue remains the fixed read-only `chinwag_inbox_read` tool. Tool a
 
 The projection carries independent initialization, initialized-notification, catalogue-output, read-output, expiry and closure facts. It contains no bearer, raw session identifier, arbitrary client information, paths or message text. Prepared output is not proof of client receipt or model consumption. A historical initialized observation remains historical after expiry.
 
+The optional `setup_offer` contains only a fixed HTTP URL, server name and password-input identifier. Both names use the same original independent connection nonce, never the bearer or a hash of it. Repeated observations preserve the names and original deadline. A fresh explicit owner enrollment has fresh names so VS Code does not reuse the older enrollment's cached secret. This offer is not an admission reservation or a client identity.
+
 Owner closure and expiry fence new work, cancel the original session and retain cleanup ownership across cancelled awaits. `transport_worker_joined` and `reader_worker_joined` report separate actual joins. The stock SDK protocol-driver task is private and detached; this implementation makes no claim that every SDK task has joined. Scheduled cleanup, response-body drop, map removal and a process name are not drain evidence.
 
 Graceful runtime shutdown requests those MCP joins before waiting for axum's connection drain. A peer that stops reading an already-produced network response can keep that later network drain pending. The MCP join flags establish neither bounded whole-runtime exit nor completion of every HTTP connection.
+
+## Workbench check and human setup
+
+**Check MCP status** performs one same-endpoint GET when the person clicks it. Startup, Find apps, Connect, room history and the message timer perform no MCP observation request. The client accepts a strict bounded 4 KiB response. A 404 means that observation is unavailable on this endpoint; it does not distinguish disabled support from an older runtime.
+
+The panel is separate from the conversation and selected application. Its facts describe the runtime's unattributed HTTP inbox for fixed `#mgmt`, independently of the selected chat room. Every sample has a local last-checked time. Starting a check, changing endpoint or connection generation, or a failed response removes prior positive state. Successful checks replace the whole sample, so a new owner at the same URL can have lower counters. No observation is persisted or promoted to a live Connected state.
+
+**Copy VS Code setup** is enabled only after an unused, open offer was observed. Clicking it performs a fresh GET before copying anything. The exact endpoint, connection generation and request identity must still match. An expired or closed grant, a consumed session slot, a failed refresh or a superseding check produces no clipboard write. A successful copy is a historical offer, not permission reserved until installation finishes.
+
+The copied JSON contains only VS Code-format `servers` and `inputs`, a fixed HTTP URL, an Authorization placeholder and one `promptString` input with `password: true`. It contains no actual bearer. In a compatible **VS Code Local/profile configuration**, use **MCP: Open User Configuration** and merge the new server and input entries while preserving existing entries. Enter the token from the owner's private capability file only in VS Code's password prompt. Start and trust remain human actions in VS Code. Copying opens no application and writes no client configuration.
+
+This input mechanism is not portable to every agent harness. Current VS Code documentation excludes prompted input servers from Copilot-harness forwarding. The supported scope here is manual VS Code Local/profile configuration. The documented configuration and input behavior are described in the [official MCP configuration reference](https://code.visualstudio.com/docs/agents/reference/mcp-configuration); the runtime still needs actual client interoperability evidence.
+
+An existing stdio setup acknowledgment or a template-copy notice is not HTTP approval, negotiation, an inbox read or model consumption. A lease can expire after copying. A new explicit owner enrollment creates fresh prompt names; Chinwag does not clear VS Code's cached inputs, replace its configuration or renew the previous authority.
 
 ## Acceptance
 

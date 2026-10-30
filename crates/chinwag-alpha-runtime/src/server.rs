@@ -318,7 +318,11 @@ pub async fn serve_with_http_mcp(
         }
     };
     let app = match &owner {
-        Some(owner) => app.merge(http_mcp_routes(owner.transport(), http_mcp_authority(bind))),
+        Some(owner) => app.merge(http_mcp_routes(
+            owner.transport(),
+            http_mcp_authority(bind),
+            owner.setup_offer().clone(),
+        )),
         None => app,
     };
     let shutdown_owner = owner.clone();
@@ -349,7 +353,11 @@ fn http_mcp_authority(bind: std::net::SocketAddr) -> String {
     }
 }
 
-fn http_mcp_routes(inbox: Arc<chinwag_bus_mcp::http::HttpInbox>, authority: String) -> Router {
+fn http_mcp_routes(
+    inbox: Arc<chinwag_bus_mcp::http::HttpInbox>,
+    authority: String,
+    setup_offer: chinwag_bus_client::HttpMcpSetupOffer,
+) -> Router {
     let transport = inbox.clone();
     Router::new()
         .route(
@@ -364,6 +372,7 @@ fn http_mcp_routes(inbox: Arc<chinwag_bus_mcp::http::HttpInbox>, authority: Stri
             get(move |headers: HeaderMap, uri: axum::http::Uri| {
                 let inbox = inbox.clone();
                 let authority = authority.clone();
+                let setup_offer = setup_offer.clone();
                 async move {
                     if uri.query().is_some()
                         || headers.contains_key("origin")
@@ -381,6 +390,7 @@ fn http_mcp_routes(inbox: Arc<chinwag_bus_mcp::http::HttpInbox>, authority: Stri
                         "schema": "chinwag-runtime-owned-mcp/v1",
                         "binding_authority": "owner_local_http_capability_unattributed",
                         "transport": inbox.lifecycle_snapshot(),
+                        "setup_offer": setup_offer,
                     }))
                 }
             })
@@ -1379,7 +1389,11 @@ mod tests {
                 .unwrap();
         let document: Value = serde_json::from_slice(&fs::read(&capability).unwrap()).unwrap();
         let authorization = document["headers"]["Authorization"].as_str().unwrap();
-        let app = http_mcp_routes(owner.transport(), authority.clone());
+        let app = http_mcp_routes(
+            owner.transport(),
+            authority.clone(),
+            owner.setup_offer().clone(),
+        );
         let request = |value: Value, session: Option<&str>| {
             let mut request = axum::http::Request::builder()
                 .method("POST")
@@ -1471,6 +1485,10 @@ mod tests {
                     .await
                     .unwrap();
                 let status: Value = serde_json::from_slice(&bytes).unwrap();
+                let typed: chinwag_bus_client::RuntimeMcpStatus =
+                    serde_json::from_slice(&bytes).unwrap();
+                typed.validate_for(&format!("http://{authority}/")).unwrap();
+                assert_eq!(typed.setup_offer.as_ref(), Some(owner.setup_offer()));
                 assert_eq!(
                     status["transport"],
                     serde_json::to_value(owner.transport().lifecycle_snapshot()).unwrap()

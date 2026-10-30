@@ -14,11 +14,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod discovery;
+mod mcp_http;
 mod onboarding;
 pub use discovery::{
     ClientInventory, ClientKind, DiscoveredClient, DiscoveryCoverage, DiscoveryState,
     InstallationCoverage, InstallationInventory, InstallationLocation, InstallationState,
     InstalledClient, is_public_installation_version,
+};
+pub use mcp_http::{
+    HttpMcpSetupOffer, MAX_MCP_HTTP_STATUS_BYTES, McpConnectionObservation,
+    McpHttpBindingAuthority, McpHttpClientIdentity, McpHttpTransportObservation, McpOutputEvidence,
+    McpProtocolEnd, McpProtocolVersion, McpWorkerState, RuntimeMcpStatus,
 };
 pub use onboarding::{NativeOpenReceipt, NativeOpenRequest, NativeOpenState, OnboardingStatus};
 
