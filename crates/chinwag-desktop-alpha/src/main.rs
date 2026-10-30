@@ -15,8 +15,8 @@ use openings::{OpeningAttempt, OpeningStore};
 use outbox::{Attempt, AttemptState, Outbox};
 
 use chinwag_bus_client::{
-    BusClient, BusMessage, ClientError, NativeOpenReceipt, NativeOpenRequest, SendReceipt,
-    SendRequest,
+    BusClient, BusMessage, ClientError, ClientInventory, InstalledClient, NativeOpenReceipt,
+    NativeOpenRequest, OnboardingStatus, SendReceipt, SendRequest,
 };
 use chinwag_bus_model::{Conversation, SendState};
 use gpui_kit::component::{
@@ -64,6 +64,36 @@ struct OpeningFlight {
     generation: u64,
 }
 
+#[derive(Clone)]
+struct OpeningSelection {
+    app: InstalledClient,
+    endpoint: String,
+    epoch: u64,
+    inventory_generation: u64,
+    connection_generation: u64,
+    generation: u64,
+}
+
+struct AppInventoryRead {
+    inventory: Result<ClientInventory, String>,
+    opening_status: Option<Result<OnboardingStatus, String>>,
+}
+
+fn read_app_inventory(endpoint: &str) -> AppInventoryRead {
+    let inventory = BusClient::new(endpoint)
+        .and_then(|client| client.clients())
+        .map_err(|error| error.to_string());
+    let opening_status = inventory.as_ref().ok().map(|_| {
+        BusClient::new(endpoint)
+            .and_then(|client| client.onboarding_status())
+            .map_err(|error| error.to_string())
+    });
+    AppInventoryRead {
+        inventory,
+        opening_status,
+    }
+}
+
 struct Workbench {
     conversation: Conversation,
     endpoint: Entity<InputState>,
@@ -88,6 +118,8 @@ struct Workbench {
     opening_generations: HashMap<String, u64>,
     opening_sequence: u64,
     opening_epoch: u64,
+    opening_selection: Option<OpeningSelection>,
+    selection_task: Option<Task<()>>,
     load_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     check_task: Option<Task<()>>,
@@ -208,6 +240,8 @@ impl Workbench {
             opening_generations: HashMap::new(),
             opening_sequence: 0,
             opening_epoch: 0,
+            opening_selection: None,
+            selection_task: None,
             load_task: None,
             send_task: None,
             check_task: None,
@@ -391,28 +425,18 @@ impl Workbench {
         let expected_endpoint = endpoint.to_owned();
         let requested_endpoint = expected_endpoint.clone();
         self.inventory_task = Some(cx.spawn(async move |this, cx| {
-            let (result, opening_status) = cx
-                .background_spawn(async move {
-                    let inventory = BusClient::new(&requested_endpoint)
-                        .and_then(|client| client.clients())
-                        .map_err(|error| error.to_string());
-                    let status = inventory.as_ref().ok().map(|_| {
-                        BusClient::new(&requested_endpoint)
-                            .and_then(|client| client.onboarding_status())
-                            .map_err(|error| error.to_string())
-                    });
-                    (inventory, status)
-                })
+            let read = cx
+                .background_spawn(async move { read_app_inventory(&requested_endpoint) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.apply_client_inventory(
                     connection_generation,
                     generation,
                     &expected_endpoint,
-                    result,
+                    read.inventory,
                     cx,
                 ) {
-                    if let Some(status) = opening_status {
+                    if let Some(status) = read.opening_status {
                         this.client_inventory.complete_opening_status(
                             generation,
                             &expected_endpoint,
@@ -443,7 +467,8 @@ impl Workbench {
 
     fn can_open_installation(&self, installation_id: &str, cx: &App) -> bool {
         let endpoint = self.endpoint.read(cx).value().to_string();
-        self.opening_tasks.is_empty()
+        self.selection_task.is_none()
+            && self.opening_tasks.is_empty()
             && self.client_inventory.endpoint.as_deref() == Some(endpoint.as_str())
             && self
                 .client_inventory
@@ -461,11 +486,118 @@ impl Workbench {
             return;
         }
         let endpoint = self.endpoint.read(cx).value().to_string();
+        let Some(app) = self.client_inventory.installed_copy(installation_id) else {
+            return;
+        };
+        self.opening_sequence = self.opening_sequence.wrapping_add(1);
+        let selection = OpeningSelection {
+            app,
+            endpoint: endpoint.clone(),
+            epoch: self.opening_epoch,
+            inventory_generation: self.client_inventory.generation(),
+            connection_generation: self.connection_generation,
+            generation: self.opening_sequence,
+        };
+        self.opening_selection = Some(selection.clone());
+        self.client_inventory.opening_notice = None;
+        self.selection_task = Some(cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_spawn(async move { read_app_inventory(&endpoint) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_selection_refresh(&selection, read, cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn apply_selection_refresh(
+        &mut self,
+        selection: &OpeningSelection,
+        read: AppInventoryRead,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self
+            .opening_selection
+            .as_ref()
+            .is_none_or(|current| current.generation != selection.generation)
+        {
+            return false;
+        }
+        self.selection_task = None;
+        self.opening_selection = None;
+        if self.opening_epoch != selection.epoch
+            || self.connection_generation != selection.connection_generation
+            || self.endpoint.read(cx).value().as_ref() != selection.endpoint
+            || self.client_inventory.generation() != selection.inventory_generation
+            || self.client_inventory.endpoint.as_deref() != Some(selection.endpoint.as_str())
+        {
+            return false;
+        }
+        let selected_still_matches = read
+            .inventory
+            .as_ref()
+            .ok()
+            .and_then(|inventory| inventory.installations.as_ref())
+            .and_then(|installed| installed.apps.iter().find(|app| app.id == selection.app.id))
+            .is_some_and(|app| {
+                app.family == selection.app.family
+                    && app.kind == selection.app.kind
+                    && app.location == selection.app.location
+                    && app.version == selection.app.version
+            });
+        let status_valid = read.opening_status.as_ref().is_some_and(|status| {
+            status.as_ref().is_ok_and(|status| {
+                status.validate().is_ok()
+                    && status.native_open_allowed
+                    && status.openable_installation_ids.contains(&selection.app.id)
+            })
+        });
+        let refreshed =
+            read.inventory.is_ok() && read.opening_status.as_ref().is_some_and(Result::is_ok);
+        self.client_inventory.complete(
+            selection.inventory_generation,
+            &selection.endpoint,
+            read.inventory,
+        );
+        if let Some(status) = read.opening_status {
+            self.client_inventory.complete_opening_status(
+                selection.inventory_generation,
+                &selection.endpoint,
+                status,
+            );
+        } else {
+            self.client_inventory.opening_status = None;
+        }
+        if !selected_still_matches || !status_valid {
+            self.client_inventory.opening_notice = Some(if refreshed {
+                "The selected app changed or is no longer available. Select an app again. No opening was started."
+            } else {
+                "The selected app could not be checked. Find apps and select it again. No opening was started."
+            }.into());
+            return true;
+        }
+        if !self.can_open_installation(&selection.app.id, cx) {
+            self.client_inventory.opening_notice =
+                Some("This app has an opening to check first. No new opening was started.".into());
+            return true;
+        }
+        self.prepare_selected_opening(&selection.endpoint, &selection.app.id, cx);
+        true
+    }
+
+    fn prepare_selected_opening(
+        &mut self,
+        endpoint: &str,
+        installation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
         let attempt = match self
             .openings
             .as_mut()
             .expect("eligibility requires storage")
-            .prepare(&endpoint, installation_id)
+            .prepare(endpoint, installation_id)
         {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -931,6 +1063,10 @@ impl Workbench {
             .enumerate()
             .map(|(index, (id, label))| {
                 let enabled = self.can_open_installation(&id, cx);
+                let preparing = self.opening_selection.as_ref().is_some_and(|selection| {
+                    selection.app.id == id && selection.endpoint == configured_endpoint
+                });
+                let disambiguation = self.client_inventory.copy_disambiguation(&id);
                 let latest = self
                     .openings
                     .as_ref()
@@ -954,13 +1090,25 @@ impl Workbench {
                             .child(
                                 Button::new(("open-installation", index))
                                     .small()
-                                    .label("Open/reuse")
+                                    .label(if preparing {
+                                        "Checking selected app…"
+                                    } else {
+                                        "Open/reuse"
+                                    })
                                     .disabled(!enabled)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.open_installation(&id, cx)
                                     })),
                             ),
                     )
+                    .when_some(disambiguation, |this, detail| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(detail),
+                        )
+                    })
                     .when_some(latest, |this, summary| {
                         this.child(
                             div()

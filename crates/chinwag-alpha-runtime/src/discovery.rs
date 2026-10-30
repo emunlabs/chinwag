@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use crate::onboarding::{OnboardingService, observed_installation_id};
 use chinwag_bus_client::{
     ClientInventory, ClientKind, DiscoveredClient, DiscoveryCoverage, DiscoveryState,
-    InstallationCoverage, InstallationInventory, InstallationState, InstalledClient,
+    InstallationCoverage, InstallationInventory, InstallationLocation, InstallationState,
+    InstalledClient, is_public_installation_version,
 };
 use chinwag_client_discovery::{
     CANDIDATE_CAPACITY, ClientCandidate, InventorySnapshot, PID_CAPACITY, ProcessBirth, ProcessRole,
@@ -179,6 +180,8 @@ fn project_installed(
                 },
                 running_instances: row.observed_instances.len(),
                 state: InstallationState::InstalledUnverified,
+                location: public_installation_location(&row.installation),
+                version: public_installation_version(&row.installation),
             })
         })
         .collect::<std::result::Result<Vec<_>, DiscoveryFailure>>()?;
@@ -217,6 +220,38 @@ fn project_installed(
                 .saturating_add(coverage.unavailable_paths),
         },
     })
+}
+
+fn public_installation_location(
+    installation: &chinwag_client_discovery::Installation,
+) -> Option<InstallationLocation> {
+    if installation.kind != chinwag_client_discovery::InstallationKind::Application {
+        return None;
+    }
+    let parent = installation.canonical_path.parent()?.as_os_str().to_str()?;
+    if parent == "/Applications" {
+        return Some(InstallationLocation::SharedApplications);
+    }
+    let user = parent
+        .strip_prefix("/Users/")?
+        .strip_suffix("/Applications")?;
+    (!user.is_empty()
+        && user.len() <= 256
+        && !matches!(user, "." | "..")
+        && !user.contains('/')
+        && !user.chars().any(char::is_control))
+    .then_some(InstallationLocation::UserApplications)
+}
+
+fn public_installation_version(
+    installation: &chinwag_client_discovery::Installation,
+) -> Option<String> {
+    let raw = installation.version.as_deref()?;
+    if !raw.is_ascii() || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let version = raw.trim();
+    is_public_installation_version(version).then(|| version.to_owned())
 }
 
 fn lock_failure<T>(error: TryLockError<T>) -> DiscoveryFailure {
@@ -552,6 +587,103 @@ mod tests {
         assert_eq!(
             project_installed(&no_running, &installed).unwrap().apps[0].running_instances,
             0
+        );
+    }
+
+    #[test]
+    fn installation_copy_hints_are_coarse_bounded_and_never_expose_location_names() {
+        let process = fixture_snapshot();
+        for (path, expected) in [
+            (
+                "/Applications/Private-marker-client.app",
+                Some(InstallationLocation::SharedApplications),
+            ),
+            (
+                "/Users/private-account-marker/Applications/Private-marker-client.app",
+                Some(InstallationLocation::UserApplications),
+            ),
+            ("/Applications/nested/Private-marker-client.app", None),
+            (
+                "/Users/private-account-marker/Private/Private-marker-client.app",
+                None,
+            ),
+            (
+                "/Users/account/../Applications/Private-marker-client.app",
+                None,
+            ),
+            ("/Network/Applications/Private-marker-client.app", None),
+        ] {
+            let mut installed = installed_fixture();
+            installed.installations[0].canonical_path = path.into();
+            installed.installations[0].version = Some("  v1.2.3-beta+4 (arm64)  ".into());
+            let projection = project_installed(&process, &installed).unwrap();
+            assert_eq!(projection.apps[0].location, expected);
+            assert_eq!(
+                projection.apps[0].version.as_deref(),
+                Some("v1.2.3-beta+4 (arm64)")
+            );
+            let raw = serde_json::to_string(&projection).unwrap();
+            for forbidden in [
+                "/Applications",
+                "/Users",
+                "private-account-marker",
+                "Private-marker",
+                "bundle_id",
+                "executable",
+                "canonical_path",
+            ] {
+                assert!(
+                    !raw.contains(forbidden),
+                    "raw metadata escaped through copy hints: {forbidden}"
+                );
+            }
+        }
+        let mut installed = installed_fixture();
+        installed.installations[0].kind = chinwag_client_discovery::InstallationKind::CommandLine;
+        assert_eq!(
+            project_installed(&process, &installed).unwrap().apps[0].location,
+            None
+        );
+    }
+
+    #[test]
+    fn unsafe_or_unknown_versions_are_suppressed_instead_of_rejected_inventory() {
+        let process = fixture_snapshot();
+        let mut installed = installed_fixture();
+        let oversized = "1".repeat(65);
+        for unsafe_version in [
+            "private-version-marker",
+            "v",
+            "vNext",
+            "1.2/path",
+            "1:2",
+            "1.0\n",
+            "\t1.0",
+            "v1.0 🦀",
+            "1.0 api key marker",
+            "1.0 credential marker",
+            "1.0;build",
+            oversized.as_str(),
+        ] {
+            installed.installations[0].version = Some(unsafe_version.into());
+            let projection = project_installed(&process, &installed).unwrap();
+            assert_eq!(
+                projection.apps[0].version, None,
+                "unsafe public version was kept: {unsafe_version}"
+            );
+        }
+        installed.installations[0].version = None;
+        assert_eq!(
+            project_installed(&process, &installed).unwrap().apps[0].version,
+            None
+        );
+        installed.installations[0].version = Some("1".repeat(64));
+        assert_eq!(
+            project_installed(&process, &installed).unwrap().apps[0]
+                .version
+                .as_ref()
+                .map(String::len),
+            Some(64)
         );
     }
 

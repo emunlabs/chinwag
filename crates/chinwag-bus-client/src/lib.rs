@@ -17,7 +17,8 @@ mod discovery;
 mod onboarding;
 pub use discovery::{
     ClientInventory, ClientKind, DiscoveredClient, DiscoveryCoverage, DiscoveryState,
-    InstallationCoverage, InstallationInventory, InstallationState, InstalledClient,
+    InstallationCoverage, InstallationInventory, InstallationLocation, InstallationState,
+    InstalledClient, is_public_installation_version,
 };
 pub use onboarding::{NativeOpenReceipt, NativeOpenRequest, NativeOpenState, OnboardingStatus};
 

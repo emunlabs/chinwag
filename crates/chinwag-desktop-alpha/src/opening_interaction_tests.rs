@@ -82,6 +82,7 @@ fn fixture(
                 }
                 Err(error) => panic!("accept fixture: {error}"),
             };
+            stream.set_nonblocking(false).unwrap();
             let mut bytes = Vec::new();
             let request = loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -128,22 +129,49 @@ fn fixture(
 }
 
 #[gpui_kit::test]
-fn exact_copy_click_posts_once_after_pending_is_saved_and_keeps_family_grouping(
+fn expired_cached_exact_copy_refreshes_before_one_post_and_keeps_family_grouping(
     cx: &mut TestAppContext,
 ) {
     let directory = Directory::new();
     let drafts = directory.drafts();
     let store_path = openings::path_for_drafts(&drafts).unwrap();
-    let (endpoint, worker) = fixture(3, move |request, index| match index {
+    let mut cache_current = false;
+    let (endpoint, worker) = fixture(5, move |request, index| match index {
         0 => {
             assert!(request.starts_with("GET /api/bus/clients "));
+            cache_current = true;
             (200, inventory())
         }
         1 => {
             assert!(request.starts_with("GET /api/onboarding/status "));
+            assert!(cache_current);
+            cache_current = false;
+            (200, status(true))
+        }
+        2 => {
+            assert!(request.starts_with("GET /api/bus/clients "));
+            assert!(
+                !cache_current,
+                "the displayed capability outlived its runtime cache"
+            );
+            assert!(
+                !store_path.exists(),
+                "metadata refresh must not prepare Pending"
+            );
+            cache_current = true;
+            (200, inventory())
+        }
+        3 => {
+            assert!(request.starts_with("GET /api/onboarding/status "));
+            assert!(cache_current);
+            assert!(
+                !store_path.exists(),
+                "capability refresh must not prepare Pending"
+            );
             (200, status(true))
         }
         _ => {
+            assert!(cache_current);
             assert!(request.starts_with("POST /api/onboarding/open "));
             assert_eq!(header(request, "X-Chinwag-Onboarding-Intent"), "1");
             let body: Value =
@@ -178,6 +206,10 @@ fn exact_copy_click_posts_once_after_pending_is_saved_and_keeps_family_grouping(
         window.draw(cx).clear(cx);
         window.click(("open-installation", 0_usize), cx);
         window.click(("open-installation", 0_usize), cx);
+        view.update(cx, |view, _| {
+            assert!(view.selection_task.is_some());
+            assert!(view.openings.as_ref().unwrap().attempts.is_empty());
+        });
     })
     .unwrap();
     cx.run_until_parked();
@@ -327,10 +359,12 @@ fn restored_pending_attempt_checks_original_endpoint_by_get_without_find_or_post
 #[gpui_kit::test]
 fn malformed_open_receipt_stays_uncertain_while_another_copy_can_open(cx: &mut TestAppContext) {
     let directory = Directory::new();
-    let (endpoint, worker) = fixture(4, |request, index| match index {
-        0 => (200, inventory()),
-        1 => (200, status(true)),
-        _ => {
+    let (endpoint, worker) = fixture(8, |request, _| {
+        if request.starts_with("GET /api/bus/clients ") {
+            (200, inventory())
+        } else if request.starts_with("GET /api/onboarding/status ") {
+            (200, status(true))
+        } else {
             assert!(request.starts_with("POST /api/onboarding/open "));
             let body: Value =
                 serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
@@ -464,4 +498,252 @@ fn stale_endpoint_or_attempt_completion_cannot_confirm_an_opening(cx: &mut TestA
         })
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn changed_vanished_renamed_or_uncheckable_selection_creates_no_attempt_or_post(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    for mutation in 0..7 {
+        let directory = Directory::new();
+        let path = openings::path_for_drafts(&directory.drafts()).unwrap();
+        let mut changed = inventory();
+        match mutation {
+            0 => changed["installations"]["apps"][0]["id"] = json!("c".repeat(64)),
+            1 => {
+                changed["installations"]["apps"]
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(0);
+            }
+            2 => changed["installations"]["apps"][0]["family"] = json!("claude_desktop"),
+            3 => changed["installations"]["apps"][0]["version"] = json!("1.2.4"),
+            _ => {}
+        }
+        serde_json::from_value::<ClientInventory>(changed.clone())
+            .unwrap()
+            .validate()
+            .unwrap_or_else(|error| {
+                panic!("mutation {mutation} must remain valid metadata: {error}")
+            });
+        let expected_requests = if mutation == 4 { 3 } else { 4 };
+        let (endpoint, worker) = fixture(expected_requests, move |request, index| {
+            assert!(
+                request.starts_with("GET "),
+                "metadata rejection must never POST"
+            );
+            match index {
+                0 => (200, inventory()),
+                1 => (200, status(true)),
+                2 if mutation == 4 => (503, json!({"error":"fixture metadata unavailable"})),
+                2 => {
+                    assert!(request.starts_with("GET /api/bus/clients "));
+                    (200, changed.clone())
+                }
+                _ if mutation == 5 => (503, json!({"error":"fixture capability unavailable"})),
+                _ if mutation == 6 => (200, status(false)),
+                _ => {
+                    assert!(request.starts_with("GET /api/onboarding/status "));
+                    let ids: Vec<_> = changed["installations"]["apps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|app| app["id"].as_str().unwrap().to_owned())
+                        .collect();
+                    (
+                        200,
+                        json!({"schema":"chinwag-native-onboarding/v1","native_open_allowed":true,"openable_installation_ids":ids}),
+                    )
+                }
+            }
+        });
+        let (window, view) = cx.update(|cx| {
+            open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    Workbench::with_settings(window, cx, endpoint.clone(), Some(directory.drafts()))
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                view.load_client_inventory(&endpoint, view.connection_generation, cx)
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                view.open_installation(&"a".repeat(64), cx);
+                assert!(view.selection_task.is_some());
+                assert!(view.openings.as_ref().unwrap().attempts.is_empty());
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let requests = worker.join().unwrap();
+        cx.run_until_parked();
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        assert!(
+            !path.exists(),
+            "metadata failure/change must not save an opening record"
+        );
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.selection_task.is_none());
+            assert!(view.opening_selection.is_none());
+            assert!(view.opening_tasks.is_empty());
+            assert!(
+                view.opening_generations.is_empty(),
+                "no persistent request ID has been allocated"
+            );
+            assert!(view.openings.as_ref().unwrap().attempts.is_empty());
+            let notice = view
+                .client_inventory
+                .opening_notice
+                .as_ref()
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(notice.contains("select") && notice.contains("no opening was started"));
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn unresolved_selected_id_blocks_before_any_metadata_refresh_even_through_endpoint_alias(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let original = "http://127.0.0.1:44341";
+    let alias = "http://localhost:44341";
+    let mut store =
+        OpeningStore::open(openings::path_for_drafts(&directory.drafts()).unwrap()).unwrap();
+    let attempt = store.prepare(original, &"a".repeat(64)).unwrap();
+    drop(store);
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_settings(window, cx, alias.into(), Some(directory.drafts()))
+            })
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            let generation = view.client_inventory.begin(alias.into());
+            view.client_inventory.complete(
+                generation,
+                alias,
+                Ok(serde_json::from_value(inventory()).unwrap()),
+            );
+            view.client_inventory.complete_opening_status(
+                generation,
+                alias,
+                Ok(serde_json::from_value(status(true)).unwrap()),
+            );
+            view.open_installation(&attempt.installation_id, cx);
+            assert!(
+                view.selection_task.is_none(),
+                "unresolved attempts must stop before any metadata GET"
+            );
+            assert!(view.opening_selection.is_none());
+            assert!(view.opening_tasks.is_empty());
+            assert_eq!(
+                view.openings.as_ref().unwrap().attempts,
+                vec![attempt.clone()]
+            );
+        })
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn endpoint_find_or_connect_supersession_clears_metadata_flight_without_preparing(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    for supersede in 0..3 {
+        let directory = Directory::new();
+        let endpoint = "http://127.0.0.1:41111";
+        let (window, view) = cx.update(|cx| {
+            open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    Workbench::with_settings(window, cx, endpoint.into(), Some(directory.drafts()))
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let generation = view.client_inventory.begin(endpoint.into());
+                view.client_inventory.complete(
+                    generation,
+                    endpoint,
+                    Ok(serde_json::from_value(inventory()).unwrap()),
+                );
+                view.client_inventory.complete_opening_status(
+                    generation,
+                    endpoint,
+                    Ok(serde_json::from_value(status(true)).unwrap()),
+                );
+                let selected = OpeningSelection {
+                    app: view
+                        .client_inventory
+                        .installed_copy(&"a".repeat(64))
+                        .unwrap(),
+                    endpoint: endpoint.into(),
+                    epoch: view.opening_epoch,
+                    inventory_generation: generation,
+                    connection_generation: view.connection_generation,
+                    generation: 1,
+                };
+                view.opening_selection = Some(selected.clone());
+                view.selection_task =
+                    Some(cx.spawn(async move |_, _| std::future::pending::<()>().await));
+                match supersede {
+                    0 => view.endpoint.update(cx, |state, cx| {
+                        state.set_value("http://127.0.0.1:42222", window, cx)
+                    }),
+                    1 => {
+                        view.client_inventory.begin(endpoint.into());
+                    }
+                    _ => {
+                        view.connection_generation = view.connection_generation.wrapping_add(1);
+                    }
+                }
+                assert!(
+                    view.selection_task.is_some(),
+                    "the flight must remain owned until its result is handled"
+                );
+                assert!(!view.can_open_installation(&"a".repeat(64), cx));
+                assert!(!view.apply_selection_refresh(
+                    &selected,
+                    AppInventoryRead {
+                        inventory: Ok(serde_json::from_value(inventory()).unwrap()),
+                        opening_status: Some(Ok(serde_json::from_value(status(true)).unwrap()))
+                    },
+                    cx
+                ));
+                assert!(view.selection_task.is_none());
+                assert!(view.opening_selection.is_none());
+                assert!(view.opening_tasks.is_empty());
+                assert!(view.opening_generations.is_empty());
+                assert!(view.openings.as_ref().unwrap().attempts.is_empty());
+                if supersede == 1 {
+                    assert!(matches!(
+                        view.client_inventory.state,
+                        InventoryState::Loading
+                    ));
+                }
+            })
+        })
+        .unwrap();
+        assert!(
+            !openings::path_for_drafts(&directory.drafts())
+                .unwrap()
+                .exists()
+        );
+    }
 }

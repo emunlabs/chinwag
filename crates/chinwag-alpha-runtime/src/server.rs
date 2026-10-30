@@ -272,9 +272,36 @@ async fn discover_clients(State(state): State<AppState>, headers: HeaderMap) -> 
             "explicit native metadata discovery intent required".into(),
         ));
     }
+    let include_details = match headers
+        .get_all("x-chinwag-discovery-details")
+        .iter()
+        .count()
+    {
+        0 => false,
+        1 if headers
+            .get("x-chinwag-discovery-details")
+            .and_then(|value| value.to_str().ok())
+            == Some("1") =>
+        {
+            true
+        }
+        _ => {
+            return failure(RuntimeError::Rejected(
+                "one explicit discovery details version1 is required".into(),
+            ));
+        }
+    };
     blocking_http(
         move || match state.1.inventory_with_onboarding(state.2.as_deref()) {
-            Ok(inventory) => {
+            Ok(mut inventory) => {
+                // Legacy clients deny unknown fields. Only an explicit details
+                // negotiation may receive these additive public copy hints.
+                if !include_details && let Some(installed) = &mut inventory.installations {
+                    for application in &mut installed.apps {
+                        application.location = None;
+                        application.version = None;
+                    }
+                }
                 let bytes = serde_json::to_vec(&inventory).map_err(json_error)?;
                 if bytes.len() > MAX_RESPONSE {
                     return Err(RuntimeError::Unavailable(
@@ -1354,6 +1381,173 @@ mod tests {
         }
     }
     const DISCOVERY_INTENT: &str = "X-Chinwag-Discovery-Intent: 1\r\n";
+
+    #[tokio::test]
+    async fn discovery_details_are_negotiated_before_collection_and_preserve_legacy_rows() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use chinwag_client_discovery::*;
+        use tower::ServiceExt;
+
+        struct Source {
+            processes: AtomicUsize,
+            installations: AtomicUsize,
+        }
+        impl InventorySource for Source {
+            fn snapshot(&self) -> std::result::Result<InventorySnapshot, DiscoveryFailure> {
+                self.processes.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::discovery::fixture_snapshot())
+            }
+
+            fn installed(&self) -> Option<InstalledSnapshot> {
+                self.installations.fetch_add(1, Ordering::SeqCst);
+                Some(InstalledSnapshot {
+                    observed_at_unix_ms: 1_793_398_000_321,
+                    installations: vec![Installation {
+                        id: "a".repeat(64),
+                        family: ClientFamily::GrokBot,
+                        kind: InstallationKind::Application,
+                        match_basis: catalogue::InstallationMatch::PublicBundleIdentity,
+                        canonical_path:
+                            "/Users/private-account-marker/Applications/Private-marker-client.app"
+                                .into(),
+                        observed_paths: vec![
+                            "/Users/private-account-marker/Applications/Private-marker-client.app"
+                                .into(),
+                        ],
+                        display_name: "Private-marker-client".into(),
+                        bundle_id: Some("private-bundle-marker".into()),
+                        version: Some("  v1.2.3-beta+4 (arm64)  ".into()),
+                        executable_path:
+                            "/Users/private-account-marker/Applications/Private-marker-client.app/Contents/MacOS/Private-marker-client"
+                                .into(),
+                        executable: ExecutableMetadata {
+                            device: 1,
+                            inode: 2,
+                            size: 100,
+                            modified_seconds: 1,
+                            modified_nanoseconds: 0,
+                            mode: 0o755,
+                            format: ExecutableFormat::MachO,
+                        },
+                        metadata_fingerprint: "private-fingerprint-marker".into(),
+                    }],
+                    coverage: InstalledCoverage {
+                        installation_capacity: 128,
+                        ..InstalledCoverage::default()
+                    },
+                    limitations: vec!["private-install-diagnostic-marker".into()],
+                })
+            }
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyInstalledClient {
+            id: String,
+            family: String,
+            kind: String,
+            running_instances: usize,
+            state: String,
+        }
+
+        fn request(details: &[&str]) -> Request<Body> {
+            let mut request = Request::builder()
+                .uri("/api/bus/clients")
+                .header("host", "127.0.0.1:44339")
+                .header("x-chinwag-discovery-intent", "1")
+                .body(Body::empty())
+                .unwrap();
+            for detail in details {
+                request
+                    .headers_mut()
+                    .append("x-chinwag-discovery-details", detail.parse().unwrap());
+            }
+            request
+        }
+
+        let directory = TempDir::new().unwrap();
+        let source = Arc::new(Source {
+            processes: AtomicUsize::new(0),
+            installations: AtomicUsize::new(0),
+        });
+        let app = router_with_discovery(
+            RuntimeConfig {
+                bind: "127.0.0.1:44339".parse().unwrap(),
+                mode: RuntimeMode::Isolated {
+                    data_dir: directory.path().into(),
+                },
+            },
+            source.clone(),
+        )
+        .unwrap();
+
+        for details in [
+            vec![""],
+            vec!["0"],
+            vec!["2"],
+            vec!["01"],
+            vec!["1, 1"],
+            vec!["1", "1"],
+            vec!["0", "1"],
+        ] {
+            let response = app.clone().oneshot(request(&details)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(source.processes.load(Ordering::SeqCst), 0);
+        assert_eq!(source.installations.load(Ordering::SeqCst), 0);
+
+        let response = app.clone().oneshot(request(&[])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let legacy_bytes = to_bytes(response.into_body(), 20_000).await.unwrap();
+        let legacy: Value = serde_json::from_slice(&legacy_bytes).unwrap();
+        let row = &legacy["installations"]["apps"][0];
+        assert!(row.get("location").is_none());
+        assert!(row.get("version").is_none());
+        let old_row: LegacyInstalledClient = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(old_row.id.len(), 64);
+        assert_eq!(old_row.family, "grok_bot");
+        assert_eq!(old_row.kind, "application");
+        assert_eq!(old_row.running_instances, 0);
+        assert_eq!(old_row.state, "installed_unverified");
+        assert_eq!(source.processes.load(Ordering::SeqCst), 1);
+        assert_eq!(source.installations.load(Ordering::SeqCst), 1);
+
+        let response = app.oneshot(request(&["1"])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let detailed_bytes = to_bytes(response.into_body(), 20_000).await.unwrap();
+        let detailed: Value = serde_json::from_slice(&detailed_bytes).unwrap();
+        let row = &detailed["installations"]["apps"][0];
+        assert_eq!(row["id"], old_row.id);
+        assert_eq!(row["location"], "user_applications");
+        assert_eq!(row["version"], "v1.2.3-beta+4 (arm64)");
+        let typed: chinwag_bus_client::ClientInventory =
+            serde_json::from_value(detailed.clone()).unwrap();
+        typed.validate().unwrap();
+        assert_eq!(source.processes.load(Ordering::SeqCst), 2);
+        assert_eq!(source.installations.load(Ordering::SeqCst), 2);
+
+        for value in [legacy, detailed] {
+            let raw = value.to_string();
+            for forbidden in [
+                "/Users",
+                "/Applications",
+                "private-account-marker",
+                "Private-marker-client",
+                "private-bundle-marker",
+                "private-fingerprint-marker",
+                "private-install-diagnostic-marker",
+                "canonical_path",
+                "executable_path",
+                "bundle_id",
+            ] {
+                assert!(
+                    !raw.contains(forbidden),
+                    "raw metadata escaped: {forbidden}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn discovery_http_rejects_method_host_origin_and_intent_before_the_provider() {

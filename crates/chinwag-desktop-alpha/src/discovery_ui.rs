@@ -1,4 +1,6 @@
-use chinwag_bus_client::{ClientInventory, ClientKind, OnboardingStatus};
+use chinwag_bus_client::{
+    ClientInventory, ClientKind, InstallationLocation, InstalledClient, OnboardingStatus,
+};
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 
@@ -111,6 +113,23 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
     format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
+fn copy_hint(app: &InstalledClient) -> String {
+    let mut parts = vec![family_label(&app.family)];
+    if let Some(location) = &app.location {
+        parts.push(
+            match location {
+                InstallationLocation::SharedApplications => "Applications",
+                InstallationLocation::UserApplications => "Your Applications",
+            }
+            .into(),
+        );
+    }
+    if let Some(version) = &app.version {
+        parts.push(format!("Version {version}"));
+    }
+    parts.join(" · ")
+}
+
 fn grouped_families(inventory: &ClientInventory) -> BTreeMap<&str, FamilyCounts> {
     let mut families: BTreeMap<&str, FamilyCounts> = BTreeMap::new();
     for client in &inventory.clients {
@@ -162,6 +181,23 @@ impl Default for DiscoveryPanel {
 }
 
 impl DiscoveryPanel {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn installed_copy(&self, id: &str) -> Option<InstalledClient> {
+        let InventoryState::Ready(inventory) = &self.state else {
+            return None;
+        };
+        inventory
+            .installations
+            .as_ref()?
+            .apps
+            .iter()
+            .find(|app| app.kind == ClientKind::Application && app.id == id)
+            .cloned()
+    }
+
     pub fn clear(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.endpoint = None;
@@ -222,7 +258,7 @@ impl DiscoveryPanel {
         true
     }
 
-    pub fn openable_copies(&self) -> Vec<(String, String)> {
+    fn openable_apps(&self) -> Vec<&InstalledClient> {
         let InventoryState::Ready(inventory) = &self.state else {
             return Vec::new();
         };
@@ -235,31 +271,41 @@ impl DiscoveryPanel {
         let Some(installed) = &inventory.installations else {
             return Vec::new();
         };
-        let apps: Vec<_> = installed
+        installed
             .apps
             .iter()
             .filter(|app| {
                 app.kind == ClientKind::Application
                     && status.openable_installation_ids.contains(&app.id)
             })
-            .collect();
-        apps.iter()
-            .map(|app| {
-                let suffix = (8..=64)
-                    .step_by(4)
-                    .filter_map(|length| app.id.get(app.id.len().saturating_sub(length)..))
-                    .find(|suffix| {
-                        !apps
-                            .iter()
-                            .any(|other| other.id != app.id && other.id.ends_with(suffix))
-                    })
-                    .unwrap_or(&app.id);
-                (
-                    app.id.clone(),
-                    format!("{} · copy {suffix}", family_label(&app.family)),
-                )
-            })
             .collect()
+    }
+
+    pub fn openable_copies(&self) -> Vec<(String, String)> {
+        self.openable_apps()
+            .into_iter()
+            .map(|app| (app.id.clone(), copy_hint(app)))
+            .collect()
+    }
+
+    pub fn copy_disambiguation(&self, id: &str) -> Option<String> {
+        let apps = self.openable_apps();
+        let app = apps.iter().find(|app| app.id == id)?;
+        let hint = copy_hint(app);
+        let ambiguous = apps.iter().filter(|other| copy_hint(other) == hint).count() > 1;
+        if !ambiguous && (app.location.is_some() || app.version.is_some()) {
+            return None;
+        }
+        let suffix = (8..=64)
+            .step_by(4)
+            .filter_map(|length| app.id.get(app.id.len().saturating_sub(length)..))
+            .find(|suffix| {
+                !apps
+                    .iter()
+                    .any(|other| other.id != app.id && other.id.ends_with(suffix))
+            })
+            .unwrap_or(&app.id);
+        Some(format!("Copy {suffix}"))
     }
 
     pub fn summary(&self) -> String {

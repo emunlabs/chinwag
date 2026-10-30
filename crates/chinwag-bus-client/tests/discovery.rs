@@ -3,7 +3,9 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-use chinwag_bus_client::{BusClient, ClientError, ClientInventory, ClientKind, DiscoveryState};
+use chinwag_bus_client::{
+    BusClient, ClientError, ClientInventory, ClientKind, DiscoveryState, InstallationLocation,
+};
 use serde_json::{Value, json};
 
 fn inventory() -> Value {
@@ -60,6 +62,21 @@ fn explicit_discovery_get_preserves_server_host_and_grouped_component_count() {
     );
     assert!(!request.contains("POST "));
     assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    let lower = request.to_ascii_lowercase();
+    assert_eq!(
+        lower
+            .lines()
+            .filter(|line| line.starts_with("x-chinwag-discovery-intent:"))
+            .collect::<Vec<_>>(),
+        vec!["x-chinwag-discovery-intent: 1"]
+    );
+    assert_eq!(
+        lower
+            .lines()
+            .filter(|line| line.starts_with("x-chinwag-discovery-details:"))
+            .collect::<Vec<_>>(),
+        vec!["x-chinwag-discovery-details: 1"]
+    );
     let value = serde_json::to_value(snapshot).unwrap();
     let fields = value["clients"][0].as_object().unwrap();
     assert_eq!(fields.len(), 5);
@@ -148,4 +165,64 @@ fn missing_old_server_endpoint_and_oversized_snapshot_return_bounded_errors() {
         Err(ClientError::ResponseTooLarge { .. })
     ));
     worker.join().unwrap();
+}
+
+fn installed_inventory() -> Value {
+    let mut value = inventory();
+    value["installations"] = json!({"observed_at_unix_ms":1793361786000_u64,
+        "apps":[{"id":"b".repeat(64),"family":"grok_bot","kind":"application",
+            "running_instances":0,"state":"installed_unverified"}],
+        "coverage":{"entry_capacity":4096,"entries_examined":5,"installation_capacity":128,
+            "capacity_reached":false,"unavailable_roots":0,"invalid_metadata":0}});
+    value
+}
+
+#[test]
+fn explicit_details_get_accepts_new_public_hints_and_old_runtime_missing_hints() {
+    for details in [false, true] {
+        let mut value = installed_inventory();
+        if details {
+            value["installations"]["apps"][0]["location"] = json!("user_applications");
+            value["installations"]["apps"][0]["version"] = json!("v1.2.3 (42)");
+        }
+        let (url, worker) = endpoint(200, serde_json::to_vec(&value).unwrap());
+        let result = BusClient::new(&url).unwrap().clients().unwrap();
+        let app = &result.installations.as_ref().unwrap().apps[0];
+        if details {
+            assert_eq!(app.location, Some(InstallationLocation::UserApplications));
+            assert_eq!(app.version.as_deref(), Some("v1.2.3 (42)"));
+        } else {
+            assert!(app.location.is_none());
+            assert!(app.version.is_none());
+        }
+        let request = worker.join().unwrap().to_ascii_lowercase();
+        assert_eq!(
+            request
+                .lines()
+                .filter(|line| line.starts_with("x-chinwag-discovery-details:"))
+                .collect::<Vec<_>>(),
+            vec!["x-chinwag-discovery-details: 1"]
+        );
+        assert!(request.starts_with("get /api/bus/clients "));
+        assert!(!request.contains("post "));
+    }
+}
+
+#[test]
+fn malformed_optional_details_are_rejected_by_the_http_client() {
+    for malformed in [
+        json!({"location":"private_applications"}),
+        json!({"version":"1.0 PRIVATE_MARKER"}),
+        json!({"version":"1/Users/private"}),
+        json!({"version":format!("1{}", "a".repeat(64))}),
+    ] {
+        let mut value = installed_inventory();
+        value["installations"]["apps"][0]
+            .as_object_mut()
+            .unwrap()
+            .extend(malformed.as_object().unwrap().clone());
+        let (url, worker) = endpoint(200, serde_json::to_vec(&value).unwrap());
+        assert!(BusClient::new(&url).unwrap().clients().is_err());
+        assert!(worker.join().unwrap().starts_with("GET "));
+    }
 }

@@ -38,7 +38,8 @@ fn opening_is_default_disabled_and_exact_application_ids_require_same_inventory_
     assert_eq!(copies[0].0, first);
     assert_eq!(copies[1].0, second);
     assert_ne!(
-        copies[0].1, copies[1].1,
+        panel.copy_disambiguation(&first),
+        panel.copy_disambiguation(&second),
         "same suffix must expand enough to distinguish copies"
     );
     assert_eq!(panel.rows().len(), 1, "family grouping remains intact");
@@ -46,6 +47,49 @@ fn opening_is_default_disabled_and_exact_application_ids_require_same_inventory_
     panel.clear();
     assert!(!panel.complete_opening_status(generation, "bus", Ok(status)));
     assert!(panel.openable_copies().is_empty());
+}
+
+#[test]
+fn public_location_and_version_replace_hashes_until_identical_hints_need_disambiguation() {
+    let mut raw = snapshot("Studio");
+    let first = "a".repeat(64);
+    let second = "b".repeat(64);
+    raw.installations = Some(serde_json::from_value(serde_json::json!({
+        "observed_at_unix_ms":1793361786000_u64,
+        "apps":[
+            {"id":first,"family":"grok_bot","kind":"application","running_instances":0,"state":"installed_unverified","location":"shared_applications","version":"1.2.3"},
+            {"id":second,"family":"grok_bot","kind":"application","running_instances":0,"state":"installed_unverified","location":"user_applications","version":"2.0"}
+        ],
+        "coverage":{"entry_capacity":4096,"entries_examined":2,"installation_capacity":128,"capacity_reached":false,"unavailable_roots":0,"invalid_metadata":0}
+    })).unwrap());
+    let mut panel = DiscoveryPanel::default();
+    let generation = panel.begin("bus".into());
+    panel.complete(generation, "bus", Ok(raw));
+    panel.complete_opening_status(
+        generation,
+        "bus",
+        Ok(OnboardingStatus {
+            schema: "chinwag-native-onboarding/v1".into(),
+            native_open_allowed: true,
+            openable_installation_ids: vec![first.clone(), second.clone()],
+        }),
+    );
+    let copies = panel.openable_copies();
+    assert_eq!(copies[0].1, "Grok Bot · Applications · Version 1.2.3");
+    assert_eq!(copies[1].1, "Grok Bot · Your Applications · Version 2.0");
+    assert!(panel.copy_disambiguation(&first).is_none());
+    assert!(panel.copy_disambiguation(&second).is_none());
+    let InventoryState::Ready(inventory) = &mut panel.state else {
+        unreachable!()
+    };
+    let apps = &mut inventory.installations.as_mut().unwrap().apps;
+    apps[1].location = apps[0].location;
+    apps[1].version = apps[0].version.clone();
+    assert_eq!(panel.openable_copies()[0].1, panel.openable_copies()[1].1);
+    assert_ne!(
+        panel.copy_disambiguation(&first),
+        panel.copy_disambiguation(&second)
+    );
 }
 
 #[test]

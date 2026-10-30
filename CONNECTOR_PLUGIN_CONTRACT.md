@@ -34,6 +34,8 @@ Installations retain canonical location, aliases, public metadata fingerprint an
 
 The HTTP response exposes only opaque host-qualified observation IDs, family/kind, running-instance counts and bounded coverage. Paths, PIDs, UID, boot UUID, bundle IDs and executable metadata stay host-local. Installation observation failure leaves the running inventory usable and visible as partial capability. The configured Studio endpoint returns Studio metadata; no MacBook fallback runs.
 
+Explicitly negotiated discovery details add optional public directory-category and version hints. The directory category contains no path or username, and version text must pass the bounded shared version-shape validator. Earlier clients receive the original response shape; new clients accept an older runtime without the hints. Human opening refreshes the selected exact copy before durable attempt creation. Changed metadata or a superseded UI selection requires reselection rather than substitution.
+
 GPUI groups rows by family for presentation. Original instance and installation identities remain distinct. Installed, running, protocol-capable, authenticated, connected and message-delivered are separate states.
 
 ## Implemented boundaries and remaining work

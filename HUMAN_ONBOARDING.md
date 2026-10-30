@@ -15,6 +15,9 @@ sequenceDiagram
     Runtime-->>UI: Redacted families and installation IDs
     UI->>Runtime: GET opening capability
     Person->>UI: Open/reuse selected copy
+    UI->>Runtime: Refresh inventory and capability on the same host
+    Runtime-->>UI: Fresh exact installation ID or changed/missing selection
+    UI->>UI: Require the same selected copy and current UI generation
     UI->>UI: Save attempt ID, endpoint and installation ID
     UI->>Runtime: POST one opaque installation ID
     Runtime->>Journal: Save Pending and sync before dispatch
@@ -34,7 +37,11 @@ Native opening is an explicit runtime option. Run `serve-local` or `serve-shared
 
 The existing default startup remains unchanged. A runtime without the opening controller reports the capability as disabled. The options do not launch an AI application at startup, during inventory, on a timer or after reconnect. They do not turn the runtime into a remote agent ingress service.
 
-In GPUI, **Find apps** reads the configured runtime host's inventory. Eligible copies receive an explicit **Open/reuse** action. Opaque ID suffixes distinguish multiple copies without sending private filesystem paths to the UI. An application that is installed but absent from the bounded running sample is described as **running not observed**. That observation does not establish that it is asleep.
+In GPUI, **Find apps** reads the configured runtime host's inventory. Eligible copies receive an explicit **Open/reuse** action. Public application-location and version hints help distinguish copies without sending private filesystem paths to the UI. An opaque suffix is a fallback when copies remain ambiguous. These hints are metadata observations, not vendor or account authentication.
+
+Selecting **Open/reuse** refreshes inventory and opening capability on the same endpoint before preparing an attempt. Only the same opaque installation ID, family and current selection can proceed. The ID includes host, boot and public metadata fingerprint, so a replaced or changed copy requires reselection. Endpoint edits and a newer Find/Connect operation invalidate the selection. A failed refresh creates no Pending record and sends no opening POST. No timer performs this refresh or launches an application.
+
+An application that is installed but absent from the bounded running sample is described as **running not observed**. That observation does not establish that it is asleep.
 
 ## Native loopback interface
 
@@ -47,6 +54,8 @@ All routes use the existing loopback Host and no-Origin boundary and require exa
 | `GET /api/onboarding/opens/<request ID>` | Read an existing receipt. Never dispatch an application open. |
 
 Unknown fields, invalid identifiers, query parameters, incorrect intent and unsupported methods are rejected. Only the same explicit inventory observation supplies the controller's target cache. Opening rechecks the selected exact public target; it does not rescan other installations or inspect private sessions.
+
+New clients request public copy hints with `X-Chinwag-Discovery-Details: 1` on the inventory GET. Without that header, the runtime omits the new optional fields so earlier strict clients keep their existing response shape. New clients also accept inventories without hints. Location is an enum for the shared or user Applications directory; the runtime does not disclose a username or path. Version hints accept only bounded version-shaped public strings. Invalid or duplicate details headers reject before collection.
 
 ## Outcomes and recovery
 

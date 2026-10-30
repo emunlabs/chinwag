@@ -51,6 +51,18 @@ pub struct InstalledClient {
     pub kind: ClientKind,
     pub running_instances: usize,
     pub state: InstallationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<InstallationLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// Public installation scope only; never an absolute path or connector grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationLocation {
+    SharedApplications,
+    UserApplications,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +120,7 @@ impl BusClient {
             self.http
                 .get(self.endpoint("/api/bus/clients"))
                 .header("X-Chinwag-Discovery-Intent", "1")
+                .header("X-Chinwag-Discovery-Details", "1")
                 .send()?,
         )?;
         inventory.validate()?;
@@ -227,6 +240,10 @@ impl ClientInventory {
                         .bytes()
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
                     || app.running_instances > c.candidate_process_count
+                    || app
+                        .version
+                        .as_deref()
+                        .is_some_and(|version| !is_public_installation_version(version))
                 {
                     return Err(invalid("invalid installed application observation"));
                 }
@@ -234,6 +251,50 @@ impl ClientInventory {
         }
         Ok(())
     }
+}
+
+/// Conservative public version-display grammar. This validates an optional
+/// hint; it does not authenticate a publisher, installation or executable.
+pub fn is_public_installation_version(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let prefix = bytes.first().is_some_and(|byte| byte.is_ascii_digit())
+        || (bytes.first() == Some(&b'v') && bytes.get(1).is_some_and(|byte| byte.is_ascii_digit()));
+    if value.is_empty()
+        || value.len() > 64
+        || value.trim() != value
+        || !prefix
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b' ' | b'_' | b'+' | b'-' | b'(' | b')')
+        })
+    {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    ![
+        "auth",
+        "bearer",
+        "token",
+        "secret",
+        "credential",
+        "password",
+        "private",
+        "api_key",
+        "api-key",
+        "api key",
+        "apikey",
+        "access_key",
+        "access-key",
+        "access key",
+        "accesskey",
+        "session",
+        "cookie",
+        "sk-",
+        "sk_",
+        "hf_",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 #[cfg(test)]
@@ -296,6 +357,106 @@ mod installed_wire_tests {
             .unwrap()
             .coverage
             .entries_examined = 4097;
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn old_installation_rows_omit_optional_details_without_inventing_them() {
+        let value = inventory();
+        let app = &value.installations.as_ref().unwrap().apps[0];
+        assert!(app.location.is_none());
+        assert!(app.version.is_none());
+        let wire = serde_json::to_value(&value).unwrap();
+        assert!(wire["installations"]["apps"][0].get("location").is_none());
+        assert!(wire["installations"]["apps"][0].get("version").is_none());
+        value.validate().unwrap();
+    }
+
+    #[test]
+    fn public_location_enum_round_trips_both_scopes_and_rejects_unknown_paths() {
+        for (location, wire) in [
+            (
+                InstallationLocation::SharedApplications,
+                "shared_applications",
+            ),
+            (InstallationLocation::UserApplications, "user_applications"),
+        ] {
+            let mut value = inventory();
+            value.installations.as_mut().unwrap().apps[0].location = Some(location);
+            let encoded = serde_json::to_value(&value).unwrap();
+            assert_eq!(encoded["installations"]["apps"][0]["location"], wire);
+            let parsed: ClientInventory = serde_json::from_value(encoded).unwrap();
+            parsed.validate().unwrap();
+            assert_eq!(
+                parsed.installations.unwrap().apps[0].location,
+                Some(location)
+            );
+        }
+        for unsupported in [
+            "other",
+            "/Users/private/Applications",
+            "connected",
+            "SharedApplications",
+        ] {
+            let mut value = serde_json::to_value(inventory()).unwrap();
+            value["installations"]["apps"][0]["location"] = json!(unsupported);
+            assert!(serde_json::from_value::<ClientInventory>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn public_version_accepts_bounded_numeric_versions_and_rejects_invalid_hints() {
+        for version in [
+            "1",
+            "v1",
+            "1.2.3",
+            "2026.10.30",
+            "v1.2-beta_4+abcdef",
+            "1.2.3 (42)",
+        ] {
+            assert!(is_public_installation_version(version), "{version}");
+            let mut value = inventory();
+            value.installations.as_mut().unwrap().apps[0].version = Some(version.into());
+            value.validate().unwrap();
+        }
+        for version in [
+            "",
+            " ",
+            " 1.2",
+            "1.2 ",
+            "v",
+            "V1.2",
+            "preview",
+            "vbeta",
+            "1/Users",
+            "1\\private",
+            "1:secret",
+            "1\n2",
+            "1\t2",
+            "1.2β",
+            "1.0 PRIVATE_MARKER",
+            "v1_auth_value",
+            "1.0 bearer abc",
+            "1.0 api-key abc",
+            "1.0 sk-example",
+            "1.0 cookie",
+            "1.0 session",
+        ] {
+            assert!(!is_public_installation_version(version), "{version:?}");
+            let mut value = inventory();
+            value.installations.as_mut().unwrap().apps[0].version = Some(version.into());
+            assert!(value.validate().is_err(), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn public_version_byte_cap_is_enforced_at_the_wire_boundary() {
+        let mut value = inventory();
+        let at_limit = format!("1{}", "a".repeat(63));
+        assert_eq!(at_limit.len(), 64);
+        value.installations.as_mut().unwrap().apps[0].version = Some(at_limit.clone());
+        value.validate().unwrap();
+        value.installations.as_mut().unwrap().apps[0].version = Some(format!("{at_limit}a"));
         assert!(value.validate().is_err());
     }
 }
