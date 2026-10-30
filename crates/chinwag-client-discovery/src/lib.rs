@@ -13,7 +13,8 @@ pub use installed::{
     APP_CAPACITY_PER_DIRECTORY, APP_ENTRY_CAPACITY, DirectoryCoverage, DirectoryStatus,
     ExecutableFormat, ExecutableMetadata, INSTALLATION_CAPACITY, Installation, InstallationKind,
     InstalledCoverage, InstalledError, InstalledRunningState, InstalledSnapshot,
-    InstalledWithRunning, MAX_PLIST_BYTES, MergedInventory, installed_snapshot, merge_installed,
+    InstalledWithRunning, MAX_APPLICATION_ALIASES, MAX_PLIST_BYTES, MergedInventory,
+    ReobserveError, installed_snapshot, merge_installed, reobserve_application,
 };
 
 #[cfg(target_os = "macos")]

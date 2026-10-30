@@ -19,5 +19,8 @@ sha2.workspace = true
 thiserror.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+chinwag-native-launch = { path = "../chinwag-native-launch" }
+
 [dev-dependencies]
 tempfile = "3"

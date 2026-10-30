@@ -1245,6 +1245,7 @@ dependencies = [
  "chinwag-client-discovery",
  "chinwag-connector-registry",
  "chinwag-connectors",
+ "chinwag-native-launch",
  "chrono",
  "rustix",
  "serde",
@@ -1427,6 +1428,7 @@ version = "0.0.1"
 dependencies = [
  "block2 0.6.2",
  "chinwag-client-discovery",
+ "core-foundation 0.10.1",
  "dispatch2",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",

@@ -523,3 +523,269 @@ fn public_metadata_change_replaces_the_observation_fingerprint() {
     assert_ne!(first.id, second.id);
     assert_eq!(second.version.as_deref(), Some("2.0"));
 }
+
+fn selected(scope: &Scope, path: &Path) -> Installation {
+    let mut row = app(path, scope).unwrap().unwrap();
+    row.observed_paths.push(path.to_owned());
+    row
+}
+
+fn native_app(scope: &Scope, file_name: &str) -> PathBuf {
+    make_app(
+        scope,
+        file_name,
+        "Grok Bot",
+        "com.anysphere.sand",
+        "Grok Bot",
+        false,
+    )
+}
+
+#[test]
+fn reobserve_one_unchanged_application_and_alias_without_inventory_rescan() {
+    let directory = TempDir::new().unwrap();
+    let mut scope = scope(&directory);
+    let path = native_app(&scope, "Grok Bot.app");
+    let alias = scope.apps[0].join("Grok alias.app");
+    symlink("Grok Bot.app", &alias).unwrap();
+    let mut previous = selected(&scope, &path);
+    previous.observed_paths.push(alias);
+    // Full collection would accept no entries and the extra root is absent;
+    // exact reobservation touches neither unrelated entries nor other roots.
+    scope.entry_cap = 0;
+    scope.app_cap = 0;
+    scope.apps.push(directory.path().join("unavailable-root"));
+    assert_eq!(reobserve_in_scope(&previous, &scope), Ok(previous));
+}
+
+#[test]
+fn reobserve_rejects_modified_or_replaced_executable_and_stat() {
+    for mutation in 0..3 {
+        let directory = TempDir::new().unwrap();
+        let scope = scope(&directory);
+        let path = native_app(&scope, "Grok Bot.app");
+        let previous = selected(&scope, &path);
+        let executable = path.join("Contents/MacOS/Grok Bot");
+        match mutation {
+            0 => binary(&executable, &[0xcf, 0xfa, 0xed, 0xfe, 9, 9, 9, 9, 9]),
+            1 => {
+                let bytes = fs::read(&executable).unwrap();
+                fs::rename(&executable, path.join("Contents/MacOS/old")).unwrap();
+                binary(&executable, &bytes);
+            }
+            _ => fs::set_permissions(&executable, fs::Permissions::from_mode(0o744)).unwrap(),
+        }
+        assert_eq!(
+            reobserve_in_scope(&previous, &scope),
+            Err(ReobserveError::Changed)
+        );
+    }
+}
+
+#[test]
+fn reobserve_rejects_changed_plist_and_identical_byte_plist_replacement() {
+    for replace in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let scope = scope(&directory);
+        let path = native_app(&scope, "Grok Bot.app");
+        let previous = selected(&scope, &path);
+        let plist_path = path.join("Contents/Info.plist");
+        if replace {
+            let bytes = fs::read(&plist_path).unwrap();
+            fs::rename(&plist_path, path.join("Contents/Old.plist")).unwrap();
+            fs::write(&plist_path, bytes).unwrap();
+        } else {
+            let mut value = plist::Value::from_file(&plist_path).unwrap();
+            value.as_dictionary_mut().unwrap().insert(
+                "CFBundleShortVersionString".into(),
+                plist::Value::String("2.0".into()),
+            );
+            value.to_file_xml(&plist_path).unwrap();
+        }
+        assert_eq!(
+            reobserve_in_scope(&previous, &scope),
+            Err(ReobserveError::Changed)
+        );
+    }
+}
+
+#[test]
+fn reobserve_rejects_deleted_moved_replaced_application_and_parent_root_swap() {
+    for mutation in 0..4 {
+        let directory = TempDir::new().unwrap();
+        let scope = scope(&directory);
+        let path = native_app(&scope, "Grok Bot.app");
+        let previous = selected(&scope, &path);
+        let expected = match mutation {
+            0 => {
+                fs::remove_dir_all(&path).unwrap();
+                ReobserveError::Unavailable
+            }
+            1 => {
+                fs::rename(&path, scope.apps[0].join("Moved.app")).unwrap();
+                ReobserveError::Unavailable
+            }
+            2 => {
+                fs::rename(&path, scope.apps[0].join("Old.app")).unwrap();
+                native_app(&scope, "Grok Bot.app");
+                ReobserveError::Changed
+            }
+            _ => {
+                let old_root = directory.path().join("old-applications");
+                fs::rename(&scope.apps[0], &old_root).unwrap();
+                fs::create_dir(&scope.apps[0]).unwrap();
+                // Keep the same selected app/executable inodes; the public
+                // parent identity alone must still invalidate the observation.
+                fs::rename(old_root.join("Grok Bot.app"), &path).unwrap();
+                ReobserveError::Changed
+            }
+        };
+        assert_eq!(reobserve_in_scope(&previous, &scope), Err(expected));
+    }
+}
+
+#[test]
+fn reobserve_never_follows_selected_target_parent_plist_or_executable_symlinks() {
+    for mutation in 0..5 {
+        let directory = TempDir::new().unwrap();
+        let scope = scope(&directory);
+        let path = native_app(&scope, "Grok Bot.app");
+        let previous = selected(&scope, &path);
+        let private = directory.path().join("private");
+        match mutation {
+            0 => {
+                fs::rename(&path, &private).unwrap();
+                symlink(&private, &path).unwrap();
+            }
+            1 => {
+                fs::rename(path.join("Contents"), &private).unwrap();
+                symlink(&private, path.join("Contents")).unwrap();
+            }
+            2 => {
+                fs::rename(path.join("Contents/Info.plist"), &private).unwrap();
+                symlink(&private, path.join("Contents/Info.plist")).unwrap();
+            }
+            3 => {
+                fs::rename(path.join("Contents/MacOS/Grok Bot"), &private).unwrap();
+                symlink(&private, path.join("Contents/MacOS/Grok Bot")).unwrap();
+            }
+            _ => {
+                fs::rename(&scope.apps[0], &private).unwrap();
+                symlink(&private, &scope.apps[0]).unwrap();
+            }
+        }
+        assert_eq!(
+            reobserve_in_scope(&previous, &scope),
+            Err(ReobserveError::UnsafeTarget)
+        );
+    }
+}
+
+#[test]
+fn reobserve_rejects_retargeted_and_private_aliases_without_following_them() {
+    for private_escape in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let scope = scope(&directory);
+        let path = native_app(&scope, "Grok Bot.app");
+        let alias = scope.apps[0].join("Alias.app");
+        symlink(&path, &alias).unwrap();
+        let mut previous = selected(&scope, &path);
+        previous.observed_paths.push(alias.clone());
+        fs::remove_file(&alias).unwrap();
+        let (target, expected) = if private_escape {
+            // The escaped destination deliberately does not exist. A scope
+            // rejection, rather than Unavailable, proves it was not resolved.
+            (
+                directory.path().join("private/Absent.app"),
+                ReobserveError::UnsafeTarget,
+            )
+        } else {
+            (
+                native_app(&scope, "Other copy.app"),
+                ReobserveError::Changed,
+            )
+        };
+        symlink(target, alias).unwrap();
+        assert_eq!(reobserve_in_scope(&previous, &scope), Err(expected));
+    }
+}
+
+#[test]
+fn reobserve_rejects_unsupported_rows_and_caller_paths_before_file_access() {
+    let directory = TempDir::new().unwrap();
+    let scope = scope(&directory);
+    let path = native_app(&scope, "Grok Bot.app");
+    let previous = selected(&scope, &path);
+    for mutation in 0..5 {
+        let mut row = previous.clone();
+        match mutation {
+            0 => row.kind = InstallationKind::CommandLine,
+            1 => row.match_basis = InstallationMatch::NameAndExecutableHint,
+            2 => row.match_basis = InstallationMatch::LauncherOnly,
+            3 => row.executable.format = ExecutableFormat::Script,
+            _ => row.bundle_id = Some("unrecognized.bundle".into()),
+        }
+        row.canonical_path = directory.path().join("private/missing.app");
+        assert_eq!(
+            reobserve_in_scope(&row, &scope),
+            Err(ReobserveError::UnsupportedInstallation)
+        );
+    }
+    for bad_path in [
+        directory.path().join("private/missing.app"),
+        scope.apps[0].join("nested/Hidden.app"),
+        scope.apps[0].join("../Applications/Grok Bot.app"),
+        scope.apps[0].join("NotApplication"),
+    ] {
+        let mut row = previous.clone();
+        row.canonical_path = bad_path.clone();
+        row.executable_path = bad_path.join("Contents/MacOS/Grok Bot");
+        row.observed_paths = vec![bad_path];
+        assert_eq!(
+            reobserve_in_scope(&row, &scope),
+            Err(ReobserveError::UnsafeTarget)
+        );
+    }
+    let mut row = previous.clone();
+    row.observed_paths
+        .push(directory.path().join("private/missing.app"));
+    assert_eq!(
+        reobserve_in_scope(&row, &scope),
+        Err(ReobserveError::UnsafeTarget)
+    );
+}
+
+#[test]
+fn reobserve_bounds_plist_alias_count_and_alias_cycles() {
+    let directory = TempDir::new().unwrap();
+    let scope = scope(&directory);
+    let path = native_app(&scope, "Grok Bot.app");
+    let mut previous = selected(&scope, &path);
+    previous.observed_paths = (0..=MAX_APPLICATION_ALIASES)
+        .map(|index| scope.apps[0].join(format!("Alias{index}.app")))
+        .collect();
+    assert_eq!(
+        reobserve_in_scope(&previous, &scope),
+        Err(ReobserveError::UnsafeTarget)
+    );
+    previous = selected(&scope, &path);
+    let a = scope.apps[0].join("AliasA.app");
+    let b = scope.apps[0].join("AliasB.app");
+    symlink(&b, &a).unwrap();
+    symlink(&a, &b).unwrap();
+    previous.observed_paths.push(a);
+    assert_eq!(
+        reobserve_in_scope(&previous, &scope),
+        Err(ReobserveError::UnsafeTarget)
+    );
+    previous = selected(&scope, &path);
+    fs::write(
+        path.join("Contents/Info.plist"),
+        vec![b' '; MAX_PLIST_BYTES + 1],
+    )
+    .unwrap();
+    assert_eq!(
+        reobserve_in_scope(&previous, &scope),
+        Err(ReobserveError::MetadataTooLarge)
+    );
+}

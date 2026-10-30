@@ -20,6 +20,8 @@ use std::{
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod main_loop;
 
 pub const MAX_PLANS_PER_OPERATION: usize = 128;
 pub const MAX_OBSERVATION_AGE: Duration = Duration::from_secs(30);

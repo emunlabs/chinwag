@@ -6,14 +6,14 @@ use crate::{
     ClientCandidate, ClientFamily, Coverage, HostObservation, InventorySnapshot, ProcessBirth,
     ProcessRole,
 };
-use rustix::fs::{Mode, OFlags, open, openat};
+use rustix::fs::{Mode, OFlags, open, openat, readlinkat_raw};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, Metadata},
     io::{Cursor, Read},
-    os::unix::fs::MetadataExt,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Component, Path, PathBuf},
     time::SystemTime,
 };
@@ -22,6 +22,27 @@ pub const INSTALLATION_CAPACITY: usize = 128;
 pub const APP_ENTRY_CAPACITY: usize = 2048;
 pub const APP_CAPACITY_PER_DIRECTORY: usize = 256;
 pub const MAX_PLIST_BYTES: usize = 131_072;
+pub const MAX_APPLICATION_ALIASES: usize = 2 * APP_CAPACITY_PER_DIRECTORY;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReobserveError {
+    #[error("exact application reobservation is supported only on macOS")]
+    UnsupportedPlatform,
+    #[error("current user's fixed public application scope is unavailable")]
+    ScopeUnavailable,
+    #[error("observation is not a supported public-bundle native application")]
+    UnsupportedInstallation,
+    #[error(
+        "application or alias is outside the bounded public application scope or uses an unsafe path"
+    )]
+    UnsafeTarget,
+    #[error("selected application public metadata is unavailable")]
+    Unavailable,
+    #[error("selected application public plist exceeds the byte bound")]
+    MetadataTooLarge,
+    #[error("selected application, alias or public metadata changed; refresh the inventory")]
+    Changed,
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InstalledError {
@@ -243,6 +264,160 @@ pub fn installed_snapshot() -> Result<InstalledSnapshot, InstalledError> {
     }
 }
 
+/// Rechecks one previously observed exact application in the current user's
+/// fixed public scope. This does not enumerate applications/processes, launch,
+/// establish asleep/connected state, authenticate a vendor, or grant permission.
+/// The caller must keep the host/boot binding and monotonic observation time.
+/// Public metadata remains mutable after this bounded filesystem observation.
+pub fn reobserve_application(previous: &Installation) -> Result<Installation, ReobserveError> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = current_home().map_err(|_| ReobserveError::ScopeUnavailable)?;
+        reobserve_in_scope(previous, &Scope::new(home))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = previous;
+        Err(ReobserveError::UnsupportedPlatform)
+    }
+}
+
+fn direct_application_path(path: &Path, scope: &Scope) -> bool {
+    path.is_absolute()
+        && path.as_os_str().as_bytes().len() <= 4096
+        && path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+        && scope
+            .apps
+            .iter()
+            .any(|root| path.parent() == Some(root.as_path()))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.len() <= 256
+                    && name.ends_with(".app")
+                    && name.len() > 4
+                    && !name.chars().any(char::is_control)
+            })
+}
+
+fn reobserve_in_scope(
+    previous: &Installation,
+    scope: &Scope,
+) -> Result<Installation, ReobserveError> {
+    let binary = previous
+        .executable_path
+        .file_name()
+        .and_then(|name| name.to_str());
+    if previous.kind != InstallationKind::Application
+        || previous.match_basis != InstallationMatch::PublicBundleIdentity
+        || previous.executable.format != ExecutableFormat::MachO
+        || previous.executable.mode & 0o111 == 0
+        || binary.is_none_or(|name| !plain_component(name))
+        || previous
+            .bundle_id
+            .as_deref()
+            .zip(binary)
+            .and_then(|(bundle, binary)| app_family(&previous.display_name, bundle, binary))
+            != Some((previous.family, InstallationMatch::PublicBundleIdentity))
+    {
+        return Err(ReobserveError::UnsupportedInstallation);
+    }
+    // Validate every caller-carried path before stat/canonicalize/file contents.
+    if !direct_application_path(&previous.canonical_path, scope)
+        || previous.executable_path
+            != previous
+                .canonical_path
+                .join("Contents/MacOS")
+                .join(binary.unwrap_or_default())
+        || previous.observed_paths.is_empty()
+        || previous.observed_paths.len() > MAX_APPLICATION_ALIASES
+        || previous
+            .observed_paths
+            .iter()
+            .any(|path| !direct_application_path(path, scope))
+        || previous
+            .observed_paths
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != previous.observed_paths.len()
+        || [&previous.id, &previous.metadata_fingerprint]
+            .iter()
+            .any(|value| value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(ReobserveError::UnsafeTarget);
+    }
+    // read_application never canonicalizes the selected target. In particular a
+    // new symlink at that exact name is rejected rather than followed elsewhere.
+    let mut fresh = read_application(&previous.canonical_path, scope)
+        .map_err(reobserve_failure)?
+        .ok_or(ReobserveError::Changed)?;
+    for alias in &previous.observed_paths {
+        verify_alias(alias, &previous.canonical_path, scope).map_err(reobserve_failure)?;
+    }
+    fresh.observed_paths = previous.observed_paths.clone();
+    if fresh != *previous {
+        return Err(ReobserveError::Changed);
+    }
+    Ok(fresh)
+}
+
+fn reobserve_failure(error: ReadFailure) -> ReobserveError {
+    match error {
+        ReadFailure::Unavailable => ReobserveError::Unavailable,
+        ReadFailure::Unsafe => ReobserveError::UnsafeTarget,
+        ReadFailure::Oversized => ReobserveError::MetadataTooLarge,
+        ReadFailure::Invalid | ReadFailure::Changed => ReobserveError::Changed,
+    }
+}
+
+fn verify_alias(alias: &Path, expected: &Path, scope: &Scope) -> Result<(), ReadFailure> {
+    let mut current = alias.to_owned();
+    let mut visited = BTreeSet::new();
+    // Aliases may traverse only a bounded chain of depth-one public app names;
+    // absolute/relative private escapes are rejected before touching that path.
+    for _ in 0..8 {
+        if !direct_application_path(&current, scope) || !visited.insert(current.clone()) {
+            return Err(ReadFailure::Unsafe);
+        }
+        let parent = current.parent().ok_or(ReadFailure::Unsafe)?;
+        let directory = open_directory(parent)?;
+        let parent_before = directory.metadata().map_err(|_| ReadFailure::Unavailable)?;
+        let name = current.file_name().ok_or(ReadFailure::Unsafe)?;
+        match open_child(&directory, name, true) {
+            Ok(_) if current == expected => {
+                verify_directory_path(&directory, parent, &parent_before)?;
+                return Ok(());
+            }
+            Ok(_) => return Err(ReadFailure::Changed),
+            Err(ReadFailure::Unsafe) => {
+                let mut bytes = [0u8; 4097];
+                let count = readlinkat_raw(&directory, name, &mut bytes)
+                    .map_err(|_| ReadFailure::Unsafe)?;
+                if count == 0 || count >= bytes.len() || bytes[..count].contains(&0) {
+                    return Err(ReadFailure::Unsafe);
+                }
+                let target = Path::new(std::ffi::OsStr::from_bytes(&bytes[..count]));
+                let next = if target.is_absolute() {
+                    target.to_owned()
+                } else {
+                    parent.join(target)
+                };
+                if !direct_application_path(&next, scope) {
+                    return Err(ReadFailure::Unsafe);
+                }
+                verify_directory_path(&directory, parent, &parent_before)?;
+                current = next;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ReadFailure::Unsafe)
+}
+
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn current_home() -> Result<PathBuf, InstalledError> {
@@ -369,8 +544,20 @@ fn open_regular(path: &Path) -> Result<File, ReadFailure> {
     if !before.is_file() || before.file_type().is_symlink() {
         return Err(ReadFailure::Unsafe);
     }
-    // Resolve each canonical public path component through held directories.
-    // A leaf-only NOFOLLOW would permit a replaced parent to redirect the read.
+    let file = open_absolute(path, false)?;
+    if stat_key(&before) != stat_key(&file.metadata().map_err(|_| ReadFailure::Unavailable)?) {
+        return Err(ReadFailure::Changed);
+    }
+    Ok(file)
+}
+
+fn open_directory(path: &Path) -> Result<File, ReadFailure> {
+    open_absolute(path, true)
+}
+
+fn open_absolute(path: &Path, directory: bool) -> Result<File, ReadFailure> {
+    // Resolve each public path component through held directories. A leaf-only
+    // NOFOLLOW would permit a replaced parent to redirect a subsequent read.
     if !path.is_absolute() {
         return Err(ReadFailure::Unsafe);
     }
@@ -392,7 +579,7 @@ fn open_regular(path: &Path) -> Result<File, ReadFailure> {
             return Err(ReadFailure::Unsafe);
         };
         let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-        if index + 1 != components.len() {
+        if directory || index + 1 != components.len() {
             flags |= OFlags::DIRECTORY;
         }
         current = openat(&current, *name, flags, Mode::empty()).map_err(|error| {
@@ -404,10 +591,70 @@ fn open_regular(path: &Path) -> Result<File, ReadFailure> {
         })?;
     }
     let file = File::from(current);
-    if stat_key(&before) != stat_key(&file.metadata().map_err(|_| ReadFailure::Unavailable)?) {
-        return Err(ReadFailure::Changed);
+    let metadata = file.metadata().map_err(|_| ReadFailure::Unavailable)?;
+    if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+        return Err(ReadFailure::Unsafe);
     }
     Ok(file)
+}
+
+fn open_child(parent: &File, name: &std::ffi::OsStr, directory: bool) -> Result<File, ReadFailure> {
+    if !matches!(
+        Path::new(name).components().next(),
+        Some(Component::Normal(_))
+    ) || Path::new(name).components().count() != 1
+    {
+        return Err(ReadFailure::Unsafe);
+    }
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let descriptor = openat(parent, name, flags, Mode::empty()).map_err(|error| {
+        if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+            ReadFailure::Unsafe
+        } else {
+            ReadFailure::Unavailable
+        }
+    })?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(|_| ReadFailure::Unavailable)?;
+    if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+        return Err(ReadFailure::Unsafe);
+    }
+    Ok(file)
+}
+
+fn directory_identity(metadata: &Metadata) -> (u64, u64, u32) {
+    (metadata.dev(), metadata.ino(), metadata.mode())
+}
+
+fn verify_directory_path(file: &File, path: &Path, before: &Metadata) -> Result<(), ReadFailure> {
+    let named = open_directory(path)?;
+    if directory_identity(before)
+        != directory_identity(&file.metadata().map_err(|_| ReadFailure::Changed)?)
+        || directory_identity(before)
+            != directory_identity(&named.metadata().map_err(|_| ReadFailure::Changed)?)
+    {
+        return Err(ReadFailure::Changed);
+    }
+    Ok(())
+}
+
+fn verify_child(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    file: &File,
+    before: &Metadata,
+    directory: bool,
+) -> Result<(), ReadFailure> {
+    let named = open_child(parent, name, directory)?;
+    if stat_key(before) != stat_key(&file.metadata().map_err(|_| ReadFailure::Changed)?)
+        || stat_key(before) != stat_key(&named.metadata().map_err(|_| ReadFailure::Changed)?)
+    {
+        return Err(ReadFailure::Changed);
+    }
+    Ok(())
 }
 
 fn stable_after(file: &File, path: &Path, before: &Metadata) -> Result<(), ReadFailure> {
@@ -422,6 +669,12 @@ fn stable_after(file: &File, path: &Path, before: &Metadata) -> Result<(), ReadF
 fn executable(path: &Path) -> Result<ExecutableMetadata, ReadFailure> {
     let mut file = open_regular(path)?;
     let before = file.metadata().map_err(|_| ReadFailure::Unavailable)?;
+    let result = executable_bytes(&mut file, &before)?;
+    stable_after(&file, path, &before)?;
+    Ok(result)
+}
+
+fn executable_bytes(file: &mut File, before: &Metadata) -> Result<ExecutableMetadata, ReadFailure> {
     if before.mode() & 0o111 == 0 {
         return Err(ReadFailure::Invalid);
     }
@@ -429,7 +682,6 @@ fn executable(path: &Path) -> Result<ExecutableMetadata, ReadFailure> {
     let count = file
         .read(&mut bytes)
         .map_err(|_| ReadFailure::Unavailable)?;
-    stable_after(&file, path, &before)?;
     let format = if count == 4
         && matches!(
             bytes,
@@ -491,25 +743,27 @@ fn finish_installation(
 
 fn app(path: &Path, scope: &Scope) -> Result<Option<Installation>, ReadFailure> {
     let canonical = fs::canonicalize(path).map_err(|_| ReadFailure::Unavailable)?;
-    if !scope
-        .apps
-        .iter()
-        .any(|root| canonical.parent() == Some(root.as_path()))
-    {
+    read_application(&canonical, scope)
+}
+
+fn read_application(canonical: &Path, scope: &Scope) -> Result<Option<Installation>, ReadFailure> {
+    if !direct_application_path(canonical, scope) {
         return Err(ReadFailure::Unsafe);
     }
-    let location = fs::symlink_metadata(&canonical).map_err(|_| ReadFailure::Unavailable)?;
-    if !location.is_dir() || location.file_type().is_symlink() {
-        return Err(ReadFailure::Unsafe);
-    }
-    for directory in [canonical.join("Contents"), canonical.join("Contents/MacOS")] {
-        let metadata = fs::symlink_metadata(directory).map_err(|_| ReadFailure::Unavailable)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(ReadFailure::Unsafe);
-        }
-    }
-    let path = canonical.join("Contents/Info.plist");
-    let mut file = open_regular(&path)?;
+    let root_path = canonical.parent().ok_or(ReadFailure::Unsafe)?;
+    let application_name = canonical.file_name().ok_or(ReadFailure::Unsafe)?;
+    let root = open_directory(root_path)?;
+    let root_before = root.metadata().map_err(|_| ReadFailure::Unavailable)?;
+    let application = open_child(&root, application_name, true)?;
+    let location = application
+        .metadata()
+        .map_err(|_| ReadFailure::Unavailable)?;
+    let contents = open_child(&application, std::ffi::OsStr::new("Contents"), true)?;
+    let contents_before = contents.metadata().map_err(|_| ReadFailure::Unavailable)?;
+    let macos = open_child(&contents, std::ffi::OsStr::new("MacOS"), true)?;
+    let macos_before = macos.metadata().map_err(|_| ReadFailure::Unavailable)?;
+    let plist_name = std::ffi::OsStr::new("Info.plist");
+    let mut file = open_child(&contents, plist_name, false)?;
     let before = file.metadata().map_err(|_| ReadFailure::Unavailable)?;
     if before.len() > MAX_PLIST_BYTES as u64 {
         return Err(ReadFailure::Oversized);
@@ -522,7 +776,7 @@ fn app(path: &Path, scope: &Scope) -> Result<Option<Installation>, ReadFailure> 
     if bytes.len() > MAX_PLIST_BYTES {
         return Err(ReadFailure::Oversized);
     }
-    stable_after(&file, &path, &before)?;
+    verify_child(&contents, plist_name, &file, &before, false)?;
     let value = plist::Value::from_reader(Cursor::new(&bytes)).map_err(|_| ReadFailure::Invalid)?;
     let dictionary = value.as_dictionary().ok_or(ReadFailure::Invalid)?;
     let string = |key: &str| {
@@ -542,13 +796,17 @@ fn app(path: &Path, scope: &Scope) -> Result<Option<Installation>, ReadFailure> 
         return Ok(None);
     };
     let executable_path = canonical.join("Contents/MacOS").join(binary);
-    let executable = executable(&executable_path)?;
+    let mut executable_file = open_child(&macos, std::ffi::OsStr::new(binary), false)?;
+    let executable_before = executable_file
+        .metadata()
+        .map_err(|_| ReadFailure::Unavailable)?;
+    let executable = executable_bytes(&mut executable_file, &executable_before)?;
     let row = Installation {
         id: String::new(),
         family,
         kind: InstallationKind::Application,
         match_basis,
-        canonical_path: canonical.clone(),
+        canonical_path: canonical.to_owned(),
         observed_paths: vec![],
         display_name: string("CFBundleDisplayName").unwrap_or(name).to_owned(),
         bundle_id: Some(bundle_id.to_owned()),
@@ -559,12 +817,50 @@ fn app(path: &Path, scope: &Scope) -> Result<Option<Installation>, ReadFailure> 
         executable,
         metadata_fingerprint: String::new(),
     };
-    if stat_key(&location)
-        != stat_key(&fs::symlink_metadata(&canonical).map_err(|_| ReadFailure::Changed)?)
-    {
-        return Err(ReadFailure::Changed);
-    }
-    Ok(Some(finish_installation(row, &bytes, &location)))
+    verify_child(
+        &macos,
+        std::ffi::OsStr::new(binary),
+        &executable_file,
+        &executable_before,
+        false,
+    )?;
+    verify_child(&contents, plist_name, &file, &before, false)?;
+    verify_child(
+        &contents,
+        std::ffi::OsStr::new("MacOS"),
+        &macos,
+        &macos_before,
+        true,
+    )?;
+    verify_child(
+        &application,
+        std::ffi::OsStr::new("Contents"),
+        &contents,
+        &contents_before,
+        true,
+    )?;
+    verify_child(&root, application_name, &application, &location, true)?;
+    verify_directory_path(&root, root_path, &root_before)?;
+    // Root directory mtimes can change when unrelated apps are installed; only
+    // its identity/mode participates. The exact app/plist/executable and nested
+    // directory identities do participate, so same-byte replacements invalidate.
+    let context = format!(
+        "{:?}:{:?}:{:?}:{:?}",
+        directory_identity(&root_before),
+        directory_identity(&contents_before),
+        directory_identity(&macos_before),
+        stat_key(&before)
+    );
+    let public_fingerprint = digest(&[
+        b"chinwag-application-public-metadata/v2",
+        context.as_bytes(),
+        &bytes,
+    ]);
+    Ok(Some(finish_installation(
+        row,
+        public_fingerprint.as_bytes(),
+        &location,
+    )))
 }
 
 fn cli(path: &Path, name: &str, scope: &Scope) -> Result<Installation, ReadFailure> {

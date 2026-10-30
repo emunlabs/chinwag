@@ -8,12 +8,59 @@ use std::{
     sync::Arc,
 };
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run(std::env::args().skip(1).collect()).await {
+fn main() {
+    if let Err(error) = dispatch(std::env::args().skip(1).collect()) {
         eprintln!("chinwag-alpha-runtime: {error}");
         std::process::exit(1);
     }
+}
+
+fn dispatch(mut args: Vec<String>) -> Result<()> {
+    if take_native_main_loop(&mut args)? {
+        #[cfg(target_os = "macos")]
+        {
+            return chinwag_native_launch::main_loop::run_main_loop_host(move || run_async(args))
+                .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(RuntimeError::Unavailable(
+            "native main-loop hosting requires macOS".into(),
+        ));
+    }
+    run_async(args)
+}
+
+fn run_async(args: Vec<String>) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+/// Native main-loop ownership is opt-in and changes no launch permissions.
+/// Validate before initializing any runtime mode, storage or signer adapter.
+fn take_native_main_loop(args: &mut Vec<String>) -> Result<bool> {
+    let flags: Vec<_> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.as_str() == "--native-main-loop")
+        .map(|(index, _)| index)
+        .collect();
+    let Some(&index) = flags.first() else {
+        return Ok(false);
+    };
+    if flags.len() != 1
+        || !matches!(
+            args.first().map(String::as_str),
+            Some("serve-local" | "serve-shared")
+        )
+    {
+        return Err(RuntimeError::Invalid(
+            "--native-main-loop is accepted once with serve-local or serve-shared".into(),
+        ));
+    }
+    args.remove(index);
+    Ok(true)
 }
 
 async fn run(args: Vec<String>) -> Result<()> {
@@ -148,6 +195,43 @@ fn verify_signer_ledger(ledger: &std::path::Path, repo: &std::path::Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_main_loop_flag_is_explicit_and_preserves_server_arguments() {
+        let mut default = vec![
+            "serve-shared".into(),
+            "--ledger".into(),
+            "/fixture/ledger".into(),
+        ];
+        let original = default.clone();
+        assert!(!take_native_main_loop(&mut default).unwrap());
+        assert_eq!(default, original);
+        for command in ["serve-local", "serve-shared"] {
+            let mut args = vec![
+                command.into(),
+                "--native-main-loop".into(),
+                "--port".into(),
+                "44343".into(),
+            ];
+            assert!(take_native_main_loop(&mut args).unwrap());
+            assert_eq!(args, [command, "--port", "44343"]);
+        }
+    }
+
+    #[test]
+    fn invalid_native_host_flags_reject_without_touching_existing_dispatch() {
+        for input in [
+            vec!["launch", "--native-main-loop"],
+            vec!["discover-clients", "--native-main-loop"],
+            vec!["--native-main-loop"],
+            vec!["serve-shared", "--native-main-loop", "--native-main-loop"],
+        ] {
+            let mut args: Vec<String> = input.iter().map(|value| (*value).into()).collect();
+            let original = args.clone();
+            assert!(take_native_main_loop(&mut args).is_err());
+            assert_eq!(args, original);
+        }
+    }
     #[tokio::test]
     async fn launcher_under_async_dispatch_returns_a_normal_missing_binary_error() {
         let root = tempfile::tempdir().unwrap();
