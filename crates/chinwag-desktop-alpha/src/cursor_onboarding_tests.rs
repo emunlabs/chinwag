@@ -190,8 +190,9 @@ fn cursor_copy_choice_and_primary_action_use_existing_durable_preflight(cx: &mut
         window.draw(cx).clear(cx);
         assert_eq!(
             window.find("cursor-onboarding-setup").label(),
-            Some("Set up Cursor again")
+            Some("Setup request sent")
         );
+        window.click("cursor-onboarding-setup", cx);
         view.update(cx, |view, _| {
             let attempts = &view.openings.as_ref().unwrap().attempts;
             assert_eq!(attempts.len(), 1);
@@ -199,6 +200,256 @@ fn cursor_copy_choice_and_primary_action_use_existing_durable_preflight(cx: &mut
             assert!(attempts[0].summary().contains("connection unconfirmed"));
             assert!(matches!(view.connection, Connection::Disconnected));
             assert!(view.send_task.is_none());
+            assert!(view.selection_task.is_none());
+            assert!(view.opening_tasks.is_empty());
+        });
+    })
+    .unwrap();
+}
+
+fn save_setup_acknowledgement(
+    store: &mut OpeningStore,
+    endpoint: &str,
+    installation_id: &str,
+) -> OpeningAttempt {
+    let attempt = store
+        .prepare(OpeningAction::CursorMcpSetup, endpoint, installation_id)
+        .unwrap();
+    store
+        .apply_receipt(
+            &attempt.id,
+            NativeOpenReceipt {
+                schema: "chinwag-native-open/v1".into(),
+                request_id: attempt.id.clone(),
+                installation_id: installation_id.into(),
+                state: chinwag_bus_client::NativeOpenState::OpenedOrReused,
+                message: "Synthetic OS handoff acknowledgement".into(),
+            },
+        )
+        .unwrap();
+    store.attempts.last().unwrap().clone()
+}
+
+#[gpui_kit::test]
+fn acknowledged_setup_beyond_recent_history_cap_cannot_repeat_from_primary(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let drafts = directory.drafts();
+    let (endpoint, worker) = fixture(2, |request, index| {
+        assert!(request.starts_with("GET "));
+        if index == 0 {
+            (200, cursor_copies_inventory(false))
+        } else {
+            (200, status(true))
+        }
+    });
+    let original = {
+        let mut store = OpeningStore::open(openings::path_for_drafts(&drafts).unwrap()).unwrap();
+        let original = save_setup_acknowledgement(&mut store, &endpoint, &"a".repeat(64));
+        for _ in 0..5 {
+            save_setup_acknowledgement(&mut store, &endpoint, &"b".repeat(64));
+        }
+        original
+    };
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_mode_settings(
+                    window,
+                    cx,
+                    endpoint.clone(),
+                    Some(drafts.clone()),
+                    AppMode::CursorOnboarding,
+                    None,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap().len(), 2);
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            window.find("cursor-onboarding-setup").label(),
+            Some("Setup request sent")
+        );
+        assert_eq!(
+            window.find("cursor-onboarding-setup").disabled(),
+            Some(true)
+        );
+        assert!(window.try_find("cursor-send-another-setup").is_none());
+        window.click("cursor-onboarding-setup", cx);
+        view.update(cx, |view, cx| {
+            // The handler also protects against an older enabled frame.
+            view.start_cursor_setup(cx);
+            assert_eq!(view.openings.as_ref().unwrap().attempts.len(), 6);
+            assert_eq!(view.openings.as_ref().unwrap().attempts[0], original);
+            assert!(view.selection_task.is_none());
+            assert!(view.opening_tasks.is_empty());
+        });
+        window.click("cursor-setup-options", cx);
+        assert_eq!(
+            window.find("cursor-send-another-setup").label(),
+            Some("Send another setup request")
+        );
+        view.update(cx, |view, _| {
+            assert!(
+                view.selection_task.is_none(),
+                "showing options submits nothing"
+            );
+            assert!(view.opening_tasks.is_empty());
+            assert_eq!(view.openings.as_ref().unwrap().attempts.len(), 6);
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn resend_requires_explicit_options_then_one_new_durable_preflight(cx: &mut TestAppContext) {
+    let directory = Directory::new();
+    let drafts = directory.drafts();
+    let history = openings::path_for_drafts(&drafts).unwrap();
+    let (endpoint, worker) = fixture(5, move |request, index| match index {
+        0 | 2 => {
+            assert!(request.starts_with("GET /api/bus/clients "));
+            let saved: Value = serde_json::from_slice(&std::fs::read(&history).unwrap()).unwrap();
+            assert_eq!(
+                saved["attempts"].as_array().unwrap().len(),
+                1,
+                "preflight preserves the original acknowledgement"
+            );
+            (200, cursor_copies_inventory(false))
+        }
+        1 | 3 => {
+            assert!(request.starts_with("GET /api/onboarding/cursor-mcp/status "));
+            (200, status(true))
+        }
+        _ => {
+            assert!(request.starts_with("POST /api/onboarding/cursor-mcp/setup "));
+            let saved: Value = serde_json::from_slice(&std::fs::read(&history).unwrap()).unwrap();
+            assert_eq!(saved["attempts"].as_array().unwrap().len(), 2);
+            assert_eq!(saved["attempts"][0]["state"], "receipt");
+            assert_eq!(saved["attempts"][1]["state"], "pending");
+            assert_eq!(
+                saved["attempts"][1]["id"],
+                header(request, "X-Chinwag-Request-Id")
+            );
+            (200, reply(request, "a".repeat(64), "opened_or_reused"))
+        }
+    });
+    let original = {
+        let mut store = OpeningStore::open(openings::path_for_drafts(&drafts).unwrap()).unwrap();
+        save_setup_acknowledgement(&mut store, &endpoint, &"a".repeat(64))
+    };
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_mode_settings(
+                    window,
+                    cx,
+                    endpoint.clone(),
+                    Some(drafts.clone()),
+                    AppMode::CursorOnboarding,
+                    None,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.click("cursor-onboarding-setup", cx);
+        assert!(window.try_find("cursor-send-another-setup").is_none());
+        window.click("cursor-setup-options", cx);
+        view.update(cx, |view, _| {
+            assert!(view.selection_task.is_none());
+            assert_eq!(view.openings.as_ref().unwrap().attempts.len(), 1);
+        });
+        window.click("cursor-send-another-setup", cx);
+        view.update(cx, |view, _| {
+            assert!(
+                view.cursor_setup_options.is_none(),
+                "resend consumes its explicit UI intent"
+            );
+            assert!(view.selection_task.is_some());
+            assert_eq!(view.openings.as_ref().unwrap().attempts.len(), 1);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let requests = worker.join().unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("POST "))
+            .count(),
+        1
+    );
+    cx.update(|cx| {
+        let attempts = &view.read(cx).openings.as_ref().unwrap().attempts;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0], original);
+        assert_ne!(attempts[0].id, attempts[1].id);
+    });
+}
+
+#[gpui_kit::test]
+fn acknowledgement_for_same_copy_on_another_endpoint_does_not_claim_current_setup(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let drafts = directory.drafts();
+    let old_endpoint = "http://127.0.0.1:1";
+    {
+        let mut store = OpeningStore::open(openings::path_for_drafts(&drafts).unwrap()).unwrap();
+        save_setup_acknowledgement(&mut store, old_endpoint, &"a".repeat(64));
+    }
+    let (endpoint, worker) = fixture(2, |request, index| {
+        assert!(request.starts_with("GET "));
+        if index == 0 {
+            (200, cursor_copies_inventory(false))
+        } else {
+            (200, status(true))
+        }
+    });
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_mode_settings(
+                    window,
+                    cx,
+                    endpoint.clone(),
+                    Some(drafts.clone()),
+                    AppMode::CursorOnboarding,
+                    None,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap().len(), 2);
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            window.find("cursor-onboarding-setup").label(),
+            Some("Set up Cursor")
+        );
+        assert!(window.try_find("cursor-setup-options").is_none());
+        view.update(cx, |view, _| {
+            assert!(!view.cursor_setup_was_sent(&endpoint, &"a".repeat(64)));
+            assert!(view.cursor_setup_was_sent(old_endpoint, &"a".repeat(64)));
+            assert_eq!(view.openings.as_ref().unwrap().attempts.len(), 1);
+            assert!(view.selection_task.is_none());
         });
     })
     .unwrap();

@@ -9,8 +9,13 @@ The dedicated entry opens **Connect Cursor to Chinwag**. It gives the person a f
 3. The setup window collects one bounded target-host inventory. It shows Cursor copies with their public location and version hints.
 4. Choose **Set up Cursor** for the intended copy.
 5. Review and approve Cursor's own installation dialog on the Mac Studio.
+6. After macOS acknowledges the handoff, the window shows **Setup request sent**. Check **Customize → MCPs** in Cursor on Studio for the Chinwag inbox. For diagnostics, open **Output** (`Cmd+Shift+U`) and select **MCP Logs**.
 
 The window performs no automatic installation request. It reuses the existing exact-copy refresh, durable action, single-flight and GET-only recovery contracts. An OS handoff acknowledgment remains separate from Cursor approval, MCP initialization and an actual inbox read.
+
+**Setup request sent** comes from the full bounded opening history for the exact configured endpoint and selected installation, even when that receipt is older than the recent-history display. It disables the main setup action. This window cannot verify installation approval or MCP protocol activity; it does not wait for an approval callback or provide a connection check. The existing **Check setup status** action resolves only an uncertain OS handoff receipt.
+
+If the person deliberately needs to repeat the handoff, **Show setup options** reveals **Send another setup request** with an explanation. Both steps are explicit. The second step consumes its endpoint/copy-specific UI intent and uses the existing exact-copy preflight and a new durable request. Changing the endpoint or copy, refreshing inventory, or receiving a setup result closes those options. Existing receipts remain unchanged; no request is automatically repeated.
 
 ## Launcher contract
 

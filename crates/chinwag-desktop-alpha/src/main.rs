@@ -99,6 +99,11 @@ struct OpeningSelection {
     action: OpeningAction,
 }
 
+struct CursorSetupOptions {
+    endpoint: String,
+    installation_id: String,
+}
+
 struct AppInventoryRead {
     inventory: Result<ClientInventory, String>,
     opening_status: Option<Result<OnboardingStatus, String>>,
@@ -156,6 +161,7 @@ struct Workbench {
     mode: AppMode,
     configured_target_host: Option<String>,
     selected_cursor_copy: Option<String>,
+    cursor_setup_options: Option<CursorSetupOptions>,
     conversation: Conversation,
     endpoint: Entity<InputState>,
     composer: Entity<TextareaState>,
@@ -273,6 +279,7 @@ impl Workbench {
                 this.inventory_task = None;
                 this.client_inventory.clear();
                 this.selected_cursor_copy = None;
+                this.cursor_setup_options = None;
                 this.opening_epoch = this.opening_epoch.wrapping_add(1);
                 this.opening_generations.clear();
                 this.connection = Connection::Disconnected;
@@ -305,6 +312,7 @@ impl Workbench {
             mode,
             configured_target_host,
             selected_cursor_copy: None,
+            cursor_setup_options: None,
             conversation: Conversation::new("#alpha"),
             endpoint,
             composer,
@@ -519,6 +527,9 @@ impl Workbench {
         connection_generation: u64,
         cx: &mut Context<Self>,
     ) {
+        if self.mode == AppMode::CursorOnboarding {
+            self.cursor_setup_options = None;
+        }
         let generation = self.client_inventory.begin(endpoint.into());
         let expected_endpoint = endpoint.to_owned();
         let requested_endpoint = expected_endpoint.clone();
@@ -838,6 +849,9 @@ impl Workbench {
             Err(error) => store.mark_uncertain(&flight.id, &error),
         };
         self.opening_warning = update.err().map(|error| format!("Opening status was not accepted or saved: {error}. Original attempt retained; check its status."));
+        if flight.action == OpeningAction::CursorMcpSetup {
+            self.cursor_setup_options = None;
+        }
         true
     }
 
@@ -1190,6 +1204,64 @@ impl Workbench {
             return;
         }
         self.selected_cursor_copy = (copies.len() == 1).then(|| copies[0].0.clone());
+        self.cursor_setup_options = None;
+    }
+
+    fn cursor_setup_was_sent(&self, endpoint: &str, installation_id: &str) -> bool {
+        self.openings.as_ref().is_some_and(|store| {
+            store.attempts.iter().any(|attempt| {
+                attempt.action == OpeningAction::CursorMcpSetup
+                    && attempt.endpoint == endpoint
+                    && attempt.installation_id == installation_id
+                    && matches!(&attempt.state, openings::OpeningState::Receipt(receipt)
+                        if receipt.state == chinwag_bus_client::NativeOpenState::OpenedOrReused)
+            })
+        })
+    }
+
+    fn start_cursor_setup(&mut self, cx: &mut Context<Self>) {
+        let endpoint = self.endpoint.read(cx).value().to_string();
+        let Some(id) = self.selected_cursor_copy.clone() else {
+            return;
+        };
+        if self.cursor_setup_was_sent(&endpoint, &id) {
+            return;
+        }
+        self.act_on_installation(OpeningAction::CursorMcpSetup, &id, cx);
+    }
+
+    fn show_cursor_setup_options(&mut self, cx: &mut Context<Self>) {
+        let endpoint = self.endpoint.read(cx).value().to_string();
+        let Some(id) = self.selected_cursor_copy.clone() else {
+            return;
+        };
+        if self.cursor_setup_was_sent(&endpoint, &id)
+            && self.can_act_on_installation(OpeningAction::CursorMcpSetup, &id, cx)
+        {
+            self.cursor_setup_options = Some(CursorSetupOptions {
+                endpoint,
+                installation_id: id,
+            });
+            cx.notify();
+        }
+    }
+
+    fn send_another_cursor_setup(&mut self, cx: &mut Context<Self>) {
+        let Some(scope) = self.cursor_setup_options.take() else {
+            return;
+        };
+        if self.endpoint.read(cx).value().as_ref() == scope.endpoint
+            && self.selected_cursor_copy.as_deref() == Some(scope.installation_id.as_str())
+            && self.cursor_setup_was_sent(&scope.endpoint, &scope.installation_id)
+            && self.can_act_on_installation(
+                OpeningAction::CursorMcpSetup,
+                &scope.installation_id,
+                cx,
+            )
+        {
+            self.act_on_installation(OpeningAction::CursorMcpSetup, &scope.installation_id, cx);
+        }
+        cx.notify();
     }
 
     fn cursor_target_host(&self) -> String {
@@ -1246,6 +1318,7 @@ impl Workbench {
                             .disabled(loading || busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected_cursor_copy = Some(id.clone());
+                                this.cursor_setup_options = None;
                                 cx.notify();
                             })),
                     )
@@ -1284,13 +1357,12 @@ impl Workbench {
             }
         }
         attempts.sort_by_key(|attempt| !attempt.unresolved());
-        let request_sent = selected.as_ref().is_some_and(|selected| {
-            attempts.iter().any(|attempt| {
-                attempt.endpoint == endpoint
-                    && attempt.installation_id == *selected
-                    && matches!(&attempt.state, openings::OpeningState::Receipt(receipt)
-                    if receipt.state == chinwag_bus_client::NativeOpenState::OpenedOrReused)
-            })
+        let request_sent = selected
+            .as_ref()
+            .is_some_and(|id| self.cursor_setup_was_sent(&endpoint, id));
+        let show_setup_options = self.cursor_setup_options.as_ref().is_some_and(|scope| {
+            scope.endpoint == endpoint
+                && selected.as_deref() == Some(scope.installation_id.as_str())
         });
         let history_rows = attempts
             .iter()
@@ -1347,7 +1419,14 @@ impl Workbench {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(attempt.summary()),
+                            .child(if attempt.action == OpeningAction::CursorMcpSetup
+                                && matches!(&attempt.state, openings::OpeningState::Receipt(receipt)
+                                    if receipt.state == chinwag_bus_client::NativeOpenState::OpenedOrReused)
+                            {
+                                "Setup request sent · Cursor approval and MCP connection are not verified here".into()
+                            } else {
+                                attempt.summary()
+                            }),
                     )
             })
             .collect::<Vec<_>>();
@@ -1369,6 +1448,8 @@ impl Workbench {
                 .is_some_and(|store| store.blocks(&endpoint, id))
         }) {
             "A saved request for this copy needs a status check. Use its status button below before starting another setup.".into()
+        } else if request_sent {
+            "macOS acknowledged the setup handoff. This window cannot verify Cursor approval or an MCP connection.".into()
         } else if ready && selected.is_some() && !enabled && !busy && self.openings.is_some() {
             "This host has not made the selected Cursor copy available for setup. Check the host setup notice below, then find again.".into()
         } else if ready {
@@ -1410,16 +1491,27 @@ impl Workbench {
                     .child(Button::new("cursor-onboarding-setup").primary().w_full().h(px(44.))
                         .label(if self.selection_task.is_some() { "Checking selected Cursor…" }
                             else if !self.opening_tasks.is_empty() { "Checking setup…" }
-                            else if request_sent { "Set up Cursor again" }
+                            else if request_sent { "Setup request sent" }
                             else { "Set up Cursor" })
-                        .disabled(!enabled || loading)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(id) = &selected {
-                                this.act_on_installation(OpeningAction::CursorMcpSetup, id, cx);
-                            }
-                        })))
+                        .disabled(request_sent || !enabled || loading)
+                        .on_click(cx.listener(|this, _, _, cx| this.start_cursor_setup(cx))))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child(format!("This adds the existing Chinwag inbox to Cursor on {host}. Approve it there when Cursor asks. An acknowledgement here does not confirm a connection.")))
+                        .child(if request_sent {
+                            format!("In Cursor on {host}, check Customize → MCPs for the Chinwag inbox. For diagnostics, open Output (Cmd+Shift+U) and select MCP Logs.")
+                        } else {
+                            format!("This adds the existing Chinwag inbox to Cursor on {host}. Approve it there when Cursor asks. An acknowledgement here does not confirm a connection.")
+                        }))
+                    .when(request_sent, |this| this.child(
+                        Button::new("cursor-setup-options").small().label("Show setup options")
+                            .disabled(!enabled || loading)
+                            .on_click(cx.listener(|this, _, _, cx| this.show_cursor_setup_options(cx)))))
+                    .when(request_sent && show_setup_options, |this| this.child(
+                        div().flex().flex_col().gap_2()
+                            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                                .child("Sending another request opens Cursor’s setup approval again. It does not check whether the earlier installation succeeded."))
+                            .child(Button::new("cursor-send-another-setup").small().label("Send another setup request")
+                                .disabled(!enabled || loading)
+                                .on_click(cx.listener(|this, _, _, cx| this.send_another_cursor_setup(cx))))))
                     .when_some(setup_notice, |this, notice| this.child(
                         div().id("cursor-setup-notice").text_sm().text_color(cx.theme().danger).child(notice)))
                     .when_some(self.opening_warning.clone(), |this, warning| this.child(
