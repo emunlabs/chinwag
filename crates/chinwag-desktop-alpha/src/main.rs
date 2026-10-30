@@ -104,6 +104,13 @@ struct CursorSetupOptions {
     installation_id: String,
 }
 
+#[derive(Clone)]
+struct CursorConfirmationScope {
+    endpoint: String,
+    installation_id: String,
+    request_id: String,
+}
+
 struct AppInventoryRead {
     inventory: Result<ClientInventory, String>,
     opening_status: Option<Result<OnboardingStatus, String>>,
@@ -1208,15 +1215,72 @@ impl Workbench {
     }
 
     fn cursor_setup_was_sent(&self, endpoint: &str, installation_id: &str) -> bool {
-        self.openings.as_ref().is_some_and(|store| {
-            store.attempts.iter().any(|attempt| {
-                attempt.action == OpeningAction::CursorMcpSetup
-                    && attempt.endpoint == endpoint
-                    && attempt.installation_id == installation_id
-                    && matches!(&attempt.state, openings::OpeningState::Receipt(receipt)
-                        if receipt.state == chinwag_bus_client::NativeOpenState::OpenedOrReused)
-            })
+        self.openings
+            .as_ref()
+            .and_then(|store| store.latest_acknowledged_cursor_setup(endpoint, installation_id))
+            .is_some()
+    }
+
+    fn cursor_confirmation_scope(
+        &self,
+        endpoint: &str,
+        installation_id: &str,
+    ) -> Option<CursorConfirmationScope> {
+        let attempt = self
+            .openings
+            .as_ref()?
+            .latest_acknowledged_cursor_setup(endpoint, installation_id)?;
+        Some(CursorConfirmationScope {
+            endpoint: endpoint.into(),
+            installation_id: installation_id.into(),
+            request_id: attempt.id.clone(),
         })
+    }
+
+    fn cursor_human_confirmation(&self, endpoint: &str, installation_id: &str) -> Option<u64> {
+        self.openings
+            .as_ref()?
+            .latest_acknowledged_cursor_setup(endpoint, installation_id)?
+            .human_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.confirmed_at_unix_ms)
+    }
+
+    fn confirm_cursor_tools(&mut self, scope: &CursorConfirmationScope, cx: &mut Context<Self>) {
+        if self.mode != AppMode::CursorOnboarding
+            || self.endpoint.read(cx).value().as_ref() != scope.endpoint
+            || self.selected_cursor_copy.as_deref() != Some(scope.installation_id.as_str())
+            || self.client_inventory.endpoint.as_deref() != Some(scope.endpoint.as_str())
+            || !self
+                .client_inventory
+                .installed_copy(&scope.installation_id)
+                .is_some_and(|app| app.family == "cursor")
+            || self.selection_task.is_some()
+            || !self.opening_tasks.is_empty()
+        {
+            return;
+        }
+        let Some(store) = &mut self.openings else {
+            return;
+        };
+        if store.blocks(&scope.endpoint, &scope.installation_id)
+            || store
+                .latest_acknowledged_cursor_setup(&scope.endpoint, &scope.installation_id)
+                .is_none_or(|attempt| attempt.id != scope.request_id)
+        {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+        self.opening_warning = match now {
+            Some(now) => store.confirm_cursor_tools_listed(&scope.endpoint, &scope.installation_id, now)
+                .err().map(|error| format!("Your confirmation could not be saved: {error}. The original setup receipt is retained.")),
+            None => Some("Your confirmation could not be saved because the date is unavailable. The original setup receipt is retained.".into()),
+        };
+        self.cursor_setup_options = None;
+        cx.notify();
     }
 
     fn start_cursor_setup(&mut self, cx: &mut Context<Self>) {
@@ -1360,6 +1424,20 @@ impl Workbench {
         let request_sent = selected
             .as_ref()
             .is_some_and(|id| self.cursor_setup_was_sent(&endpoint, id));
+        let confirmation_scope = selected
+            .as_ref()
+            .and_then(|id| self.cursor_confirmation_scope(&endpoint, id));
+        let human_confirmation = selected
+            .as_ref()
+            .and_then(|id| self.cursor_human_confirmation(&endpoint, id));
+        let can_confirm = confirmation_scope.is_some()
+            && !loading
+            && !busy
+            && selected.as_ref().is_some_and(|id| {
+                self.openings
+                    .as_ref()
+                    .is_some_and(|store| !store.blocks(&endpoint, id))
+            });
         let show_setup_options = self.cursor_setup_options.as_ref().is_some_and(|scope| {
             scope.endpoint == endpoint
                 && selected.as_deref() == Some(scope.installation_id.as_str())
@@ -1419,7 +1497,10 @@ impl Workbench {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if attempt.action == OpeningAction::CursorMcpSetup
+                            .child(if let Some(confirmation) = &attempt.human_confirmation {
+                                format!("Enabled with tools in Cursor — confirmed by you · {} · historical report",
+                                    confirmation_time(confirmation.confirmed_at_unix_ms))
+                            } else if attempt.action == OpeningAction::CursorMcpSetup
                                 && matches!(&attempt.state, openings::OpeningState::Receipt(receipt)
                                     if receipt.state == chinwag_bus_client::NativeOpenState::OpenedOrReused)
                             {
@@ -1448,6 +1529,8 @@ impl Workbench {
                 .is_some_and(|store| store.blocks(&endpoint, id))
         }) {
             "A saved request for this copy needs a status check. Use its status button below before starting another setup.".into()
+        } else if human_confirmation.is_some() {
+            "Your dated report is saved for this Cursor copy. It does not establish a live connection or an inbox read.".into()
         } else if request_sent {
             "macOS acknowledged the setup handoff. This window cannot verify Cursor approval or an MCP connection.".into()
         } else if ready && selected.is_some() && !enabled && !busy && self.openings.is_some() {
@@ -1473,7 +1556,9 @@ impl Workbench {
                 .child(div().id("cursor-target-host").flex().flex_col().gap_1()
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("Target host: {host}")))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child(if ready { format!("Approve access in Cursor on {host}.") }
+                        .child(if human_confirmation.is_some() {
+                            "Your confirmation is saved as a historical report.".into()
+                        } else if ready { format!("Approve access in Cursor on {host}.") }
                             else { "Checking the configured target before setup is available.".into() })))
                 .child(div().flex().flex_col().gap_3()
                     .child(div().flex().items_center().gap_3()
@@ -1496,11 +1581,23 @@ impl Workbench {
                         .disabled(request_sent || !enabled || loading)
                         .on_click(cx.listener(|this, _, _, cx| this.start_cursor_setup(cx))))
                     .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child(if request_sent {
+                        .child(if human_confirmation.is_some() {
+                            "No live connection, account, lease or model activity is inferred from your report.".into()
+                        } else if request_sent {
                             format!("In Cursor on {host}, check Customize → MCPs for the Chinwag inbox. For diagnostics, open Output (Cmd+Shift+U) and select MCP Logs.")
                         } else {
                             format!("This adds the existing Chinwag inbox to Cursor on {host}. Approve it there when Cursor asks. An acknowledgement here does not confirm a connection.")
                         }))
+                    .when_some(human_confirmation, |this, at_ms| this.child(
+                        div().id("cursor-human-confirmation").flex().flex_col().gap_1()
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD)
+                                .child("Enabled with tools in Cursor — confirmed by you"))
+                            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                                .child(format!("Reported {} · historical confirmation", confirmation_time(at_ms))))))
+                    .when(human_confirmation.is_none(), |this| this.when_some(confirmation_scope, |this, scope| this.child(
+                        Button::new("cursor-confirm-tools").w_full().label("Cursor shows enabled and tools")
+                            .disabled(!can_confirm)
+                            .on_click(cx.listener(move |this, _, _, cx| this.confirm_cursor_tools(&scope, cx))))))
                     .when(request_sent, |this| this.child(
                         Button::new("cursor-setup-options").small().label("Show setup options")
                             .disabled(!enabled || loading)
@@ -2224,6 +2321,18 @@ fn initials(sender: &str) -> String {
 
 fn short_time(timestamp: &str) -> String {
     timestamp.get(11..19).unwrap_or(timestamp).to_owned()
+}
+
+fn confirmation_time(milliseconds: u64) -> String {
+    i64::try_from(milliseconds)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|date| {
+            date.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "date unavailable".into())
 }
 
 fn main() {

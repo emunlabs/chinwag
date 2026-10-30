@@ -10,10 +10,13 @@ The dedicated entry opens **Connect Cursor to Chinwag**. It gives the person a f
 4. Choose **Set up Cursor** for the intended copy.
 5. Review and approve Cursor's own installation dialog on the Mac Studio.
 6. After macOS acknowledges the handoff, the window shows **Setup request sent**. Check **Customize → MCPs** in Cursor on Studio for the Chinwag inbox. For diagnostics, open **Output** (`Cmd+Shift+U`) and select **MCP Logs**.
+7. If that exact Cursor entry shows enabled/ready with tools listed, choose **Cursor shows enabled and tools** in Chinwag. The window saves a dated **Enabled with tools in Cursor — confirmed by you** report.
 
 The window performs no automatic installation request. It reuses the existing exact-copy refresh, durable action, single-flight and GET-only recovery contracts. An OS handoff acknowledgment remains separate from Cursor approval, MCP initialization and an actual inbox read.
 
 **Setup request sent** comes from the full bounded opening history for the exact configured endpoint and selected installation, even when that receipt is older than the recent-history display. It disables the main setup action. This window cannot verify installation approval or MCP protocol activity; it does not wait for an approval callback or provide a connection check. The existing **Check setup status** action resolves only an uncertain OS handoff receipt.
+
+The enabled/tools confirmation is an explicit historical human report on the latest acknowledged setup for that exact endpoint and installation. It is saved alongside the unchanged OS receipt and survives reopening the window. Its date uses the client machine's local timezone; the stored timestamp is Unix milliseconds. Repeating the same confirmation preserves its original date. It does not assert a live connection, successful inbox read, active lease, account identity or model activity. Process presence and OS acknowledgement never create this report. A failed save does not publish a confirmation in the current window, and the original OS receipt remains unchanged. If failure occurs after file replacement, recovery may find the report already saved. Changing the selected copy or endpoint cannot attach a stale confirmation to the new target; an unresolved opening or setup must be checked first.
 
 If the person deliberately needs to repeat the handoff, **Show setup options** reveals **Send another setup request** with an explanation. Both steps are explicit. The second step consumes its endpoint/copy-specific UI intent and uses the existing exact-copy preflight and a new durable request. Changing the endpoint or copy, refreshing inventory, or receiving a setup result closes those options. Existing receipts remain unchanged; no request is automatically repeated.
 

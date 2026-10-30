@@ -410,6 +410,9 @@ fn acknowledgement_for_same_copy_on_another_endpoint_does_not_claim_current_setu
     {
         let mut store = OpeningStore::open(openings::path_for_drafts(&drafts).unwrap()).unwrap();
         save_setup_acknowledgement(&mut store, old_endpoint, &"a".repeat(64));
+        store
+            .confirm_cursor_tools_listed(old_endpoint, &"a".repeat(64), 1)
+            .unwrap();
     }
     let (endpoint, worker) = fixture(2, |request, index| {
         assert!(request.starts_with("GET "));
@@ -445,9 +448,18 @@ fn acknowledgement_for_same_copy_on_another_endpoint_does_not_claim_current_setu
             Some("Set up Cursor")
         );
         assert!(window.try_find("cursor-setup-options").is_none());
+        assert!(window.try_find("cursor-confirm-tools").is_none());
         view.update(cx, |view, _| {
             assert!(!view.cursor_setup_was_sent(&endpoint, &"a".repeat(64)));
             assert!(view.cursor_setup_was_sent(old_endpoint, &"a".repeat(64)));
+            assert!(
+                view.cursor_human_confirmation(&endpoint, &"a".repeat(64))
+                    .is_none()
+            );
+            assert_eq!(
+                view.cursor_human_confirmation(old_endpoint, &"a".repeat(64)),
+                Some(1)
+            );
             assert_eq!(view.openings.as_ref().unwrap().attempts.len(), 1);
             assert!(view.selection_task.is_none());
         });
@@ -634,4 +646,349 @@ fn older_cross_action_pending_cursor_request_remains_recoverable(cx: &mut TestAp
     cx.update(|cx| {
         assert!(!view.read(cx).openings.as_ref().unwrap().attempts[0].unresolved());
     });
+}
+
+#[gpui_kit::test]
+fn explicit_tools_confirmation_is_durable_dated_and_does_not_repeat_on_reopen(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let drafts = directory.drafts();
+    let history = openings::path_for_drafts(&drafts).unwrap();
+    let (endpoint, worker) = fixture(4, |request, index| {
+        assert!(
+            request.starts_with("GET "),
+            "confirmation cannot submit setup"
+        );
+        if index % 2 == 0 {
+            assert!(request.starts_with("GET /api/bus/clients "));
+            (200, cursor_copies_inventory(false))
+        } else {
+            assert!(request.starts_with("GET /api/onboarding/cursor-mcp/status "));
+            (200, status(true))
+        }
+    });
+    let original = {
+        let mut store = OpeningStore::open(history.clone()).unwrap();
+        let original = save_setup_acknowledgement(&mut store, &endpoint, &"a".repeat(64));
+        // The acknowledgement must remain confirmable beyond the display cap.
+        for _ in 0..5 {
+            save_setup_acknowledgement(&mut store, &endpoint, &"b".repeat(64));
+        }
+        original
+    };
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_mode_settings(
+                    window,
+                    cx,
+                    endpoint.clone(),
+                    Some(drafts.clone()),
+                    AppMode::CursorOnboarding,
+                    None,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    let scope = cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(
+            view.cursor_human_confirmation(&endpoint, &"a".repeat(64))
+                .is_none()
+        );
+        view.cursor_confirmation_scope(&endpoint, &"a".repeat(64))
+            .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            window.find("cursor-confirm-tools").label(),
+            Some("Cursor shows enabled and tools")
+        );
+        window.click("cursor-confirm-tools", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let saved = std::fs::read(&history).unwrap();
+    let value: Value = serde_json::from_slice(&saved).unwrap();
+    let at_ms = value["attempts"][0]["human_confirmation"]["confirmed_at_unix_ms"]
+        .as_u64()
+        .unwrap();
+    assert!(at_ms > 0);
+    assert_eq!(
+        value["attempts"][0]["human_confirmation"]["evidence"],
+        "human_reported_enabled_with_tools"
+    );
+    assert!(!confirmation_time(at_ms).contains("date unavailable"));
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(window.try_find("cursor-confirm-tools").is_none());
+        assert_eq!(
+            window.find("cursor-onboarding-setup").disabled(),
+            Some(true)
+        );
+        window.click("cursor-onboarding-setup", cx);
+        view.update(cx, |view, cx| {
+            // A stale copy of the original confirmation handler is idempotent.
+            view.confirm_cursor_tools(&scope, cx);
+            let store = view.openings.as_ref().unwrap();
+            assert_eq!(store.attempts.len(), 6);
+            assert_eq!(store.attempts[0].state, original.state);
+            assert_eq!(
+                view.cursor_human_confirmation(&endpoint, &"a".repeat(64)),
+                Some(at_ms)
+            );
+            assert!(view.selection_task.is_none());
+            assert!(view.opening_tasks.is_empty());
+            assert!(matches!(view.connection, Connection::Disconnected));
+        });
+        window.remove_window();
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&history).unwrap(),
+        saved,
+        "repeat must not renew the date or rewrite history"
+    );
+    let released_view = view.downgrade();
+    drop(view);
+    cx.run_until_parked();
+    // Dropping the last Entity outside an App update only queues destruction.
+    // Flush that queue before a replacement view tries to acquire its lock.
+    cx.update(|_| {});
+    assert!(released_view.upgrade().is_none());
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_mode_settings(
+                    window,
+                    cx,
+                    endpoint.clone(),
+                    Some(drafts.clone()),
+                    AppMode::CursorOnboarding,
+                    None,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| request.starts_with("GET ")));
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            assert!(
+                view.opening_warning.is_none(),
+                "reopened history must acquire its lock and decode: {:?}",
+                view.opening_warning
+            );
+            assert_eq!(view.openings.as_ref().unwrap().attempts.len(), 6);
+            assert_eq!(
+                view.cursor_human_confirmation(&endpoint, &"a".repeat(64)),
+                Some(at_ms),
+                "the replacement view must load the persisted report"
+            );
+        });
+        window.draw(cx).clear(cx);
+        assert!(window.try_find("cursor-confirm-tools").is_none());
+        assert_eq!(
+            window.find("cursor-onboarding-setup").label(),
+            Some("Setup request sent")
+        );
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.cursor_human_confirmation(&endpoint, &"a".repeat(64)),
+                Some(at_ms)
+            );
+            assert_eq!(
+                view.openings.as_ref().unwrap().attempts[0].state,
+                original.state
+            );
+            assert!(matches!(view.connection, Connection::Disconnected));
+            assert!(view.send_task.is_none());
+            assert!(view._refresh_task.is_none());
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn failed_confirmation_save_keeps_the_original_receipt_and_surfaces_recovery(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let drafts = directory.drafts();
+    let history = openings::path_for_drafts(&drafts).unwrap();
+    let (endpoint, worker) = fixture(2, |request, index| {
+        assert!(request.starts_with("GET "));
+        if index == 0 {
+            (200, cursor_copies_inventory(false))
+        } else {
+            (200, status(true))
+        }
+    });
+    let original = {
+        let mut store = OpeningStore::open(history.clone()).unwrap();
+        save_setup_acknowledgement(&mut store, &endpoint, &"a".repeat(64))
+    };
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_mode_settings(
+                    window,
+                    cx,
+                    endpoint.clone(),
+                    Some(drafts.clone()),
+                    AppMode::CursorOnboarding,
+                    None,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap().len(), 2);
+    cx.run_until_parked();
+    let backup = directory.0.join("history-backup.json");
+    let saved = std::fs::read(&history).unwrap();
+    std::fs::rename(&history, &backup).unwrap();
+    std::fs::create_dir(&history).unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.click("cursor-confirm-tools", cx);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.openings.as_ref().unwrap().attempts,
+                vec![original.clone()]
+            );
+            assert!(
+                view.cursor_human_confirmation(&endpoint, &"a".repeat(64))
+                    .is_none()
+            );
+            assert!(
+                view.opening_warning
+                    .as_deref()
+                    .unwrap()
+                    .contains("confirmation could not be saved")
+            );
+            assert!(view.selection_task.is_none());
+            assert!(view.opening_tasks.is_empty());
+        });
+        assert!(window.find("cursor-confirm-tools").visible());
+    })
+    .unwrap();
+    assert!(
+        history.is_dir(),
+        "failed save must not replace the incompatible target"
+    );
+    assert_eq!(std::fs::read(&backup).unwrap(), saved);
+    std::fs::remove_dir(&history).unwrap();
+    std::fs::rename(&backup, &history).unwrap();
+}
+
+#[gpui_kit::test]
+fn confirmation_rejects_another_copy_stale_frame_and_unresolved_action(cx: &mut TestAppContext) {
+    let directory = Directory::new();
+    let drafts = directory.drafts();
+    let history = openings::path_for_drafts(&drafts).unwrap();
+    let (endpoint, worker) = fixture(2, |request, index| {
+        assert!(request.starts_with("GET "));
+        if index == 0 {
+            (200, cursor_copies_inventory(true))
+        } else {
+            (200, status(true))
+        }
+    });
+    {
+        let mut store = OpeningStore::open(history.clone()).unwrap();
+        save_setup_acknowledgement(&mut store, &endpoint, &"a".repeat(64));
+    }
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_mode_settings(
+                    window,
+                    cx,
+                    endpoint.clone(),
+                    Some(drafts.clone()),
+                    AppMode::CursorOnboarding,
+                    None,
+                )
+            })
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap().len(), 2);
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.click(("cursor-copy", 0_usize), cx);
+        let scope = view.update(cx, |view, _| {
+            view.cursor_confirmation_scope(&endpoint, &"a".repeat(64))
+                .unwrap()
+        });
+        window.click(("cursor-copy", 1_usize), cx);
+        assert!(window.try_find("cursor-confirm-tools").is_none());
+        view.update(cx, |view, cx| {
+            view.confirm_cursor_tools(&scope, cx);
+            assert!(
+                view.openings.as_ref().unwrap().attempts[0]
+                    .human_confirmation
+                    .is_none()
+            );
+        });
+        window.click(("cursor-copy", 0_usize), cx);
+        view.update(cx, |view, cx| {
+            // A later acknowledgement makes the old frame's exact request stale.
+            save_setup_acknowledgement(view.openings.as_mut().unwrap(), &endpoint, &"a".repeat(64));
+            view.confirm_cursor_tools(&scope, cx);
+            assert!(
+                view.openings
+                    .as_ref()
+                    .unwrap()
+                    .attempts
+                    .iter()
+                    .all(|attempt| attempt.human_confirmation.is_none())
+            );
+            let current = view
+                .cursor_confirmation_scope(&endpoint, &"a".repeat(64))
+                .unwrap();
+            view.openings
+                .as_mut()
+                .unwrap()
+                .prepare(OpeningAction::OrdinaryOpen, &endpoint, &"a".repeat(64))
+                .unwrap();
+            view.confirm_cursor_tools(&current, cx);
+            assert!(
+                view.cursor_human_confirmation(&endpoint, &"a".repeat(64))
+                    .is_none()
+            );
+            assert!(view.selection_task.is_none());
+            assert!(view.opening_tasks.is_empty());
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+        assert_eq!(window.find("cursor-confirm-tools").disabled(), Some(true));
+        window.click("cursor-confirm-tools", cx);
+        view.update(cx, |view, _| {
+            assert!(
+                view.openings
+                    .as_ref()
+                    .unwrap()
+                    .attempts
+                    .iter()
+                    .all(|attempt| attempt.human_confirmation.is_none())
+            )
+        });
+    })
+    .unwrap();
 }

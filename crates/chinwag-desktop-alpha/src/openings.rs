@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_ATTEMPTS: usize = 128;
+const MAX_CONFIRMATION_UNIX_MS: u64 = 253_402_300_799_999;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +52,20 @@ pub enum OpeningState {
     Receipt(NativeOpenReceipt),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanConfirmationEvidence {
+    HumanReportedEnabledWithTools,
+}
+
+/// A dated report from the human; no live transport or named identity claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanConfirmation {
+    pub evidence: HumanConfirmationEvidence,
+    pub confirmed_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpeningAttempt {
     pub id: String,
@@ -58,6 +73,7 @@ pub struct OpeningAttempt {
     pub installation_id: String,
     pub action: OpeningAction,
     pub state: OpeningState,
+    pub human_confirmation: Option<HumanConfirmation>,
 }
 
 impl OpeningAttempt {
@@ -73,6 +89,10 @@ impl OpeningAttempt {
 
     pub fn summary(&self) -> String {
         if self.action == OpeningAction::CursorMcpSetup {
+            if self.human_confirmation.is_some() && acknowledged_cursor_setup(self) {
+                return "Enabled with tools in Cursor — confirmed by you; live connection unverified."
+                    .into();
+            }
             return match &self.state {
                 OpeningState::Receipt(receipt)
                     if receipt.state == NativeOpenState::OpenedOrReused =>
@@ -204,6 +224,57 @@ impl OpeningStore {
             .any(|attempt| attempt.unresolved() && attempt.installation_id == installation_id)
     }
 
+    /// Exact saved scope, including attempts outside the UI's visible tail.
+    pub fn latest_acknowledged_cursor_setup(
+        &self,
+        endpoint: &str,
+        installation_id: &str,
+    ) -> Option<&OpeningAttempt> {
+        self.attempts.iter().rev().find(|attempt| {
+            attempt.endpoint == endpoint
+                && attempt.installation_id == installation_id
+                && acknowledged_cursor_setup(attempt)
+        })
+    }
+
+    /// Adds only the explicit human's report to the original OS receipt. A
+    /// repeat preserves the original time and performs no write or dispatch.
+    pub fn confirm_cursor_tools_listed(
+        &mut self,
+        endpoint: &str,
+        installation_id: &str,
+        at_ms: u64,
+    ) -> io::Result<()> {
+        validate_target(endpoint, installation_id)?;
+        validate_confirmation_time(at_ms)?;
+        if self.blocks(endpoint, installation_id) {
+            return Err(invalid(
+                "this installation has an unresolved action; recover it before confirming setup",
+            ));
+        }
+        let id = self
+            .latest_acknowledged_cursor_setup(endpoint, installation_id)
+            .ok_or_else(|| invalid("no acknowledged Cursor setup exists for this exact scope"))?
+            .id
+            .clone();
+        let mut next = self.attempts.clone();
+        let attempt = next
+            .iter_mut()
+            .find(|attempt| attempt.id == id)
+            .ok_or_else(|| invalid("unknown local opening attempt"))?;
+        validate_confirmation(attempt)?;
+        if attempt.human_confirmation.is_some() {
+            return Ok(());
+        }
+        attempt.human_confirmation = Some(HumanConfirmation {
+            evidence: HumanConfirmationEvidence::HumanReportedEnabledWithTools,
+            confirmed_at_unix_ms: at_ms,
+        });
+        self.save(&next)?;
+        self.attempts = next;
+        Ok(())
+    }
+
     /// Durably write Pending before the caller may schedule one POST.
     pub fn prepare(
         &mut self,
@@ -223,6 +294,7 @@ impl OpeningStore {
             installation_id: installation_id.into(),
             action,
             state: OpeningState::Pending,
+            human_confirmation: None,
         };
         let mut next = self.attempts.clone();
         while next.len() >= MAX_ATTEMPTS {
@@ -296,13 +368,16 @@ impl OpeningStore {
 
     fn save(&self, attempts: &[OpeningAttempt]) -> io::Result<()> {
         check_target(&self.path)?;
+        for attempt in attempts {
+            validate_confirmation(attempt)?;
+        }
         let rows: Vec<_> = attempts.iter().map(|attempt| {
             let (state, message, receipt) = match &attempt.state {
                 OpeningState::Pending => ("pending", None, None),
                 OpeningState::Uncertain(message) => ("uncertain", Some(message), None),
                 OpeningState::Receipt(receipt) => ("receipt", None, Some(receipt)),
             };
-            json!({"id":attempt.id,"endpoint":attempt.endpoint,"installation_id":attempt.installation_id,"action":attempt.action,"state":state,"message":message,"receipt":receipt})
+            json!({"id":attempt.id,"endpoint":attempt.endpoint,"installation_id":attempt.installation_id,"action":attempt.action,"state":state,"message":message,"receipt":receipt,"human_confirmation":attempt.human_confirmation})
         }).collect();
         let bytes =
             serde_json::to_vec(&json!({"schema":"chinwag-opening-history/v1","attempts":rows}))
@@ -391,15 +466,59 @@ fn decode(value: Value) -> io::Result<Vec<OpeningAttempt>> {
             }
             _ => return Err(invalid("unknown opening attempt state")),
         };
-        attempts.push(OpeningAttempt {
+        let human_confirmation = match row.get("human_confirmation") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(serde_json::from_value(value.clone()).map_err(json_error)?),
+        };
+        let attempt = OpeningAttempt {
             id,
             endpoint,
             installation_id,
             action,
             state,
-        });
+            human_confirmation,
+        };
+        validate_confirmation(&attempt)?;
+        attempts.push(attempt);
     }
     Ok(attempts)
+}
+
+fn acknowledged_cursor_setup(attempt: &OpeningAttempt) -> bool {
+    if attempt.action != OpeningAction::CursorMcpSetup {
+        return false;
+    }
+    let OpeningState::Receipt(receipt) = &attempt.state else {
+        return false;
+    };
+    receipt.state == NativeOpenState::OpenedOrReused
+        && receipt
+            .validate_for(
+                &attempt.id,
+                &NativeOpenRequest {
+                    installation_id: attempt.installation_id.clone(),
+                },
+            )
+            .is_ok()
+}
+
+fn validate_confirmation_time(at_ms: u64) -> io::Result<()> {
+    if !(1..=MAX_CONFIRMATION_UNIX_MS).contains(&at_ms) {
+        return Err(invalid("invalid human confirmation time"));
+    }
+    Ok(())
+}
+
+fn validate_confirmation(attempt: &OpeningAttempt) -> io::Result<()> {
+    if let Some(confirmation) = attempt.human_confirmation {
+        validate_confirmation_time(confirmation.confirmed_at_unix_ms)?;
+        if !acknowledged_cursor_setup(attempt) {
+            return Err(invalid(
+                "human confirmation requires the original acknowledged Cursor setup receipt",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_target(endpoint: &str, installation_id: &str) -> io::Result<()> {

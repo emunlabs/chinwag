@@ -11,7 +11,7 @@ chinwag-bus-client = { path = "../chinwag-bus-client" }
 chinwag-bus-model = { path = "../chinwag-bus-model" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
-chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
