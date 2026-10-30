@@ -11,6 +11,7 @@ chinwag-connector-registry = { path = "../chinwag-connector-registry" }
 chinwag-client-discovery = { path = "../chinwag-client-discovery" }
 chinwag-native-launch = { path = "../chinwag-native-launch" }
 chinwag-bus-client = { path = "../chinwag-bus-client" }
+chinwag-bus-mcp = { path = "../chinwag-bus-mcp" }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "original-uri"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net"] }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -19,6 +20,7 @@ rustix = { version = "1", features = ["fs", "process"] }
 sha2.workspace = true
 thiserror.workspace = true
 crc32fast = "=1.5.3"
+getrandom = "=0.3.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]

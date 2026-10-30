@@ -10,12 +10,18 @@ publish = false
 chinwag-connectors = { path = "../chinwag-connectors" }
 chinwag-bus-client = { path = "../chinwag-bus-client" }
 chinwag-connector-registry = { path = "../chinwag-connector-registry" }
-rmcp = { version = "=3.7.0", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.7.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+futures = "=0.3.34"
+http-body = "=1.1.0"
+tokio-util = { version = "=0.7.20", features = ["rt"] }
+subtle = "=2.6.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 tokio = { version = "=1.54.1", default-features = false, features = ["macros", "rt", "io-util", "io-std", "sync", "time"] }
 
 [dev-dependencies]
-rmcp = { version = "=3.7.0", default-features = false, features = ["client", "transport-io"] }
-tokio = { version = "=1.54.1", default-features = false, features = ["process"] }
+rmcp = { version = "=3.7.0", default-features = false, features = ["client", "transport-io", "transport-streamable-http-client-reqwest"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["process", "net", "rt-multi-thread"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"] }
 tempfile = "3"

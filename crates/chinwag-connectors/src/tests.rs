@@ -1,5 +1,5 @@
 use super::*;
-use chinwag_connector_registry::{BindingState, Destination, Limits, NativeRoom};
+use chinwag_connector_registry::{AuthorityKind, BindingState, Destination, Limits, NativeRoom};
 use std::cell::Cell;
 
 fn registry() -> Registry {
@@ -414,6 +414,168 @@ fn host_admission_is_atomic_and_repeating_the_owner_decision_returns_existing_sc
         )
         .unwrap();
     assert_eq!(duplicate, first);
+    assert_eq!(host.inbox_grants.len(), 1);
+    assert_eq!(host.inbox_bindings.len(), 1);
+}
+
+fn admit_http(host: &mut ConnectorHost, now: Instant, lease: Duration) -> BindingView {
+    let connection = ConnectionId::new("owner-http-connection").unwrap();
+    let decision = OwnerLocalDecision::new_http_capability(
+        "explicit-owner-http-enrollment",
+        connection.clone(),
+        target(NativeRoom::Mgmt),
+    )
+    .unwrap();
+    host.admit_local_inbox(decision, &connection, lease, now)
+        .unwrap()
+}
+
+#[test]
+fn shared_host_dispatch_uses_canonical_http_authority_not_a_public_view_label() {
+    let now = Instant::now();
+    let (mut host, stdio) = enabled_host(now);
+    let http = admit_http(&mut host, now, Duration::from_secs(10));
+    assert_eq!(
+        http.authority,
+        AuthorityKind::OwnerLocalHttpCapabilityUnattributed
+    );
+    let invocation = invocation(&host, BuiltinConnector::NativeInbox, now);
+    let mut relabeled = http.clone();
+    relabeled.authority = AuthorityKind::OwnerLocalStdioUnattributed;
+    let observed = host
+        .inbox(&invocation, &relabeled, || now, |scope| scope.authority())
+        .unwrap();
+    assert_eq!(
+        observed,
+        AuthorityKind::OwnerLocalHttpCapabilityUnattributed
+    );
+    assert_eq!(host.inspect_binding(http.id, now).unwrap(), http);
+    assert_eq!(
+        host.inbox(&invocation, &stdio, || now, |scope| scope.authority()),
+        Ok(AuthorityKind::OwnerLocalStdioUnattributed)
+    );
+    assert_eq!(host.inbox_grants.len(), 2);
+    assert_eq!(host.inbox_bindings.len(), 2);
+}
+
+#[test]
+fn terminal_http_binding_never_reads_and_unrelated_stdio_and_metadata_stay_usable() {
+    let now = Instant::now();
+    for terminal in [
+        BindingState::Revoked,
+        BindingState::Expired,
+        BindingState::Disconnected,
+    ] {
+        let mut host = ConnectorHost::new(registry());
+        host.set_enabled(BuiltinConnector::NativeInbox, true)
+            .unwrap();
+        host.set_enabled(BuiltinConnector::NativeClients, true)
+            .unwrap();
+        let stdio_connection = ConnectionId::new("unrelated-stdio").unwrap();
+        let stdio = host
+            .admit_local_inbox(
+                OwnerLocalDecision::new(
+                    "explicit-owner-stdio-launch",
+                    stdio_connection.clone(),
+                    target(NativeRoom::Mgmt),
+                )
+                .unwrap(),
+                &stdio_connection,
+                Duration::from_secs(60),
+                now,
+            )
+            .unwrap();
+        let http = admit_http(&mut host, now, Duration::from_secs(5));
+        let checked_at = match terminal {
+            BindingState::Revoked => {
+                host.revoke(http.grant).unwrap();
+                now
+            }
+            BindingState::Expired => now + Duration::from_secs(5),
+            BindingState::Disconnected => {
+                host.disconnect_binding(http.id, http.generation).unwrap();
+                now
+            }
+            _ => unreachable!(),
+        };
+        let current = host.inspect_binding(http.id, checked_at).unwrap();
+        assert_eq!(current.state, terminal);
+        assert_eq!(
+            current.authority,
+            AuthorityKind::OwnerLocalHttpCapabilityUnattributed
+        );
+        let inbox = invocation(&host, BuiltinConnector::NativeInbox, checked_at);
+        let rejected: Result<()> = host.inbox(
+            &inbox,
+            &current,
+            || checked_at,
+            |_| panic!("unavailable HTTP admission must never call the inbox reader"),
+        );
+        let expected = match terminal {
+            BindingState::Revoked => RegistryError::GrantRevoked,
+            BindingState::Expired => RegistryError::GrantExpired,
+            BindingState::Disconnected => {
+                RegistryError::BindingUnavailable(BindingState::Disconnected)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(rejected, Err(ConnectorError::Admission(expected)));
+        assert_eq!(
+            host.inbox(&inbox, &stdio, || checked_at, |scope| scope.authority()),
+            Ok(AuthorityKind::OwnerLocalStdioUnattributed)
+        );
+        let metadata = invocation(&host, BuiltinConnector::NativeClients, checked_at);
+        let calls = Cell::new(0);
+        assert_eq!(
+            host.clients(
+                &metadata,
+                || checked_at,
+                || {
+                    calls.set(calls.get() + 1);
+                    "one metadata snapshot"
+                }
+            ),
+            Ok("one metadata snapshot")
+        );
+        assert_eq!(calls.get(), 1);
+    }
+}
+
+#[test]
+fn http_host_repeat_preserves_original_admission_and_conflicting_stdio_cannot_replace_it() {
+    let now = Instant::now();
+    let mut host = ConnectorHost::new(
+        Registry::new(Limits {
+            max_grants: 1,
+            max_bindings: 1,
+            max_lease: Duration::from_secs(60),
+        })
+        .unwrap(),
+    );
+    host.set_enabled(BuiltinConnector::NativeInbox, true)
+        .unwrap();
+    let first = admit_http(&mut host, now, Duration::from_secs(10));
+    let repeated_at = now + Duration::from_secs(2);
+    let duplicate = admit_http(&mut host, repeated_at, Duration::from_secs(60));
+    assert_eq!(duplicate, first);
+    assert_eq!(duplicate.lease_expires_at, now + Duration::from_secs(10));
+    assert_eq!(duplicate.grant_expires_at, now + Duration::from_secs(10));
+    let changed_authority = OwnerLocalDecision::new(
+        "explicit-owner-http-enrollment",
+        first.connection.clone(),
+        first.destination.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        host.admit_local_inbox(
+            changed_authority,
+            &first.connection,
+            Duration::from_secs(20),
+            repeated_at
+        ),
+        Err(ConnectorError::Admission(RegistryError::BindingConflict))
+    );
+    assert_eq!(host.inspect_binding(first.id, repeated_at).unwrap(), first);
     assert_eq!(host.inbox_grants.len(), 1);
     assert_eq!(host.inbox_bindings.len(), 1);
 }

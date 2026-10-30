@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as RoutePath, Query, State};
@@ -14,6 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chinwag_bus_client::{BusMessage, SendReceipt, SendRequest};
+use chinwag_connector_registry::{Limits, Registry};
+use chinwag_connectors::{BuiltinConnector, ConnectorHost};
 use rustix::fs::{FlockOperation, OFlags, flock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -96,6 +99,17 @@ fn router_with_components(
     onboarding: Option<Arc<OnboardingService>>,
     cursor_mcp: Option<Arc<OnboardingService>>,
     vscode_mcp: Option<Arc<OnboardingService>>,
+) -> Result<Router> {
+    router_with_shared_host(config, source, onboarding, cursor_mcp, vscode_mcp, None)
+}
+
+fn router_with_shared_host(
+    config: RuntimeConfig,
+    source: Arc<dyn InventorySource>,
+    onboarding: Option<Arc<OnboardingService>>,
+    cursor_mcp: Option<Arc<OnboardingService>>,
+    vscode_mcp: Option<Arc<OnboardingService>>,
+    host: Option<Arc<Mutex<ConnectorHost>>>,
 ) -> Result<Router> {
     if config.bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
         return Err(RuntimeError::Invalid("bind must be 127.0.0.1".into()));
@@ -207,7 +221,10 @@ fn router_with_components(
         .layer(DefaultBodyLimit::max(MAX_REQUEST))
         .with_state(AppState(
             Arc::new(backend),
-            Arc::new(DiscoveryService::new(source)),
+            Arc::new(match host {
+                Some(host) => DiscoveryService::with_shared_host(source, host),
+                None => DiscoveryService::new(source),
+            }),
             onboarding,
             cursor_mcp,
             vscode_mcp,
@@ -233,6 +250,150 @@ pub async fn serve_with_native_actions(
     vscode_mcp: Option<Arc<OnboardingService>>,
 ) -> Result<()> {
     serve_optional_onboarding(config, onboarding, cursor_mcp, vscode_mcp).await
+}
+
+/// Explicit owner opt-in. The default server creates neither a capability file
+/// nor an HTTP inbox. Existing clients and stdio children are never attached.
+pub async fn serve_with_http_mcp(
+    config: RuntimeConfig,
+    onboarding: Option<Arc<OnboardingService>>,
+    cursor_mcp: Option<Arc<OnboardingService>>,
+    vscode_mcp: Option<Arc<OnboardingService>>,
+    capability_file: PathBuf,
+) -> Result<()> {
+    if config.bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST)
+        || config.bind.port() == 0
+        || !matches!(
+            &config.mode,
+            RuntimeMode::Shared {
+                signed_sender: None,
+                ..
+            }
+        )
+    {
+        return Err(RuntimeError::Invalid(
+            "HTTP MCP requires a fixed loopback read-only shared runtime".into(),
+        ));
+    }
+    let registry = Registry::new(Limits {
+        max_grants: 1,
+        max_bindings: 1,
+        max_lease: Duration::from_secs(900),
+    })
+    .map_err(|_| RuntimeError::Unavailable("runtime connector host unavailable".into()))?;
+    let mut host = ConnectorHost::new(registry);
+    host.set_enabled(BuiltinConnector::NativeClients, true)
+        .map_err(|_| RuntimeError::Unavailable("runtime connector host unavailable".into()))?;
+    let host = Arc::new(Mutex::new(host));
+    let shared_host = host.clone();
+    let bind = config.bind;
+    let app = tokio::task::spawn_blocking(move || {
+        router_with_shared_host(
+            config,
+            Arc::new(NativeInventorySource),
+            onboarding,
+            cursor_mcp,
+            vscode_mcp,
+            Some(shared_host),
+        )
+    })
+    .await
+    .map_err(|_| RuntimeError::Unavailable("runtime initialization worker failed".into()))??;
+    // Reserve the exact endpoint before issuing any capability. An occupied
+    // listener is preserved and cannot cause a grant or file to be issued.
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let owner = match crate::mcp::HttpMcpOwner::start(
+        &format!("http://{bind}"),
+        host,
+        &capability_file,
+    )
+    .await
+    {
+        Ok(owner) => Some(Arc::new(owner)),
+        Err(_) => {
+            eprintln!(
+                "chinwag-alpha-runtime: HTTP MCP initialization unavailable; bus continues with HTTP MCP disabled; no existing capability was adopted or repaired"
+            );
+            None
+        }
+    };
+    let app = match &owner {
+        Some(owner) => app.merge(http_mcp_routes(owner.transport(), http_mcp_authority(bind))),
+        None => app,
+    };
+    let shutdown_owner = owner.clone();
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            // Retire sessions and their SSE bodies before axum waits for
+            // graceful connection completion. Only actual joins prove drain.
+            if let Some(owner) = shutdown_owner {
+                let _ = owner.shutdown().await;
+            }
+        })
+        .await;
+    if let Some(owner) = owner {
+        owner.shutdown().await.map_err(|_| {
+            RuntimeError::Unavailable("HTTP MCP owner cleanup could not be confirmed".into())
+        })?;
+    }
+    result?;
+    Ok(())
+}
+
+fn http_mcp_authority(bind: std::net::SocketAddr) -> String {
+    if bind.port() == 80 {
+        bind.ip().to_string()
+    } else {
+        bind.to_string()
+    }
+}
+
+fn http_mcp_routes(inbox: Arc<chinwag_bus_mcp::http::HttpInbox>, authority: String) -> Router {
+    let transport = inbox.clone();
+    Router::new()
+        .route(
+            "/api/mcp",
+            axum::routing::any(move |request: axum::extract::Request| {
+                let transport = transport.clone();
+                async move { transport.handle(request).await }
+            }),
+        )
+        .route(
+            "/api/onboarding/mcp-http/status",
+            get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                let inbox = inbox.clone();
+                let authority = authority.clone();
+                async move {
+                    if uri.query().is_some()
+                        || headers.contains_key("origin")
+                        || headers.get_all("host").iter().count() != 1
+                        || headers.get("host").and_then(|value| value.to_str().ok())
+                            != Some(authority.as_str())
+                        || headers.get_all("x-chinwag-onboarding-intent").iter().count() != 1
+                        || headers.get("x-chinwag-onboarding-intent")
+                            .and_then(|value| value.to_str().ok()) != Some("1")
+                    {
+                        return response(StatusCode::FORBIDDEN, json!({"ok":false,"error":"explicit native loopback observation required"}));
+                    }
+                    response(StatusCode::OK, json!({
+                        "ok": true,
+                        "schema": "chinwag-runtime-owned-mcp/v1",
+                        "binding_authority": "owner_local_http_capability_unattributed",
+                        "transport": inbox.lifecycle_snapshot(),
+                    }))
+                }
+            })
+            .head(http_mcp_status_method)
+            .fallback(http_mcp_status_method),
+        )
+}
+
+async fn http_mcp_status_method() -> Response {
+    response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        json!({"ok":false,"error":"MCP observation accepts GET only"}),
+    )
 }
 
 async fn serve_optional_onboarding(
@@ -1162,6 +1323,178 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn default_router_has_no_http_mcp_or_protocol_observation_route() {
+        use tower::ServiceExt;
+        let temp = TempDir::new().unwrap();
+        let ledger = temp.path().join("messages.jsonl");
+        fs::write(&ledger, b"").unwrap();
+        let app = router(RuntimeConfig {
+            bind: "127.0.0.1:44341".parse().unwrap(),
+            mode: RuntimeMode::Shared {
+                ledger,
+                signed_sender: None,
+                journal_dir: None,
+            },
+        })
+        .unwrap();
+        for path in ["/api/mcp", "/api/onboarding/mcp-http/status"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .header("host", "127.0.0.1:44341")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_status_projects_the_original_protocol_holder_without_reading_the_bus() {
+        use tower::ServiceExt;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let bus_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        bus_listener.set_nonblocking(true).unwrap();
+        let authority = bus_listener.local_addr().unwrap().to_string();
+        let host = Arc::new(Mutex::new(ConnectorHost::new(
+            Registry::new(Limits {
+                max_grants: 1,
+                max_bindings: 1,
+                max_lease: Duration::from_secs(900),
+            })
+            .unwrap(),
+        )));
+        let capability = root.join("new-capability.json");
+        let owner =
+            crate::mcp::HttpMcpOwner::start(&format!("http://{authority}"), host, &capability)
+                .await
+                .unwrap();
+        let document: Value = serde_json::from_slice(&fs::read(&capability).unwrap()).unwrap();
+        let authorization = document["headers"]["Authorization"].as_str().unwrap();
+        let app = http_mcp_routes(owner.transport(), authority.clone());
+        let request = |value: Value, session: Option<&str>| {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/mcp")
+                .header("host", &authority)
+                .header("authorization", authorization)
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json")
+                .header("mcp-protocol-version", "2025-11-25");
+            if let Some(session) = session {
+                request = request.header("mcp-session-id", session);
+            }
+            request
+                .body(axum::body::Body::from(serde_json::to_vec(&value).unwrap()))
+                .unwrap()
+        };
+        let initialized = app
+            .clone()
+            .oneshot(request(
+                json!({
+                    "jsonrpc":"2.0", "id":1, "method":"initialize", "params": {
+                        "protocolVersion":"2025-11-25", "capabilities":{},
+                        "clientInfo":{"name":"synthetic-runtime-fixture","version":"fixture"}
+                    }
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(initialized.status(), StatusCode::OK);
+        let session = initialized
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        axum::body::to_bytes(initialized.into_body(), 65_536)
+            .await
+            .unwrap();
+        let catalogue = app.clone().oneshot(request(json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{"_meta":{"progressToken":2}}
+        }), Some(&session))).await.unwrap();
+        assert_eq!(catalogue.status(), StatusCode::OK);
+        axum::body::to_bytes(catalogue.into_body(), 65_536)
+            .await
+            .unwrap();
+        for (method, path, intent, expected) in [
+            (
+                "GET",
+                "/api/onboarding/mcp-http/status",
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "HEAD",
+                "/api/onboarding/mcp-http/status",
+                true,
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                "GET",
+                "/api/onboarding/mcp-http/status?refresh=1",
+                true,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "GET",
+                "/api/onboarding/mcp-http/status",
+                true,
+                StatusCode::OK,
+            ),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", &authority);
+            if intent {
+                request = request.header("x-chinwag-onboarding-intent", "1");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let status: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    status["transport"],
+                    serde_json::to_value(owner.transport().lifecycle_snapshot()).unwrap()
+                );
+                assert_eq!(
+                    status["transport"]["connection_observation"]["catalogue_outputs_prepared"],
+                    1
+                );
+                assert_eq!(
+                    status["transport"]["connection_observation"]["read_windows_prepared"],
+                    0
+                );
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(!text.contains(authorization.strip_prefix("Bearer ").unwrap()));
+                assert!(!text.contains("synthetic-runtime-fixture"));
+                assert!(!text.contains(&session));
+            }
+        }
+        assert!(
+            matches!(bus_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        owner.shutdown().await.unwrap();
+        assert!(owner.transport().lifecycle_snapshot().reader_worker_joined);
+    }
 
     fn request_value() -> SendRequest {
         SendRequest {

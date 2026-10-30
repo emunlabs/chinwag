@@ -176,11 +176,13 @@ async fn launch_and_capability_listing_are_inert_and_read_scope_is_fixed() {
         server.start_read(1, Box::new(|| false)),
         Err(InboxError::AdmissionClosed)
     ));
-    let mut admission = server.shared.admission.lock().unwrap();
+    let admission = server.shared.admission.lock().unwrap();
     let id = admission.binding.id;
     assert_eq!(
         admission
             .host
+            .lock()
+            .unwrap()
             .inspect_binding(id, Instant::now())
             .unwrap()
             .state,
@@ -275,9 +277,9 @@ async fn eof_closes_admission_and_waits_for_original_reader() {
 async fn revoked_generation_rejects_dispatch_without_restoring_authority() {
     let (server, calls, _) = fixture(Duration::from_secs(10)).await;
     {
-        let mut admission = server.shared.admission.lock().unwrap();
+        let admission = server.shared.admission.lock().unwrap();
         let grant = admission.binding.grant;
-        admission.host.revoke(grant).unwrap();
+        admission.host.lock().unwrap().revoke(grant).unwrap();
     }
     let result = server.start_read(1, Box::new(|| false)).unwrap();
     assert_eq!(result.await.unwrap(), Err(InboxError::AdmissionClosed));
@@ -289,9 +291,11 @@ async fn revoked_generation_rejects_dispatch_without_restoring_authority() {
 async fn disabling_builtin_inbox_blocks_source_and_reenable_does_not_restore_grant() {
     let (server, calls, _) = fixture(Duration::from_secs(10)).await;
     {
-        let mut admission = server.shared.admission.lock().unwrap();
+        let admission = server.shared.admission.lock().unwrap();
         admission
             .host
+            .lock()
+            .unwrap()
             .set_enabled(BuiltinConnector::NativeInbox, false)
             .unwrap();
     }
@@ -304,9 +308,11 @@ async fn disabling_builtin_inbox_blocks_source_and_reenable_does_not_restore_gra
         Err(InboxError::AdmissionClosed)
     );
     {
-        let mut admission = server.shared.admission.lock().unwrap();
+        let admission = server.shared.admission.lock().unwrap();
         admission
             .host
+            .lock()
+            .unwrap()
             .set_enabled(BuiltinConnector::NativeInbox, true)
             .unwrap();
     }

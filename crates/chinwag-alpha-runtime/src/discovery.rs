@@ -57,7 +57,7 @@ impl InventorySource for NativeInventorySource {
 
 pub struct DiscoveryService {
     source: Arc<dyn InventorySource>,
-    host: Mutex<ConnectorHost>,
+    host: Arc<Mutex<ConnectorHost>>,
 }
 
 impl DiscoveryService {
@@ -72,10 +72,16 @@ impl DiscoveryService {
         );
         host.set_enabled(BuiltinConnector::NativeClients, true)
             .expect("initial connector generation is available");
-        Self {
-            source,
-            host: Mutex::new(host),
-        }
+        Self::with_shared_host(source, Arc::new(Mutex::new(host)))
+    }
+
+    /// The runtime supplies its existing host when an owner-held MCP transport
+    /// is enabled. Discovery does not create another registry in this path.
+    pub(crate) fn with_shared_host(
+        source: Arc<dyn InventorySource>,
+        host: Arc<Mutex<ConnectorHost>>,
+    ) -> Self {
+        Self { source, host }
     }
 
     pub fn inventory(&self) -> std::result::Result<ClientInventory, DiscoveryFailure> {

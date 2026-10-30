@@ -30,6 +30,7 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
     let journal = onboarding_journal(&args, native_main_loop)?;
     cursor_mcp_options(&args, native_main_loop, journal.as_deref())?;
     vscode_mcp_options(&args, native_main_loop, journal.as_deref())?;
+    http_mcp_capability_file(&args)?;
     if native_main_loop {
         #[cfg(target_os = "macos")]
         {
@@ -196,10 +197,57 @@ fn mcp_setup_options(
     }
 }
 
+/// Issuing a new owner capability is separate from native app setup. Validate
+/// the explicit read-only opt-in before runtime, storage or signer startup.
+fn http_mcp_capability_file(args: &[String]) -> Result<Option<PathBuf>> {
+    let positions = args
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.as_str() == "--mcp-http-capability-file")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let Some(&position) = positions.first() else {
+        return Ok(None);
+    };
+    if positions.len() != 1
+        || args.first().map(String::as_str) != Some("serve-shared")
+        || args
+            .iter()
+            .any(|value| matches!(value.as_str(), "--signed-cli" | "--repo" | "--send-journal"))
+    {
+        return Err(RuntimeError::Invalid(
+            "HTTP MCP requires one explicit capability output with a read-only shared runtime"
+                .into(),
+        ));
+    }
+    let file = args
+        .get(position + 1)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            RuntimeError::Invalid("HTTP MCP capability output must be an absolute new path".into())
+        })?;
+    chinwag_alpha_runtime::mcp::validate_capability_path(&file).map_err(|_| {
+        RuntimeError::Invalid(
+            "HTTP MCP capability output must be a normalized absolute new path".into(),
+        )
+    })?;
+    if args
+        .windows(2)
+        .any(|pair| pair[0] == "--port" && pair[1].parse::<u16>().ok() == Some(0))
+    {
+        return Err(RuntimeError::Invalid(
+            "HTTP MCP requires a fixed nonzero runtime port".into(),
+        ));
+    }
+    Ok(Some(file))
+}
+
 async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
     let onboarding_journal = onboarding_journal(&args, native_main_loop)?;
     let cursor_mcp = cursor_mcp_options(&args, native_main_loop, onboarding_journal.as_deref())?;
     let vscode_mcp = vscode_mcp_options(&args, native_main_loop, onboarding_journal.as_deref())?;
+    let http_mcp_file = http_mcp_capability_file(&args)?;
     let Some((command, rest)) = args.split_first() else {
         return Err(RuntimeError::Invalid(
             "use launch, serve-local, serve-shared, discover-clients or export-connector".into(),
@@ -245,6 +293,7 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
             "--cursor-mcp-journal",
             "--vscode-mcp-binary",
             "--vscode-mcp-journal",
+            "--mcp-http-capability-file",
         ],
         _ => return Err(RuntimeError::Invalid("unknown runtime command".into())),
     };
@@ -399,7 +448,19 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
             }
         }
     }
-    server::serve_with_native_actions(config, opening_service, cursor_service, vscode_service).await
+    if let Some(file) = http_mcp_file {
+        server::serve_with_http_mcp(
+            config,
+            opening_service,
+            cursor_service,
+            vscode_service,
+            file,
+        )
+        .await
+    } else {
+        server::serve_with_native_actions(config, opening_service, cursor_service, vscode_service)
+            .await
+    }
 }
 
 fn verify_signer_ledger(ledger: &std::path::Path, repo: &std::path::Path) -> Result<()> {
@@ -417,6 +478,105 @@ fn verify_signer_ledger(ledger: &std::path::Path, repo: &std::path::Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_mcp_is_explicit_read_only_owner_output_before_initialization() {
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            http_mcp_capability_file(&args(&["serve-shared"]))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            http_mcp_capability_file(&args(&[
+                "serve-shared",
+                "--mcp-http-capability-file",
+                "/owned/new-capability.json"
+            ]))
+            .unwrap(),
+            Some(PathBuf::from("/owned/new-capability.json")),
+        );
+        for malformed in [
+            "/owned/../new.json".to_owned(),
+            "/owned/./new.json".to_owned(),
+            "/owned//new.json".to_owned(),
+            "/owned/new.json/".to_owned(),
+            "/owned/new\n.json".to_owned(),
+            format!("/owned/{}", "a".repeat(241)),
+            format!("/{}/new.json", "a/".repeat(2050)),
+        ] {
+            assert!(
+                http_mcp_capability_file(&args(&[
+                    "serve-shared",
+                    "--mcp-http-capability-file",
+                    &malformed,
+                ]))
+                .is_err(),
+                "malformed path must reject before runtime initialization"
+            );
+        }
+        for command in [
+            "serve-local",
+            "launch",
+            "discover-clients",
+            "export-connector",
+        ] {
+            assert!(
+                http_mcp_capability_file(&args(&[
+                    command,
+                    "--mcp-http-capability-file",
+                    "/owned/new.json"
+                ]))
+                .is_err()
+            );
+        }
+        for parts in [
+            vec!["serve-shared", "--mcp-http-capability-file"],
+            vec!["serve-shared", "--mcp-http-capability-file", "relative"],
+            vec![
+                "serve-shared",
+                "--mcp-http-capability-file",
+                "/owned/new.json",
+                "--mcp-http-capability-file",
+                "/owned/another.json",
+            ],
+            vec![
+                "serve-shared",
+                "--mcp-http-capability-file",
+                "/owned/new.json",
+                "--signed-cli",
+                "/must/not/run",
+            ],
+            vec![
+                "serve-shared",
+                "--mcp-http-capability-file",
+                "/owned/new.json",
+                "--repo",
+                "/must/not/read",
+            ],
+            vec![
+                "serve-shared",
+                "--mcp-http-capability-file",
+                "/owned/new.json",
+                "--send-journal",
+                "/must/not/create",
+            ],
+            vec![
+                "serve-shared",
+                "--mcp-http-capability-file",
+                "/owned/new.json",
+                "--port",
+                "00",
+            ],
+        ] {
+            assert!(http_mcp_capability_file(&args(&parts)).is_err());
+        }
+    }
 
     #[test]
     fn cursor_setup_is_a_paired_distinct_owner_opt_in_before_dispatch() {

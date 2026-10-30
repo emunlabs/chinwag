@@ -721,3 +721,180 @@ fn atomic_binding_capacity_failure_consumes_no_grant_or_identifier() {
         .grant_local(decision(&second, &target), Duration::from_secs(10), now)
         .expect("failed binding admission must not allocate a grant");
 }
+
+fn http_decision(connection: &ConnectionId, destination: &Destination) -> OwnerLocalDecision {
+    OwnerLocalDecision::new_http_capability(
+        "owner-http-enrollment-1",
+        connection.clone(),
+        destination.clone(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn http_owner_grant_projects_its_canonical_authority_to_view_and_read_scope() {
+    let now = Instant::now();
+    let mut registry = registry();
+    let connection = ConnectionId::new("owner-http-1").unwrap();
+    let target = destination(NativeRoom::Mgmt);
+    let grant = registry
+        .grant_local(
+            http_decision(&connection, &target),
+            Duration::from_secs(30),
+            now,
+        )
+        .unwrap();
+    let binding = registry
+        .register_local(grant, &connection, Duration::from_secs(10), now)
+        .unwrap()
+        .binding;
+    assert_eq!(
+        binding.authority,
+        AuthorityKind::OwnerLocalHttpCapabilityUnattributed
+    );
+    assert_eq!(
+        binding.integration_class,
+        IntegrationClass::ClientInitiatedMcp
+    );
+    assert_eq!(binding.capability, Capability::InboxRead);
+    assert_eq!(binding.owner_decision_reference, "owner-http-enrollment-1");
+    assert_eq!(binding.lease_expires_at, now + Duration::from_secs(10));
+    assert_eq!(binding.grant_expires_at, now + Duration::from_secs(30));
+    let observed = registry
+        .with_read(
+            binding.id,
+            binding.generation,
+            &connection,
+            &target,
+            now,
+            |scope| {
+                assert_eq!(scope.destination(), &target);
+                assert_eq!(scope.capability(), Capability::InboxRead);
+                scope.authority()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        observed,
+        AuthorityKind::OwnerLocalHttpCapabilityUnattributed
+    );
+    assert_eq!(registry.inspect(binding.id, now).unwrap(), binding);
+}
+
+#[test]
+fn repeating_http_admission_at_capacity_keeps_original_grant_and_lease() {
+    let now = Instant::now();
+    let mut registry = Registry::new(Limits {
+        max_grants: 1,
+        max_bindings: 1,
+        max_lease: Duration::from_secs(60),
+    })
+    .unwrap();
+    let connection = ConnectionId::new("owner-http-1").unwrap();
+    let target = destination(NativeRoom::Mgmt);
+    let owner = http_decision(&connection, &target);
+    let first = registry
+        .admit_local(owner.clone(), &connection, Duration::from_secs(10), now)
+        .unwrap();
+    let duplicate = registry
+        .admit_local(
+            owner.clone(),
+            &connection,
+            Duration::from_secs(60),
+            now + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(first.disposition, RegistrationDisposition::Created);
+    assert_eq!(duplicate.disposition, RegistrationDisposition::Existing);
+    assert_eq!(duplicate.binding, first.binding);
+    assert_eq!(
+        duplicate.binding.lease_expires_at,
+        now + Duration::from_secs(10)
+    );
+    assert_eq!(
+        duplicate.binding.grant_expires_at,
+        now + Duration::from_secs(10)
+    );
+    assert_eq!(
+        registry.admit_local(
+            owner,
+            &connection,
+            Duration::from_secs(60),
+            now + Duration::from_secs(10),
+        ),
+        Err(RegistryError::GrantExpired)
+    );
+    assert_eq!(registry.grants.len(), 1);
+    assert_eq!(registry.bindings.len(), 1);
+}
+
+#[test]
+fn authority_cannot_switch_on_the_same_connection_or_consume_capacity_on_conflict() {
+    let now = Instant::now();
+    for http_first in [false, true] {
+        let mut registry = Registry::new(Limits {
+            max_grants: 2,
+            max_bindings: 2,
+            max_lease: Duration::from_secs(60),
+        })
+        .unwrap();
+        let connection = ConnectionId::new("same-owner-connection").unwrap();
+        let target = destination(NativeRoom::Mgmt);
+        // Identical reference, connection and destination isolate authority as
+        // the sole conflict. Neither constructor accepts a secret or a token.
+        let stdio =
+            OwnerLocalDecision::new("same-owner-reference", connection.clone(), target.clone())
+                .unwrap();
+        let http = OwnerLocalDecision::new_http_capability(
+            "same-owner-reference",
+            connection.clone(),
+            target.clone(),
+        )
+        .unwrap();
+        assert_ne!(stdio, http);
+        let (first, conflict) = if http_first {
+            (http, stdio)
+        } else {
+            (stdio, http)
+        };
+        let original = registry
+            .admit_local(first, &connection, Duration::from_secs(10), now)
+            .unwrap()
+            .binding;
+        let next_id = registry.next_id;
+        for _ in 0..2 {
+            assert_eq!(
+                registry.admit_local(conflict.clone(), &connection, Duration::from_secs(20), now),
+                Err(RegistryError::BindingConflict)
+            );
+        }
+        assert_eq!(registry.next_id, next_id);
+        assert_eq!(registry.grants.len(), 1);
+        assert_eq!(registry.bindings.len(), 1);
+        assert_eq!(registry.inspect(original.id, now).unwrap(), original);
+        let other = ConnectionId::new("unrelated-owner-connection").unwrap();
+        let other_binding = registry
+            .admit_local(
+                decision(&other, &target),
+                &other,
+                Duration::from_secs(10),
+                now,
+            )
+            .expect("conflicting authority must leave the other slot usable")
+            .binding;
+        assert_eq!(other_binding.grant, GrantId(next_id));
+        assert_eq!(other_binding.id, BindingId(next_id + 1));
+    }
+}
+
+#[test]
+fn http_constructor_reuses_bounded_owner_reference_validation() {
+    let connection = ConnectionId::new("owner-http-1").unwrap();
+    let target = destination(NativeRoom::Mgmt);
+    for reference in ["", " ", "owner\nreference", &"x".repeat(257)] {
+        assert_eq!(
+            OwnerLocalDecision::new_http_capability(reference, connection.clone(), target.clone()),
+            Err(RegistryError::InvalidField("owner decision reference"))
+        );
+    }
+}

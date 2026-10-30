@@ -247,8 +247,10 @@ impl ConnectorHost {
         Ok(result)
     }
 
-    /// Only the trusted owner-local launch boundary calls this method. Enabling
-    /// the descriptor alone cannot manufacture the decision or grant.
+    /// Only the trusted owner-local stdio or scoped HTTP enrollment boundary
+    /// calls this method. The decision retains its transport authority; enabling
+    /// the descriptor alone cannot manufacture the decision or grant. Raw HTTP
+    /// credentials and client-supplied identity/session fields stay outside it.
     pub fn admit_local_inbox(
         &mut self,
         decision: OwnerLocalDecision,

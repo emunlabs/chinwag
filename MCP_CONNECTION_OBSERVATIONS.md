@@ -49,3 +49,5 @@ A process killed before cleanup can produce no terminal summary. Missing output 
 An SDK subprocess fixture can prove negotiation, tool handling and cleanup for that fixture. It is not evidence that Cursor installed the server or read its inbox. Actual Cursor acceptance requires the human-approved client route and its own successful protocol exchange.
 
 The current GPUI preview does not read these in-process observations across processes. Its setup acknowledgment remains an OS handoff receipt. No live Connected indicator follows from a saved observation, a process name or an installation.
+
+The separate optional [runtime-owned HTTP binding](MCP_HTTP_BINDING.md) projects the same observations from its own held InboxServer through a native runtime GET. That transport owns its HTTP session and can observe its own reader and transport joins. It does not add a return path to existing stdio children or change the current GPUI preview.

@@ -1242,12 +1242,14 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "chinwag-bus-client",
+ "chinwag-bus-mcp",
  "chinwag-client-discovery",
  "chinwag-connector-registry",
  "chinwag-connectors",
  "chinwag-native-launch",
  "chrono",
  "crc32fast",
+ "getrandom 0.3.4",
  "libc",
  "rustix",
  "serde",
@@ -1273,14 +1275,20 @@ dependencies = [
 name = "chinwag-bus-mcp"
 version = "0.0.1"
 dependencies = [
+ "axum",
  "chinwag-bus-client",
  "chinwag-connector-registry",
  "chinwag-connectors",
+ "futures",
+ "http-body",
+ "reqwest 0.13.5",
  "rmcp",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -10042,6 +10050,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -10227,6 +10237,7 @@ dependencies = [
  "pastey 0.2.3",
  "pin-project-lite",
  "rand 0.10.3",
+ "reqwest 0.13.5",
  "rmcp-macros",
  "schemars",
  "serde",

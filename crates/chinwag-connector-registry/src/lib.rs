@@ -1,9 +1,10 @@
-//! In-process admission for one explicitly granted owner-local stdio inbox.
+//! In-process admission for explicitly granted owner-local inbox transports.
 //!
-//! The caller is the trusted launch boundary. MCP clientInfo, process names and
-//! HTTP headers cannot create grants here. Local stdio authority identifies no
-//! named application, human account or native conversation. This registry starts
-//! empty and neither persists nor restores trust. It performs no external I/O.
+//! The caller is the trusted owner boundary. MCP clientInfo, process names and
+//! HTTP headers cannot create grants here. Stdio and HTTP capability authority
+//! identify no named application, human account or native conversation. This
+//! registry starts empty and neither persists nor restores trust. It performs
+//! no external I/O and stores no HTTP credentials.
 #![deny(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -51,7 +52,8 @@ pub enum RegistryError {
 pub struct ConnectionId(String);
 
 impl ConnectionId {
-    /// Created by the trusted pipe owner, never from MCP clientInfo.
+    /// Created by the trusted transport owner, never from MCP clientInfo or a
+    /// caller-supplied HTTP session identifier. This is not a bearer credential.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         if value.is_empty()
@@ -148,21 +150,54 @@ pub enum IntegrationClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityKind {
     OwnerLocalStdioUnattributed,
+    OwnerLocalHttpCapabilityUnattributed,
 }
 
-/// An owner-local launch decision, not a wire request or an account assertion.
+/// An owner-local decision, not a wire request or an account assertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerLocalDecision {
     reference: String,
     connection: ConnectionId,
     destination: Destination,
+    authority: AuthorityKind,
 }
 
 impl OwnerLocalDecision {
+    /// Existing owner-launched stdio admission. No client metadata grants it.
     pub fn new(
         reference: impl Into<String>,
         connection: ConnectionId,
         destination: Destination,
+    ) -> Result<Self> {
+        Self::with_authority(
+            reference,
+            connection,
+            destination,
+            AuthorityKind::OwnerLocalStdioUnattributed,
+        )
+    }
+
+    /// Trusted owner HTTP enrollment only. The caller separately validates its
+    /// scoped capability; raw tokens, headers and session/client metadata never
+    /// enter this decision or its nonsecret reference/connection identifiers.
+    pub fn new_http_capability(
+        reference: impl Into<String>,
+        connection: ConnectionId,
+        destination: Destination,
+    ) -> Result<Self> {
+        Self::with_authority(
+            reference,
+            connection,
+            destination,
+            AuthorityKind::OwnerLocalHttpCapabilityUnattributed,
+        )
+    }
+
+    fn with_authority(
+        reference: impl Into<String>,
+        connection: ConnectionId,
+        destination: Destination,
+        authority: AuthorityKind,
     ) -> Result<Self> {
         let reference = reference.into();
         if reference.trim().is_empty()
@@ -175,6 +210,7 @@ impl OwnerLocalDecision {
             reference,
             connection,
             destination,
+            authority,
         })
     }
 }
@@ -248,6 +284,7 @@ pub struct ReadScope<'a> {
     binding: BindingId,
     generation: u64,
     destination: &'a Destination,
+    authority: AuthorityKind,
 }
 
 impl ReadScope<'_> {
@@ -264,7 +301,7 @@ impl ReadScope<'_> {
         Capability::InboxRead
     }
     pub fn authority(&self) -> AuthorityKind {
-        AuthorityKind::OwnerLocalStdioUnattributed
+        self.authority
     }
 }
 
@@ -281,9 +318,9 @@ struct Grant {
     revoked: bool,
 }
 
-// Only grant_local/register_local construct this evidence. No native/account
-// proof can be supplied through a process label or a deserialized JSON object.
-struct LocalStdioEvidence {
+// Only owner-local registration/admission constructs this evidence. No native
+// or account proof comes from a process label or a deserialized JSON object.
+struct OwnerLocalEvidence {
     connection: ConnectionId,
 }
 
@@ -291,7 +328,7 @@ struct Binding {
     id: BindingId,
     grant: GrantId,
     generation: u64,
-    evidence: LocalStdioEvidence,
+    evidence: OwnerLocalEvidence,
     lease_expires_at: Instant,
     state: BindingState,
 }
@@ -404,7 +441,7 @@ impl Registry {
                 id,
                 grant,
                 generation: 1,
-                evidence: LocalStdioEvidence {
+                evidence: OwnerLocalEvidence {
                     connection: connection.clone(),
                 },
                 lease_expires_at: expires_at,
@@ -457,7 +494,7 @@ impl Registry {
                 id,
                 grant,
                 generation: 1,
-                evidence: LocalStdioEvidence {
+                evidence: OwnerLocalEvidence {
                     connection: connection.clone(),
                 },
                 lease_expires_at,
@@ -517,6 +554,7 @@ impl Registry {
             binding,
             generation: current.generation,
             destination: &grant.decision.destination,
+            authority: grant.decision.authority,
         };
         Ok(read(&scope))
     }
@@ -669,7 +707,7 @@ impl Registry {
             generation: binding.generation,
             connection: binding.evidence.connection.clone(),
             destination: grant.decision.destination.clone(),
-            authority: AuthorityKind::OwnerLocalStdioUnattributed,
+            authority: grant.decision.authority,
             integration_class: IntegrationClass::ClientInitiatedMcp,
             capability: Capability::InboxRead,
             state,
