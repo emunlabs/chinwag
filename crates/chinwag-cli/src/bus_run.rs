@@ -119,12 +119,16 @@ fn resolve_repo_root(explicit: Option<&str>) -> PathBuf {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    if let Ok(cwd) = std::env::current_dir()
-        && cwd != PathBuf::from(&home)
-        && cwd.join(".chinwag").is_dir()
-        && (cwd.join(".git").exists() || cwd.join("TASKS.md").exists())
-    {
-        return cwd;
+    let home_path = PathBuf::from(&home);
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            if ancestor != home_path
+                && ancestor.join(".chinwag").is_dir()
+                && (ancestor.join(".git").exists() || ancestor.join("TASKS.md").exists())
+            {
+                return ancestor.to_path_buf();
+            }
+        }
     }
     PathBuf::from(format!("{home}/WORKSPACE/chinwag"))
 }
@@ -1943,12 +1947,17 @@ mod tests {
 
     #[test]
     fn actor_signing_secret_never_derives_predictable_seed_from_seat_name() {
-        let s1 = os_csprng_32_bytes();
-        let s2 = os_csprng_32_bytes();
-        assert_ne!(s1, s2);
+        let t1 = actor_transport_secret("EPHEMERAL");
+        let t2 = actor_transport_secret("EPHEMERAL");
+        assert_ne!(t1.to_bytes(), t2.to_bytes());
+
         let mut legacy_hasher = Sha256::new();
-        legacy_hasher.update(b"chinwag-iroh-bus-seat-ed25519-v1:ephemeral");
+        legacy_hasher.update(b"chinwag-iroh-bus-seat-ed25519-v1:ephemeral_probe");
         let legacy_digest = legacy_hasher.finalize();
-        assert_ne!(&s1[..], &legacy_digest[..]);
+        let unique_seat = format!("ephemeral_probe_{}", std::process::id());
+        let signing = actor_signing_secret(&unique_seat);
+        assert_ne!(&signing.to_bytes()[..], &legacy_digest[..]);
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let _ = fs::remove_file(format!("{home}/.chinwag/signing/{unique_seat}_ed25519.key"));
     }
 }

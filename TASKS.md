@@ -58,22 +58,22 @@
 - **Files:** `crates/chinwag-cli/src/bus_run.rs`, `TASKS.md`
 - **Scope:** When a worker posts a verified (`sig_verified == true`) `COMPLETED TASK-XX` or `[DONE]` message, automatically transition `### [IN_PROGRESS] TASK-XX` to `### [DONE] TASK-XX` under `.chinwag/bus/bus.lock` and promote the next `[READY]` task for that seat to `[IN_PROGRESS]`.
 
-### `[IN_PROGRESS]` `TASK-22` (`BUS-HARDEN-06`) — Remove Predictable Seat-Derived Key Fallback in `actor_signing_secret` & `actor_transport_secret`
+### `[DONE]` `TASK-22` (`BUS-HARDEN-06`) — Remove Predictable Seat-Derived Key Fallback in `actor_signing_secret` & `actor_transport_secret`
 - **Owner:** `■ RUST` (`GPT / Codex`)
 - **Files:** `crates/chinwag-cli/src/bus_run.rs`
 - **Scope:** Verify that `actor_signing_secret` and `actor_transport_secret` use `/dev/urandom` CSPRNG (`os_csprng_32_bytes`) instead of any predictable SHA-256 seat-name seed, and verify `auto_advance_tasks_markdown` unit test coverage (`cargo test -p chinwag-cli --bin chinwag`).
 
-### `[IN_PROGRESS]` `TASK-23` (`CHWG-PLUGIN-JCS-01`) — Full-Manifest Canonical JSON `Ed25519` Signing & `display_name` Tamper-Rejection
+### `[DONE]` `TASK-23` (`CHWG-PLUGIN-JCS-01`) — Full-Manifest Canonical JSON `Ed25519` Signing & `display_name` Tamper-Rejection
 - **Owner:** `■ ARCHITECT` (`GPT / Codex`)
 - **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `.chinwag/plugins/com.emunlabs.breakroom.cwplugin/manifest.json`
 - **Scope:** Verify that `canonical_plugin_manifest_payload` signs the entire canonical JSON `BTreeMap` object (excluding `payload_sha256` and `signature_ed25519`), so mutating `display_name` or any field in `manifest.json` fails verification.
 
-### `[READY]` `TASK-24` (`CHWG-CWCard-CLI-01`) — Captionizm™ `.cwcard` HPKE+BLAKE3+Ed25519 Sealed Card Envelope Verifier (`chinwag cwcard inspect | verify`)
+### `[DONE]` `TASK-24` (`CHWG-CWCard-CLI-01`) — Captionizm™ `.cwcard` HPKE+BLAKE3+Ed25519 Sealed Card Envelope Verifier (`chinwag cwcard inspect | verify`)
 - **Owner:** `■ ALISTAIR`
 - **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `.chinwag/plugins/com.emunlabs.breakroom.cwplugin/sample.cwcard.json`
 - **Scope:** Audit `verify_cwcard_json` and `chinwag cwcard verify --json` to confirm full-envelope `Ed25519` signature + `.chinwag/allowed_signers` verification on `.cwcard` sealed card envelopes.
 
-### `[READY]` `TASK-25` (`CHWG-BUS-TOP-01`) — Live 10-Seat Swarm Utilization Roster (`chinwag bus roster`) & Adversarial Gate
+### `[DONE]` `TASK-25` (`CHWG-BUS-TOP-01`) — Live 10-Seat Swarm Utilization Roster (`chinwag bus roster`) & Adversarial Gate
 - **Owner:** `■ QA`
 - **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-cli/src/feature_cli_run.rs`
 - **Scope:** Verify `chinwag bus roster --json`, `chinwag cwcard verify --json`, `chinwag plugin verify --json`, and all `35/35` `chinwag-cli` automated tests.

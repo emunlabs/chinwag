@@ -21,12 +21,16 @@ fn resolve_repo_root(args: &[String]) -> PathBuf {
         i += 1;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    if let Ok(cwd) = std::env::current_dir()
-        && cwd != PathBuf::from(&home)
-        && cwd.join(".chinwag").is_dir()
-        && (cwd.join(".git").exists() || cwd.join("TASKS.md").exists())
-    {
-        return cwd;
+    let home_path = PathBuf::from(&home);
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            if ancestor != home_path
+                && ancestor.join(".chinwag").is_dir()
+                && (ancestor.join(".git").exists() || ancestor.join("TASKS.md").exists())
+            {
+                return ancestor.to_path_buf();
+            }
+        }
     }
     PathBuf::from(format!("{home}/WORKSPACE/chinwag"))
 }
