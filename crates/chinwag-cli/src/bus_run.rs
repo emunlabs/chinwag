@@ -1756,7 +1756,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 ("FLINT", "Claude Opus 4.7"),
                 ("QA", "Claude Sonnet 4.6"),
                 ("ALISTAIR", "Claude Sonnet 4.6"),
-                ("TYPE", "Claude Sonnet 4.6"),
+                ("TYPE", "Claude Opus 5.5 XHigh"),
                 ("DEV-1", "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral Dev 1)"),
                 ("DEV-2", "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral Dev 2)"),
                 ("DEV-3", "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral Dev 3)"),
