@@ -134,8 +134,9 @@ fn agent_uuid(agent_upper: &str) -> Option<&'static str> {
 fn grokbot_dept(agent_upper: &str) -> &'static str {
     match agent_upper {
         "ALISTAIR" | "HOUSEKEEPING" | "INFRA BOT (GROK)" | "INFRAJR" | "QA" | "FLINT" | "DOCS"
-        | "MGMT-INFRA" | "INFRA" => "infra",
-        "ARCHITECT" | "RUST" | "INDEX" | "DEV-1" | "DEV-2" | "DEV-3" | "ENG" | "MGMT-ENG" => "eng",
+        | "MGMT-INFRA" | "INFRA" | "EPHEMERAL-QA" => "infra",
+        "ARCHITECT" | "RUST" | "INDEX" | "DEV-1" | "DEV-2" | "DEV-3" | "ENG" | "MGMT-ENG"
+        | "EPHEMERAL-DEV" => "eng",
         "VENTURE" | "MO" | "EAGLE-EYE" | "BIZFIN" | "INVESTIGATIONS" | "RECORD" | "DEX"
         | "MGMT-BIZFIN" => "bizfin",
         "DECLARATION" | "GROWTH" | "SOCIAL" | "S-AND-M" | "SALES" | "MGMT-S-AND-M" => "s-and-m",
@@ -318,6 +319,17 @@ fn strip_flint_banner(raw: &str) -> String {
     raw.trim().to_owned()
 }
 
+/// Extra `claude` CLI flags per seat. Flags verified against `claude --help`
+/// (v2.1.311): `--model <alias|full name>` (alias `opus` = latest Opus) and
+/// `--effort <low|medium|high|xhigh|max>`. Only TYPE is pinned; every other
+/// seat keeps the CLI default.
+fn claude_model_args(agent_upper: &str) -> &'static [&'static str] {
+    match agent_upper {
+        "TYPE" => &["--model", "opus", "--effort", "xhigh"],
+        _ => &[],
+    }
+}
+
 fn dispatch_to_engine(
     agent_upper: &str,
     full_prompt: &str,
@@ -328,6 +340,18 @@ fn dispatch_to_engine(
         && !mock.trim().is_empty()
     {
         return (mock, "mock-engine");
+    }
+
+    // 0. Ephemeral seats DEV-1..5 and QA-1..5 (plus legacy EPHEMERAL-DEV /
+    //    EPHEMERAL-QA) use Cloudflare Workers AI DeepSeek v4.1 Flash once the
+    //    credential file exists. Plain QA is NOT routed here. Off-switch:
+    //    EPHEMERAL_DEEPSEEK_DISABLE=1. The kill switch, 10-slot concurrency cap
+    //    and spend ledger live in deepseek_pool. Once active there is no
+    //    fallback to another engine.
+    if let Some(pool) = crate::deepseek_pool::pool_for_agent(agent_upper)
+        && crate::deepseek_pool::enabled()
+    {
+        return crate::deepseek_pool::run(pool, agent_upper, full_prompt);
     }
 
     let home = user_home();
@@ -430,7 +454,9 @@ fn dispatch_to_engine(
         PathBuf::from("/opt/homebrew/bin/claude")
     };
     if let Ok(out) = Command::new(&claude_bin)
-        .args(["--print", "--dangerously-skip-permissions", full_prompt])
+        .args(["--print", "--dangerously-skip-permissions"])
+        .args(claude_model_args(agent_upper))
+        .arg(full_prompt)
         .current_dir(&default_cwd)
         .env("PATH", &path_env)
         .envs(signing_env.iter().cloned())
@@ -722,4 +748,24 @@ pub fn run_agent_dispatch(
         return 1;
     }
     0
+}
+
+#[cfg(test)]
+mod claude_model_args_tests {
+    use super::claude_model_args;
+
+    #[test]
+    fn type_is_pinned_to_opus_xhigh() {
+        assert_eq!(
+            claude_model_args("TYPE"),
+            &["--model", "opus", "--effort", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn other_seats_use_cli_defaults() {
+        for seat in ["ALISTAIR", "QA", "MO", "FLINT", "type"] {
+            assert!(claude_model_args(seat).is_empty());
+        }
+    }
 }
