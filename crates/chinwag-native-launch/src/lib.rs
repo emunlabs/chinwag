@@ -501,6 +501,12 @@ fn canonical_absolute(path: &Path) -> bool {
             .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
 }
 
+/// Whether public metadata matches a supported native application recipe.
+/// This grants no opening authority and performs no I/O or native calls.
+pub fn is_launch_eligible(installation: &Installation) -> bool {
+    validate_installation(installation).is_ok()
+}
+
 fn validate_installation(installation: &Installation) -> Result<(), LaunchError> {
     let (name, bundle, executable) =
         recipe(installation.family).ok_or(LaunchError::UnsupportedInstallation)?;

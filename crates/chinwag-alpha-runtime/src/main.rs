@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use chinwag_alpha_runtime::onboarding::OnboardingService;
 use chinwag_alpha_runtime::{
     Result, RuntimeConfig, RuntimeError, RuntimeMode, launcher, server, signed::CliSignedSender,
 };
@@ -16,25 +18,29 @@ fn main() {
 }
 
 fn dispatch(mut args: Vec<String>) -> Result<()> {
-    if take_native_main_loop(&mut args)? {
+    let native_main_loop = take_native_main_loop(&mut args)?;
+    onboarding_journal(&args, native_main_loop)?;
+    if native_main_loop {
         #[cfg(target_os = "macos")]
         {
-            return chinwag_native_launch::main_loop::run_main_loop_host(move || run_async(args))
-                .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+            return chinwag_native_launch::main_loop::run_main_loop_host(move || {
+                run_async(args, true)
+            })
+            .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
         }
         #[cfg(not(target_os = "macos"))]
         return Err(RuntimeError::Unavailable(
             "native main-loop hosting requires macOS".into(),
         ));
     }
-    run_async(args)
+    run_async(args, false)
 }
 
-fn run_async(args: Vec<String>) -> Result<()> {
+fn run_async(args: Vec<String>, native_main_loop: bool) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(args))
+        .block_on(run(args, native_main_loop))
 }
 
 /// Native main-loop ownership is opt-in and changes no launch permissions.
@@ -63,7 +69,37 @@ fn take_native_main_loop(args: &mut Vec<String>) -> Result<bool> {
     Ok(true)
 }
 
-async fn run(args: Vec<String>) -> Result<()> {
+fn onboarding_journal(args: &[String], native_main_loop: bool) -> Result<Option<PathBuf>> {
+    let positions: Vec<_> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.as_str() == "--onboarding-journal")
+        .map(|(index, _)| index)
+        .collect();
+    let Some(&index) = positions.first() else {
+        return Ok(None);
+    };
+    if positions.len() != 1
+        || !native_main_loop
+        || !matches!(
+            args.first().map(String::as_str),
+            Some("serve-local" | "serve-shared")
+        )
+    {
+        return Err(RuntimeError::Invalid("--onboarding-journal requires one explicit --native-main-loop with serve-local or serve-shared".into()));
+    }
+    let path = args
+        .get(index + 1)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            RuntimeError::Invalid("--onboarding-journal requires an absolute directory".into())
+        })?;
+    Ok(Some(path))
+}
+
+async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
+    let onboarding_journal = onboarding_journal(&args, native_main_loop)?;
     let Some((command, rest)) = args.split_first() else {
         return Err(RuntimeError::Invalid(
             "use launch, serve-local, serve-shared or discover-clients".into(),
@@ -89,13 +125,14 @@ async fn run(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
     let allowed: &[&str] = match command.as_str() {
-        "serve-local" => &["--data-dir", "--port"],
+        "serve-local" => &["--data-dir", "--port", "--onboarding-journal"],
         "serve-shared" => &[
             "--ledger",
             "--port",
             "--signed-cli",
             "--repo",
             "--send-journal",
+            "--onboarding-journal",
         ],
         _ => return Err(RuntimeError::Invalid("unknown runtime command".into())),
     };
@@ -173,11 +210,33 @@ async fn run(args: Vec<String>) -> Result<()> {
             journal_dir,
         }
     };
-    server::serve(RuntimeConfig {
+    let config = RuntimeConfig {
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         mode,
-    })
-    .await
+    };
+    if let Some(path) = onboarding_journal {
+        #[cfg(target_os = "macos")]
+        {
+            match tokio::task::spawn_blocking(move || OnboardingService::new_native(&path)).await {
+                Ok(Ok(service)) => {
+                    return server::serve_with_onboarding(config, Arc::new(service)).await;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    eprintln!(
+                        "chinwag-alpha-runtime: native opening initialization unavailable; bus service continues with opening disabled; no recovery was attempted"
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            return Err(RuntimeError::Unavailable(
+                "native onboarding requires macOS".into(),
+            ));
+        }
+    }
+    server::serve(config).await
 }
 
 fn verify_signer_ledger(ledger: &std::path::Path, repo: &std::path::Path) -> Result<()> {
@@ -232,18 +291,88 @@ mod tests {
             assert_eq!(args, original);
         }
     }
+
+    #[test]
+    fn onboarding_journal_requires_explicit_native_host_and_absolute_scope() {
+        let ordinary = vec![
+            "serve-local".into(),
+            "--data-dir".into(),
+            "/fixture/state".into(),
+        ];
+        assert_eq!(onboarding_journal(&ordinary, false).unwrap(), None);
+        let opted_in = vec![
+            "serve-local".into(),
+            "--onboarding-journal".into(),
+            "/fixture/open-journal".into(),
+        ];
+        assert!(onboarding_journal(&opted_in, false).is_err());
+        assert_eq!(
+            onboarding_journal(&opted_in, true).unwrap(),
+            Some(PathBuf::from("/fixture/open-journal"))
+        );
+        for input in [
+            vec!["launch", "--onboarding-journal", "/fixture/journal"],
+            vec![
+                "discover-clients",
+                "--onboarding-journal",
+                "/fixture/journal",
+            ],
+            vec!["serve-local", "--onboarding-journal"],
+            vec!["serve-local", "--onboarding-journal", "relative"],
+            vec![
+                "serve-local",
+                "--onboarding-journal",
+                "/fixture/journal",
+                "--onboarding-journal",
+                "/fixture/other",
+            ],
+        ] {
+            let args: Vec<String> = input.into_iter().map(str::to_owned).collect();
+            assert!(onboarding_journal(&args, true).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_onboarding_optin_rejects_before_any_storage_or_signer_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = directory.path().join("new-opening-journal");
+        let error = run(
+            vec![
+                "serve-shared".into(),
+                "--ledger".into(),
+                "/missing-ledger".into(),
+                "--repo".into(),
+                "/missing-repo".into(),
+                "--signed-cli".into(),
+                "/missing-signer".into(),
+                "--onboarding-journal".into(),
+                journal.display().to_string(),
+            ],
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::Invalid(ref detail) if detail.contains("--native-main-loop"))
+        );
+        assert!(!journal.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
     #[tokio::test]
     async fn launcher_under_async_dispatch_returns_a_normal_missing_binary_error() {
         let root = tempfile::tempdir().unwrap();
-        let error = run(vec![
-            "launch".into(),
-            "--state-dir".into(),
-            root.path().join("state").display().to_string(),
-            "--desktop".into(),
-            root.path().join("absent-desktop").display().to_string(),
-            "--bus-url".into(),
-            "http://127.0.0.1:1".into(),
-        ])
+        let error = run(
+            vec![
+                "launch".into(),
+                "--state-dir".into(),
+                root.path().join("state").display().to_string(),
+                "--desktop".into(),
+                root.path().join("absent-desktop").display().to_string(),
+                "--bus-url".into(),
+                "http://127.0.0.1:1".into(),
+            ],
+            false,
+        )
         .await
         .unwrap_err();
         assert!(

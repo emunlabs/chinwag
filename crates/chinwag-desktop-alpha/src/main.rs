@@ -5,12 +5,19 @@ mod discovery_ui;
 mod drafts;
 #[cfg(test)]
 mod interaction_tests;
+#[cfg(test)]
+mod opening_interaction_tests;
+mod openings;
 mod outbox;
 use discovery_ui::{DiscoveryPanel, InventoryState};
 use drafts::DraftFile;
+use openings::{OpeningAttempt, OpeningStore};
 use outbox::{Attempt, AttemptState, Outbox};
 
-use chinwag_bus_client::{BusClient, BusMessage, ClientError, SendReceipt, SendRequest};
+use chinwag_bus_client::{
+    BusClient, BusMessage, ClientError, NativeOpenReceipt, NativeOpenRequest, SendReceipt,
+    SendRequest,
+};
 use chinwag_bus_model::{Conversation, SendState};
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable,
@@ -49,6 +56,14 @@ enum Connection {
     Failed(String),
 }
 
+struct OpeningFlight {
+    id: String,
+    attempt_endpoint: String,
+    view_endpoint: String,
+    epoch: u64,
+    generation: u64,
+}
+
 struct Workbench {
     conversation: Conversation,
     endpoint: Entity<InputState>,
@@ -67,6 +82,12 @@ struct Workbench {
     connection_generation: u64,
     client_inventory: DiscoveryPanel,
     inventory_task: Option<Task<()>>,
+    openings: Option<OpeningStore>,
+    opening_warning: Option<String>,
+    opening_tasks: HashMap<String, Task<()>>,
+    opening_generations: HashMap<String, u64>,
+    opening_sequence: u64,
+    opening_epoch: u64,
     load_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     check_task: Option<Task<()>>,
@@ -90,6 +111,13 @@ impl Workbench {
         initial_endpoint: String,
         draft_path: Option<std::path::PathBuf>,
     ) -> Self {
+        let (openings, opening_warning) = match draft_path.as_deref() {
+            Some(path) => match openings::path_for_drafts(path).and_then(OpeningStore::open) {
+                Ok(store) => (Some(store), None),
+                Err(error) => (None, Some(format!("Opening history unavailable: {error}. Opening is disabled; existing records are untouched."))),
+            },
+            None => (None, Some("Opening apps requires persistent opening history. Start with the alpha launcher to configure its storage.".into())),
+        };
         let (outbox, outbox_warning) = match draft_path.as_deref() {
             Some(path) => match outbox::path_for_drafts(path).and_then(Outbox::open) {
                 Ok(outbox) => (Some(outbox), None),
@@ -128,6 +156,8 @@ impl Workbench {
                 this.load_task = None;
                 this.inventory_task = None;
                 this.client_inventory.clear();
+                this.opening_epoch = this.opening_epoch.wrapping_add(1);
+                this.opening_generations.clear();
                 this.connection = Connection::Disconnected;
                 this.conversation.messages.clear();
                 this.conversation.last_error = None;
@@ -172,6 +202,12 @@ impl Workbench {
             connection_generation: 0,
             client_inventory: DiscoveryPanel::default(),
             inventory_task: None,
+            openings,
+            opening_warning,
+            opening_tasks: HashMap::new(),
+            opening_generations: HashMap::new(),
+            opening_sequence: 0,
+            opening_epoch: 0,
             load_task: None,
             send_task: None,
             check_task: None,
@@ -355,11 +391,17 @@ impl Workbench {
         let expected_endpoint = endpoint.to_owned();
         let requested_endpoint = expected_endpoint.clone();
         self.inventory_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
+            let (result, opening_status) = cx
                 .background_spawn(async move {
-                    BusClient::new(&requested_endpoint)
+                    let inventory = BusClient::new(&requested_endpoint)
                         .and_then(|client| client.clients())
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| error.to_string());
+                    let status = inventory.as_ref().ok().map(|_| {
+                        BusClient::new(&requested_endpoint)
+                            .and_then(|client| client.onboarding_status())
+                            .map_err(|error| error.to_string())
+                    });
+                    (inventory, status)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -370,6 +412,13 @@ impl Workbench {
                     result,
                     cx,
                 ) {
+                    if let Some(status) = opening_status {
+                        this.client_inventory.complete_opening_status(
+                            generation,
+                            &expected_endpoint,
+                            status,
+                        );
+                    }
                     cx.notify();
                 }
             });
@@ -390,6 +439,146 @@ impl Workbench {
             return false;
         }
         self.client_inventory.complete(generation, endpoint, result)
+    }
+
+    fn can_open_installation(&self, installation_id: &str, cx: &App) -> bool {
+        let endpoint = self.endpoint.read(cx).value().to_string();
+        self.opening_tasks.is_empty()
+            && self.client_inventory.endpoint.as_deref() == Some(endpoint.as_str())
+            && self
+                .client_inventory
+                .openable_copies()
+                .iter()
+                .any(|(id, _)| id == installation_id)
+            && self
+                .openings
+                .as_ref()
+                .is_some_and(|store| !store.blocks(&endpoint, installation_id))
+    }
+
+    fn open_installation(&mut self, installation_id: &str, cx: &mut Context<Self>) {
+        if !self.can_open_installation(installation_id, cx) {
+            return;
+        }
+        let endpoint = self.endpoint.read(cx).value().to_string();
+        let attempt = match self
+            .openings
+            .as_mut()
+            .expect("eligibility requires storage")
+            .prepare(&endpoint, installation_id)
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                self.opening_warning = Some(format!("Opening was not started: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        self.opening_warning = None;
+        self.start_opening_request(attempt, false, cx);
+    }
+
+    fn check_opening(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.opening_tasks.contains_key(id) {
+            return;
+        }
+        let Some(attempt) = self.openings.as_ref().and_then(|store| {
+            store
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == id && attempt.unresolved())
+                .cloned()
+        }) else {
+            return;
+        };
+        self.start_opening_request(attempt, true, cx);
+    }
+
+    fn start_opening_request(
+        &mut self,
+        attempt: OpeningAttempt,
+        check_only: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.opening_sequence = self.opening_sequence.wrapping_add(1);
+        let generation = self.opening_sequence;
+        let epoch = self.opening_epoch;
+        let view_endpoint = self.endpoint.read(cx).value().to_string();
+        let request_id = attempt.id.clone();
+        self.opening_generations
+            .insert(request_id.clone(), generation);
+        let flight = OpeningFlight {
+            id: request_id.clone(),
+            attempt_endpoint: attempt.endpoint.clone(),
+            view_endpoint,
+            epoch,
+            generation,
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let client =
+                        BusClient::new(&attempt.endpoint).map_err(|error| error.to_string())?;
+                    if check_only {
+                        client
+                            .application_open_receipt(&attempt.id)
+                            .map_err(|error| error.to_string())
+                    } else {
+                        client
+                            .open_application(
+                                &attempt.id,
+                                &NativeOpenRequest {
+                                    installation_id: attempt.installation_id,
+                                },
+                            )
+                            .map(Some)
+                            .map_err(|error| error.to_string())
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // Endpoint edits invalidate the receipt, but an HTTP worker may
+                // still be running. Retain its flight gate until it returns.
+                this.opening_tasks.remove(&flight.id);
+                this.apply_opening_result(&flight, result, cx);
+                cx.notify();
+            });
+        });
+        self.opening_tasks.insert(request_id, task);
+        cx.notify();
+    }
+
+    fn apply_opening_result(
+        &mut self,
+        flight: &OpeningFlight,
+        result: Result<Option<NativeOpenReceipt>, String>,
+        cx: &Context<Self>,
+    ) -> bool {
+        if self.opening_epoch != flight.epoch
+            || self.endpoint.read(cx).value().as_ref() != flight.view_endpoint
+            || self.opening_generations.get(&flight.id) != Some(&flight.generation)
+        {
+            return false;
+        }
+        let Some(store) = &mut self.openings else {
+            return false;
+        };
+        if !store
+            .attempts
+            .iter()
+            .any(|attempt| attempt.id == flight.id && attempt.endpoint == flight.attempt_endpoint)
+        {
+            return false;
+        }
+        self.opening_tasks.remove(&flight.id);
+        self.opening_generations.remove(&flight.id);
+        let update = match result {
+            Ok(Some(receipt)) => store.apply_receipt(&flight.id, receipt),
+            Ok(None) => store.mark_uncertain(&flight.id, "The host has no saved receipt. This does not prove the app stayed closed. It was not opened again."),
+            Err(error) => store.mark_uncertain(&flight.id, &error),
+        };
+        self.opening_warning = update.err().map(|error| format!("Opening status was not accepted or saved: {error}. Original attempt retained; check its status."));
+        true
     }
 
     fn select_room(&mut self, room: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -735,6 +924,112 @@ impl Workbench {
         let loading = matches!(self.client_inventory.state, InventoryState::Loading);
         let ready = matches!(self.client_inventory.state, InventoryState::Ready(_));
         let configured_endpoint = self.endpoint.read(cx).value().to_string();
+        let exact_copies = self
+            .client_inventory
+            .openable_copies()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, label))| {
+                let enabled = self.can_open_installation(&id, cx);
+                let latest = self
+                    .openings
+                    .as_ref()
+                    .and_then(|store| {
+                        store.attempts.iter().rev().find(|attempt| {
+                            attempt.endpoint == configured_endpoint && attempt.installation_id == id
+                        })
+                    })
+                    .map(OpeningAttempt::summary);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().text_xs().child(label))
+                            .child(
+                                Button::new(("open-installation", index))
+                                    .small()
+                                    .label("Open/reuse")
+                                    .disabled(!enabled)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_installation(&id, cx)
+                                    })),
+                            ),
+                    )
+                    .when_some(latest, |this, summary| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(summary),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let opening_history = self
+            .openings
+            .as_ref()
+            .map(|store| store.attempts.iter().rev().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, attempt)| {
+                let checking = self.opening_tasks.contains_key(&attempt.id);
+                let unresolved = attempt.unresolved();
+                let summary = attempt.summary();
+                let id = attempt.id.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().text_xs().child(format!(
+                                "Copy {} · {}",
+                                openings::short_installation_id(&attempt.installation_id),
+                                attempt.endpoint
+                            )))
+                            .when(unresolved, |this| {
+                                this.child(
+                                    Button::new(("check-opening-status", index))
+                                        .small()
+                                        .label(if checking {
+                                            "Checking…"
+                                        } else {
+                                            "Check opening status"
+                                        })
+                                        .disabled(checking)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.check_opening(&id, cx)
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(summary),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let opening_warning = self.opening_warning.clone().filter(|_| {
+            !opening_history.is_empty()
+                || self
+                    .client_inventory
+                    .opening_status
+                    .as_ref()
+                    .is_some_and(|status| status.native_open_allowed)
+        });
         div()
                 .flex().flex_col().gap_2().border_t_1().border_color(cx.theme().border).pt_3()
                 .child(div().flex().items_center().gap_2()
@@ -768,6 +1063,14 @@ impl Workbench {
                         .child(div().id("detected-client-inventory").max_h(px(150.))
                             .overflow_y_scroll().flex().flex_col().gap_2()
                             .children(rows.into_iter().map(|row| div().text_xs().child(row))))
+                        .when(!exact_copies.is_empty(), |this| this.child(div().id("openable-installed-copies")
+                            .max_h(px(170.)).overflow_y_scroll().flex().flex_col().gap_1().children(exact_copies)))
+                        .when_some(self.client_inventory.opening_notice.clone(), |this, notice| this.child(
+                            div().text_xs().text_color(cx.theme().muted_foreground).child(notice)))
+                        .when(!opening_history.is_empty(), |this| this.child(div().id("opening-history")
+                            .max_h(px(170.)).overflow_y_scroll().flex().flex_col().gap_1().children(opening_history)))
+                        .when_some(opening_warning, |this, warning| this.child(
+                            div().text_xs().text_color(cx.theme().danger).child(warning)))
                         .when(ready, |this| this.child(
                             Button::new("toggle-client-discovery-details").small()
                                 .label(if self.client_inventory.details_expanded { "Hide details" } else { "Discovery details" })

@@ -9,8 +9,9 @@ license.workspace = true
 chinwag-connectors = { path = "../chinwag-connectors" }
 chinwag-connector-registry = { path = "../chinwag-connector-registry" }
 chinwag-client-discovery = { path = "../chinwag-client-discovery" }
+chinwag-native-launch = { path = "../chinwag-native-launch" }
 chinwag-bus-client = { path = "../chinwag-bus-client" }
-axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "original-uri"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
@@ -19,8 +20,7 @@ sha2.workspace = true
 thiserror.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-chinwag-native-launch = { path = "../chinwag-native-launch" }
-
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+libc = "=0.2.191"

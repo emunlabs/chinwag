@@ -14,10 +14,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod discovery;
+mod onboarding;
 pub use discovery::{
     ClientInventory, ClientKind, DiscoveredClient, DiscoveryCoverage, DiscoveryState,
     InstallationCoverage, InstallationInventory, InstallationState, InstalledClient,
 };
+pub use onboarding::{NativeOpenReceipt, NativeOpenRequest, NativeOpenState, OnboardingStatus};
 
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_MESSAGE_LIMIT: usize = 200;
@@ -138,6 +140,10 @@ pub enum ClientError {
     InvalidResponse(String),
     #[error("send outcome unknown; do not resend automatically: {reason}")]
     SendOutcomeUnknown { reason: String },
+    #[error(
+        "application opening outcome unknown; check its receipt before opening again: {reason}"
+    )]
+    NativeOpenOutcomeUnknown { reason: String },
 }
 
 impl ClientError {

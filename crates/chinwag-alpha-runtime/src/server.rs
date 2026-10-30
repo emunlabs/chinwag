@@ -22,9 +22,11 @@ use sha2::{Digest, Sha256};
 use crate::discovery::{
     DiscoveryFailure, DiscoveryService, InventorySource, NativeInventorySource,
 };
+use crate::onboarding::OnboardingService;
 use crate::{Result, RuntimeConfig, RuntimeError, RuntimeMode, SignedSender};
 
 mod journal;
+mod onboarding;
 use journal::AttemptJournal;
 
 pub const LOCAL_TRANSPORT: &str = "local-jsonl-alpha (unsigned, isolated)";
@@ -37,7 +39,11 @@ const MAX_RESPONSE: usize = 900_000;
 const ROOMS: [&str; 4] = ["#mgmt", "#eng", "#qa", "#alpha"];
 
 #[derive(Clone)]
-struct AppState(Arc<Backend>, Arc<DiscoveryService>);
+struct AppState(
+    Arc<Backend>,
+    Arc<DiscoveryService>,
+    Option<Arc<OnboardingService>>,
+);
 
 enum Backend {
     Local {
@@ -60,9 +66,26 @@ pub fn router(config: RuntimeConfig) -> Result<Router> {
     router_with_discovery(config, Arc::new(NativeInventorySource))
 }
 
+/// Opt-in only: the caller owns the target host's serviced native main loop.
+/// A service is never constructed implicitly by the default router.
+pub fn router_with_onboarding(
+    config: RuntimeConfig,
+    service: Arc<OnboardingService>,
+) -> Result<Router> {
+    router_with_components(config, Arc::new(NativeInventorySource), Some(service))
+}
+
 fn router_with_discovery(
     config: RuntimeConfig,
     source: Arc<dyn InventorySource>,
+) -> Result<Router> {
+    router_with_components(config, source, None)
+}
+
+fn router_with_components(
+    config: RuntimeConfig,
+    source: Arc<dyn InventorySource>,
+    onboarding: Option<Arc<OnboardingService>>,
 ) -> Result<Router> {
     if config.bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
         return Err(RuntimeError::Invalid("bind must be 127.0.0.1".into()));
@@ -122,19 +145,52 @@ fn router_with_discovery(
                 .head(deny_discovery_method)
                 .fallback(deny_discovery_method),
         )
+        .route(
+            "/api/onboarding/status",
+            get(onboarding::status)
+                .head(onboarding::deny_get_method)
+                .fallback(onboarding::deny_get_method),
+        )
+        .route(
+            "/api/onboarding/open",
+            axum::routing::post(onboarding::open).fallback(onboarding::deny_post_method),
+        )
+        .route(
+            "/api/onboarding/opens/{id}",
+            get(onboarding::lookup)
+                .head(onboarding::deny_get_method)
+                .fallback(onboarding::deny_get_method),
+        )
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(MAX_REQUEST))
         .with_state(AppState(
             Arc::new(backend),
             Arc::new(DiscoveryService::new(source)),
+            onboarding,
         )))
 }
 
 pub async fn serve(config: RuntimeConfig) -> Result<()> {
+    serve_optional_onboarding(config, None).await
+}
+
+pub async fn serve_with_onboarding(
+    config: RuntimeConfig,
+    service: Arc<OnboardingService>,
+) -> Result<()> {
+    serve_optional_onboarding(config, Some(service)).await
+}
+
+async fn serve_optional_onboarding(
+    config: RuntimeConfig,
+    onboarding: Option<Arc<OnboardingService>>,
+) -> Result<()> {
     let bind = config.bind;
-    let app = tokio::task::spawn_blocking(move || router(config))
-        .await
-        .map_err(|_| RuntimeError::Unavailable("runtime initialization worker failed".into()))??;
+    let app = tokio::task::spawn_blocking(move || {
+        router_with_components(config, Arc::new(NativeInventorySource), onboarding)
+    })
+    .await
+    .map_err(|_| RuntimeError::Unavailable("runtime initialization worker failed".into()))??;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -216,23 +272,25 @@ async fn discover_clients(State(state): State<AppState>, headers: HeaderMap) -> 
             "explicit native metadata discovery intent required".into(),
         ));
     }
-    blocking_http(move || match state.1.inventory() {
-        Ok(inventory) => {
-            let bytes = serde_json::to_vec(&inventory).map_err(json_error)?;
-            if bytes.len() > MAX_RESPONSE {
-                return Err(RuntimeError::Unavailable(
-                    "client inventory exceeds the response limit".into(),
-                ));
+    blocking_http(
+        move || match state.1.inventory_with_onboarding(state.2.as_deref()) {
+            Ok(inventory) => {
+                let bytes = serde_json::to_vec(&inventory).map_err(json_error)?;
+                if bytes.len() > MAX_RESPONSE {
+                    return Err(RuntimeError::Unavailable(
+                        "client inventory exceeds the response limit".into(),
+                    ));
+                }
+                let value = serde_json::from_slice(&bytes).map_err(json_error)?;
+                Ok((StatusCode::OK, value))
             }
-            let value = serde_json::from_slice(&bytes).map_err(json_error)?;
-            Ok((StatusCode::OK, value))
-        }
-        Err(DiscoveryFailure::Busy) => Ok((
-            StatusCode::CONFLICT,
-            json!({"ok":false,"error":DiscoveryFailure::Busy.to_string()}),
-        )),
-        Err(error) => Err(RuntimeError::Unavailable(error.to_string())),
-    })
+            Err(DiscoveryFailure::Busy) => Ok((
+                StatusCode::CONFLICT,
+                json!({"ok":false,"error":DiscoveryFailure::Busy.to_string()}),
+            )),
+            Err(error) => Err(RuntimeError::Unavailable(error.to_string())),
+        },
+    )
     .await
 }
 

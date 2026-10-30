@@ -3,6 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 pub mod discovery;
 pub mod launcher;
+pub mod onboarding;
 pub mod server;
 pub mod signed;
 

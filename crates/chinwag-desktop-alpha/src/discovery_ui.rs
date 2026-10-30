@@ -1,4 +1,4 @@
-use chinwag_bus_client::{ClientInventory, ClientKind};
+use chinwag_bus_client::{ClientInventory, ClientKind, OnboardingStatus};
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 
@@ -142,6 +142,8 @@ pub struct DiscoveryPanel {
     pub state: InventoryState,
     pub expanded: bool,
     pub details_expanded: bool,
+    pub opening_status: Option<OnboardingStatus>,
+    pub opening_notice: Option<String>,
     generation: u64,
 }
 
@@ -152,6 +154,8 @@ impl Default for DiscoveryPanel {
             state: InventoryState::NotRequested,
             expanded: true,
             details_expanded: false,
+            opening_status: None,
+            opening_notice: None,
             generation: 0,
         }
     }
@@ -162,12 +166,16 @@ impl DiscoveryPanel {
         self.generation = self.generation.wrapping_add(1);
         self.endpoint = None;
         self.state = InventoryState::NotRequested;
+        self.opening_status = None;
+        self.opening_notice = None;
     }
 
     pub fn begin(&mut self, endpoint: String) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.endpoint = Some(endpoint);
         self.state = InventoryState::Loading;
+        self.opening_status = None;
+        self.opening_notice = None;
         self.generation
     }
 
@@ -185,6 +193,73 @@ impl DiscoveryPanel {
             Err(error) => InventoryState::Unavailable(error.chars().take(300).collect()),
         };
         true
+    }
+
+    pub fn complete_opening_status(
+        &mut self,
+        generation: u64,
+        endpoint: &str,
+        result: Result<OnboardingStatus, String>,
+    ) -> bool {
+        if generation != self.generation
+            || self.endpoint.as_deref() != Some(endpoint)
+            || !matches!(self.state, InventoryState::Ready(_))
+        {
+            return false;
+        }
+        match result {
+            Ok(status) if status.validate().is_ok() => {
+                self.opening_notice = (!status.native_open_allowed)
+                    .then(|| "Opening is disabled for this host.".into());
+                self.opening_status = Some(status);
+            }
+            _ => {
+                self.opening_status = None;
+                self.opening_notice =
+                    Some("Opening is unavailable on this host. Finding apps still works.".into());
+            }
+        }
+        true
+    }
+
+    pub fn openable_copies(&self) -> Vec<(String, String)> {
+        let InventoryState::Ready(inventory) = &self.state else {
+            return Vec::new();
+        };
+        let Some(status) = &self.opening_status else {
+            return Vec::new();
+        };
+        if !status.native_open_allowed {
+            return Vec::new();
+        }
+        let Some(installed) = &inventory.installations else {
+            return Vec::new();
+        };
+        let apps: Vec<_> = installed
+            .apps
+            .iter()
+            .filter(|app| {
+                app.kind == ClientKind::Application
+                    && status.openable_installation_ids.contains(&app.id)
+            })
+            .collect();
+        apps.iter()
+            .map(|app| {
+                let suffix = (8..=64)
+                    .step_by(4)
+                    .filter_map(|length| app.id.get(app.id.len().saturating_sub(length)..))
+                    .find(|suffix| {
+                        !apps
+                            .iter()
+                            .any(|other| other.id != app.id && other.id.ends_with(suffix))
+                    })
+                    .unwrap_or(&app.id);
+                (
+                    app.id.clone(),
+                    format!("{} · copy {suffix}", family_label(&app.family)),
+                )
+            })
+            .collect()
     }
 
     pub fn summary(&self) -> String {

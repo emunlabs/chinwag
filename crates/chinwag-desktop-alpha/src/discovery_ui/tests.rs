@@ -8,6 +8,47 @@ fn snapshot(host: &str) -> ClientInventory {
 }
 
 #[test]
+fn opening_is_default_disabled_and_exact_application_ids_require_same_inventory_status() {
+    let mut raw = snapshot("Studio");
+    let first = format!("{}12345678", "a".repeat(56));
+    let second = format!("{}12345678", "b".repeat(56));
+    let cli = "c".repeat(64);
+    raw.installations = Some(serde_json::from_value(serde_json::json!({
+        "observed_at_unix_ms":1793361786000_u64,
+        "apps":[
+            {"id":first,"family":"grok_bot","kind":"application","running_instances":0,"state":"installed_unverified"},
+            {"id":second,"family":"grok_bot","kind":"application","running_instances":1,"state":"installed_unverified"},
+            {"id":cli,"family":"grok_bot","kind":"command_line","running_instances":0,"state":"installed_unverified"}
+        ],
+        "coverage":{"entry_capacity":4096,"entries_examined":3,"installation_capacity":128,"capacity_reached":false,"unavailable_roots":0,"invalid_metadata":0}
+    })).unwrap());
+    let mut panel = DiscoveryPanel::default();
+    assert!(panel.openable_copies().is_empty());
+    let generation = panel.begin("bus".into());
+    panel.complete(generation, "bus", Ok(raw));
+    assert!(panel.openable_copies().is_empty());
+    let status = OnboardingStatus {
+        schema: "chinwag-native-onboarding/v1".into(),
+        native_open_allowed: true,
+        openable_installation_ids: vec![first.clone(), second.clone(), cli, "d".repeat(64)],
+    };
+    assert!(panel.complete_opening_status(generation, "bus", Ok(status.clone())));
+    let copies = panel.openable_copies();
+    assert_eq!(copies.len(), 2);
+    assert_eq!(copies[0].0, first);
+    assert_eq!(copies[1].0, second);
+    assert_ne!(
+        copies[0].1, copies[1].1,
+        "same suffix must expand enough to distinguish copies"
+    );
+    assert_eq!(panel.rows().len(), 1, "family grouping remains intact");
+    assert!(panel.rows()[0].contains("not connected"));
+    panel.clear();
+    assert!(!panel.complete_opening_status(generation, "bus", Ok(status)));
+    assert!(panel.openable_copies().is_empty());
+}
+
+#[test]
 fn grouped_components_are_not_invented_agents_and_host_comes_from_server_snapshot() {
     let mut panel = DiscoveryPanel::default();
     let generation = panel.begin("http://127.0.0.1:44341".into());

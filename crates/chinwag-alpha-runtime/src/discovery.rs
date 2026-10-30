@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
+use crate::onboarding::{OnboardingService, observed_installation_id};
 use chinwag_bus_client::{
     ClientInventory, ClientKind, DiscoveredClient, DiscoveryCoverage, DiscoveryState,
     InstallationCoverage, InstallationInventory, InstallationState, InstalledClient,
@@ -77,14 +78,58 @@ impl DiscoveryService {
     }
 
     pub fn inventory(&self) -> std::result::Result<ClientInventory, DiscoveryFailure> {
-        let mut host = self.host.try_lock().map_err(lock_failure)?;
+        self.inventory_with_onboarding(None)
+    }
+
+    /// Reuses this explicit scan's raw observations. Cache failure disables
+    /// opening, while a healthy metadata response remains available.
+    pub fn inventory_with_onboarding(
+        &self,
+        onboarding: Option<&OnboardingService>,
+    ) -> std::result::Result<ClientInventory, DiscoveryFailure> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut host = match self.host.try_lock() {
+            Ok(host) => host,
+            Err(error) => {
+                if let Some(onboarding) = onboarding {
+                    let _ = onboarding.invalidate();
+                }
+                return Err(lock_failure(error));
+            }
+        };
+        let result = self.collect_inventory(&mut host, deadline);
+        if let Some(onboarding) = onboarding {
+            let cached = match &result {
+                Ok((_, process, Some(installed))) if Instant::now() < deadline => {
+                    onboarding.observe(process, installed).is_ok() && Instant::now() < deadline
+                }
+                _ => false,
+            };
+            if !cached {
+                let _ = onboarding.invalidate();
+            }
+        }
+        // Keep scan and cache publication under the same existing scan gate so
+        // an older completion cannot overwrite a newer observation's targets.
+        drop(host);
+        result.map(|(inventory, _, _)| inventory)
+    }
+
+    fn collect_inventory(
+        &self,
+        host: &mut ConnectorHost,
+        deadline: Instant,
+    ) -> std::result::Result<
+        (
+            ClientInventory,
+            InventorySnapshot,
+            Option<chinwag_client_discovery::InstalledSnapshot>,
+        ),
+        DiscoveryFailure,
+    > {
         let now = Instant::now();
         let invocation = host
-            .begin(
-                BuiltinConnector::NativeClients,
-                now + Duration::from_secs(8),
-                now,
-            )
+            .begin(BuiltinConnector::NativeClients, deadline, now)
             .map_err(|_| DiscoveryFailure::Unavailable)?;
         host.clients(&invocation, Instant::now, || {
             let snapshot = self.source.snapshot()?;
@@ -93,12 +138,19 @@ impl DiscoveryService {
                 .as_ref()
                 .map(|installed| project_installed(&snapshot, installed))
                 .transpose()?;
-            let mut inventory = project(snapshot)?;
+            let mut inventory = project(snapshot.clone())?;
             inventory.installations = installations;
             inventory
                 .validate()
                 .map_err(|_| DiscoveryFailure::InvalidSnapshot)?;
-            Ok(inventory)
+            if serde_json::to_vec(&inventory)
+                .map_err(|_| DiscoveryFailure::InvalidSnapshot)?
+                .len()
+                > 900_000
+            {
+                return Err(DiscoveryFailure::InvalidSnapshot);
+            }
+            Ok((inventory, snapshot, installed))
         })
         .map_err(|_| DiscoveryFailure::Unavailable)?
     }
@@ -118,19 +170,8 @@ fn project_installed(
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .ok_or(DiscoveryFailure::InvalidSnapshot)?;
-            // Host identity namespaces even identical installations on two machines.
-            let mut hash = Sha256::new();
-            hash.update(b"chinwag-installed-observation/v1\0");
-            for field in [
-                process.host.label.as_bytes(),
-                process.host.boot_uuid.as_bytes(),
-                row.installation.id.as_bytes(),
-            ] {
-                hash.update((field.len() as u64).to_be_bytes());
-                hash.update(field);
-            }
             Ok(InstalledClient {
-                id: format!("{:x}", hash.finalize()),
+                id: observed_installation_id(process, &row.installation),
                 family,
                 kind: match row.installation.kind {
                     InstallationKind::Application => ClientKind::Application,

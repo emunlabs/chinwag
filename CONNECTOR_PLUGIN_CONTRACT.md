@@ -40,7 +40,9 @@ GPUI groups rows by family for presentation. Original instance and installation 
 
 This check-in implements trusted linked components. It does not implement external `.cwplugin` loading, independently updated workers, dynamic libraries, signed archives, TUF, Seatbelt containment or release-key handling. The descriptor schema is `chinwag-builtin-connector/v1`, distinct from the reference's signed archive manifest. No external-package fallback exists.
 
-Human onboarding still needs the supported native-launch coordinator, client-specific bindings, lifecycle invalidation and scoped remote publication. Launch plans must name an exact revalidated installation and a human-started operation. Reused applications remain externally owned and must not be terminated on disconnect. Opening an application is separate from connecting its protocol.
+Human onboarding uses the separate `chinwag-native-launch` component for supported exact-copy opening. The runtime owns its human-action boundary, exact public reobservation, persistent consumed attempts and optional native main queue. This is a host function, not a newly granted native-open capability in the two read-only descriptors above. GPUI offers the action only for eligible IDs from the selected host; neither discovery nor component enablement dispatches it. See [HUMAN_ONBOARDING.md](HUMAN_ONBOARDING.md).
+
+Client-specific bindings, lifecycle invalidation and scoped remote publication remain separate work. Reused applications remain externally owned and must not be terminated on disconnect. Opening an application is separate from connecting its protocol.
 
 The current shared MCP route is owner-local, unattributed and read-only. Its successful SDK fixture/native-ledger read does not establish that a named GPT/Claude/Gemini client enrolled or that Grok Bot received a group message. General remote ingress is not exposed by these loopback-only alpha services.
 

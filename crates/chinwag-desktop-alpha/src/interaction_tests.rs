@@ -266,7 +266,7 @@ fn retained_native_composer_preserves_multiline_and_disconnected_send_guard(
     });
 }
 
-fn discovery_snapshot_fixture(host: &str) -> serde_json::Value {
+pub(super) fn discovery_snapshot_fixture(host: &str) -> serde_json::Value {
     serde_json::json!({"schema":"chinwag-client-inventory/v1","observed_at_unix_ms":1793361786000_u64,"host_label":host,
         "coverage":{"pid_capacity":4096,"candidate_capacity":128,"sampled_pid_count":100,"candidate_process_count":75,"omitted_candidate_count":0,"raced_processes":0,"permission_denied_processes":0,"unavailable_processes":0,"invalid_process_metadata":0,"unclassified_interpreters":5,"unresolved_components":0,"pid_capacity_reached":false,"candidate_capacity_reached":false},
         "clients":[{"id":"a".repeat(64),"family":"grok_bot","kind":"application","state":"detected_unverified","component_count":75}]})
@@ -324,6 +324,11 @@ fn discovery_http_fixture(
                     200,
                     serde_json::json!([{"id":"fixture-history","seq":7,"ts_iso":"2026-10-30T12:00:00Z","room":"#alpha","sender":"Brian","body":"History remains usable","sig_verified":false}]),
                 )
+            } else if request.starts_with("GET /api/onboarding/status ") {
+                (
+                    200,
+                    serde_json::json!({"schema":"chinwag-native-onboarding/v1","native_open_allowed":false,"openable_installation_ids":[]}),
+                )
             } else if request.starts_with("GET /api/bus/clients ") {
                 assert!(
                     request
@@ -357,8 +362,11 @@ fn explicit_connect_uses_server_inventory_and_old_server_404_does_not_break_hist
 ) {
     cx.update(init);
     for missing in [false, true] {
-        let (endpoint, worker) =
-            discovery_http_fixture(missing, 3, discovery_snapshot_fixture("Studio"));
+        let (endpoint, worker) = discovery_http_fixture(
+            missing,
+            if missing { 3 } else { 4 },
+            discovery_snapshot_fixture("Studio"),
+        );
         let (window, view) = cx.update(|cx| {
             open_window(WindowOptions::default(), cx, |window, cx| {
                 cx.new(|cx| Workbench::with_settings(window, cx, endpoint.clone(), None))
@@ -449,7 +457,7 @@ fn find_apps_is_one_explicit_read_with_family_rows_and_collapsible_details(
         "coverage":{"entry_capacity":512,"entries_examined":12,"installation_capacity":128,
             "capacity_reached":false,"unavailable_roots":0,"invalid_metadata":0}
     });
-    let (endpoint, worker) = discovery_http_fixture(false, 1, inventory);
+    let (endpoint, worker) = discovery_http_fixture(false, 2, inventory);
     let (window, view) = cx.update(|cx| {
         open_window(WindowOptions::default(), cx, |window, cx| {
             cx.new(|cx| Workbench::with_settings(window, cx, endpoint.clone(), None))
@@ -464,8 +472,9 @@ fn find_apps_is_one_explicit_read_with_family_rows_and_collapsible_details(
     cx.run_until_parked();
     let requests = worker.join().unwrap();
     cx.run_until_parked();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with("GET /api/bus/clients "));
+    assert!(requests[1].starts_with("GET /api/onboarding/status "));
     cx.update(|cx| {
         let view = view.read(cx);
         assert!(matches!(view.connection, Connection::Disconnected));
