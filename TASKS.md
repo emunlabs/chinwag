@@ -64,7 +64,7 @@
 - **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `.chinwag/plugins/com.emunlabs.breakroom.cwplugin/manifest.json`, `.chinwag/plugins/com.emunlabs.breakroom.cwplugin/sample.cwcard.json`
 - **Scope:** Verify that `chinwag plugin verify --json`, `chinwag cwcard verify --json`, and `http://127.0.0.1:44331/api/health` enforce `"studio_issuer": "Rogue Machine Media LLC (d/b/a Lag Lords)"` and `"brand_firewall_invariant": "INV-BRAND-FIREWALL-01"`.
 
-### `[IN_PROGRESS]` `TASK-28` (`CHWG-PLUGIN-DOMAIN-SEP-01`) — Domain-Separated JCS Transcripts (`manifest` vs `cwcard` vs `cwbond`)
+### `[DONE]` `TASK-28` (`CHWG-PLUGIN-DOMAIN-SEP-01`) — Domain-Separated JCS Transcripts (`manifest` vs `cwcard` vs `cwbond`)
 - **Owner:** `■ ALISTAIR`
 - **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`
 - **Scope:** Audit `canonical_plugin_manifest_payload` (`chinwag-plugin-manifest-sig-v2|`), `canonical_cwcard_payload` (`chinwag-cwcard-envelope-sig-v1|`), and `canonical_bond_payload` (`chinwag-triple-b-bond-sig-v2|`) and run `cargo test -p chinwag-cli --bin chinwag`.
@@ -79,7 +79,7 @@
 - **Files:** `crates/chinwag-cli/src/ui_workbench_run.rs`, `crates/chinwag-ui/src/app.rs`
 - **Scope:** Run `cargo test -p chinwag-cli --bin chinwag`, `cargo test -p chinwag-ui`, and verify live HTTP 200 responses on `http://127.0.0.1:44331/api/health`, `/api/bus/status`, `/api/bus/roster`, `/api/tasks`, `/api/bonds`, and `/captionizm`.
 
-### `[IN_PROGRESS]` `TASK-32` (`CHWG-UI-DIOXUS-WORKBENCH-01`) — Live 12-View `workbench-v5` + `live-bus-bridge.js` & `chinwag-ui` Route Verification
+### `[DONE]` `TASK-32` (`CHWG-UI-DIOXUS-WORKBENCH-01`) — Live 12-View `workbench-v5` + `live-bus-bridge.js` & `chinwag-ui` Route Verification
 - **Owner:** `■ TYPE`
 - **Files:** `crates/chinwag-cli/src/ui_workbench_run.rs`, `crates/chinwag-ui/src/app.rs`, `crates/chinwag-ui/src/lib.rs`
 - **Scope:** Verify the live 12-view Workbench (`http://127.0.0.1:44331/`), `/live-bus-bridge.js` real-time `iroh` QUIC telemetry & composer bridge, `Captionizm™` (`/captionizm`), `chinwag.tv` (`/chinwag-tv`), and all `chinwag-ui` Dioxus routes (`/`, `/comms/:channel_id`, `/workbench`, `/tasks`, `/roster`, `/captionizm`, `/a509`).
@@ -89,7 +89,7 @@
 - **Files:** `crates/chinwag-cli/src/ui_workbench_run.rs`, `crates/chinwag-cli/src/main.rs`
 - **Scope:** Verify `chinwag ui status --json` and test `GET /api/bus/status`, `GET /api/bus/messages`, `GET /api/bus/roster`, `GET /api/tasks`, `GET /api/a509`, `GET /api/bonds`, `GET /api/plugins`, and `GET /api/cwcards` on `http://127.0.0.1:44331`.
 
-### `[READY]` `TASK-33` (`CHWG-UI-CAPTIONIZM-PLUGIN-01`) — `Captionizm™` & `chinwag.tv` Broadcast Arena Asset & Audio Verification
+### `[IN_PROGRESS]` `TASK-33` (`CHWG-UI-CAPTIONIZM-PLUGIN-01`) — `Captionizm™` & `chinwag.tv` Broadcast Arena Asset & Audio Verification
 - **Owner:** `■ TYPE`
 - **Files:** `crates/chinwag-cli/src/ui_workbench_run.rs`, `crates/chinwag-ui/src/app.rs`
 - **Scope:** Verify `/07-workbench-captionizm-game.html`, `/12-chinwag-tv-broadcast-arena.html`, `/assets/axel-motif-trademarked.png`, `/assets/rando-motif-trademarked.png`, `/assets/axel-normal-guy.mp3`, and `Rogue Machine Media LLC (d/b/a Lag Lords)` badge on `http://127.0.0.1:44331`.
@@ -98,3 +98,23 @@
 - **Owner:** `■ QA`
 - **Files:** `crates/chinwag-ui/tests/ssr.rs`, `crates/chinwag-cli/src/ui_workbench_run.rs`
 - **Scope:** Verify `cargo test -p chinwag-ui` (`20/20` green) and `cargo test -p chinwag-cli --bin chinwag` (`38/38` green) plus live `127.0.0.1:44331` HTTP/API endpoints.
+
+### `[IN_PROGRESS]` `TASK-35` (`CHWG-CONT-ALISTAIR-35`) — Continuous Rolling-Wave Verification & Hardening
+- **Owner:** `■ ALISTAIR`
+- **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-cli/src/feature_cli_run.rs`, `crates/chinwag-ui/src/app.rs`
+- **Scope:** Continuous zero-idle verification wave after `TASK-28`: run `cargo test -p chinwag-cli --bin chinwag`, `cargo test -p chinwag-ui`, `chinwag bond verify --json`, `chinwag plugin verify --json`, and `chinwag cwcard verify --json`.
+
+### `[IN_PROGRESS]` `TASK-36` (`CHWG-CONT-ARCHITECT-36`) — Continuous Rolling-Wave UI & Protocol Verification
+- **Owner:** `■ ARCHITECT`
+- **Files:** `crates/chinwag-cli/src/ui_workbench_run.rs`, `crates/chinwag-cli/src/feature_cli_run.rs`
+- **Scope:** Verify `http://127.0.0.1:44331/api/health`, `/api/plugins`, `/api/cwcards`, and `/api/bonds` alongside `INV-BRAND-FIREWALL-01` (`Rogue Machine Media LLC (d/b/a Lag Lords)`).
+
+### `[IN_PROGRESS]` `TASK-37` (`CHWG-CONT-FLINT-37`) — Adversarial Verification of `FLINT #213` F1/F2 Remediations
+- **Owner:** `■ FLINT`
+- **Files:** `crates/chinwag-cli/src/ui_workbench_run.rs`, `crates/chinwag-cli/src/bus_run.rs`
+- **Scope:** Verify `FLINT #213` F1 (`Host` loopback DNS-rebinding guard, `X-Chinwag-UI-Intent: 1`, `Origin` guard, and operator-only `sender` whitelist on `POST /api/bus/send`) and F2 (`valid_seat_slug` path-traversal rejection in `actor_signing_secret`).
+
+### `[IN_PROGRESS]` `TASK-38` (`CHWG-CONT-QA-38`) — Continuous Full-Suite & Live Workbench Verification (`QA #215`)
+- **Owner:** `■ QA`
+- **Files:** `crates/chinwag-cli/src/ui_workbench_run.rs`, `crates/chinwag-ui/src/app.rs`
+- **Scope:** Verify `RUSTDOC` injection (`QA #215`), run `cargo test -p chinwag-cli --bin chinwag` (`17/17`) and `cargo test -p chinwag-ui` (`38/38`), and probe `http://127.0.0.1:44331`.
