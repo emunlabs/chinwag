@@ -1,14 +1,16 @@
 {
+  "brand_firewall_invariant": "INV-BRAND-FIREWALL-01",
   "card_id": "cwcard-2026-emun-0001",
   "ciphertext_blake3": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "edition": "Captionizm Series I · Founder's Deck",
   "hpke_aead": "ChaCha20Poly1305",
   "hpke_kdf": "HKDF-SHA256",
   "hpke_kem": "X25519-HKDF-SHA256",
-  "payload_sha256": "9e1580c459bc50fc0e479f21e4b680e257e1ef0e28430d6b8f1530632779b9bc",
+  "payload_sha256": "ca2645d6efa629171fecd068fd04d004cf38bca90b00d4b54da9b6d1aa8b6ecc",
   "schema": "chinwag-cwcard-envelope/v1",
-  "signature_ed25519": "de5e27346d86213778ecb04b4a616964a7093db87dd323625e869b3730d2abcedce441083de7aa7009388c483919a77035eb48d69a9b75d84b4591a8f8b74f0d",
+  "signature_ed25519": "301039cee3aa5c02931935f682a8773518421b2aa8f2827400bc6d4e27e361ecd2833421a57de6298e95ad5b322310de31bcc2d5c5dd7c16113037b18690c804",
   "signer_pubkey_ed25519": "fa80fada8ea3af9d8af8e86709d6e23d48736aa2bb02d8508ceb8ea5882e7d6a",
   "signer_seat": "ALISTAIR",
+  "studio_issuer": "Rogue Machine Media LLC (d/b/a Lag Lords)",
   "zero_knowledge_chip_mint": "INV-PLUGIN-CHIP-01"
 }

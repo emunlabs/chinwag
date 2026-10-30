@@ -187,13 +187,21 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
 
 fn canonical_plugin_manifest_payload(v: &Value) -> Option<String> {
     let obj = v.as_object()?;
-    let _schema = obj.get("schema")?.as_str()?;
+    if obj.get("schema")?.as_str()? != "chinwag-plugin-manifest/v1" {
+        return None;
+    }
     let _plugin_id = obj.get("plugin_id")?.as_str()?;
     let _display_name = obj.get("display_name")?.as_str()?;
     let _version = obj.get("version")?.as_str()?;
     let _monotonic_seq = obj.get("monotonic_seq")?.as_u64()?;
     let _ui_mount = obj.get("ui_mount")?.as_str()?;
     let _seatbelt_profile = obj.get("seatbelt_profile")?.as_str()?;
+    if obj.get("studio_issuer")?.as_str()? != "Rogue Machine Media LLC (d/b/a Lag Lords)" {
+        return None;
+    }
+    if obj.get("brand_firewall_invariant")?.as_str()? != "INV-BRAND-FIREWALL-01" {
+        return None;
+    }
     let _signer_seat = obj.get("signer_seat")?.as_str()?;
     let _signer_pubkey = obj.get("signer_pubkey_ed25519")?.as_str()?;
     let _invariants = obj.get("invariants")?.as_array()?;
@@ -202,7 +210,8 @@ fn canonical_plugin_manifest_payload(v: &Value) -> Option<String> {
     let mut stripped = obj.clone();
     stripped.remove("payload_sha256");
     stripped.remove("signature_ed25519");
-    serde_json::to_string(&Value::Object(stripped)).ok()
+    let jcs = serde_json::to_string(&Value::Object(stripped)).ok()?;
+    Some(format!("chinwag-plugin-manifest-sig-v2|{jcs}"))
 }
 
 pub fn build_signed_breakroom_manifest(signer_seat: &str) -> Value {
@@ -212,6 +221,8 @@ pub fn build_signed_breakroom_manifest(signer_seat: &str) -> Value {
         "schema": "chinwag-plugin-manifest/v1",
         "plugin_id": "com.emunlabs.breakroom",
         "display_name": "The Chinwag Break Room ('No Attribution. We're Among Friends.')",
+        "studio_issuer": "Rogue Machine Media LLC (d/b/a Lag Lords)",
+        "brand_firewall_invariant": "INV-BRAND-FIREWALL-01",
         "version": "0.2.4",
         "monotonic_seq": 24,
         "signing_key_id": "pub_plugin_emun_2026",
@@ -224,7 +235,8 @@ pub fn build_signed_breakroom_manifest(signer_seat: &str) -> Value {
             "INV-PLUGIN-SEATBELT-01",
             "INV-PLUGIN-CHIP-01",
             "INV-PLUGIN-EGRESS-01",
-            "INV-PLUGIN-ENT-01"
+            "INV-PLUGIN-ENT-01",
+            "INV-BRAND-FIREWALL-01"
         ],
         "egress_allowlist": [
             "syndicate.chinwag.sh:443",
@@ -592,9 +604,17 @@ pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn W
 
 fn canonical_cwcard_payload(v: &Value) -> Option<String> {
     let obj = v.as_object()?;
-    let _schema = obj.get("schema")?.as_str()?;
+    if obj.get("schema")?.as_str()? != "chinwag-cwcard-envelope/v1" {
+        return None;
+    }
     let _card_id = obj.get("card_id")?.as_str()?;
     let _edition = obj.get("edition")?.as_str()?;
+    if obj.get("studio_issuer")?.as_str()? != "Rogue Machine Media LLC (d/b/a Lag Lords)" {
+        return None;
+    }
+    if obj.get("brand_firewall_invariant")?.as_str()? != "INV-BRAND-FIREWALL-01" {
+        return None;
+    }
     let _hpke_kem = obj.get("hpke_kem")?.as_str()?;
     let _hpke_aead = obj.get("hpke_aead")?.as_str()?;
     let _ciphertext_blake3 = obj.get("ciphertext_blake3")?.as_str()?;
@@ -604,7 +624,8 @@ fn canonical_cwcard_payload(v: &Value) -> Option<String> {
     let mut stripped = obj.clone();
     stripped.remove("payload_sha256");
     stripped.remove("signature_ed25519");
-    serde_json::to_string(&Value::Object(stripped)).ok()
+    let jcs = serde_json::to_string(&Value::Object(stripped)).ok()?;
+    Some(format!("chinwag-cwcard-envelope-sig-v1|{jcs}"))
 }
 
 pub fn build_signed_cwcard_envelope(signer_seat: &str) -> Value {
@@ -614,6 +635,8 @@ pub fn build_signed_cwcard_envelope(signer_seat: &str) -> Value {
         "schema": "chinwag-cwcard-envelope/v1",
         "card_id": "cwcard-2026-emun-0001",
         "edition": "Captionizm Series I · Founder's Deck",
+        "studio_issuer": "Rogue Machine Media LLC (d/b/a Lag Lords)",
+        "brand_firewall_invariant": "INV-BRAND-FIREWALL-01",
         "hpke_kem": "X25519-HKDF-SHA256",
         "hpke_kdf": "HKDF-SHA256",
         "hpke_aead": "ChaCha20Poly1305",
@@ -807,6 +830,241 @@ pub fn run_cwcard_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
     }
 }
 
+fn canonical_bond_payload(v: &Value) -> Option<String> {
+    let obj = v.as_object()?;
+    if obj.get("schema")?.as_str()? != "chinwag-triple-b-bond/v2" {
+        return None;
+    }
+    let _bond_id = obj.get("bond_id")?.as_str()?;
+    let _agent_handle = obj.get("agent_handle")?.as_str()?;
+    let _agent_did = obj.get("agent_did")?.as_str()?;
+    let _rating = obj.get("rating")?.as_str()?;
+    let _chincred_score = obj.get("chincred_score")?.as_u64()?;
+    let _endowment_covenant = obj.get("endowment_covenant")?.as_str()?;
+    let _fse_settlement = obj.get("fse_settlement")?.as_str()?;
+    let _ietf_bcp79_carveout = obj.get("ietf_bcp79_carveout")?.as_str()?;
+    let _signer_seat = obj.get("signer_seat")?.as_str()?;
+    let _signer_pubkey = obj.get("signer_pubkey_ed25519")?.as_str()?;
+
+    let mut stripped = obj.clone();
+    stripped.remove("payload_sha256");
+    stripped.remove("signature_ed25519");
+    let jcs = serde_json::to_string(&Value::Object(stripped)).ok()?;
+    Some(format!("chinwag-triple-b-bond-sig-v2|{jcs}"))
+}
+
+pub fn build_signed_bond_envelope(
+    bond_id: &str,
+    agent_handle: &str,
+    chincred_score: u64,
+    signer_seat: &str,
+) -> Value {
+    let secret = bus_run::actor_signing_secret(signer_seat);
+    let pubkey_hex = secret.public().to_string();
+    let slug = agent_handle.to_lowercase();
+    let mut base = json!({
+        "schema": "chinwag-triple-b-bond/v2",
+        "bond_id": bond_id,
+        "agent_handle": agent_handle.to_uppercase(),
+        "agent_did": format!("did:chinwag:a509:{slug}"),
+        "rating": "BBB+ (Investment Grade · Chincred Empirical Underwriting)",
+        "chincred_score": chincred_score,
+        "endowment_covenant": "OP_CSV+FROST-3-of-5-Rolling-Endowment",
+        "fse_settlement": "PTLC-Adaptor-Signature-v1",
+        "ietf_bcp79_carveout": "RFC-0509-Base-Royalty-Free-Carve-Out",
+        "patent_anchor": "CHWG-PAT-05",
+        "signer_seat": signer_seat.to_uppercase(),
+        "signer_pubkey_ed25519": pubkey_hex
+    });
+    let canonical = canonical_bond_payload(&base).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let payload_sha256 = bytes_to_hex(&hasher.finalize());
+    let sig = secret.sign(canonical.as_bytes());
+    let sig_hex = bytes_to_hex(&sig.to_bytes());
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert("payload_sha256".to_string(), json!(payload_sha256));
+        obj.insert("signature_ed25519".to_string(), json!(sig_hex));
+    }
+    base
+}
+
+pub fn verify_bond_json(repo_root: &Path, raw_json: &str) -> Result<Value, String> {
+    let v: Value =
+        serde_json::from_str(raw_json).map_err(|e| format!("invalid bond json: {e}"))?;
+    let canonical =
+        canonical_bond_payload(&v).ok_or_else(|| "missing required bond fields".to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let expected_sha256 = bytes_to_hex(&hasher.finalize());
+
+    let claimed_sha256 = v
+        .get("payload_sha256")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing payload_sha256".to_string())?;
+    if claimed_sha256 != expected_sha256 {
+        return Err("payload_sha256 mismatch (bond envelope tampered)".to_string());
+    }
+
+    let pub_hex = v
+        .get("signer_pubkey_ed25519")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing signer_pubkey_ed25519".to_string())?;
+    let sig_hex = v
+        .get("signature_ed25519")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing signature_ed25519".to_string())?;
+    let signer_seat = v
+        .get("signer_seat")
+        .and_then(|x| x.as_str())
+        .unwrap_or("ALISTAIR");
+
+    let pubkey: EndpointId = pub_hex
+        .parse()
+        .map_err(|_| "invalid signer_pubkey_ed25519".to_string())?;
+    let sig_bytes =
+        hex_to_64_bytes(sig_hex).ok_or_else(|| "invalid signature_ed25519 hex".to_string())?;
+    let sig = Signature::from_bytes(&sig_bytes);
+
+    pubkey
+        .verify(canonical.as_bytes(), &sig)
+        .map_err(|_| "Ed25519 signature verification failed".to_string())?;
+
+    let allowed_path = repo_root.join(".chinwag").join("allowed_signers");
+    let allowed_raw = fs::read_to_string(&allowed_path)
+        .map_err(|_| "missing or unreadable .chinwag/allowed_signers".to_string())?;
+    let signers = chinwag_swarm::identity::parse_allowed_signers(&allowed_raw);
+    if signers.is_empty() {
+        return Err(".chinwag/allowed_signers contains no valid signers".to_string());
+    }
+    let matched = signers.iter().any(|(seat_opt, bytes)| {
+        bytes == pubkey.as_bytes()
+            && seat_opt
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(signer_seat))
+    });
+    if !matched {
+        return Err(format!(
+            "signer_pubkey_ed25519 for {signer_seat} is not registered in .chinwag/allowed_signers"
+        ));
+    }
+
+    Ok(v)
+}
+
+/// `TASK-26` (`CHWG-TRIPLE-B-CLI-01`): `chinwag bond status | verify | inspect | init [--json]`
+pub fn run_bond_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("verify");
+    let repo_root = resolve_repo_root(args);
+    let is_json = has_json_flag(args);
+    let bonds_dir = repo_root.join(".chinwag").join("bonds");
+    let axel_path = bonds_dir.join("axel-0001.cwbond.json");
+    let rando_path = bonds_dir.join("rando-0002.cwbond.json");
+
+    if sub == "init" {
+        let _ = fs::create_dir_all(&bonds_dir);
+        if !axel_path.exists() {
+            let axel = build_signed_bond_envelope("cwbond-2026-axel-0001", "AXEL", 942, "ALISTAIR");
+            if let Ok(t) = serde_json::to_string_pretty(&axel) {
+                let _ = fs::write(&axel_path, t);
+            }
+        }
+        if !rando_path.exists() {
+            let rando =
+                build_signed_bond_envelope("cwbond-2026-rando-0002", "RANDO", 918, "ALISTAIR");
+            if let Ok(t) = serde_json::to_string_pretty(&rando) {
+                let _ = fs::write(&rando_path, t);
+            }
+        }
+    }
+
+    let mut verified_bonds = Vec::new();
+    for path in [&axel_path, &rando_path] {
+        let raw = match fs::read_to_string(path) {
+            Ok(r) => r,
+            Err(e) => {
+                if is_json {
+                    let payload = json!({
+                        "ok": false,
+                        "command": format!("chinwag bond {sub}"),
+                        "bond_path": path.to_string_lossy(),
+                        "ed25519_verified": false,
+                        "error": format!("missing or unreadable bond envelope: {e}")
+                    });
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    );
+                } else {
+                    let _ = writeln!(
+                        stderr,
+                        "chinwag bond {sub}: missing or unreadable {}",
+                        path.display()
+                    );
+                }
+                return 1;
+            }
+        };
+        match verify_bond_json(&repo_root, &raw) {
+            Ok(val) => verified_bonds.push(val),
+            Err(err_msg) => {
+                if is_json {
+                    let payload = json!({
+                        "ok": false,
+                        "command": format!("chinwag bond {sub}"),
+                        "bond_path": path.to_string_lossy(),
+                        "ed25519_verified": false,
+                        "error": err_msg
+                    });
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    );
+                } else {
+                    let _ = writeln!(stderr, "chinwag bond {sub} failed: {err_msg}");
+                }
+                return 1;
+            }
+        }
+    }
+
+    if is_json {
+        let payload = json!({
+            "ok": true,
+            "command": format!("chinwag bond {sub}"),
+            "patent_anchor": "CHWG-PAT-05",
+            "ed25519_verified": true,
+            "allowed_signers_verified": true,
+            "bonds": verified_bonds
+        });
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        let _ = writeln!(
+            stdout,
+            "🏦 Chinwag Triple-B v2.0 Agent Bond Registry ({sub} · CHWG-PAT-05 · RFC-0509 Carve-Out):"
+        );
+        for b in &verified_bonds {
+            let _ = writeln!(
+                stdout,
+                "  • {} [■ {} · {}] Chincred={} · Covenant={} (✓ed25519 by ■ {})",
+                b["bond_id"].as_str().unwrap_or(""),
+                b["agent_handle"].as_str().unwrap_or(""),
+                b["rating"].as_str().unwrap_or(""),
+                b["chincred_score"].as_u64().unwrap_or(0),
+                b["endowment_covenant"].as_str().unwrap_or(""),
+                b["signer_seat"].as_str().unwrap_or("")
+            );
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,6 +1120,12 @@ mod tests {
 
         // Valid signed manifest + registered signer passes verification
         assert!(verify_plugin_manifest_json(temp.path(), &raw).is_ok());
+
+        // Mutating schema -> domain-separation & exact schema check fails closed (`TASK-28`)
+        let mut tampered_schema = manifest.clone();
+        tampered_schema["schema"] = json!("chinwag-bus-v1");
+        let raw_schema = serde_json::to_string(&tampered_schema).unwrap();
+        assert!(verify_plugin_manifest_json(temp.path(), &raw_schema).is_err());
 
         // Mutating display_name -> full-manifest JCS canonical payload fails closed (`TASK-23`)
         let mut tampered_name = manifest.clone();
@@ -933,5 +1197,33 @@ mod tests {
         tampered["edition"] = json!("Counterfeit Edition");
         let raw_tampered = serde_json::to_string(&tampered).unwrap();
         assert!(verify_cwcard_json(temp.path(), &raw_tampered).is_err());
+    }
+
+    #[test]
+    fn bond_verify_checks_triple_b_ed25519_envelope_and_rejects_tampering() {
+        let temp = tempfile::tempdir().unwrap();
+        let bond = build_signed_bond_envelope("cwbond-2026-axel-0001", "AXEL", 942, "ALISTAIR");
+        let raw = serde_json::to_string_pretty(&bond).unwrap();
+
+        let pub_hex = bond["signer_pubkey_ed25519"].as_str().unwrap();
+        let endpoint_id: EndpointId = pub_hex.parse().unwrap();
+        let ssh_pub = ssh_key::PublicKey::from(
+            ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()),
+        );
+        let openssh_line = ssh_pub.to_openssh().unwrap();
+        let chinwag_dir = temp.path().join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::write(
+            chinwag_dir.join("allowed_signers"),
+            format!("alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"),
+        )
+        .unwrap();
+
+        assert!(verify_bond_json(temp.path(), &raw).is_ok());
+
+        let mut tampered = bond.clone();
+        tampered["chincred_score"] = json!(999);
+        let raw_tampered = serde_json::to_string(&tampered).unwrap();
+        assert!(verify_bond_json(temp.path(), &raw_tampered).is_err());
     }
 }

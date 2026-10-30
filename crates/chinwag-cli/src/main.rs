@@ -4,6 +4,7 @@ mod bus_run;
 mod feature_cli_run;
 mod relay_run;
 mod ui_gate_run;
+mod ui_workbench_run;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -113,6 +114,25 @@ fn main() -> ExitCode {
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("cwcard") {
             let code = feature_cli_run::run_cwcard_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("bond") {
+            let code = feature_cli_run::run_bond_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
+        if matches!(
+            raw_args.get(1).map(|s| s.as_str()),
+            Some("ui" | "workbench")
+        ) {
+            let code = ui_workbench_run::run_ui_workbench_cli(
                 &raw_args[2..],
                 &mut std::io::stdout().lock(),
                 &mut std::io::stderr().lock(),

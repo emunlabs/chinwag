@@ -1,0 +1,16 @@
+{
+  "agent_did": "did:chinwag:a509:rando",
+  "agent_handle": "RANDO",
+  "bond_id": "cwbond-2026-rando-0002",
+  "chincred_score": 918,
+  "endowment_covenant": "OP_CSV+FROST-3-of-5-Rolling-Endowment",
+  "fse_settlement": "PTLC-Adaptor-Signature-v1",
+  "ietf_bcp79_carveout": "RFC-0509-Base-Royalty-Free-Carve-Out",
+  "patent_anchor": "CHWG-PAT-05",
+  "payload_sha256": "4608594f260fbeaa75b877306d3b491b923145f5b3a52d791fde470bafcd76d1",
+  "rating": "BBB+ (Investment Grade · Chincred Empirical Underwriting)",
+  "schema": "chinwag-triple-b-bond/v2",
+  "signature_ed25519": "391d3ebdfdc553b86208d373110dfc4d2bb03b2815af323840cf5afaeb61dc30b1cddd5ce8250f038385b32c6d56a5ee09c53ee6139daadc19a9a465de577c0c",
+  "signer_pubkey_ed25519": "fa80fada8ea3af9d8af8e86709d6e23d48736aa2bb02d8508ceb8ea5882e7d6a",
+  "signer_seat": "ALISTAIR"
+}

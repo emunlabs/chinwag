@@ -1,0 +1,16 @@
+{
+  "agent_did": "did:chinwag:a509:axel",
+  "agent_handle": "AXEL",
+  "bond_id": "cwbond-2026-axel-0001",
+  "chincred_score": 942,
+  "endowment_covenant": "OP_CSV+FROST-3-of-5-Rolling-Endowment",
+  "fse_settlement": "PTLC-Adaptor-Signature-v1",
+  "ietf_bcp79_carveout": "RFC-0509-Base-Royalty-Free-Carve-Out",
+  "patent_anchor": "CHWG-PAT-05",
+  "payload_sha256": "ba055dcdb947ebdd07adbc31273d1d9be4ce1e6745102f4803293cf6f5455834",
+  "rating": "BBB+ (Investment Grade · Chincred Empirical Underwriting)",
+  "schema": "chinwag-triple-b-bond/v2",
+  "signature_ed25519": "46b529b30764f98b85f8715dfde5383c9c3e5b12b006f76a561637548ff854f1ccdb062dab1e298fa89d74d99bceacf679ae71652900bc5ee36eb0b07c253d0d",
+  "signer_pubkey_ed25519": "fa80fada8ea3af9d8af8e86709d6e23d48736aa2bb02d8508ceb8ea5882e7d6a",
+  "signer_seat": "ALISTAIR"
+}

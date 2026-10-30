@@ -22,3 +22,5 @@ pub use theme::Theme;
 
 /// Port the legacy Node planner listens on; `chinwag ui` keeps the same port.
 pub const MISSION_CONTROL_PORT: u16 = 5487;
+/// Live Workbench v5 + iroh QUIC Bus HTTP/API port (`chinwag ui` / `TASK-31`).
+pub const WORKBENCH_PORT: u16 = 44331;

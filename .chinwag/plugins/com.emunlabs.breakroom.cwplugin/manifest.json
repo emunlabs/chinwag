@@ -1,4 +1,5 @@
 {
+  "brand_firewall_invariant": "INV-BRAND-FIREWALL-01",
   "display_name": "The Chinwag Break Room ('No Attribution. We're Among Friends.')",
   "egress_allowlist": [
     "syndicate.chinwag.sh:443",
@@ -10,17 +11,19 @@
     "INV-PLUGIN-SEATBELT-01",
     "INV-PLUGIN-CHIP-01",
     "INV-PLUGIN-EGRESS-01",
-    "INV-PLUGIN-ENT-01"
+    "INV-PLUGIN-ENT-01",
+    "INV-BRAND-FIREWALL-01"
   ],
   "monotonic_seq": 24,
-  "payload_sha256": "8ed14eb3288045e296a61034091671cf75892ac616caab011de8076578e931a9",
+  "payload_sha256": "2d1d33279b14f59fcb9d726118f49c449e0ebab113d488d149f7fc6237e28dec",
   "plugin_id": "com.emunlabs.breakroom",
   "schema": "chinwag-plugin-manifest/v1",
   "seatbelt_profile": "INV-PLUGIN-SEATBELT-01",
-  "signature_ed25519": "ba36a4ea48342f3a513c6b56dcc8b041f10e8bf7ab53128ae964c28561b71e1f6c92358e2473460c5bb32c9bdf4f2f4ed6c27113a3ded1f19ce7f1e64267dc0b",
+  "signature_ed25519": "c5184c1e920e53955ce6852f7487f4f2df81589cbf82374e089281fa0fd0608e47a41e614da610ca63e9fc7a460a31ff1f93a1a42e015f4e1aa5876be45a4606",
   "signer_pubkey_ed25519": "fa80fada8ea3af9d8af8e86709d6e23d48736aa2bb02d8508ceb8ea5882e7d6a",
   "signer_seat": "ALISTAIR",
   "signing_key_id": "pub_plugin_emun_2026",
+  "studio_issuer": "Rogue Machine Media LLC (d/b/a Lag Lords)",
   "ui_mount": "/plugins/breakroom",
   "version": "0.2.4"
 }
