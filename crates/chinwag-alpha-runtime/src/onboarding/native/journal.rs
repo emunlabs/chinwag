@@ -24,12 +24,14 @@ const DOMAIN_NAME: &str = "native-action-domain.json";
 pub(super) enum Domain {
     OrdinaryOpen,
     CursorMcpSetup,
+    VsCodeMcpSetup,
 }
 
 impl Domain {
     fn bytes(self) -> &'static [u8] {
         match self {
             Self::OrdinaryOpen => b"{\"schema\":\"chinwag-native-action-domain/v1\",\"action\":\"ordinary_open\"}\n",
+            Self::VsCodeMcpSetup => b"{\"schema\":\"chinwag-native-action-domain/v1\",\"action\":\"vscode_mcp_setup\"}\n",
             Self::CursorMcpSetup => b"{\"schema\":\"chinwag-native-action-domain/v1\",\"action\":\"cursor_mcp_setup\"}\n",
         }
     }
@@ -360,7 +362,7 @@ fn ensure_domain(directory: &File, domain: Domain) -> Result<(), OnboardingError
         Err(error) if error == rustix::io::Errno::NOENT => (),
         Err(_) => return Err(OnboardingError::Storage),
     }
-    if domain == Domain::CursorMcpSetup {
+    if domain != Domain::OrdinaryOpen {
         // New setup storage must be empty apart from its owned lock. Stop at
         // the first other entry; never adopt legacy/unknown/orphan records.
         for entry in Dir::read_from(directory).map_err(|_| OnboardingError::Storage)? {

@@ -50,6 +50,8 @@ The current shared MCP route is owner-local, unattributed and read-only. Its suc
 
 The human Cursor setup handoff uses that same fixed-room Rust stdio server. It is a host-native action with separate owner opt-ins and durable action namespace, not a new registry, publication capability or external plugin loader. The selected application receives Cursor's supported install URI through exact-application dispatch; only Cursor can approve it. See [CURSOR_MCP_SETUP.md](CURSOR_MCP_SETUP.md). OS acknowledgment is not connector admission or actual client handshake evidence.
 
+The VS Code setup handoff reuses that Rust server and the existing native-action controller. Its paired owner options, exact VS Code family filter, supported install URI, and immutable journal domain remain separate from ordinary opening and Cursor setup. It adds no registry, grant type, client configuration reader, or automatic tool call. OS acknowledgment disables duplicate setup but proves no registration, trust approval, or inbox read. Source integration and testing are in progress; deployment and actual VS Code acceptance remain unproven. See [VS Code setup](VSCODE_MCP_SETUP.md).
+
 ## Verification
 
 Relevant Rust fixtures cover disabled/undeclared capabilities, stale invocations, post-call expiry, exact inbox scope, revocation, cancellation/EOF, public metadata bounds and aliases, partial installed discovery, redaction, host qualification and family grouping. Runtime and MCP reads migrate through the component host in this change. Product services, tests and launcher remain Rust with the pinned Rust1.97.1 toolchain and existing dependency versions.

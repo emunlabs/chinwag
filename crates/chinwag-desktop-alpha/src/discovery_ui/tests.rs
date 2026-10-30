@@ -1,6 +1,55 @@
 use super::*;
 
 #[test]
+fn vscode_setup_is_family_scoped_and_404_does_not_disable_other_capabilities() {
+    let mut raw = snapshot("Studio");
+    raw.installations = Some(serde_json::from_value(serde_json::json!({
+        "observed_at_unix_ms":1793361786000_u64,
+        "apps":[
+            {"id":"a".repeat(64),"family":"visual_studio_code","kind":"application","running_instances":0,"state":"installed_unverified"},
+            {"id":"b".repeat(64),"family":"cursor","kind":"application","running_instances":0,"state":"installed_unverified"},
+            {"id":"c".repeat(64),"family":"visual_studio_code","kind":"command_line","running_instances":0,"state":"installed_unverified"}
+        ],
+        "coverage":{"entry_capacity":4096,"entries_examined":3,"installation_capacity":128,"capacity_reached":false,"unavailable_roots":0,"invalid_metadata":0}
+    })).unwrap());
+    let mut panel = DiscoveryPanel::default();
+    let generation = panel.begin("bus".into());
+    panel.complete(generation, "bus", Ok(raw));
+    let capability = OnboardingStatus {
+        schema: "chinwag-native-onboarding/v1".into(),
+        native_open_allowed: true,
+        openable_installation_ids: vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)],
+    };
+    panel.complete_opening_status(generation, "bus", Ok(capability.clone()));
+    panel.complete_cursor_mcp_status(generation, "bus", Ok(capability.clone()));
+    panel.complete_vscode_mcp_status(generation, "bus", Ok(capability.clone()));
+    assert_eq!(
+        panel.action_copies(OpeningAction::VsCodeMcpSetup),
+        vec![("a".repeat(64), "Visual Studio Code".into())]
+    );
+    assert_eq!(panel.actionable_copies().len(), 2);
+    panel.complete_vscode_mcp_status(generation, "bus", Err("HTTP404".into()));
+    assert!(
+        panel
+            .action_copies(OpeningAction::VsCodeMcpSetup)
+            .is_empty()
+    );
+    assert_eq!(panel.action_copies(OpeningAction::OrdinaryOpen).len(), 2);
+    assert_eq!(panel.action_copies(OpeningAction::CursorMcpSetup).len(), 1);
+    assert!(matches!(panel.state, InventoryState::Ready(_)));
+    assert!(
+        panel
+            .vscode_mcp_notice
+            .as_deref()
+            .unwrap()
+            .contains("unavailable")
+    );
+    panel.begin("another bus".into());
+    assert!(!panel.complete_vscode_mcp_status(generation, "bus", Ok(capability)));
+    assert!(panel.vscode_mcp_status.is_none());
+}
+
+#[test]
 fn cursor_setup_is_independent_and_only_exact_cursor_app_copies_are_eligible() {
     let mut raw = snapshot("Studio");
     raw.installations = Some(serde_json::from_value(serde_json::json!({

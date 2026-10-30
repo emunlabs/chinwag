@@ -112,29 +112,74 @@ impl OnboardingService {
         binary: &Path,
         endpoint: String,
     ) -> Result<Self, OnboardingError> {
+        Self::new_mcp_native(journal_dir, binary, endpoint, ClientFamily::Cursor)
+    }
+
+    /// Human-approved install handoff restricted to the observed VS Code copy.
+    pub fn new_vscode_mcp_native(
+        journal_dir: &Path,
+        binary: &Path,
+        endpoint: String,
+    ) -> Result<Self, OnboardingError> {
+        Self::new_mcp_native(
+            journal_dir,
+            binary,
+            endpoint,
+            ClientFamily::VisualStudioCode,
+        )
+    }
+
+    fn new_mcp_native(
+        journal_dir: &Path,
+        binary: &Path,
+        endpoint: String,
+        family: ClientFamily,
+    ) -> Result<Self, OnboardingError> {
         #[cfg(target_os = "macos")]
         {
             let pinned = super::cursor::PinnedMcpBinary::open(binary)?;
-            let spec = chinwag_native_launch::CursorMcpInstall::new(binary.to_owned(), endpoint)
-                .map_err(|_| OnboardingError::Invalid)?;
+            let (launcher, domain): (Box<dyn NativeApplicationLauncher + Send>, Domain) =
+                match family {
+                    ClientFamily::Cursor => {
+                        let spec = chinwag_native_launch::CursorMcpInstall::new(
+                            binary.to_owned(),
+                            endpoint,
+                        )
+                        .map_err(|_| OnboardingError::Invalid)?;
+                        (Box::new(chinwag_native_launch::macos::MacOsApplicationLauncher::for_cursor_mcp_setup_host(spec)), Domain::CursorMcpSetup)
+                    }
+                    ClientFamily::VisualStudioCode => {
+                        let spec = chinwag_native_launch::VsCodeMcpInstall::new(
+                            binary.to_owned(),
+                            endpoint,
+                        )
+                        .map_err(|_| OnboardingError::Invalid)?;
+                        (Box::new(chinwag_native_launch::macos::MacOsApplicationLauncher::for_vscode_mcp_setup_host(spec)), Domain::VsCodeMcpSetup)
+                    }
+                    _ => return Err(OnboardingError::Invalid),
+                };
             let mut service = Self::new_parts_in_domain(
                 journal_dir,
                 Arc::new(move |host, previous| {
                     pinned.revalidate()?;
                     let installation = chinwag_client_discovery::reobserve_application(previous)
                         .map_err(|_| OnboardingError::Unavailable)?;
-                    Ok(NativeObservation::new(host.clone(), installation, Instant::now()))
+                    Ok(NativeObservation::new(
+                        host.clone(),
+                        installation,
+                        Instant::now(),
+                    ))
                 }),
-                Box::new(chinwag_native_launch::macos::MacOsApplicationLauncher::for_cursor_mcp_setup_host(spec)),
+                launcher,
                 Arc::new(Instant::now),
-                Domain::CursorMcpSetup,
+                domain,
             )?;
-            service.family = Some(ClientFamily::Cursor);
+            service.family = Some(family);
             Ok(service)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (journal_dir, binary, endpoint);
+            let _ = (journal_dir, binary, endpoint, family);
             Err(OnboardingError::Unavailable)
         }
     }
@@ -236,6 +281,13 @@ impl OnboardingService {
     pub(crate) fn new_cursor_fixture(journal_dir: &Path) -> Result<Self, OnboardingError> {
         let mut service = Self::new_fixture_in_domain(journal_dir, Domain::CursorMcpSetup)?;
         service.family = Some(ClientFamily::Cursor);
+        Ok(service)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_vscode_fixture(journal_dir: &Path) -> Result<Self, OnboardingError> {
+        let mut service = Self::new_fixture_in_domain(journal_dir, Domain::VsCodeMcpSetup)?;
+        service.family = Some(ClientFamily::VisualStudioCode);
         Ok(service)
     }
 

@@ -86,6 +86,88 @@ fn cursor_domain_keeps_crash_pending_uncertain_and_rejects_unknown_marker_bytes(
     );
 }
 
+#[test]
+fn vscode_journal_cannot_adopt_other_action_domains_legacy_records_or_orphans() {
+    let temporary = TempDir::new().unwrap();
+    let root = fs::canonicalize(temporary.path()).unwrap();
+    for (name, domain) in [
+        ("ordinary", Domain::OrdinaryOpen),
+        ("cursor", Domain::CursorMcpSetup),
+    ] {
+        let path = root.join(name);
+        let mut journal = Journal::open_in_domain(&path, domain).unwrap();
+        journal.begin(ID, &"a".repeat(64)).unwrap();
+        journal
+            .finish(receipt(
+                ID,
+                &"a".repeat(64),
+                NativeOpenState::OpenedOrReused,
+            ))
+            .unwrap();
+        drop(journal);
+        let marker = fs::read(path.join("native-action-domain.json")).unwrap();
+        let original = fs::read(path.join(format!("{ID}.json"))).unwrap();
+        assert!(Journal::open_in_domain(&path, Domain::VsCodeMcpSetup).is_err());
+        assert_eq!(
+            fs::read(path.join("native-action-domain.json")).unwrap(),
+            marker
+        );
+        assert_eq!(fs::read(path.join(format!("{ID}.json"))).unwrap(), original);
+    }
+    for orphan in [false, true] {
+        let path = root.join(if orphan { "orphan" } else { "legacy" });
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let entry = if orphan {
+            write_orphan(&path, ID, b"{crash-left-write");
+            format!(".{ID}-write.tmp")
+        } else {
+            write_record(
+                &path,
+                ID,
+                &receipt(ID, &"a".repeat(64), NativeOpenState::OpenedOrReused),
+            );
+            format!("{ID}.json")
+        };
+        let original = fs::read(path.join(&entry)).unwrap();
+        assert!(Journal::open_in_domain(&path, Domain::VsCodeMcpSetup).is_err());
+        assert!(!path.join("native-action-domain.json").exists());
+        assert_eq!(fs::read(path.join(entry)).unwrap(), original);
+    }
+}
+
+#[test]
+fn vscode_domain_is_immutable_and_crash_pending_cannot_replay_after_restart() {
+    let temporary = TempDir::new().unwrap();
+    let root = fs::canonicalize(temporary.path()).unwrap().join("vscode");
+    let mut journal = Journal::open_in_domain(&root, Domain::VsCodeMcpSetup).unwrap();
+    journal.begin(ID, &"d".repeat(64)).unwrap();
+    let original = fs::read(root.join(format!("{ID}.json"))).unwrap();
+    drop(journal);
+    for wrong_domain in [Domain::OrdinaryOpen, Domain::CursorMcpSetup] {
+        assert!(Journal::open_in_domain(&root, wrong_domain).is_err());
+    }
+    let mut reopened = Journal::open_in_domain(&root, Domain::VsCodeMcpSetup).unwrap();
+    assert_eq!(
+        reopened.lookup(ID).unwrap().unwrap().state,
+        NativeOpenState::Uncertain
+    );
+    assert!(matches!(
+        reopened.begin(ID, &"d".repeat(64)),
+        Err(OnboardingError::Conflict)
+    ));
+    assert_eq!(fs::read(root.join(format!("{ID}.json"))).unwrap(), original);
+    reopened.begin(OTHER_ID, &"d".repeat(64)).unwrap();
+    drop(reopened);
+    let marker = root.join("native-action-domain.json");
+    fs::write(&marker, b"unknown or partial setup action marker").unwrap();
+    assert!(Journal::open_in_domain(&root, Domain::VsCodeMcpSetup).is_err());
+    assert_eq!(
+        fs::read(marker).unwrap(),
+        b"unknown or partial setup action marker"
+    );
+}
+
 struct FakeLauncher {
     calls: Arc<AtomicUsize>,
     panic: bool,
@@ -151,6 +233,106 @@ fn snapshots() -> (InventorySnapshot, InstalledSnapshot) {
             limitations: vec![],
         },
     )
+}
+
+fn named_installation(family: ClientFamily) -> Installation {
+    let mut application = installation();
+    let (id, path, name, bundle, executable) = match family {
+        ClientFamily::Cursor => (
+            "c",
+            "/Applications/Cursor.app",
+            "Cursor",
+            "com.todesktop.230313mzl4w4u92",
+            "Cursor",
+        ),
+        ClientFamily::VisualStudioCode => (
+            "d",
+            "/Applications/Visual Studio Code.app",
+            "Code",
+            "com.microsoft.VSCode",
+            "Code",
+        ),
+        _ => panic!("unsupported named fixture"),
+    };
+    application.id = id.repeat(64);
+    application.family = family;
+    application.canonical_path = path.into();
+    application.observed_paths = vec![application.canonical_path.clone()];
+    application.display_name = name.into();
+    application.bundle_id = Some(bundle.into());
+    application.executable_path = application
+        .canonical_path
+        .join("Contents/MacOS")
+        .join(executable);
+    application
+}
+
+#[test]
+fn vscode_cache_rejects_other_families_before_verification_or_native_effect() {
+    let (_directory, path) = private_temp_directory();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let verifications = Arc::new(AtomicUsize::new(0));
+    let now = Instant::now();
+    let counted = Arc::clone(&verifications);
+    let mut service = OnboardingService::new_parts_in_domain(
+        &path,
+        Arc::new(move |host, installation| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(NativeObservation::new(
+                host.clone(),
+                installation.clone(),
+                now,
+            ))
+        }),
+        Box::new(FakeLauncher {
+            calls: Arc::clone(&calls),
+            panic: false,
+        }),
+        Arc::new(move || now),
+        Domain::VsCodeMcpSetup,
+    )
+    .unwrap();
+    service.family = Some(ClientFamily::VisualStudioCode);
+    let (process, mut installed) = snapshots();
+    installed
+        .installations
+        .push(named_installation(ClientFamily::Cursor));
+    installed
+        .installations
+        .push(named_installation(ClientFamily::VisualStudioCode));
+    service.observe(&process, &installed).unwrap();
+    let vscode_id = observed_installation_id(&process, &installed.installations[2]);
+    assert_eq!(
+        service.status().unwrap().openable_installation_ids,
+        vec![vscode_id.clone()]
+    );
+    for (id, installation) in [ID, OTHER_ID]
+        .into_iter()
+        .zip(&installed.installations[..2])
+    {
+        let request = NativeOpenRequest {
+            installation_id: observed_installation_id(&process, installation),
+        };
+        assert_eq!(
+            service.open(id, &request).unwrap().state,
+            NativeOpenState::Rejected
+        );
+    }
+    assert_eq!(verifications.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let request = NativeOpenRequest {
+        installation_id: vscode_id,
+    };
+    let request_id = "vscode-valid-fixture-0001";
+    let result = service.open(request_id, &request).unwrap();
+    assert_eq!(result.state, NativeOpenState::OpenedOrReused);
+    assert_eq!(verifications.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(service.lookup(request_id).unwrap(), Some(result.clone()));
+    assert_eq!(service.open(request_id, &request).unwrap(), result);
+    assert!(service.status().unwrap().native_open_allowed);
+    assert_eq!(verifications.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 struct Fixture {

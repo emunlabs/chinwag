@@ -79,6 +79,150 @@ fn pending_is_durable_before_dispatch_and_restart_never_creates_a_new_attempt() 
 }
 
 #[test]
+fn vscode_action_survives_restart_and_blocks_every_conflicting_action() {
+    let directory = Directory::new();
+    let endpoint = "http://127.0.0.1:44341";
+    let id = "a".repeat(64);
+    let attempt = {
+        let mut store = OpeningStore::open(directory.file()).unwrap();
+        store
+            .prepare(OpeningAction::VsCodeMcpSetup, endpoint, &id)
+            .unwrap()
+    };
+    let saved: Value = serde_json::from_slice(&fs::read(directory.file()).unwrap()).unwrap();
+    assert_eq!(saved["attempts"][0]["action"], "vscode_mcp_setup");
+    let mut store = OpeningStore::open(directory.file()).unwrap();
+    assert_eq!(store.attempts, vec![attempt.clone()]);
+    for action in [
+        OpeningAction::OrdinaryOpen,
+        OpeningAction::CursorMcpSetup,
+        OpeningAction::VsCodeMcpSetup,
+    ] {
+        assert!(store.prepare(action, endpoint, &id).is_err());
+        assert!(
+            store
+                .prepare(action, "http://127.0.0.1:44342", &id)
+                .is_err()
+        );
+    }
+    store
+        .apply_receipt(
+            &attempt.id,
+            receipt(&attempt, NativeOpenState::OpenedOrReused),
+        )
+        .unwrap();
+    assert!(store.has_acknowledged_vscode_setup(endpoint, &id));
+    assert!(!store.has_acknowledged_vscode_setup("http://127.0.0.1:44342", &id));
+    assert!(!store.has_acknowledged_vscode_setup(endpoint, &"b".repeat(64)));
+    assert!(
+        store
+            .prepare(OpeningAction::VsCodeMcpSetup, endpoint, &id)
+            .is_err()
+    );
+    assert!(
+        store.attempts[0]
+            .summary()
+            .contains("inbox read are unverified")
+    );
+    assert!(store.confirm_cursor_tools_listed(endpoint, &id, 1).is_err());
+}
+
+fn write_full_history_fixture(path: &Path, endpoint: &str, protected: usize, pending: usize) {
+    assert!(protected + pending <= MAX_ATTEMPTS);
+    let rows: Vec<_> = (0..MAX_ATTEMPTS)
+        .map(|index| {
+            let request_id = format!("ui-history-capacity-{index:04}");
+            let installation_id = format!("{index:064x}");
+            let unresolved = index >= MAX_ATTEMPTS - pending;
+            json!({
+                "id":request_id, "endpoint":endpoint, "installation_id":installation_id,
+                "action":if index < protected { "vscode_mcp_setup" } else { "ordinary_open" },
+                "state":if unresolved { "pending" } else { "receipt" },
+                "receipt":if unresolved { Value::Null } else { json!({
+                    "schema":"chinwag-native-open/v1", "request_id":request_id,
+                    "installation_id":installation_id, "state":"opened_or_reused",
+                    "message":"Synthetic OS acknowledgement"
+                }) }
+            })
+        })
+        .collect();
+    fs::write(
+        path,
+        serde_json::to_vec(&json!({
+            "schema":"chinwag-opening-history/v1", "attempts":rows
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn vscode_ack_survives_capacity_eviction_and_blocks_repeat_before_dispatch() {
+    let directory = Directory::new();
+    let endpoint = "http://127.0.0.1:44341";
+    let id = format!("{:064x}", 0);
+    write_full_history_fixture(&directory.file(), endpoint, 1, 0);
+    let mut store = OpeningStore::open(directory.file()).unwrap();
+    let original = store.attempts[0].clone();
+    for index in 0..4 {
+        let attempt = store
+            .prepare(
+                OpeningAction::OrdinaryOpen,
+                endpoint,
+                &format!("{:064x}", MAX_ATTEMPTS + index),
+            )
+            .unwrap();
+        store
+            .apply_receipt(
+                &attempt.id,
+                receipt(&attempt, NativeOpenState::OpenedOrReused),
+            )
+            .unwrap();
+        assert_eq!(store.attempts.len(), MAX_ATTEMPTS);
+        assert_eq!(store.attempts[0], original);
+        assert!(store.has_acknowledged_vscode_setup(endpoint, &id));
+    }
+    assert!(
+        !store
+            .attempts
+            .iter()
+            .any(|attempt| attempt.id == "ui-history-capacity-0001"),
+        "ordinary terminal rows keep their existing eviction behavior"
+    );
+    let saved = fs::read(directory.file()).unwrap();
+    assert!(
+        store
+            .prepare(OpeningAction::VsCodeMcpSetup, endpoint, &id)
+            .is_err(),
+        "no fresh attempt is returned for a duplicate setup POST"
+    );
+    assert_eq!(fs::read(directory.file()).unwrap(), saved);
+    drop(store);
+    let store = OpeningStore::open(directory.file()).unwrap();
+    assert_eq!(store.attempts[0], original);
+    assert!(store.has_acknowledged_vscode_setup(endpoint, &id));
+}
+
+#[test]
+fn full_protected_or_unresolved_history_refuses_capacity_without_changing_disk_or_memory() {
+    for (protected, pending) in [(MAX_ATTEMPTS, 0), (64, 64), (0, MAX_ATTEMPTS)] {
+        let directory = Directory::new();
+        let endpoint = "http://127.0.0.1:44341";
+        write_full_history_fixture(&directory.file(), endpoint, protected, pending);
+        let saved = fs::read(directory.file()).unwrap();
+        let mut store = OpeningStore::open(directory.file()).unwrap();
+        let original = store.attempts.clone();
+        assert!(
+            store
+                .prepare(OpeningAction::OrdinaryOpen, endpoint, &"f".repeat(64))
+                .is_err()
+        );
+        assert_eq!(store.attempts, original);
+        assert_eq!(fs::read(directory.file()).unwrap(), saved);
+    }
+}
+
+#[test]
 fn malformed_or_foreign_receipt_cannot_claim_opened_or_unblock_an_attempt() {
     let directory = Directory::new();
     let mut store = OpeningStore::open(directory.file()).unwrap();

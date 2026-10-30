@@ -11,6 +11,9 @@ use std::{
 #[path = "cursor_onboarding_tests.rs"]
 mod cursor_onboarding_tests;
 
+#[path = "vscode_onboarding_tests.rs"]
+mod vscode_onboarding_tests;
+
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
@@ -396,6 +399,7 @@ fn stale_setup_selection_cannot_replace_another_action_or_survive_generation_cha
                 inventory: Ok(serde_json::from_value(cursor_inventory()).unwrap()),
                 opening_status: None,
                 cursor_mcp_status: Some(Ok(serde_json::from_value(status(true)).unwrap())),
+                vscode_mcp_status: None,
             };
             assert!(!view.apply_selection_refresh(&selected, read(), cx));
             assert_eq!(
@@ -1126,6 +1130,7 @@ fn endpoint_find_or_connect_supersession_clears_metadata_flight_without_preparin
                         inventory: Ok(serde_json::from_value(inventory()).unwrap()),
                         opening_status: Some(Ok(serde_json::from_value(status(true)).unwrap())),
                         cursor_mcp_status: None,
+                        vscode_mcp_status: None,
                     },
                     cx
                 ));

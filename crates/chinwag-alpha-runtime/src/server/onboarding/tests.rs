@@ -27,6 +27,7 @@ struct FixtureSource {
     fail: AtomicBool,
     bad_host: AtomicBool,
     include_cursor: bool,
+    include_vscode: bool,
 }
 
 fn installed() -> InstalledSnapshot {
@@ -90,6 +91,18 @@ impl InventorySource for FixtureSource {
             cursor.executable_path = "/Applications/Cursor.app/Contents/MacOS/Cursor".into();
             snapshot.installations.push(cursor);
         }
+        if self.include_vscode {
+            let mut vscode = snapshot.installations[0].clone();
+            vscode.id = "d".repeat(64);
+            vscode.family = ClientFamily::VisualStudioCode;
+            vscode.canonical_path = "/Applications/Visual Studio Code.app".into();
+            vscode.observed_paths = vec![vscode.canonical_path.clone()];
+            vscode.display_name = "Code".into();
+            vscode.bundle_id = Some("com.microsoft.VSCode".into());
+            vscode.executable_path =
+                "/Applications/Visual Studio Code.app/Contents/MacOS/Code".into();
+            snapshot.installations.push(vscode);
+        }
         Some(snapshot)
     }
 }
@@ -100,6 +113,7 @@ struct Fixture {
     service: Option<Arc<OnboardingService>>,
     source: Arc<FixtureSource>,
     cursor_service: Option<Arc<OnboardingService>>,
+    vscode_service: Option<Arc<OnboardingService>>,
 }
 
 impl Fixture {
@@ -108,6 +122,10 @@ impl Fixture {
     }
 
     fn with_setup(enabled: bool, cursor_enabled: bool) -> Self {
+        Self::with_actions(enabled, cursor_enabled, false)
+    }
+
+    fn with_actions(enabled: bool, cursor_enabled: bool, vscode_enabled: bool) -> Self {
         let directory = TempDir::new().unwrap();
         let root = std::fs::canonicalize(directory.path()).unwrap();
         let service = enabled.then(|| {
@@ -116,12 +134,16 @@ impl Fixture {
         let cursor_service = cursor_enabled.then(|| {
             Arc::new(OnboardingService::new_cursor_fixture(&root.join("cursor-journal")).unwrap())
         });
+        let vscode_service = vscode_enabled.then(|| {
+            Arc::new(OnboardingService::new_vscode_fixture(&root.join("vscode-journal")).unwrap())
+        });
         let source = Arc::new(FixtureSource {
             snapshots: AtomicUsize::new(0),
             installations: AtomicUsize::new(0),
             fail: AtomicBool::new(false),
             bad_host: AtomicBool::new(false),
             include_cursor: cursor_enabled,
+            include_vscode: vscode_enabled,
         });
         let app = super::super::router_with_components(
             RuntimeConfig {
@@ -133,6 +155,7 @@ impl Fixture {
             source.clone(),
             service.clone(),
             cursor_service.clone(),
+            vscode_service.clone(),
         )
         .unwrap();
         Self {
@@ -141,6 +164,7 @@ impl Fixture {
             service,
             source,
             cursor_service,
+            vscode_service,
         }
     }
     async fn request(
@@ -394,6 +418,227 @@ async fn one_observation_supplies_separate_cursor_handoff_and_opening_domains() 
 }
 
 #[tokio::test]
+async fn vscode_setup_is_independently_disabled_without_scanning_or_consuming_an_attempt() {
+    let fixture = Fixture::with_setup(true, true);
+    let (code, status) = fixture
+        .request(
+            Method::GET,
+            "/api/onboarding/vscode-mcp/status",
+            &[INTENT],
+            String::new(),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(status["native_open_allowed"], false);
+    assert_eq!(status["openable_installation_ids"], json!([]));
+    assert_eq!(
+        fixture
+            .request(
+                Method::POST,
+                "/api/onboarding/vscode-mcp/setup",
+                &post_headers(),
+                open_body(&"d".repeat(64))
+            )
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE,
+    );
+    assert_eq!(
+        fixture
+            .request(
+                Method::GET,
+                &format!("/api/onboarding/vscode-mcp/setups/{ID}"),
+                &[INTENT],
+                String::new()
+            )
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE,
+    );
+    assert!(
+        fixture
+            .service
+            .as_ref()
+            .unwrap()
+            .lookup(ID)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .cursor_service
+            .as_ref()
+            .unwrap()
+            .lookup(ID)
+            .unwrap()
+            .is_none()
+    );
+    fixture.no_scan();
+}
+
+#[tokio::test]
+async fn one_observation_supplies_three_isolated_action_caches_and_same_id_namespaces() {
+    let fixture = Fixture::with_actions(true, true, true);
+    let (code, inventory) = fixture.discover().await;
+    assert_eq!(code, StatusCode::OK);
+    let observed_id = |family: &str| {
+        inventory["installations"]["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["family"] == family)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let grok_id = observed_id("grok_bot");
+    let cursor_id = observed_id("cursor");
+    let vscode_id = observed_id("visual_studio_code");
+    assert_ne!(cursor_id, vscode_id);
+    let (_, cursor_status) = fixture
+        .request(
+            Method::GET,
+            "/api/onboarding/cursor-mcp/status",
+            &[INTENT],
+            String::new(),
+        )
+        .await;
+    let (_, vscode_status) = fixture
+        .request(
+            Method::GET,
+            "/api/onboarding/vscode-mcp/status",
+            &[INTENT],
+            String::new(),
+        )
+        .await;
+    assert_eq!(
+        cursor_status["openable_installation_ids"],
+        json!([cursor_id])
+    );
+    assert_eq!(
+        vscode_status["openable_installation_ids"],
+        json!([vscode_id])
+    );
+    assert_eq!(
+        fixture.status().await["openable_installation_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(fixture.source.snapshots.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.source.installations.load(Ordering::SeqCst), 1);
+
+    // Non-VS-Code copies cannot reach its fake native executor. The core fixture
+    // separately counts zero verifier/launcher calls for these rejected targets.
+    for (wrong_id, target) in [
+        ("vscode-wrong-family-0001", &grok_id),
+        ("vscode-wrong-family-0002", &cursor_id),
+    ] {
+        let headers = [
+            INTENT,
+            ("content-type", "application/json"),
+            ("x-chinwag-request-id", wrong_id),
+        ];
+        let (code, rejected) = fixture
+            .request(
+                Method::POST,
+                "/api/onboarding/vscode-mcp/setup",
+                &headers,
+                open_body(target),
+            )
+            .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(rejected["state"], "rejected");
+    }
+
+    for (post, lookup, target, service) in [
+        (
+            "/api/onboarding/open",
+            format!("/api/onboarding/opens/{ID}"),
+            &grok_id,
+            fixture.service.as_ref().unwrap(),
+        ),
+        (
+            "/api/onboarding/cursor-mcp/setup",
+            format!("/api/onboarding/cursor-mcp/setups/{ID}"),
+            &cursor_id,
+            fixture.cursor_service.as_ref().unwrap(),
+        ),
+        (
+            "/api/onboarding/vscode-mcp/setup",
+            format!("/api/onboarding/vscode-mcp/setups/{ID}"),
+            &vscode_id,
+            fixture.vscode_service.as_ref().unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            fixture
+                .request(Method::GET, &lookup, &[INTENT], String::new())
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            service.lookup(ID).unwrap().is_none(),
+            "GET must not consume an attempt"
+        );
+        let (code, receipt) = fixture
+            .request(Method::POST, post, &post_headers(), open_body(target))
+            .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(receipt["request_id"], ID);
+        assert_eq!(receipt["installation_id"], *target);
+        assert_eq!(receipt["state"], "opened_or_reused"); // Synthetic OS acknowledgement only.
+        assert!(receipt["message"].as_str().unwrap().contains("unconfirmed"));
+        assert_eq!(
+            fixture
+                .request(Method::GET, &lookup, &[INTENT], String::new())
+                .await
+                .1,
+            receipt
+        );
+        assert_eq!(
+            fixture
+                .request(Method::POST, post, &post_headers(), open_body(target))
+                .await
+                .1,
+            receipt
+        );
+        for private in [
+            "/Applications",
+            "com.microsoft",
+            "vscode:",
+            "command",
+            "args",
+        ] {
+            assert!(!receipt.to_string().contains(private));
+        }
+    }
+    assert_eq!(fixture.source.snapshots.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.source.installations.load(Ordering::SeqCst), 1);
+    fixture.source.fail.store(true, Ordering::SeqCst);
+    assert_eq!(fixture.discover().await.0, StatusCode::SERVICE_UNAVAILABLE);
+    for service in [
+        &fixture.service,
+        &fixture.cursor_service,
+        &fixture.vscode_service,
+    ] {
+        assert!(
+            !service
+                .as_ref()
+                .unwrap()
+                .status()
+                .unwrap()
+                .native_open_allowed
+        );
+    }
+    assert_eq!(fixture.source.snapshots.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.source.installations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn default_runtime_exposes_disabled_capability_and_never_opens() {
     let fixture = Fixture::new(false);
     let value = fixture.status().await;
@@ -425,12 +670,18 @@ async fn default_runtime_exposes_disabled_capability_and_never_opens() {
 
 #[tokio::test]
 async fn onboarding_methods_queries_and_missing_native_intent_reject_without_work() {
-    let fixture = Fixture::new(true);
+    let fixture = Fixture::with_actions(true, true, true);
     for (path, allowed) in [
         ("/api/onboarding/status", Method::GET),
         ("/api/onboarding/open", Method::POST),
         ("/api/onboarding/cursor-mcp/status", Method::GET),
         ("/api/onboarding/cursor-mcp/setup", Method::POST),
+        ("/api/onboarding/vscode-mcp/status", Method::GET),
+        ("/api/onboarding/vscode-mcp/setup", Method::POST),
+        (
+            "/api/onboarding/vscode-mcp/setups/open-fixture-request-0001",
+            Method::GET,
+        ),
         (
             "/api/onboarding/cursor-mcp/setups/open-fixture-request-0001",
             Method::GET,
@@ -496,12 +747,30 @@ async fn onboarding_methods_queries_and_missing_native_intent_reject_without_wor
             .unwrap()
             .is_none()
     );
+    assert!(
+        fixture
+            .cursor_service
+            .as_ref()
+            .unwrap()
+            .lookup(ID)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .vscode_service
+            .as_ref()
+            .unwrap()
+            .lookup(ID)
+            .unwrap()
+            .is_none()
+    );
     fixture.no_scan();
 }
 
 #[tokio::test]
 async fn opening_json_headers_ids_and_size_validate_before_controller() {
-    let fixture = Fixture::new(true);
+    let fixture = Fixture::with_actions(true, true, true);
     let valid_body = open_body(&"a".repeat(64));
     for (headers, body) in [
         (
@@ -554,17 +823,41 @@ async fn opening_json_headers_ids_and_size_validate_before_controller() {
         (post_headers().to_vec(), " ".repeat(MAX_OPEN_BODY + 1)),
         (post_headers().to_vec(), "not json".into()),
     ] {
-        assert_eq!(
-            fixture
-                .request(Method::POST, "/api/onboarding/open", &headers, body)
-                .await
-                .0,
-            StatusCode::BAD_REQUEST
-        );
+        for route in [
+            "/api/onboarding/open",
+            "/api/onboarding/cursor-mcp/setup",
+            "/api/onboarding/vscode-mcp/setup",
+        ] {
+            assert_eq!(
+                fixture
+                    .request(Method::POST, route, &headers, body.clone())
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
     assert!(
         fixture
             .service
+            .as_ref()
+            .unwrap()
+            .lookup(ID)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .cursor_service
+            .as_ref()
+            .unwrap()
+            .lookup(ID)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .vscode_service
             .as_ref()
             .unwrap()
             .lookup(ID)

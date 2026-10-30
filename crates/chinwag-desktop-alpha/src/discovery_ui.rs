@@ -185,6 +185,8 @@ pub struct DiscoveryPanel {
     pub opening_notice: Option<String>,
     pub cursor_mcp_status: Option<OnboardingStatus>,
     pub cursor_mcp_notice: Option<String>,
+    pub vscode_mcp_status: Option<OnboardingStatus>,
+    pub vscode_mcp_notice: Option<String>,
     generation: u64,
 }
 
@@ -199,6 +201,8 @@ impl Default for DiscoveryPanel {
             opening_notice: None,
             cursor_mcp_status: None,
             cursor_mcp_notice: None,
+            vscode_mcp_status: None,
+            vscode_mcp_notice: None,
             generation: 0,
         }
     }
@@ -230,6 +234,8 @@ impl DiscoveryPanel {
         self.opening_notice = None;
         self.cursor_mcp_status = None;
         self.cursor_mcp_notice = None;
+        self.vscode_mcp_status = None;
+        self.vscode_mcp_notice = None;
     }
 
     pub fn begin(&mut self, endpoint: String) -> u64 {
@@ -240,6 +246,8 @@ impl DiscoveryPanel {
         self.opening_notice = None;
         self.cursor_mcp_status = None;
         self.cursor_mcp_notice = None;
+        self.vscode_mcp_status = None;
+        self.vscode_mcp_notice = None;
         self.generation
     }
 
@@ -281,13 +289,24 @@ impl DiscoveryPanel {
         match action {
             OpeningAction::OrdinaryOpen => self.opening_status.as_ref(),
             OpeningAction::CursorMcpSetup => self.cursor_mcp_status.as_ref(),
+            OpeningAction::VsCodeMcpSetup => self.vscode_mcp_status.as_ref(),
         }
+    }
+
+    pub fn complete_vscode_mcp_status(
+        &mut self,
+        generation: u64,
+        endpoint: &str,
+        result: Result<OnboardingStatus, String>,
+    ) -> bool {
+        self.complete_action_status(generation, endpoint, OpeningAction::VsCodeMcpSetup, result)
     }
 
     pub fn set_action_notice(&mut self, action: OpeningAction, notice: Option<String>) {
         match action {
             OpeningAction::OrdinaryOpen => self.opening_notice = notice,
             OpeningAction::CursorMcpSetup => self.cursor_mcp_notice = notice,
+            OpeningAction::VsCodeMcpSetup => self.vscode_mcp_notice = notice,
         }
     }
 
@@ -316,6 +335,12 @@ impl DiscoveryPanel {
                 &mut self.cursor_mcp_notice,
                 "Cursor setup is disabled for this host.",
                 "Cursor setup is unavailable on this host. Finding apps and ordinary opening still work.",
+            ),
+            OpeningAction::VsCodeMcpSetup => (
+                &mut self.vscode_mcp_status,
+                &mut self.vscode_mcp_notice,
+                "VS Code setup is disabled for this host.",
+                "VS Code setup is unavailable on this host. Finding apps and other setup actions still work.",
             ),
         };
         match result {
@@ -349,7 +374,11 @@ impl DiscoveryPanel {
             .iter()
             .filter(|app| {
                 app.kind == ClientKind::Application
-                    && (action != OpeningAction::CursorMcpSetup || app.family == "cursor")
+                    && match action {
+                        OpeningAction::OrdinaryOpen => true,
+                        OpeningAction::CursorMcpSetup => app.family == "cursor",
+                        OpeningAction::VsCodeMcpSetup => app.family == "visual_studio_code",
+                    }
                     && status.openable_installation_ids.contains(&app.id)
             })
             .collect()
@@ -395,9 +424,11 @@ impl DiscoveryPanel {
 
     fn actionable_apps(&self) -> Vec<&InstalledClient> {
         let mut apps = self.action_apps(OpeningAction::OrdinaryOpen);
-        for app in self.action_apps(OpeningAction::CursorMcpSetup) {
-            if !apps.iter().any(|other| other.id == app.id) {
-                apps.push(app);
+        for action in [OpeningAction::CursorMcpSetup, OpeningAction::VsCodeMcpSetup] {
+            for app in self.action_apps(action) {
+                if !apps.iter().any(|other| other.id == app.id) {
+                    apps.push(app);
+                }
             }
         }
         apps

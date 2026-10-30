@@ -44,6 +44,7 @@ struct AppState(
     Arc<DiscoveryService>,
     Option<Arc<OnboardingService>>,
     Option<Arc<OnboardingService>>,
+    Option<Arc<OnboardingService>>,
 );
 
 enum Backend {
@@ -73,14 +74,20 @@ pub fn router_with_onboarding(
     config: RuntimeConfig,
     service: Arc<OnboardingService>,
 ) -> Result<Router> {
-    router_with_components(config, Arc::new(NativeInventorySource), Some(service), None)
+    router_with_components(
+        config,
+        Arc::new(NativeInventorySource),
+        Some(service),
+        None,
+        None,
+    )
 }
 
 fn router_with_discovery(
     config: RuntimeConfig,
     source: Arc<dyn InventorySource>,
 ) -> Result<Router> {
-    router_with_components(config, source, None, None)
+    router_with_components(config, source, None, None, None)
 }
 
 fn router_with_components(
@@ -88,6 +95,7 @@ fn router_with_components(
     source: Arc<dyn InventorySource>,
     onboarding: Option<Arc<OnboardingService>>,
     cursor_mcp: Option<Arc<OnboardingService>>,
+    vscode_mcp: Option<Arc<OnboardingService>>,
 ) -> Result<Router> {
     if config.bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
         return Err(RuntimeError::Invalid("bind must be 127.0.0.1".into()));
@@ -179,6 +187,22 @@ fn router_with_components(
                 .head(onboarding::deny_get_method)
                 .fallback(onboarding::deny_get_method),
         )
+        .route(
+            "/api/onboarding/vscode-mcp/status",
+            get(onboarding::vscode_status)
+                .head(onboarding::deny_get_method)
+                .fallback(onboarding::deny_get_method),
+        )
+        .route(
+            "/api/onboarding/vscode-mcp/setup",
+            axum::routing::post(onboarding::vscode_setup).fallback(onboarding::deny_post_method),
+        )
+        .route(
+            "/api/onboarding/vscode-mcp/setups/{id}",
+            get(onboarding::vscode_lookup)
+                .head(onboarding::deny_get_method)
+                .fallback(onboarding::deny_get_method),
+        )
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(MAX_REQUEST))
         .with_state(AppState(
@@ -186,33 +210,36 @@ fn router_with_components(
             Arc::new(DiscoveryService::new(source)),
             onboarding,
             cursor_mcp,
+            vscode_mcp,
         )))
 }
 
 pub async fn serve(config: RuntimeConfig) -> Result<()> {
-    serve_optional_onboarding(config, None, None).await
+    serve_optional_onboarding(config, None, None, None).await
 }
 
 pub async fn serve_with_onboarding(
     config: RuntimeConfig,
     service: Arc<OnboardingService>,
 ) -> Result<()> {
-    serve_optional_onboarding(config, Some(service), None).await
+    serve_optional_onboarding(config, Some(service), None, None).await
 }
 
-/// Both controllers are explicitly constructed by the target-host owner.
+/// Each controller is explicitly constructed by the target-host owner.
 pub async fn serve_with_native_actions(
     config: RuntimeConfig,
     onboarding: Option<Arc<OnboardingService>>,
     cursor_mcp: Option<Arc<OnboardingService>>,
+    vscode_mcp: Option<Arc<OnboardingService>>,
 ) -> Result<()> {
-    serve_optional_onboarding(config, onboarding, cursor_mcp).await
+    serve_optional_onboarding(config, onboarding, cursor_mcp, vscode_mcp).await
 }
 
 async fn serve_optional_onboarding(
     config: RuntimeConfig,
     onboarding: Option<Arc<OnboardingService>>,
     cursor_mcp: Option<Arc<OnboardingService>>,
+    vscode_mcp: Option<Arc<OnboardingService>>,
 ) -> Result<()> {
     let bind = config.bind;
     let app = tokio::task::spawn_blocking(move || {
@@ -221,6 +248,7 @@ async fn serve_optional_onboarding(
             Arc::new(NativeInventorySource),
             onboarding,
             cursor_mcp,
+            vscode_mcp,
         )
     })
     .await
@@ -327,7 +355,7 @@ async fn discover_clients(State(state): State<AppState>, headers: HeaderMap) -> 
     };
     blocking_http(move || {
         match state.1.inventory_with_actions(
-            &[state.2.as_deref(), state.3.as_deref()]
+            &[state.2.as_deref(), state.3.as_deref(), state.4.as_deref()]
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>(),
@@ -818,10 +846,19 @@ fn open_regular(path: &Path, write: bool, create: bool) -> Result<File> {
     Ok(file)
 }
 
+struct LedgerLock(File);
+
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        // A child may retain the same file description until exec closes it.
+        let _ = flock(&self.0, FlockOperation::Unlock);
+    }
+}
+
 struct LocalLedger {
     root: PathBuf,
     path: PathBuf,
-    _guard: File,
+    _guard: LedgerLock,
     file: File,
     messages: Vec<Value>,
     write_failed: bool,
@@ -848,6 +885,7 @@ impl LocalLedger {
         flock(&guard, FlockOperation::NonBlockingLockExclusive).map_err(|_| {
             RuntimeError::Unavailable("isolated ledger is already owned or cannot be locked".into())
         })?;
+        let guard = LedgerLock(guard);
         let path = root.join("messages.jsonl");
         let mut file = open_regular(&path, true, true)?;
         let bytes = file.metadata()?.len();
@@ -1195,6 +1233,20 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
         write_records(&path, &[record(1, "#alpha", "validated by test")]);
         assert!(LocalLedger::open(root.path().into()).is_ok());
+    }
+
+    #[test]
+    fn ledger_owner_drop_releases_lock_with_a_retained_file_description() {
+        let root = TempDir::new().unwrap();
+        let ledger = LocalLedger::open(root.path().into()).unwrap();
+        // Models an inherited open-file description retained across an unrelated spawn.
+        let inherited = ledger._guard.0.try_clone().unwrap();
+        assert!(LocalLedger::open(root.path().into()).is_err());
+        drop(ledger);
+        let reopened = LocalLedger::open(root.path().into()).unwrap();
+        assert_eq!(reopened.status()["storage_healthy"], true);
+        drop(inherited);
+        assert!(LocalLedger::open(root.path().into()).is_err());
     }
 
     #[test]

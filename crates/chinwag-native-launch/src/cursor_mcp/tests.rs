@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp_config::{MAX_COMMAND_BYTES, MAX_ENDPOINT_BYTES};
 use serde_json::{Value, json};
 
 fn spec(binary: &str, endpoint: &str) -> Result<CursorMcpInstall, CursorMcpInstallError> {

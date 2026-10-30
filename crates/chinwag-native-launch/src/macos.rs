@@ -1,4 +1,4 @@
-//! Native exact-copy opening and optional human Cursor installation handoff.
+//! Native exact-copy opening and optional human MCP installation handoffs.
 //!
 //! The host must already service Cocoa's main dispatch queue and call this
 //! synchronous adapter from a worker. It does not create NSApplication or a run
@@ -8,6 +8,7 @@
 
 use crate::{
     CursorMcpInstall, LaunchFailure, LaunchTarget, NativeApplicationLauncher, OpenReceipt,
+    VsCodeMcpInstall,
 };
 use block2::RcBlock;
 use chinwag_client_discovery::ClientFamily;
@@ -42,6 +43,7 @@ pub struct MacOsApplicationLauncher {
 enum OpenMode {
     Ordinary,
     CursorMcpSetup(CursorMcpInstall),
+    VsCodeMcpSetup(VsCodeMcpInstall),
 }
 
 impl OpenMode {
@@ -53,6 +55,12 @@ impl OpenMode {
             }
             Self::CursorMcpSetup(_) => Err(LaunchFailure::Rejected(
                 "Cursor MCP setup requires the exact selected Cursor installation",
+            )),
+            Self::VsCodeMcpSetup(spec) if family == ClientFamily::VisualStudioCode => {
+                Ok(Some(spec.install_uri().to_owned()))
+            }
+            Self::VsCodeMcpSetup(_) => Err(LaunchFailure::Rejected(
+                "VS Code MCP setup requires the exact selected VS Code installation",
             )),
         }
     }
@@ -73,6 +81,15 @@ impl MacOsApplicationLauncher {
     pub fn for_cursor_mcp_setup_host(spec: CursorMcpInstall) -> Self {
         Self {
             mode: OpenMode::CursorMcpSetup(spec),
+        }
+    }
+
+    /// Opens VS Code's installation approval prompt in the exact selected copy.
+    /// The owner must revalidate the declared MCP binary and selected application
+    /// before each call. OS acknowledgement is not installation or MCP proof.
+    pub fn for_vscode_mcp_setup_host(spec: VsCodeMcpInstall) -> Self {
+        Self {
+            mode: OpenMode::VsCodeMcpSetup(spec),
         }
     }
 }
@@ -193,7 +210,7 @@ impl NativeApplicationLauncher for MacOsApplicationLauncher {
                         Some(url) => Some(url),
                         None => {
                             let _ = sender.try_send(Err(LaunchFailure::Rejected(
-                                "fixed Cursor setup URL could not be represented",
+                                "fixed MCP setup URL could not be represented",
                             )));
                             return;
                         }
@@ -383,9 +400,36 @@ mod tests {
     #[test]
     fn ordinary_open_never_attaches_an_install_uri() {
         let launcher = MacOsApplicationLauncher::for_main_loop_host();
-        for family in [ClientFamily::Cursor, ClientFamily::GrokBot] {
+        for family in [
+            ClientFamily::Cursor,
+            ClientFamily::GrokBot,
+            ClientFamily::VisualStudioCode,
+        ] {
             assert_eq!(launcher.mode.setup_uri(family), Ok(None));
         }
+    }
+
+    #[test]
+    fn vscode_setup_mode_rejects_other_families_before_any_native_submission() {
+        let spec = VsCodeMcpInstall::new(
+            "/owner/chinwag-native-inbox-mcp".into(),
+            "http://127.0.0.1:4780".into(),
+        )
+        .unwrap();
+        let launcher = MacOsApplicationLauncher::for_vscode_mcp_setup_host(spec);
+        for family in [ClientFamily::Cursor, ClientFamily::GrokBot] {
+            assert!(matches!(
+                launcher.mode.setup_uri(family),
+                Err(LaunchFailure::Rejected(_))
+            ));
+        }
+        let uri = launcher
+            .mode
+            .setup_uri(ClientFamily::VisualStudioCode)
+            .unwrap()
+            .unwrap();
+        assert!(uri.starts_with("vscode:mcp/install?%7B"));
+        assert!(!uri.starts_with("cursor:"));
     }
 
     fn expected() -> ExpectedApplication {

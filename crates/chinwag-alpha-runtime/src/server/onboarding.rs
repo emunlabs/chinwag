@@ -138,6 +138,14 @@ pub(super) async fn cursor_status(
     status_for(state.3, uri, headers).await
 }
 
+pub(super) async fn vscode_status(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    status_for(state.4, uri, headers).await
+}
+
 async fn status_for(
     service: Option<Arc<OnboardingService>>,
     uri: Uri,
@@ -181,6 +189,15 @@ pub(super) async fn cursor_setup(
     bytes: Bytes,
 ) -> Response {
     open_for(state.3, uri, headers, bytes).await
+}
+
+pub(super) async fn vscode_setup(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    open_for(state.4, uri, headers, bytes).await
 }
 
 async fn open_for(
@@ -230,6 +247,15 @@ pub(super) async fn cursor_lookup(
     headers: HeaderMap,
 ) -> Response {
     lookup_for(state.3, uri, id, headers).await
+}
+
+pub(super) async fn vscode_lookup(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    lookup_for(state.4, uri, id, headers).await
 }
 
 async fn lookup_for(

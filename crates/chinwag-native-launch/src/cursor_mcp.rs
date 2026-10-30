@@ -1,14 +1,12 @@
 //! Pure owner-declared Cursor setup payload. This never reads client settings,
 //! discovers a binary, resolves DNS, or executes the supplied command.
 
+use crate::mcp_config::{self, ConfigError, SERVER_NAME};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use std::{net::IpAddr, path::PathBuf};
+use std::path::PathBuf;
 use url::Url;
 
-const SERVER_NAME: &str = "chinwag-native-inbox-mgmt";
 const INSTALL_URL: &str = "cursor://anysphere.cursor-deeplink/mcp/install";
-const MAX_COMMAND_BYTES: usize = 4096;
-const MAX_ENDPOINT_BYTES: usize = 256;
 
 /// Opaque configuration for Cursor's human-approved MCP installation prompt.
 /// It supplies only the fixed read-only native inbox command and arguments.
@@ -43,32 +41,12 @@ pub enum CursorMcpInstallError {
 
 impl CursorMcpInstall {
     pub fn new(binary: PathBuf, endpoint: String) -> Result<Self, CursorMcpInstallError> {
-        let command = binary
-            .to_str()
-            .filter(|text| {
-                !text.is_empty()
-                    && text.len() <= MAX_COMMAND_BYTES
-                    && text.trim() == *text
-                    && !text
-                        .chars()
-                        .any(|c| c.is_control() || matches!(c, '$' | '`'))
-            })
-            .ok_or(CursorMcpInstallError::InvalidBinary)?;
-        let normalized: PathBuf = binary.components().collect();
-        if !crate::canonical_absolute(&binary)
-            || binary.file_name().is_none()
-            || normalized.as_os_str() != binary.as_os_str()
-        {
-            return Err(CursorMcpInstallError::InvalidBinary);
-        }
-        let endpoint = loopback_origin(&endpoint)?;
+        let config = mcp_config::stdio_config(&binary, &endpoint).map_err(|error| match error {
+            ConfigError::InvalidBinary => CursorMcpInstallError::InvalidBinary,
+            ConfigError::InvalidEndpoint => CursorMcpInstallError::InvalidEndpoint,
+        })?;
         // Cursor's install-link config is the inner server value; the server
         // name is a separate query field. There is no mcpServers/name wrapper.
-        let config = serde_json::json!({
-            "type": "stdio",
-            "command": command,
-            "args": ["--bus-url", endpoint.as_str(), "--allow-room", "#mgmt", "--lease-seconds", "900"]
-        });
         let json =
             serde_json::to_vec(&config).map_err(|_| CursorMcpInstallError::InvalidConfiguration)?;
         let encoded = STANDARD.encode(json);
@@ -87,54 +65,6 @@ impl CursorMcpInstall {
     pub(crate) fn install_uri(&self) -> &str {
         &self.install_uri
     }
-}
-
-fn loopback_origin(endpoint: &str) -> Result<Url, CursorMcpInstallError> {
-    let invalid = || CursorMcpInstallError::InvalidEndpoint;
-    if endpoint.is_empty()
-        || endpoint.len() > MAX_ENDPOINT_BYTES
-        || endpoint.trim() != endpoint
-        || endpoint
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '$' | '`' | '\\'))
-    {
-        return Err(invalid());
-    }
-    let after_scheme = endpoint.strip_prefix("http://").ok_or_else(invalid)?;
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(invalid)?;
-    if !matches!(&after_scheme[authority.len()..], "" | "/") {
-        return Err(invalid());
-    }
-    let mut url = Url::parse(endpoint).map_err(|_| invalid())?;
-    if url.scheme() != "http"
-        || authority.contains('@')
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || url.port_or_known_default() == Some(0)
-    {
-        return Err(invalid());
-    }
-    match url.host_str() {
-        Some("localhost") => url.set_host(Some("127.0.0.1")).map_err(|_| invalid())?,
-        Some(host) => {
-            if !host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-            {
-                return Err(invalid());
-            }
-        }
-        None => return Err(invalid()),
-    }
-    Ok(url)
 }
 
 #[cfg(test)]

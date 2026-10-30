@@ -27,6 +27,8 @@ pub enum OpeningAction {
     #[default]
     OrdinaryOpen,
     CursorMcpSetup,
+    #[serde(rename = "vscode_mcp_setup")]
+    VsCodeMcpSetup,
 }
 
 impl OpeningAction {
@@ -34,6 +36,7 @@ impl OpeningAction {
         match self {
             Self::OrdinaryOpen => "Open/reuse",
             Self::CursorMcpSetup => "Set up Cursor",
+            Self::VsCodeMcpSetup => "Set up VS Code",
         }
     }
 
@@ -41,6 +44,7 @@ impl OpeningAction {
         match self {
             Self::OrdinaryOpen => "Check opening status",
             Self::CursorMcpSetup => "Check setup status",
+            Self::VsCodeMcpSetup => "Check VS Code setup status",
         }
     }
 }
@@ -88,6 +92,17 @@ impl OpeningAttempt {
     }
 
     pub fn summary(&self) -> String {
+        if self.action == OpeningAction::VsCodeMcpSetup {
+            return match &self.state {
+                OpeningState::Receipt(receipt) if receipt.state == NativeOpenState::OpenedOrReused =>
+                    "VS Code setup request sent · server addition, trust and inbox read are unverified.".into(),
+                OpeningState::Receipt(receipt) if receipt.state == NativeOpenState::Rejected =>
+                    format!("VS Code setup was not acknowledged · {}", receipt.message),
+                _ if self.unresolved() =>
+                    "VS Code setup unconfirmed · check saved status; it will not be submitted again".into(),
+                _ => "VS Code setup acknowledgement unavailable; connection unverified".into(),
+            };
+        }
         if self.action == OpeningAction::CursorMcpSetup {
             if self.human_confirmation.is_some() && acknowledged_cursor_setup(self) {
                 return "Enabled with tools in Cursor — confirmed by you; live connection unverified."
@@ -134,6 +149,7 @@ impl OpeningAttempt {
             return match self.action {
                 OpeningAction::OrdinaryOpen => client.application_open_receipt(&self.id),
                 OpeningAction::CursorMcpSetup => client.cursor_mcp_setup_receipt(&self.id),
+                OpeningAction::VsCodeMcpSetup => client.vscode_mcp_setup_receipt(&self.id),
             };
         }
         let request = NativeOpenRequest {
@@ -142,6 +158,7 @@ impl OpeningAttempt {
         match self.action {
             OpeningAction::OrdinaryOpen => client.open_application(&self.id, &request),
             OpeningAction::CursorMcpSetup => client.setup_cursor_mcp(&self.id, &request),
+            OpeningAction::VsCodeMcpSetup => client.setup_vscode_mcp(&self.id, &request),
         }
         .map(Some)
     }
@@ -165,6 +182,14 @@ pub fn short_installation_id(id: &str) -> &str {
 }
 
 impl OpeningStore {
+    pub fn has_acknowledged_vscode_setup(&self, endpoint: &str, installation_id: &str) -> bool {
+        self.attempts.iter().any(|attempt| {
+            attempt.endpoint == endpoint
+                && attempt.installation_id == installation_id
+                && acknowledged_vscode_setup(attempt)
+        })
+    }
+
     pub fn open(path: PathBuf) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid("opening history path must be absolute"));
@@ -283,6 +308,13 @@ impl OpeningStore {
         installation_id: &str,
     ) -> io::Result<OpeningAttempt> {
         validate_target(endpoint, installation_id)?;
+        if action == OpeningAction::VsCodeMcpSetup
+            && self.has_acknowledged_vscode_setup(endpoint, installation_id)
+        {
+            return Err(invalid(
+                "VS Code setup was already acknowledged for this exact target",
+            ));
+        }
         if self.blocks(endpoint, installation_id) {
             return Err(invalid(
                 "this installation has an unconfirmed opening; use Check opening status",
@@ -300,8 +332,10 @@ impl OpeningStore {
         while next.len() >= MAX_ATTEMPTS {
             let index = next
                 .iter()
-                .position(|attempt| !attempt.unresolved())
-                .ok_or_else(|| invalid("opening history is full of unconfirmed attempts"))?;
+                .position(|attempt| !attempt.unresolved() && !acknowledged_vscode_setup(attempt))
+                .ok_or_else(|| {
+                    invalid("opening history is full of protected or unconfirmed attempts")
+                })?;
             next.remove(index);
         }
         next.push(attempt.clone());
@@ -500,6 +534,15 @@ fn acknowledged_cursor_setup(attempt: &OpeningAttempt) -> bool {
                 },
             )
             .is_ok()
+}
+
+fn acknowledged_vscode_setup(attempt: &OpeningAttempt) -> bool {
+    attempt.action == OpeningAction::VsCodeMcpSetup
+        && matches!(&attempt.state, OpeningState::Receipt(receipt)
+            if receipt.state == NativeOpenState::OpenedOrReused
+            && receipt.validate_for(&attempt.id, &NativeOpenRequest {
+                installation_id: attempt.installation_id.clone()
+            }).is_ok())
 }
 
 fn validate_confirmation_time(at_ms: u64) -> io::Result<()> {

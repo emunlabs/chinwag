@@ -21,6 +21,7 @@ fn dispatch(mut args: Vec<String>) -> Result<()> {
     let native_main_loop = take_native_main_loop(&mut args)?;
     let journal = onboarding_journal(&args, native_main_loop)?;
     cursor_mcp_options(&args, native_main_loop, journal.as_deref())?;
+    vscode_mcp_options(&args, native_main_loop, journal.as_deref())?;
     if native_main_loop {
         #[cfg(target_os = "macos")]
         {
@@ -100,7 +101,7 @@ fn onboarding_journal(args: &[String], native_main_loop: bool) -> Result<Option<
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct CursorMcpOptions {
+struct McpOptions {
     binary: PathBuf,
     journal: PathBuf,
 }
@@ -110,7 +111,36 @@ fn cursor_mcp_options(
     args: &[String],
     native_main_loop: bool,
     opening_journal: Option<&std::path::Path>,
-) -> Result<Option<CursorMcpOptions>> {
+) -> Result<Option<McpOptions>> {
+    mcp_setup_options(args, native_main_loop, opening_journal, "cursor", "Cursor")
+}
+
+fn vscode_mcp_options(
+    args: &[String],
+    native_main_loop: bool,
+    opening_journal: Option<&std::path::Path>,
+) -> Result<Option<McpOptions>> {
+    let options = mcp_setup_options(args, native_main_loop, opening_journal, "vscode", "VS Code")?;
+    let cursor = cursor_mcp_options(args, native_main_loop, opening_journal)?;
+    if options
+        .as_ref()
+        .zip(cursor.as_ref())
+        .is_some_and(|(left, right)| left.journal == right.journal)
+    {
+        return Err(RuntimeError::Invalid(
+            "Cursor and VS Code setup require distinct journals".into(),
+        ));
+    }
+    Ok(options)
+}
+
+fn mcp_setup_options(
+    args: &[String],
+    native_main_loop: bool,
+    opening_journal: Option<&std::path::Path>,
+    kind: &str,
+    label: &str,
+) -> Result<Option<McpOptions>> {
     let find = |flag: &str| -> Result<Option<PathBuf>> {
         let positions: Vec<_> = args
             .iter()
@@ -119,9 +149,9 @@ fn cursor_mcp_options(
             .map(|(i, _)| i)
             .collect();
         if positions.len() > 1 {
-            return Err(RuntimeError::Invalid(
-                "Cursor setup options must be unique".into(),
-            ));
+            return Err(RuntimeError::Invalid(format!(
+                "{label} setup options must be unique"
+            )));
         }
         positions
             .first()
@@ -130,27 +160,38 @@ fn cursor_mcp_options(
                     .map(PathBuf::from)
                     .filter(|path| path.is_absolute())
                     .ok_or_else(|| {
-                        RuntimeError::Invalid(
-                            "Cursor setup requires absolute binary and journal paths".into(),
-                        )
+                        RuntimeError::Invalid(format!(
+                            "{label} setup requires absolute binary and journal paths"
+                        ))
                     })
             })
             .transpose()
     };
-    let binary = find("--cursor-mcp-binary")?;
-    let journal = find("--cursor-mcp-journal")?;
+    let binary = find(&format!("--{kind}-mcp-binary"))?;
+    let journal = find(&format!("--{kind}-mcp-journal"))?;
     match (binary, journal) {
         (None, None) => Ok(None),
-        (Some(binary), Some(journal)) if native_main_loop && opening_journal.is_some()
-            && matches!(args.first().map(String::as_str), Some("serve-local" | "serve-shared"))
-            && opening_journal != Some(journal.as_path()) => Ok(Some(CursorMcpOptions { binary, journal })),
-        _ => Err(RuntimeError::Invalid("Cursor setup requires --native-main-loop, --onboarding-journal and paired --cursor-mcp-binary/--cursor-mcp-journal with a distinct journal".into())),
+        (Some(binary), Some(journal))
+            if native_main_loop
+                && opening_journal.is_some()
+                && matches!(
+                    args.first().map(String::as_str),
+                    Some("serve-local" | "serve-shared")
+                )
+                && opening_journal != Some(journal.as_path()) =>
+        {
+            Ok(Some(McpOptions { binary, journal }))
+        }
+        _ => Err(RuntimeError::Invalid(format!(
+            "{label} setup requires --native-main-loop, --onboarding-journal and paired --{kind}-mcp-binary/--{kind}-mcp-journal with a distinct journal"
+        ))),
     }
 }
 
 async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
     let onboarding_journal = onboarding_journal(&args, native_main_loop)?;
     let cursor_mcp = cursor_mcp_options(&args, native_main_loop, onboarding_journal.as_deref())?;
+    let vscode_mcp = vscode_mcp_options(&args, native_main_loop, onboarding_journal.as_deref())?;
     let Some((command, rest)) = args.split_first() else {
         return Err(RuntimeError::Invalid(
             "use launch, serve-local, serve-shared or discover-clients".into(),
@@ -182,6 +223,8 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
             "--onboarding-journal",
             "--cursor-mcp-binary",
             "--cursor-mcp-journal",
+            "--vscode-mcp-binary",
+            "--vscode-mcp-journal",
         ],
         "serve-shared" => &[
             "--ledger",
@@ -192,6 +235,8 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
             "--onboarding-journal",
             "--cursor-mcp-binary",
             "--cursor-mcp-journal",
+            "--vscode-mcp-binary",
+            "--vscode-mcp-journal",
         ],
         _ => return Err(RuntimeError::Invalid("unknown runtime command".into())),
     };
@@ -297,38 +342,56 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
         }
     }
     let mut cursor_service = None;
-    if let Some(options) = cursor_mcp {
-        #[cfg(target_os = "macos")]
-        {
-            let endpoint = format!("http://127.0.0.1:{port}");
-            // Port zero cannot be embedded in a persistent child configuration.
-            if port != 0 {
-                match tokio::task::spawn_blocking(move || {
-                    OnboardingService::new_cursor_mcp_native(
-                        &options.journal,
-                        &options.binary,
-                        endpoint,
-                    )
-                })
-                .await
-                {
-                    Ok(Ok(service)) => cursor_service = Some(Arc::new(service)),
-                    Ok(Err(_)) | Err(_) => eprintln!(
-                        "chinwag-alpha-runtime: Cursor setup initialization unavailable; bus and ordinary opening continue; no recovery was attempted"
-                    ),
+    let mut vscode_service = None;
+    for (is_vscode, label, options) in
+        [(false, "Cursor", cursor_mcp), (true, "VS Code", vscode_mcp)]
+    {
+        if let Some(options) = options {
+            #[cfg(target_os = "macos")]
+            {
+                let endpoint = format!("http://127.0.0.1:{port}");
+                if port != 0 {
+                    match tokio::task::spawn_blocking(move || {
+                        if is_vscode {
+                            OnboardingService::new_vscode_mcp_native(
+                                &options.journal,
+                                &options.binary,
+                                endpoint,
+                            )
+                        } else {
+                            OnboardingService::new_cursor_mcp_native(
+                                &options.journal,
+                                &options.binary,
+                                endpoint,
+                            )
+                        }
+                    })
+                    .await
+                    {
+                        Ok(Ok(service)) => {
+                            if is_vscode {
+                                vscode_service = Some(Arc::new(service));
+                            } else {
+                                cursor_service = Some(Arc::new(service));
+                            }
+                        }
+                        Ok(Err(_)) | Err(_) => eprintln!(
+                            "chinwag-alpha-runtime: {label} setup initialization unavailable; bus and ordinary opening continue; no recovery was attempted"
+                        ),
+                    }
+                } else {
+                    eprintln!(
+                        "chinwag-alpha-runtime: {label} setup requires a fixed nonzero runtime port; setup disabled"
+                    );
                 }
-            } else {
-                eprintln!(
-                    "chinwag-alpha-runtime: Cursor setup requires a fixed nonzero runtime port; setup disabled"
-                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (is_vscode, label, options);
             }
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = options;
-        }
     }
-    server::serve_with_native_actions(config, opening_service, cursor_service).await
+    server::serve_with_native_actions(config, opening_service, cursor_service, vscode_service).await
 }
 
 fn verify_signer_ledger(ledger: &std::path::Path, repo: &std::path::Path) -> Result<()> {
@@ -360,7 +423,7 @@ mod tests {
         let ordinary = std::path::Path::new("/fixture/ordinary");
         assert_eq!(
             cursor_mcp_options(&valid, true, Some(ordinary)).unwrap(),
-            Some(CursorMcpOptions {
+            Some(McpOptions {
                 binary: "/fixture/mcp".into(),
                 journal: "/fixture/cursor".into(),
             })
@@ -555,5 +618,92 @@ mod tests {
         let alias = root.path().join("alias.jsonl");
         std::os::unix::fs::symlink(&own, &alias).unwrap();
         assert!(verify_signer_ledger(&alias, &repo).is_err());
+    }
+
+    #[test]
+    fn vscode_setup_requires_its_own_paired_owner_opt_in() {
+        let values = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let ordinary = std::path::Path::new("/fixture/open");
+        let valid = values(&[
+            "serve-shared",
+            "--vscode-mcp-binary",
+            "/fixture/mcp",
+            "--vscode-mcp-journal",
+            "/fixture/vscode",
+        ]);
+        assert_eq!(
+            vscode_mcp_options(&valid, true, Some(ordinary)).unwrap(),
+            Some(McpOptions {
+                binary: "/fixture/mcp".into(),
+                journal: "/fixture/vscode".into()
+            })
+        );
+        assert!(vscode_mcp_options(&valid, false, Some(ordinary)).is_err());
+        assert!(vscode_mcp_options(&valid, true, None).is_err());
+        assert!(
+            vscode_mcp_options(&valid, true, Some(std::path::Path::new("/fixture/vscode")))
+                .is_err()
+        );
+        for invalid in [
+            values(&["serve-local", "--vscode-mcp-binary", "/fixture/mcp"]),
+            values(&["serve-local", "--vscode-mcp-journal", "/fixture/vscode"]),
+            values(&[
+                "serve-shared",
+                "--vscode-mcp-binary",
+                "relative",
+                "--vscode-mcp-journal",
+                "/fixture/vscode",
+            ]),
+            values(&[
+                "launch",
+                "--vscode-mcp-binary",
+                "/fixture/mcp",
+                "--vscode-mcp-journal",
+                "/fixture/vscode",
+            ]),
+            values(&[
+                "serve-local",
+                "--vscode-mcp-binary",
+                "/fixture/mcp",
+                "--vscode-mcp-binary",
+                "/fixture/mcp",
+                "--vscode-mcp-journal",
+                "/fixture/vscode",
+            ]),
+            values(&[
+                "serve-shared",
+                "--vscode-mcp-binary",
+                "/fixture/mcp",
+                "--vscode-mcp-journal",
+                "/fixture/setup",
+                "--cursor-mcp-binary",
+                "/fixture/mcp",
+                "--cursor-mcp-journal",
+                "/fixture/setup",
+            ]),
+        ] {
+            assert!(vscode_mcp_options(&invalid, true, Some(ordinary)).is_err());
+        }
+        assert!(
+            vscode_mcp_options(&values(&["serve-shared"]), false, None)
+                .unwrap()
+                .is_none()
+        );
+        let paired = values(&[
+            "serve-shared",
+            "--vscode-mcp-binary",
+            "/fixture/mcp",
+            "--vscode-mcp-journal",
+            "/fixture/vscode",
+            "--cursor-mcp-binary",
+            "/fixture/mcp",
+            "--cursor-mcp-journal",
+            "/fixture/cursor",
+        ]);
+        assert!(
+            vscode_mcp_options(&paired, true, Some(ordinary))
+                .unwrap()
+                .is_some()
+        );
     }
 }

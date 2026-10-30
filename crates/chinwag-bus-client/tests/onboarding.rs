@@ -359,3 +359,117 @@ fn cursor_setup_missing_rejected_or_mismatched_response_stays_unknown_without_re
     );
     assert_eq!(worker.join().unwrap().len(), 1);
 }
+
+#[test]
+fn vscode_setup_posts_once_with_correlated_opaque_payload_and_no_client_claim() {
+    let (url, worker) = fixture(200, Some(receipt()));
+    let received = BusClient::new(&url)
+        .unwrap()
+        .setup_vscode_mcp(REQUEST_ID, &request())
+        .unwrap();
+    assert_eq!(received.state, NativeOpenState::OpenedOrReused);
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    let wire = &requests[0];
+    assert!(wire.starts_with("POST /api/onboarding/vscode-mcp/setup HTTP/1.1\r\n"));
+    let lower = wire.to_ascii_lowercase();
+    assert_eq!(
+        lower.matches("x-chinwag-onboarding-intent: 1\r\n").count(),
+        1
+    );
+    assert_eq!(
+        lower
+            .matches(&format!("x-chinwag-request-id: {REQUEST_ID}\r\n"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(wire.split_once("\r\n\r\n").unwrap().1).unwrap(),
+        json!({"installation_id":"a".repeat(64)})
+    );
+    for forbidden in ["command", "env", "path", "sender", "wake", "authorization:"] {
+        assert!(!wire.contains(forbidden));
+    }
+}
+
+#[test]
+fn vscode_capability_and_saved_recovery_use_only_their_get_routes() {
+    let (url, worker) = fixture(
+        200,
+        Some(json!({"schema":"chinwag-native-onboarding/v1",
+        "native_open_allowed":true,"openable_installation_ids":["a".repeat(64)]})),
+    );
+    assert!(
+        BusClient::new(&url)
+            .unwrap()
+            .vscode_mcp_setup_status()
+            .unwrap()
+            .native_open_allowed
+    );
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /api/onboarding/vscode-mcp/status HTTP/1.1\r\n"));
+    for code in [200, 404] {
+        let (url, worker) = fixture(code, Some(receipt()));
+        assert_eq!(
+            BusClient::new(&url)
+                .unwrap()
+                .vscode_mcp_setup_receipt(REQUEST_ID)
+                .unwrap()
+                .is_some(),
+            code == 200
+        );
+        let requests = worker.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(&format!(
+            "GET /api/onboarding/vscode-mcp/setups/{REQUEST_ID} HTTP/1.1\r\n"
+        )));
+    }
+    let (url, worker) = fixture(404, Some(json!({"error":"older runtime"})));
+    assert!(
+        BusClient::new(&url)
+            .unwrap()
+            .vscode_mcp_setup_status()
+            .is_err()
+    );
+    assert_eq!(worker.join().unwrap().len(), 1);
+}
+
+#[test]
+fn vscode_missing_or_mismatched_receipt_stays_unknown_without_replay() {
+    let mut other = receipt();
+    other["installation_id"] = json!("b".repeat(64));
+    for (code, body) in [
+        (200, None),
+        (200, Some(other)),
+        (200, Some(json!({"connected":true}))),
+        (403, Some(json!({"error":"no"}))),
+    ] {
+        let (url, worker) = fixture(code, body);
+        assert!(matches!(
+            BusClient::new(&url)
+                .unwrap()
+                .setup_vscode_mcp(REQUEST_ID, &request()),
+            Err(ClientError::NativeOpenOutcomeUnknown { .. })
+        ));
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+    let client = BusClient::new("http://127.0.0.1:9").unwrap();
+    assert!(matches!(
+        client.setup_vscode_mcp("bad/id", &request()),
+        Err(ClientError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client.vscode_mcp_setup_receipt("bad/id"),
+        Err(ClientError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client.setup_vscode_mcp(
+            REQUEST_ID,
+            &NativeOpenRequest {
+                installation_id: "/Applications/Visual Studio Code.app".into()
+            }
+        ),
+        Err(ClientError::InvalidRequest(_))
+    ));
+}

@@ -121,6 +121,11 @@ impl BusClient {
         self.native_action_status("/api/onboarding/cursor-mcp/status")
     }
 
+    /// VS Code installation handoff capability; no installation or connection.
+    pub fn vscode_mcp_setup_status(&self) -> Result<OnboardingStatus, ClientError> {
+        self.native_action_status("/api/onboarding/vscode-mcp/status")
+    }
+
     fn native_action_status(&self, route: &str) -> Result<OnboardingStatus, ClientError> {
         let status: OnboardingStatus = read_json(
             self.http
@@ -150,6 +155,16 @@ impl BusClient {
         request: &NativeOpenRequest,
     ) -> Result<NativeOpenReceipt, ClientError> {
         self.perform_native_action("/api/onboarding/cursor-mcp/setup", request_id, request)
+    }
+
+    /// One explicit VS Code handoff. The OS receipt does not prove that VS Code
+    /// added or trusted the server, listed its tools, or read the inbox.
+    pub fn setup_vscode_mcp(
+        &self,
+        request_id: &str,
+        request: &NativeOpenRequest,
+    ) -> Result<NativeOpenReceipt, ClientError> {
+        self.perform_native_action("/api/onboarding/vscode-mcp/setup", request_id, request)
     }
 
     fn perform_native_action(
@@ -193,6 +208,14 @@ impl BusClient {
         request_id: &str,
     ) -> Result<Option<NativeOpenReceipt>, ClientError> {
         self.native_action_receipt("/api/onboarding/cursor-mcp/setups", request_id)
+    }
+
+    /// GET-only reconciliation of the original VS Code setup request.
+    pub fn vscode_mcp_setup_receipt(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<NativeOpenReceipt>, ClientError> {
+        self.native_action_receipt("/api/onboarding/vscode-mcp/setups", request_id)
     }
 
     fn native_action_receipt(

@@ -115,6 +115,7 @@ struct AppInventoryRead {
     inventory: Result<ClientInventory, String>,
     opening_status: Option<Result<OnboardingStatus, String>>,
     cursor_mcp_status: Option<Result<OnboardingStatus, String>>,
+    vscode_mcp_status: Option<Result<OnboardingStatus, String>>,
 }
 
 impl AppInventoryRead {
@@ -122,6 +123,7 @@ impl AppInventoryRead {
         match action {
             OpeningAction::OrdinaryOpen => self.opening_status.as_ref(),
             OpeningAction::CursorMcpSetup => self.cursor_mcp_status.as_ref(),
+            OpeningAction::VsCodeMcpSetup => self.vscode_mcp_status.as_ref(),
         }
     }
 }
@@ -133,7 +135,7 @@ fn read_app_inventory(endpoint: &str, action: Option<OpeningAction>) -> AppInven
     let opening_status = inventory
         .as_ref()
         .ok()
-        .filter(|_| action != Some(OpeningAction::CursorMcpSetup))
+        .filter(|_| action.is_none() || action == Some(OpeningAction::OrdinaryOpen))
         .map(|_| {
             BusClient::new(endpoint)
                 .and_then(|client| client.onboarding_status())
@@ -157,10 +159,29 @@ fn read_app_inventory(endpoint: &str, action: Option<OpeningAction>) -> AppInven
                 .and_then(|client| client.cursor_mcp_setup_status())
                 .map_err(|error| error.to_string())
         });
+    let vscode_mcp_status = inventory
+        .as_ref()
+        .ok()
+        .filter(|inventory| {
+            action == Some(OpeningAction::VsCodeMcpSetup)
+                || (action.is_none()
+                    && inventory.installations.as_ref().is_some_and(|installed| {
+                        installed.apps.iter().any(|app| {
+                            app.kind == chinwag_bus_client::ClientKind::Application
+                                && app.family == "visual_studio_code"
+                        })
+                    }))
+        })
+        .map(|_| {
+            BusClient::new(endpoint)
+                .and_then(|client| client.vscode_mcp_setup_status())
+                .map_err(|error| error.to_string())
+        });
     AppInventoryRead {
         inventory,
         opening_status,
         cursor_mcp_status,
+        vscode_mcp_status,
     }
 }
 
@@ -568,6 +589,13 @@ impl Workbench {
                             status,
                         );
                     }
+                    if let Some(status) = read.vscode_mcp_status {
+                        this.client_inventory.complete_vscode_mcp_status(
+                            generation,
+                            &expected_endpoint,
+                            status,
+                        );
+                    }
                     this.sync_cursor_copy_selection();
                     cx.notify();
                 }
@@ -611,10 +639,11 @@ impl Workbench {
                 .action_copies(action)
                 .iter()
                 .any(|(id, _)| id == installation_id)
-            && self
-                .openings
-                .as_ref()
-                .is_some_and(|store| !store.blocks(&endpoint, installation_id))
+            && self.openings.as_ref().is_some_and(|store| {
+                !store.blocks(&endpoint, installation_id)
+                    && (action != OpeningAction::VsCodeMcpSetup
+                        || !store.has_acknowledged_vscode_setup(&endpoint, installation_id))
+            })
     }
 
     fn open_installation(&mut self, installation_id: &str, cx: &mut Context<Self>) {
@@ -722,6 +751,15 @@ impl Workbench {
             );
         } else if selection.action == OpeningAction::CursorMcpSetup {
             self.client_inventory.cursor_mcp_status = None;
+        }
+        if let Some(status) = read.vscode_mcp_status {
+            self.client_inventory.complete_vscode_mcp_status(
+                selection.inventory_generation,
+                &selection.endpoint,
+                status,
+            );
+        } else if selection.action == OpeningAction::VsCodeMcpSetup {
+            self.client_inventory.vscode_mcp_status = None;
         }
         if !selected_still_matches || !status_valid {
             self.client_inventory.set_action_notice(selection.action, Some(if refreshed {
@@ -1666,8 +1704,24 @@ impl Workbench {
                     .any(|(copy, _)| copy == &id);
                 let setup_enabled =
                     self.can_act_on_installation(OpeningAction::CursorMcpSetup, &id, cx);
+                let vscode_preparing = self.opening_selection.as_ref().is_some_and(|selection| {
+                    selection.app.id == id
+                        && selection.endpoint == configured_endpoint
+                        && selection.action == OpeningAction::VsCodeMcpSetup
+                });
+                let vscode_supported = self
+                    .client_inventory
+                    .action_copies(OpeningAction::VsCodeMcpSetup)
+                    .iter()
+                    .any(|(copy, _)| copy == &id);
+                let vscode_sent = self.openings.as_ref().is_some_and(|store| {
+                    store.has_acknowledged_vscode_setup(&configured_endpoint, &id)
+                });
+                let vscode_enabled =
+                    self.can_act_on_installation(OpeningAction::VsCodeMcpSetup, &id, cx);
                 let open_id = id.clone();
                 let setup_id = id.clone();
+                let vscode_id = id.clone();
                 let disambiguation = self.client_inventory.copy_disambiguation(&id);
                 let latest = self
                     .openings
@@ -1716,6 +1770,27 @@ impl Workbench {
                                             this.act_on_installation(
                                                 OpeningAction::CursorMcpSetup,
                                                 &setup_id,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            })
+                            .when(vscode_supported, |this| {
+                                this.child(
+                                    Button::new(("setup-vscode-mcp", index))
+                                        .small()
+                                        .label(if vscode_preparing {
+                                            "Checking selected app…"
+                                        } else if vscode_sent {
+                                            "VS Code setup request sent"
+                                        } else {
+                                            "Set up VS Code"
+                                        })
+                                        .disabled(!vscode_enabled)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.act_on_installation(
+                                                OpeningAction::VsCodeMcpSetup,
+                                                &vscode_id,
                                                 cx,
                                             )
                                         })),
@@ -1804,6 +1879,11 @@ impl Workbench {
                     .cursor_mcp_status
                     .as_ref()
                     .is_some_and(|status| status.native_open_allowed)
+                || self
+                    .client_inventory
+                    .vscode_mcp_status
+                    .as_ref()
+                    .is_some_and(|status| status.native_open_allowed)
         });
         div()
                 .flex().flex_col().gap_2().border_t_1().border_color(cx.theme().border).pt_3()
@@ -1843,9 +1923,14 @@ impl Workbench {
                         .when(!self.client_inventory.action_copies(OpeningAction::CursorMcpSetup).is_empty(), |this| this.child(
                             div().text_xs().text_color(cx.theme().muted_foreground)
                                 .child("Read native #mgmt in Cursor; Cursor will ask for installation approval.")))
+                        .when(!self.client_inventory.action_copies(OpeningAction::VsCodeMcpSetup).is_empty(), |this| this.child(
+                            div().text_xs().text_color(cx.theme().muted_foreground)
+                                .child("Read native #mgmt in VS Code. Review server addition and trust in VS Code; this does not verify an inbox read.")))
                         .when_some(self.client_inventory.opening_notice.clone(), |this, notice| this.child(
                             div().text_xs().text_color(cx.theme().muted_foreground).child(notice)))
                         .when_some(self.client_inventory.cursor_mcp_notice.clone(), |this, notice| this.child(
+                            div().text_xs().text_color(cx.theme().muted_foreground).child(notice)))
+                        .when_some(self.client_inventory.vscode_mcp_notice.clone(), |this, notice| this.child(
                             div().text_xs().text_color(cx.theme().muted_foreground).child(notice)))
                         .when(!opening_history.is_empty(), |this| this.child(div().id("opening-history")
                             .max_h(px(170.)).overflow_y_scroll().flex().flex_col().gap_1().children(opening_history)))
