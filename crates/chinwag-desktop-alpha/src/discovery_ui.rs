@@ -131,6 +131,25 @@ fn copy_hint(app: &InstalledClient) -> String {
     parts.join(" · ")
 }
 
+fn copy_disambiguation(apps: &[&InstalledClient], id: &str) -> Option<String> {
+    let app = apps.iter().find(|app| app.id == id)?;
+    let hint = copy_hint(app);
+    let ambiguous = apps.iter().filter(|other| copy_hint(other) == hint).count() > 1;
+    if !ambiguous && (app.location.is_some() || app.version.is_some()) {
+        return None;
+    }
+    let suffix = (8..=64)
+        .step_by(4)
+        .filter_map(|length| app.id.get(app.id.len().saturating_sub(length)..))
+        .find(|suffix| {
+            !apps
+                .iter()
+                .any(|other| other.id != app.id && other.id.ends_with(suffix))
+        })
+        .unwrap_or(&app.id);
+    Some(format!("Copy {suffix}"))
+}
+
 fn grouped_families(inventory: &ClientInventory) -> BTreeMap<&str, FamilyCounts> {
     let mut families: BTreeMap<&str, FamilyCounts> = BTreeMap::new();
     for client in &inventory.clients {
@@ -343,24 +362,35 @@ impl DiscoveryPanel {
             .collect()
     }
 
-    pub fn copy_disambiguation(&self, id: &str) -> Option<String> {
-        let apps = self.actionable_apps();
-        let app = apps.iter().find(|app| app.id == id)?;
-        let hint = copy_hint(app);
-        let ambiguous = apps.iter().filter(|other| copy_hint(other) == hint).count() > 1;
-        if !ambiguous && (app.location.is_some() || app.version.is_some()) {
-            return None;
-        }
-        let suffix = (8..=64)
-            .step_by(4)
-            .filter_map(|length| app.id.get(app.id.len().saturating_sub(length)..))
-            .find(|suffix| {
-                !apps
+    fn cursor_apps(&self) -> Vec<&InstalledClient> {
+        let InventoryState::Ready(inventory) = &self.state else {
+            return Vec::new();
+        };
+        inventory
+            .installations
+            .as_ref()
+            .map_or_else(Vec::new, |installed| {
+                installed
+                    .apps
                     .iter()
-                    .any(|other| other.id != app.id && other.id.ends_with(suffix))
+                    .filter(|app| app.kind == ClientKind::Application && app.family == "cursor")
+                    .collect()
             })
-            .unwrap_or(&app.id);
-        Some(format!("Copy {suffix}"))
+    }
+
+    pub fn cursor_copies(&self) -> Vec<(String, String)> {
+        self.cursor_apps()
+            .into_iter()
+            .map(|app| (app.id.clone(), copy_hint(app)))
+            .collect()
+    }
+
+    pub fn cursor_copy_disambiguation(&self, id: &str) -> Option<String> {
+        copy_disambiguation(&self.cursor_apps(), id)
+    }
+
+    pub fn copy_disambiguation(&self, id: &str) -> Option<String> {
+        copy_disambiguation(&self.actionable_apps(), id)
     }
 
     fn actionable_apps(&self) -> Vec<&InstalledClient> {

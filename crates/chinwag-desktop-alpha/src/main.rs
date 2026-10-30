@@ -42,6 +42,29 @@ const ROOMS: [(&str, &str); 4] = [
 ];
 const SENDERS: [&str; 3] = ["CODEX", "Brian", "Nic"];
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum AppMode {
+    #[default]
+    Workbench,
+    CursorOnboarding,
+}
+
+impl AppMode {
+    fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("cursor") => Self::CursorOnboarding,
+            _ => Self::Workbench,
+        }
+    }
+
+    fn window_title(self) -> &'static str {
+        match self {
+            Self::Workbench => "Chinwag — Native coordination bus alpha",
+            Self::CursorOnboarding => "Connect Cursor to Chinwag",
+        }
+    }
+}
+
 enum Connection {
     Disconnected,
     Connecting,
@@ -130,6 +153,9 @@ fn read_app_inventory(endpoint: &str, action: Option<OpeningAction>) -> AppInven
 }
 
 struct Workbench {
+    mode: AppMode,
+    configured_target_host: Option<String>,
+    selected_cursor_copy: Option<String>,
     conversation: Conversation,
     endpoint: Entity<InputState>,
     composer: Entity<TextareaState>,
@@ -164,19 +190,42 @@ struct Workbench {
 
 impl Workbench {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_settings(
+        Self::with_mode_settings(
             window,
             cx,
             std::env::var("CHINWAG_BUS_URL").unwrap_or_else(|_| "http://127.0.0.1:44331".into()),
             std::env::var_os("CHINWAG_ALPHA_DRAFTS_PATH").map(Into::into),
+            AppMode::from_setting(std::env::var("CHINWAG_ALPHA_ONBOARDING").ok().as_deref()),
+            std::env::var("CHINWAG_ALPHA_TARGET_HOST")
+                .ok()
+                .filter(|host| host == "Studio"),
         )
     }
 
+    #[cfg(test)]
     fn with_settings(
         window: &mut Window,
         cx: &mut Context<Self>,
         initial_endpoint: String,
         draft_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::with_mode_settings(
+            window,
+            cx,
+            initial_endpoint,
+            draft_path,
+            AppMode::Workbench,
+            None,
+        )
+    }
+
+    fn with_mode_settings(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        initial_endpoint: String,
+        draft_path: Option<std::path::PathBuf>,
+        mode: AppMode,
+        configured_target_host: Option<String>,
     ) -> Self {
         let (openings, opening_warning) = match draft_path.as_deref() {
             Some(path) => match openings::path_for_drafts(path).and_then(OpeningStore::open) {
@@ -223,6 +272,7 @@ impl Workbench {
                 this.load_task = None;
                 this.inventory_task = None;
                 this.client_inventory.clear();
+                this.selected_cursor_copy = None;
                 this.opening_epoch = this.opening_epoch.wrapping_add(1);
                 this.opening_generations.clear();
                 this.connection = Connection::Disconnected;
@@ -252,6 +302,9 @@ impl Workbench {
                 }
             });
         let mut workbench = Self {
+            mode,
+            configured_target_host,
+            selected_cursor_copy: None,
             conversation: Conversation::new("#alpha"),
             endpoint,
             composer,
@@ -283,7 +336,12 @@ impl Workbench {
             _refresh_task: None,
             _subscriptions: vec![endpoint_subscription, composer_subscription],
         };
-        workbench.start_read_only_refresh(cx);
+        if mode == AppMode::CursorOnboarding {
+            let endpoint = workbench.endpoint.read(cx).value().to_string();
+            workbench.load_client_inventory(&endpoint, workbench.connection_generation, cx);
+        } else {
+            workbench.start_read_only_refresh(cx);
+        }
         workbench
     }
 
@@ -301,7 +359,7 @@ impl Workbench {
     }
 
     fn can_send(&self) -> bool {
-        if self.outbox.is_none() {
+        if self.mode != AppMode::Workbench || self.outbox.is_none() {
             return false;
         }
         match &self.connection {
@@ -384,7 +442,12 @@ impl Workbench {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
-        self.load_connection(true, cx);
+        if self.mode == AppMode::CursorOnboarding {
+            let endpoint = self.endpoint.read(cx).value().to_string();
+            self.load_client_inventory(&endpoint, self.connection_generation, cx);
+        } else {
+            self.load_connection(true, cx);
+        }
     }
 
     fn load_connection(&mut self, request_inventory: bool, cx: &mut Context<Self>) {
@@ -459,9 +522,11 @@ impl Workbench {
         let generation = self.client_inventory.begin(endpoint.into());
         let expected_endpoint = endpoint.to_owned();
         let requested_endpoint = expected_endpoint.clone();
+        let action =
+            (self.mode == AppMode::CursorOnboarding).then_some(OpeningAction::CursorMcpSetup);
         self.inventory_task = Some(cx.spawn(async move |this, cx| {
             let read = cx
-                .background_spawn(async move { read_app_inventory(&requested_endpoint, None) })
+                .background_spawn(async move { read_app_inventory(&requested_endpoint, action) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.apply_client_inventory(
@@ -485,6 +550,7 @@ impl Workbench {
                             status,
                         );
                     }
+                    this.sync_cursor_copy_selection();
                     cx.notify();
                 }
             });
@@ -518,7 +584,8 @@ impl Workbench {
         cx: &App,
     ) -> bool {
         let endpoint = self.endpoint.read(cx).value().to_string();
-        self.selection_task.is_none()
+        (self.mode == AppMode::Workbench || action == OpeningAction::CursorMcpSetup)
+            && self.selection_task.is_none()
             && self.opening_tasks.is_empty()
             && self.client_inventory.endpoint.as_deref() == Some(endpoint.as_str())
             && self
@@ -1110,6 +1177,275 @@ impl Workbench {
         }
     }
 
+    fn sync_cursor_copy_selection(&mut self) {
+        if self.mode != AppMode::CursorOnboarding {
+            return;
+        }
+        let copies = self.client_inventory.cursor_copies();
+        if self
+            .selected_cursor_copy
+            .as_ref()
+            .is_some_and(|selected| copies.iter().any(|(id, _)| id == selected))
+        {
+            return;
+        }
+        self.selected_cursor_copy = (copies.len() == 1).then(|| copies[0].0.clone());
+    }
+
+    fn cursor_target_host(&self) -> String {
+        match &self.client_inventory.state {
+            InventoryState::Ready(inventory) => inventory.host_label.clone(),
+            _ => self
+                .configured_target_host
+                .clone()
+                .unwrap_or_else(|| "the configured host".into()),
+        }
+    }
+
+    fn find_cursor(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.client_inventory.state, InventoryState::Loading)
+            || self.selection_task.is_some()
+            || !self.opening_tasks.is_empty()
+        {
+            return;
+        }
+        let endpoint = self.endpoint.read(cx).value().to_string();
+        self.load_client_inventory(&endpoint, self.connection_generation, cx);
+        cx.notify();
+    }
+
+    fn render_cursor_onboarding(&self, cx: &mut Context<Self>) -> Div {
+        let host = self.cursor_target_host();
+        let loading = matches!(self.client_inventory.state, InventoryState::Loading);
+        let ready = matches!(self.client_inventory.state, InventoryState::Ready(_));
+        let unavailable = matches!(self.client_inventory.state, InventoryState::Unavailable(_));
+        let busy = self.selection_task.is_some() || !self.opening_tasks.is_empty();
+        let copies = self.client_inventory.cursor_copies();
+        let selected = self
+            .selected_cursor_copy
+            .clone()
+            .filter(|id| copies.iter().any(|(copy, _)| copy == id));
+        let enabled = selected
+            .as_ref()
+            .is_some_and(|id| self.can_act_on_installation(OpeningAction::CursorMcpSetup, id, cx));
+        let copy_rows = copies
+            .iter()
+            .enumerate()
+            .map(|(index, (id, label))| {
+                let chosen = selected.as_ref() == Some(id);
+                let id = id.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        Button::new(("cursor-copy", index))
+                            .w_full()
+                            .label(label.clone())
+                            .selected(chosen)
+                            .disabled(loading || busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected_cursor_copy = Some(id.clone());
+                                cx.notify();
+                            })),
+                    )
+                    .when_some(
+                        self.client_inventory
+                            .cursor_copy_disambiguation(&copies[index].0),
+                        |this, detail| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(detail),
+                            )
+                        },
+                    )
+            })
+            .collect::<Vec<_>>();
+        let endpoint = self.endpoint.read(cx).value().to_string();
+        let mut attempts = Vec::new();
+        let mut terminal_count = 0;
+        if let Some(store) = &self.openings {
+            for attempt in store.attempts.iter().rev() {
+                let blocking_cursor_open = attempt.unresolved()
+                    && copies.iter().any(|(id, _)| id == &attempt.installation_id);
+                if attempt.action != OpeningAction::CursorMcpSetup && !blocking_cursor_open {
+                    continue;
+                }
+                if !attempt.unresolved() {
+                    if terminal_count >= 4 {
+                        continue;
+                    }
+                    terminal_count += 1;
+                }
+                attempts.push(attempt.clone());
+            }
+        }
+        attempts.sort_by_key(|attempt| !attempt.unresolved());
+        let request_sent = selected.as_ref().is_some_and(|selected| {
+            attempts.iter().any(|attempt| {
+                attempt.endpoint == endpoint
+                    && attempt.installation_id == *selected
+                    && matches!(&attempt.state, openings::OpeningState::Receipt(receipt)
+                    if receipt.state == chinwag_bus_client::NativeOpenState::OpenedOrReused)
+            })
+        });
+        let history_rows = attempts
+            .iter()
+            .enumerate()
+            .map(|(index, attempt)| {
+                let checking = self.opening_tasks.contains_key(&attempt.id);
+                let id = attempt.id.clone();
+                let copy = copies
+                    .iter()
+                    .find(|(copy, _)| copy == &attempt.installation_id)
+                    .map(|(_, label)| label.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Cursor · Copy {}",
+                            openings::short_installation_id(&attempt.installation_id)
+                        )
+                    });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .py_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().flex_1().text_sm().child(copy))
+                            .when(attempt.unresolved(), |this| {
+                                this.child(
+                                    Button::new(("cursor-setup-status", index))
+                                        .small()
+                                        .label(if checking {
+                                            "Checking…"
+                                        } else {
+                                            attempt.action.check_label()
+                                        })
+                                        .disabled(busy || loading)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.check_opening(&id, cx)
+                                        })),
+                                )
+                            }),
+                    )
+                    .when(attempt.endpoint != endpoint, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Saved request · status checks use its original host"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(attempt.summary()),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let state_text = if loading {
+            format!("Looking for Cursor on {host}…")
+        } else if unavailable {
+            format!(
+                "Chinwag could not reach {host}. Check the host connection, then choose Find Cursor again."
+            )
+        } else if ready && copies.is_empty() {
+            format!(
+                "No Cursor application was observed on {host}. Check that Cursor is installed there, then find again."
+            )
+        } else if copies.len() > 1 && selected.is_none() {
+            "Choose the Cursor copy you want to set up.".into()
+        } else if selected.as_ref().is_some_and(|id| {
+            self.openings
+                .as_ref()
+                .is_some_and(|store| store.blocks(&endpoint, id))
+        }) {
+            "A saved request for this copy needs a status check. Use its status button below before starting another setup.".into()
+        } else if ready && selected.is_some() && !enabled && !busy && self.openings.is_some() {
+            "This host has not made the selected Cursor copy available for setup. Check the host setup notice below, then find again.".into()
+        } else if ready {
+            "This copy will be checked again before setup begins.".into()
+        } else {
+            "Find Cursor on your target host to get started.".into()
+        };
+        let setup_notice = self
+            .client_inventory
+            .cursor_mcp_notice
+            .as_ref()
+            .map(|notice| notice.replace("Find apps", "Find Cursor"));
+        div().size_full().child(div().id("cursor-onboarding").size_full().flex().flex_col()
+            .bg(cx.theme().background).text_color(cx.theme().foreground)
+            .child(div().id("cursor-onboarding-content").flex_1().min_h_0().overflow_y_scroll()
+                .flex().flex_col().gap_6().p_8()
+                .child(div().flex().flex_col().gap_2()
+                    .child(div().text_2xl().font_weight(FontWeight::BOLD).child("Connect Cursor to Chinwag"))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                        .child("Allow Cursor to use Chinwag’s read-only #mgmt inbox.")))
+                .child(div().id("cursor-target-host").flex().flex_col().gap_1()
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("Target host: {host}")))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                        .child(if ready { format!("Approve access in Cursor on {host}.") }
+                            else { "Checking the configured target before setup is available.".into() })))
+                .child(div().flex().flex_col().gap_3()
+                    .child(div().flex().items_center().gap_3()
+                        .child(div().flex_1().text_sm().font_weight(FontWeight::SEMIBOLD).child("Cursor application"))
+                        .child(Button::new("find-cursor").small()
+                            .label(if loading { "Finding Cursor…" } else { "Find Cursor" })
+                            .disabled(loading || busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.find_cursor(cx)))))
+                    .child(div().text_sm().text_color(if unavailable { cx.theme().danger } else { cx.theme().muted_foreground }).child(state_text))
+                    .children(copy_rows)
+                    .when_some(self.client_inventory.coverage_warning(), |this, _| this.child(
+                        div().text_xs().text_color(cx.theme().muted_foreground)
+                            .child("This is a bounded snapshot. Some apps may be missing; see Details."))))
+                .child(div().flex().flex_col().gap_3()
+                    .child(Button::new("cursor-onboarding-setup").primary().w_full().h(px(44.))
+                        .label(if self.selection_task.is_some() { "Checking selected Cursor…" }
+                            else if !self.opening_tasks.is_empty() { "Checking setup…" }
+                            else if request_sent { "Set up Cursor again" }
+                            else { "Set up Cursor" })
+                        .disabled(!enabled || loading)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(id) = &selected {
+                                this.act_on_installation(OpeningAction::CursorMcpSetup, id, cx);
+                            }
+                        })))
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                        .child(format!("This adds the existing Chinwag inbox to Cursor on {host}. Approve it there when Cursor asks. An acknowledgement here does not confirm a connection.")))
+                    .when_some(setup_notice, |this, notice| this.child(
+                        div().id("cursor-setup-notice").text_sm().text_color(cx.theme().danger).child(notice)))
+                    .when_some(self.opening_warning.clone(), |this, warning| this.child(
+                        div().id("cursor-setup-storage-warning").text_sm().text_color(cx.theme().danger).child(warning))))
+                .when(!history_rows.is_empty(), |this| this.child(div().id("cursor-setup-history")
+                    .flex().flex_col().gap_1().border_t_1().border_color(cx.theme().border).pt_4()
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Recent requests"))
+                    .children(history_rows)))
+                .child(Button::new("cursor-onboarding-details").small()
+                    .label(if self.client_inventory.details_expanded { "Hide details" } else { "Details" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.client_inventory.details_expanded = !this.client_inventory.details_expanded;
+                        cx.notify();
+                    })))
+                .when(self.client_inventory.details_expanded, |this| this.child(
+                    div().id("cursor-onboarding-diagnostics").flex().flex_col().gap_2()
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Configured host endpoint"))
+                        .child(Input::new(&self.endpoint).small())
+                        .when_some(match &self.client_inventory.state {
+                            InventoryState::Unavailable(error) => Some(error.clone()), _ => None
+                        }, |this, error| this.child(div().text_xs().text_color(cx.theme().danger).child(error)))
+                        .children(self.client_inventory.coverage_lines().into_iter().map(|line| {
+                            div().text_xs().text_color(cx.theme().muted_foreground).child(line)
+                        })))) ))
+    }
+
     fn render_client_inventory(&self, cx: &mut Context<Self>) -> Div {
         let rows = self.client_inventory.rows();
         let coverage = self.client_inventory.coverage_lines();
@@ -1344,6 +1680,9 @@ impl Workbench {
 
 impl Render for Workbench {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.mode == AppMode::CursorOnboarding {
+            return self.render_cursor_onboarding(cx);
+        }
         let sending = self.sending();
         let loading = matches!(self.connection, Connection::Connecting);
         let connected = self.connected_endpoint().is_some();
@@ -1801,12 +2140,25 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus([Menu::new("Chinwag").items([MenuItem::action("Quit Chinwag", Quit)])]);
-        let bounds = Bounds::centered(None, size(px(1120.), px(800.)), cx);
+        let mode = AppMode::from_setting(std::env::var("CHINWAG_ALPHA_ONBOARDING").ok().as_deref());
+        let bounds = Bounds::centered(
+            None,
+            if mode == AppMode::CursorOnboarding {
+                size(px(720.), px(740.))
+            } else {
+                size(px(1120.), px(800.))
+            },
+            cx,
+        );
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(800.), px(600.))),
+            window_min_size: Some(if mode == AppMode::CursorOnboarding {
+                size(px(600.), px(540.))
+            } else {
+                size(px(800.), px(600.))
+            }),
             titlebar: Some(TitlebarOptions {
-                title: Some("Chinwag — Native coordination bus alpha".into()),
+                title: Some(mode.window_title().into()),
                 ..Default::default()
             }),
             ..Default::default()

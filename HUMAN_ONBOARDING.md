@@ -79,3 +79,5 @@ This unit wires a human action to the native launch component and durable receip
 Client-specific protocol attachment, lifecycle invalidation, remote identity enrollment and a supported Grok Bot group publisher remain separate work. The owner-local MCP inbox route reads native ledger messages; its SDK acceptance is not named-client enrollment or Grok group delivery. See [CONNECTOR_PLUGIN_CONTRACT.md](CONNECTOR_PLUGIN_CONTRACT.md).
 
 The optional human **Set up Cursor** action hands the fixed Rust inbox configuration to an exact selected Cursor copy for its own installation approval. It refreshes eligibility and keeps an action-specific durable attempt. It does not claim a protocol connection. See [CURSOR_MCP_SETUP.md](CURSOR_MCP_SETUP.md) for the owner opt-ins, distinct journal domain and actual-client acceptance gates.
+
+The dedicated Cursor entry opens a focused native setup window and checks its optional owned Studio forward before app activation. It performs one metadata inventory, then waits for the person to choose Set up Cursor. The general workbench is unchanged. See [Cursor onboarding entry](CURSOR_ONBOARDING_ENTRY.md).

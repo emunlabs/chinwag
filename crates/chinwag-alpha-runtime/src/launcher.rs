@@ -23,11 +23,15 @@ const MAX_RECEIPT: u64 = 65_536;
 const MAX_DESKTOP: u64 = 1024 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+mod forward;
+
 #[derive(Debug, Clone)]
 struct Options {
     state: PathBuf,
     desktop: PathBuf,
     bus_url: Option<String>,
+    cursor_onboarding: bool,
+    studio_forward: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,17 +51,24 @@ trait Platform {
     fn poll_local(&mut self, pid: u32) -> Result<Option<i32>>;
     fn open_app(&mut self, arguments: &[String]) -> Result<()>;
     fn pause(&mut self);
+    fn forward_identity(&mut self, pid: u32) -> Result<Option<forward::ProcessIdentity>>;
+    fn forward_port_free(&mut self) -> Result<bool>;
+    fn spawn_forward(&mut self, command: &[String], log: &Path) -> Result<u32>;
+    fn poll_forward(&mut self, pid: u32) -> Result<Option<i32>>;
+    fn forward_listens(&mut self, pid: u32) -> Result<bool>;
 }
 
 struct System {
     executable: PathBuf,
     child: Option<Child>,
+    forward_child: Option<Child>,
 }
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut system = System {
         executable: std::env::current_exe()?,
         child: None,
+        forward_child: None,
     };
     let options = Options::parse(args, system.current_exe())?;
     let receipt = launch(options, &mut system)?;
@@ -74,11 +85,26 @@ impl Options {
         let mut state = None;
         let mut desktop = None;
         let mut bus_url = None;
+        let mut cursor_onboarding = false;
+        let mut studio_forward = false;
         let mut index = 0;
         while index < args.len() {
             let flag = args[index].as_str();
-            if !matches!(flag, "--state-dir" | "--desktop" | "--bus-url") {
-                return invalid("launch accepts --state-dir, --desktop and --bus-url only");
+            if flag == "--studio-forward" {
+                if studio_forward {
+                    return invalid("duplicate launch option");
+                }
+                studio_forward = true;
+                index += 1;
+                continue;
+            }
+            if !matches!(
+                flag,
+                "--state-dir" | "--desktop" | "--bus-url" | "--onboarding"
+            ) {
+                return invalid(
+                    "launch accepts --state-dir, --desktop, --bus-url, --onboarding cursor and --studio-forward only",
+                );
             }
             let value = args
                 .get(index + 1)
@@ -88,6 +114,12 @@ impl Options {
                 "--state-dir" => state.replace(PathBuf::from(value)).is_some(),
                 "--desktop" => desktop.replace(PathBuf::from(value)).is_some(),
                 "--bus-url" => bus_url.replace(value.clone()).is_some(),
+                "--onboarding" => {
+                    if value != "cursor" {
+                        return invalid("only Cursor onboarding is supported");
+                    }
+                    std::mem::replace(&mut cursor_onboarding, true)
+                }
                 _ => unreachable!(),
             };
             if duplicate {
@@ -97,13 +129,29 @@ impl Options {
         }
         if let Some(url) = &bus_url {
             let url = url.clone();
-            thread::spawn(move || {
+            let normalized = thread::spawn(move || {
                 BusClient::new(&url)
-                    .map(|_| ())
+                    .map(|client| {
+                        client
+                            .normalized_endpoint()
+                            .trim_end_matches('/')
+                            .to_owned()
+                    })
                     .map_err(|error| RuntimeError::Invalid(error.to_string()))
             })
             .join()
             .map_err(|_| RuntimeError::Unavailable("endpoint validation worker failed".into()))??;
+            bus_url = Some(normalized);
+        }
+        if (cursor_onboarding || studio_forward) && bus_url.is_none() {
+            return invalid(
+                "Cursor onboarding and Studio forwarding require an explicit --bus-url",
+            );
+        }
+        if studio_forward && bus_url.as_deref() != Some(forward::URL) {
+            return invalid(
+                "--studio-forward supports only the saved Studio loopback route http://127.0.0.1:44345",
+            );
         }
         let state = match state {
             Some(state) => state,
@@ -123,6 +171,8 @@ impl Options {
             state: std::path::absolute(state)?,
             desktop: std::path::absolute(desktop)?,
             bus_url,
+            cursor_onboarding,
+            studio_forward,
         })
     }
 }
@@ -176,15 +226,40 @@ fn launch(mut options: Options, platform: &mut impl Platform) -> Result<Value> {
     } else {
         None
     };
-    let (app, executable, bundle_id) = package_app(&options.state, &options.desktop)?;
+    let studio_forward = if options.studio_forward {
+        Some(forward::ensure(&options.state, platform)?)
+    } else {
+        None
+    };
+    let endpoint_preflight = if options.bus_url.is_some() {
+        let status = platform.status(url).map_err(|error| RuntimeError::Unavailable(format!(
+            "Configured bus connection is unavailable; the app was not opened. No Cursor setup was attempted. {error}"
+        )))?.ok_or_else(|| RuntimeError::Unavailable(
+            "Configured bus connection is unavailable; the app was not opened. Check the preview connection before trying again. No Cursor setup was attempted.".into()
+        ))?;
+        Some(validate_external_status(&status, options.studio_forward)?)
+    } else {
+        None
+    };
+    if options.studio_forward {
+        forward::verify_after_preflight(&options.state, platform)?;
+    }
+    let (app, executable, bundle_id) =
+        package_app(&options.state, &options.desktop, options.cursor_onboarding)?;
     let drafts = options.state.join("human-drafts.json");
-    let arguments = vec![
+    let mut arguments = vec![
         "--env".into(),
         format!("CHINWAG_BUS_URL={url}"),
         "--env".into(),
         format!("CHINWAG_ALPHA_DRAFTS_PATH={}", path_text(&drafts)?),
-        path_text(&app)?,
     ];
+    if options.cursor_onboarding {
+        arguments.extend(["--env".into(), "CHINWAG_ALPHA_ONBOARDING=cursor".into()]);
+    }
+    if options.studio_forward {
+        arguments.extend(["--env".into(), "CHINWAG_ALPHA_TARGET_HOST=Studio".into()]);
+    }
+    arguments.push(path_text(&app)?);
     platform.open_app(&arguments)?;
     let receipt = json!({
         "runtime": "rust",
@@ -198,6 +273,9 @@ fn launch(mut options: Options, platform: &mut impl Platform) -> Result<Value> {
         "existing_app_environment_replaced": false,
         "mode": mode,
         "bus": bus,
+        "studio_forward": studio_forward,
+        "endpoint_preflight": endpoint_preflight,
+        "onboarding": if options.cursor_onboarding {Some("cursor")} else {None},
         "drafts_path": path_text(&drafts)?,
         "launch_action": "open-or-activate",
         "connection_verified": false,
@@ -206,6 +284,32 @@ fn launch(mut options: Options, platform: &mut impl Platform) -> Result<Value> {
     });
     atomic_json(&options.state.join("latest-launch.json"), &receipt)?;
     Ok(receipt)
+}
+
+fn validate_external_status(status: &Value, studio: bool) -> Result<Value> {
+    let mode = status.get("mode").and_then(Value::as_str);
+    if status.get("ok").and_then(Value::as_bool) != Some(true)
+        || status.get("storage_healthy").and_then(Value::as_bool) != Some(true)
+        || !matches!(
+            mode,
+            Some(LOCAL_MODE | "fleet-ledger-read-only" | "fleet-signed-ui")
+        )
+        || (studio
+            && (mode != Some("fleet-ledger-read-only")
+                || status.get("read_only").and_then(Value::as_bool) != Some(true)
+                || status.get("send_allowed").and_then(Value::as_bool) != Some(false)
+                || status.get("agent_wake").and_then(Value::as_bool) != Some(false)
+                || status.get("transport").and_then(Value::as_str)
+                    != Some("local-ledger-read-only")))
+    {
+        return unavailable(
+            "Configured endpoint did not confirm a healthy expected Chinwag bus; the app was not opened. No Cursor setup was attempted.",
+        );
+    }
+    Ok(
+        json!({"http_status_checked":true,"mode":mode,"storage_healthy":true,
+        "client_connected":false,"recipient_delivery_verified":false}),
+    )
 }
 
 fn bus_command(state: &Path, executable: &Path) -> Result<Vec<String>> {
@@ -364,7 +468,7 @@ fn now_ms() -> Result<u64> {
 fn open_regular(path: &Path, maximum: u64) -> Result<File> {
     let input = OpenOptions::new()
         .read(true)
-        .custom_flags(OFlags::NOFOLLOW.bits() as i32)
+        .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32)
         .open(path)?;
     let metadata = input.metadata()?;
     if !metadata.is_file() || metadata.len() > maximum {
@@ -390,7 +494,7 @@ fn temporary(path: &Path) -> Result<(PathBuf, File)> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(OFlags::NOFOLLOW.bits() as i32)
+        .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32)
         .open(&temporary)?;
     Ok((temporary, file))
 }
@@ -435,8 +539,17 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn package_app(state: &Path, desktop: &Path) -> Result<(PathBuf, PathBuf, String)> {
-    let app = state.join("Chinwag Alpha.app");
+fn package_app(
+    state: &Path,
+    desktop: &Path,
+    cursor_onboarding: bool,
+) -> Result<(PathBuf, PathBuf, String)> {
+    let display_name = if cursor_onboarding {
+        "Chinwag Cursor Setup"
+    } else {
+        "Chinwag Alpha"
+    };
+    let app = state.join(format!("{display_name}.app"));
     let contents = app.join("Contents");
     let executable = contents.join("MacOS/ChinwagAlpha");
     fs::create_dir_all(
@@ -444,7 +557,12 @@ fn package_app(state: &Path, desktop: &Path) -> Result<(PathBuf, PathBuf, String
             .parent()
             .ok_or_else(|| RuntimeError::Invalid("app has no executable directory".into()))?,
     )?;
-    let digest = format!("{:x}", Sha256::digest(state.as_os_str().as_encoded_bytes()));
+    let mut hasher = Sha256::new();
+    hasher.update(state.as_os_str().as_encoded_bytes());
+    if cursor_onboarding {
+        hasher.update(b"\0cursor-onboarding");
+    }
+    let digest = format!("{:x}", hasher.finalize());
     let bundle_id = format!("com.emunlabs.chinwag.alpha.a{}", &digest[..16]);
     let source = open_regular(desktop, MAX_DESKTOP)?;
     atomic_file(&executable, 0o755, |output| {
@@ -457,8 +575,8 @@ fn package_app(state: &Path, desktop: &Path) -> Result<(PathBuf, PathBuf, String
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\"><dict>\
-         <key>CFBundleName</key><string>Chinwag Alpha</string>\
-         <key>CFBundleDisplayName</key><string>Chinwag Alpha</string>\
+         <key>CFBundleName</key><string>{display_name}</string>\
+         <key>CFBundleDisplayName</key><string>{display_name}</string>\
          <key>CFBundleIdentifier</key><string>{}</string>\
          <key>CFBundleExecutable</key><string>ChinwagAlpha</string>\
          <key>CFBundlePackageType</key><string>APPL</string>\
@@ -584,6 +702,125 @@ impl Platform for System {
 
     fn pause(&mut self) {
         thread::sleep(Duration::from_millis(100));
+    }
+
+    fn forward_identity(&mut self, pid: u32) -> Result<Option<forward::ProcessIdentity>> {
+        let mut child = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "command="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let status = wait_helper(&mut child, Duration::from_secs(2))?;
+        let mut raw = Vec::new();
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| {
+                RuntimeError::Unavailable("owned forward process proof has no output".into())
+            })?
+            .take(MAX_RECEIPT + 1)
+            .read_to_end(&mut raw)?;
+        if raw.len() as u64 > MAX_RECEIPT {
+            return unavailable("owned forward process proof exceeds its bound");
+        }
+        let output = String::from_utf8(raw).map_err(|_| {
+            RuntimeError::Unavailable("owned forward process proof is not UTF-8".into())
+        })?;
+        if status == Some(1) && output.trim().is_empty() {
+            return Ok(None);
+        }
+        if status != Some(0) || output.trim().lines().count() != 1 {
+            return unavailable("owned forward process proof is uncertain");
+        }
+        let fields: Vec<_> = output.split_whitespace().collect();
+        if fields.len() < 6 {
+            return unavailable("owned forward process start-time proof is incomplete");
+        }
+        Ok(Some(forward::ProcessIdentity {
+            started: fields[..5].join(" "),
+            command: fields[5..].join(" "),
+        }))
+    }
+
+    fn forward_port_free(&mut self) -> Result<bool> {
+        match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 44345)) {
+            Ok(listener) => {
+                drop(listener);
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn spawn_forward(&mut self, command: &[String], log: &Path) -> Result<u32> {
+        if self.forward_child.is_some() || command != forward::command().as_slice() {
+            return invalid("launcher may start only one fixed saved Studio forward");
+        }
+        let log = forward::log(log)?;
+        let child = Command::new(&command[0])
+            .args(&command[1..])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .process_group(0)
+            .spawn()?;
+        let pid = child.id();
+        // std::process::Child does not kill on Drop. Null stdin, a separate
+        // process group and owned log let this child survive the launcher exit.
+        self.forward_child = Some(child);
+        Ok(pid)
+    }
+
+    fn poll_forward(&mut self, pid: u32) -> Result<Option<i32>> {
+        let child = self
+            .forward_child
+            .as_mut()
+            .filter(|child| child.id() == pid)
+            .ok_or_else(|| {
+                RuntimeError::Invalid("cannot poll an unrelated forward process".into())
+            })?;
+        Ok(child.try_wait()?.map(|status| status.code().unwrap_or(-1)))
+    }
+
+    fn forward_listens(&mut self, pid: u32) -> Result<bool> {
+        let mut child = Command::new("/usr/sbin/lsof")
+            .args([
+                "-nP",
+                "-a",
+                "-p",
+                &pid.to_string(),
+                "-iTCP@127.0.0.1:44345",
+                "-sTCP:LISTEN",
+                "-Fpn",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let status = wait_helper(&mut child, Duration::from_secs(2))?;
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| RuntimeError::Unavailable("owned listener proof has no output".into()))?
+            .take(4097)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 {
+            return unavailable("owned listener proof exceeds its bound");
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| RuntimeError::Unavailable("owned listener proof is not UTF-8".into()))?;
+        if status == Some(1) && text.trim().is_empty() {
+            return Ok(false);
+        }
+        if status != Some(0) {
+            return unavailable("owned listener proof is uncertain");
+        }
+        forward::parse_listener_proof(&text, pid)
     }
 }
 

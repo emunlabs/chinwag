@@ -18,6 +18,14 @@ struct FakePlatform {
     exit_code: Option<i32>,
     fail_open: bool,
     pauses: usize,
+    forward_processes: HashMap<u32, forward::ProcessIdentity>,
+    forward_ports: VecDeque<Result<bool>>,
+    forward_spawns: Vec<Vec<String>>,
+    forward_exit: Option<i32>,
+    fail_forward_spawn: bool,
+    lose_forward_during_status: bool,
+    foreign_listener_after_spawn: bool,
+    forward_listeners: std::collections::HashSet<u32>,
 }
 
 impl Fixture {
@@ -45,6 +53,14 @@ impl Fixture {
                 exit_code: None,
                 fail_open: false,
                 pauses: 0,
+                forward_processes: HashMap::new(),
+                forward_ports: VecDeque::new(),
+                forward_spawns: Vec::new(),
+                forward_exit: None,
+                fail_forward_spawn: false,
+                lose_forward_during_status: false,
+                foreign_listener_after_spawn: false,
+                forward_listeners: std::collections::HashSet::new(),
             },
         }
     }
@@ -54,6 +70,8 @@ impl Fixture {
             state: self.state.clone(),
             desktop: self.desktop.clone(),
             bus_url: None,
+            cursor_onboarding: false,
+            studio_forward: false,
         }
     }
 
@@ -61,7 +79,8 @@ impl Fixture {
         json!({
             "ok": true, "mode": LOCAL_MODE, "transport": LOCAL_TRANSPORT,
             "live_fleet": false, "signed": false, "agent_wake": false,
-            "storage_healthy": true, "data_dir":self.state.join("local-bus"), "pid":pid
+            "storage_healthy": true, "data_dir":self.state.join("local-bus"), "pid":pid,
+            "read_only":false,"send_allowed":true
         })
     }
 
@@ -91,6 +110,9 @@ impl Platform for FakePlatform {
     }
 
     fn status(&mut self, _: &str) -> Result<Option<Value>> {
+        if self.lose_forward_during_status {
+            self.forward_processes.remove(&999);
+        }
         self.statuses.pop_front().unwrap_or(Ok(None))
     }
 
@@ -119,6 +141,50 @@ impl Platform for FakePlatform {
 
     fn pause(&mut self) {
         self.pauses += 1;
+    }
+
+    fn forward_identity(&mut self, pid: u32) -> Result<Option<forward::ProcessIdentity>> {
+        Ok(self.forward_processes.get(&pid).cloned())
+    }
+
+    fn forward_port_free(&mut self) -> Result<bool> {
+        self.forward_ports.pop_front().unwrap_or(Ok(true))
+    }
+
+    fn spawn_forward(&mut self, command: &[String], log: &Path) -> Result<u32> {
+        let journal: Value = serde_json::from_slice(
+            &fs::read(log.parent().unwrap().join("studio-forward-process.json")).unwrap(),
+        )
+        .unwrap();
+        let attempt = journal["attempts"].as_array().unwrap().last().unwrap();
+        assert_eq!(
+            attempt["phase"], "spawn_pending",
+            "durable consumed intent precedes possible SSH spawn"
+        );
+        assert!(attempt["pid"].is_null());
+        self.forward_spawns.push(command.to_vec());
+        if self.fail_forward_spawn {
+            return unavailable("injected uncertain SSH spawn");
+        }
+        self.forward_processes.insert(
+            999,
+            forward::ProcessIdentity {
+                command: command.join(" "),
+                started: "Fri Oct 30 00:00:00 2026".into(),
+            },
+        );
+        if !self.foreign_listener_after_spawn {
+            self.forward_listeners.insert(999);
+        }
+        Ok(999)
+    }
+
+    fn poll_forward(&mut self, _: u32) -> Result<Option<i32>> {
+        Ok(self.forward_exit)
+    }
+
+    fn forward_listens(&mut self, pid: u32) -> Result<bool> {
+        Ok(self.forward_listeners.contains(&pid))
     }
 }
 
@@ -341,6 +407,8 @@ fn native_bundle_id_starts_each_hash_component_with_letter_and_preserves_user_da
     fs::write(&drafts, b"existing human draft bytes").unwrap();
     let mut options = fixture.options();
     options.bus_url = Some("http://localhost:44341".into());
+    let status = fixture.status(777);
+    fixture.platform.statuses.push_back(Ok(Some(status)));
     let receipt = launch(options, &mut fixture.platform).unwrap();
     let bundled = PathBuf::from(receipt["binary"].as_str().unwrap());
     assert_eq!(
@@ -378,9 +446,9 @@ fn native_bundle_id_starts_each_hash_component_with_letter_and_preserves_user_da
 #[test]
 fn separate_state_bundles_have_distinct_stable_ids() {
     let fixture = Fixture::new();
-    let (_, _, first) = package_app(&fixture.state, &fixture.desktop).unwrap();
-    let (_, _, repeated) = package_app(&fixture.state, &fixture.desktop).unwrap();
-    let (_, _, second) = package_app(&fixture.state.join("qa"), &fixture.desktop).unwrap();
+    let (_, _, first) = package_app(&fixture.state, &fixture.desktop, false).unwrap();
+    let (_, _, repeated) = package_app(&fixture.state, &fixture.desktop, false).unwrap();
+    let (_, _, second) = package_app(&fixture.state.join("qa"), &fixture.desktop, false).unwrap();
     assert_eq!(first, repeated);
     assert_ne!(first, second);
 }
@@ -391,6 +459,8 @@ fn failed_open_does_not_create_successful_launch_receipt() {
     fixture.platform.fail_open = true;
     let mut options = fixture.options();
     options.bus_url = Some("http://localhost:44341".into());
+    let status = fixture.status(777);
+    fixture.platform.statuses.push_back(Ok(Some(status)));
     assert!(launch(options, &mut fixture.platform).is_err());
     assert!(!fixture.state.join("latest-launch.json").exists());
 }
@@ -415,6 +485,7 @@ fn actual_refused_ephemeral_loopback_is_absence_without_starting_any_service() {
     let mut system = System {
         executable: fixture.platform.executable,
         child: None,
+        forward_child: None,
     };
     assert!(
         system
@@ -422,4 +493,331 @@ fn actual_refused_ephemeral_loopback_is_absence_without_starting_any_service() {
             .unwrap()
             .is_none()
     );
+}
+
+impl Fixture {
+    fn studio_options(&self) -> Options {
+        Options {
+            bus_url: Some(forward::URL.into()),
+            cursor_onboarding: true,
+            studio_forward: true,
+            ..self.options()
+        }
+    }
+
+    fn ready_studio(&mut self) {
+        self.platform.forward_ports = VecDeque::from([Ok(true), Ok(false), Ok(false)]);
+        self.platform.statuses.push_back(Ok(Some(shared_status())));
+    }
+}
+
+fn shared_status() -> Value {
+    json!({"ok":true,"mode":"fleet-ledger-read-only","transport":"local-ledger-read-only",
+        "read_only":true,"send_allowed":false,"storage_healthy":true,"agent_wake":false})
+}
+
+#[test]
+fn onboarding_and_forward_flags_are_explicit_fixed_and_normalized() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["--onboarding", "cursor"],
+        vec!["--studio-forward"],
+        vec!["--bus-url", forward::URL, "--onboarding", "other"],
+        vec![
+            "--bus-url",
+            forward::URL,
+            "--studio-forward",
+            "--studio-forward",
+        ],
+        vec![
+            "--bus-url",
+            forward::URL,
+            "--onboarding",
+            "cursor",
+            "--onboarding",
+            "cursor",
+        ],
+        vec!["--bus-url", "http://127.0.0.1:44346", "--studio-forward"],
+        vec!["--bus-url", "http://[::1]:44345", "--studio-forward"],
+        vec!["--bus-url", forward::URL, "--ssh-host", "other"],
+    ] {
+        assert!(
+            Options::parse(
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                &fixture.platform.executable
+            )
+            .is_err()
+        );
+    }
+    let args = [
+        "--studio-forward",
+        "--bus-url",
+        "http://localhost:44345/",
+        "--onboarding",
+        "cursor",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let parsed = Options::parse(&args, &fixture.platform.executable).unwrap();
+    assert_eq!(parsed.bus_url.as_deref(), Some(forward::URL));
+    assert!(parsed.cursor_onboarding && parsed.studio_forward);
+}
+
+#[test]
+fn external_bus_must_pass_health_before_packaging_or_activation() {
+    for response in [
+        Ok(None),
+        unavailable("injected HTTP403"),
+        Ok(Some(json!({"ok":true}))),
+        Ok(Some(
+            json!({"ok":true,"mode":LOCAL_MODE,"storage_healthy":false}),
+        )),
+    ] {
+        let mut fixture = Fixture::new();
+        let mut options = fixture.options();
+        options.bus_url = Some("http://127.0.0.1:44341".into());
+        fixture.platform.statuses.push_back(response);
+        assert!(launch(options, &mut fixture.platform).is_err());
+        assert!(fixture.platform.opens.is_empty());
+        assert!(fixture.platform.forward_spawns.is_empty());
+        assert!(!fixture.state.join("latest-launch.json").exists());
+        assert!(!fixture.state.join("Chinwag Alpha.app").exists());
+    }
+}
+
+#[test]
+fn focused_launch_uses_separate_bundle_and_explicit_env_without_claiming_connection() {
+    let mut fixture = Fixture::new();
+    let (_, _, ordinary) = package_app(&fixture.state, &fixture.desktop, false).unwrap();
+    let mut options = fixture.options();
+    options.cursor_onboarding = true;
+    options.bus_url = Some(forward::URL.into());
+    fixture
+        .platform
+        .statuses
+        .push_back(Ok(Some(shared_status())));
+    let receipt = launch(options, &mut fixture.platform).unwrap();
+    assert_ne!(receipt["bundle_id"], ordinary);
+    assert!(
+        receipt["app"]
+            .as_str()
+            .unwrap()
+            .ends_with("Chinwag Cursor Setup.app")
+    );
+    assert!(fixture.state.join("Chinwag Alpha.app").is_dir());
+    let plist = fs::read_to_string(
+        fixture
+            .state
+            .join("Chinwag Cursor Setup.app/Contents/Info.plist"),
+    )
+    .unwrap();
+    assert!(plist.contains("<key>CFBundleDisplayName</key><string>Chinwag Cursor Setup</string>"));
+    assert!(
+        fixture.platform.opens[0]
+            .iter()
+            .any(|arg| arg == "CHINWAG_ALPHA_ONBOARDING=cursor")
+    );
+    assert!(!fixture.platform.opens[0].iter().any(|arg| arg == "-n"));
+    assert!(
+        fixture.platform.forward_spawns.is_empty(),
+        "external URL alone never authorizes SSH"
+    );
+    assert_eq!(receipt["endpoint_preflight"]["http_status_checked"], true);
+    assert_eq!(receipt["connection_verified"], false);
+    assert_eq!(receipt["endpoint_preflight"]["client_connected"], false);
+}
+
+#[test]
+fn owned_forward_starts_once_reuses_and_preserves_absent_original_history() {
+    let mut fixture = Fixture::new();
+    fixture.ready_studio();
+    let options = fixture.studio_options();
+    let first = launch(options.clone(), &mut fixture.platform).unwrap();
+    assert_eq!(first["studio_forward"]["action"], "started");
+    assert_eq!(fixture.platform.forward_spawns, vec![forward::command()]);
+    assert!(fixture.platform.spawns.is_empty());
+    assert!(
+        fixture.platform.opens[0]
+            .iter()
+            .any(|arg| arg == "CHINWAG_ALPHA_TARGET_HOST=Studio")
+    );
+    fixture.platform.forward_ports = VecDeque::from([Ok(false), Ok(false)]);
+    fixture
+        .platform
+        .statuses
+        .push_back(Ok(Some(shared_status())));
+    let reused = launch(options.clone(), &mut fixture.platform).unwrap();
+    assert_eq!(reused["studio_forward"]["action"], "reused");
+    assert_eq!(fixture.platform.forward_spawns.len(), 1);
+    fixture.platform.forward_processes.remove(&999);
+    fixture.ready_studio();
+    launch(options, &mut fixture.platform).unwrap();
+    let history: Value = serde_json::from_slice(
+        &fs::read(fixture.state.join("studio-forward-process.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(history["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(history["attempts"][0]["pid"], 999);
+    assert_eq!(history["attempts"][1]["phase"], "identified");
+    assert_eq!(fixture.platform.forward_spawns.len(), 2);
+}
+
+#[test]
+fn active_unready_changed_pid_proof_and_busy_unowned_port_never_duplicate() {
+    for mutation in 0..3 {
+        let mut fixture = Fixture::new();
+        fixture.ready_studio();
+        let options = fixture.studio_options();
+        launch(options.clone(), &mut fixture.platform).unwrap();
+        match mutation {
+            0 => fixture.platform.forward_ports = VecDeque::from([Ok(true)]),
+            1 => {
+                fixture
+                    .platform
+                    .forward_processes
+                    .get_mut(&999)
+                    .unwrap()
+                    .command = "unrelated process".into()
+            }
+            _ => {
+                fixture
+                    .platform
+                    .forward_processes
+                    .get_mut(&999)
+                    .unwrap()
+                    .started = "different process birth".into()
+            }
+        }
+        assert!(launch(options, &mut fixture.platform).is_err());
+        assert_eq!(fixture.platform.forward_spawns.len(), 1);
+        assert_eq!(fixture.platform.opens.len(), 1);
+    }
+    let mut fixture = Fixture::new();
+    fixture.platform.forward_ports = VecDeque::from([Ok(false), Ok(false)]);
+    let options = fixture.studio_options();
+    assert!(
+        launch(options, &mut fixture.platform)
+            .unwrap_err()
+            .to_string()
+            .contains("occupied")
+    );
+    assert!(fixture.platform.forward_spawns.is_empty());
+    assert!(!fixture.state.join("studio-forward-process.json").exists());
+}
+
+#[test]
+fn uncertain_spawn_and_unready_health_retain_original_without_replay() {
+    let mut fixture = Fixture::new();
+    fixture.platform.fail_forward_spawn = true;
+    let options = fixture.studio_options();
+    assert!(launch(options.clone(), &mut fixture.platform).is_err());
+    assert!(launch(options, &mut fixture.platform).is_err());
+    assert_eq!(fixture.platform.forward_spawns.len(), 1);
+    assert!(fixture.platform.opens.is_empty());
+    let mut fixture = Fixture::new();
+    fixture.platform.forward_ports = VecDeque::from([Ok(true), Ok(false), Ok(false)]);
+    fixture.platform.statuses.push_back(Ok(None));
+    let options = fixture.studio_options();
+    assert!(launch(options.clone(), &mut fixture.platform).is_err());
+    assert_eq!(fixture.platform.forward_spawns.len(), 1);
+    assert!(fixture.platform.opens.is_empty());
+    fixture.platform.forward_ports = VecDeque::from([Ok(false), Ok(false)]);
+    fixture
+        .platform
+        .statuses
+        .push_back(Ok(Some(shared_status())));
+    let receipt = launch(options, &mut fixture.platform).unwrap();
+    assert_eq!(receipt["studio_forward"]["action"], "reused");
+    assert_eq!(fixture.platform.forward_spawns.len(), 1);
+}
+
+#[test]
+fn forward_child_exit_or_bind_timeout_never_opens_or_restarts_it() {
+    for exited in [true, false] {
+        let mut fixture = Fixture::new();
+        if exited {
+            fixture.platform.forward_exit = Some(255);
+        }
+        let options = fixture.studio_options();
+        assert!(launch(options, &mut fixture.platform).is_err());
+        assert_eq!(fixture.platform.forward_spawns.len(), 1);
+        assert!(fixture.platform.opens.is_empty());
+        assert_eq!(fixture.platform.pauses, if exited { 0 } else { 60 });
+        assert!(fixture.state.join("studio-forward-process.json").is_file());
+    }
+}
+
+#[test]
+fn malformed_symlink_and_fifo_forward_receipts_refuse_before_spawn() {
+    for kind in 0..3 {
+        let mut fixture = Fixture::new();
+        let path = fixture.state.join("studio-forward-process.json");
+        match kind {
+            0 => {
+                fs::write(&path, b"{partial").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            1 => {
+                let preserved = fixture.state.join("preserved");
+                fs::write(&preserved, b"preserve").unwrap();
+                std::os::unix::fs::symlink(preserved, &path).unwrap();
+            }
+            _ => {
+                let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+        }
+        let options = fixture.studio_options();
+        assert!(launch(options, &mut fixture.platform).is_err());
+        assert!(fixture.platform.forward_spawns.is_empty());
+        assert!(fixture.platform.opens.is_empty());
+    }
+}
+
+#[test]
+fn lost_owned_forward_during_health_check_cannot_open_or_restart() {
+    let mut fixture = Fixture::new();
+    fixture.ready_studio();
+    fixture.platform.lose_forward_during_status = true;
+    let options = fixture.studio_options();
+    assert!(launch(options, &mut fixture.platform).is_err());
+    assert_eq!(fixture.platform.forward_spawns.len(), 1);
+    assert!(fixture.platform.opens.is_empty());
+    assert!(!fixture.state.join("latest-launch.json").exists());
+}
+
+#[test]
+fn matching_ssh_pid_does_not_adopt_a_foreign_local_listener() {
+    let mut fixture = Fixture::new();
+    fixture.ready_studio();
+    fixture.platform.foreign_listener_after_spawn = true;
+    let options = fixture.studio_options();
+    assert!(launch(options, &mut fixture.platform).is_err());
+    assert_eq!(fixture.platform.forward_spawns.len(), 1);
+    assert!(fixture.platform.opens.is_empty());
+    let mut fixture = Fixture::new();
+    fixture.ready_studio();
+    let options = fixture.studio_options();
+    launch(options.clone(), &mut fixture.platform).unwrap();
+    fixture.platform.forward_listeners.clear();
+    fixture.platform.forward_ports = VecDeque::from([Ok(false)]);
+    assert!(launch(options, &mut fixture.platform).is_err());
+    assert_eq!(fixture.platform.forward_spawns.len(), 1);
+    assert_eq!(fixture.platform.opens.len(), 1);
+}
+
+#[test]
+fn listener_proof_requires_the_exact_owned_pid_and_loopback_route() {
+    assert!(forward::parse_listener_proof("p999\nn127.0.0.1:44345\n", 999).unwrap());
+    assert!(!forward::parse_listener_proof("", 999).unwrap());
+    for bad in [
+        "p998\nn127.0.0.1:44345\n",
+        "n127.0.0.1:44345\np999\n",
+        "p999\nn*:44345\n",
+        "p999\nn127.0.0.1:44346\n",
+        "p999\np999\nn127.0.0.1:44345\n",
+    ] {
+        assert!(forward::parse_listener_proof(bad, 999).is_err());
+    }
 }

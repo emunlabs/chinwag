@@ -8,6 +8,9 @@ use std::{
     thread,
 };
 
+#[path = "cursor_onboarding_tests.rs"]
+mod cursor_onboarding_tests;
+
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
