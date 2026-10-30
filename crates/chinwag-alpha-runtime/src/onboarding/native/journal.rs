@@ -18,6 +18,22 @@ use std::{
 pub(super) const MAX_RECORDS: usize = 256;
 const MAX_RECORD_BYTES: u64 = 4096;
 const LOCK_NAME: &str = "native-open.lock";
+const DOMAIN_NAME: &str = "native-action-domain.json";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Domain {
+    OrdinaryOpen,
+    CursorMcpSetup,
+}
+
+impl Domain {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::OrdinaryOpen => b"{\"schema\":\"chinwag-native-action-domain/v1\",\"action\":\"ordinary_open\"}\n",
+            Self::CursorMcpSetup => b"{\"schema\":\"chinwag-native-action-domain/v1\",\"action\":\"cursor_mcp_setup\"}\n",
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +56,12 @@ pub(super) struct Journal {
 }
 
 impl Journal {
+    #[cfg(test)]
     pub fn open(root: &Path) -> Result<Self, OnboardingError> {
+        Self::open_in_domain(root, Domain::OrdinaryOpen)
+    }
+
+    pub fn open_in_domain(root: &Path, domain: Domain) -> Result<Self, OnboardingError> {
         let directory = open_directory(root)?;
         let lock: File = openat(
             &directory,
@@ -54,6 +75,7 @@ impl Journal {
         flock(&lock, FlockOperation::NonBlockingLockExclusive)
             .map_err(|_| OnboardingError::Unavailable)?;
         directory.sync_all().map_err(|_| OnboardingError::Storage)?;
+        ensure_domain(&directory, domain)?;
         let mut records = BTreeMap::new();
         let mut reserved = BTreeSet::new();
         let mut ids_seen = BTreeSet::new();
@@ -65,7 +87,7 @@ impl Journal {
                 .file_name()
                 .to_str()
                 .map_err(|_| OnboardingError::Storage)?;
-            if matches!(name, "." | ".." | LOCK_NAME) {
+            if matches!(name, "." | ".." | LOCK_NAME | DOMAIN_NAME) {
                 continue;
             }
             examined += 1;
@@ -314,6 +336,62 @@ impl Journal {
         self.healthy = true;
         Ok(())
     }
+}
+
+// An immutable, synced marker binds the journal to its action across restarts.
+// Legacy unmarked records can belong only to ordinary opening. Setup must never
+// reinterpret an ordinary receipt as an installation handoff acknowledgment.
+fn ensure_domain(directory: &File, domain: Domain) -> Result<(), OnboardingError> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    match openat(directory, DOMAIN_NAME, flags, Mode::empty()) {
+        Ok(file) => {
+            let mut file = File::from(file);
+            owned_file(&file)?;
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(257)
+                .read_to_end(&mut bytes)
+                .map_err(|_| OnboardingError::Storage)?;
+            if bytes != domain.bytes() {
+                return Err(OnboardingError::Storage);
+            }
+            return Ok(());
+        }
+        Err(error) if error == rustix::io::Errno::NOENT => (),
+        Err(_) => return Err(OnboardingError::Storage),
+    }
+    if domain == Domain::CursorMcpSetup {
+        // New setup storage must be empty apart from its owned lock. Stop at
+        // the first other entry; never adopt legacy/unknown/orphan records.
+        for entry in Dir::read_from(directory).map_err(|_| OnboardingError::Storage)? {
+            let entry = entry.map_err(|_| OnboardingError::Storage)?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .map_err(|_| OnboardingError::Storage)?;
+            if !matches!(name, "." | ".." | LOCK_NAME) {
+                return Err(OnboardingError::Storage);
+            }
+        }
+    }
+    let mut file: File = openat(
+        directory,
+        DOMAIN_NAME,
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC
+            | OFlags::NONBLOCK,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| OnboardingError::Storage)?
+    .into();
+    owned_file(&file)?;
+    file.write_all(domain.bytes())
+        .map_err(|_| OnboardingError::Storage)?;
+    file.sync_all().map_err(|_| OnboardingError::Storage)?;
+    directory.sync_all().map_err(|_| OnboardingError::Storage)
 }
 
 fn owned_file(file: &File) -> Result<(), OnboardingError> {

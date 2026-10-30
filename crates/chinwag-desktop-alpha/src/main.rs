@@ -11,12 +11,12 @@ mod openings;
 mod outbox;
 use discovery_ui::{DiscoveryPanel, InventoryState};
 use drafts::DraftFile;
-use openings::{OpeningAttempt, OpeningStore};
+use openings::{OpeningAction, OpeningAttempt, OpeningStore};
 use outbox::{Attempt, AttemptState, Outbox};
 
 use chinwag_bus_client::{
     BusClient, BusMessage, ClientError, ClientInventory, InstalledClient, NativeOpenReceipt,
-    NativeOpenRequest, OnboardingStatus, SendReceipt, SendRequest,
+    OnboardingStatus, SendReceipt, SendRequest,
 };
 use chinwag_bus_model::{Conversation, SendState};
 use gpui_kit::component::{
@@ -62,6 +62,7 @@ struct OpeningFlight {
     view_endpoint: String,
     epoch: u64,
     generation: u64,
+    action: OpeningAction,
 }
 
 #[derive(Clone)]
@@ -72,25 +73,59 @@ struct OpeningSelection {
     inventory_generation: u64,
     connection_generation: u64,
     generation: u64,
+    action: OpeningAction,
 }
 
 struct AppInventoryRead {
     inventory: Result<ClientInventory, String>,
     opening_status: Option<Result<OnboardingStatus, String>>,
+    cursor_mcp_status: Option<Result<OnboardingStatus, String>>,
 }
 
-fn read_app_inventory(endpoint: &str) -> AppInventoryRead {
+impl AppInventoryRead {
+    fn status_for(&self, action: OpeningAction) -> Option<&Result<OnboardingStatus, String>> {
+        match action {
+            OpeningAction::OrdinaryOpen => self.opening_status.as_ref(),
+            OpeningAction::CursorMcpSetup => self.cursor_mcp_status.as_ref(),
+        }
+    }
+}
+
+fn read_app_inventory(endpoint: &str, action: Option<OpeningAction>) -> AppInventoryRead {
     let inventory = BusClient::new(endpoint)
         .and_then(|client| client.clients())
         .map_err(|error| error.to_string());
-    let opening_status = inventory.as_ref().ok().map(|_| {
-        BusClient::new(endpoint)
-            .and_then(|client| client.onboarding_status())
-            .map_err(|error| error.to_string())
-    });
+    let opening_status = inventory
+        .as_ref()
+        .ok()
+        .filter(|_| action != Some(OpeningAction::CursorMcpSetup))
+        .map(|_| {
+            BusClient::new(endpoint)
+                .and_then(|client| client.onboarding_status())
+                .map_err(|error| error.to_string())
+        });
+    let cursor_mcp_status = inventory
+        .as_ref()
+        .ok()
+        .filter(|inventory| {
+            action == Some(OpeningAction::CursorMcpSetup)
+                || (action.is_none()
+                    && inventory.installations.as_ref().is_some_and(|installed| {
+                        installed.apps.iter().any(|app| {
+                            app.kind == chinwag_bus_client::ClientKind::Application
+                                && app.family == "cursor"
+                        })
+                    }))
+        })
+        .map(|_| {
+            BusClient::new(endpoint)
+                .and_then(|client| client.cursor_mcp_setup_status())
+                .map_err(|error| error.to_string())
+        });
     AppInventoryRead {
         inventory,
         opening_status,
+        cursor_mcp_status,
     }
 }
 
@@ -426,7 +461,7 @@ impl Workbench {
         let requested_endpoint = expected_endpoint.clone();
         self.inventory_task = Some(cx.spawn(async move |this, cx| {
             let read = cx
-                .background_spawn(async move { read_app_inventory(&requested_endpoint) })
+                .background_spawn(async move { read_app_inventory(&requested_endpoint, None) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.apply_client_inventory(
@@ -438,6 +473,13 @@ impl Workbench {
                 ) {
                     if let Some(status) = read.opening_status {
                         this.client_inventory.complete_opening_status(
+                            generation,
+                            &expected_endpoint,
+                            status,
+                        );
+                    }
+                    if let Some(status) = read.cursor_mcp_status {
+                        this.client_inventory.complete_cursor_mcp_status(
                             generation,
                             &expected_endpoint,
                             status,
@@ -466,13 +508,22 @@ impl Workbench {
     }
 
     fn can_open_installation(&self, installation_id: &str, cx: &App) -> bool {
+        self.can_act_on_installation(OpeningAction::OrdinaryOpen, installation_id, cx)
+    }
+
+    fn can_act_on_installation(
+        &self,
+        action: OpeningAction,
+        installation_id: &str,
+        cx: &App,
+    ) -> bool {
         let endpoint = self.endpoint.read(cx).value().to_string();
         self.selection_task.is_none()
             && self.opening_tasks.is_empty()
             && self.client_inventory.endpoint.as_deref() == Some(endpoint.as_str())
             && self
                 .client_inventory
-                .openable_copies()
+                .action_copies(action)
                 .iter()
                 .any(|(id, _)| id == installation_id)
             && self
@@ -482,7 +533,16 @@ impl Workbench {
     }
 
     fn open_installation(&mut self, installation_id: &str, cx: &mut Context<Self>) {
-        if !self.can_open_installation(installation_id, cx) {
+        self.act_on_installation(OpeningAction::OrdinaryOpen, installation_id, cx);
+    }
+
+    fn act_on_installation(
+        &mut self,
+        action: OpeningAction,
+        installation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_act_on_installation(action, installation_id, cx) {
             return;
         }
         let endpoint = self.endpoint.read(cx).value().to_string();
@@ -497,12 +557,13 @@ impl Workbench {
             inventory_generation: self.client_inventory.generation(),
             connection_generation: self.connection_generation,
             generation: self.opening_sequence,
+            action,
         };
         self.opening_selection = Some(selection.clone());
-        self.client_inventory.opening_notice = None;
+        self.client_inventory.set_action_notice(action, None);
         self.selection_task = Some(cx.spawn(async move |this, cx| {
             let read = cx
-                .background_spawn(async move { read_app_inventory(&endpoint) })
+                .background_spawn(async move { read_app_inventory(&endpoint, Some(action)) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.apply_selection_refresh(&selection, read, cx);
@@ -518,11 +579,9 @@ impl Workbench {
         read: AppInventoryRead,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self
-            .opening_selection
-            .as_ref()
-            .is_none_or(|current| current.generation != selection.generation)
-        {
+        if self.opening_selection.as_ref().is_none_or(|current| {
+            current.generation != selection.generation || current.action != selection.action
+        }) {
             return false;
         }
         self.selection_task = None;
@@ -547,7 +606,7 @@ impl Workbench {
                     && app.location == selection.app.location
                     && app.version == selection.app.version
             });
-        let status_valid = read.opening_status.as_ref().is_some_and(|status| {
+        let status_valid = read.status_for(selection.action).is_some_and(|status| {
             status.as_ref().is_ok_and(|status| {
                 status.validate().is_ok()
                     && status.native_open_allowed
@@ -555,7 +614,7 @@ impl Workbench {
             })
         });
         let refreshed =
-            read.inventory.is_ok() && read.opening_status.as_ref().is_some_and(Result::is_ok);
+            read.inventory.is_ok() && read.status_for(selection.action).is_some_and(Result::is_ok);
         self.client_inventory.complete(
             selection.inventory_generation,
             &selection.endpoint,
@@ -567,28 +626,43 @@ impl Workbench {
                 &selection.endpoint,
                 status,
             );
-        } else {
+        } else if selection.action == OpeningAction::OrdinaryOpen {
             self.client_inventory.opening_status = None;
         }
+        if let Some(status) = read.cursor_mcp_status {
+            self.client_inventory.complete_cursor_mcp_status(
+                selection.inventory_generation,
+                &selection.endpoint,
+                status,
+            );
+        } else if selection.action == OpeningAction::CursorMcpSetup {
+            self.client_inventory.cursor_mcp_status = None;
+        }
         if !selected_still_matches || !status_valid {
-            self.client_inventory.opening_notice = Some(if refreshed {
+            self.client_inventory.set_action_notice(selection.action, Some(if refreshed {
                 "The selected app changed or is no longer available. Select an app again. No opening was started."
             } else {
                 "The selected app could not be checked. Find apps and select it again. No opening was started."
-            }.into());
+            }.into()));
             return true;
         }
-        if !self.can_open_installation(&selection.app.id, cx) {
-            self.client_inventory.opening_notice =
-                Some("This app has an opening to check first. No new opening was started.".into());
+        if !self.can_act_on_installation(selection.action, &selection.app.id, cx) {
+            self.client_inventory.set_action_notice(
+                selection.action,
+                Some(
+                    "This app has an opening or setup to check first. No new action was started."
+                        .into(),
+                ),
+            );
             return true;
         }
-        self.prepare_selected_opening(&selection.endpoint, &selection.app.id, cx);
+        self.prepare_selected_opening(selection.action, &selection.endpoint, &selection.app.id, cx);
         true
     }
 
     fn prepare_selected_opening(
         &mut self,
+        action: OpeningAction,
         endpoint: &str,
         installation_id: &str,
         cx: &mut Context<Self>,
@@ -597,7 +671,7 @@ impl Workbench {
             .openings
             .as_mut()
             .expect("eligibility requires storage")
-            .prepare(endpoint, installation_id)
+            .prepare(action, endpoint, installation_id)
         {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -645,27 +719,14 @@ impl Workbench {
             view_endpoint,
             epoch,
             generation,
+            action: attempt.action,
         };
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let client =
-                        BusClient::new(&attempt.endpoint).map_err(|error| error.to_string())?;
-                    if check_only {
-                        client
-                            .application_open_receipt(&attempt.id)
-                            .map_err(|error| error.to_string())
-                    } else {
-                        client
-                            .open_application(
-                                &attempt.id,
-                                &NativeOpenRequest {
-                                    installation_id: attempt.installation_id,
-                                },
-                            )
-                            .map(Some)
-                            .map_err(|error| error.to_string())
-                    }
+                    attempt
+                        .perform(check_only)
+                        .map_err(|error| error.to_string())
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -695,11 +756,11 @@ impl Workbench {
         let Some(store) = &mut self.openings else {
             return false;
         };
-        if !store
-            .attempts
-            .iter()
-            .any(|attempt| attempt.id == flight.id && attempt.endpoint == flight.attempt_endpoint)
-        {
+        if !store.attempts.iter().any(|attempt| {
+            attempt.id == flight.id
+                && attempt.endpoint == flight.attempt_endpoint
+                && attempt.action == flight.action
+        }) {
             return false;
         }
         self.opening_tasks.remove(&flight.id);
@@ -1058,14 +1119,30 @@ impl Workbench {
         let configured_endpoint = self.endpoint.read(cx).value().to_string();
         let exact_copies = self
             .client_inventory
-            .openable_copies()
+            .actionable_copies()
             .into_iter()
             .enumerate()
             .map(|(index, (id, label))| {
                 let enabled = self.can_open_installation(&id, cx);
                 let preparing = self.opening_selection.as_ref().is_some_and(|selection| {
-                    selection.app.id == id && selection.endpoint == configured_endpoint
+                    selection.app.id == id
+                        && selection.endpoint == configured_endpoint
+                        && selection.action == OpeningAction::OrdinaryOpen
                 });
+                let setup_preparing = self.opening_selection.as_ref().is_some_and(|selection| {
+                    selection.app.id == id
+                        && selection.endpoint == configured_endpoint
+                        && selection.action == OpeningAction::CursorMcpSetup
+                });
+                let setup_supported = self
+                    .client_inventory
+                    .action_copies(OpeningAction::CursorMcpSetup)
+                    .iter()
+                    .any(|(copy, _)| copy == &id);
+                let setup_enabled =
+                    self.can_act_on_installation(OpeningAction::CursorMcpSetup, &id, cx);
+                let open_id = id.clone();
+                let setup_id = id.clone();
                 let disambiguation = self.client_inventory.copy_disambiguation(&id);
                 let latest = self
                     .openings
@@ -1097,9 +1174,28 @@ impl Workbench {
                                     })
                                     .disabled(!enabled)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_installation(&id, cx)
+                                        this.open_installation(&open_id, cx)
                                     })),
-                            ),
+                            )
+                            .when(setup_supported, |this| {
+                                this.child(
+                                    Button::new(("setup-cursor-mcp", index))
+                                        .small()
+                                        .label(if setup_preparing {
+                                            "Checking selected app…"
+                                        } else {
+                                            "Set up Cursor"
+                                        })
+                                        .disabled(!setup_enabled)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.act_on_installation(
+                                                OpeningAction::CursorMcpSetup,
+                                                &setup_id,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            }),
                     )
                     .when_some(disambiguation, |this, detail| {
                         this.child(
@@ -1142,7 +1238,8 @@ impl Workbench {
                             .items_center()
                             .gap_2()
                             .child(div().flex_1().text_xs().child(format!(
-                                "Copy {} · {}",
+                                "{} · Copy {} · {}",
+                                attempt.action.label(),
                                 openings::short_installation_id(&attempt.installation_id),
                                 attempt.endpoint
                             )))
@@ -1153,7 +1250,7 @@ impl Workbench {
                                         .label(if checking {
                                             "Checking…"
                                         } else {
-                                            "Check opening status"
+                                            attempt.action.check_label()
                                         })
                                         .disabled(checking)
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1175,6 +1272,11 @@ impl Workbench {
                 || self
                     .client_inventory
                     .opening_status
+                    .as_ref()
+                    .is_some_and(|status| status.native_open_allowed)
+                || self
+                    .client_inventory
+                    .cursor_mcp_status
                     .as_ref()
                     .is_some_and(|status| status.native_open_allowed)
         });
@@ -1213,7 +1315,12 @@ impl Workbench {
                             .children(rows.into_iter().map(|row| div().text_xs().child(row))))
                         .when(!exact_copies.is_empty(), |this| this.child(div().id("openable-installed-copies")
                             .max_h(px(170.)).overflow_y_scroll().flex().flex_col().gap_1().children(exact_copies)))
+                        .when(!self.client_inventory.action_copies(OpeningAction::CursorMcpSetup).is_empty(), |this| this.child(
+                            div().text_xs().text_color(cx.theme().muted_foreground)
+                                .child("Read native #mgmt in Cursor; Cursor will ask for installation approval.")))
                         .when_some(self.client_inventory.opening_notice.clone(), |this, notice| this.child(
+                            div().text_xs().text_color(cx.theme().muted_foreground).child(notice)))
+                        .when_some(self.client_inventory.cursor_mcp_notice.clone(), |this, notice| this.child(
                             div().text_xs().text_color(cx.theme().muted_foreground).child(notice)))
                         .when(!opening_history.is_empty(), |this| this.child(div().id("opening-history")
                             .max_h(px(170.)).overflow_y_scroll().flex().flex_col().gap_1().children(opening_history)))

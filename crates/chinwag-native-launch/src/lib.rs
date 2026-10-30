@@ -18,6 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod cursor_mcp;
+pub use cursor_mcp::{CursorMcpInstall, CursorMcpInstallError};
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "macos")]

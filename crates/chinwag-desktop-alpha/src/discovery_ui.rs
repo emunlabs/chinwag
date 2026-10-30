@@ -1,3 +1,4 @@
+use crate::openings::OpeningAction;
 use chinwag_bus_client::{
     ClientInventory, ClientKind, InstallationLocation, InstalledClient, OnboardingStatus,
 };
@@ -163,6 +164,8 @@ pub struct DiscoveryPanel {
     pub details_expanded: bool,
     pub opening_status: Option<OnboardingStatus>,
     pub opening_notice: Option<String>,
+    pub cursor_mcp_status: Option<OnboardingStatus>,
+    pub cursor_mcp_notice: Option<String>,
     generation: u64,
 }
 
@@ -175,6 +178,8 @@ impl Default for DiscoveryPanel {
             details_expanded: false,
             opening_status: None,
             opening_notice: None,
+            cursor_mcp_status: None,
+            cursor_mcp_notice: None,
             generation: 0,
         }
     }
@@ -204,6 +209,8 @@ impl DiscoveryPanel {
         self.state = InventoryState::NotRequested;
         self.opening_status = None;
         self.opening_notice = None;
+        self.cursor_mcp_status = None;
+        self.cursor_mcp_notice = None;
     }
 
     pub fn begin(&mut self, endpoint: String) -> u64 {
@@ -212,6 +219,8 @@ impl DiscoveryPanel {
         self.state = InventoryState::Loading;
         self.opening_status = None;
         self.opening_notice = None;
+        self.cursor_mcp_status = None;
+        self.cursor_mcp_notice = None;
         self.generation
     }
 
@@ -237,32 +246,77 @@ impl DiscoveryPanel {
         endpoint: &str,
         result: Result<OnboardingStatus, String>,
     ) -> bool {
+        self.complete_action_status(generation, endpoint, OpeningAction::OrdinaryOpen, result)
+    }
+
+    pub fn complete_cursor_mcp_status(
+        &mut self,
+        generation: u64,
+        endpoint: &str,
+        result: Result<OnboardingStatus, String>,
+    ) -> bool {
+        self.complete_action_status(generation, endpoint, OpeningAction::CursorMcpSetup, result)
+    }
+
+    pub fn action_status(&self, action: OpeningAction) -> Option<&OnboardingStatus> {
+        match action {
+            OpeningAction::OrdinaryOpen => self.opening_status.as_ref(),
+            OpeningAction::CursorMcpSetup => self.cursor_mcp_status.as_ref(),
+        }
+    }
+
+    pub fn set_action_notice(&mut self, action: OpeningAction, notice: Option<String>) {
+        match action {
+            OpeningAction::OrdinaryOpen => self.opening_notice = notice,
+            OpeningAction::CursorMcpSetup => self.cursor_mcp_notice = notice,
+        }
+    }
+
+    fn complete_action_status(
+        &mut self,
+        generation: u64,
+        endpoint: &str,
+        action: OpeningAction,
+        result: Result<OnboardingStatus, String>,
+    ) -> bool {
         if generation != self.generation
             || self.endpoint.as_deref() != Some(endpoint)
             || !matches!(self.state, InventoryState::Ready(_))
         {
             return false;
         }
+        let (status_slot, notice_slot, disabled, unavailable) = match action {
+            OpeningAction::OrdinaryOpen => (
+                &mut self.opening_status,
+                &mut self.opening_notice,
+                "Opening is disabled for this host.",
+                "Opening is unavailable on this host. Finding apps still works.",
+            ),
+            OpeningAction::CursorMcpSetup => (
+                &mut self.cursor_mcp_status,
+                &mut self.cursor_mcp_notice,
+                "Cursor setup is disabled for this host.",
+                "Cursor setup is unavailable on this host. Finding apps and ordinary opening still work.",
+            ),
+        };
         match result {
             Ok(status) if status.validate().is_ok() => {
-                self.opening_notice = (!status.native_open_allowed)
-                    .then(|| "Opening is disabled for this host.".into());
-                self.opening_status = Some(status);
+                *notice_slot = (!status.native_open_allowed).then(|| disabled.into());
+                *status_slot = Some(status);
             }
             _ => {
-                self.opening_status = None;
-                self.opening_notice =
-                    Some("Opening is unavailable on this host. Finding apps still works.".into());
+                *status_slot = None;
+                *notice_slot = Some(unavailable.into());
             }
         }
         true
     }
 
-    fn openable_apps(&self) -> Vec<&InstalledClient> {
+    fn action_apps(&self, action: OpeningAction) -> Vec<&InstalledClient> {
         let InventoryState::Ready(inventory) = &self.state else {
             return Vec::new();
         };
-        let Some(status) = &self.opening_status else {
+        let Some(status) = self.action_status(action) else {
             return Vec::new();
         };
         if !status.native_open_allowed {
@@ -276,20 +330,21 @@ impl DiscoveryPanel {
             .iter()
             .filter(|app| {
                 app.kind == ClientKind::Application
+                    && (action != OpeningAction::CursorMcpSetup || app.family == "cursor")
                     && status.openable_installation_ids.contains(&app.id)
             })
             .collect()
     }
 
-    pub fn openable_copies(&self) -> Vec<(String, String)> {
-        self.openable_apps()
+    pub fn action_copies(&self, action: OpeningAction) -> Vec<(String, String)> {
+        self.action_apps(action)
             .into_iter()
             .map(|app| (app.id.clone(), copy_hint(app)))
             .collect()
     }
 
     pub fn copy_disambiguation(&self, id: &str) -> Option<String> {
-        let apps = self.openable_apps();
+        let apps = self.actionable_apps();
         let app = apps.iter().find(|app| app.id == id)?;
         let hint = copy_hint(app);
         let ambiguous = apps.iter().filter(|other| copy_hint(other) == hint).count() > 1;
@@ -306,6 +361,23 @@ impl DiscoveryPanel {
             })
             .unwrap_or(&app.id);
         Some(format!("Copy {suffix}"))
+    }
+
+    fn actionable_apps(&self) -> Vec<&InstalledClient> {
+        let mut apps = self.action_apps(OpeningAction::OrdinaryOpen);
+        for app in self.action_apps(OpeningAction::CursorMcpSetup) {
+            if !apps.iter().any(|other| other.id == app.id) {
+                apps.push(app);
+            }
+        }
+        apps
+    }
+
+    pub fn actionable_copies(&self) -> Vec<(String, String)> {
+        self.actionable_apps()
+            .into_iter()
+            .map(|app| (app.id.clone(), copy_hint(app)))
+            .collect()
     }
 
     pub fn summary(&self) -> String {

@@ -47,3 +47,5 @@ pub(crate) fn observed_installation_id(
 
 mod native;
 pub use native::OnboardingService;
+#[cfg(any(target_os = "macos", test))]
+mod cursor;

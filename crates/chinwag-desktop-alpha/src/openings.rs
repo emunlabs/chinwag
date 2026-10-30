@@ -9,15 +9,40 @@ use std::{
 };
 
 use chinwag_bus_client::{
-    BusClient, NativeOpenReceipt, NativeOpenRequest, NativeOpenState, new_request_id,
+    BusClient, ClientError, NativeOpenReceipt, NativeOpenRequest, NativeOpenState, new_request_id,
     validate_request_id,
 };
 use rustix::fs::{FlockOperation, OFlags, flock};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_ATTEMPTS: usize = 128;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpeningAction {
+    #[default]
+    OrdinaryOpen,
+    CursorMcpSetup,
+}
+
+impl OpeningAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OrdinaryOpen => "Open/reuse",
+            Self::CursorMcpSetup => "Set up Cursor",
+        }
+    }
+
+    pub fn check_label(self) -> &'static str {
+        match self {
+            Self::OrdinaryOpen => "Check opening status",
+            Self::CursorMcpSetup => "Check setup status",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpeningState {
@@ -31,6 +56,7 @@ pub struct OpeningAttempt {
     pub id: String,
     pub endpoint: String,
     pub installation_id: String,
+    pub action: OpeningAction,
     pub state: OpeningState,
 }
 
@@ -46,6 +72,22 @@ impl OpeningAttempt {
     }
 
     pub fn summary(&self) -> String {
+        if self.action == OpeningAction::CursorMcpSetup {
+            return match &self.state {
+                OpeningState::Receipt(receipt)
+                    if receipt.state == NativeOpenState::OpenedOrReused =>
+                {
+                    "Check Cursor to approve setup; connection unconfirmed.".into()
+                }
+                OpeningState::Receipt(receipt) if receipt.state == NativeOpenState::Rejected => {
+                    format!("Setup was not acknowledged · {}", receipt.message)
+                }
+                _ if self.unresolved() => {
+                    "Setup unconfirmed · check status; it will not be submitted again".into()
+                }
+                _ => "Setup acknowledgement unavailable; connection unconfirmed".into(),
+            };
+        }
         match &self.state {
             OpeningState::Pending => "Opening pending · check status before trying again".into(),
             OpeningState::Uncertain(_) => {
@@ -64,6 +106,24 @@ impl OpeningAttempt {
                 }
             },
         }
+    }
+
+    pub fn perform(&self, check_only: bool) -> Result<Option<NativeOpenReceipt>, ClientError> {
+        let client = BusClient::new(&self.endpoint)?;
+        if check_only {
+            return match self.action {
+                OpeningAction::OrdinaryOpen => client.application_open_receipt(&self.id),
+                OpeningAction::CursorMcpSetup => client.cursor_mcp_setup_receipt(&self.id),
+            };
+        }
+        let request = NativeOpenRequest {
+            installation_id: self.installation_id.clone(),
+        };
+        match self.action {
+            OpeningAction::OrdinaryOpen => client.open_application(&self.id, &request),
+            OpeningAction::CursorMcpSetup => client.setup_cursor_mcp(&self.id, &request),
+        }
+        .map(Some)
     }
 }
 
@@ -145,7 +205,12 @@ impl OpeningStore {
     }
 
     /// Durably write Pending before the caller may schedule one POST.
-    pub fn prepare(&mut self, endpoint: &str, installation_id: &str) -> io::Result<OpeningAttempt> {
+    pub fn prepare(
+        &mut self,
+        action: OpeningAction,
+        endpoint: &str,
+        installation_id: &str,
+    ) -> io::Result<OpeningAttempt> {
         validate_target(endpoint, installation_id)?;
         if self.blocks(endpoint, installation_id) {
             return Err(invalid(
@@ -156,6 +221,7 @@ impl OpeningStore {
             id: new_request_id().map_err(|error| invalid(&error.to_string()))?,
             endpoint: endpoint.into(),
             installation_id: installation_id.into(),
+            action,
             state: OpeningState::Pending,
         };
         let mut next = self.attempts.clone();
@@ -236,7 +302,7 @@ impl OpeningStore {
                 OpeningState::Uncertain(message) => ("uncertain", Some(message), None),
                 OpeningState::Receipt(receipt) => ("receipt", None, Some(receipt)),
             };
-            json!({"id":attempt.id,"endpoint":attempt.endpoint,"installation_id":attempt.installation_id,"state":state,"message":message,"receipt":receipt})
+            json!({"id":attempt.id,"endpoint":attempt.endpoint,"installation_id":attempt.installation_id,"action":attempt.action,"state":state,"message":message,"receipt":receipt})
         }).collect();
         let bytes =
             serde_json::to_vec(&json!({"schema":"chinwag-opening-history/v1","attempts":rows}))
@@ -297,6 +363,10 @@ fn decode(value: Value) -> io::Result<Vec<OpeningAttempt>> {
         let endpoint = text("endpoint")?.to_owned();
         let installation_id = text("installation_id")?.to_owned();
         validate_target(&endpoint, &installation_id)?;
+        let action = match row.get("action") {
+            None => OpeningAction::OrdinaryOpen,
+            Some(value) => serde_json::from_value(value.clone()).map_err(json_error)?,
+        };
         let state = match text("state")? {
             "pending" => OpeningState::Pending,
             "uncertain" => {
@@ -325,6 +395,7 @@ fn decode(value: Value) -> io::Result<Vec<OpeningAttempt>> {
             id,
             endpoint,
             installation_id,
+            action,
             state,
         });
     }

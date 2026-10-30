@@ -26,6 +26,7 @@ struct FixtureSource {
     installations: AtomicUsize,
     fail: AtomicBool,
     bad_host: AtomicBool,
+    include_cursor: bool,
 }
 
 fn installed() -> InstalledSnapshot {
@@ -77,7 +78,19 @@ impl InventorySource for FixtureSource {
     }
     fn installed(&self) -> Option<InstalledSnapshot> {
         self.installations.fetch_add(1, Ordering::SeqCst);
-        Some(installed())
+        let mut snapshot = installed();
+        if self.include_cursor {
+            let mut cursor = snapshot.installations[0].clone();
+            cursor.id = "c".repeat(64);
+            cursor.family = ClientFamily::Cursor;
+            cursor.canonical_path = "/Applications/Cursor.app".into();
+            cursor.observed_paths = vec![cursor.canonical_path.clone()];
+            cursor.display_name = "Cursor".into();
+            cursor.bundle_id = Some("com.todesktop.230313mzl4w4u92".into());
+            cursor.executable_path = "/Applications/Cursor.app/Contents/MacOS/Cursor".into();
+            snapshot.installations.push(cursor);
+        }
+        Some(snapshot)
     }
 }
 
@@ -86,20 +99,29 @@ struct Fixture {
     app: Router,
     service: Option<Arc<OnboardingService>>,
     source: Arc<FixtureSource>,
+    cursor_service: Option<Arc<OnboardingService>>,
 }
 
 impl Fixture {
     fn new(enabled: bool) -> Self {
+        Self::with_setup(enabled, false)
+    }
+
+    fn with_setup(enabled: bool, cursor_enabled: bool) -> Self {
         let directory = TempDir::new().unwrap();
         let root = std::fs::canonicalize(directory.path()).unwrap();
         let service = enabled.then(|| {
             Arc::new(OnboardingService::new_fixture(&root.join("opening-journal")).unwrap())
+        });
+        let cursor_service = cursor_enabled.then(|| {
+            Arc::new(OnboardingService::new_cursor_fixture(&root.join("cursor-journal")).unwrap())
         });
         let source = Arc::new(FixtureSource {
             snapshots: AtomicUsize::new(0),
             installations: AtomicUsize::new(0),
             fail: AtomicBool::new(false),
             bad_host: AtomicBool::new(false),
+            include_cursor: cursor_enabled,
         });
         let app = super::super::router_with_components(
             RuntimeConfig {
@@ -110,6 +132,7 @@ impl Fixture {
             },
             source.clone(),
             service.clone(),
+            cursor_service.clone(),
         )
         .unwrap();
         Self {
@@ -117,6 +140,7 @@ impl Fixture {
             app,
             service,
             source,
+            cursor_service,
         }
     }
     async fn request(
@@ -185,6 +209,191 @@ fn post_headers() -> [(&'static str, &'static str); 3] {
 }
 
 #[tokio::test]
+async fn cursor_setup_is_disabled_by_default_and_does_not_scan_or_consume() {
+    let fixture = Fixture::new(true);
+    let (code, value) = fixture
+        .request(
+            Method::GET,
+            "/api/onboarding/cursor-mcp/status",
+            &[INTENT],
+            String::new(),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(value["native_open_allowed"], false);
+    assert_eq!(value["openable_installation_ids"], json!([]));
+    assert_eq!(
+        fixture
+            .request(
+                Method::POST,
+                "/api/onboarding/cursor-mcp/setup",
+                &post_headers(),
+                open_body(&"a".repeat(64))
+            )
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        fixture
+            .request(
+                Method::GET,
+                &format!("/api/onboarding/cursor-mcp/setups/{ID}"),
+                &[INTENT],
+                String::new()
+            )
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(
+        fixture
+            .service
+            .as_ref()
+            .unwrap()
+            .lookup(ID)
+            .unwrap()
+            .is_none()
+    );
+    fixture.no_scan();
+}
+
+#[tokio::test]
+async fn one_observation_supplies_separate_cursor_handoff_and_opening_domains() {
+    let fixture = Fixture::with_setup(true, true);
+    let (code, inventory) = fixture.discover().await;
+    assert_eq!(code, StatusCode::OK);
+    let cursor_id = inventory["installations"]["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["family"] == "cursor")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_, setup) = fixture
+        .request(
+            Method::GET,
+            "/api/onboarding/cursor-mcp/status",
+            &[INTENT],
+            String::new(),
+        )
+        .await;
+    assert_eq!(setup["native_open_allowed"], true);
+    assert_eq!(setup["openable_installation_ids"], json!([cursor_id]));
+    assert_eq!(
+        fixture.status().await["openable_installation_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(fixture.source.snapshots.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.source.installations.load(Ordering::SeqCst), 1);
+    for extra in ["command", "args", "uri", "endpoint", "room"] {
+        let mut body = json!({"installation_id":cursor_id});
+        body[extra] = json!("caller-controlled");
+        assert_eq!(
+            fixture
+                .request(
+                    Method::POST,
+                    "/api/onboarding/cursor-mcp/setup",
+                    &post_headers(),
+                    body.to_string()
+                )
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let service = fixture.cursor_service.as_ref().unwrap();
+    assert!(service.lookup(ID).unwrap().is_none());
+    let (code, receipt) = fixture
+        .request(
+            Method::POST,
+            "/api/onboarding/cursor-mcp/setup",
+            &post_headers(),
+            open_body(&cursor_id),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(receipt["state"], "opened_or_reused"); // Fake executor: OS acknowledgement only.
+    assert!(receipt["message"].as_str().unwrap().contains("unconfirmed"));
+    assert_eq!(
+        fixture
+            .request(
+                Method::POST,
+                "/api/onboarding/cursor-mcp/setup",
+                &post_headers(),
+                open_body(&cursor_id)
+            )
+            .await
+            .1,
+        receipt
+    );
+    assert_eq!(
+        fixture
+            .request(
+                Method::GET,
+                &format!("/api/onboarding/cursor-mcp/setups/{ID}"),
+                &[INTENT],
+                String::new()
+            )
+            .await
+            .1,
+        receipt
+    );
+    assert!(
+        fixture
+            .service
+            .as_ref()
+            .unwrap()
+            .lookup(ID)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .request(
+                Method::GET,
+                &format!("/api/onboarding/opens/{ID}"),
+                &[INTENT],
+                String::new()
+            )
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        fixture
+            .request(
+                Method::POST,
+                "/api/onboarding/cursor-mcp/setup",
+                &post_headers(),
+                open_body(&"f".repeat(64))
+            )
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    fixture.source.fail.store(true, Ordering::SeqCst);
+    assert_eq!(fixture.discover().await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!service.status().unwrap().native_open_allowed);
+    assert!(
+        !fixture
+            .service
+            .as_ref()
+            .unwrap()
+            .status()
+            .unwrap()
+            .native_open_allowed
+    );
+    assert_eq!(fixture.source.snapshots.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.source.installations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn default_runtime_exposes_disabled_capability_and_never_opens() {
     let fixture = Fixture::new(false);
     let value = fixture.status().await;
@@ -220,6 +429,12 @@ async fn onboarding_methods_queries_and_missing_native_intent_reject_without_wor
     for (path, allowed) in [
         ("/api/onboarding/status", Method::GET),
         ("/api/onboarding/open", Method::POST),
+        ("/api/onboarding/cursor-mcp/status", Method::GET),
+        ("/api/onboarding/cursor-mcp/setup", Method::POST),
+        (
+            "/api/onboarding/cursor-mcp/setups/open-fixture-request-0001",
+            Method::GET,
+        ),
         (
             "/api/onboarding/opens/open-fixture-request-0001",
             Method::GET,

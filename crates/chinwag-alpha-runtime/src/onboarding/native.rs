@@ -1,7 +1,7 @@
 use super::{OnboardingError, disabled_status, observed_installation_id};
 use chinwag_bus_client::{NativeOpenReceipt, NativeOpenRequest, NativeOpenState, OnboardingStatus};
 use chinwag_client_discovery::{
-    INSTALLATION_CAPACITY, Installation, InstalledSnapshot, InventorySnapshot,
+    ClientFamily, INSTALLATION_CAPACITY, Installation, InstalledSnapshot, InventorySnapshot,
 };
 use chinwag_native_launch::{
     HostIdentity, HumanOperation, LaunchCoordinator, LaunchError, LaunchFailure,
@@ -16,7 +16,7 @@ use std::{
 };
 
 mod journal;
-use journal::Journal;
+use journal::{Domain, Journal};
 
 const CACHE_LIFETIME: Duration = Duration::from_secs(30);
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
@@ -101,9 +101,44 @@ pub struct OnboardingService {
     verifier: Verifier,
     launcher: Mutex<Launcher>,
     clock: Clock,
+    family: Option<ClientFamily>,
 }
 
 impl OnboardingService {
+    /// A distinct owner-enabled setup domain, sharing the same consumed-attempt
+    /// mechanism. OS acknowledgement is not installation or MCP acceptance.
+    pub fn new_cursor_mcp_native(
+        journal_dir: &Path,
+        binary: &Path,
+        endpoint: String,
+    ) -> Result<Self, OnboardingError> {
+        #[cfg(target_os = "macos")]
+        {
+            let pinned = super::cursor::PinnedMcpBinary::open(binary)?;
+            let spec = chinwag_native_launch::CursorMcpInstall::new(binary.to_owned(), endpoint)
+                .map_err(|_| OnboardingError::Invalid)?;
+            let mut service = Self::new_parts_in_domain(
+                journal_dir,
+                Arc::new(move |host, previous| {
+                    pinned.revalidate()?;
+                    let installation = chinwag_client_discovery::reobserve_application(previous)
+                        .map_err(|_| OnboardingError::Unavailable)?;
+                    Ok(NativeObservation::new(host.clone(), installation, Instant::now()))
+                }),
+                Box::new(chinwag_native_launch::macos::MacOsApplicationLauncher::for_cursor_mcp_setup_host(spec)),
+                Arc::new(Instant::now),
+                Domain::CursorMcpSetup,
+            )?;
+            service.family = Some(ClientFamily::Cursor);
+            Ok(service)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (journal_dir, binary, endpoint);
+            Err(OnboardingError::Unavailable)
+        }
+    }
+
     /// Caller must have opted into the serviced native main-loop host. This
     /// constructor performs no scan or launch and creates no connector grant.
     pub fn new_native(journal_dir: &Path) -> Result<Self, OnboardingError> {
@@ -139,19 +174,35 @@ impl OnboardingService {
         launcher: Box<dyn NativeApplicationLauncher + Send>,
         clock: Clock,
     ) -> Result<Self, OnboardingError> {
+        Self::new_parts_in_domain(journal_dir, verifier, launcher, clock, Domain::OrdinaryOpen)
+    }
+
+    fn new_parts_in_domain(
+        journal_dir: &Path,
+        verifier: Verifier,
+        launcher: Box<dyn NativeApplicationLauncher + Send>,
+        clock: Clock,
+        domain: Domain,
+    ) -> Result<Self, OnboardingError> {
         Ok(Self {
-            journal: Mutex::new(Journal::open(journal_dir)?),
+            journal: Mutex::new(Journal::open_in_domain(journal_dir, domain)?),
             cache: Mutex::new(Cache::default()),
             active: Mutex::new(()),
             active_operation: Mutex::new(None),
             verifier,
             launcher: Mutex::new(Launcher(launcher)),
             clock,
+            family: None,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn new_fixture(journal_dir: &Path) -> Result<Self, OnboardingError> {
+        Self::new_fixture_in_domain(journal_dir, Domain::OrdinaryOpen)
+    }
+
+    #[cfg(test)]
+    fn new_fixture_in_domain(journal_dir: &Path, domain: Domain) -> Result<Self, OnboardingError> {
         struct FixtureLauncher;
         impl NativeApplicationLauncher for FixtureLauncher {
             fn open_or_reuse(
@@ -166,7 +217,7 @@ impl OnboardingService {
                 })
             }
         }
-        Self::new_parts(
+        Self::new_parts_in_domain(
             journal_dir,
             Arc::new(|host, installation| {
                 Ok(NativeObservation::new(
@@ -177,7 +228,15 @@ impl OnboardingService {
             }),
             Box::new(FixtureLauncher),
             Arc::new(Instant::now),
+            domain,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_cursor_fixture(journal_dir: &Path) -> Result<Self, OnboardingError> {
+        let mut service = Self::new_fixture_in_domain(journal_dir, Domain::CursorMcpSetup)?;
+        service.family = Some(ClientFamily::Cursor);
+        Ok(service)
     }
 
     pub fn invalidate(&self) -> Result<(), OnboardingError> {
@@ -229,7 +288,11 @@ impl OnboardingService {
             return Err(OnboardingError::Unavailable);
         }
         for installation in &installed.installations {
-            if !is_launch_eligible(installation) {
+            if !is_launch_eligible(installation)
+                || self
+                    .family
+                    .is_some_and(|family| family != installation.family)
+            {
                 continue;
             }
             let id = observed_installation_id(process, installation);

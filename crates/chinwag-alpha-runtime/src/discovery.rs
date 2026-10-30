@@ -88,18 +88,27 @@ impl DiscoveryService {
         &self,
         onboarding: Option<&OnboardingService>,
     ) -> std::result::Result<ClientInventory, DiscoveryFailure> {
+        self.inventory_with_actions(&onboarding.into_iter().collect::<Vec<_>>())
+    }
+
+    /// One host observation supplies each enabled human-action controller.
+    /// No controller or family performs another process/installation scan.
+    pub(crate) fn inventory_with_actions(
+        &self,
+        actions: &[&OnboardingService],
+    ) -> std::result::Result<ClientInventory, DiscoveryFailure> {
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut host = match self.host.try_lock() {
             Ok(host) => host,
             Err(error) => {
-                if let Some(onboarding) = onboarding {
+                for onboarding in actions {
                     let _ = onboarding.invalidate();
                 }
                 return Err(lock_failure(error));
             }
         };
         let result = self.collect_inventory(&mut host, deadline);
-        if let Some(onboarding) = onboarding {
+        for onboarding in actions {
             let cached = match &result {
                 Ok((_, process, Some(installed))) if Instant::now() < deadline => {
                     onboarding.observe(process, installed).is_ok() && Instant::now() < deadline

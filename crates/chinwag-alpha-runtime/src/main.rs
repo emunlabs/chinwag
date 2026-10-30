@@ -19,7 +19,8 @@ fn main() {
 
 fn dispatch(mut args: Vec<String>) -> Result<()> {
     let native_main_loop = take_native_main_loop(&mut args)?;
-    onboarding_journal(&args, native_main_loop)?;
+    let journal = onboarding_journal(&args, native_main_loop)?;
+    cursor_mcp_options(&args, native_main_loop, journal.as_deref())?;
     if native_main_loop {
         #[cfg(target_os = "macos")]
         {
@@ -98,8 +99,58 @@ fn onboarding_journal(args: &[String], native_main_loop: bool) -> Result<Option<
     Ok(Some(path))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CursorMcpOptions {
+    binary: PathBuf,
+    journal: PathBuf,
+}
+
+// Validate explicit opt-ins before initializing any bus mode, storage or signer.
+fn cursor_mcp_options(
+    args: &[String],
+    native_main_loop: bool,
+    opening_journal: Option<&std::path::Path>,
+) -> Result<Option<CursorMcpOptions>> {
+    let find = |flag: &str| -> Result<Option<PathBuf>> {
+        let positions: Vec<_> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.as_str() == flag)
+            .map(|(i, _)| i)
+            .collect();
+        if positions.len() > 1 {
+            return Err(RuntimeError::Invalid(
+                "Cursor setup options must be unique".into(),
+            ));
+        }
+        positions
+            .first()
+            .map(|i| {
+                args.get(i + 1)
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .ok_or_else(|| {
+                        RuntimeError::Invalid(
+                            "Cursor setup requires absolute binary and journal paths".into(),
+                        )
+                    })
+            })
+            .transpose()
+    };
+    let binary = find("--cursor-mcp-binary")?;
+    let journal = find("--cursor-mcp-journal")?;
+    match (binary, journal) {
+        (None, None) => Ok(None),
+        (Some(binary), Some(journal)) if native_main_loop && opening_journal.is_some()
+            && matches!(args.first().map(String::as_str), Some("serve-local" | "serve-shared"))
+            && opening_journal != Some(journal.as_path()) => Ok(Some(CursorMcpOptions { binary, journal })),
+        _ => Err(RuntimeError::Invalid("Cursor setup requires --native-main-loop, --onboarding-journal and paired --cursor-mcp-binary/--cursor-mcp-journal with a distinct journal".into())),
+    }
+}
+
 async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
     let onboarding_journal = onboarding_journal(&args, native_main_loop)?;
+    let cursor_mcp = cursor_mcp_options(&args, native_main_loop, onboarding_journal.as_deref())?;
     let Some((command, rest)) = args.split_first() else {
         return Err(RuntimeError::Invalid(
             "use launch, serve-local, serve-shared or discover-clients".into(),
@@ -125,7 +176,13 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
         return Ok(());
     }
     let allowed: &[&str] = match command.as_str() {
-        "serve-local" => &["--data-dir", "--port", "--onboarding-journal"],
+        "serve-local" => &[
+            "--data-dir",
+            "--port",
+            "--onboarding-journal",
+            "--cursor-mcp-binary",
+            "--cursor-mcp-journal",
+        ],
         "serve-shared" => &[
             "--ledger",
             "--port",
@@ -133,6 +190,8 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
             "--repo",
             "--send-journal",
             "--onboarding-journal",
+            "--cursor-mcp-binary",
+            "--cursor-mcp-journal",
         ],
         _ => return Err(RuntimeError::Invalid("unknown runtime command".into())),
     };
@@ -214,12 +273,13 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         mode,
     };
+    let mut opening_service = None;
     if let Some(path) = onboarding_journal {
         #[cfg(target_os = "macos")]
         {
             match tokio::task::spawn_blocking(move || OnboardingService::new_native(&path)).await {
                 Ok(Ok(service)) => {
-                    return server::serve_with_onboarding(config, Arc::new(service)).await;
+                    opening_service = Some(Arc::new(service));
                 }
                 Ok(Err(_)) | Err(_) => {
                     eprintln!(
@@ -236,7 +296,39 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
             ));
         }
     }
-    server::serve(config).await
+    let mut cursor_service = None;
+    if let Some(options) = cursor_mcp {
+        #[cfg(target_os = "macos")]
+        {
+            let endpoint = format!("http://127.0.0.1:{port}");
+            // Port zero cannot be embedded in a persistent child configuration.
+            if port != 0 {
+                match tokio::task::spawn_blocking(move || {
+                    OnboardingService::new_cursor_mcp_native(
+                        &options.journal,
+                        &options.binary,
+                        endpoint,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(service)) => cursor_service = Some(Arc::new(service)),
+                    Ok(Err(_)) | Err(_) => eprintln!(
+                        "chinwag-alpha-runtime: Cursor setup initialization unavailable; bus and ordinary opening continue; no recovery was attempted"
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "chinwag-alpha-runtime: Cursor setup requires a fixed nonzero runtime port; setup disabled"
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = options;
+        }
+    }
+    server::serve_with_native_actions(config, opening_service, cursor_service).await
 }
 
 fn verify_signer_ledger(ledger: &std::path::Path, repo: &std::path::Path) -> Result<()> {
@@ -254,6 +346,73 @@ fn verify_signer_ledger(ledger: &std::path::Path, repo: &std::path::Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_setup_is_a_paired_distinct_owner_opt_in_before_dispatch() {
+        let values = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let valid = values(&[
+            "serve-shared",
+            "--cursor-mcp-binary",
+            "/fixture/mcp",
+            "--cursor-mcp-journal",
+            "/fixture/cursor",
+        ]);
+        let ordinary = std::path::Path::new("/fixture/ordinary");
+        assert_eq!(
+            cursor_mcp_options(&valid, true, Some(ordinary)).unwrap(),
+            Some(CursorMcpOptions {
+                binary: "/fixture/mcp".into(),
+                journal: "/fixture/cursor".into(),
+            })
+        );
+        assert!(cursor_mcp_options(&valid, false, Some(ordinary)).is_err());
+        assert!(cursor_mcp_options(&valid, true, None).is_err());
+        assert!(
+            cursor_mcp_options(&valid, true, Some(std::path::Path::new("/fixture/cursor")))
+                .is_err()
+        );
+        for bad in [
+            values(&["serve-shared", "--cursor-mcp-binary", "/fixture/mcp"]),
+            values(&["serve-shared", "--cursor-mcp-journal", "/fixture/cursor"]),
+            values(&[
+                "serve-shared",
+                "--cursor-mcp-binary",
+                "relative",
+                "--cursor-mcp-journal",
+                "/fixture/cursor",
+            ]),
+            values(&[
+                "launch",
+                "--cursor-mcp-binary",
+                "/fixture/mcp",
+                "--cursor-mcp-journal",
+                "/fixture/cursor",
+            ]),
+            values(&[
+                "discover-clients",
+                "--cursor-mcp-binary",
+                "/fixture/mcp",
+                "--cursor-mcp-journal",
+                "/fixture/cursor",
+            ]),
+            values(&[
+                "serve-local",
+                "--cursor-mcp-binary",
+                "/fixture/mcp",
+                "--cursor-mcp-binary",
+                "/fixture/mcp",
+                "--cursor-mcp-journal",
+                "/fixture/cursor",
+            ]),
+        ] {
+            assert!(cursor_mcp_options(&bad, true, Some(ordinary)).is_err());
+        }
+        assert!(
+            cursor_mcp_options(&values(&["serve-shared"]), false, None)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn native_main_loop_flag_is_explicit_and_preserves_server_arguments() {

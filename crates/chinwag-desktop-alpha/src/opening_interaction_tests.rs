@@ -43,6 +43,379 @@ fn status(allowed: bool) -> Value {
         "openable_installation_ids":if allowed { vec!["a".repeat(64),"b".repeat(64)] } else { Vec::<String>::new() }})
 }
 
+fn cursor_inventory() -> Value {
+    let mut value = inventory();
+    value["installations"]["apps"][0]["family"] = json!("cursor");
+    value
+}
+
+#[gpui_kit::test]
+fn cursor_setup_refreshes_exact_copy_before_one_post_and_never_claims_connected(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let drafts = directory.drafts();
+    let history = openings::path_for_drafts(&drafts).unwrap();
+    let (endpoint, worker) = fixture(6, move |request, index| match index {
+        0 | 3 => {
+            assert!(request.starts_with("GET /api/bus/clients "));
+            assert!(
+                !history.exists(),
+                "Find and exact-copy preflight do not create Pending"
+            );
+            (200, cursor_inventory())
+        }
+        1 => {
+            assert!(request.starts_with("GET /api/onboarding/status "));
+            (200, status(true))
+        }
+        2 | 4 => {
+            assert!(request.starts_with("GET /api/onboarding/cursor-mcp/status "));
+            assert!(!history.exists());
+            (200, status(true))
+        }
+        _ => {
+            assert!(request.starts_with("POST /api/onboarding/cursor-mcp/setup "));
+            assert_eq!(header(request, "X-Chinwag-Onboarding-Intent"), "1");
+            let body: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body, json!({"installation_id":"a".repeat(64)}));
+            let saved: Value = serde_json::from_slice(&std::fs::read(&history).unwrap()).unwrap();
+            assert_eq!(saved["attempts"][0]["state"], "pending");
+            assert_eq!(saved["attempts"][0]["action"], "cursor_mcp_setup");
+            assert_eq!(
+                saved["attempts"][0]["id"],
+                header(request, "X-Chinwag-Request-Id")
+            );
+            (200, reply(request, "a".repeat(64), "opened_or_reused"))
+        }
+    });
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_settings(window, cx, endpoint.clone(), Some(drafts.clone()))
+            })
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.click("find-client-apps", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            assert!(view.openings.as_ref().unwrap().attempts.is_empty());
+            assert!(view.opening_tasks.is_empty());
+        });
+        window.draw(cx).clear(cx);
+        window.click(("setup-cursor-mcp", 0_usize), cx);
+        view.update(cx, |view, cx| {
+            assert!(!view.can_open_installation(&"a".repeat(64), cx));
+            assert!(!view.can_open_installation(&"b".repeat(64), cx));
+            assert_eq!(
+                view.opening_selection.as_ref().unwrap().action,
+                OpeningAction::CursorMcpSetup
+            );
+            view.open_installation(&"a".repeat(64), cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let requests = worker.join().unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("POST "))
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with("POST /api/onboarding/open "))
+    );
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let attempts = &view.openings.as_ref().unwrap().attempts;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].action, OpeningAction::CursorMcpSetup);
+        assert_eq!(
+            attempts[0].summary(),
+            "Check Cursor to approve setup; connection unconfirmed."
+        );
+        assert!(matches!(view.connection, Connection::Disconnected));
+        assert!(view.send_task.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn old_setup_route_disables_only_setup_and_find_never_posts(cx: &mut TestAppContext) {
+    let directory = Directory::new();
+    let (endpoint, worker) = fixture(3, |request, index| {
+        assert!(request.starts_with("GET "));
+        match index {
+            0 => (200, cursor_inventory()),
+            1 => (200, status(true)),
+            _ => {
+                assert!(request.starts_with("GET /api/onboarding/cursor-mcp/status "));
+                (404, json!({"error":"old runtime"}))
+            }
+        }
+    });
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_settings(window, cx, endpoint.clone(), Some(directory.drafts()))
+            })
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.load_client_inventory(&endpoint, view.connection_generation, cx)
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap().len(), 3);
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(matches!(
+            view.client_inventory.state,
+            InventoryState::Ready(_)
+        ));
+        assert!(view.can_open_installation(&"a".repeat(64), cx));
+        assert!(!view.can_act_on_installation(OpeningAction::CursorMcpSetup, &"a".repeat(64), cx));
+        assert!(view.openings.as_ref().unwrap().attempts.is_empty());
+        assert!(matches!(view.connection, Connection::Disconnected));
+    });
+}
+
+#[gpui_kit::test]
+fn restored_setup_action_checks_saved_route_and_blocks_ordinary_open_before_refresh(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let (endpoint, worker) = fixture(1, |request, _| {
+        assert!(request.starts_with("GET /api/onboarding/cursor-mcp/setups/"));
+        let id = request
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        (
+            200,
+            json!({"schema":"chinwag-native-open/v1","request_id":id,"installation_id":"a".repeat(64),"state":"opened_or_reused","message":"Synthetic OS acknowledgement"}),
+        )
+    });
+    let mut store =
+        OpeningStore::open(openings::path_for_drafts(&directory.drafts()).unwrap()).unwrap();
+    let attempt = store
+        .prepare(OpeningAction::CursorMcpSetup, &endpoint, &"a".repeat(64))
+        .unwrap();
+    drop(store);
+    cx.update(init);
+    let alias = "http://127.0.0.1:1";
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_settings(window, cx, alias.into(), Some(directory.drafts()))
+            })
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.opening_tasks.is_empty(), "startup never submits setup");
+            let generation = view.client_inventory.begin(alias.into());
+            view.client_inventory.complete(
+                generation,
+                alias,
+                Ok(serde_json::from_value(cursor_inventory()).unwrap()),
+            );
+            view.client_inventory.complete_opening_status(
+                generation,
+                alias,
+                Ok(serde_json::from_value(status(true)).unwrap()),
+            );
+            view.client_inventory.complete_cursor_mcp_status(
+                generation,
+                alias,
+                Ok(serde_json::from_value(status(true)).unwrap()),
+            );
+            for action in [OpeningAction::OrdinaryOpen, OpeningAction::CursorMcpSetup] {
+                assert!(!view.can_act_on_installation(action, &attempt.installation_id, cx));
+                view.act_on_installation(action, &attempt.installation_id, cx);
+            }
+            assert!(
+                view.selection_task.is_none(),
+                "unresolved actions block before metadata GET"
+            );
+            view.check_opening(&attempt.id, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(worker.join().unwrap().len(), 1);
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).openings.as_ref().unwrap().attempts[0].summary(),
+            "Check Cursor to approve setup; connection unconfirmed."
+        )
+    });
+}
+
+#[gpui_kit::test]
+fn changed_cursor_copy_or_failed_setup_capability_prevents_pending_and_post(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    for mutation in 0..4 {
+        let directory = Directory::new();
+        let history = openings::path_for_drafts(&directory.drafts()).unwrap();
+        let (endpoint, worker) = fixture(5, move |request, index| {
+            assert!(
+                request.starts_with("GET "),
+                "failed setup preparation never POSTs"
+            );
+            match index {
+                0 => (200, cursor_inventory()),
+                1 => (200, status(true)),
+                2 => {
+                    assert!(request.starts_with("GET /api/onboarding/cursor-mcp/status "));
+                    (200, status(true))
+                }
+                3 => {
+                    assert!(request.starts_with("GET /api/bus/clients "));
+                    let mut changed = cursor_inventory();
+                    match mutation {
+                        0 => changed["installations"]["apps"][0]["id"] = json!("c".repeat(64)),
+                        1 => changed["installations"]["apps"][0]["family"] = json!("grok_bot"),
+                        _ => {}
+                    }
+                    (200, changed)
+                }
+                _ => {
+                    assert!(request.starts_with("GET /api/onboarding/cursor-mcp/status "));
+                    if mutation == 2 {
+                        (503, json!({"error":"unavailable"}))
+                    } else {
+                        (200, status(mutation != 3))
+                    }
+                }
+            }
+        });
+        let (window, view) = cx.update(|cx| {
+            open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    Workbench::with_settings(window, cx, endpoint.clone(), Some(directory.drafts()))
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                view.load_client_inventory(&endpoint, view.connection_generation, cx)
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                view.act_on_installation(OpeningAction::CursorMcpSetup, &"a".repeat(64), cx)
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(worker.join().unwrap().len(), 5);
+        cx.run_until_parked();
+        assert!(!history.exists());
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(view.openings.as_ref().unwrap().attempts.is_empty());
+            assert!(view.opening_tasks.is_empty());
+            assert!(view.opening_selection.is_none());
+            assert!(view.client_inventory.cursor_mcp_notice.is_some());
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn stale_setup_selection_cannot_replace_another_action_or_survive_generation_change(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let endpoint = "http://127.0.0.1:41111";
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_settings(window, cx, endpoint.into(), Some(directory.drafts()))
+            })
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            let generation = view.client_inventory.begin(endpoint.into());
+            view.client_inventory.complete(
+                generation,
+                endpoint,
+                Ok(serde_json::from_value(cursor_inventory()).unwrap()),
+            );
+            let selected = OpeningSelection {
+                app: view
+                    .client_inventory
+                    .installed_copy(&"a".repeat(64))
+                    .unwrap(),
+                endpoint: endpoint.into(),
+                epoch: view.opening_epoch,
+                inventory_generation: generation,
+                connection_generation: view.connection_generation,
+                generation: 8,
+                action: OpeningAction::CursorMcpSetup,
+            };
+            let mut another = selected.clone();
+            another.action = OpeningAction::OrdinaryOpen;
+            view.opening_selection = Some(another);
+            view.selection_task =
+                Some(cx.spawn(async move |_, _| std::future::pending::<()>().await));
+            let read = || AppInventoryRead {
+                inventory: Ok(serde_json::from_value(cursor_inventory()).unwrap()),
+                opening_status: None,
+                cursor_mcp_status: Some(Ok(serde_json::from_value(status(true)).unwrap())),
+            };
+            assert!(!view.apply_selection_refresh(&selected, read(), cx));
+            assert_eq!(
+                view.opening_selection.as_ref().unwrap().action,
+                OpeningAction::OrdinaryOpen
+            );
+            assert!(view.selection_task.is_some());
+            view.opening_selection = Some(selected.clone());
+            view.client_inventory.begin(endpoint.into());
+            assert!(!view.apply_selection_refresh(&selected, read(), cx));
+            assert!(view.selection_task.is_none());
+            assert!(view.openings.as_ref().unwrap().attempts.is_empty());
+            assert!(view.opening_tasks.is_empty());
+        })
+    })
+    .unwrap();
+    assert!(
+        !openings::path_for_drafts(&directory.drafts())
+            .unwrap()
+            .exists()
+    );
+}
+
 fn header<'a>(request: &'a str, name: &str) -> &'a str {
     request
         .lines()
@@ -225,7 +598,12 @@ fn expired_cached_exact_copy_refreshes_before_one_post_and_keeps_family_grouping
     cx.update(|cx| {
         let view = view.read(cx);
         assert_eq!(view.client_inventory.rows().len(), 1);
-        assert_eq!(view.client_inventory.openable_copies().len(), 2);
+        assert_eq!(
+            view.client_inventory
+                .action_copies(OpeningAction::OrdinaryOpen)
+                .len(),
+            2
+        );
         let store = view.openings.as_ref().unwrap();
         assert_eq!(store.attempts.len(), 1);
         assert_eq!(
@@ -261,7 +639,11 @@ fn older_runtime_status_404_preserves_inventory_and_exposes_no_open_action(
     });
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |view, cx| {
-            assert!(view.client_inventory.openable_copies().is_empty());
+            assert!(
+                view.client_inventory
+                    .action_copies(OpeningAction::OrdinaryOpen)
+                    .is_empty()
+            );
             view.open_installation(&"a".repeat(64), cx);
             view.load_client_inventory(&endpoint, view.connection_generation, cx);
         })
@@ -282,7 +664,11 @@ fn older_runtime_status_404_preserves_inventory_and_exposes_no_open_action(
             view.client_inventory.state,
             InventoryState::Ready(_)
         ));
-        assert!(view.client_inventory.openable_copies().is_empty());
+        assert!(
+            view.client_inventory
+                .action_copies(OpeningAction::OrdinaryOpen)
+                .is_empty()
+        );
         assert!(view.openings.as_ref().unwrap().attempts.is_empty());
     });
 }
@@ -308,7 +694,9 @@ fn restored_pending_attempt_checks_original_endpoint_by_get_without_find_or_post
     });
     let mut store =
         OpeningStore::open(openings::path_for_drafts(&directory.drafts()).unwrap()).unwrap();
-    let attempt = store.prepare(&endpoint, &"a".repeat(64)).unwrap();
+    let attempt = store
+        .prepare(OpeningAction::OrdinaryOpen, &endpoint, &"a".repeat(64))
+        .unwrap();
     drop(store);
     cx.update(init);
     let (window, view) = cx.update(|cx| {
@@ -330,7 +718,11 @@ fn restored_pending_attempt_checks_original_endpoint_by_get_without_find_or_post
             view.opening_tasks.is_empty(),
             "startup must not replay a pending POST"
         );
-        assert!(view.client_inventory.openable_copies().is_empty());
+        assert!(
+            view.client_inventory
+                .action_copies(OpeningAction::OrdinaryOpen)
+                .is_empty()
+        );
         assert!(
             view.openings
                 .as_ref()
@@ -468,7 +860,7 @@ fn stale_endpoint_or_attempt_completion_cannot_confirm_an_opening(cx: &mut TestA
                 .openings
                 .as_mut()
                 .unwrap()
-                .prepare(endpoint, &"a".repeat(64))
+                .prepare(OpeningAction::OrdinaryOpen, endpoint, &"a".repeat(64))
                 .unwrap();
             view.opening_generations.insert(attempt.id.clone(), 2);
             let mut flight = OpeningFlight {
@@ -477,6 +869,7 @@ fn stale_endpoint_or_attempt_completion_cannot_confirm_an_opening(cx: &mut TestA
                 view_endpoint: endpoint.into(),
                 epoch: view.opening_epoch,
                 generation: 1,
+                action: OpeningAction::OrdinaryOpen,
             };
             let receipt = NativeOpenReceipt {
                 schema: "chinwag-native-open/v1".into(),
@@ -487,6 +880,9 @@ fn stale_endpoint_or_attempt_completion_cannot_confirm_an_opening(cx: &mut TestA
             };
             assert!(!view.apply_opening_result(&flight, Ok(Some(receipt.clone())), cx));
             flight.generation = 2;
+            flight.action = OpeningAction::CursorMcpSetup;
+            assert!(!view.apply_opening_result(&flight, Ok(Some(receipt.clone())), cx));
+            flight.action = OpeningAction::OrdinaryOpen;
             view.endpoint.update(cx, |state, cx| {
                 state.set_value("http://127.0.0.1:42222", window, cx)
             });
@@ -619,7 +1015,9 @@ fn unresolved_selected_id_blocks_before_any_metadata_refresh_even_through_endpoi
     let alias = "http://localhost:44341";
     let mut store =
         OpeningStore::open(openings::path_for_drafts(&directory.drafts()).unwrap()).unwrap();
-    let attempt = store.prepare(original, &"a".repeat(64)).unwrap();
+    let attempt = store
+        .prepare(OpeningAction::OrdinaryOpen, original, &"a".repeat(64))
+        .unwrap();
     drop(store);
     cx.update(init);
     let (window, view) = cx.update(|cx| {
@@ -698,6 +1096,7 @@ fn endpoint_find_or_connect_supersession_clears_metadata_flight_without_preparin
                     inventory_generation: generation,
                     connection_generation: view.connection_generation,
                     generation: 1,
+                    action: OpeningAction::OrdinaryOpen,
                 };
                 view.opening_selection = Some(selected.clone());
                 view.selection_task =
@@ -722,7 +1121,8 @@ fn endpoint_find_or_connect_supersession_clears_metadata_flight_without_preparin
                     &selected,
                     AppInventoryRead {
                         inventory: Ok(serde_json::from_value(inventory()).unwrap()),
-                        opening_status: Some(Ok(serde_json::from_value(status(true)).unwrap()))
+                        opening_status: Some(Ok(serde_json::from_value(status(true)).unwrap())),
+                        cursor_mcp_status: None,
                     },
                     cx
                 ));

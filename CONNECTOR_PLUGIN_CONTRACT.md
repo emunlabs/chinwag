@@ -48,6 +48,8 @@ Client-specific bindings, lifecycle invalidation and scoped remote publication r
 
 The current shared MCP route is owner-local, unattributed and read-only. Its successful SDK fixture/native-ledger read does not establish that a named GPT/Claude/Gemini client enrolled or that Grok Bot received a group message. General remote ingress is not exposed by these loopback-only alpha services.
 
+The human Cursor setup handoff uses that same fixed-room Rust stdio server. It is a host-native action with separate owner opt-ins and durable action namespace, not a new registry, publication capability or external plugin loader. The selected application receives Cursor's supported install URI through exact-application dispatch; only Cursor can approve it. See [CURSOR_MCP_SETUP.md](CURSOR_MCP_SETUP.md). OS acknowledgment is not connector admission or actual client handshake evidence.
+
 ## Verification
 
 Relevant Rust fixtures cover disabled/undeclared capabilities, stale invocations, post-call expiry, exact inbox scope, revocation, cancellation/EOF, public metadata bounds and aliases, partial installed discovery, redaction, host qualification and family grouping. Runtime and MCP reads migrate through the component host in this change. Product services, tests and launcher remain Rust with the pinned Rust1.97.1 toolchain and existing dependency versions.

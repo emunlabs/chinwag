@@ -4,7 +4,7 @@
 //! Only explicit startup configuration enables opening; default routes cannot.
 
 use super::{AppState, boundary, failure, response};
-use crate::onboarding::{OnboardingError, disabled_status};
+use crate::onboarding::{OnboardingError, OnboardingService, disabled_status};
 use crate::{Result, RuntimeError};
 use axum::{
     body::Bytes,
@@ -15,6 +15,7 @@ use axum::{
 use chinwag_bus_client::{NativeOpenRequest, validate_request_id};
 use serde::Serialize;
 use serde_json::json;
+use std::sync::Arc;
 
 const MAX_OPEN_BODY: usize = 1024;
 
@@ -126,10 +127,26 @@ pub(super) async fn status(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
+    status_for(state.2, uri, headers).await
+}
+
+pub(super) async fn cursor_status(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    status_for(state.3, uri, headers).await
+}
+
+async fn status_for(
+    service: Option<Arc<OnboardingService>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
     if let Err(error) = explicit_boundary(&headers, &uri) {
         return failure(error);
     }
-    let Some(service) = state.2 else {
+    let Some(service) = service else {
         return encoded(&disabled_status());
     };
     match tokio::task::spawn_blocking(move || {
@@ -154,6 +171,24 @@ pub(super) async fn open(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Response {
+    open_for(state.2, uri, headers, bytes).await
+}
+
+pub(super) async fn cursor_setup(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
+    open_for(state.3, uri, headers, bytes).await
+}
+
+async fn open_for(
+    service: Option<Arc<OnboardingService>>,
+    uri: Uri,
+    headers: HeaderMap,
+    bytes: Bytes,
+) -> Response {
     if let Err(error) = explicit_boundary(&headers, &uri) {
         return failure(error);
     }
@@ -161,7 +196,7 @@ pub(super) async fn open(
         Ok(value) => value,
         Err(error) => return failure(error),
     };
-    let Some(service) = state.2 else {
+    let Some(service) = service else {
         return unavailable();
     };
     match tokio::task::spawn_blocking(move || {
@@ -185,13 +220,31 @@ pub(super) async fn lookup(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    lookup_for(state.2, uri, id, headers).await
+}
+
+pub(super) async fn cursor_lookup(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    lookup_for(state.3, uri, id, headers).await
+}
+
+async fn lookup_for(
+    service: Option<Arc<OnboardingService>>,
+    uri: Uri,
+    id: String,
+    headers: HeaderMap,
+) -> Response {
     if let Err(error) = explicit_boundary(&headers, &uri) {
         return failure(error);
     }
     if validate_request_id(&id).is_err() {
         return failure(RuntimeError::Invalid("invalid opening request ID".into()));
     }
-    let Some(service) = state.2 else {
+    let Some(service) = service else {
         return unavailable();
     };
     match tokio::task::spawn_blocking(move || {

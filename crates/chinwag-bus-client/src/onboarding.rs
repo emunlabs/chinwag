@@ -113,9 +113,18 @@ impl NativeOpenReceipt {
 impl BusClient {
     /// Capability lookup only. Does not inventory or open applications.
     pub fn onboarding_status(&self) -> Result<OnboardingStatus, ClientError> {
+        self.native_action_status("/api/onboarding/status")
+    }
+
+    /// Cursor installation handoff capability only; does not install or connect.
+    pub fn cursor_mcp_setup_status(&self) -> Result<OnboardingStatus, ClientError> {
+        self.native_action_status("/api/onboarding/cursor-mcp/status")
+    }
+
+    fn native_action_status(&self, route: &str) -> Result<OnboardingStatus, ClientError> {
         let status: OnboardingStatus = read_json(
             self.http
-                .get(self.endpoint("/api/onboarding/status"))
+                .get(self.endpoint(route))
                 .header(INTENT, "1")
                 .send()?,
         )?;
@@ -130,12 +139,31 @@ impl BusClient {
         request_id: &str,
         request: &NativeOpenRequest,
     ) -> Result<NativeOpenReceipt, ClientError> {
+        self.perform_native_action("/api/onboarding/open", request_id, request)
+    }
+
+    /// One explicit Cursor installation handoff. An OS acknowledgement does not
+    /// prove installation approval, MCP initialization or a connected account.
+    pub fn setup_cursor_mcp(
+        &self,
+        request_id: &str,
+        request: &NativeOpenRequest,
+    ) -> Result<NativeOpenReceipt, ClientError> {
+        self.perform_native_action("/api/onboarding/cursor-mcp/setup", request_id, request)
+    }
+
+    fn perform_native_action(
+        &self,
+        route: &str,
+        request_id: &str,
+        request: &NativeOpenRequest,
+    ) -> Result<NativeOpenReceipt, ClientError> {
         validate_request_id(request_id)?;
         request.validate()?;
         let perform = || -> Result<NativeOpenReceipt, ClientError> {
             let receipt: NativeOpenReceipt = read_json(
                 self.http
-                    .post(self.endpoint("/api/onboarding/open"))
+                    .post(self.endpoint(route))
                     .header(INTENT, "1")
                     .header("X-Chinwag-Request-Id", request_id)
                     .json(request)
@@ -156,10 +184,26 @@ impl BusClient {
         &self,
         request_id: &str,
     ) -> Result<Option<NativeOpenReceipt>, ClientError> {
+        self.native_action_receipt("/api/onboarding/opens", request_id)
+    }
+
+    /// GET-only reconciliation of the original Cursor installation handoff.
+    pub fn cursor_mcp_setup_receipt(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<NativeOpenReceipt>, ClientError> {
+        self.native_action_receipt("/api/onboarding/cursor-mcp/setups", request_id)
+    }
+
+    fn native_action_receipt(
+        &self,
+        route: &str,
+        request_id: &str,
+    ) -> Result<Option<NativeOpenReceipt>, ClientError> {
         validate_request_id(request_id)?;
         let response = self
             .http
-            .get(self.endpoint(&format!("/api/onboarding/opens/{request_id}")))
+            .get(self.endpoint(&format!("{route}/{request_id}")))
             .header(INTENT, "1")
             .send()?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {

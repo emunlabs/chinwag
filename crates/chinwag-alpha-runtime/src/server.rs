@@ -43,6 +43,7 @@ struct AppState(
     Arc<Backend>,
     Arc<DiscoveryService>,
     Option<Arc<OnboardingService>>,
+    Option<Arc<OnboardingService>>,
 );
 
 enum Backend {
@@ -72,20 +73,21 @@ pub fn router_with_onboarding(
     config: RuntimeConfig,
     service: Arc<OnboardingService>,
 ) -> Result<Router> {
-    router_with_components(config, Arc::new(NativeInventorySource), Some(service))
+    router_with_components(config, Arc::new(NativeInventorySource), Some(service), None)
 }
 
 fn router_with_discovery(
     config: RuntimeConfig,
     source: Arc<dyn InventorySource>,
 ) -> Result<Router> {
-    router_with_components(config, source, None)
+    router_with_components(config, source, None, None)
 }
 
 fn router_with_components(
     config: RuntimeConfig,
     source: Arc<dyn InventorySource>,
     onboarding: Option<Arc<OnboardingService>>,
+    cursor_mcp: Option<Arc<OnboardingService>>,
 ) -> Result<Router> {
     if config.bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
         return Err(RuntimeError::Invalid("bind must be 127.0.0.1".into()));
@@ -161,33 +163,65 @@ fn router_with_components(
                 .head(onboarding::deny_get_method)
                 .fallback(onboarding::deny_get_method),
         )
+        .route(
+            "/api/onboarding/cursor-mcp/status",
+            get(onboarding::cursor_status)
+                .head(onboarding::deny_get_method)
+                .fallback(onboarding::deny_get_method),
+        )
+        .route(
+            "/api/onboarding/cursor-mcp/setup",
+            axum::routing::post(onboarding::cursor_setup).fallback(onboarding::deny_post_method),
+        )
+        .route(
+            "/api/onboarding/cursor-mcp/setups/{id}",
+            get(onboarding::cursor_lookup)
+                .head(onboarding::deny_get_method)
+                .fallback(onboarding::deny_get_method),
+        )
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(MAX_REQUEST))
         .with_state(AppState(
             Arc::new(backend),
             Arc::new(DiscoveryService::new(source)),
             onboarding,
+            cursor_mcp,
         )))
 }
 
 pub async fn serve(config: RuntimeConfig) -> Result<()> {
-    serve_optional_onboarding(config, None).await
+    serve_optional_onboarding(config, None, None).await
 }
 
 pub async fn serve_with_onboarding(
     config: RuntimeConfig,
     service: Arc<OnboardingService>,
 ) -> Result<()> {
-    serve_optional_onboarding(config, Some(service)).await
+    serve_optional_onboarding(config, Some(service), None).await
+}
+
+/// Both controllers are explicitly constructed by the target-host owner.
+pub async fn serve_with_native_actions(
+    config: RuntimeConfig,
+    onboarding: Option<Arc<OnboardingService>>,
+    cursor_mcp: Option<Arc<OnboardingService>>,
+) -> Result<()> {
+    serve_optional_onboarding(config, onboarding, cursor_mcp).await
 }
 
 async fn serve_optional_onboarding(
     config: RuntimeConfig,
     onboarding: Option<Arc<OnboardingService>>,
+    cursor_mcp: Option<Arc<OnboardingService>>,
 ) -> Result<()> {
     let bind = config.bind;
     let app = tokio::task::spawn_blocking(move || {
-        router_with_components(config, Arc::new(NativeInventorySource), onboarding)
+        router_with_components(
+            config,
+            Arc::new(NativeInventorySource),
+            onboarding,
+            cursor_mcp,
+        )
     })
     .await
     .map_err(|_| RuntimeError::Unavailable("runtime initialization worker failed".into()))??;
@@ -291,8 +325,13 @@ async fn discover_clients(State(state): State<AppState>, headers: HeaderMap) -> 
             ));
         }
     };
-    blocking_http(
-        move || match state.1.inventory_with_onboarding(state.2.as_deref()) {
+    blocking_http(move || {
+        match state.1.inventory_with_actions(
+            &[state.2.as_deref(), state.3.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ) {
             Ok(mut inventory) => {
                 // Legacy clients deny unknown fields. Only an explicit details
                 // negotiation may receive these additive public copy hints.
@@ -316,8 +355,8 @@ async fn discover_clients(State(state): State<AppState>, headers: HeaderMap) -> 
                 json!({"ok":false,"error":DiscoveryFailure::Busy.to_string()}),
             )),
             Err(error) => Err(RuntimeError::Unavailable(error.to_string())),
-        },
-    )
+        }
+    })
     .await
 }
 

@@ -1,4 +1,63 @@
 use super::*;
+
+#[test]
+fn cursor_setup_is_independent_and_only_exact_cursor_app_copies_are_eligible() {
+    let mut raw = snapshot("Studio");
+    raw.installations = Some(serde_json::from_value(serde_json::json!({
+        "observed_at_unix_ms":1793361786000_u64,
+        "apps":[
+            {"id":"a".repeat(64),"family":"cursor","kind":"application","running_instances":0,"state":"installed_unverified"},
+            {"id":"b".repeat(64),"family":"grok_bot","kind":"application","running_instances":0,"state":"installed_unverified"},
+            {"id":"c".repeat(64),"family":"cursor","kind":"command_line","running_instances":0,"state":"installed_unverified"}
+        ],
+        "coverage":{"entry_capacity":4096,"entries_examined":3,"installation_capacity":128,"capacity_reached":false,"unavailable_roots":0,"invalid_metadata":0}
+    })).unwrap());
+    let mut panel = DiscoveryPanel::default();
+    let generation = panel.begin("bus".into());
+    panel.complete(generation, "bus", Ok(raw));
+    let status = OnboardingStatus {
+        schema: "chinwag-native-onboarding/v1".into(),
+        native_open_allowed: true,
+        openable_installation_ids: vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)],
+    };
+    panel.complete_opening_status(generation, "bus", Ok(status.clone()));
+    panel.complete_cursor_mcp_status(generation, "bus", Err("HTTP404 older runtime".into()));
+    assert!(matches!(panel.state, InventoryState::Ready(_)));
+    assert_eq!(panel.action_copies(OpeningAction::OrdinaryOpen).len(), 2);
+    assert!(
+        panel
+            .action_copies(OpeningAction::CursorMcpSetup)
+            .is_empty()
+    );
+    assert!(
+        panel
+            .cursor_mcp_notice
+            .as_ref()
+            .unwrap()
+            .contains("unavailable")
+    );
+    panel.complete_cursor_mcp_status(generation, "bus", Ok(status.clone()));
+    assert_eq!(
+        panel.action_copies(OpeningAction::CursorMcpSetup),
+        vec![("a".repeat(64), "Cursor".into())]
+    );
+    assert_eq!(
+        panel.actionable_copies().len(),
+        2,
+        "shared copy must render once"
+    );
+    panel.complete_opening_status(generation, "bus", Err("opening disabled".into()));
+    assert!(panel.action_copies(OpeningAction::OrdinaryOpen).is_empty());
+    assert_eq!(
+        panel.actionable_copies().len(),
+        1,
+        "setup does not require ordinary opening capability"
+    );
+    panel.begin("new bus".into());
+    assert!(panel.cursor_mcp_status.is_none());
+    assert!(!panel.complete_cursor_mcp_status(generation, "bus", Ok(status)));
+    assert!(panel.actionable_copies().is_empty());
+}
 fn snapshot(host: &str) -> ClientInventory {
     serde_json::from_value(serde_json::json!({
     "schema":"chinwag-client-inventory/v1","observed_at_unix_ms":1793361786000_u64,"host_label":host,
@@ -23,17 +82,17 @@ fn opening_is_default_disabled_and_exact_application_ids_require_same_inventory_
         "coverage":{"entry_capacity":4096,"entries_examined":3,"installation_capacity":128,"capacity_reached":false,"unavailable_roots":0,"invalid_metadata":0}
     })).unwrap());
     let mut panel = DiscoveryPanel::default();
-    assert!(panel.openable_copies().is_empty());
+    assert!(panel.action_copies(OpeningAction::OrdinaryOpen).is_empty());
     let generation = panel.begin("bus".into());
     panel.complete(generation, "bus", Ok(raw));
-    assert!(panel.openable_copies().is_empty());
+    assert!(panel.action_copies(OpeningAction::OrdinaryOpen).is_empty());
     let status = OnboardingStatus {
         schema: "chinwag-native-onboarding/v1".into(),
         native_open_allowed: true,
         openable_installation_ids: vec![first.clone(), second.clone(), cli, "d".repeat(64)],
     };
     assert!(panel.complete_opening_status(generation, "bus", Ok(status.clone())));
-    let copies = panel.openable_copies();
+    let copies = panel.action_copies(OpeningAction::OrdinaryOpen);
     assert_eq!(copies.len(), 2);
     assert_eq!(copies[0].0, first);
     assert_eq!(copies[1].0, second);
@@ -46,7 +105,7 @@ fn opening_is_default_disabled_and_exact_application_ids_require_same_inventory_
     assert!(panel.rows()[0].contains("not connected"));
     panel.clear();
     assert!(!panel.complete_opening_status(generation, "bus", Ok(status)));
-    assert!(panel.openable_copies().is_empty());
+    assert!(panel.action_copies(OpeningAction::OrdinaryOpen).is_empty());
 }
 
 #[test]
@@ -74,7 +133,7 @@ fn public_location_and_version_replace_hashes_until_identical_hints_need_disambi
             openable_installation_ids: vec![first.clone(), second.clone()],
         }),
     );
-    let copies = panel.openable_copies();
+    let copies = panel.action_copies(OpeningAction::OrdinaryOpen);
     assert_eq!(copies[0].1, "Grok Bot · Applications · Version 1.2.3");
     assert_eq!(copies[1].1, "Grok Bot · Your Applications · Version 2.0");
     assert!(panel.copy_disambiguation(&first).is_none());
@@ -85,7 +144,10 @@ fn public_location_and_version_replace_hashes_until_identical_hints_need_disambi
     let apps = &mut inventory.installations.as_mut().unwrap().apps;
     apps[1].location = apps[0].location;
     apps[1].version = apps[0].version.clone();
-    assert_eq!(panel.openable_copies()[0].1, panel.openable_copies()[1].1);
+    assert_eq!(
+        panel.action_copies(OpeningAction::OrdinaryOpen)[0].1,
+        panel.action_copies(OpeningAction::OrdinaryOpen)[1].1
+    );
     assert_ne!(
         panel.copy_disambiguation(&first),
         panel.copy_disambiguation(&second)

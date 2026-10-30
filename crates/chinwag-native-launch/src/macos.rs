@@ -1,4 +1,4 @@
-//! Native exact-copy opening. This foundation is deliberately not runtime-wired.
+//! Native exact-copy opening and optional human Cursor installation handoff.
 //!
 //! The host must already service Cocoa's main dispatch queue and call this
 //! synchronous adapter from a worker. It does not create NSApplication or a run
@@ -6,12 +6,15 @@
 //! exact-target public metadata observation; a process sample is not asleep proof.
 //! macOS may still show Gatekeeper UI despite `promptsUserIfNeeded = false`.
 
-use crate::{LaunchFailure, LaunchTarget, NativeApplicationLauncher, OpenReceipt};
+use crate::{
+    CursorMcpInstall, LaunchFailure, LaunchTarget, NativeApplicationLauncher, OpenReceipt,
+};
 use block2::RcBlock;
+use chinwag_client_discovery::ClientFamily;
 use dispatch2::DispatchQueue;
 use objc2::{MainThreadMarker, rc::autoreleasepool};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
-use objc2_foundation::{NSError, NSString, NSURL};
+use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use std::{
     path::PathBuf,
     sync::{
@@ -33,13 +36,44 @@ const CANCELLED: u8 = 2;
 /// A plain Tokio daemon without a serviced main queue must not advertise this
 /// adapter as available. Opened applications remain user-owned, including reuse.
 pub struct MacOsApplicationLauncher {
-    _private: (),
+    mode: OpenMode,
+}
+
+enum OpenMode {
+    Ordinary,
+    CursorMcpSetup(CursorMcpInstall),
+}
+
+impl OpenMode {
+    fn setup_uri(&self, family: ClientFamily) -> Result<Option<String>, LaunchFailure> {
+        match self {
+            Self::Ordinary => Ok(None),
+            Self::CursorMcpSetup(spec) if family == ClientFamily::Cursor => {
+                Ok(Some(spec.install_uri().to_owned()))
+            }
+            Self::CursorMcpSetup(_) => Err(LaunchFailure::Rejected(
+                "Cursor MCP setup requires the exact selected Cursor installation",
+            )),
+        }
+    }
 }
 
 impl MacOsApplicationLauncher {
     /// The caller owns the serviced Cocoa main loop and exact metadata refresh.
     pub fn for_main_loop_host() -> Self {
-        Self { _private: () }
+        Self {
+            mode: OpenMode::Ordinary,
+        }
+    }
+
+    /// Opens Cursor's installation approval prompt in the exact selected copy.
+    /// The host must revalidate the owner-declared MCP binary before each call,
+    /// and retain the same human-operation, metadata and journal boundaries.
+    /// An OS acknowledgement does not confirm installation or MCP connection.
+    pub fn for_cursor_mcp_setup_host(spec: CursorMcpInstall) -> Self {
+        Self {
+            mode: OpenMode::CursorMcpSetup(spec),
+        }
     }
 }
 
@@ -115,6 +149,7 @@ impl NativeApplicationLauncher for MacOsApplicationLauncher {
         target: &LaunchTarget,
         deadline: Instant,
     ) -> Result<OpenReceipt, LaunchFailure> {
+        let setup_uri = self.mode.setup_uri(target.installation().family)?;
         if MainThreadMarker::new().is_some() {
             return Err(LaunchFailure::Unavailable(
                 "call from a worker while the host services its native main loop",
@@ -153,6 +188,19 @@ impl NativeApplicationLauncher for MacOsApplicationLauncher {
                     &NSString::from_str(&application_path),
                     true,
                 );
+                let setup_url = match setup_uri.as_deref() {
+                    Some(uri) => match NSURL::URLWithString(&NSString::from_str(uri)) {
+                        Some(url) => Some(url),
+                        None => {
+                            let _ = sender.try_send(Err(LaunchFailure::Rejected(
+                                "fixed Cursor setup URL could not be represented",
+                            )));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                let setup_urls = setup_url.as_deref().map(|url| NSArray::from_slice(&[url]));
                 let config = NSWorkspaceOpenConfiguration::new();
                 config.setCreatesNewApplicationInstance(false);
                 config.setAllowsRunningApplicationSubstitution(false);
@@ -173,11 +221,20 @@ impl NativeApplicationLauncher for MacOsApplicationLauncher {
                     let _ = pre_submission_sender.try_send(Err(error));
                     return;
                 }
-                workspace.openApplicationAtURL_configuration_completionHandler(
-                    &application_url,
-                    &config,
-                    Some(&completion),
-                );
+                if let Some(urls) = setup_urls {
+                    workspace.openURLs_withApplicationAtURL_configuration_completionHandler(
+                        &urls,
+                        &application_url,
+                        &config,
+                        Some(&completion),
+                    );
+                } else {
+                    workspace.openApplicationAtURL_configuration_completionHandler(
+                        &application_url,
+                        &config,
+                        Some(&completion),
+                    );
+                }
             })
         });
         wait_for_completion(&attempt, &receiver)
@@ -298,6 +355,38 @@ fn validate_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_setup_mode_rejects_other_families_before_any_native_submission() {
+        let spec = CursorMcpInstall::new(
+            "/owner/chinwag-native-inbox-mcp".into(),
+            "http://127.0.0.1:4780".into(),
+        )
+        .unwrap();
+        let launcher = MacOsApplicationLauncher::for_cursor_mcp_setup_host(spec);
+        for family in [ClientFamily::GrokBot, ClientFamily::VisualStudioCode] {
+            assert!(matches!(
+                launcher.mode.setup_uri(family),
+                Err(LaunchFailure::Rejected(_))
+            ));
+        }
+        assert!(
+            launcher
+                .mode
+                .setup_uri(ClientFamily::Cursor)
+                .unwrap()
+                .unwrap()
+                .starts_with("cursor://anysphere.cursor-deeplink/mcp/install?")
+        );
+    }
+
+    #[test]
+    fn ordinary_open_never_attaches_an_install_uri() {
+        let launcher = MacOsApplicationLauncher::for_main_loop_host();
+        for family in [ClientFamily::Cursor, ClientFamily::GrokBot] {
+            assert_eq!(launcher.mode.setup_uri(family), Ok(None));
+        }
+    }
 
     fn expected() -> ExpectedApplication {
         ExpectedApplication {

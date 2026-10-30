@@ -227,4 +227,135 @@ fn invalid_request_is_rejected_before_network_io() {
         client.application_open_receipt("bad/id"),
         Err(ClientError::InvalidRequest(_))
     ));
+    assert!(matches!(
+        client.setup_cursor_mcp("bad/id", &request()),
+        Err(ClientError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client.setup_cursor_mcp(
+            REQUEST_ID,
+            &NativeOpenRequest {
+                installation_id: "/Applications/Cursor.app".into()
+            }
+        ),
+        Err(ClientError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client.cursor_mcp_setup_receipt("bad/id"),
+        Err(ClientError::InvalidRequest(_))
+    ));
+}
+
+#[test]
+fn cursor_setup_uses_one_guarded_correlated_post_and_no_identity_claims() {
+    let (url, worker) = fixture(200, Some(receipt()));
+    let result = BusClient::new(&url)
+        .unwrap()
+        .setup_cursor_mcp(REQUEST_ID, &request())
+        .unwrap();
+    assert_eq!(result.state, NativeOpenState::OpenedOrReused);
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    let wire = &requests[0];
+    assert!(wire.starts_with("POST /api/onboarding/cursor-mcp/setup HTTP/1.1\r\n"));
+    let lower = wire.to_ascii_lowercase();
+    assert_eq!(
+        lower.matches("x-chinwag-onboarding-intent: 1\r\n").count(),
+        1
+    );
+    assert_eq!(
+        lower
+            .matches(&format!("x-chinwag-request-id: {REQUEST_ID}\r\n"))
+            .count(),
+        1
+    );
+    let body: Value = serde_json::from_str(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body, json!({"installation_id":"a".repeat(64)}));
+    for forbidden in [
+        "sender",
+        "wake",
+        "command",
+        "env",
+        "path",
+        "session",
+        "authorization:",
+    ] {
+        assert!(!wire.contains(forbidden));
+    }
+}
+
+#[test]
+fn cursor_setup_status_and_recovery_are_get_only_and_old_runtime_is_not_replayable() {
+    let (url, worker) = fixture(
+        200,
+        Some(
+            json!({"schema":"chinwag-native-onboarding/v1", "native_open_allowed":true, "openable_installation_ids":["a".repeat(64)]}),
+        ),
+    );
+    assert!(
+        BusClient::new(&url)
+            .unwrap()
+            .cursor_mcp_setup_status()
+            .unwrap()
+            .native_open_allowed
+    );
+    assert!(
+        worker.join().unwrap()[0].starts_with("GET /api/onboarding/cursor-mcp/status HTTP/1.1\r\n")
+    );
+    for code in [200, 404] {
+        let (url, worker) = fixture(code, Some(receipt()));
+        assert_eq!(
+            BusClient::new(&url)
+                .unwrap()
+                .cursor_mcp_setup_receipt(REQUEST_ID)
+                .unwrap()
+                .is_some(),
+            code == 200
+        );
+        let requests = worker.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(&format!(
+            "GET /api/onboarding/cursor-mcp/setups/{REQUEST_ID} HTTP/1.1\r\n"
+        )));
+    }
+    let (url, worker) = fixture(404, Some(json!({"error":"old runtime"})));
+    assert!(
+        BusClient::new(&url)
+            .unwrap()
+            .cursor_mcp_setup_status()
+            .is_err()
+    );
+    assert_eq!(worker.join().unwrap().len(), 1);
+}
+
+#[test]
+fn cursor_setup_missing_rejected_or_mismatched_response_stays_unknown_without_retry() {
+    let mut mismatched = receipt();
+    mismatched["request_id"] = json!("some-other-valid-request-id");
+    for (code, body) in [
+        (200, None),
+        (200, Some(mismatched)),
+        (200, Some(json!({"connected":true}))),
+        (403, Some(json!({"error":"no"}))),
+        (404, Some(json!({"error":"old"}))),
+    ] {
+        let (url, worker) = fixture(code, body);
+        assert!(matches!(
+            BusClient::new(&url)
+                .unwrap()
+                .setup_cursor_mcp(REQUEST_ID, &request()),
+            Err(ClientError::NativeOpenOutcomeUnknown { .. })
+        ));
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+    let mut mismatched = receipt();
+    mismatched["request_id"] = json!("some-other-valid-request-id");
+    let (url, worker) = fixture(200, Some(mismatched));
+    assert!(
+        BusClient::new(&url)
+            .unwrap()
+            .cursor_mcp_setup_receipt(REQUEST_ID)
+            .is_err()
+    );
+    assert_eq!(worker.join().unwrap().len(), 1);
 }

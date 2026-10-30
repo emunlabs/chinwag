@@ -19,6 +19,73 @@ use tempfile::TempDir;
 const ID: &str = "native-open-fixture-0001";
 const OTHER_ID: &str = "native-open-fixture-0002";
 
+#[test]
+fn action_journals_cannot_change_domain_across_restart_or_adopt_legacy_setup() {
+    let temporary = TempDir::new().unwrap();
+    let root = fs::canonicalize(temporary.path()).unwrap();
+    let ordinary_path = root.join("ordinary");
+    let mut ordinary = Journal::open(&ordinary_path).unwrap();
+    ordinary.begin(ID, &"a".repeat(64)).unwrap();
+    ordinary
+        .finish(receipt(
+            ID,
+            &"a".repeat(64),
+            NativeOpenState::OpenedOrReused,
+        ))
+        .unwrap();
+    drop(ordinary);
+    assert!(Journal::open_in_domain(&ordinary_path, Domain::CursorMcpSetup).is_err());
+    let legacy_path = root.join("legacy");
+    fs::create_dir(&legacy_path).unwrap();
+    fs::set_permissions(&legacy_path, fs::Permissions::from_mode(0o700)).unwrap();
+    let record = fs::read(ordinary_path.join(format!("{ID}.json"))).unwrap();
+    let legacy_record = legacy_path.join(format!("{ID}.json"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&legacy_record)
+        .unwrap();
+    file.write_all(&record).unwrap();
+    drop(file);
+    assert!(Journal::open_in_domain(&legacy_path, Domain::CursorMcpSetup).is_err());
+    assert!(!legacy_path.join("native-action-domain.json").exists());
+    assert_eq!(fs::read(&legacy_record).unwrap(), record);
+    let adopted_ordinary = Journal::open(&legacy_path).unwrap();
+    assert_eq!(
+        adopted_ordinary.lookup(ID).unwrap().unwrap().state,
+        NativeOpenState::OpenedOrReused
+    );
+    assert_eq!(fs::read(legacy_record).unwrap(), record);
+}
+
+#[test]
+fn cursor_domain_keeps_crash_pending_uncertain_and_rejects_unknown_marker_bytes() {
+    let temporary = TempDir::new().unwrap();
+    let root = fs::canonicalize(temporary.path()).unwrap().join("cursor");
+    let mut journal = Journal::open_in_domain(&root, Domain::CursorMcpSetup).unwrap();
+    journal.begin(ID, &"a".repeat(64)).unwrap();
+    drop(journal);
+    assert!(Journal::open(&root).is_err());
+    let mut reopened = Journal::open_in_domain(&root, Domain::CursorMcpSetup).unwrap();
+    assert_eq!(
+        reopened.lookup(ID).unwrap().unwrap().state,
+        NativeOpenState::Uncertain
+    );
+    assert!(matches!(
+        reopened.begin(ID, &"a".repeat(64)),
+        Err(OnboardingError::Conflict)
+    ));
+    drop(reopened);
+    let marker = root.join("native-action-domain.json");
+    fs::write(&marker, b"partial or foreign domain bytes").unwrap();
+    assert!(Journal::open_in_domain(&root, Domain::CursorMcpSetup).is_err());
+    assert_eq!(
+        fs::read(marker).unwrap(),
+        b"partial or foreign domain bytes"
+    );
+}
+
 struct FakeLauncher {
     calls: Arc<AtomicUsize>,
     panic: bool,

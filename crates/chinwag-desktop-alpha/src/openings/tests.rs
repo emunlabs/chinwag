@@ -36,7 +36,11 @@ fn pending_is_durable_before_dispatch_and_restart_never_creates_a_new_attempt() 
     let directory = Directory::new();
     let mut store = OpeningStore::open(directory.file()).unwrap();
     let attempt = store
-        .prepare("http://127.0.0.1:44341", &"a".repeat(64))
+        .prepare(
+            OpeningAction::OrdinaryOpen,
+            "http://127.0.0.1:44341",
+            &"a".repeat(64),
+        )
         .unwrap();
     let value: Value = serde_json::from_slice(&fs::read(directory.file()).unwrap()).unwrap();
     assert_eq!(value["attempts"][0]["id"], attempt.id);
@@ -46,13 +50,29 @@ fn pending_is_durable_before_dispatch_and_restart_never_creates_a_new_attempt() 
     assert_eq!(store.attempts, vec![attempt.clone()]);
     assert!(
         store
-            .prepare(&attempt.endpoint, &attempt.installation_id)
+            .prepare(
+                OpeningAction::OrdinaryOpen,
+                &attempt.endpoint,
+                &attempt.installation_id
+            )
             .is_err()
     );
-    assert!(store.prepare(&attempt.endpoint, &"b".repeat(64)).is_ok());
     assert!(
         store
-            .prepare("http://127.0.0.1:44342", &attempt.installation_id)
+            .prepare(
+                OpeningAction::OrdinaryOpen,
+                &attempt.endpoint,
+                &"b".repeat(64)
+            )
+            .is_ok()
+    );
+    assert!(
+        store
+            .prepare(
+                OpeningAction::OrdinaryOpen,
+                "http://127.0.0.1:44342",
+                &attempt.installation_id
+            )
             .is_err(),
         "host-qualified IDs must remain blocked across endpoint aliases"
     );
@@ -63,7 +83,11 @@ fn malformed_or_foreign_receipt_cannot_claim_opened_or_unblock_an_attempt() {
     let directory = Directory::new();
     let mut store = OpeningStore::open(directory.file()).unwrap();
     let attempt = store
-        .prepare("http://127.0.0.1:44341", &"a".repeat(64))
+        .prepare(
+            OpeningAction::OrdinaryOpen,
+            "http://127.0.0.1:44341",
+            &"a".repeat(64),
+        )
         .unwrap();
     for mutation in 0..4 {
         let mut invalid = receipt(&attempt, NativeOpenState::OpenedOrReused);
@@ -84,7 +108,11 @@ fn uncertain_and_pending_checks_never_downgrade_validated_opening() {
     let directory = Directory::new();
     let mut store = OpeningStore::open(directory.file()).unwrap();
     let attempt = store
-        .prepare("http://127.0.0.1:44341", &"a".repeat(64))
+        .prepare(
+            OpeningAction::OrdinaryOpen,
+            "http://127.0.0.1:44341",
+            &"a".repeat(64),
+        )
         .unwrap();
     store
         .mark_uncertain(&attempt.id, "lost HTTP response")
@@ -111,7 +139,11 @@ fn failed_pending_save_prevents_permission_to_dispatch() {
     fs::create_dir(directory.file()).unwrap();
     assert!(
         store
-            .prepare("http://127.0.0.1:44341", &"a".repeat(64))
+            .prepare(
+                OpeningAction::OrdinaryOpen,
+                "http://127.0.0.1:44341",
+                &"a".repeat(64)
+            )
             .is_err()
     );
     assert!(store.attempts.is_empty());
@@ -138,4 +170,69 @@ fn nonregular_opening_history_is_rejected_before_reading_bytes() {
     let path = directory.0.join("s");
     let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
     assert!(OpeningStore::open(path).is_err());
+}
+
+#[test]
+fn action_is_durable_and_unknown_cursor_setup_blocks_both_actions_after_restart() {
+    let directory = Directory::new();
+    let endpoint = "http://127.0.0.1:44341";
+    let id = "a".repeat(64);
+    let mut store = OpeningStore::open(directory.file()).unwrap();
+    let attempt = store
+        .prepare(OpeningAction::CursorMcpSetup, endpoint, &id)
+        .unwrap();
+    store.mark_uncertain(&attempt.id, "lost response").unwrap();
+    drop(store);
+    let mut store = OpeningStore::open(directory.file()).unwrap();
+    assert_eq!(store.attempts[0].action, OpeningAction::CursorMcpSetup);
+    for action in [OpeningAction::OrdinaryOpen, OpeningAction::CursorMcpSetup] {
+        assert!(
+            store
+                .prepare(action, "http://localhost:44341", &id)
+                .is_err()
+        );
+    }
+    store
+        .apply_receipt(
+            &attempt.id,
+            receipt(&attempt, NativeOpenState::OpenedOrReused),
+        )
+        .unwrap();
+    assert_eq!(
+        store.attempts[0].summary(),
+        "Check Cursor to approve setup; connection unconfirmed."
+    );
+    assert!(
+        store
+            .prepare(OpeningAction::OrdinaryOpen, endpoint, &id)
+            .is_ok()
+    );
+}
+
+#[test]
+fn old_rows_default_to_ordinary_open_and_unknown_actions_cannot_change_recovery_route() {
+    let directory = Directory::new();
+    let mut store = OpeningStore::open(directory.file()).unwrap();
+    store
+        .prepare(
+            OpeningAction::OrdinaryOpen,
+            "http://127.0.0.1:44341",
+            &"a".repeat(64),
+        )
+        .unwrap();
+    drop(store);
+    let mut saved: Value = serde_json::from_slice(&fs::read(directory.file()).unwrap()).unwrap();
+    saved["attempts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("action");
+    fs::write(directory.file(), serde_json::to_vec(&saved).unwrap()).unwrap();
+    let store = OpeningStore::open(directory.file()).unwrap();
+    assert_eq!(store.attempts[0].action, OpeningAction::OrdinaryOpen);
+    drop(store);
+    for bad in [json!("post_anywhere"), Value::Null, json!("Connected")] {
+        saved["attempts"][0]["action"] = bad;
+        fs::write(directory.file(), serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(OpeningStore::open(directory.file()).is_err());
+    }
 }
