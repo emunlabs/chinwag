@@ -61,3 +61,7 @@ Relevant Rust fixtures cover disabled/undeclared capabilities, stale invocations
 The MCP inbox result includes bounded in-process connection observations from the existing SDK hooks. Observation is not a new capability or registry and cannot renew a lease or restore permission. See [MCP connection observations](MCP_CONNECTION_OBSERVATIONS.md).
 
 The optional [runtime-owned HTTP inbox](MCP_HTTP_BINDING.md) injects the same host and registry used by runtime discovery into the held InboxServer. Its private HTTP capability is an unattributed owner-local authority, distinct from stdio authority in canonical admission and dispatch. The transport creates no parallel identity registry. Its native status GET reads that same held server; it cannot observe or attach an independently launched stdio child. This source unit is staged, with named-client acceptance separate.
+
+## Separate human steering authority
+
+The source-only `chinwag-codex-steer` core accepts IO exclusively delegated by an already initialized protocol owner and a separate human-control scope for one thread. Discovery, MCP inbox grants, bus messages, and descriptor enablement cannot create that scope. The controller consumes an exact operation before one native active-turn steer; it has no process, initialization, thread-start, GUI-adoption, or arbitrary RPC API. It uses its own action journal rather than an agent identity registry. Actual owner integration and changed-work acceptance remain future work. See [Codex steering](CODEX_STEERING.md).
