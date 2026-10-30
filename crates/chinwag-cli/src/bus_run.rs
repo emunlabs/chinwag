@@ -277,7 +277,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 fn hex_to_64_bytes(hex_str: &str) -> Option<[u8; 64]> {
-    if hex_str.len() != 128 {
+    if hex_str.len() != 128 || !hex_str.is_ascii() {
         return None;
     }
     let mut out = [0u8; 64];
@@ -392,9 +392,7 @@ fn read_all_messages_unlocked(repo_root: &Path) -> Vec<BusMessage> {
             continue;
         }
         if let Ok(mut msg) = serde_json::from_str::<BusMessage>(trimmed) {
-            if msg.signature_ed25519.is_some() {
-                let _ = verify_detached_bus_signature(repo_root, &mut msg);
-            }
+            let _ = verify_detached_bus_signature(repo_root, &mut msg);
             out.push(msg);
         }
     }
@@ -407,10 +405,6 @@ fn read_all_messages(repo_root: &Path) -> Vec<BusMessage> {
 
 fn append_message_to_disk_and_crdb(repo_root: &Path, msg: &BusMessage) -> u64 {
     let mut verified_msg = msg.clone();
-    if verified_msg.signature_ed25519.is_none() {
-        let sign_key = actor_signing_secret(&verified_msg.sender);
-        sign_bus_message(&mut verified_msg, &sign_key);
-    }
     let _ = verify_detached_bus_signature(repo_root, &mut verified_msg);
 
     with_bus_file_lock(repo_root, || {
@@ -1116,6 +1110,24 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
                     };
                     if let Ok(BusFrame::Publish { mut message }) = serde_json::from_slice::<BusFrame>(&bytes) {
                         let sig_ok = verify_detached_bus_signature(&repo_clone, &mut message);
+                        if !sig_ok {
+                            let ack = BusAck {
+                                ok: false,
+                                seq: 0,
+                                message_id: message.id,
+                                daemon_endpoint_id: daemon_ep,
+                                transport: "iroh-quic/chinwag-bus-1 (rejected: invalid_signature)".to_string(),
+                                room: message.room,
+                                subscribers_notified: 0,
+                                sig_verified: false,
+                            };
+                            if let Ok(ack_bytes) = serde_json::to_vec(&ack) {
+                                let _ = send.write_all(&ack_bytes).await;
+                                let _ = send.finish();
+                                let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+                            }
+                            return;
+                        }
                         let seq = append_message_to_disk_and_crdb(&repo_clone, &message);
                         message.seq = seq;
                         let subs = tx_clone.send(message.clone()).unwrap_or(0);

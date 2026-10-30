@@ -49,7 +49,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 fn hex_to_64_bytes(hex_str: &str) -> Option<[u8; 64]> {
-    if hex_str.len() != 128 {
+    if hex_str.len() != 128 || !hex_str.is_ascii() {
         return None;
     }
     let mut out = [0u8; 64];
