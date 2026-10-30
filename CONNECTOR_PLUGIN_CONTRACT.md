@@ -53,3 +53,5 @@ The human Cursor setup handoff uses that same fixed-room Rust stdio server. It i
 ## Verification
 
 Relevant Rust fixtures cover disabled/undeclared capabilities, stale invocations, post-call expiry, exact inbox scope, revocation, cancellation/EOF, public metadata bounds and aliases, partial installed discovery, redaction, host qualification and family grouping. Runtime and MCP reads migrate through the component host in this change. Product services, tests and launcher remain Rust with the pinned Rust1.97.1 toolchain and existing dependency versions.
+
+The MCP inbox result includes bounded in-process connection observations from the existing SDK hooks. Observation is not a new capability or registry and cannot renew a lease or restore permission. See [MCP connection observations](MCP_CONNECTION_OBSERVATIONS.md).

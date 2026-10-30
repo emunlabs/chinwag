@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 fn message(seq: u64, body: &str) -> BusMessage {
     BusMessage {
@@ -436,12 +436,257 @@ async fn observed_input_eof_closes_admission_before_sdk_handler_drain() {
     let result = server.start_read(1, Box::new(|| false)).unwrap();
     entered.await.unwrap();
     let admission = server.shared.clone();
-    let mut input =
-        wire::ClosingReader::new(tokio::io::empty(), move || admission.close_admission());
+    let mut input = wire::ClosingReader::new(tokio::io::empty(), move |end| {
+        admission.observation.input_ended(end);
+        admission.close_admission();
+    });
     assert_eq!(input.read(&mut [0_u8; 1]).await.unwrap(), 0);
     assert!(server.shared.closed.load(Ordering::Acquire));
+    let snapshot = server.lifecycle_snapshot();
+    assert!(snapshot.input_eof_seen);
+    assert!(!snapshot.input_error_seen);
+    assert!(!snapshot.owner_close_requested);
+    assert_eq!(snapshot.worker_state, WorkerState::DrainNotObserved);
     release.send(()).unwrap();
     assert_eq!(result.await.unwrap(), Err(InboxError::AdmissionClosed));
     server.shutdown().await.unwrap();
+    assert_eq!(
+        server.lifecycle_snapshot().worker_state,
+        WorkerState::Drained
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn actual_sdk_hooks_allow_catalogue_before_initialized_without_reading_bus() {
+    for (protocol, expected) in [
+        ("2025-06-18", NegotiatedProtocol::June2025),
+        ("2025-11-25", NegotiatedProtocol::November2025),
+    ] {
+        let (server, calls, _) = fixture(Duration::from_secs(10)).await;
+        let owner = server.clone();
+        let admission = server.shared.clone();
+        let (peer, transport) = tokio::io::duplex(16_384);
+        let (input, output) = tokio::io::split(transport);
+        let transport = AsyncRwTransport::new(
+            wire::ClosingReader::new(input, move |end| {
+                admission.observation.input_ended(end);
+                admission.close_admission();
+            }),
+            output,
+        );
+        let task = tokio::spawn(async move {
+            server
+                .serve(transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap()
+        });
+        let (input, mut output) = tokio::io::split(peer);
+        let mut input = BufReader::new(input);
+        let mut line = String::new();
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":protocol,"capabilities":{},
+            "clientInfo":{"name":"DO-NOT-RETAIN-PEER","version":"PRIVATE-VERSION"}
+        }});
+        output
+            .write_all(format!("{init}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), input.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["result"]["protocolVersion"],
+            protocol
+        );
+        assert_eq!(
+            owner.lifecycle_snapshot().negotiated_protocol,
+            Some(expected)
+        );
+        assert!(!owner.lifecycle_snapshot().initialized_notification_seen);
+        output
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(1), input.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let snapshot = owner.lifecycle_snapshot();
+        assert_eq!(snapshot.catalogue_outputs_prepared, 1);
+        assert_eq!(snapshot.read_windows_prepared, 0);
+        assert!(!snapshot.initialized_notification_seen);
+        assert_eq!(snapshot.protocol_end, ProtocolEnd::NotObserved);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        output
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !owner.lifecycle_snapshot().initialized_notification_seen {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let snapshot_json = serde_json::to_string(&owner.lifecycle_snapshot()).unwrap();
+        assert!(!snapshot_json.contains("DO-NOT-RETAIN-PEER"));
+        assert!(!snapshot_json.contains("PRIVATE-VERSION"));
+        output.shutdown().await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            QuitReason::Closed
+        ));
+        owner.shutdown().await.unwrap();
+        let snapshot = owner.lifecycle_snapshot();
+        assert!(snapshot.input_eof_seen);
+        assert!(snapshot.owner_close_requested);
+        assert_eq!(snapshot.worker_state, WorkerState::Drained);
+    }
+}
+
+#[tokio::test]
+async fn snapshots_do_not_wait_for_read_mutex_or_renew_the_projected_lease() {
+    let ((server, calls, _), entered, release) = gated_fixture(Duration::from_millis(20)).await;
+    let result = server.start_read(1, Box::new(|| false)).unwrap();
+    entered.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let owner = server.clone();
+    let snapshot = tokio::task::spawn_blocking(move || owner.lifecycle_snapshot());
+    let observed = tokio::time::timeout(Duration::from_millis(100), snapshot).await;
+    release.send(()).unwrap();
+    server.shutdown().await.unwrap();
+    let snapshot = observed
+        .expect("snapshot must not wait for the admission mutex")
+        .unwrap();
+    assert!(snapshot.lease_expired);
+    assert!(!snapshot.admission_closed);
+    assert_eq!(snapshot.read_windows_prepared, 0);
+    assert!(server.lifecycle_snapshot().lease_expired);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(result.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn prepared_outputs_reserve_total_byte_budget_and_counters_saturate() {
+    let (server, calls, _) = fixture(Duration::from_secs(10)).await;
+    assert!(
+        server
+            .prepare_read_output(json!({"bad":"x".repeat(wire::MAX_TOOL_DATA_BYTES)}))
+            .is_err()
+    );
+    assert_eq!(server.lifecycle_snapshot().read_windows_prepared, 0);
+    let large = "x".repeat(12_000);
+    let value = bounded_window(
+        (1..=50).map(|seq| message(seq, &large)).collect(),
+        NativeRoom::Mgmt,
+        50,
+    )
+    .unwrap();
+    server.shared.observation.saturate_counters_for_test();
+    server.shared.observation.catalogue_prepared();
+    let result = server.prepare_read_output(value).unwrap();
+    let bytes = serde_json::to_vec(&result).unwrap();
+    assert!(bytes.len() <= wire::MAX_TOOL_DATA_BYTES);
+    assert!(result["omitted_for_byte_limit"].as_u64().unwrap() > 0);
+    assert_eq!(
+        result["connection_observation"]["read_windows_prepared"],
+        u64::MAX
+    );
+    assert_eq!(
+        server.lifecycle_snapshot().catalogue_outputs_prepared,
+        u64::MAX
+    );
+    assert_eq!(
+        result["connection_observation"]["output_evidence"],
+        "prepared_only"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    server.shutdown().await.unwrap();
+    let summary = terminal_summary(server.lifecycle_snapshot()).unwrap();
+    assert!(summary.len() <= wire::OBSERVATION_BYTES + 1);
+    assert_eq!(summary.iter().filter(|byte| **byte == b'\n').count(), 1);
+    let summary: Value = serde_json::from_slice(&summary).unwrap();
+    assert_eq!(summary["schema"], "chinwag-mcp-connection-terminal/v1");
+    assert_eq!(summary["connection_observation"]["worker_state"], "drained");
+}
+
+#[tokio::test]
+async fn owner_abort_is_observed_separately_from_transport_end_and_awaited_drain() {
+    let ((server, calls, _), entered, release) = gated_fixture(Duration::from_secs(10)).await;
+    let result = server.start_read(1, Box::new(|| false)).unwrap();
+    entered.await.unwrap();
+    let observed = server.shared.clone();
+    let worker = server.lifetime.worker.lock().await.take().unwrap();
+    let owner = tokio::spawn(async move {
+        let _owner = server;
+        std::future::pending::<()>().await;
+    });
+    tokio::task::yield_now().await;
+    owner.abort();
+    let _ = owner.await;
+    let snapshot = observed.observation.snapshot(Instant::now());
+    assert!(snapshot.admission_closed && snapshot.owner_close_requested);
+    assert!(!snapshot.input_eof_seen && !snapshot.input_error_seen);
+    assert_eq!(snapshot.protocol_end, ProtocolEnd::NotObserved);
+    assert_eq!(snapshot.worker_state, WorkerState::DrainNotObserved);
+    assert!(!worker.is_finished());
+    release.send(()).unwrap();
+    assert_eq!(result.await.unwrap(), Err(InboxError::AdmissionClosed));
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn actual_input_error_closes_admission_without_claiming_eof_or_raw_error() {
+    struct FailedInput;
+    impl tokio::io::AsyncRead for FailedInput {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("PRIVATE-ERROR-NOT-OBSERVABLE")))
+        }
+    }
+    let (server, calls, _) = fixture(Duration::from_secs(10)).await;
+    let admission = server.shared.clone();
+    let mut input = wire::ClosingReader::new(FailedInput, move |end| {
+        admission.observation.input_ended(end);
+        admission.close_admission();
+    });
+    assert!(input.read(&mut [0u8; 1]).await.is_err());
+    let snapshot = server.lifecycle_snapshot();
+    assert!(snapshot.input_error_seen && snapshot.admission_closed);
+    assert!(!snapshot.input_eof_seen);
+    assert_eq!(snapshot.protocol_end, ProtocolEnd::NotObserved);
+    server.shutdown().await.unwrap();
+    let terminal = terminal_summary(server.lifecycle_snapshot()).unwrap();
+    assert!(
+        !String::from_utf8(terminal)
+            .unwrap()
+            .contains("PRIVATE-ERROR")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

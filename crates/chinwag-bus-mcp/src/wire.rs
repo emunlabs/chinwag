@@ -8,6 +8,13 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub const MAX_INPUT_BYTES: usize = 16_384;
 pub const MAX_OUTPUT_BYTES: usize = 262_144;
 pub const MAX_TOOL_DATA_BYTES: usize = 65_536;
+pub const OBSERVATION_BYTES: usize = 1024;
+
+#[derive(Clone, Copy)]
+pub enum InputEnd {
+    Eof,
+    Error,
+}
 
 /// Closes admission at observed input EOF/error, before the SDK response drain.
 pub struct ClosingReader<R, F> {
@@ -21,7 +28,7 @@ impl<R, F> ClosingReader<R, F> {
     }
 }
 
-impl<R: AsyncRead + Unpin, F: Fn() + Unpin> AsyncRead for ClosingReader<R, F> {
+impl<R: AsyncRead + Unpin, F: Fn(InputEnd) + Unpin> AsyncRead for ClosingReader<R, F> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -30,12 +37,13 @@ impl<R: AsyncRead + Unpin, F: Fn() + Unpin> AsyncRead for ClosingReader<R, F> {
         let had_space = buffer.remaining() != 0;
         let before = buffer.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buffer);
-        if matches!(&result, Poll::Ready(Err(_)))
-            || (had_space
-                && matches!(&result, Poll::Ready(Ok(())))
-                && buffer.filled().len() == before)
+        if matches!(&result, Poll::Ready(Err(_))) {
+            (self.close)(InputEnd::Error);
+        } else if had_space
+            && matches!(&result, Poll::Ready(Ok(())))
+            && buffer.filled().len() == before
         {
-            (self.close)();
+            (self.close)(InputEnd::Eof);
         }
         result
     }

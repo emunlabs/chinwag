@@ -85,3 +85,5 @@ The tool reads the **native coordination ledger's #mgmt room**. It does not esta
 ## Primary interface sources
 
 Cursor documents its URI and installation prompt in [MCP install links](https://cursor.com/docs/mcp/install-links). Its [MCP documentation](https://cursor.com/docs/mcp) specifies stdio configuration fields, interpolation and tool approval. The fixed install link in [OpenAI's MCP documentation](https://developers.openai.com/learn/docs-mcp) encodes an inner server value, providing a concrete serialization example. These sources establish the supported handoff format; they do not establish this alpha's actual client acceptance.
+
+The Rust server adds a bounded server-side connection observation to successful inbox results and emits a coarse terminal summary after orderly cleanup. These independent protocol facts do not authenticate Cursor or provide cross-process GPUI liveness. See [MCP connection observations](MCP_CONNECTION_OBSERVATIONS.md).

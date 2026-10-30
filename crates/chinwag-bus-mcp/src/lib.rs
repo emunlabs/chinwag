@@ -4,7 +4,11 @@
 //! application, process or conversation authentication. No publication API exists.
 #![forbid(unsafe_code)]
 
+mod observation;
 mod wire;
+
+use observation::Observation;
+pub use observation::{LifecycleSnapshot, NegotiatedProtocol, ProtocolEnd, WorkerState};
 
 use chinwag_bus_client::{BusClient, BusMessage};
 use chinwag_connector_registry::{
@@ -15,10 +19,10 @@ use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
-        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
-        Tool, ToolAnnotations,
+        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
     },
-    service::RequestContext,
+    service::{NotificationContext, QuitReason, RequestContext},
     transport::async_rw::AsyncRwTransport,
 };
 use serde::{Deserialize, Serialize};
@@ -149,6 +153,7 @@ struct Shared {
     permits: Arc<Semaphore>,
     closed: Arc<AtomicBool>,
     admission: Mutex<Admission>,
+    observation: Observation,
 }
 
 impl Shared {
@@ -168,11 +173,13 @@ struct Lifetime {
 // Explicit shutdown still awaits the worker; Drop only signals bounded cleanup.
 struct CloseOnDrop {
     closed: Arc<AtomicBool>,
+    owner_close: Arc<AtomicBool>,
     sender: SyncSender<Command>,
 }
 
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
+        self.owner_close.store(true, Ordering::Release);
         self.closed.store(true, Ordering::Release);
         let _ = self.sender.try_send(Command::Stop);
     }
@@ -208,8 +215,10 @@ impl InboxServer {
         }
         let (sender, receiver) = mpsc::sync_channel(1);
         let closed = Arc::new(AtomicBool::new(false));
+        let owner_close = Arc::new(AtomicBool::new(false));
         let close = CloseOnDrop {
             closed: closed.clone(),
+            owner_close: owner_close.clone(),
             sender: sender.clone(),
         };
         let (ready, started) = oneshot::channel();
@@ -231,7 +240,15 @@ impl InboxServer {
             let shared = Arc::new(Shared {
                 sender,
                 permits: Arc::new(Semaphore::new(1)),
-                closed,
+                closed: closed.clone(),
+                observation: Observation::new(
+                    admission
+                        .binding
+                        .lease_expires_at
+                        .min(admission.binding.grant_expires_at),
+                    closed,
+                    owner_close,
+                ),
                 admission: Mutex::new(admission),
             });
             if ready.send(Ok(shared.clone())).is_ok() {
@@ -292,16 +309,61 @@ impl InboxServer {
     /// Stops admission immediately, then drains the original bounded read and worker.
     /// This never terminates or controls the launching client application.
     pub async fn shutdown(&self) -> Result<(), InboxError> {
+        self.shared.observation.owner_close_requested();
         self.shared.close_admission();
         let mut worker = self.lifetime.worker.lock().await;
         if let Some(handle) = worker.as_mut() {
             // Keep the original handle stored if this shutdown future is itself
             // cancelled; a later owner must still be able to await the drain.
             let outcome = handle.await;
+            self.shared.observation.worker_finished(outcome.is_ok());
             worker.take();
             outcome.map_err(|_| InboxError::Unavailable)?;
         }
         Ok(())
+    }
+
+    /// Reads only fixed in-process observations and the original monotonic
+    /// lease deadline. This acquires no admission lock and performs no I/O.
+    pub fn lifecycle_snapshot(&self) -> LifecycleSnapshot {
+        self.shared.observation.snapshot(Instant::now())
+    }
+
+    fn prepare_read_output(&self, mut value: Value) -> Result<Value, InboxError> {
+        if !value.is_object()
+            || serde_json::to_vec(&value)
+                .map_err(|_| InboxError::InvalidSource)?
+                .len()
+                > wire::MAX_TOOL_DATA_BYTES - wire::OBSERVATION_BYTES
+        {
+            return Err(InboxError::InvalidSource);
+        }
+        // The bounded, validated window is ready. This counter records output
+        // preparation only, even if cancellation or transport loss follows.
+        self.shared.observation.read_prepared();
+        let observation = json!({"connection_observation":self.lifecycle_snapshot()});
+        if serde_json::to_vec(&observation)
+            .map_err(|_| InboxError::InvalidSource)?
+            .len()
+            > wire::OBSERVATION_BYTES
+        {
+            return Err(InboxError::InvalidSource);
+        }
+        value
+            .as_object_mut()
+            .ok_or(InboxError::InvalidSource)?
+            .insert(
+                "connection_observation".into(),
+                observation["connection_observation"].clone(),
+            );
+        if serde_json::to_vec(&value)
+            .map_err(|_| InboxError::InvalidSource)?
+            .len()
+            > wire::MAX_TOOL_DATA_BYTES
+        {
+            return Err(InboxError::InvalidSource);
+        }
+        Ok(value)
     }
 }
 
@@ -431,12 +493,31 @@ impl ServerHandler for InboxServer {
         Cow::Borrowed(&[ProtocolVersion::V_2025_06_18, ProtocolVersion::V_2025_11_25])
     }
 
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        // Preserve rmcp's default handshake behavior. The observer retains no
+        // peer metadata: only the fixed successful negotiated protocol value.
+        context.peer.set_peer_info(request.clone());
+        let result = self.negotiate_initialize(&request)?;
+        self.shared.observation.negotiated(&result.protocol_version);
+        Ok(result)
+    }
+
+    async fn on_initialized(&self, _: NotificationContext<RoleServer>) {
+        self.shared.observation.initialized();
+    }
+
     async fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(vec![definition()]))
+        let result = ListToolsResult::with_all_items(vec![definition()]);
+        self.shared.observation.catalogue_prepared();
+        Ok(result)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -461,7 +542,10 @@ impl ServerHandler for InboxServer {
             result = result => result.unwrap_or(Err(InboxError::Unavailable)),
         };
         Ok(match result {
-            Ok(value) => CallToolResult::structured(value),
+            Ok(value) => match self.prepare_read_output(value) {
+                Ok(value) => CallToolResult::structured(value),
+                Err(error) => error_result(error),
+            },
             Err(error) => error_result(error),
         }
         .into())
@@ -540,13 +624,21 @@ fn bounded_window(
         window.returned_count = window.messages.len();
         window.omitted_for_byte_limit = window.received_count - window.returned_count;
         let bytes = serde_json::to_vec(&window).map_err(|_| InboxError::InvalidSource)?;
-        if bytes.len() > wire::MAX_TOOL_DATA_BYTES {
+        if bytes.len() > wire::MAX_TOOL_DATA_BYTES - wire::OBSERVATION_BYTES {
             window.messages.remove(0);
         }
     }
     window.returned_count = window.messages.len();
     window.omitted_for_byte_limit = window.received_count - window.returned_count;
-    serde_json::to_value(window).map_err(|_| InboxError::InvalidSource)
+    let value = serde_json::to_value(window).map_err(|_| InboxError::InvalidSource)?;
+    if serde_json::to_vec(&value)
+        .map_err(|_| InboxError::InvalidSource)?
+        .len()
+        > wire::MAX_TOOL_DATA_BYTES - wire::OBSERVATION_BYTES
+    {
+        return Err(InboxError::InvalidSource);
+    }
+    Ok(value)
 }
 
 /// Serves newline-delimited MCP over owned stdin/stdout, then closes admission
@@ -556,23 +648,60 @@ pub async fn serve_stdio(config: LaunchConfig) -> Result<(), InboxError> {
     let owner = server.clone();
     let admission = owner.shared.clone();
     let transport = AsyncRwTransport::new(
-        wire::ClosingReader::new(tokio::io::stdin(), move || admission.close_admission()),
+        wire::ClosingReader::new(tokio::io::stdin(), move |end| {
+            admission.observation.input_ended(end);
+            admission.close_admission();
+        }),
         wire::BoundedWriter::new(tokio::io::stdout()),
     )
     .with_max_line_length(wire::MAX_INPUT_BYTES);
-    let outcome = async {
-        server
-            .serve(transport)
-            .await
-            .map_err(|_| InboxError::Protocol)?
-            .waiting()
-            .await
-            .map_err(|_| InboxError::Protocol)?;
-        Ok(())
-    }
-    .await;
-    owner.shutdown().await?;
+    let outcome = match server.serve(transport).await {
+        Ok(service) => match service.waiting().await {
+            Ok(QuitReason::Closed) => {
+                owner.shared.observation.protocol_ended(ProtocolEnd::Closed);
+                Ok(())
+            }
+            Ok(QuitReason::Cancelled) => {
+                owner
+                    .shared
+                    .observation
+                    .protocol_ended(ProtocolEnd::Cancelled);
+                Ok(())
+            }
+            _ => {
+                owner.shared.observation.protocol_ended(ProtocolEnd::Error);
+                Err(InboxError::Protocol)
+            }
+        },
+        Err(_) => {
+            owner.shared.observation.protocol_ended(ProtocolEnd::Error);
+            Err(InboxError::Protocol)
+        }
+    };
+    let drained = owner.shutdown().await;
+    emit_terminal_summary(owner.lifecycle_snapshot());
+    drained?;
     outcome
+}
+
+fn terminal_summary(snapshot: LifecycleSnapshot) -> Result<Vec<u8>, InboxError> {
+    let mut bytes = serde_json::to_vec(&json!({
+        "schema":"chinwag-mcp-connection-terminal/v1", "connection_observation":snapshot
+    }))
+    .map_err(|_| InboxError::InvalidSource)?;
+    if bytes.len() > wire::OBSERVATION_BYTES {
+        return Err(InboxError::InvalidSource);
+    }
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn emit_terminal_summary(snapshot: LifecycleSnapshot) {
+    use std::io::Write as _;
+    if let Ok(bytes) = terminal_summary(snapshot) {
+        // A single best-effort fixed summary, never raw errors or peer fields.
+        let _ = std::io::stderr().lock().write_all(&bytes);
+    }
 }
 
 #[cfg(test)]
