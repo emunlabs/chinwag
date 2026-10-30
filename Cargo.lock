@@ -1247,6 +1247,7 @@ dependencies = [
  "chinwag-connectors",
  "chinwag-native-launch",
  "chrono",
+ "crc32fast",
  "libc",
  "rustix",
  "serde",

@@ -1,5 +1,7 @@
 # Rust connector components
 
+The owner [install artifact exporter](MCP_ARTIFACT_EXPORTS.md) packages the existing native inbox for Claude Desktop or Antigravity. It reuses the fixed configuration and binary pin without creating a connector descriptor, parallel registry, grant, identity record or observation store. Human installation and actual client acceptance remain separate.
+
 The native GPUI host uses built-in Rust connector components. This implements the host and feature separation from the Captionizm plugin architecture, `CHWG-PRD-PLUGIN-0.2.0` / `CHWG-PLUGIN-1`. The reference document is Studio `docuswiki/wiki/projects/Chinwag/prd/chinwag-plugin-architecture-and-seatbelt-isolation-prd.md` (SHA256 `57289933603cd44a6d91e98a3ea2a2468306aea53f1b63213923e100a9032e86`). GPUI replaces the reference's Dioxus-specific UI layer.
 
 ```mermaid

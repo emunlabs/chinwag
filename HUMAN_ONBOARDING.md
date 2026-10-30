@@ -1,5 +1,7 @@
 # Native application opening during onboarding
 
+Claude Desktop and Antigravity also have an explicit owner [install artifact export](MCP_ARTIFACT_EXPORTS.md). It creates new local files for human installation on the intended computer. Exporting opens no client and establishes no connection.
+
 Chinwag can find running and installed applications, then let a person open one supported application copy on the selected runtime host. Opening uses macOS's supported application interface. It does not connect the application's AI session to the bus.
 
 ```mermaid

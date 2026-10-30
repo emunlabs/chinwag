@@ -10,6 +10,8 @@ use std::{
     sync::Arc,
 };
 
+mod export_cli;
+
 fn main() {
     if let Err(error) = dispatch(std::env::args().skip(1).collect()) {
         eprintln!("chinwag-alpha-runtime: {error}");
@@ -18,6 +20,12 @@ fn main() {
 }
 
 fn dispatch(mut args: Vec<String>) -> Result<()> {
+    if args
+        .first()
+        .is_some_and(|command| command == "export-connector")
+    {
+        return export_cli::run(&args[1..]);
+    }
     let native_main_loop = take_native_main_loop(&mut args)?;
     let journal = onboarding_journal(&args, native_main_loop)?;
     cursor_mcp_options(&args, native_main_loop, journal.as_deref())?;
@@ -194,7 +202,7 @@ async fn run(args: Vec<String>, native_main_loop: bool) -> Result<()> {
     let vscode_mcp = vscode_mcp_options(&args, native_main_loop, onboarding_journal.as_deref())?;
     let Some((command, rest)) = args.split_first() else {
         return Err(RuntimeError::Invalid(
-            "use launch, serve-local, serve-shared or discover-clients".into(),
+            "use launch, serve-local, serve-shared, discover-clients or export-connector".into(),
         ));
     };
     if command == "launch" {

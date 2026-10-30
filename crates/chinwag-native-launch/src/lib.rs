@@ -22,6 +22,7 @@ mod cursor_mcp;
 mod mcp_config;
 mod vscode_mcp;
 pub use cursor_mcp::{CursorMcpInstall, CursorMcpInstallError};
+pub use mcp_config::{FixedMcpConfig, FixedMcpConfigError};
 pub use vscode_mcp::{VsCodeMcpInstall, VsCodeMcpInstallError};
 
 #[cfg(target_os = "macos")]
