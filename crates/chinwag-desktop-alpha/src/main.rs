@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+mod codex_work_launch;
+mod codex_work_ui;
 mod discovery_ui;
 mod drafts;
 #[cfg(test)]
@@ -36,7 +38,7 @@ use gpui_kit::{
     WindowOptions, application, assets, div, init, open_window, px, size,
 };
 
-gpui_kit::actions!(chinwag_alpha, [Quit]);
+gpui_kit::actions!(chinwag_alpha, [Quit, ShowOwnedWork]);
 
 const ROOMS: [(&str, &str); 4] = [
     ("#alpha", "Try the workbench"),
@@ -2589,11 +2591,55 @@ fn confirmation_time(milliseconds: u64) -> String {
 }
 
 fn main() {
-    application().with_assets(assets::Assets).run(|cx| {
+    let work = match codex_work_launch::parse(std::env::args_os().skip(1).collect()) {
+        Ok(Some(config)) => match chinwag_codex_steer::open_work_service(config) {
+            Ok(port) => Some(port),
+            Err(error) => {
+                eprintln!("Could not open owned work: {error}");
+                return;
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("Invalid owned-work invocation: {error}");
+            return;
+        }
+    };
+    application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus([Menu::new("Chinwag").items([MenuItem::action("Quit Chinwag", Quit)])]);
+        if let Some(port) = work {
+            let show = port.clone();
+            cx.on_action(move |_: &ShowOwnedWork, cx| {
+                if cx.windows().is_empty() {
+                    open_owned_work_window(show.clone(), cx);
+                }
+                cx.activate(true);
+            });
+            cx.bind_keys([KeyBinding::new("cmd-0", ShowOwnedWork, None)]);
+            cx.set_menus([Menu::new("Chinwag").items([
+                MenuItem::action("Show task window", ShowOwnedWork),
+                MenuItem::action("Quit Chinwag and close control connection", Quit),
+            ])]);
+            let quit = port.clone();
+            cx.on_app_quit(move |_| {
+                let mut updates = quit.subscribe();
+                let _ = quit.close();
+                async move {
+                    while updates.borrow().phase != chinwag_codex_steer::WorkPhase::Closed {
+                        if updates.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+            open_owned_work_window(port, cx);
+            cx.activate(true);
+            return;
+        }
         let mode = AppMode::from_setting(std::env::var("CHINWAG_ALPHA_ONBOARDING").ok().as_deref());
         let bounds = Bounds::centered(
             None,
@@ -2625,6 +2671,32 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+fn open_owned_work_window(
+    port: std::sync::Arc<dyn chinwag_codex_steer::HumanWorkPort>,
+    cx: &mut App,
+) {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(920.), px(820.)),
+            cx,
+        ))),
+        window_min_size: Some(size(px(680.), px(560.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Steer Codex while it works".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    if open_window(options, cx, move |window, cx| {
+        cx.new(|cx| codex_work_ui::CodexWorkView::new(port, window, cx))
+    })
+    .is_err()
+    {
+        eprintln!("Could not open owned work window");
+    }
 }
 
 #[cfg(test)]

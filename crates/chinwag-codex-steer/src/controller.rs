@@ -26,6 +26,7 @@ struct Inner {
     connection: CodexSteerConnection,
     journal: Arc<Mutex<SteerJournal>>,
     evidence_worker: tokio::sync::Mutex<Option<JoinHandle<Result<()>>>>,
+    receipts: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     before_dispatch: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
@@ -53,6 +54,30 @@ impl SteerController {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        Self::build(journal_path, move || {
+            CodexSteerConnection::from_established_io(scope, reader, writer)
+        })
+        .await
+    }
+    pub(crate) async fn from_fresh_thread<R, W>(
+        proof: crate::work_bootstrap::FreshThreadProof,
+        journal_path: &Path,
+        reader: R,
+        writer: W,
+    ) -> Result<(Self, ConnectionOwner)>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::build(journal_path, move || {
+            CodexSteerConnection::from_fresh_thread(proof, reader, writer)
+        })
+        .await
+    }
+    async fn build(
+        journal_path: &Path,
+        create: impl FnOnce() -> Result<(CodexSteerConnection, ConnectionOwner)> + Send,
+    ) -> Result<(Self, ConnectionOwner)> {
         tokio::runtime::Handle::try_current().map_err(|_| SteerError::Unavailable)?;
         let path = journal_path.to_owned();
         // A failed journal opens no transport and performs no protocol write.
@@ -60,7 +85,9 @@ impl SteerController {
             .await
             .map_err(|_| SteerError::Storage)??;
         let journal = Arc::new(Mutex::new(journal));
-        let (connection, owner) = CodexSteerConnection::from_established_io(scope, reader, writer)?;
+        let (connection, owner) = create()?;
+        let (receipts, _) = tokio::sync::watch::channel(0u64);
+        let updates = receipts.clone();
         let mut events = connection.take_events().ok_or(SteerError::Unavailable)?;
         let store = journal.clone();
         let evidence_worker = tokio::spawn(async move {
@@ -78,6 +105,7 @@ impl SteerController {
                     Ok(())
                 })
                 .await;
+                updates.send_modify(|revision| *revision = revision.saturating_add(1));
                 if !matches!(result, Ok(Ok(()))) {
                     failed = true;
                 }
@@ -94,6 +122,7 @@ impl SteerController {
                     connection,
                     journal,
                     evidence_worker: tokio::sync::Mutex::new(Some(evidence_worker)),
+                    receipts,
                     #[cfg(test)]
                     before_dispatch: None,
                 }),
@@ -102,6 +131,38 @@ impl SteerController {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn journal_for_fixture(&self) -> Arc<Mutex<SteerJournal>> {
+        self.inner.journal.clone()
+    }
+    pub(crate) fn request_close(&self) {
+        self.inner.connection.request_close();
+    }
+    pub(crate) fn transport_epoch(&self) -> &str {
+        self.inner.connection.transport_epoch()
+    }
+    pub(crate) fn subscribe_activity(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::connection::ConnectionActivity> {
+        self.inner.connection.subscribe_activity()
+    }
+    pub(crate) fn subscribe_receipts(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.receipts.subscribe()
+    }
+    pub(crate) fn capture_human_action(
+        &self,
+        target: &ObservedActiveTurn,
+        id: &str,
+        text: &str,
+    ) -> Result<crate::connection::HumanSteerAction> {
+        self.inner.connection.capture_human_action(target, id, text)
+    }
+    pub(crate) async fn dispatch_initial(
+        &self,
+        attempt: crate::connection::CommittedInitialTurn,
+    ) -> Evidence {
+        self.inner.connection.dispatch_initial(attempt).await
+    }
     pub fn active_turn(&self) -> Option<ObservedActiveTurn> {
         self.inner.connection.active_turn()
     }
@@ -176,7 +237,7 @@ impl SteerController {
     async fn save_evidence(&self, operation_id: &str, evidence: Evidence) -> Result<Receipt> {
         let store = self.inner.journal.clone();
         let id = operation_id.to_owned();
-        tokio::task::spawn_blocking(move || {
+        let receipt = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().map_err(|_| SteerError::Storage)?;
             match store.apply(&id, evidence) {
                 Ok(receipt) => Ok(receipt),
@@ -184,7 +245,11 @@ impl SteerController {
             }
         })
         .await
-        .map_err(|_| SteerError::Storage)?
+        .map_err(|_| SteerError::Storage)??;
+        self.inner
+            .receipts
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        Ok(receipt)
     }
 
     /// Joins this owner's reader/writer and drains retained evidence work. This

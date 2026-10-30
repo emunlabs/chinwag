@@ -38,7 +38,7 @@ struct Entry {
     receipt: Receipt,
 }
 
-struct JournalLock(File);
+pub(crate) struct JournalLock(pub(crate) File);
 
 impl Drop for JournalLock {
     fn drop(&mut self) {
@@ -290,6 +290,13 @@ impl SteerJournal {
         Ok(Some(entry.receipt.clone()))
     }
 
+    pub(crate) fn receipts(&self) -> Result<Vec<Receipt>> {
+        self.records
+            .keys()
+            .map(|id| self.lookup(id)?.ok_or(SteerError::Storage))
+            .collect()
+    }
+
     pub(crate) fn mark_persistence_failure(&mut self, id: &str) -> Result<Receipt> {
         let entry = self.records.get_mut(id).ok_or(SteerError::Storage)?;
         mark_failed(entry);
@@ -472,7 +479,7 @@ fn domain(directory: &File) -> Result<File> {
     }
 }
 
-fn owned_file(file: &File) -> Result<()> {
+pub(crate) fn owned_file(file: &File) -> Result<()> {
     let metadata = file.metadata().map_err(storage)?;
     if !metadata.is_file()
         || metadata.nlink() != 1
@@ -484,7 +491,7 @@ fn owned_file(file: &File) -> Result<()> {
     Ok(())
 }
 
-fn named_file(directory: &File, name: &str, held: &File) -> Result<()> {
+pub(crate) fn named_file(directory: &File, name: &str, held: &File) -> Result<()> {
     owned_file(held)?;
     let named: File = openat(
         directory,
@@ -498,7 +505,7 @@ fn named_file(directory: &File, name: &str, held: &File) -> Result<()> {
     same_file(held, &named)
 }
 
-fn same_file(left: &File, right: &File) -> Result<()> {
+pub(crate) fn same_file(left: &File, right: &File) -> Result<()> {
     let left = left.metadata().map_err(storage)?;
     let right = right.metadata().map_err(storage)?;
     if left.dev() != right.dev() || left.ino() != right.ino() {
@@ -507,7 +514,7 @@ fn same_file(left: &File, right: &File) -> Result<()> {
     Ok(())
 }
 
-fn read_bounded(file: &File, max: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_bounded(file: &File, max: usize) -> Result<Vec<u8>> {
     owned_file(file)?;
     let before = file.metadata().map_err(storage)?;
     if before.len() > max as u64 {
@@ -536,7 +543,7 @@ fn read_bounded(file: &File, max: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn open_root(root: &Path, create: bool) -> Result<(File, File, OsString)> {
+pub(crate) fn open_root(root: &Path, create: bool) -> Result<(File, File, OsString)> {
     if !root.is_absolute() || root.as_os_str().len() > 4096 {
         return Err(SteerError::InvalidInput);
     }

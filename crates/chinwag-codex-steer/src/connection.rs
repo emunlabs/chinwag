@@ -30,6 +30,7 @@ pub struct OwnerControlScope {
     thread_id: String,
     deadline: Instant,
     _reference: String,
+    fresh: Option<(String, String)>,
 }
 impl OwnerControlScope {
     pub fn new(
@@ -53,6 +54,7 @@ impl OwnerControlScope {
             thread_id,
             deadline,
             _reference: decision_reference,
+            fresh: None,
         })
     }
 }
@@ -62,6 +64,26 @@ pub struct HumanSteerGrant {
     identity: Arc<Identity>,
     revoked: Arc<AtomicBool>,
     deadline: Instant,
+    action: Option<HumanSteerAction>,
+}
+/// Exact captured native human action; cloning never extends its deadline.
+#[derive(Clone)]
+pub(crate) struct HumanSteerAction {
+    target: ObservedActiveTurn,
+    id: String,
+    text: String,
+    deadline: Instant,
+}
+impl HumanSteerAction {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+    pub(crate) fn target(&self) -> &ObservedActiveTurn {
+        &self.target
+    }
 }
 #[derive(Clone)]
 pub struct ObservedActiveTurn {
@@ -116,6 +138,65 @@ struct Pending {
     evidence: Evidence,
     may_have_written: bool,
 }
+#[derive(Clone)]
+pub(crate) struct InitialEvidence {
+    pub id: String,
+    pub accepted_turn_id: Option<String>,
+    pub evidence: Evidence,
+}
+#[derive(Clone)]
+pub(crate) struct ConnectionActivity {
+    pub target: Option<ObservedActiveTurn>,
+    pub completed: bool,
+    pub initial: Option<InitialEvidence>,
+    pub agent_text: Option<String>,
+    pub intervention: bool,
+    pub write_fenced: bool,
+    pub closed: bool,
+    pub revision: u64,
+}
+struct InitialPending {
+    id: String,
+    text: String,
+    rpc_id: String,
+    evidence: Evidence,
+    accepted_turn_id: Option<String>,
+    may_have_written: bool,
+}
+pub(crate) struct CommittedInitialTurn {
+    id: String,
+    text: String,
+    epoch: String,
+    thread: String,
+    deadline: Instant,
+}
+impl CommittedInitialTurn {
+    pub(crate) fn new(
+        id: String,
+        text: String,
+        epoch: String,
+        thread: String,
+        deadline: Instant,
+    ) -> crate::Result<Self> {
+        if !crate::record::valid_operation_id(&id)
+            || !crate::record::valid_text(&text)
+            || !valid_target_id(&thread)
+            || epoch.len() != 32
+            || !epoch
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(SteerError::InvalidInput);
+        }
+        Ok(Self {
+            id,
+            text,
+            epoch,
+            thread,
+            deadline,
+        })
+    }
+}
 struct Job {
     join: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -126,6 +207,11 @@ struct State {
     write_fenced: bool,
     intervention: bool,
     jobs: Vec<Arc<Job>>,
+    initial: Option<InitialPending>,
+    owned_turn: Option<String>,
+    ended: bool,
+    agent_text: Option<String>,
+    revision: u64,
 }
 struct Shared {
     identity: Arc<Identity>,
@@ -140,13 +226,17 @@ struct Shared {
     write_gate: Arc<Semaphore>,
     runtime: tokio::runtime::Handle,
     reader_job: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    activity: watch::Sender<ConnectionActivity>,
 }
 impl Shared {
     fn ready(&self, state: &State) -> crate::Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(SteerError::Unavailable);
         }
-        if self.revoked.load(Ordering::Acquire) || Instant::now() >= self.scope.deadline {
+        if self.revoked.load(Ordering::Acquire)
+            || (self.scope.fresh.is_none() && Instant::now() >= self.scope.deadline)
+            || (self.scope.fresh.is_some() && state.ended)
+        {
             return Err(SteerError::PermissionDenied);
         }
         if state.intervention {
@@ -166,6 +256,22 @@ impl Shared {
         {
             return Err(SteerError::PermissionDenied);
         }
+        if self.scope.fresh.is_some() {
+            let action = prepared
+                .grant
+                .action
+                .as_ref()
+                .ok_or(SteerError::PermissionDenied)?;
+            if action.id != prepared.record.id
+                || action.text != prepared.record.text
+                || action.target.epoch != prepared.target.epoch
+                || action.target.generation != prepared.target.generation
+                || action.target.turn_id != prepared.target.turn_id
+                || Instant::now() >= action.deadline
+            {
+                return Err(SteerError::PermissionDenied);
+            }
+        }
         if prepared.record.transport_epoch != self.epoch
             || prepared.record.thread_id != self.scope.thread_id
         {
@@ -177,6 +283,48 @@ impl Shared {
             return Err(SteerError::StaleTarget);
         }
         Ok(())
+    }
+    fn notify_activity(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.revision = state.revision.saturating_add(1);
+            let target = if self.ready(&state).is_ok() {
+                state
+                    .active
+                    .as_ref()
+                    .map(|(turn, generation)| ObservedActiveTurn {
+                        identity: self.identity.clone(),
+                        epoch: self.epoch.clone(),
+                        thread_id: self.scope.thread_id.clone(),
+                        turn_id: turn.clone(),
+                        generation: *generation,
+                    })
+            } else {
+                None
+            };
+            self.activity.send_replace(ConnectionActivity {
+                target,
+                completed: state.ended,
+                initial: state.initial.as_ref().map(|p| InitialEvidence {
+                    id: p.id.clone(),
+                    accepted_turn_id: p.accepted_turn_id.clone(),
+                    evidence: p.evidence,
+                }),
+                agent_text: state.agent_text.clone(),
+                intervention: state.intervention,
+                write_fenced: state.write_fenced,
+                closed: self.closed.load(Ordering::Acquire),
+                revision: state.revision,
+            });
+        }
+    }
+    fn publish_initial(&self, add: Evidence) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(initial) = state.initial.as_mut()
+            && let Ok(merged) = initial.evidence.merged(add)
+        {
+            initial.evidence = merged;
+        }
+        self.notify_activity();
     }
     fn publish(&self, id: &str, add: Evidence) {
         let event = {
@@ -243,6 +391,26 @@ impl Shared {
         for (id, evidence) in updates {
             self.publish(&id, evidence);
         }
+        let initial = self.state.lock().ok().and_then(|s| {
+            s.initial
+                .as_ref()
+                .filter(|p| !p.evidence.core_accepted && !p.evidence.not_dispatched)
+                .map(|p| p.may_have_written)
+        });
+        if let Some(written) = initial {
+            self.publish_initial(if written {
+                Evidence {
+                    write_uncertain: true,
+                    ..Evidence::default()
+                }
+            } else {
+                Evidence {
+                    not_dispatched: true,
+                    ..Evidence::default()
+                }
+            });
+        }
+        self.notify_activity();
     }
     fn request_close(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -279,14 +447,44 @@ impl ConnectionOwner {
             .lock()
             .map_err(|_| SteerError::Unavailable)?;
         self.shared.ready(&state)?;
+        if self.shared.scope.fresh.is_some() {
+            return Err(SteerError::PermissionDenied);
+        }
         Ok(HumanSteerGrant {
             identity: self.shared.identity.clone(),
             revoked: self.shared.revoked.clone(),
             deadline: self.shared.scope.deadline,
+            action: None,
+        })
+    }
+    pub(crate) fn authorize_action(
+        &self,
+        action: &HumanSteerAction,
+    ) -> crate::Result<HumanSteerGrant> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| SteerError::Unavailable)?;
+        self.shared.ready(&state)?;
+        if self.shared.scope.fresh.is_none()
+            || !Arc::ptr_eq(&self.shared.identity, &action.target.identity)
+            || Instant::now() >= action.deadline
+            || state.active.as_ref()
+                != Some(&(action.target.turn_id.clone(), action.target.generation))
+        {
+            return Err(SteerError::PermissionDenied);
+        }
+        Ok(HumanSteerGrant {
+            identity: self.shared.identity.clone(),
+            revoked: self.shared.revoked.clone(),
+            deadline: action.deadline,
+            action: Some(action.clone()),
         })
     }
     pub fn revoke(&self) {
         self.shared.revoked.store(true, Ordering::Release);
+        self.shared.notify_activity();
     }
     pub fn request_close(&self) {
         self.shared.request_close();
@@ -320,6 +518,16 @@ impl CodexSteerConnection {
         getrandom::fill(&mut nonce).map_err(|_| SteerError::Unavailable)?;
         let epoch = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
         let (close, _) = watch::channel(false);
+        let (activity, _) = watch::channel(ConnectionActivity {
+            target: None,
+            completed: false,
+            initial: None,
+            agent_text: None,
+            intervention: false,
+            write_fenced: false,
+            closed: false,
+            revision: 0,
+        });
         let (events, receiver) = mpsc::channel(MAX_OPERATIONS * 6);
         let shared = Arc::new(Shared {
             identity: Arc::new(Identity),
@@ -335,12 +543,18 @@ impl CodexSteerConnection {
                 write_fenced: false,
                 intervention: false,
                 jobs: Vec::new(),
+                initial: None,
+                owned_turn: None,
+                ended: false,
+                agent_text: None,
+                revision: 0,
             }),
             events: Mutex::new(Some(events)),
             receiver: Mutex::new(Some(receiver)),
             write_gate: Arc::new(Semaphore::new(1)),
             runtime: runtime.clone(),
             reader_job: tokio::sync::Mutex::new(None),
+            activity,
         });
         let input = shared.clone();
         let job = runtime.spawn(async move {
@@ -361,6 +575,24 @@ impl CodexSteerConnection {
             owner,
         ))
     }
+    pub(crate) fn from_fresh_thread<R, W>(
+        proof: crate::work_bootstrap::FreshThreadProof,
+        reader: R,
+        writer: W,
+    ) -> crate::Result<(Self, ConnectionOwner)>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let (thread, id, text, deadline, prefix) = proof.into_parts();
+        let scope = OwnerControlScope {
+            thread_id: thread,
+            deadline,
+            _reference: "committed-fresh-human-work".into(),
+            fresh: Some((id, text)),
+        };
+        Self::from_established_io(scope, std::io::Cursor::new(prefix).chain(reader), writer)
+    }
     pub fn active_turn(&self) -> Option<ObservedActiveTurn> {
         let state = self.shared.state.lock().ok()?;
         self.shared.ready(&state).ok()?;
@@ -378,12 +610,39 @@ impl CodexSteerConnection {
             && self.shared.epoch == target.epoch
             && self.shared.scope.thread_id == target.thread_id
     }
-    #[cfg(test)]
     pub(crate) fn transport_epoch(&self) -> &str {
         &self.shared.epoch
     }
     pub fn request_close(&self) {
         self.shared.request_close();
+    }
+    pub(crate) fn subscribe_activity(&self) -> watch::Receiver<ConnectionActivity> {
+        self.shared.activity.subscribe()
+    }
+    pub(crate) fn capture_human_action(
+        &self,
+        target: &ObservedActiveTurn,
+        id: &str,
+        text: &str,
+    ) -> crate::Result<HumanSteerAction> {
+        if !crate::record::valid_operation_id(id) || !crate::record::valid_text(text) {
+            return Err(SteerError::InvalidInput);
+        }
+        let current = self.active_turn().ok_or(SteerError::NoActiveTurn)?;
+        if !self.owns_target(target)
+            || current.turn_id != target.turn_id
+            || current.generation != target.generation
+        {
+            return Err(SteerError::StaleTarget);
+        }
+        Ok(HumanSteerAction {
+            target: target.clone(),
+            id: id.into(),
+            text: text.into(),
+            deadline: Instant::now()
+                .checked_add(Duration::from_secs(30))
+                .ok_or(SteerError::Unavailable)?,
+        })
     }
     pub fn prepare(
         &self,
@@ -509,6 +768,79 @@ impl CodexSteerConnection {
             ..Evidence::default()
         })
     }
+    pub(crate) async fn dispatch_initial(&self, attempt: CommittedInitialTurn) -> Evidence {
+        let (reply, result) = oneshot::channel();
+        {
+            let Ok(mut state) = self.shared.state.lock() else {
+                return Evidence {
+                    not_dispatched: true,
+                    ..Evidence::default()
+                };
+            };
+            if let Some(existing) = state.initial.as_ref() {
+                return if existing.id == attempt.id && existing.text == attempt.text {
+                    existing.evidence
+                } else {
+                    Evidence {
+                        not_dispatched: true,
+                        ..Evidence::default()
+                    }
+                };
+            }
+            if self.shared.scope.fresh.as_ref() != Some(&(attempt.id.clone(), attempt.text.clone()))
+                || attempt.epoch != self.shared.epoch
+                || attempt.thread != self.shared.scope.thread_id
+                || attempt.deadline != self.shared.scope.deadline
+            {
+                return Evidence {
+                    not_dispatched: true,
+                    ..Evidence::default()
+                };
+            }
+            let rpc_id = format!("chinwag-initial-{}", self.shared.epoch);
+            state.initial = Some(InitialPending {
+                id: attempt.id.clone(),
+                text: attempt.text.clone(),
+                rpc_id: rpc_id.clone(),
+                evidence: Evidence::default(),
+                accepted_turn_id: None,
+                may_have_written: false,
+            });
+            let permit = if self.shared.ready(&state).is_ok() && Instant::now() < attempt.deadline {
+                self.shared.write_gate.clone().try_acquire_owned().ok()
+            } else {
+                None
+            };
+            let Some(permit) = permit else {
+                drop(state);
+                let e = Evidence {
+                    not_dispatched: true,
+                    ..Evidence::default()
+                };
+                self.shared.publish_initial(e);
+                return e;
+            };
+            let shared = self.shared.clone();
+            let writer = self.writer.clone();
+            let job = self.shared.runtime.spawn(async move {
+                let evidence = write_initial(&shared, writer, &attempt, &rpc_id).await;
+                shared.publish_initial(evidence);
+                drop(permit);
+                if evidence.frame_written {
+                    schedule_initial_deadline(&shared);
+                }
+                let _ = reply.send(evidence);
+            });
+            state.jobs.push(Arc::new(Job {
+                join: tokio::sync::Mutex::new(Some(job)),
+            }));
+        }
+        self.shared.notify_activity();
+        result.await.unwrap_or(Evidence {
+            write_uncertain: true,
+            ..Evidence::default()
+        })
+    }
     pub async fn shutdown(&self) -> crate::Result<()> {
         self.shared.request_close();
         let mut failed = false;
@@ -536,7 +868,14 @@ impl CodexSteerConnection {
                 failed |= result.is_err();
             }
         }
-        let close = async { self.writer.lock().await.shutdown().await };
+        let close = async {
+            let mut slot = self.writer.lock().await;
+            let mut owned = std::mem::replace(&mut *slot, Box::new(tokio::io::sink()));
+            drop(slot);
+            // Dropping owned on success, error, or timeout releases the actual
+            // writer even while read-only controller clones remain retained.
+            owned.shutdown().await
+        };
         if !matches!(tokio::time::timeout(WRITE_TIMEOUT, close).await, Ok(Ok(()))) {
             failed = true;
         }
@@ -616,6 +955,89 @@ async fn write_attempt(
         }
     }
 }
+async fn write_initial(
+    shared: &Arc<Shared>,
+    writer: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
+    attempt: &CommittedInitialTurn,
+    rpc: &str,
+) -> Evidence {
+    let Ok(frame) = wire::initial_frame(rpc, &attempt.thread, &attempt.id, &attempt.text) else {
+        return Evidence {
+            not_dispatched: true,
+            ..Evidence::default()
+        };
+    };
+    let mut close = shared.close.subscribe();
+    let write = async {
+        let mut writer = writer.lock().await;
+        {
+            let mut state = shared.state.lock().map_err(|_| false)?;
+            shared.ready(&state).map_err(|_| false)?;
+            if Instant::now() >= attempt.deadline {
+                return Err(false);
+            }
+            let pending = state.initial.as_mut().ok_or(false)?;
+            if pending.id != attempt.id || pending.evidence.not_dispatched {
+                return Err(false);
+            }
+            pending.may_have_written = true;
+        }
+        writer.write_all(&frame).await.map_err(|_| true)?;
+        writer.flush().await.map_err(|_| true)
+    };
+    let remaining = attempt
+        .deadline
+        .saturating_duration_since(Instant::now())
+        .min(WRITE_TIMEOUT);
+    let result = tokio::select! {biased;_=close.changed()=>Err(true),result=tokio::time::timeout(remaining,write)=>result.unwrap_or(Err(true))};
+    match result {
+        Ok(()) => Evidence {
+            frame_written: true,
+            ..Evidence::default()
+        },
+        Err(false) => Evidence {
+            not_dispatched: true,
+            ..Evidence::default()
+        },
+        Err(true) => {
+            let written = shared
+                .state
+                .lock()
+                .ok()
+                .and_then(|s| s.initial.as_ref().map(|p| p.may_have_written))
+                .unwrap_or(true);
+            shared.fence(false);
+            if written {
+                Evidence {
+                    write_uncertain: true,
+                    ..Evidence::default()
+                }
+            } else {
+                Evidence {
+                    not_dispatched: true,
+                    ..Evidence::default()
+                }
+            }
+        }
+    }
+}
+fn schedule_initial_deadline(shared: &Arc<Shared>) {
+    let Ok(mut state) = shared.state.lock() else {
+        return;
+    };
+    if shared.closed.load(Ordering::Acquire) {
+        return;
+    }
+    let owner = shared.clone();
+    let mut close = shared.close.subscribe();
+    let task=shared.runtime.spawn(async move{tokio::select!{biased;_=close.changed()=>{},_=tokio::time::sleep(ACK_TIMEOUT)=>{
+   let pending=owner.state.lock().ok().is_some_and(|s|s.initial.as_ref().is_some_and(|p|!p.evidence.core_accepted&&!p.evidence.not_dispatched));
+   if pending{owner.publish_initial(Evidence{write_uncertain:true,..Evidence::default()});}
+ }}});
+    state.jobs.push(Arc::new(Job {
+        join: tokio::sync::Mutex::new(Some(task)),
+    }));
+}
 fn schedule_ack_deadline(shared: &Arc<Shared>, id: &str) {
     let Ok(mut state) = shared.state.lock() else {
         return;
@@ -672,12 +1094,40 @@ async fn read_pump<R: AsyncRead + Send + Unpin>(shared: Arc<Shared>, reader: R) 
             },
         }
     }
+    shared.closed.store(true, Ordering::Release);
+    shared.notify_activity();
     shared.close_events();
 }
 fn observe(shared: &Arc<Shared>, event: Incoming) {
     match event {
         Incoming::Started { thread_id, turn_id } if thread_id == shared.scope.thread_id => {
             if let Ok(mut state) = shared.state.lock() {
+                if shared.scope.fresh.is_some() {
+                    if state.ended {
+                        return;
+                    }
+                    if !state.initial.as_ref().is_some_and(|p| p.may_have_written) {
+                        drop(state);
+                        shared.fence(true);
+                        return;
+                    }
+                    if state.owned_turn.as_ref().is_some_and(|id| id != &turn_id) {
+                        drop(state);
+                        shared.fence(true);
+                        return;
+                    }
+                    if state
+                        .initial
+                        .as_ref()
+                        .and_then(|p| p.accepted_turn_id.as_ref())
+                        .is_some_and(|id| id != &turn_id)
+                    {
+                        drop(state);
+                        shared.fence(true);
+                        return;
+                    }
+                    state.owned_turn = Some(turn_id.clone());
+                }
                 if state
                     .active
                     .as_ref()
@@ -695,14 +1145,72 @@ fn observe(shared: &Arc<Shared>, event: Incoming) {
             }
         }
         Incoming::Completed { thread_id, turn_id } if thread_id == shared.scope.thread_id => {
-            if let Ok(mut state) = shared.state.lock()
-                && state
+            if let Ok(mut state) = shared.state.lock() {
+                if shared.scope.fresh.is_some()
+                    && !state.ended
+                    && !state.initial.as_ref().is_some_and(|p| p.may_have_written)
+                {
+                    drop(state);
+                    shared.fence(true);
+                    return;
+                }
+                if shared.scope.fresh.is_some()
+                    && state.initial.as_ref().is_some_and(|p| p.may_have_written)
+                    && state.owned_turn.as_ref().is_none_or(|id| id == &turn_id)
+                {
+                    state.owned_turn = Some(turn_id.clone());
+                    state.ended = true;
+                }
+                if state
                     .active
                     .as_ref()
                     .is_some_and(|(active, _)| *active == turn_id)
-            {
-                state.active = None;
-                state.generation = state.generation.saturating_add(1);
+                {
+                    state.active = None;
+                    state.generation = state.generation.saturating_add(1);
+                }
+            }
+        }
+        Incoming::InitialSuccess {
+            id: WireId::String(rpc_id),
+            turn_id,
+            terminal,
+        } => {
+            let matching = shared.state.lock().ok().and_then(|mut state| {
+                let owned_turn_matches = state.owned_turn.as_ref().is_none_or(|id| id == &turn_id);
+                let initial = state.initial.as_mut()?;
+                if initial.rpc_id != rpc_id || !initial.may_have_written {
+                    return None;
+                }
+                let turn_matches = owned_turn_matches
+                    && initial
+                        .accepted_turn_id
+                        .as_ref()
+                        .is_none_or(|id| id == &turn_id);
+                if turn_matches {
+                    initial.accepted_turn_id = Some(turn_id.clone());
+                    if terminal {
+                        state.owned_turn = Some(turn_id);
+                        state.ended = true;
+                        state.active = None;
+                        state.generation = state.generation.saturating_add(1);
+                    }
+                }
+                Some(turn_matches)
+            });
+            match matching {
+                Some(true) => shared.publish_initial(Evidence {
+                    core_accepted: true,
+                    ..Evidence::default()
+                }),
+                Some(false) => {
+                    shared.publish_initial(Evidence {
+                        write_uncertain: true,
+                        ..Evidence::default()
+                    });
+                    shared.fence(true);
+                }
+                None => {}
             }
         }
         Incoming::Success {
@@ -713,8 +1221,8 @@ fn observe(shared: &Arc<Shared>, event: Incoming) {
                 state
                     .records
                     .iter()
-                    .find(|(_, pending)| pending.rpc_id == rpc_id && pending.may_have_written)
-                    .map(|(id, pending)| (id.clone(), pending.record.expected_turn_id == turn_id))
+                    .find(|(_, p)| p.rpc_id == rpc_id && p.may_have_written)
+                    .map(|(id, p)| (id.clone(), p.record.expected_turn_id == turn_id))
             });
             if let Some((id, true)) = matched {
                 shared.publish(
@@ -738,11 +1246,22 @@ fn observe(shared: &Arc<Shared>, event: Incoming) {
         Incoming::Error {
             id: WireId::String(rpc_id),
         } => {
-            let id = shared.state.lock().ok().and_then(|state| {
-                state
-                    .records
+            let initial = shared.state.lock().ok().is_some_and(|s| {
+                s.initial
+                    .as_ref()
+                    .is_some_and(|p| p.rpc_id == rpc_id && p.may_have_written)
+            });
+            if initial {
+                shared.publish_initial(Evidence {
+                    write_uncertain: true,
+                    peer_error_observed: true,
+                    ..Evidence::default()
+                });
+            }
+            let id = shared.state.lock().ok().and_then(|s| {
+                s.records
                     .iter()
-                    .find(|(_, pending)| pending.rpc_id == rpc_id && pending.may_have_written)
+                    .find(|(_, p)| p.rpc_id == rpc_id && p.may_have_written)
                     .map(|(id, _)| id.clone())
             });
             if let Some(id) = id {
@@ -762,12 +1281,12 @@ fn observe(shared: &Arc<Shared>, event: Incoming) {
             client_id,
             text,
         } => {
-            let matched = shared.state.lock().ok().is_some_and(|state| {
-                state.records.get(&client_id).is_some_and(|pending| {
-                    pending.may_have_written
-                        && pending.record.thread_id == thread_id
-                        && pending.record.expected_turn_id == turn_id
-                        && pending.record.text == text
+            let matched = shared.state.lock().ok().is_some_and(|s| {
+                s.records.get(&client_id).is_some_and(|p| {
+                    p.may_have_written
+                        && p.record.thread_id == thread_id
+                        && p.record.expected_turn_id == turn_id
+                        && p.record.text == text
                 })
             });
             if matched {
@@ -779,10 +1298,50 @@ fn observe(shared: &Arc<Shared>, event: Incoming) {
                     },
                 );
             }
+            let initial = shared.state.lock().ok().is_some_and(|s| {
+                thread_id == shared.scope.thread_id
+                    && s.owned_turn.as_ref().is_none_or(|id| id == &turn_id)
+                    && s.initial
+                        .as_ref()
+                        .is_some_and(|p| p.may_have_written && p.id == client_id && p.text == text)
+            });
+            if initial {
+                if let Ok(mut state) = shared.state.lock() {
+                    if state
+                        .initial
+                        .as_ref()
+                        .and_then(|p| p.accepted_turn_id.as_ref())
+                        .is_some_and(|id| id != &turn_id)
+                    {
+                        drop(state);
+                        shared.fence(true);
+                        return;
+                    }
+                    if state.owned_turn.is_none() {
+                        state.owned_turn = Some(turn_id.clone());
+                    }
+                }
+                shared.publish_initial(Evidence {
+                    harness_recorded: true,
+                    ..Evidence::default()
+                });
+            }
+        }
+        Incoming::AgentText {
+            thread_id,
+            turn_id,
+            text,
+        } if thread_id == shared.scope.thread_id => {
+            if let Ok(mut state) = shared.state.lock()
+                && state.owned_turn.as_ref().is_some_and(|id| id == &turn_id)
+            {
+                state.agent_text = Some(text);
+            }
         }
         Incoming::ServerRequest => shared.fence(true),
         _ => {}
     }
+    shared.notify_activity();
 }
 
 #[cfg(test)]

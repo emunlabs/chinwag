@@ -82,3 +82,24 @@ fn oversized_frames_and_unknown_server_requests_cannot_become_acceptance() {
         Incoming::Other
     ));
 }
+
+#[test]
+fn fixed_initial_lane_is_distinct_from_steer_and_excludes_overrides() {
+    let bytes = initial_frame(
+        "initial-rpc",
+        "thread-new",
+        "initial-human-work1",
+        "Initial human text",
+    )
+    .unwrap();
+    let value = unique_value(&bytes).unwrap();
+    assert_eq!(
+        value,
+        json!({"id":"initial-rpc","method":"turn/start","params":{"threadId":"thread-new","clientUserMessageId":"initial-human-work1","input":[{"type":"text","text":"Initial human text","text_elements":[]}]}})
+    );
+    assert!(matches!(parse(br#"{"id":"initial-rpc","result":{"turn":{"id":"turn-new","status":"inProgress","items":[]}}}"#).unwrap(),Incoming::InitialSuccess{..}));
+    assert!(matches!(
+        parse(br#"{"id":"steer-rpc","result":{"turnId":"turn-new"}}"#).unwrap(),
+        Incoming::Success { .. }
+    ));
+}

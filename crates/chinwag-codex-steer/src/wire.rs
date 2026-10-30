@@ -22,6 +22,11 @@ pub(crate) enum Incoming {
         id: WireId,
         turn_id: String,
     },
+    InitialSuccess {
+        id: WireId,
+        turn_id: String,
+        terminal: bool,
+    },
     Error {
         id: WireId,
     },
@@ -37,6 +42,11 @@ pub(crate) enum Incoming {
         thread_id: String,
         turn_id: String,
         client_id: String,
+        text: String,
+    },
+    AgentText {
+        thread_id: String,
+        turn_id: String,
         text: String,
     },
     ServerRequest,
@@ -61,11 +71,7 @@ pub(crate) fn steer_frame(rpc_id: &str, record: &SavedSteer) -> crate::Result<Ve
 }
 
 pub(crate) fn parse(bytes: &[u8]) -> crate::Result<Incoming> {
-    if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
-        return Err(SteerError::Unavailable);
-    }
-    let Unique(value): Unique =
-        serde_json::from_slice(bytes).map_err(|_| SteerError::Unavailable)?;
+    let value = unique_value(bytes)?;
     let object = value.as_object().ok_or(SteerError::Unavailable)?;
     let id = object.get("id");
     let method = object.get("method");
@@ -123,6 +129,25 @@ pub(crate) fn parse(bytes: &[u8]) -> crate::Result<Incoming> {
                 let Some(item) = params.get("item").and_then(Value::as_object) else {
                     return Err(SteerError::Unavailable);
                 };
+                if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                    let text = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or(SteerError::Unavailable)?;
+                    let text: String = text
+                        .chars()
+                        .filter(|c| !c.is_control() || matches!(*c, '\n' | '\r' | '\t'))
+                        .scan(0usize, |n, c| {
+                            *n += c.len_utf8();
+                            (*n <= crate::MAX_TEXT_BYTES).then_some(c)
+                        })
+                        .collect();
+                    return Ok(Incoming::AgentText {
+                        thread_id: target(params.get("threadId"))?,
+                        turn_id: target(params.get("turnId"))?,
+                        text,
+                    });
+                }
                 if item.get("type").and_then(Value::as_str) != Some("userMessage") {
                     return Ok(Incoming::Other);
                 }
@@ -173,6 +198,21 @@ pub(crate) fn parse(bytes: &[u8]) -> crate::Result<Incoming> {
             if result.len() != 1 {
                 return Err(SteerError::Unavailable);
             }
+            if let Some(turn) = result.get("turn").and_then(Value::as_object) {
+                if !turn.get("items").is_some_and(Value::is_array)
+                    || !matches!(
+                        turn.get("status").and_then(Value::as_str),
+                        Some("inProgress" | "completed" | "failed" | "interrupted")
+                    )
+                {
+                    return Err(SteerError::Unavailable);
+                }
+                return Ok(Incoming::InitialSuccess {
+                    id,
+                    turn_id: target(turn.get("id"))?,
+                    terminal: turn.get("status").and_then(Value::as_str) != Some("inProgress"),
+                });
+            }
             Ok(Incoming::Success {
                 id,
                 turn_id: target(result.get("turnId"))?,
@@ -191,6 +231,33 @@ pub(crate) fn parse(bytes: &[u8]) -> crate::Result<Incoming> {
             Ok(Incoming::Error { id })
         }
     }
+}
+pub(crate) fn unique_value(bytes: &[u8]) -> crate::Result<Value> {
+    if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
+        return Err(SteerError::Unavailable);
+    }
+    let Unique(value): Unique =
+        serde_json::from_slice(bytes).map_err(|_| SteerError::Unavailable)?;
+    Ok(value)
+}
+pub(crate) fn initial_frame(
+    rpc_id: &str,
+    thread: &str,
+    id: &str,
+    text: &str,
+) -> crate::Result<Vec<u8>> {
+    if !crate::record::valid_target_id(thread)
+        || !crate::record::valid_operation_id(id)
+        || !crate::record::valid_text(text)
+    {
+        return Err(SteerError::InvalidInput);
+    }
+    let mut bytes = serde_json::to_vec(&serde_json::json!({"id":rpc_id,"method":"turn/start","params":{"threadId":thread,"clientUserMessageId":id,"input":[{"type":"text","text":text,"text_elements":[]}]}})).map_err(|_| SteerError::InvalidInput)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_OUTBOUND_BYTES {
+        return Err(SteerError::InvalidInput);
+    }
+    Ok(bytes)
 }
 fn target(value: Option<&Value>) -> crate::Result<String> {
     let value = value

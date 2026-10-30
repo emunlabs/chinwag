@@ -331,3 +331,163 @@ fn constructor_without_runtime_returns_fixed_error_before_creating_journal() {
     ));
     assert!(!path.exists());
 }
+
+#[tokio::test]
+async fn consumed_fresh_bootstrap_then_live_steer_does_not_wait_for_initial_ack() {
+    use crate::work_journal::{ConsumedWork, WorkJournal};
+    use std::time::Instant;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config = crate::WorkConfig::new(
+        &root.join("human-declared.sock"),
+        &root.join("selected-folder"),
+        &root.join("work"),
+        crate::RuntimePolicyDeclaration::DedicatedRuntimeWithExplicitLogin,
+    )
+    .unwrap();
+    let mut work_journal = WorkJournal::open(config).unwrap();
+    let ConsumedWork::Created(work) = work_journal
+        .consume(
+            "initial-controller01",
+            "Initial human task",
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap()
+    else {
+        panic!("new consumed work");
+    };
+    let (io, peer) = tokio::io::duplex(65536);
+    let (reader, mut writer) = tokio::io::split(io);
+    let mut reader = BufReader::new(reader);
+    let mut peer = BufReader::new(peer);
+    let (allow_initial, wait_initial) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let init = frame(&mut peer).await;
+        assert_eq!(init["method"], "initialize");
+        send(&mut peer,json!({"id":init["id"],"result":{"userAgent":"synthetic","codexHome":"/private/not-retained","platformFamily":"unix","platformOs":"macos"}})).await;
+        assert_eq!(frame(&mut peer).await, json!({"method":"initialized"}));
+        let new_thread = frame(&mut peer).await;
+        assert_eq!(new_thread["method"], "thread/start");
+        // Both frames fit one read; the bootstrap must retain read-ahead.
+        send(
+            &mut peer,
+            json!({"id":new_thread["id"],"result":{"thread":{"id":THREAD,"turns":[],"cwd":new_thread["params"]["cwd"]}}}),
+        )
+        .await;
+        send(
+            &mut peer,
+            json!({"method":"thread/started","params":{"thread":{"id":THREAD}}}),
+        )
+        .await;
+        let initial = frame(&mut peer).await;
+        assert_eq!(initial["method"], "turn/start");
+        assert_eq!(
+            initial["params"]["clientUserMessageId"],
+            "initial-controller01"
+        );
+        send(&mut peer,json!({"method":"turn/started","params":{"threadId":THREAD,"turn":{"id":"turn-first-owned","status":"inProgress","items":[]}}})).await;
+        let steer = frame(&mut peer).await;
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["expectedTurnId"], "turn-first-owned");
+        send(
+            &mut peer,
+            json!({"id":steer["id"],"result":{"turnId":"turn-first-owned"}}),
+        )
+        .await;
+        wait_initial.await.unwrap();
+        send(&mut peer,json!({"id":initial["id"],"result":{"turn":{"id":"turn-first-owned","status":"inProgress","items":[]}}})).await;
+        send(&mut peer,json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":"turn-first-owned","status":"completed","items":[]}}})).await;
+        peer
+    });
+    let proof = crate::work_bootstrap::bootstrap(&work, &mut reader, &mut writer)
+        .await
+        .unwrap();
+    let thread = proof.thread_id().to_owned();
+    let (controller, owner) =
+        SteerController::from_fresh_thread(proof, &root.join("steers"), reader, writer)
+            .await
+            .unwrap();
+    let capsule = work_journal
+        .commit_initial(&work, &thread, controller.transport_epoch())
+        .unwrap();
+    assert!(controller.dispatch_initial(capsule).await.frame_written);
+    let mut activity = controller.subscribe_activity();
+    let target = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(target) = activity.borrow().target.clone() {
+                break target;
+            }
+            activity.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let action = controller
+        .capture_human_action(&target, "steer-controller-live1", TEXT)
+        .unwrap();
+    let grant = owner.authorize_action(&action).unwrap();
+    let receipt = controller
+        .submit_human_text(&grant, action.target(), action.id(), action.text())
+        .await
+        .unwrap();
+    assert!(receipt.evidence.frame_written);
+    let mut updates = controller.subscribe_receipts();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if controller
+                .receipt(action.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .evidence
+                .core_accepted
+            {
+                break;
+            }
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !activity
+            .borrow()
+            .initial
+            .as_ref()
+            .unwrap()
+            .evidence
+            .core_accepted,
+        "Steer was accepted while initial Start reply remained unconfirmed"
+    );
+    allow_initial.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if activity.borrow().completed
+                && activity
+                    .borrow()
+                    .initial
+                    .as_ref()
+                    .unwrap()
+                    .evidence
+                    .core_accepted
+            {
+                break;
+            }
+            activity.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(controller.active_turn().is_none());
+    let _peer = server.await.unwrap();
+    controller.shutdown().await.unwrap();
+    assert!(
+        !controller
+            .receipt(action.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .persistence_failed,
+        "Initial operation never went to the separate Steer journal"
+    );
+}

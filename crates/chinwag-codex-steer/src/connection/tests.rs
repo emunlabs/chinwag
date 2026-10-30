@@ -489,3 +489,358 @@ async fn expired_grant_before_prepare_or_final_write_cannot_dispatch() {
     drop(reading);
     f.connection.shutdown().await.unwrap();
 }
+
+const INITIAL_ID: &str = "work-initial-human-01";
+fn fresh_fixture() -> Fixture {
+    let (bridge, peer) = tokio::io::duplex(65536);
+    let (reader, writer) = tokio::io::split(bridge);
+    let mut scope = OwnerControlScope::new(
+        "dedicated consenting owner".into(),
+        THREAD.into(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    scope.fresh = Some((INITIAL_ID.into(), "Initial explicit work".into()));
+    let (connection, owner) =
+        CodexSteerConnection::from_established_io(scope, reader, writer).unwrap();
+    Fixture {
+        connection,
+        owner,
+        peer: BufReader::new(peer),
+    }
+}
+async fn initial(f: &mut Fixture) -> Value {
+    let capsule = CommittedInitialTurn::new(
+        INITIAL_ID.into(),
+        "Initial explicit work".into(),
+        f.connection.shared.epoch.clone(),
+        THREAD.into(),
+        f.connection.shared.scope.deadline,
+    )
+    .unwrap();
+    let written = f.connection.dispatch_initial(capsule).await;
+    assert!(written.frame_written && !written.core_accepted);
+    let request = frame(&mut f.peer).await;
+    assert_eq!(request["method"], "turn/start");
+    request
+}
+#[tokio::test]
+async fn owned_start_allows_midrun_steer_before_initial_reply_and_never_reopens_after_completion() {
+    let mut f = fresh_fixture();
+    let mut events = f.connection.take_events().unwrap();
+    assert!(matches!(
+        f.owner.human_grant(),
+        Err(SteerError::PermissionDenied)
+    ));
+    let start = initial(&mut f).await;
+    let target = active(&mut f, "turn-owned").await;
+    let action = f
+        .connection
+        .capture_human_action(&target, "steer-human-owned01", TEXT)
+        .unwrap();
+    let grant = f.owner.authorize_action(&action).unwrap();
+    let prepared = f
+        .connection
+        .prepare(&grant, &target, action.id(), action.text())
+        .unwrap();
+    assert!(
+        f.connection
+            .dispatch_committed(CommittedSteerAttempt::new(prepared))
+            .await
+            .frame_written
+    );
+    let steer = frame(&mut f.peer).await;
+    assert_eq!(steer["method"], "turn/steer");
+    send(
+        &mut f.peer,
+        json!({"id":steer["id"],"result":{"turnId":"turn-owned"}}),
+    )
+    .await;
+    until(|| f.connection.evidence(action.id()).unwrap().core_accepted).await;
+    assert!(
+        !f.connection
+            .subscribe_activity()
+            .borrow()
+            .initial
+            .as_ref()
+            .unwrap()
+            .evidence
+            .core_accepted
+    );
+    send(&mut f.peer, completed("turn-owned")).await;
+    until(|| f.connection.subscribe_activity().borrow().completed).await;
+    send(&mut f.peer,json!({"id":start["id"],"result":{"turn":{"id":"turn-owned","items":[],"status":"inProgress"}}})).await;
+    send(&mut f.peer, started(THREAD, "turn-owned")).await;
+    send(&mut f.peer, started(THREAD, "another-turn")).await;
+    until(|| {
+        f.connection
+            .subscribe_activity()
+            .borrow()
+            .initial
+            .as_ref()
+            .unwrap()
+            .evidence
+            .core_accepted
+    })
+    .await;
+    assert!(f.connection.active_turn().is_none());
+    assert!(f.owner.authorize_action(&action).is_err());
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(
+            event.id, INITIAL_ID,
+            "Initial facts never enter Steer journal channel"
+        );
+    }
+    f.connection.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn exact_work_action_rejects_substitution_and_expiry_without_writing() {
+    use std::future::Future;
+    let mut f = fresh_fixture();
+    initial(&mut f).await;
+    let target = active(&mut f, "turn-owned").await;
+    let action = f
+        .connection
+        .capture_human_action(&target, "steer-human-exact01", TEXT)
+        .unwrap();
+    let grant = f.owner.authorize_action(&action).unwrap();
+    assert!(matches!(
+        f.connection
+            .prepare(&grant, &target, "steer-human-other01", TEXT),
+        Err(SteerError::PermissionDenied)
+    ));
+    assert!(matches!(
+        f.connection
+            .prepare(&grant, &target, action.id(), "different human text"),
+        Err(SteerError::PermissionDenied)
+    ));
+    let mut expired = action.clone();
+    expired.deadline = Instant::now() - Duration::from_secs(1);
+    assert!(f.owner.authorize_action(&expired).is_err());
+    let mut prepared = f
+        .connection
+        .prepare(&grant, &target, action.id(), TEXT)
+        .unwrap();
+    prepared.grant.deadline = Instant::now() - Duration::from_secs(1);
+    let evidence = f
+        .connection
+        .dispatch_committed(CommittedSteerAttempt::new(prepared))
+        .await;
+    assert!(evidence.not_dispatched && !evidence.write_uncertain);
+    let mut reading = Box::pin(f.peer.read_u8());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(reading.as_mut().poll(cx).is_pending()))
+            .await
+    );
+    drop(reading);
+    f.connection.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn first_work_uses_a_fresh_exact_action_instead_of_a_generic_legacy_grant() {
+    let mut f = fresh_fixture();
+    initial(&mut f).await;
+    let target = active(&mut f, "turn-owned").await;
+    // Each explicit action captures an immutable 30s deadline. Generic legacy
+    // grants remain unavailable for the fresh-work scope.
+    let action = f
+        .connection
+        .capture_human_action(&target, "steer-later-action1", TEXT)
+        .unwrap();
+    assert!(action.deadline <= Instant::now() + Duration::from_secs(30));
+    let grant = f.owner.authorize_action(&action).unwrap();
+    assert!(
+        f.connection
+            .prepare(&grant, &target, action.id(), TEXT)
+            .is_ok()
+    );
+    f.connection.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn completed_agent_text_is_bounded_same_owned_turn_and_not_a_model_awareness_receipt() {
+    let mut f = fresh_fixture();
+    initial(&mut f).await;
+    active(&mut f, "turn-owned").await;
+    send(&mut f.peer,json!({"method":"item/completed","params":{"threadId":THREAD,"turnId":"turn-owned","item":{"type":"agentMessage","text":"é".repeat(crate::MAX_TEXT_BYTES)}}})).await;
+    until(|| {
+        f.connection
+            .subscribe_activity()
+            .borrow()
+            .agent_text
+            .is_some()
+    })
+    .await;
+    let activity = f.connection.subscribe_activity().borrow().clone();
+    assert_eq!(activity.agent_text.unwrap().len(), crate::MAX_TEXT_BYTES);
+    assert!(!activity.initial.unwrap().evidence.core_accepted);
+    send(&mut f.peer,json!({"id":"approval-request","method":"item/commandExecution/requestApproval","params":{}})).await;
+    until(|| f.connection.subscribe_activity().borrow().intervention).await;
+    assert!(f.connection.active_turn().is_none());
+    f.connection.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_initial_response_ends_work_even_without_completion_notification() {
+    for status in ["completed", "failed", "interrupted"] {
+        let mut f = fresh_fixture();
+        let request = initial(&mut f).await;
+        send(&mut f.peer,json!({"id":request["id"],"result":{"turn":{"id":"turn-terminal","items":[],"status":status}}})).await;
+        until(|| f.connection.subscribe_activity().borrow().completed).await;
+        send(&mut f.peer, started(THREAD, "turn-terminal")).await;
+        send(&mut f.peer, started(THREAD, "later-turn")).await;
+        tokio::task::yield_now().await;
+        assert!(f.connection.active_turn().is_none());
+        let observation = f.connection.subscribe_activity().borrow().clone();
+        assert!(
+            observation.completed && observation.initial.as_ref().unwrap().evidence.core_accepted
+        );
+        assert_eq!(
+            observation.initial.unwrap().accepted_turn_id.as_deref(),
+            Some("turn-terminal")
+        );
+        f.connection.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn early_owned_thread_activity_fences_initial_start_instead_of_steering_existing_work() {
+    use std::future::Future;
+    for event in [
+        started(THREAD, "already-active"),
+        completed("already-completed"),
+    ] {
+        let mut f = fresh_fixture();
+        send(&mut f.peer, event).await;
+        until(|| f.connection.subscribe_activity().borrow().intervention).await;
+        assert!(f.connection.active_turn().is_none());
+        let capsule = CommittedInitialTurn::new(
+            INITIAL_ID.into(),
+            "Initial explicit work".into(),
+            f.connection.shared.epoch.clone(),
+            THREAD.into(),
+            f.connection.shared.scope.deadline,
+        )
+        .unwrap();
+        let result = f.connection.dispatch_initial(capsule).await;
+        assert!(result.not_dispatched && !result.frame_written && !result.write_uncertain);
+        let mut reading = Box::pin(f.peer.read_u8());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                reading.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        drop(reading);
+        f.connection.shutdown().await.unwrap();
+    }
+}
+
+struct PartialWriteFault {
+    writer: WriteHalf<DuplexStream>,
+    remaining: usize,
+}
+impl AsyncWrite for PartialWriteFault {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.remaining == 0 {
+            return std::task::Poll::Ready(Err(std::io::Error::other(
+                "fixture partial write fault",
+            )));
+        }
+        let length = bytes.len().min(self.remaining);
+        let result = std::pin::Pin::new(&mut self.writer).poll_write(cx, &bytes[..length]);
+        if let std::task::Poll::Ready(Ok(n)) = &result {
+            self.remaining -= *n;
+        }
+        result
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+#[tokio::test]
+async fn partial_steer_write_exposes_fenced_open_connection_with_no_active_control_target() {
+    let (bridge, peer) = tokio::io::duplex(65536);
+    let (reader, writer) = tokio::io::split(bridge);
+    let scope = OwnerControlScope::new(
+        "explicit partial-fault fixture".into(),
+        THREAD.into(),
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let (connection, owner) = CodexSteerConnection::from_established_io(
+        scope,
+        reader,
+        PartialWriteFault {
+            writer,
+            remaining: 8,
+        },
+    )
+    .unwrap();
+    let mut f = Fixture {
+        connection,
+        owner,
+        peer: BufReader::new(peer),
+    };
+    let target = active(&mut f, "turn-running").await;
+    let evidence = dispatch(&f, &target, "steer-partial-fault1").await;
+    assert!(evidence.write_uncertain && !evidence.frame_written);
+    let activity = f.connection.subscribe_activity().borrow().clone();
+    assert!(activity.write_fenced);
+    assert!(activity.target.is_none());
+    assert!(!activity.closed && !activity.completed && !activity.intervention);
+    let mut prefix = [0u8; 8];
+    f.peer.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(prefix[0], b'{');
+    assert!(!prefix.contains(&b'\n'));
+    f.connection.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn contradictory_initial_success_preserves_first_turn_and_fences_delayed_started() {
+    use std::future::Future;
+    let mut f = fresh_fixture();
+    let request = initial(&mut f).await;
+    send(&mut f.peer,json!({"id":request["id"],"result":{"turn":{"id":"turn-first-accepted","items":[],"status":"inProgress"}}})).await;
+    until(|| {
+        f.connection
+            .subscribe_activity()
+            .borrow()
+            .initial
+            .as_ref()
+            .unwrap()
+            .evidence
+            .core_accepted
+    })
+    .await;
+    send(&mut f.peer,json!({"id":request["id"],"result":{"turn":{"id":"turn-contradiction","items":[],"status":"inProgress"}}})).await;
+    send(&mut f.peer, started(THREAD, "turn-contradiction")).await;
+    until(|| f.connection.subscribe_activity().borrow().intervention).await;
+    let activity = f.connection.subscribe_activity().borrow().clone();
+    let initial = activity.initial.unwrap();
+    assert_eq!(
+        initial.accepted_turn_id.as_deref(),
+        Some("turn-first-accepted")
+    );
+    assert!(initial.evidence.core_accepted && initial.evidence.write_uncertain);
+    assert!(activity.write_fenced && activity.target.is_none() && !activity.completed);
+    assert!(f.connection.active_turn().is_none());
+    let mut reading = Box::pin(f.peer.read_u8());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(reading.as_mut().poll(cx).is_pending()))
+            .await
+    );
+    drop(reading);
+    f.connection.shutdown().await.unwrap();
+}

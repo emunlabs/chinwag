@@ -1350,6 +1350,7 @@ dependencies = [
 name = "chinwag-codex-steer"
 version = "0.0.1"
 dependencies = [
+ "futures-util",
  "getrandom 0.3.4",
  "libc",
  "rustix",
@@ -1358,6 +1359,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite 0.29.0",
 ]
 
 [[package]]
@@ -1393,11 +1395,13 @@ version = "0.0.1"
 dependencies = [
  "chinwag-bus-client",
  "chinwag-bus-model",
+ "chinwag-codex-steer",
  "chrono",
  "gpui-kit",
  "rustix",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

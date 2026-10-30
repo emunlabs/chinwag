@@ -298,8 +298,13 @@ fn discovery_http_fixture(
                 }
                 Err(error) => panic!("fixture accept {error}"),
             };
+            // Darwin can inherit the listener's nonblocking flag on accept.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
             let mut raw = Vec::new();
             while !raw.windows(4).any(|bytes| bytes == b"\r\n\r\n") {

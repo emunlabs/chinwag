@@ -1,6 +1,6 @@
 # Codex steering core
 
-`chinwag-codex-steer` implements a Rust core with synthetic IO fixtures. This unit has no real app-server binding, process or model start, initialization, thread adoption, GPUI control, HTTP route, or deployment. It does not prove that a human steer changed an agent's work or an artifact.
+`chinwag-codex-steer` provides a legacy already-initialized steering controller and a separate human-owned Start/Steer integration. This document describes the legacy controller contract. See [human-owned work](CODEX_OWNED_WORK.md) for the explicit native work window, owner-selected Unix listener, fixed initialization/initial-turn lane and distinct per-action control policy. Validation uses synthetic peers; actual human steering and changed-artifact acceptance remain unproven.
 
 ## Owner and target contract
 
