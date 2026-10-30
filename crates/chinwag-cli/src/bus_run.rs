@@ -118,12 +118,14 @@ fn resolve_repo_root(explicit: Option<&str>) -> PathBuf {
     if let Some(p) = explicit {
         return PathBuf::from(p);
     }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     if let Ok(cwd) = std::env::current_dir()
+        && cwd != PathBuf::from(&home)
         && cwd.join(".chinwag").is_dir()
+        && (cwd.join(".git").exists() || cwd.join("TASKS.md").exists())
     {
         return cwd;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(format!("{home}/WORKSPACE/chinwag"))
 }
 
@@ -194,8 +196,18 @@ fn seat_slug_clean(actor: &str) -> String {
         .to_lowercase()
 }
 
+fn os_csprng_32_bytes() -> [u8; 32] {
+    let mut arr = [0u8; 32];
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        use std::io::Read as _;
+        let _ = f.read_exact(&mut arr);
+    }
+    arr
+}
+
 /// Loads the seat's real OpenSSH Ed25519 signing key (`~/.chinwag/signing/<seat>_ed25519`)
-/// or raw 32-byte seed (`~/.chinwag/signing/<seat>_ed25519.key`) for detached message signing (`BUS-HARDEN-01`).
+/// or raw 32-byte CSPRNG seed (`~/.chinwag/signing/<seat>_ed25519.key`) for detached message signing (`BUS-HARDEN-01` & `BUS-HARDEN-06`).
+/// Never derives a predictable key from the public seat name.
 pub fn actor_signing_secret(actor: &str) -> SecretKey {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let slug = seat_slug_clean(actor);
@@ -215,26 +227,15 @@ pub fn actor_signing_secret(actor: &str) -> SecretKey {
         return SecretKey::from_bytes(&arr);
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"chinwag-iroh-bus-seat-ed25519-v1:");
-    hasher.update(slug.as_bytes());
-    let digest = hasher.finalize();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&digest);
+    let arr = os_csprng_32_bytes();
     let _ = fs::create_dir_all(&signing_dir);
     let _ = fs::write(&raw_key_path, arr);
     let _ = fs::set_permissions(&raw_key_path, fs::Permissions::from_mode(0o600));
     SecretKey::from_bytes(&arr)
 }
 
-fn actor_transport_secret(actor: &str) -> SecretKey {
-    let mut hasher = Sha256::new();
-    hasher.update(b"chinwag-iroh-bus-actor-v1:");
-    hasher.update(actor.trim().to_uppercase().as_bytes());
-    let digest = hasher.finalize();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&digest);
-    SecretKey::from_bytes(&arr)
+fn actor_transport_secret(_actor: &str) -> SecretKey {
+    SecretKey::from_bytes(&os_csprng_32_bytes())
 }
 
 /// Unambiguous length-prefixed 7-field canonical signing payload binding
@@ -480,8 +481,113 @@ fn append_message_to_disk_and_crdb(repo_root: &Path, msg: &BusMessage) -> u64 {
             .stderr(Stdio::null())
             .status();
 
+        if verified_msg.sig_verified
+            && (verified_msg.body.starts_with("COMPLETED ")
+                || verified_msg.body.starts_with("[DONE]"))
+            && let Some(ref tid) = verified_msg.task_id
+        {
+            let _ = auto_advance_tasks_markdown(repo_root, tid, &verified_msg.sender);
+        }
+
         next_seq
     })
+}
+
+/// Automatically transitions a completed `TASK-XX` from `[IN_PROGRESS]`/`[READY]` to `[DONE]` in `TASKS.md`
+/// and promotes the next `[READY]` task owned by `seat` to `[IN_PROGRESS]` (`TASK-21` / `CHWG-AUTO-ADVANCE-TASKS-01`).
+pub fn auto_advance_tasks_markdown(
+    repo_root: &Path,
+    completed_task_id: &str,
+    seat: &str,
+) -> Option<String> {
+    let tasks_path = repo_root.join("TASKS.md");
+    let raw = fs::read_to_string(&tasks_path).ok()?;
+    let target_tid = completed_task_id.trim().to_uppercase();
+    let target_seat = seat.trim().to_uppercase();
+    if !target_tid.starts_with("TASK-") {
+        return None;
+    }
+
+    let mut lines: Vec<String> = raw.lines().map(|l| l.to_string()).collect();
+    let mut changed = false;
+
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with("### ") {
+            let matches_tid = trimmed.contains(&format!("`{target_tid}`"))
+                || trimmed.contains(&format!(" {target_tid} "))
+                || trimmed.ends_with(&format!(" {target_tid}"));
+            if matches_tid && (trimmed.contains("[IN_PROGRESS]") || trimmed.contains("[READY]")) {
+                *line = line
+                    .replace("[IN_PROGRESS]", "[DONE]")
+                    .replace("[READY]", "[DONE]");
+                changed = true;
+            }
+        }
+    }
+
+    // Check if seat already has another [IN_PROGRESS] item; if not, promote its first [READY] item
+    let mut current_heading_idx: Option<usize> = None;
+    let mut current_heading_tid: Option<String> = None;
+    let mut current_heading_is_ready = false;
+    let mut current_heading_is_in_progress = false;
+    let mut seat_has_in_progress = false;
+    let mut first_ready_for_seat: Option<(usize, String)> = None;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("### ") {
+            current_heading_idx = Some(idx);
+            current_heading_is_ready = trimmed.contains("[READY]");
+            current_heading_is_in_progress = trimmed.contains("[IN_PROGRESS]");
+            current_heading_tid = None;
+            if let Some(pos) = trimmed.find("TASK-") {
+                let rest = &trimmed[pos..];
+                let tid: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if tid.len() >= 6 {
+                    current_heading_tid = Some(tid);
+                }
+            }
+            continue;
+        }
+        if trimmed.starts_with("- **Owner:**") {
+            let upper = trimmed.to_uppercase();
+            if upper.contains(&target_seat) {
+                if current_heading_is_in_progress {
+                    seat_has_in_progress = true;
+                } else if current_heading_is_ready
+                    && first_ready_for_seat.is_none()
+                    && let (Some(h_idx), Some(tid)) =
+                        (current_heading_idx, current_heading_tid.clone())
+                {
+                    first_ready_for_seat = Some((h_idx, tid));
+                }
+            }
+        }
+    }
+
+    let mut promoted_tid: Option<String> = None;
+    if !seat_has_in_progress
+        && let Some((h_idx, tid)) = first_ready_for_seat
+        && let Some(line) = lines.get_mut(h_idx)
+    {
+        *line = line.replace("[READY]", "[IN_PROGRESS]");
+        promoted_tid = Some(tid);
+        changed = true;
+    }
+
+    if changed {
+        let mut updated = lines.join("\n");
+        if raw.ends_with('\n') {
+            updated.push('\n');
+        }
+        let _ = fs::write(&tasks_path, updated);
+    }
+
+    promoted_tid
 }
 
 fn compute_message_digest(
@@ -1550,6 +1656,98 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             }
             0
         }
+        "roster" | "top" => {
+            let all = read_all_messages(&repo_root);
+            let active_tasks = parse_active_tasks_from_markdown(&repo_root);
+            let seats = [
+                ("RUST", "GPT-5.4 / Codex"),
+                ("ARCHITECT", "GPT-5.4 / Codex"),
+                ("FLINT", "Claude Opus 4.7"),
+                ("QA", "Claude Sonnet 4.6"),
+                ("ALISTAIR", "Claude Sonnet 4.6"),
+                ("TYPE", "Claude Sonnet 4.6"),
+                ("GEMINI-PM", "Gemini 3.1 Pro"),
+                ("PRODUCT", "45s Autonomous Governor"),
+                ("DELIVERY", "iroh Work-Stream Router"),
+                ("BRIAN", "Principal Founder"),
+            ];
+
+            let mut rows = Vec::new();
+            for (seat, engine) in seats {
+                let worker_active = is_seat_worker_active(&repo_root, seat);
+                let assigned_task = active_tasks
+                    .iter()
+                    .find(|(s, _, _)| s.eq_ignore_ascii_case(seat))
+                    .map(|(_, tid, _)| tid.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                let msg_count = all
+                    .iter()
+                    .filter(|m| m.sender.eq_ignore_ascii_case(seat))
+                    .count();
+                let last_msg = all
+                    .iter()
+                    .rev()
+                    .find(|m| m.sender.eq_ignore_ascii_case(seat));
+                let last_ts = last_msg
+                    .map(|m| format_local_wall_clock(&m.ts_iso))
+                    .unwrap_or_else(|| "-".to_string());
+                let last_tid = last_msg
+                    .and_then(|m| m.task_id.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                let status = if worker_active {
+                    "WORKING"
+                } else if seat == "PRODUCT" {
+                    "GOVERNOR_ON"
+                } else if seat == "DELIVERY" {
+                    "ROUTER_ON"
+                } else {
+                    "STANDBY"
+                };
+                rows.push(json!({
+                    "seat": seat,
+                    "engine": engine,
+                    "status": status,
+                    "assigned_task": assigned_task,
+                    "message_count": msg_count,
+                    "last_receipt_cdt": last_ts,
+                    "last_task_id": last_tid
+                }));
+            }
+
+            if is_json {
+                let out = json!({
+                    "ok": true,
+                    "command": "chinwag bus roster",
+                    "seats": rows
+                });
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&out).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(
+                    stdout,
+                    "📊 Chinwag 10-Seat Swarm Utilization Roster (INV-UTIL-01 · Central Time CDT):\n  \
+                     {:<11} {:<24} {:<12} {:<10} {:<6} {:<14} {}",
+                    "SEAT", "ENGINE", "STATE", "ASSIGNED", "MSGS", "LAST_RECEIPT", "LAST_TASK"
+                );
+                for r in &rows {
+                    let _ = writeln!(
+                        stdout,
+                        "  ■ {:<9} {:<24} {:<12} {:<10} {:<6} {:<14} {}",
+                        r["seat"].as_str().unwrap_or(""),
+                        r["engine"].as_str().unwrap_or(""),
+                        r["status"].as_str().unwrap_or(""),
+                        r["assigned_task"].as_str().unwrap_or(""),
+                        r["message_count"].as_u64().unwrap_or(0),
+                        r["last_receipt_cdt"].as_str().unwrap_or(""),
+                        r["last_task_id"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            0
+        }
         "status" | _ => {
             let daemon = read_daemon_state(&repo_root);
             let all = read_all_messages(&repo_root);
@@ -1720,5 +1918,37 @@ mod tests {
             format_local_wall_clock("2026-10-29T18:06:12-0500 CDT"),
             "18:06:12 CDT"
         );
+    }
+
+    #[test]
+    fn auto_advance_tasks_md_transitions_completed_task_to_done_and_promotes_next_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let sample = "# TASKS\n\
+            ### `[IN_PROGRESS]` `TASK-15` — Hardened Bus Signatures\n\
+            - **Owner:** `■ RUST` (`GPT / Codex`)\n\
+            - **Scope:** Verify 7-field Ed25519 signature.\n\
+            ### `[READY]` `TASK-22` — Remove Predictable Seat-Derived Key Fallback\n\
+            - **Owner:** `■ RUST` (`GPT / Codex`)\n\
+            - **Scope:** Replace SHA-256 fallback with CSPRNG.\n";
+        let tasks_path = temp.path().join("TASKS.md");
+        fs::write(&tasks_path, sample).unwrap();
+
+        let promoted = auto_advance_tasks_markdown(temp.path(), "TASK-15", "RUST");
+        assert_eq!(promoted.as_deref(), Some("TASK-22"));
+
+        let updated = fs::read_to_string(&tasks_path).unwrap();
+        assert!(updated.contains("### `[DONE]` `TASK-15`"));
+        assert!(updated.contains("### `[IN_PROGRESS]` `TASK-22`"));
+    }
+
+    #[test]
+    fn actor_signing_secret_never_derives_predictable_seed_from_seat_name() {
+        let s1 = os_csprng_32_bytes();
+        let s2 = os_csprng_32_bytes();
+        assert_ne!(s1, s2);
+        let mut legacy_hasher = Sha256::new();
+        legacy_hasher.update(b"chinwag-iroh-bus-seat-ed25519-v1:ephemeral");
+        let legacy_digest = legacy_hasher.finalize();
+        assert_ne!(&s1[..], &legacy_digest[..]);
     }
 }

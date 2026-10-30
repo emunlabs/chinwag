@@ -40,34 +40,40 @@
 
 ---
 
-## 3. Phase 1.2 Active Engineering Sprint (`TASK-15` .. `TASK-20`)
+## 3. Completed Phase 1.2 Tasks (`TASK-15` .. `TASK-20`)
 
-### `[IN_PROGRESS]` `TASK-15` (`BUS-HARDEN-04`) — 7-Field Canonical Ed25519 Signature + `.chinwag/allowed_signers` Membership Check & 1800-Char Full Bus Receipts
-- **Owner:** `■ RUST` (`GPT / Codex`)
-- **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-swarm/src/identity.rs`
-- **Scope:** Verify `verify_detached_bus_signature` binds all 7 fields (`id:ts_unix:sender:to:room:task_id:body`) AND checks `parse_allowed_signers` in `.chinwag/allowed_signers`, plus 1800-char receipts and explicit `rustc 1.97.1` worker env injection. Run `cargo test -p chinwag-cli --bin chinwag` and report receipt.
+- **`[DONE]` `TASK-15` (`BUS-HARDEN-04`):** Length-prefixed 7-field `Ed25519` canonical payload (`chinwag-bus-sig-v2`) + fail-closed `.chinwag/allowed_signers` membership check + 1800-char bus receipts + explicit `RUSTUP_TOOLCHAIN=1.97.1` worker injection (`■ RUST`).
+- **`[DONE]` `TASK-16` (`BUS-HARDEN-05`):** Dynamic `UP`+`RUNNING` non-loopback IPv4 discovery via `/sbin/ifconfig`, fail-closed nonzero port binding, and remote `DaemonState` synthesis when `CHINWAG_BUS_ADDR` is set (`■ ARCHITECT`).
+- **`[DONE]` `TASK-17` (`CHWG-PLUGIN-CRYPTO-01`):** Non-destructive fail-closed `Ed25519` + `.chinwag/allowed_signers` verification on `.chinwag/plugins/com.emunlabs.breakroom.cwplugin/manifest.json` (`■ ALISTAIR`).
+- **`[DONE]` `TASK-18` (`CHWG-DYNAMIC-TASKS-PARSER-01`):** Dynamic `TASKS.md` `[IN_PROGRESS]`/`[READY]` state-machine parser in 45s governor (`■ PRODUCT` + `■ DELIVERY`).
+- **`[DONE]` `TASK-19` (`CHWG-FLINT-AUDIT-2`):** Adversarial audit of Phase 1.2 and fail-closed `allowed_signers` remediation (`■ FLINT`).
+- **`[DONE]` `TASK-20` (`CHWG-QA-CROSS-HOST-1`):** Cross-machine `iroh-quic/chinwag-bus-1` delivery verified from MacBook Pro (`100.108.108.25 -> 100.66.156.76:44330`, `#149` & `#150`) (`■ QA`).
 
-### `[IN_PROGRESS]` `TASK-16` (`BUS-HARDEN-05`) — Dynamic Non-Loopback IPv4 Discovery (`discover_non_loopback_ipv4`) & Fail-Loudly Port Binding
-- **Owner:** `■ ARCHITECT` (`GPT / Codex`)
-- **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-cli/src/feature_cli_run.rs`
-- **Scope:** Verify removal of hardcoded IPv4 fallback in `bus_run.rs`, dynamic `ifconfig` interface discovery, fail-loudly nonzero port binding, and cryptographic `Ed25519` `.cwplugin` manifest verification in `feature_cli_run.rs`.
+---
 
-### `[IN_PROGRESS]` `TASK-17` (`CHWG-PLUGIN-CRYPTO-01`) — Real Detached `Ed25519` `.cwplugin` Manifest Signature & Tamper-Rejection Audit
-- **Owner:** `■ ALISTAIR`
-- **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `.chinwag/plugins/com.emunlabs.breakroom.cwplugin/manifest.json`
-- **Scope:** Audit `verify_plugin_manifest_json` in `crates/chinwag-cli/src/feature_cli_run.rs` and run `chinwag plugin verify --json` to confirm real `Ed25519` signature verification and `.chinwag/allowed_signers` enforcement.
+## 4. Phase 1.3 Active Engineering Sprint (`TASK-21` .. `TASK-25`)
 
-### `[IN_PROGRESS]` `TASK-18` (`CHWG-DYNAMIC-TASKS-PARSER-01`) — Dynamic `TASKS.md` `[IN_PROGRESS]`/`[READY]` State-Machine Parser
+### `[IN_PROGRESS]` `TASK-21` (`CHWG-AUTO-ADVANCE-TASKS-01`) — Auto-Transition `COMPLETED TASK-XX` to `[DONE]` in `TASKS.md` & Promote Next `[READY]` Item
 - **Owner:** `■ PRODUCT` + `■ DELIVERY`
 - **Files:** `crates/chinwag-cli/src/bus_run.rs`, `TASKS.md`
-- **Scope:** Dynamically parse active tasks and seat owners from `TASKS.md` every `45s` and on `chinwag bus wake`.
+- **Scope:** When a worker posts a verified (`sig_verified == true`) `COMPLETED TASK-XX` or `[DONE]` message, automatically transition `### [IN_PROGRESS] TASK-XX` to `### [DONE] TASK-XX` under `.chinwag/bus/bus.lock` and promote the next `[READY]` task for that seat to `[IN_PROGRESS]`.
 
-### `[READY]` `TASK-19` (`CHWG-FLINT-AUDIT-2`) — Adversarial Audit of Phase 1.2 (`BUS-HARDEN-04..05` & `CHWG-PLUGIN-CRYPTO-01`)
-- **Owner:** `■ FLINT` (`flint-agent` · `100.108.108.25:11500`)
-- **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-cli/src/feature_cli_run.rs`, `crates/chinwag-swarm/src/identity.rs`
-- **Scope:** Audit `verify_detached_bus_signature`, `parse_allowed_signers`, `verify_plugin_manifest_json`, and `parse_active_tasks_from_markdown` on synced `main` and return adversarial PASS/FAIL verdict.
+### `[IN_PROGRESS]` `TASK-22` (`BUS-HARDEN-06`) — Remove Predictable Seat-Derived Key Fallback in `actor_signing_secret` & `actor_transport_secret`
+- **Owner:** `■ RUST` (`GPT / Codex`)
+- **Files:** `crates/chinwag-cli/src/bus_run.rs`
+- **Scope:** Verify that `actor_signing_secret` and `actor_transport_secret` use `/dev/urandom` CSPRNG (`os_csprng_32_bytes`) instead of any predictable SHA-256 seat-name seed, and verify `auto_advance_tasks_markdown` unit test coverage (`cargo test -p chinwag-cli --bin chinwag`).
 
-### `[READY]` `TASK-20` (`CHWG-QA-CROSS-HOST-1`) — Full Workspace Test Gate & Cross-Machine MacBook Pro (`100.108.108.25`) QUIC Bus Verification
+### `[IN_PROGRESS]` `TASK-23` (`CHWG-PLUGIN-JCS-01`) — Full-Manifest Canonical JSON `Ed25519` Signing & `display_name` Tamper-Rejection
+- **Owner:** `■ ARCHITECT` (`GPT / Codex`)
+- **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `.chinwag/plugins/com.emunlabs.breakroom.cwplugin/manifest.json`
+- **Scope:** Verify that `canonical_plugin_manifest_payload` signs the entire canonical JSON `BTreeMap` object (excluding `payload_sha256` and `signature_ed25519`), so mutating `display_name` or any field in `manifest.json` fails verification.
+
+### `[READY]` `TASK-24` (`CHWG-CWCard-CLI-01`) — Captionizm™ `.cwcard` HPKE+BLAKE3+Ed25519 Sealed Card Envelope Verifier (`chinwag cwcard inspect | verify`)
+- **Owner:** `■ ALISTAIR`
+- **Files:** `crates/chinwag-cli/src/feature_cli_run.rs`, `.chinwag/plugins/com.emunlabs.breakroom.cwplugin/sample.cwcard.json`
+- **Scope:** Audit `verify_cwcard_json` and `chinwag cwcard verify --json` to confirm full-envelope `Ed25519` signature + `.chinwag/allowed_signers` verification on `.cwcard` sealed card envelopes.
+
+### `[READY]` `TASK-25` (`CHWG-BUS-TOP-01`) — Live 10-Seat Swarm Utilization Roster (`chinwag bus roster`) & Adversarial Gate
 - **Owner:** `■ QA`
 - **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-cli/src/feature_cli_run.rs`
-- **Scope:** Verify all `chinwag-cli` unit/integration tests (`33/33`), `chinwag plugin verify --json`, `chinwag a509 verify --json`, and cross-machine QUIC reachability between Mac Studio (`100.66.156.76:44330`) and MacBook Pro (`100.108.108.25`).
+- **Scope:** Verify `chinwag bus roster --json`, `chinwag cwcard verify --json`, `chinwag plugin verify --json`, and all `35/35` `chinwag-cli` automated tests.

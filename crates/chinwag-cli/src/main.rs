@@ -111,6 +111,14 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(code);
         }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("cwcard") {
+            let code = feature_cli_run::run_cwcard_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
         if raw_args.get(1).map(|s| s.as_str()) == Some("a509") {
             let code = feature_cli_run::run_a509_cli(
                 &raw_args[2..],

@@ -13,11 +13,11 @@
     "INV-PLUGIN-ENT-01"
   ],
   "monotonic_seq": 24,
-  "payload_sha256": "68e9060a1883cf12c4317fb9b91a15b4cee8b1da3dbc9625cd5ecdcb29ef4aa1",
+  "payload_sha256": "8ed14eb3288045e296a61034091671cf75892ac616caab011de8076578e931a9",
   "plugin_id": "com.emunlabs.breakroom",
   "schema": "chinwag-plugin-manifest/v1",
   "seatbelt_profile": "INV-PLUGIN-SEATBELT-01",
-  "signature_ed25519": "b3e31f8aeb28c4999504624088ccb0b9d903f5b7dcac8c4fa480a70ea3ebbdaa0e1c34ab94287066ea1214756350d1acf44403a1b48e0615188dd3bd44e2e501",
+  "signature_ed25519": "ba36a4ea48342f3a513c6b56dcc8b041f10e8bf7ab53128ae964c28561b71e1f6c92358e2473460c5bb32c9bdf4f2f4ed6c27113a3ded1f19ce7f1e64267dc0b",
   "signer_pubkey_ed25519": "fa80fada8ea3af9d8af8e86709d6e23d48736aa2bb02d8508ceb8ea5882e7d6a",
   "signer_seat": "ALISTAIR",
   "signing_key_id": "pub_plugin_emun_2026",

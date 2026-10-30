@@ -20,12 +20,14 @@ fn resolve_repo_root(args: &[String]) -> PathBuf {
         }
         i += 1;
     }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     if let Ok(cwd) = std::env::current_dir()
+        && cwd != PathBuf::from(&home)
         && cwd.join(".chinwag").is_dir()
+        && (cwd.join(".git").exists() || cwd.join("TASKS.md").exists())
     {
         return cwd;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(format!("{home}/WORKSPACE/chinwag"))
 }
 
@@ -180,22 +182,23 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
 }
 
 fn canonical_plugin_manifest_payload(v: &Value) -> Option<String> {
-    let schema = v.get("schema")?.as_str()?;
-    let plugin_id = v.get("plugin_id")?.as_str()?;
-    let version = v.get("version")?.as_str()?;
-    let monotonic_seq = v.get("monotonic_seq")?.as_u64()?;
-    let ui_mount = v.get("ui_mount")?.as_str()?;
-    let seatbelt_profile = v.get("seatbelt_profile")?.as_str()?;
-    let egress = v
-        .get("egress_allowlist")?
-        .as_array()?
-        .iter()
-        .filter_map(|x| x.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    Some(format!(
-        "{schema}|{plugin_id}|{version}|{monotonic_seq}|{ui_mount}|{seatbelt_profile}|{egress}"
-    ))
+    let obj = v.as_object()?;
+    let _schema = obj.get("schema")?.as_str()?;
+    let _plugin_id = obj.get("plugin_id")?.as_str()?;
+    let _display_name = obj.get("display_name")?.as_str()?;
+    let _version = obj.get("version")?.as_str()?;
+    let _monotonic_seq = obj.get("monotonic_seq")?.as_u64()?;
+    let _ui_mount = obj.get("ui_mount")?.as_str()?;
+    let _seatbelt_profile = obj.get("seatbelt_profile")?.as_str()?;
+    let _signer_seat = obj.get("signer_seat")?.as_str()?;
+    let _signer_pubkey = obj.get("signer_pubkey_ed25519")?.as_str()?;
+    let _invariants = obj.get("invariants")?.as_array()?;
+    let _egress = obj.get("egress_allowlist")?.as_array()?;
+
+    let mut stripped = obj.clone();
+    stripped.remove("payload_sha256");
+    stripped.remove("signature_ed25519");
+    serde_json::to_string(&Value::Object(stripped)).ok()
 }
 
 pub fn build_signed_breakroom_manifest(signer_seat: &str) -> Value {
@@ -583,6 +586,223 @@ pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn W
     if all_verified { 0 } else { 1 }
 }
 
+fn canonical_cwcard_payload(v: &Value) -> Option<String> {
+    let obj = v.as_object()?;
+    let _schema = obj.get("schema")?.as_str()?;
+    let _card_id = obj.get("card_id")?.as_str()?;
+    let _edition = obj.get("edition")?.as_str()?;
+    let _hpke_kem = obj.get("hpke_kem")?.as_str()?;
+    let _hpke_aead = obj.get("hpke_aead")?.as_str()?;
+    let _ciphertext_blake3 = obj.get("ciphertext_blake3")?.as_str()?;
+    let _signer_seat = obj.get("signer_seat")?.as_str()?;
+    let _signer_pubkey = obj.get("signer_pubkey_ed25519")?.as_str()?;
+
+    let mut stripped = obj.clone();
+    stripped.remove("payload_sha256");
+    stripped.remove("signature_ed25519");
+    serde_json::to_string(&Value::Object(stripped)).ok()
+}
+
+pub fn build_signed_cwcard_envelope(signer_seat: &str) -> Value {
+    let secret = bus_run::actor_signing_secret(signer_seat);
+    let pubkey_hex = secret.public().to_string();
+    let mut base = json!({
+        "schema": "chinwag-cwcard-envelope/v1",
+        "card_id": "cwcard-2026-emun-0001",
+        "edition": "Captionizm Series I · Founder's Deck",
+        "hpke_kem": "X25519-HKDF-SHA256",
+        "hpke_kdf": "HKDF-SHA256",
+        "hpke_aead": "ChaCha20Poly1305",
+        "ciphertext_blake3": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "zero_knowledge_chip_mint": "INV-PLUGIN-CHIP-01",
+        "signer_seat": signer_seat.to_uppercase(),
+        "signer_pubkey_ed25519": pubkey_hex
+    });
+    let canonical = canonical_cwcard_payload(&base).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let payload_sha256 = bytes_to_hex(&hasher.finalize());
+    let sig = secret.sign(canonical.as_bytes());
+    let sig_hex = bytes_to_hex(&sig.to_bytes());
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert("payload_sha256".to_string(), json!(payload_sha256));
+        obj.insert("signature_ed25519".to_string(), json!(sig_hex));
+    }
+    base
+}
+
+pub fn verify_cwcard_json(repo_root: &Path, raw_json: &str) -> Result<Value, String> {
+    let v: Value =
+        serde_json::from_str(raw_json).map_err(|e| format!("invalid cwcard json: {e}"))?;
+    let canonical =
+        canonical_cwcard_payload(&v).ok_or_else(|| "missing required cwcard fields".to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let expected_sha256 = bytes_to_hex(&hasher.finalize());
+
+    let claimed_sha256 = v
+        .get("payload_sha256")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing payload_sha256".to_string())?;
+    if claimed_sha256 != expected_sha256 {
+        return Err("payload_sha256 mismatch (cwcard envelope tampered)".to_string());
+    }
+
+    let pub_hex = v
+        .get("signer_pubkey_ed25519")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing signer_pubkey_ed25519".to_string())?;
+    let sig_hex = v
+        .get("signature_ed25519")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing signature_ed25519".to_string())?;
+    let signer_seat = v
+        .get("signer_seat")
+        .and_then(|x| x.as_str())
+        .unwrap_or("ALISTAIR");
+
+    let pubkey: EndpointId = pub_hex
+        .parse()
+        .map_err(|_| "invalid signer_pubkey_ed25519".to_string())?;
+    let sig_bytes =
+        hex_to_64_bytes(sig_hex).ok_or_else(|| "invalid signature_ed25519 hex".to_string())?;
+    let sig = Signature::from_bytes(&sig_bytes);
+
+    pubkey
+        .verify(canonical.as_bytes(), &sig)
+        .map_err(|_| "Ed25519 signature verification failed".to_string())?;
+
+    let allowed_path = repo_root.join(".chinwag").join("allowed_signers");
+    let allowed_raw = fs::read_to_string(&allowed_path)
+        .map_err(|_| "missing or unreadable .chinwag/allowed_signers".to_string())?;
+    let signers = chinwag_swarm::identity::parse_allowed_signers(&allowed_raw);
+    if signers.is_empty() {
+        return Err(".chinwag/allowed_signers contains no valid signers".to_string());
+    }
+    let matched = signers.iter().any(|(seat_opt, bytes)| {
+        bytes == pubkey.as_bytes()
+            && seat_opt
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(signer_seat))
+    });
+    if !matched {
+        return Err(format!(
+            "signer_pubkey_ed25519 for {signer_seat} is not registered in .chinwag/allowed_signers"
+        ));
+    }
+
+    Ok(v)
+}
+
+/// `TASK-24` (`CHWG-CWCard-CLI-01`): `chinwag cwcard inspect | verify [--json]`
+pub fn run_cwcard_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("verify");
+    let repo_root = resolve_repo_root(args);
+    let is_json = has_json_flag(args);
+    let cwcard_path = repo_root
+        .join(".chinwag")
+        .join("plugins")
+        .join("com.emunlabs.breakroom.cwplugin")
+        .join("sample.cwcard.json");
+
+    if sub == "init" && !cwcard_path.exists() {
+        if let Some(parent) = cwcard_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let env = build_signed_cwcard_envelope("ALISTAIR");
+        if let Ok(text) = serde_json::to_string_pretty(&env) {
+            let _ = fs::write(&cwcard_path, text);
+        }
+    }
+
+    let raw = match fs::read_to_string(&cwcard_path) {
+        Ok(r) => r,
+        Err(e) => {
+            if is_json {
+                let payload = json!({
+                    "ok": false,
+                    "command": format!("chinwag cwcard {sub}"),
+                    "cwcard_path": cwcard_path.to_string_lossy(),
+                    "ed25519_verified": false,
+                    "error": format!("missing or unreadable sample.cwcard.json: {e}")
+                });
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(
+                    stderr,
+                    "chinwag cwcard {sub}: missing or unreadable {}",
+                    cwcard_path.display()
+                );
+            }
+            return 1;
+        }
+    };
+
+    match verify_cwcard_json(&repo_root, &raw) {
+        Ok(val) => {
+            let payload = json!({
+                "ok": true,
+                "command": format!("chinwag cwcard {sub}"),
+                "cwcard_path": cwcard_path.to_string_lossy(),
+                "card_id": val["card_id"],
+                "edition": val["edition"],
+                "hpke_kem": val["hpke_kem"],
+                "hpke_aead": val["hpke_aead"],
+                "ciphertext_blake3": val["ciphertext_blake3"],
+                "payload_sha256": val["payload_sha256"],
+                "signer_seat": val["signer_seat"],
+                "signer_pubkey_ed25519": val["signer_pubkey_ed25519"],
+                "ed25519_verified": true,
+                "allowed_signers_verified": true
+            });
+            if is_json {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(
+                    stdout,
+                    "🃏 Captionizm Sealed Card Verifier ({sub}): {} ({})\n  • HPKE Cipher:     {} / {}\n  • BLAKE3 Seal:     {}\n  • Ed25519 Signer:  ■ {} ({}.. ✓allowed_signers)",
+                    val["card_id"].as_str().unwrap_or(""),
+                    val["edition"].as_str().unwrap_or(""),
+                    val["hpke_kem"].as_str().unwrap_or(""),
+                    val["hpke_aead"].as_str().unwrap_or(""),
+                    val["ciphertext_blake3"].as_str().unwrap_or(""),
+                    val["signer_seat"].as_str().unwrap_or(""),
+                    &val["signer_pubkey_ed25519"].as_str().unwrap_or("")[..16]
+                );
+            }
+            0
+        }
+        Err(err_msg) => {
+            if is_json {
+                let payload = json!({
+                    "ok": false,
+                    "command": format!("chinwag cwcard {sub}"),
+                    "cwcard_path": cwcard_path.to_string_lossy(),
+                    "ed25519_verified": false,
+                    "allowed_signers_verified": false,
+                    "error": err_msg
+                });
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(stderr, "chinwag cwcard {sub} failed: {err_msg}");
+            }
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +859,12 @@ mod tests {
         // Valid signed manifest + registered signer passes verification
         assert!(verify_plugin_manifest_json(temp.path(), &raw).is_ok());
 
+        // Mutating display_name -> full-manifest JCS canonical payload fails closed (`TASK-23`)
+        let mut tampered_name = manifest.clone();
+        tampered_name["display_name"] = json!("Tampered Display Name");
+        let raw_name = serde_json::to_string(&tampered_name).unwrap();
+        assert!(verify_plugin_manifest_json(temp.path(), &raw_name).is_err());
+
         // Tamper with version on disk and verify run_plugin_cli fails closed WITHOUT overwriting it
         let plugin_dir = chinwag_dir
             .join("plugins")
@@ -675,5 +901,33 @@ mod tests {
         tampered_sig["signature_ed25519"] = json!("00".repeat(64));
         let raw_sig = serde_json::to_string(&tampered_sig).unwrap();
         assert!(verify_plugin_manifest_json(temp.path(), &raw_sig).is_err());
+    }
+
+    #[test]
+    fn cwcard_verify_checks_hpke_blake3_ed25519_envelope_and_rejects_tampering() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = build_signed_cwcard_envelope("ALISTAIR");
+        let raw = serde_json::to_string_pretty(&env).unwrap();
+
+        let pub_hex = env["signer_pubkey_ed25519"].as_str().unwrap();
+        let endpoint_id: EndpointId = pub_hex.parse().unwrap();
+        let ssh_pub = ssh_key::PublicKey::from(
+            ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()),
+        );
+        let openssh_line = ssh_pub.to_openssh().unwrap();
+        let chinwag_dir = temp.path().join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::write(
+            chinwag_dir.join("allowed_signers"),
+            format!("alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"),
+        )
+        .unwrap();
+
+        assert!(verify_cwcard_json(temp.path(), &raw).is_ok());
+
+        let mut tampered = env.clone();
+        tampered["edition"] = json!("Counterfeit Edition");
+        let raw_tampered = serde_json::to_string(&tampered).unwrap();
+        assert!(verify_cwcard_json(temp.path(), &raw_tampered).is_err());
     }
 }
