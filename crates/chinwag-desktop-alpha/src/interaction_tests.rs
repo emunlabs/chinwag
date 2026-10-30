@@ -97,8 +97,13 @@ fn signed_sender_requires_explicit_selection_and_uncertain_attempt_reconciles_by
                 Err(error) => panic!("fixture accept: {error}"),
             }
         };
+        // Darwin can inherit the listener's nonblocking flag on accept.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let mut bytes = Vec::new();
         while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {

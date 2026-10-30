@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+mod claude_work_launch;
+mod claude_work_ui;
 mod codex_work_launch;
 mod codex_work_ui;
 mod discovery_ui;
@@ -38,7 +40,7 @@ use gpui_kit::{
     WindowOptions, application, assets, div, init, open_window, px, size,
 };
 
-gpui_kit::actions!(chinwag_alpha, [Quit, ShowOwnedWork]);
+gpui_kit::actions!(chinwag_alpha, [Quit, ShowOwnedWork, ShowClaudeWork]);
 
 const ROOMS: [(&str, &str); 4] = [
     ("#alpha", "Try the workbench"),
@@ -2591,7 +2593,22 @@ fn confirmation_time(milliseconds: u64) -> String {
 }
 
 fn main() {
-    let work = match codex_work_launch::parse(std::env::args_os().skip(1).collect()) {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    let claude_work = match claude_work_launch::parse(arguments.clone()) {
+        Ok(Some(config)) => match chinwag_claude_control::open_work_service(config) {
+            Ok(port) => Some(port),
+            Err(error) => {
+                eprintln!("Could not open owned Claude work: {error}");
+                return;
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("Invalid owned-Claude invocation: {error}");
+            return;
+        }
+    };
+    let work = match codex_work_launch::parse(arguments) {
         Ok(Some(config)) => match chinwag_codex_steer::open_work_service(config) {
             Ok(port) => Some(port),
             Err(error) => {
@@ -2610,6 +2627,55 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus([Menu::new("Chinwag").items([MenuItem::action("Quit Chinwag", Quit)])]);
+        if let Some(port) = claude_work {
+            let show = port.clone();
+            cx.on_action(move |_: &ShowClaudeWork, cx| {
+                if cx.windows().is_empty() {
+                    open_claude_work_window(show.clone(), cx);
+                }
+                cx.activate(true);
+            });
+            cx.bind_keys([KeyBinding::new("cmd-0", ShowClaudeWork, None)]);
+            cx.set_menus([Menu::new("Chinwag").items([
+                MenuItem::action("Show Claude task window", ShowClaudeWork),
+                MenuItem::action("Quit Chinwag and end Claude input", Quit),
+            ])]);
+            let quit = port.clone();
+            let executor = cx.background_executor().clone();
+            cx.on_app_quit(move |_| {
+                let mut updates = quit.subscribe();
+                let _ = quit.end_input();
+                let mut deadline = Box::pin(executor.timer(Duration::from_secs(3)));
+                async move {
+                    loop {
+                        let observed = updates.borrow().clone();
+                        if observed.lifecycle.stdin_ended || observed.lifecycle.child_exited {
+                            break;
+                        }
+                        let mut change = Box::pin(updates.changed());
+                        let stop = std::future::poll_fn(|cx| {
+                            if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+                                return std::task::Poll::Ready(true);
+                            }
+                            match std::future::Future::poll(change.as_mut(), cx) {
+                                std::task::Poll::Ready(result) => {
+                                    std::task::Poll::Ready(result.is_err())
+                                }
+                                std::task::Poll::Pending => std::task::Poll::Pending,
+                            }
+                        })
+                        .await;
+                        if stop {
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+            open_claude_work_window(port, cx);
+            cx.activate(true);
+            return;
+        }
         if let Some(port) = work {
             let show = port.clone();
             cx.on_action(move |_: &ShowOwnedWork, cx| {
@@ -2671,6 +2737,32 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+fn open_claude_work_window(
+    port: std::sync::Arc<dyn chinwag_claude_control::HumanWorkPort>,
+    cx: &mut App,
+) {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(920.), px(820.)),
+            cx,
+        ))),
+        window_min_size: Some(size(px(680.), px(560.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Direct Claude while it works".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    if open_window(options, cx, move |window, cx| {
+        cx.new(|cx| claude_work_ui::ClaudeWorkView::new(port, window, cx))
+    })
+    .is_err()
+    {
+        eprintln!("Could not open owned Claude work window");
+    }
 }
 
 fn open_owned_work_window(

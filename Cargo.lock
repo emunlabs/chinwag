@@ -1309,6 +1309,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "chinwag-claude-control"
+version = "0.0.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "chinwag-cli"
 version = "0.1.0"
 dependencies = [
@@ -1395,12 +1410,14 @@ version = "0.0.1"
 dependencies = [
  "chinwag-bus-client",
  "chinwag-bus-model",
+ "chinwag-claude-control",
  "chinwag-codex-steer",
  "chrono",
  "gpui-kit",
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
