@@ -1,0 +1,11 @@
+[package]
+name = "chinwag-connectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chinwag-connector-registry = { path = "../chinwag-connector-registry" }
+thiserror.workspace = true

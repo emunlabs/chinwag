@@ -1,0 +1,17 @@
+[package]
+name = "chinwag-desktop-alpha"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit = { version = "=0.8.1", features = ["gpui-fast"] }
+chinwag-bus-client = { path = "../chinwag-bus-client" }
+chinwag-bus-model = { path = "../chinwag-bus-model" }
+serde_json = "=1.0.154"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+gpui-kit = { version = "=0.8.1", features = ["gpui-fast", "test-support"] }

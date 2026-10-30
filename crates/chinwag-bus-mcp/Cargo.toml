@@ -1,0 +1,21 @@
+[package]
+name = "chinwag-bus-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chinwag-connectors = { path = "../chinwag-connectors" }
+chinwag-bus-client = { path = "../chinwag-bus-client" }
+chinwag-connector-registry = { path = "../chinwag-connector-registry" }
+rmcp = { version = "=3.7.0", default-features = false, features = ["server", "transport-io"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tokio = { version = "=1.54.1", default-features = false, features = ["macros", "rt", "io-util", "io-std", "sync", "time"] }
+
+[dev-dependencies]
+rmcp = { version = "=3.7.0", default-features = false, features = ["client", "transport-io"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["process"] }
+tempfile = "3"
