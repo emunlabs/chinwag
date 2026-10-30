@@ -809,14 +809,34 @@ fn matching_ssh_pid_does_not_adopt_a_foreign_local_listener() {
 
 #[test]
 fn listener_proof_requires_the_exact_owned_pid_and_loopback_route() {
-    assert!(forward::parse_listener_proof("p999\nn127.0.0.1:44345\n", 999).unwrap());
+    // Captured from the owned macOS forward: -Fpn includes the mandatory f record.
+    assert!(forward::parse_listener_proof("p62877\nf4\nn127.0.0.1:44345\n", 62877).unwrap());
+    assert!(
+        forward::parse_listener_proof("p999\nf4\nn127.0.0.1:44345\nf6\nn127.0.0.1:44345\n", 999,)
+            .unwrap()
+    );
     assert!(!forward::parse_listener_proof("", 999).unwrap());
     for bad in [
-        "p998\nn127.0.0.1:44345\n",
-        "n127.0.0.1:44345\np999\n",
-        "p999\nn*:44345\n",
-        "p999\nn127.0.0.1:44346\n",
-        "p999\np999\nn127.0.0.1:44345\n",
+        "p998\nf4\nn127.0.0.1:44345\n",
+        "n127.0.0.1:44345\np999\nf4\n",
+        "f4\np999\nn127.0.0.1:44345\n",
+        "p999\nn127.0.0.1:44345\n",
+        "p999\n",
+        "p999\nf4\n",
+        "p999\nf4\nf6\nn127.0.0.1:44345\n",
+        "p999\nf4\nn127.0.0.1:44345\nn127.0.0.1:44345\n",
+        "p999\nf4\nn*:44345\n",
+        "p999\nf4\nn[::1]:44345\n",
+        "p999\nf4\nn127.0.0.1:44346\n",
+        "p999\nf4\nn127.0.0.1:44345\np998\nf6\nn127.0.0.1:44345\n",
+        "p999\nf4\nn127.0.0.1:44345\nf4\nn127.0.0.1:44345\n",
+        "p999\nf4\nn127.0.0.1:44345\ntIPv4\n",
+        "p999\nf\nn127.0.0.1:44345\n",
+        "p999\nf-1\nn127.0.0.1:44345\n",
+        "p999\nf4u\nn127.0.0.1:44345\n",
+        "p999\nf 4\nn127.0.0.1:44345\n",
+        "p999\nf2147483648\nn127.0.0.1:44345\n",
+        "p999\nf00000000004\nn127.0.0.1:44345\n",
     ] {
         assert!(forward::parse_listener_proof(bad, 999).is_err());
     }

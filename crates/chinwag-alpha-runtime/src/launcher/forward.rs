@@ -361,19 +361,39 @@ pub(super) fn verify_after_preflight(state: &Path, platform: &mut impl Platform)
 }
 
 pub(super) fn parse_listener_proof(text: &str, pid: u32) -> Result<bool> {
-    let mut owner_seen = false;
-    let mut listener_seen = false;
-    for line in text.lines() {
-        if let Some(owner) = line.strip_prefix('p') {
-            if owner_seen || owner.parse::<u32>().ok() != Some(pid) {
-                return unavailable("listener proof does not match the owned Studio PID");
-            }
-            owner_seen = true;
-        } else if line == "n127.0.0.1:44345" && owner_seen {
-            listener_seen = true;
-        } else {
+    let mut lines = text.lines();
+    let Some(owner) = lines.next() else {
+        return Ok(false);
+    };
+    if owner != format!("p{pid}") {
+        return unavailable("listener proof does not match the owned Studio PID");
+    }
+    let mut descriptors = Vec::new();
+    while let Some(file) = lines.next() {
+        let descriptor = file
+            .strip_prefix('f')
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 10
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value <= i32::MAX as u32)
+            .ok_or_else(|| {
+                RuntimeError::Unavailable(
+                    "listener proof contains an invalid file descriptor".into(),
+                )
+            })?;
+        if descriptors.contains(&descriptor) {
+            return unavailable("listener proof repeats a file descriptor");
+        }
+        if lines.next() != Some("n127.0.0.1:44345") {
             return unavailable("listener proof contains an unexpected route or field");
         }
+        descriptors.push(descriptor);
     }
-    Ok(owner_seen && listener_seen)
+    if descriptors.is_empty() {
+        return unavailable("listener proof is missing a file descriptor and route");
+    }
+    Ok(true)
 }
