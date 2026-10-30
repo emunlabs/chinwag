@@ -1422,6 +1422,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chinwag-native-launch"
+version = "0.0.1"
+dependencies = [
+ "block2 0.6.2",
+ "chinwag-client-discovery",
+ "dispatch2",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "chinwag-seed"
 version = "0.0.1"
 dependencies = [
