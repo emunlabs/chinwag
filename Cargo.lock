@@ -1412,6 +1412,7 @@ dependencies = [
  "chinwag-bus-model",
  "chinwag-claude-control",
  "chinwag-codex-steer",
+ "chinwag-gemini-control",
  "chrono",
  "gpui-kit",
  "rustix",
@@ -1434,6 +1435,21 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "toml_edit 0.25.17+spec-1.1.0",
+]
+
+[[package]]
+name = "chinwag-gemini-control"
+version = "0.0.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
