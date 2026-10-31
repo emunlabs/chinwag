@@ -175,6 +175,8 @@ struct Shared {
     identity: Arc<()>,
     state: Mutex<State>,
     snapshots: watch::Sender<WorkSnapshot>,
+    publication: mpsc::Sender<()>,
+    publication_rx: Mutex<Option<mpsc::Receiver<()>>>,
     ended: Arc<AtomicBool>,
     end: watch::Sender<bool>,
     writer: tokio::sync::Mutex<Option<WriteIo>>,
@@ -187,6 +189,9 @@ struct Shared {
 }
 impl Shared {
     fn publish(&self) {
+        let _ = self.publication.try_send(());
+    }
+    fn publish_now(&self) {
         let snapshot = {
             let Ok(mut s) = self.state.lock() else {
                 return;
@@ -464,7 +469,9 @@ pub(crate) fn open_with(
                     if let Ok(mut s) = shared.state.lock() {
                         s.snapshot.phase = WorkPhase::Unavailable;
                     }
-                    shared.publish();
+                    // There is no serviced runtime/reader on this failure path.
+                    // Publish from this already-owned thread, never the API caller.
+                    shared.publish_now();
                 }
             }
         })
@@ -475,6 +482,7 @@ fn new_shared(config: WorkConfig) -> (Arc<Shared>, mpsc::Receiver<(String, Input
     let (snapshot, _) = watch::channel(WorkSnapshot::ready(config.folder_label()));
     let (end, _) = watch::channel(false);
     let (events, receiver) = mpsc::channel(MAX_OPERATIONS * 8);
+    let (publication, publication_rx) = mpsc::channel(1);
     let initial = snapshot.borrow().clone();
     let shared = Arc::new(Shared {
         identity: Arc::new(()),
@@ -494,6 +502,8 @@ fn new_shared(config: WorkConfig) -> (Arc<Shared>, mpsc::Receiver<(String, Input
         }),
         config: config.clone(),
         snapshots: snapshot,
+        publication,
+        publication_rx: Mutex::new(Some(publication_rx)),
         ended: Arc::new(AtomicBool::new(false)),
         end,
         writer: tokio::sync::Mutex::new(None),
@@ -525,6 +535,25 @@ async fn run(
     mut events: mpsc::Receiver<(String, InputEvidence)>,
     spawner: Arc<dyn Spawner>,
 ) {
+    let publications = shared
+        .publication_rx
+        .lock()
+        .ok()
+        .and_then(|mut receiver| receiver.take());
+    if let Some(mut publications) = publications {
+        let publisher = shared.clone();
+        tokio::spawn(async move {
+            while publications.recv().await.is_some() {
+                let target = publisher.clone();
+                if tokio::task::spawn_blocking(move || target.publish_now())
+                    .await
+                    .is_err()
+                {
+                    publisher.fence();
+                }
+            }
+        });
+    }
     let path = shared.config.journal.clone();
     let opened = tokio::task::spawn_blocking(move || InputJournal::open(&path)).await;
     let journal = match opened {
@@ -1421,6 +1450,8 @@ pub(crate) fn observed_fixture_session() -> Result<ObservedSession> {
             serde_json::json!({"type":"system","subtype":"init","session_id":session,"claude_code_version":CLI_VERSION,"cwd":"/fixture/work","tools":[],"permissionMode":"default"}),
         )?)?,
     );
+    // This synthetic observer helper has no retained owner publisher.
+    shared.publish_now();
     let session = shared.snapshots.borrow().session.clone();
     session.ok_or(ClaudeError::NoSession)
 }

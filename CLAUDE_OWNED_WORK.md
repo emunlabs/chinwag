@@ -41,6 +41,8 @@ Each explicit Start or direction has one original 30-second effect budget. Human
 
 The display keeps local intent, frame write, exact input echo, attributed reply, result and lifecycle observations separate. An echo acknowledges input handling. Reply UUID correlation identifies associated output. A successful result can be zero-model when a hook blocks input. None independently proves model awareness, applied direction, changed files or durable remote execution. A changed follow-up can establish prose redirection; changed-file or application claims require corresponding artifact verification.
 
+Status delivery coalesces the latest owned state independently of callers and protocol readers. End input establishes its authority fence synchronously; a displayed snapshot can arrive later, including while a caller retains an older status borrow. Status delivery is not a durable action receipt or a worker-join claim.
+
 The retained owner outlives a view and individual UI waiters. Closing a window does not request interruption or end input. Explicit **End input** fences later writes and releases stdin; application Quit is an explicit lifecycle boundary. Chinwag does not send OS terminate/kill escalation. End input, output EOF, actual child wait and joined workers remain different facts. A local shutdown deadline does not prove the model, background work or external process has stopped.
 
 ## Validation boundary

@@ -732,6 +732,7 @@ fn native_clicks_cross_the_real_owner_wire_and_journal_before_the_turn_ends(
         );
     });
     let original = "Write prose literally: /not-a-command @not-a-file";
+    let mut submitted_id = String::new();
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, cx| {
             view.editor.update(cx, |state, cx| state.focus(window, cx))
@@ -740,22 +741,43 @@ fn native_clicks_cross_the_real_owner_wire_and_journal_before_the_turn_ends(
         window.input(original, cx);
         window.draw(cx).clear(cx);
         window.click("submit-claude-work", cx);
+        submitted_id = view
+            .read(cx)
+            .flight
+            .as_ref()
+            .expect("human Start flight")
+            .id
+            .clone();
         window.click("submit-claude-work", cx);
     })
     .unwrap();
     let initialize = runtime.block_on(read_peer_frame(&mut peer.io));
     assert_eq!(initialize["type"], "control_request");
     assert_eq!(initialize["request"]["subtype"], "initialize");
-    let saved = port
-        .subscribe()
-        .borrow()
-        .start
-        .clone()
-        .expect("Start saved before initialize");
-    assert!(
-        journal
-            .join(format!("{}.jsonl", saved.operation.id))
-            .is_file()
+    // The actual first wire effect and coalesced watch publication can race.
+    // Check the exact original Saved bytes now, before waiting for any watch
+    // update; publication delivery is not the consume-before-effect proof.
+    let bytes = std::fs::read(journal.join(format!("{submitted_id}.jsonl")))
+        .expect("original Saved record exists when initialize is observed");
+    let first = bytes.split(|byte| *byte == b'\n').next().unwrap();
+    let saved_line: serde_json::Value = serde_json::from_slice(first).unwrap();
+    assert_eq!(saved_line["type"], "saved");
+    assert_eq!(saved_line["operation"]["id"], submitted_id);
+    assert_eq!(saved_line["operation"]["text"], original);
+    assert_eq!(
+        saved_line["operation"]["startup"]["policy"],
+        "managed_policy_prose_only"
+    );
+    let published = wait_snapshot(&runtime, &port, |snapshot| {
+        snapshot
+            .start
+            .as_ref()
+            .is_some_and(|receipt| receipt.operation.id == submitted_id)
+    });
+    let saved = published.start.unwrap();
+    assert_eq!(
+        saved_line["operation"],
+        serde_json::to_value(&saved.operation).unwrap()
     );
     runtime.block_on(send_peer_frame(&mut peer.io, json!({"type":"control_response","response":{
         "subtype":"success","request_id":initialize["request_id"],"response":{"claude_code_version":"2.1.314"}

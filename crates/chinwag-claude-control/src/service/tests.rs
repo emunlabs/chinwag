@@ -61,7 +61,8 @@ fn ready() -> (
             },
         );
     }
-    shared.publish();
+    // This pure observer fixture has no owner publication task.
+    shared.publish_now();
     (shared, saved, events)
 }
 fn assert_no_bytes(peer: &mut DuplexStream) {
@@ -181,6 +182,7 @@ async fn partial_input_fault_fences_new_writes_but_keeps_late_evidence() {
     *shared.writer.lock().await = Some(Box::new(PartialFault(false)));
     let e = write_input(&shared, &saved, Instant::now() + Duration::from_secs(30)).await;
     assert!(e.write_uncertain);
+    shared.publish_now();
     assert!(shared.snapshots.borrow().session.is_none());
     observe(
         &shared,
@@ -209,6 +211,7 @@ fn wrong_startup_policy_or_foreign_session_cannot_mint_target() {
             manual_empty: false,
         },
     );
+    shared.publish_now();
     assert!(shared.snapshots.borrow().session.is_none());
     assert!(shared.state.lock().unwrap().fenced);
 }
@@ -283,6 +286,70 @@ fn fixture() -> Fixture {
         spawned,
     }
 }
+
+#[test]
+fn public_end_input_returns_while_watch_snapshot_is_borrowed() {
+    let fixture = fixture();
+    let updates = fixture.port.subscribe();
+    let borrowed = updates.borrow();
+    let port = fixture.port.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let _ = entered_tx.send(());
+        let result = port.end_input();
+        let _ = returned_tx.send(result);
+    });
+
+    let entered = entered_rx.recv_timeout(Duration::from_secs(3));
+    let returned_while_borrowed = if entered.is_ok() {
+        returned_rx.recv_timeout(Duration::from_secs(3))
+    } else {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    };
+    let write_admission_while_borrowed =
+        matches!(&returned_while_borrowed, Ok(Ok(()))).then(|| {
+            fixture.port.start(
+                "55555555-5555-4555-8555-555555555555",
+                "This must not start after EndInput",
+            )
+        });
+
+    // The original synchronous publication blocks on this borrow. Release it
+    // and join before asserting, so its intended red result cannot strand a
+    // caller thread or make Cargo hang.
+    drop(borrowed);
+    if returned_while_borrowed.is_err() && returned_rx.recv_timeout(Duration::from_secs(3)).is_err()
+    {
+        // A future API fault beyond the original watch-lock bug must fail
+        // within a bound instead of hanging the test runner in join().
+        drop(caller);
+        panic!("EndInput caller remained blocked after the watch borrow was released");
+    }
+    let joined = caller.join();
+    assert!(
+        joined.is_ok(),
+        "EndInput caller joins after releasing the borrow"
+    );
+    assert!(
+        entered.is_ok(),
+        "the caller reached its public API invocation"
+    );
+    assert!(
+        matches!(returned_while_borrowed, Ok(Ok(()))),
+        "synchronous EndInput must return while the watch borrow remains held"
+    );
+    assert_eq!(
+        write_admission_while_borrowed,
+        Some(Err(ClaudeError::Unavailable)),
+        "EndInput must close write admission before returning, even while publication is blocked"
+    );
+    assert!(
+        !fixture.spawned.load(Ordering::Acquire),
+        "no child is started by mounting or EndInput"
+    );
+}
+
 async fn read_json(peer: &mut DuplexStream) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut b = Vec::new();
@@ -463,6 +530,7 @@ fn unsolicited_activity_before_initial_write_is_not_legitimized_by_later_init() 
                 manual_empty: true,
             },
         );
+        shared.publish_now();
         assert!(shared.snapshots.borrow().session.is_none());
         assert!(shared.state.lock().unwrap().fenced);
     }
@@ -481,6 +549,7 @@ fn unsolicited_activity_before_initial_write_is_not_legitimized_by_later_init() 
             manual_empty: true,
         },
     );
+    shared.publish_now();
     assert!(shared.state.lock().unwrap().corroborated);
     assert!(!shared.state.lock().unwrap().fenced);
     assert!(shared.snapshots.borrow().session.is_none());
@@ -498,6 +567,7 @@ async fn conversation_reset_invalidates_exact_observed_target_without_adoption_o
         commands: tx,
     };
     observe(&shared,wire::parse(&wire::encode(json!({"type":"conversation_reset","session_id":SESSION,"new_conversation_id":"55555555-5555-4555-8555-555555555555","uuid":new_operation_id().unwrap()})).unwrap()).unwrap());
+    shared.publish_now();
     assert!(shared.snapshots.borrow().session.is_none());
     assert_eq!(
         shared.snapshots.borrow().phase,
