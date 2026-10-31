@@ -186,7 +186,18 @@ pub(super) async fn write_bootstrap(
     frame: Vec<u8>,
     deadline: Instant,
 ) -> Result<()> {
-    match write_frame(shared, frame, deadline, |_| Ok(())).await {
+    match write_frame(shared, frame, deadline, |s| {
+        if !s
+            .records
+            .values()
+            .any(|p| p.saved.kind == ActionKind::Start && p.ticket.permits(&p.saved.id))
+        {
+            return Err(GeminiError::PermissionDenied);
+        }
+        Ok(())
+    })
+    .await
+    {
         WriteResult::Written => Ok(()),
         WriteResult::NoDispatch => Err(GeminiError::Unavailable),
         WriteResult::Uncertain => Err(GeminiError::Uncertain),
@@ -214,7 +225,11 @@ pub(super) async fn write_prompt(
         }
     };
     let result = write_frame(shared, frame, deadline, |s| {
-        if !s.initialized
+        if !s
+            .records
+            .get(&saved.id)
+            .is_some_and(|p| p.ticket.permits(&saved.id))
+            || !s.initialized
             || s.session.as_ref() != Some(&sid)
             || s.epoch != saved.session_epoch
             || s.active.is_some()
@@ -264,7 +279,11 @@ pub(super) async fn write_cancel(
         }
     };
     let result = write_frame(shared, frame, deadline, |s| {
-        if s.epoch != saved.session_epoch
+        if !s
+            .records
+            .get(&saved.id)
+            .is_some_and(|p| p.ticket.permits(&saved.id))
+            || s.epoch != saved.session_epoch
             || s.session.as_deref() != Some(sid)
             || !s.active.as_ref().is_some_and(|a| {
                 a.rpc_id == saved.prompt_rpc_id && a.generation == saved.prompt_generation

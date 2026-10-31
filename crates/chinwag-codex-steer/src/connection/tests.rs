@@ -844,3 +844,55 @@ async fn contradictory_initial_success_preserves_first_turn_and_fences_delayed_s
     drop(reading);
     f.connection.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn known_full_native_history_rejects_read_only_human_capture_without_frame() {
+    let mut f = fresh_fixture();
+    let _initial = initial(&mut f).await;
+    let target = active(&mut f, "turn-owned").await;
+    {
+        let mut state = f.connection.shared.state.lock().unwrap();
+        for index in 0..MAX_OPERATIONS {
+            let id = format!("retained-native-steer-{index:04}");
+            state.records.insert(
+                id.clone(),
+                Pending {
+                    record: SavedSteer {
+                        schema: OPERATION_SCHEMA.into(),
+                        id,
+                        transport_epoch: f.connection.shared.epoch.clone(),
+                        thread_id: THREAD.into(),
+                        expected_turn_id: target.turn_id().into(),
+                        text: TEXT.into(),
+                    },
+                    rpc_id: format!("native-rpc-{index}"),
+                    evidence: Evidence::default(),
+                    may_have_written: false,
+                },
+            );
+        }
+    }
+    assert_eq!(
+        f.connection
+            .capture_human_action_before(
+                &target,
+                "new-team-full-0001",
+                TEXT,
+                Instant::now() + Duration::from_secs(30)
+            )
+            .err(),
+        Some(SteerError::Capacity)
+    );
+    assert!(f.connection.active_turn().is_some());
+    assert_eq!(
+        f.connection.shared.state.lock().unwrap().records.len(),
+        MAX_OPERATIONS
+    );
+    let mut reading = Box::pin(f.peer.read_u8());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(reading.as_mut().poll(cx).is_pending()))
+            .await
+    );
+    drop(reading);
+    f.connection.shutdown().await.unwrap();
+}

@@ -291,7 +291,41 @@ async fn full_port_starts_only_on_human_action_and_steers_before_initial_ack_or_
     no_frame(&mut peer).await;
     let mut observations = port.subscribe();
     assert!(observations.borrow().target.is_some());
-    port.steer(&target, STEER_ID, STEER_TEXT).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    assert_eq!(
+        port.prepare_steer(
+            &target,
+            "expired-team-steer-0001",
+            STEER_TEXT,
+            Instant::now() - Duration::from_secs(1)
+        )
+        .err(),
+        Some(SteerError::PermissionDenied)
+    );
+    let dropped = port
+        .prepare_steer(&target, "dropped-team-steer-0001", STEER_TEXT, deadline)
+        .unwrap();
+    let stale = port
+        .prepare_steer(&target, "stale-team-steer-0001", STEER_TEXT, deadline)
+        .unwrap();
+    let prepared = port
+        .prepare_steer(&target, STEER_ID, STEER_TEXT, deadline)
+        .unwrap();
+    assert_eq!(prepared.operation().thread_id, THREAD);
+    assert_eq!(prepared.operation().expected_turn_id, TURN);
+    assert_eq!(prepared.deadline(), deadline);
+    assert_eq!(dropped.captured_sequence(), prepared.captured_sequence());
+    drop(dropped);
+    assert!(
+        !fixture
+            .config
+            .journal
+            .join("steers")
+            .join(format!("{STEER_ID}.jsonl"))
+            .exists()
+    );
+    no_frame(&mut peer).await;
+    port.submit_prepared_steer(prepared).unwrap();
     let steer = frame(&mut peer).await;
     assert_eq!(steer["method"], "turn/steer");
     assert_eq!(
@@ -330,6 +364,18 @@ async fn full_port_starts_only_on_human_action_and_steers_before_initial_ack_or_
         "Steer acceptance must not fabricate initial acceptance"
     );
 
+    assert_eq!(
+        port.submit_prepared_steer(stale),
+        Err(SteerError::StaleTarget)
+    );
+    assert!(
+        !fixture
+            .config
+            .journal
+            .join("steers/stale-team-steer-0001.jsonl")
+            .exists()
+    );
+    no_frame(&mut peer).await;
     let revision = observations.borrow().revision;
     port.start(START_ID, START_TEXT).unwrap();
     snapshot(&mut observations, |value| {
@@ -632,4 +678,62 @@ async fn malformed_archive_reports_storage_failure_without_reconnecting_or_adopt
     fixture.no_second_connection().await;
     port.close().unwrap();
     snapshot(&mut updates, |s| s.phase == WorkPhase::Closed).await;
+}
+
+#[tokio::test]
+async fn prepare_steer_detects_lookup_saturated_queue_without_reservation() {
+    let (commands, mut queued) = mpsc::channel(1);
+    let (snapshots, _) = watch::channel(WorkSnapshot::ready("fixture".into()));
+    let (close, _) = watch::channel(false);
+    let admission = Arc::new(Mutex::new(Admission::default()));
+    let port = Client {
+        commands,
+        snapshots: snapshots.subscribe(),
+        close,
+        flight: Arc::new(AtomicBool::new(false)),
+        admission: admission.clone(),
+        controller: Arc::new(Mutex::new(None)),
+        command_seen: Arc::new(tokio::sync::Notify::new()),
+    };
+    port.lookup(STEER_ID).unwrap();
+    assert_eq!(port.commands.capacity(), 0);
+    // Capacity is checked before controller access. A target must still be genuinely observed;
+    // this fixture obtains one from the existing synthetic observer factory.
+    use tokio::io::AsyncWriteExt;
+    let (io, mut peer) = tokio::io::duplex(16384);
+    let (reader, writer) = tokio::io::split(io);
+    let scope = crate::OwnerControlScope::new(
+        "synthetic-human-owner".into(),
+        THREAD.into(),
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let (connection, _owner) =
+        crate::CodexSteerConnection::from_established_io(scope, reader, writer).unwrap();
+    let mut activity = connection.subscribe_activity();
+    tokio::time::timeout(WAIT,peer.write_all(format!("{}\n",json!({"method":"turn/started","params":{"threadId":THREAD,"turn":turn("inProgress")}})).as_bytes())).await.unwrap().unwrap();
+    let target = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(target) = connection.active_turn() {
+                break target;
+            }
+            activity.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        port.prepare_steer(
+            &target,
+            STEER_ID,
+            STEER_TEXT,
+            Instant::now() + Duration::from_secs(30)
+        )
+        .err(),
+        Some(SteerError::Busy)
+    );
+    assert_eq!(admission.lock().unwrap().prepare_sequence().unwrap(), 0);
+    assert!(!port.flight.load(Ordering::Acquire));
+    assert!(queued.try_recv().is_ok());
+    connection.shutdown().await.unwrap();
 }

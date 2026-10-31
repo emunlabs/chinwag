@@ -44,6 +44,7 @@ fn ready() -> (
         s.records.insert(
             ID.into(),
             Pending {
+                ticket: Admission::default().admit(None, &saved.id).unwrap(),
                 saved: saved.clone(),
                 evidence: InputEvidence::default(),
                 may_written: false,
@@ -55,6 +56,7 @@ fn ready() -> (
         s.records.insert(
             initial.id.clone(),
             Pending {
+                ticket: Admission::default().admit(None, &initial.id).unwrap(),
                 saved: initial,
                 evidence: InputEvidence::default(),
                 may_written: true,
@@ -456,9 +458,21 @@ async fn busy_session_accepts_distinct_human_direction_before_initial_result() {
     let (first, mut snapshots) = begin(&mut f).await;
     let target = snapshots.borrow().session.clone().unwrap();
     let id = new_operation_id().unwrap();
-    f.port
-        .direction(&target, &id, "a human steer", InputTiming::AfterTools)
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let prepared = f
+        .port
+        .prepare_direction(
+            &target,
+            &id,
+            "a human steer",
+            InputTiming::AfterTools,
+            deadline,
+        )
         .unwrap();
+    assert_eq!(prepared.deadline(), deadline);
+    assert_eq!(prepared.operation().session_id, target.session_id());
+    assert_no_bytes(&mut f.peer);
+    f.port.submit_prepared_direction(prepared).unwrap();
     let frame = read_json(&mut f.peer).await;
     assert_eq!(frame["uuid"], id);
     assert_eq!(frame["priority"], "next");
@@ -605,4 +619,244 @@ fn retained_assistant_text_cap_includes_separators_and_utf8() {
         assert_eq!(text.len(), MAX_TEXT_BYTES);
         assert!(text.is_char_boundary(text.len()));
     }
+}
+
+#[test]
+fn prepared_direction_is_read_only_and_lookup_cannot_release_its_later_ticket() {
+    let (shared, _, _events) = ready();
+    let (commands, mut queue) = mpsc::channel(8);
+    let client = Client {
+        shared: shared.clone(),
+        commands,
+    };
+    let target = shared.snapshots.borrow().session.clone().unwrap();
+    let id = new_operation_id().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let prepared = client
+        .prepare_direction(
+            &target,
+            &id,
+            "shared human direction",
+            InputTiming::AfterTools,
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(prepared.deadline(), deadline);
+    assert_eq!(prepared.operation().id, id);
+    assert_eq!(prepared.operation().timing, InputTiming::AfterTools);
+    let older = client
+        .prepare_direction(
+            &target,
+            &new_operation_id().unwrap(),
+            "older unsubmitted",
+            InputTiming::Now,
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(prepared.captured_sequence(), older.captured_sequence());
+    assert!(queue.try_recv().is_err());
+    assert!(!shared.flight.load(Ordering::Acquire));
+    assert_eq!(shared.state.lock().unwrap().records.len(), 2);
+    client.lookup(ID).unwrap();
+    client.submit_prepared_direction(prepared).unwrap();
+    let lookup = queue.try_recv().unwrap();
+    assert!(matches!(lookup.command, Command::Lookup(_)));
+    shared.completed(ID.into(), ActionKind::Lookup, true, None);
+    shared.release(lookup.ticket.as_ref());
+    assert!(
+        shared.flight.load(Ordering::Acquire),
+        "Lookup cannot release an admitted Direction"
+    );
+    assert_eq!(
+        client
+            .prepare_direction(
+                &target,
+                &new_operation_id().unwrap(),
+                "must remain busy",
+                InputTiming::Now,
+                deadline
+            )
+            .err(),
+        Some(ClaudeError::Busy)
+    );
+    let input = queue.try_recv().unwrap();
+    shared.release(input.ticket.as_ref());
+    assert_eq!(
+        client.submit_prepared_direction(older),
+        Err(ClaudeError::StaleSession)
+    );
+    assert!(!shared.flight.load(Ordering::Acquire));
+    assert!(queue.try_recv().is_err());
+}
+
+#[test]
+fn prepared_direction_rejects_foreign_owner_expired_deadline_and_queue_failure_without_admission() {
+    let (shared, _, _events) = ready();
+    let (commands, mut queue) = mpsc::channel(1);
+    let client = Client {
+        shared: shared.clone(),
+        commands,
+    };
+    let target = shared.snapshots.borrow().session.clone().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut expired = client
+        .prepare_direction(
+            &target,
+            &new_operation_id().unwrap(),
+            "original budget",
+            InputTiming::Now,
+            deadline,
+        )
+        .unwrap();
+    expired.deadline = Instant::now() - Duration::from_secs(1);
+    assert_eq!(
+        client.submit_prepared_direction(expired),
+        Err(ClaudeError::PermissionDenied)
+    );
+    let prepared = client
+        .prepare_direction(
+            &target,
+            &new_operation_id().unwrap(),
+            "queue bounded",
+            InputTiming::Now,
+            deadline,
+        )
+        .unwrap();
+    let sequence = prepared.captured_sequence();
+    client.lookup(ID).unwrap();
+    assert_eq!(
+        client
+            .prepare_direction(
+                &target,
+                &new_operation_id().unwrap(),
+                "queue already full",
+                InputTiming::Now,
+                deadline
+            )
+            .err(),
+        Some(ClaudeError::Busy)
+    );
+    assert_eq!(
+        client.submit_prepared_direction(prepared),
+        Err(ClaudeError::Busy)
+    );
+    assert_eq!(
+        shared
+            .input_admission
+            .lock()
+            .unwrap()
+            .prepare_sequence()
+            .unwrap(),
+        sequence
+    );
+    assert!(!shared.flight.load(Ordering::Acquire));
+    queue.try_recv().unwrap();
+    let (other, _, _events) = ready();
+    let (commands, _queue) = mpsc::channel(1);
+    let foreign = Client {
+        shared: other,
+        commands,
+    };
+    let prepared = client
+        .prepare_direction(
+            &target,
+            &new_operation_id().unwrap(),
+            "exact owner",
+            InputTiming::Now,
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(
+        foreign.submit_prepared_direction(prepared),
+        Err(ClaudeError::StaleSession)
+    );
+}
+
+#[tokio::test]
+async fn admitted_direction_final_write_uses_ticket_and_original_deadline_not_latest_sequence() {
+    let (shared, saved, _events) = ready();
+    let (writer, mut peer) = tokio::io::duplex(16384);
+    *shared.writer.lock().await = Some(Box::new(writer));
+    let ticket = shared
+        .input_admission
+        .lock()
+        .unwrap()
+        .admit(None, &saved.id)
+        .unwrap();
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .records
+        .get_mut(&saved.id)
+        .unwrap()
+        .ticket = ticket.clone();
+    shared.input_admission.lock().unwrap().invalidate();
+    let e = write_input(&shared, &saved, Instant::now() + Duration::from_secs(30)).await;
+    assert!(
+        e.frame_written && !e.not_dispatched,
+        "newer sequence cannot revoke an admitted ticket"
+    );
+    let mut bytes = vec![0; wire::input(&saved).unwrap().len()];
+    tokio::time::timeout(Duration::from_secs(3), peer.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    shared.release(Some(&ticket));
+    let e = write_input(&shared, &saved, Instant::now() + Duration::from_secs(30)).await;
+    assert!(e.not_dispatched && !e.write_uncertain);
+    assert_no_bytes(&mut peer);
+}
+
+#[test]
+fn known_full_native_history_rejects_prepare_without_sequence_or_reservation() {
+    let (shared, saved, _events) = ready();
+    {
+        let mut s = shared.state.lock().unwrap();
+        for index in 0..MAX_OPERATIONS - 2 {
+            let mut operation = saved.clone();
+            operation.id = format!("00000000-0000-4000-8000-{index:012x}");
+            let ticket = Admission::default().admit(None, &operation.id).unwrap();
+            s.records.insert(
+                operation.id.clone(),
+                Pending {
+                    ticket,
+                    saved: operation,
+                    evidence: InputEvidence::default(),
+                    may_written: false,
+                },
+            );
+        }
+        assert_eq!(s.records.len(), MAX_OPERATIONS);
+    }
+    let (commands, mut queued) = mpsc::channel(8);
+    let client = Client {
+        shared: shared.clone(),
+        commands,
+    };
+    let target = shared.snapshots.borrow().session.clone().unwrap();
+    assert_eq!(
+        client
+            .prepare_direction(
+                &target,
+                &new_operation_id().unwrap(),
+                "no capacity",
+                InputTiming::Now,
+                Instant::now() + Duration::from_secs(30)
+            )
+            .err(),
+        Some(ClaudeError::Capacity)
+    );
+    assert_eq!(
+        shared
+            .input_admission
+            .lock()
+            .unwrap()
+            .prepare_sequence()
+            .unwrap(),
+        0
+    );
+    assert!(!shared.flight.load(Ordering::Acquire));
+    assert!(queued.try_recv().is_err());
+    assert_eq!(shared.state.lock().unwrap().records.len(), MAX_OPERATIONS);
 }

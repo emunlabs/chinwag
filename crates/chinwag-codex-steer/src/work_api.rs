@@ -3,7 +3,11 @@
 
 use crate::{Evidence, ObservedActiveTurn, Receipt, Result, SteerError};
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path, PathBuf};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tokio::sync::watch;
 
 #[derive(Clone)]
@@ -138,6 +142,26 @@ impl WorkSnapshot {
     }
 }
 
+/// A read-only captured native human action. Only its owning port can admit it.
+/// The audit record is data; it cannot reconstruct this non-cloneable token.
+pub struct PreparedWorkSteer {
+    pub(crate) action: crate::connection::HumanSteerAction,
+    pub(crate) operation: crate::SavedSteer,
+    pub(crate) sequence: u64,
+    pub(crate) owner: Arc<Mutex<crate::admission::Admission>>,
+}
+impl PreparedWorkSteer {
+    pub fn operation(&self) -> &crate::SavedSteer {
+        &self.operation
+    }
+    pub fn captured_sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub fn deadline(&self) -> Instant {
+        self.action.deadline()
+    }
+}
+
 /// A trusted native human-action handler uses this port. Queue admission is not
 /// protocol acceptance. Original receipts arrive through the retained snapshot.
 /// Dropping a view, receiver or caller never requests Close.
@@ -145,6 +169,18 @@ pub trait HumanWorkPort: Send + Sync {
     fn subscribe(&self) -> watch::Receiver<WorkSnapshot>;
     fn start(&self, operation_id: &str, text: &str) -> Result<()>;
     fn steer(&self, target: &ObservedActiveTurn, operation_id: &str, text: &str) -> Result<()>;
+    fn prepare_steer(
+        &self,
+        _target: &ObservedActiveTurn,
+        _operation_id: &str,
+        _text: &str,
+        _deadline: Instant,
+    ) -> Result<PreparedWorkSteer> {
+        Err(SteerError::Unavailable)
+    }
+    fn submit_prepared_steer(&self, _prepared: PreparedWorkSteer) -> Result<()> {
+        Err(SteerError::Unavailable)
+    }
     fn lookup(&self, operation_id: &str) -> Result<()>;
     /// Closes this connection only. Work may continue; no server-stop claim.
     fn close(&self) -> Result<()>;

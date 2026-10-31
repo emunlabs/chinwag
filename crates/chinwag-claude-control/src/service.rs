@@ -1,4 +1,5 @@
 use crate::{
+    admission::{Admission, Ticket},
     api::{valid_text, valid_uuid},
     binary::{self, BinaryPin},
     journal::{Consume, InputJournal},
@@ -139,6 +140,7 @@ impl Spawner for NativeSpawner {
 }
 #[derive(Clone)]
 struct Captured {
+    ticket: Ticket,
     saved: SavedInput,
     deadline: Instant,
 }
@@ -148,10 +150,15 @@ enum Command {
         text: String,
         deadline: Instant,
     },
-    Direction(Captured),
+    Direction(Box<Captured>),
     Lookup(String),
 }
+struct Queued {
+    command: Command,
+    ticket: Option<Ticket>,
+}
 struct Pending {
+    ticket: Ticket,
     saved: SavedInput,
     evidence: InputEvidence,
     may_written: bool,
@@ -184,6 +191,7 @@ struct Shared {
     evidence: Mutex<Option<mpsc::Sender<(String, InputEvidence)>>>,
     flight: AtomicBool,
     admission: Arc<Mutex<()>>,
+    input_admission: Mutex<Admission>,
     #[cfg(test)]
     before_write: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
@@ -243,6 +251,11 @@ impl Shared {
     }
     fn end_input(&self) {
         {
+            let mut control = self
+                .input_admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            control.invalidate();
             let _effect = self.admission.lock();
             let _linearize = self.state.lock();
             self.ended.store(true, Ordering::Release);
@@ -276,7 +289,15 @@ impl Shared {
                 error,
             });
         }
-        self.flight.store(false, Ordering::Release);
+        self.publish();
+    }
+    fn release(&self, ticket: Option<&Ticket>) {
+        if let Some(ticket) = ticket
+            && let Ok(mut control) = self.input_admission.lock()
+            && control.release(ticket)
+        {
+            self.flight.store(false, Ordering::Release);
+        }
         self.publish();
     }
     fn emit(&self, id: &str, e: InputEvidence) {
@@ -335,24 +356,59 @@ impl Shared {
 }
 struct Client {
     shared: Arc<Shared>,
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<Queued>,
 }
 impl Client {
-    fn send(&self, c: Command) -> Result<()> {
+    fn send_start(&self, id: &str, text: &str, deadline: Instant) -> Result<()> {
+        let mut control = self
+            .shared
+            .input_admission
+            .lock()
+            .map_err(|_| ClaudeError::Unavailable)?;
         if self.shared.ended.load(Ordering::Acquire) {
             return Err(ClaudeError::Unavailable);
         }
-        if self
-            .shared
-            .flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+        let permit = self.commands.try_reserve().map_err(|_| ClaudeError::Busy)?;
+        let ticket = control.admit(None, id)?;
+        self.shared.flight.store(true, Ordering::Release);
+        permit.send(Queued {
+            command: Command::Start {
+                id: id.into(),
+                text: text.into(),
+                deadline,
+            },
+            ticket: Some(ticket),
+        });
+        Ok(())
+    }
+    fn validate_target(
+        &self,
+        s: &State,
+        target: &ObservedSession,
+        deadline: Instant,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&target.identity, &self.shared.identity)
+            || target.epoch != s.epoch
+            || target.session_id != s.session_id
+            || target.generation != 1
         {
-            return Err(ClaudeError::Busy);
+            return Err(ClaudeError::StaleSession);
         }
-        if self.commands.try_send(c).is_err() {
-            self.shared.flight.store(false, Ordering::Release);
-            return Err(ClaudeError::Busy);
+        if self.shared.ended.load(Ordering::Acquire)
+            || s.snapshot.lifecycle.child_exited
+            || s.snapshot.lifecycle.stdout_eof
+            || s.snapshot.lifecycle.stdin_ended
+        {
+            return Err(ClaudeError::Unavailable);
+        }
+        if s.fenced {
+            return Err(ClaudeError::OwnerInterventionRequired);
+        }
+        if Instant::now() >= deadline || !s.owner_deadline.is_some_and(|d| Instant::now() < d) {
+            return Err(ClaudeError::PermissionDenied);
+        }
+        if !s.corroborated {
+            return Err(ClaudeError::NoSession);
         }
         Ok(())
     }
@@ -365,11 +421,7 @@ impl HumanWorkPort for Client {
         if !valid_uuid(id) || !valid_text(text) {
             return Err(ClaudeError::InvalidInput);
         }
-        self.send(Command::Start {
-            id: id.into(),
-            text: text.into(),
-            deadline: Instant::now() + Duration::from_secs(30),
-        })
+        self.send_start(id, text, Instant::now() + Duration::from_secs(30))
     }
     fn direction(
         &self,
@@ -378,43 +430,52 @@ impl HumanWorkPort for Client {
         text: &str,
         timing: InputTiming,
     ) -> Result<()> {
+        let prepared = self.prepare_direction(
+            target,
+            id,
+            text,
+            timing,
+            Instant::now() + Duration::from_secs(30),
+        )?;
+        self.submit_prepared_direction(prepared)
+    }
+    fn prepare_direction(
+        &self,
+        target: &ObservedSession,
+        id: &str,
+        text: &str,
+        timing: InputTiming,
+        deadline: Instant,
+    ) -> Result<PreparedDirection> {
         if !valid_uuid(id) || !valid_text(text) {
             return Err(ClaudeError::InvalidInput);
+        }
+        let now = Instant::now();
+        if deadline <= now {
+            return Err(ClaudeError::PermissionDenied);
+        }
+        if deadline > now + Duration::from_secs(30) {
+            return Err(ClaudeError::InvalidInput);
+        }
+        let control = self
+            .shared
+            .input_admission
+            .lock()
+            .map_err(|_| ClaudeError::Unavailable)?;
+        let sequence = control.prepare_sequence()?;
+        if self.commands.capacity() == 0 {
+            return Err(ClaudeError::Busy);
         }
         let s = self
             .shared
             .state
             .lock()
             .map_err(|_| ClaudeError::Unavailable)?;
-        if !Arc::ptr_eq(&target.identity, &self.shared.identity)
-            || target.epoch != s.epoch
-            || target.session_id != s.session_id
-            || target.generation != 1
-        {
-            return Err(ClaudeError::StaleSession);
+        self.validate_target(&s, target, deadline)?;
+        if s.records.len() >= MAX_OPERATIONS && !s.records.contains_key(id) {
+            return Err(ClaudeError::Capacity);
         }
-        if s.snapshot.lifecycle.child_exited
-            || s.snapshot.lifecycle.stdout_eof
-            || s.snapshot.lifecycle.stdin_ended
-        {
-            return Err(ClaudeError::Unavailable);
-        }
-        if self.shared.ended.load(Ordering::Acquire) {
-            return Err(ClaudeError::Unavailable);
-        }
-        if s.fenced {
-            return Err(ClaudeError::OwnerInterventionRequired);
-        }
-        if !s
-            .owner_deadline
-            .is_some_and(|deadline| Instant::now() < deadline)
-        {
-            return Err(ClaudeError::PermissionDenied);
-        }
-        if !s.corroborated {
-            return Err(ClaudeError::NoSession);
-        }
-        let saved = SavedInput {
+        let operation = SavedInput {
             schema: "chinwag-claude-input/v1".into(),
             id: id.into(),
             session_epoch: s.epoch.clone(),
@@ -424,18 +485,47 @@ impl HumanWorkPort for Client {
             text: text.into(),
             startup: None,
         };
-        drop(s);
-        self.send(Command::Direction(Captured {
-            saved,
-            deadline: Instant::now() + Duration::from_secs(30),
-        }))
+        Ok(PreparedDirection {
+            target: target.clone(),
+            operation,
+            deadline,
+            sequence,
+        })
+    }
+    fn submit_prepared_direction(&self, prepared: PreparedDirection) -> Result<()> {
+        let mut control = self
+            .shared
+            .input_admission
+            .lock()
+            .map_err(|_| ClaudeError::Unavailable)?;
+        let s = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| ClaudeError::Unavailable)?;
+        self.validate_target(&s, &prepared.target, prepared.deadline)?;
+        let permit = self.commands.try_reserve().map_err(|_| ClaudeError::Busy)?;
+        let ticket = control.admit(Some(prepared.sequence), &prepared.operation.id)?;
+        self.shared.flight.store(true, Ordering::Release);
+        permit.send(Queued {
+            command: Command::Direction(Box::new(Captured {
+                saved: prepared.operation,
+                deadline: prepared.deadline,
+                ticket: ticket.clone(),
+            })),
+            ticket: Some(ticket),
+        });
+        Ok(())
     }
     fn lookup(&self, id: &str) -> Result<()> {
         if !valid_uuid(id) {
             return Err(ClaudeError::InvalidInput);
         }
         self.commands
-            .try_send(Command::Lookup(id.into()))
+            .try_send(Queued {
+                command: Command::Lookup(id.into()),
+                ticket: None,
+            })
             .map_err(|_| ClaudeError::Busy)
     }
     fn end_input(&self) -> Result<()> {
@@ -511,6 +601,7 @@ fn new_shared(config: WorkConfig) -> (Arc<Shared>, mpsc::Receiver<(String, Input
         evidence: Mutex::new(Some(events)),
         flight: AtomicBool::new(false),
         admission: Arc::new(Mutex::new(())),
+        input_admission: Mutex::new(Admission::default()),
         #[cfg(test)]
         before_write: Mutex::new(None),
     });
@@ -531,7 +622,7 @@ async fn store<T: Send + 'static>(
 }
 async fn run(
     shared: Arc<Shared>,
-    mut commands: mpsc::Receiver<Command>,
+    mut commands: mpsc::Receiver<Queued>,
     mut events: mpsc::Receiver<(String, InputEvidence)>,
     spawner: Arc<dyn Spawner>,
 ) {
@@ -565,8 +656,9 @@ async fn run(
             }
             shared.publish();
             while let Some(c) = commands.recv().await {
-                let (id, kind) = command_label(&c);
+                let (id, kind) = command_label(&c.command);
                 shared.completed(id, kind, false, Some(ClaudeError::Storage));
+                shared.release(c.ticket.as_ref());
             }
             return;
         }
@@ -601,15 +693,24 @@ async fn run(
             }
         }
     });
-    while let Some(command) = commands.recv().await {
-        match command {
+    while let Some(queued) = commands.recv().await {
+        match queued.command {
             Command::Start { id, text, deadline } => {
-                start(&shared, &journal, spawner.as_ref(), id, text, deadline).await
+                start(
+                    &shared,
+                    &journal,
+                    spawner.as_ref(),
+                    id,
+                    text,
+                    deadline,
+                    queued.ticket.as_ref().expect("input ticket"),
+                )
+                .await
             }
             Command::Direction(action) => {
                 let id = action.saved.id.clone();
                 let kind = ActionKind::Direction;
-                let result = submit(&shared, &journal, action).await;
+                let result = submit(&shared, &journal, *action).await;
                 match result {
                     Ok(r) => {
                         shared.receipt(r);
@@ -635,6 +736,7 @@ async fn run(
                 }
             }
         }
+        shared.release(queued.ticket.as_ref());
     }
 }
 fn command_label(c: &Command) -> (String, ActionKind) {
@@ -651,6 +753,7 @@ async fn start(
     id: String,
     text: String,
     deadline: Instant,
+    ticket: &Ticket,
 ) {
     let requested = id.clone();
     let old = store(journal, move |j| j.lookup(&requested)).await;
@@ -733,6 +836,7 @@ async fn start(
             s.records.insert(
                 id.clone(),
                 Pending {
+                    ticket: ticket.clone(),
                     saved: saved.clone(),
                     evidence: InputEvidence::default(),
                     may_written: false,
@@ -909,6 +1013,9 @@ async fn submit(shared: &Arc<Shared>, journal: &Store, action: Captured) -> Resu
             Err(ClaudeError::Conflict)
         };
     }
+    if !action.ticket.permits(&action.saved.id) {
+        return Err(ClaudeError::PermissionDenied);
+    }
     shared.valid(&action.saved, action.deadline)?;
     let record = action.saved.clone();
     let consumed = store(journal, move |j| j.consume(record)).await?;
@@ -921,6 +1028,7 @@ async fn submit(shared: &Arc<Shared>, journal: &Store, action: Captured) -> Resu
                 s.records.insert(
                     action.saved.id.clone(),
                     Pending {
+                        ticket: action.ticket.clone(),
                         saved: action.saved.clone(),
                         evidence: InputEvidence::default(),
                         may_written: false,
@@ -953,6 +1061,10 @@ async fn write_control(shared: &Arc<Shared>, frame: Vec<u8>, deadline: Instant) 
                 .map_err(|_| ClaudeError::Unavailable)?;
             let s = shared.state.lock().map_err(|_| ClaudeError::Unavailable)?;
             if shared.ended.load(Ordering::Acquire)
+                || !s
+                    .records
+                    .values()
+                    .any(|p| p.saved.kind == ActionKind::Start && p.ticket.permits(&p.saved.id))
                 || Instant::now() >= deadline
                 || s.fenced
                 || s.snapshot.lifecycle.child_exited
@@ -1010,6 +1122,7 @@ async fn write_input(shared: &Arc<Shared>, saved: &SavedInput, deadline: Instant
                 || !s.initialized
                 || !s.owner_deadline.is_some_and(|d| Instant::now() < d)
                 || Instant::now() >= deadline
+                || !s.records.get(&id).is_some_and(|p| p.ticket.permits(&id))
                 || s.session_id != saved.session_id
                 || s.epoch != saved.session_epoch
                 || (saved.kind == ActionKind::Direction && !s.corroborated)
@@ -1426,6 +1539,7 @@ pub(crate) fn observed_fixture_session() -> Result<ObservedSession> {
         s.records.insert(
             saved.id.clone(),
             Pending {
+                ticket: Admission::default().admit(None, &saved.id)?,
                 saved,
                 evidence: InputEvidence::default(),
                 may_written: true,

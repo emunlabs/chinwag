@@ -73,8 +73,26 @@ pub(crate) struct HumanSteerAction {
     id: String,
     text: String,
     deadline: Instant,
+    admission: Option<crate::admission::Ticket>,
 }
 impl HumanSteerAction {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(crate) fn operation(&self) -> SavedSteer {
+        SavedSteer {
+            schema: OPERATION_SCHEMA.into(),
+            id: self.id.clone(),
+            transport_epoch: self.target.epoch.clone(),
+            thread_id: self.target.thread_id.clone(),
+            expected_turn_id: self.target.turn_id.clone(),
+            text: self.text.clone(),
+        }
+    }
+    pub(crate) fn admit(mut self, ticket: crate::admission::Ticket) -> Self {
+        self.admission = Some(ticket);
+        self
+    }
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -267,6 +285,10 @@ impl Shared {
                 || action.target.epoch != prepared.target.epoch
                 || action.target.generation != prepared.target.generation
                 || action.target.turn_id != prepared.target.turn_id
+                || action
+                    .admission
+                    .as_ref()
+                    .is_some_and(|t| !t.permits(&action.id))
                 || Instant::now() >= action.deadline
             {
                 return Err(SteerError::PermissionDenied);
@@ -469,6 +491,10 @@ impl ConnectionOwner {
         self.shared.ready(&state)?;
         if self.shared.scope.fresh.is_none()
             || !Arc::ptr_eq(&self.shared.identity, &action.target.identity)
+            || action
+                .admission
+                .as_ref()
+                .is_some_and(|t| !t.permits(&action.id))
             || Instant::now() >= action.deadline
             || state.active.as_ref()
                 != Some(&(action.target.turn_id.clone(), action.target.generation))
@@ -619,12 +645,29 @@ impl CodexSteerConnection {
     pub(crate) fn subscribe_activity(&self) -> watch::Receiver<ConnectionActivity> {
         self.shared.activity.subscribe()
     }
+    #[cfg(test)]
     pub(crate) fn capture_human_action(
         &self,
         target: &ObservedActiveTurn,
         id: &str,
         text: &str,
     ) -> crate::Result<HumanSteerAction> {
+        self.capture_human_action_before(target, id, text, Instant::now() + Duration::from_secs(30))
+    }
+    pub(crate) fn capture_human_action_before(
+        &self,
+        target: &ObservedActiveTurn,
+        id: &str,
+        text: &str,
+        deadline: Instant,
+    ) -> crate::Result<HumanSteerAction> {
+        let now = Instant::now();
+        if deadline <= now {
+            return Err(SteerError::PermissionDenied);
+        }
+        if deadline > now + Duration::from_secs(30) {
+            return Err(SteerError::InvalidInput);
+        }
         if !crate::record::valid_operation_id(id) || !crate::record::valid_text(text) {
             return Err(SteerError::InvalidInput);
         }
@@ -635,13 +678,20 @@ impl CodexSteerConnection {
         {
             return Err(SteerError::StaleTarget);
         }
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| SteerError::Unavailable)?;
+        if state.records.len() >= MAX_OPERATIONS && !state.records.contains_key(id) {
+            return Err(SteerError::Capacity);
+        }
         Ok(HumanSteerAction {
             target: target.clone(),
             id: id.into(),
             text: text.into(),
-            deadline: Instant::now()
-                .checked_add(Duration::from_secs(30))
-                .ok_or(SteerError::Unavailable)?,
+            deadline,
+            admission: None,
         })
     }
     pub fn prepare(

@@ -50,6 +50,7 @@ fn ready() -> (Arc<Shared>, SavedOperation, EvidenceChannel) {
         s.records.insert(
             ID.into(),
             Pending {
+                ticket: Admission::default().admit(None, &saved.id).unwrap(),
                 saved: saved.clone(),
                 evidence: Evidence {
                     frame_written: true,
@@ -236,7 +237,13 @@ fn mode_or_permission_intervention_keeps_cancel_target_without_enabling_new_prom
     client
         .cancel(&active, &new_operation_id().unwrap())
         .unwrap();
-    assert!(matches!(rx.try_recv(), Ok(Command::Cancel(_))));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Queued {
+            command: Command::Cancel(_),
+            ..
+        })
+    ));
 }
 #[test]
 fn scope_expiry_does_not_invent_terminal_or_loss() {
@@ -312,6 +319,7 @@ async fn permission_response_can_precede_terminal_and_notification_nondispatch_w
         s.records.insert(
             cancel_id.clone(),
             Pending {
+                ticket: Admission::default().admit(None, &cancel.id).unwrap(),
                 saved: cancel.clone(),
                 evidence: Evidence::default(),
                 may_written: false,
@@ -457,8 +465,17 @@ async fn actual_port_busy_cancel_terminal_then_distinct_human_prompt_without_rep
     .await;
     let next = new_operation_id().unwrap();
     let next_session = rx.borrow().session.clone().unwrap();
-    port.prompt(&next_session, &next, "a separate human prompt")
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let prepared = port
+        .prepare_prompt(&next_session, &next, "a separate human prompt", deadline)
         .unwrap();
+    assert_eq!(prepared.deadline(), deadline);
+    assert_eq!(
+        prepared.operation().session_id.as_deref(),
+        Some(next_session.session_id())
+    );
+    no_bytes(&mut peer.io);
+    port.submit_prepared_prompt(prepared).unwrap();
     let prompt = json_read(&mut peer.io).await;
     assert_eq!(prompt["method"], "session/prompt");
     assert_eq!(prompt["id"], format!("prompt-{next}"));
@@ -642,4 +659,245 @@ fn duplicate_permission_is_hard_loss_but_first_intervention_is_not() {
             .terminal_unknown
     );
     assert!(now(&shared).active_prompt.is_none());
+}
+
+#[test]
+fn prepared_prompt_observes_idle_generation_without_reserving_and_cannot_cross_intervening_input() {
+    let (shared, _, _events) = ready();
+    observe(
+        &shared,
+        Event::Response {
+            id: RpcId::String(format!("prompt-{ID}")),
+            result: Some(json!({"stopReason":"end_turn"})),
+            error: false,
+        },
+    );
+    let (commands, mut queue) = mpsc::channel(8);
+    let client = Client {
+        shared: shared.clone(),
+        commands,
+    };
+    let target = now(&shared).session.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let old = client
+        .prepare_prompt(
+            &target,
+            &new_operation_id().unwrap(),
+            "old prepared",
+            deadline,
+        )
+        .unwrap();
+    let current = client
+        .prepare_prompt(
+            &target,
+            &new_operation_id().unwrap(),
+            "new direct input",
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(old.operation().prompt_generation, 2);
+    assert_eq!(current.operation().prompt_generation, 2);
+    assert_eq!(shared.state.lock().unwrap().next_generation, 2);
+    assert!(queue.try_recv().is_err());
+    assert!(!shared.flight.load(Ordering::Acquire));
+    client.submit_prepared_prompt(current).unwrap();
+    assert_eq!(shared.state.lock().unwrap().next_generation, 3);
+    let queued = queue.try_recv().unwrap();
+    shared.release(queued.ticket.as_ref());
+    assert_eq!(
+        client.submit_prepared_prompt(old),
+        Err(GeminiError::StaleTarget)
+    );
+    assert!(queue.try_recv().is_err());
+    assert_eq!(shared.state.lock().unwrap().next_generation, 3);
+}
+
+#[test]
+fn prepared_prompt_deadline_owner_and_queue_failure_do_not_allocate_generation_or_sequence() {
+    let (shared, _, _events) = ready();
+    observe(
+        &shared,
+        Event::Response {
+            id: RpcId::String(format!("prompt-{ID}")),
+            result: Some(json!({"stopReason":"end_turn"})),
+            error: false,
+        },
+    );
+    let (commands, mut queue) = mpsc::channel(1);
+    let client = Client {
+        shared: shared.clone(),
+        commands,
+    };
+    let target = now(&shared).session.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut expired = client
+        .prepare_prompt(
+            &target,
+            &new_operation_id().unwrap(),
+            "original budget",
+            deadline,
+        )
+        .unwrap();
+    expired.deadline = Instant::now() - Duration::from_secs(1);
+    assert_eq!(
+        client.submit_prepared_prompt(expired),
+        Err(GeminiError::PermissionDenied)
+    );
+    let prepared = client
+        .prepare_prompt(
+            &target,
+            &new_operation_id().unwrap(),
+            "bounded queue",
+            deadline,
+        )
+        .unwrap();
+    let sequence = prepared.captured_sequence();
+    client.lookup(ID).unwrap();
+    assert_eq!(
+        client
+            .prepare_prompt(
+                &target,
+                &new_operation_id().unwrap(),
+                "queue already full",
+                deadline
+            )
+            .err(),
+        Some(GeminiError::Busy)
+    );
+    assert_eq!(
+        client.submit_prepared_prompt(prepared),
+        Err(GeminiError::Busy)
+    );
+    assert_eq!(
+        shared
+            .input_admission
+            .lock()
+            .unwrap()
+            .prepare_sequence()
+            .unwrap(),
+        sequence
+    );
+    assert_eq!(shared.state.lock().unwrap().next_generation, 2);
+    queue.try_recv().unwrap();
+    let (other, _, _events) = ready();
+    let (commands, _queue) = mpsc::channel(1);
+    let other = Client {
+        shared: other,
+        commands,
+    };
+    let prepared = client
+        .prepare_prompt(
+            &target,
+            &new_operation_id().unwrap(),
+            "exact owner",
+            deadline,
+        )
+        .unwrap();
+    assert_eq!(
+        other.submit_prepared_prompt(prepared),
+        Err(GeminiError::StaleTarget)
+    );
+}
+
+#[tokio::test]
+async fn admitted_prompt_ticket_survives_sequence_changes_and_retires_only_its_own_write() {
+    let (shared, saved, _events) = ready();
+    {
+        let mut s = shared.state.lock().unwrap();
+        s.active = None;
+        s.records.get_mut(ID).unwrap().may_written = false;
+    }
+    let (writer, mut peer) = tokio::io::duplex(16384);
+    *shared.writer.lock().await = Some(Box::new(writer));
+    let ticket = shared
+        .input_admission
+        .lock()
+        .unwrap()
+        .admit(None, ID)
+        .unwrap();
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .records
+        .get_mut(ID)
+        .unwrap()
+        .ticket = ticket.clone();
+    shared.input_admission.lock().unwrap().invalidate();
+    let e = io::write_prompt(&shared, &saved, Instant::now() + Duration::from_secs(30)).await;
+    assert!(e.frame_written && !e.not_dispatched);
+    let mut bytes = vec![0; wire::prompt(&saved, SID).unwrap().len()];
+    tokio::time::timeout(Duration::from_secs(3), peer.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    shared.release(Some(&ticket));
+    shared.state.lock().unwrap().active = None;
+    let e = io::write_prompt(&shared, &saved, Instant::now() + Duration::from_secs(30)).await;
+    assert!(e.not_dispatched && !e.write_uncertain);
+    no_bytes(&mut peer);
+}
+
+#[test]
+fn known_full_native_history_rejects_prepare_without_idle_generation_allocation() {
+    let (shared, saved, _events) = ready();
+    observe(
+        &shared,
+        Event::Response {
+            id: RpcId::String(saved.prompt_rpc_id.clone()),
+            result: Some(json!({"stopReason":"end_turn"})),
+            error: false,
+        },
+    );
+    {
+        let mut s = shared.state.lock().unwrap();
+        for index in 0..MAX_OPERATIONS - 1 {
+            let mut operation = saved.clone();
+            operation.id = format!("00000000-0000-4000-8000-{index:012x}");
+            operation.kind = ActionKind::Prompt;
+            operation.startup = None;
+            operation.session_id = Some(SID.into());
+            operation.prompt_rpc_id = format!("prompt-{}", operation.id);
+            let ticket = Admission::default().admit(None, &operation.id).unwrap();
+            s.records.insert(
+                operation.id.clone(),
+                Pending {
+                    ticket,
+                    saved: operation,
+                    evidence: Evidence::default(),
+                    may_written: false,
+                },
+            );
+        }
+        assert_eq!(s.records.len(), MAX_OPERATIONS);
+    }
+    let (commands, mut queued) = mpsc::channel(8);
+    let client = Client {
+        shared: shared.clone(),
+        commands,
+    };
+    let target = now(&shared).session.unwrap();
+    assert_eq!(
+        client
+            .prepare_prompt(
+                &target,
+                &new_operation_id().unwrap(),
+                "no capacity",
+                Instant::now() + Duration::from_secs(30)
+            )
+            .err(),
+        Some(GeminiError::Capacity)
+    );
+    assert_eq!(
+        shared
+            .input_admission
+            .lock()
+            .unwrap()
+            .prepare_sequence()
+            .unwrap(),
+        0
+    );
+    assert_eq!(shared.state.lock().unwrap().next_generation, 2);
+    assert!(!shared.flight.load(Ordering::Acquire));
+    assert!(queued.try_recv().is_err());
 }

@@ -149,13 +149,16 @@ impl SteerController {
     pub(crate) fn subscribe_receipts(&self) -> tokio::sync::watch::Receiver<u64> {
         self.inner.receipts.subscribe()
     }
-    pub(crate) fn capture_human_action(
+    pub(crate) fn capture_human_action_before(
         &self,
         target: &ObservedActiveTurn,
         id: &str,
         text: &str,
+        deadline: std::time::Instant,
     ) -> Result<crate::connection::HumanSteerAction> {
-        self.inner.connection.capture_human_action(target, id, text)
+        self.inner
+            .connection
+            .capture_human_action_before(target, id, text, deadline)
     }
     pub(crate) async fn dispatch_initial(
         &self,

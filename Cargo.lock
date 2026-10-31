@@ -1413,6 +1413,7 @@ dependencies = [
  "chinwag-claude-control",
  "chinwag-codex-steer",
  "chinwag-gemini-control",
+ "chinwag-team-direction",
  "chrono",
  "gpui-kit",
  "rustix",
@@ -1596,6 +1597,24 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "chinwag-team-direction"
+version = "0.0.1"
+dependencies = [
+ "chinwag-claude-control",
+ "chinwag-codex-steer",
+ "chinwag-gemini-control",
+ "futures-util",
+ "getrandom 0.3.4",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
 ]
 
 [[package]]

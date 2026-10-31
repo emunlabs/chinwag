@@ -18,6 +18,8 @@ mod mcp_http_ui;
 mod opening_interaction_tests;
 mod openings;
 mod outbox;
+mod team_work_launch;
+mod team_work_ui;
 use discovery_ui::{DiscoveryPanel, InventoryState};
 use drafts::DraftFile;
 use mcp_http_ui::{McpHttpPanel, McpHttpRequestKind, McpHttpState};
@@ -44,7 +46,13 @@ use gpui_kit::{
 
 gpui_kit::actions!(
     chinwag_alpha,
-    [Quit, ShowOwnedWork, ShowClaudeWork, ShowGeminiWork]
+    [
+        Quit,
+        ShowOwnedWork,
+        ShowClaudeWork,
+        ShowGeminiWork,
+        ShowTeamWork
+    ]
 );
 
 const ROOMS: [(&str, &str); 4] = [
@@ -2599,6 +2607,23 @@ fn confirmation_time(milliseconds: u64) -> String {
 
 fn main() {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    let team_work = match team_work_launch::parse(arguments.clone()) {
+        Ok(Some(declaration)) => match chinwag_team_direction::TeamHost::open(
+            &declaration.config,
+            &declaration.state_root,
+        ) {
+            Ok(host) => Some(team_work_ui::DesktopTeamHost::new(host)),
+            Err(error) => {
+                eprintln!("Could not open declared team work: {error}");
+                return;
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("Invalid team-work invocation: {error}");
+            return;
+        }
+    };
     let gemini_work = match gemini_work_launch::parse(arguments.clone()) {
         Ok(Some(config)) => match chinwag_gemini_control::open_work_service(config) {
             Ok(port) => Some(port),
@@ -2646,6 +2671,53 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus([Menu::new("Chinwag").items([MenuItem::action("Quit Chinwag", Quit)])]);
+        if let Some(host) = team_work {
+            let show = host.clone();
+            cx.on_action(move |_: &ShowTeamWork, cx| {
+                open_team_work_window(show.clone(), cx);
+                cx.activate(true);
+            });
+            cx.bind_keys([KeyBinding::new("cmd-0", ShowTeamWork, None)]);
+            cx.set_menus([Menu::new("Chinwag").items([
+                MenuItem::action("Show team direction", ShowTeamWork),
+                MenuItem::action("Quit Chinwag and end team control input", Quit),
+            ])]);
+            let quit = host.clone();
+            let executor = cx.background_executor().clone();
+            cx.on_app_quit(move |_| {
+                let mut updates = quit.core.subscribe();
+                quit.close_controls();
+                let mut deadline = Box::pin(executor.timer(Duration::from_secs(3)));
+                let quit = quit.clone();
+                async move {
+                    loop {
+                        if quit.locally_closed() {
+                            break;
+                        }
+                        let mut change = Box::pin(updates.changed());
+                        let stop = std::future::poll_fn(|cx| {
+                            if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+                                return std::task::Poll::Ready(true);
+                            }
+                            match std::future::Future::poll(change.as_mut(), cx) {
+                                std::task::Poll::Ready(result) => {
+                                    std::task::Poll::Ready(result.is_err())
+                                }
+                                std::task::Poll::Pending => std::task::Poll::Pending,
+                            }
+                        })
+                        .await;
+                        if stop {
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+            open_team_work_window(host, cx);
+            cx.activate(true);
+            return;
+        }
         if let Some(port) = gemini_work {
             let show = port.clone();
             cx.on_action(move |_: &ShowGeminiWork, cx| {
@@ -2805,6 +2877,96 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+fn open_team_work_window(host: std::sync::Arc<team_work_ui::DesktopTeamHost>, cx: &mut App) {
+    let existing = host.window.lock().ok().and_then(|current| *current);
+    if let Some(existing) = existing {
+        if existing
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+        {
+            return;
+        }
+        if let Ok(mut current) = host.window.lock()
+            && *current == Some(existing)
+        {
+            *current = None;
+        }
+    }
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(1180.), px(900.)),
+            cx,
+        ))),
+        window_min_size: Some(size(px(980.), px(700.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Chinwag · team direction".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let retained = host.clone();
+    if open_window(options, cx, move |window, cx| {
+        cx.new(|cx| team_work_ui::TeamWorkView::new(retained, window, cx))
+    })
+    .is_err()
+    {
+        if let Ok(mut current) = host.window.lock() {
+            *current = None;
+        }
+        eprintln!("Could not open team direction window");
+    }
+}
+
+/// Reuses the exact host-held native port; opening does not call Start or Cancel.
+fn open_team_member_window(member: &chinwag_team_direction::Member, cx: &mut App) {
+    use chinwag_team_direction::HeldWorkPort;
+    let provider = match &member.port {
+        HeldWorkPort::Codex(_) => "Codex",
+        HeldWorkPort::Claude(_) => "Claude",
+        HeldWorkPort::Gemini(_) => "Gemini",
+    };
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(920.), px(820.)),
+            cx,
+        ))),
+        window_min_size: Some(size(px(680.), px(560.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some(format!("{} · {} · {provider} work", member.label, member.id).into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let opened = match &member.port {
+        HeldWorkPort::Codex(port) => {
+            let port = port.clone();
+            open_window(options, cx, move |window, cx| {
+                cx.new(|cx| codex_work_ui::CodexWorkView::new(port, window, cx))
+            })
+            .map(|_| ())
+        }
+        HeldWorkPort::Claude(port) => {
+            let port = port.clone();
+            open_window(options, cx, move |window, cx| {
+                cx.new(|cx| claude_work_ui::ClaudeWorkView::new(port, window, cx))
+            })
+            .map(|_| ())
+        }
+        HeldWorkPort::Gemini(port) => {
+            let port = port.clone();
+            open_window(options, cx, move |window, cx| {
+                cx.new(|cx| gemini_work_ui::GeminiWorkView::new(port, window, cx))
+            })
+            .map(|_| ())
+        }
+    };
+    if opened.is_err() {
+        eprintln!("Could not open the owned member work window");
+    }
 }
 
 fn open_gemini_work_window(

@@ -1,4 +1,5 @@
 //! One explicit configured-runtime Gemini ACP owner; no existing-session adoption or implicit approval.
+mod admission;
 mod api;
 mod binary;
 mod journal;

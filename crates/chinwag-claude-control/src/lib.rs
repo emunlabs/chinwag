@@ -1,5 +1,6 @@
 //! One explicit human-owned Claude stream-json session. No GUI/session adoption,
 //! provider repair, generic RPC, automatic replay or OS termination is provided.
+mod admission;
 mod api;
 mod binary;
 mod journal;

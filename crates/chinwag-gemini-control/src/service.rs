@@ -1,4 +1,5 @@
 use crate::{
+    admission::{Admission, Ticket},
     api::{valid_text, valid_uuid},
     journal::{Consume, OperationJournal},
     wire::{self, Event, RpcId, Update},
@@ -22,6 +23,7 @@ type Store = Arc<Mutex<OperationJournal>>;
 type EvidenceChannel = mpsc::Receiver<(String, Evidence)>;
 #[derive(Clone)]
 struct Captured {
+    ticket: Ticket,
     saved: SavedOperation,
     deadline: Instant,
 }
@@ -35,7 +37,12 @@ enum Command {
     Cancel(Captured),
     Lookup(String),
 }
+struct Queued {
+    command: Command,
+    ticket: Option<Ticket>,
+}
 struct Pending {
+    ticket: Ticket,
     saved: SavedOperation,
     evidence: Evidence,
     may_written: bool,
@@ -88,6 +95,7 @@ struct Shared {
     writer: tokio::sync::Mutex<Option<io::WriteIo>>,
     write_gate: Arc<tokio::sync::Semaphore>,
     admission: Arc<Mutex<()>>,
+    input_admission: Mutex<Admission>,
     events: mpsc::Sender<(String, Evidence)>,
     publication: mpsc::Sender<()>,
     publication_rx: Mutex<Option<mpsc::Receiver<()>>>,
@@ -206,6 +214,11 @@ impl Shared {
     }
     fn end_input(&self) {
         {
+            let mut control = self
+                .input_admission
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            control.invalidate();
             let _effect = self.admission.lock();
             let _state = self.state.lock();
             self.ended.store(true, Ordering::Release);
@@ -247,9 +260,6 @@ impl Shared {
         self.publish();
     }
     fn completed(&self, id: String, kind: ActionKind, saved: bool, error: Option<GeminiError>) {
-        if kind != ActionKind::Lookup {
-            self.flight.store(false, Ordering::Release);
-        }
         if let Ok(mut s) = self.state.lock() {
             s.snapshot.last_submission = Some(WorkSubmission {
                 id,
@@ -257,6 +267,15 @@ impl Shared {
                 saved,
                 error,
             });
+        }
+        self.publish();
+    }
+    fn release(&self, ticket: Option<&Ticket>) {
+        if let Some(ticket) = ticket
+            && let Ok(mut control) = self.input_admission.lock()
+            && control.release(ticket)
+        {
+            self.flight.store(false, Ordering::Release);
         }
         self.publish();
     }
@@ -308,25 +327,20 @@ impl Shared {
 }
 struct Client {
     shared: Arc<Shared>,
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<Queued>,
 }
 impl Client {
-    fn reserve(&self) -> Result<()> {
-        if self.shared.ended.load(Ordering::Acquire) {
-            return Err(GeminiError::Unavailable);
+    fn prompt_target(&self, s: &State, target: &ObservedSession, deadline: Instant) -> Result<()> {
+        if !self.shared.target(s, target) {
+            return Err(GeminiError::StaleTarget);
         }
-        self.shared
-            .flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| GeminiError::Busy)
-    }
-    fn queue(&self, c: Command) -> Result<()> {
-        if self.commands.try_send(c).is_err() {
-            self.shared.flight.store(false, Ordering::Release);
+        self.shared.control(s, deadline)?;
+        if s.active.is_some() || s.cancel.is_some() {
             return Err(GeminiError::Busy);
         }
-        self.shared.publish();
+        if s.policy_blocked || !s.permissions.is_empty() {
+            return Err(GeminiError::OwnerInterventionRequired);
+        }
         Ok(())
     }
 }
@@ -339,114 +353,185 @@ impl HumanWorkPort for Client {
         if !valid_uuid(id) || !valid_text(text) {
             return Err(GeminiError::InvalidInput);
         }
-        self.reserve()?;
-        self.queue(Command::Start {
-            id: id.into(),
-            text: text.into(),
-            deadline,
-        })
+        let mut control = self
+            .shared
+            .input_admission
+            .lock()
+            .map_err(|_| GeminiError::Unavailable)?;
+        if self.shared.ended.load(Ordering::Acquire) {
+            return Err(GeminiError::Unavailable);
+        }
+        let permit = self.commands.try_reserve().map_err(|_| GeminiError::Busy)?;
+        let ticket = control.admit(None, id)?;
+        self.shared.flight.store(true, Ordering::Release);
+        permit.send(Queued {
+            command: Command::Start {
+                id: id.into(),
+                text: text.into(),
+                deadline,
+            },
+            ticket: Some(ticket),
+        });
+        self.shared.publish();
+        Ok(())
     }
     fn prompt(&self, target: &ObservedSession, id: &str, text: &str) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let prepared =
+            self.prepare_prompt(target, id, text, Instant::now() + Duration::from_secs(30))?;
+        self.submit_prepared_prompt(prepared)
+    }
+    fn prepare_prompt(
+        &self,
+        target: &ObservedSession,
+        id: &str,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<PreparedPrompt> {
         if !valid_uuid(id) || !valid_text(text) {
             return Err(GeminiError::InvalidInput);
         }
-        let captured = {
-            let mut s = self
-                .shared
-                .state
-                .lock()
-                .map_err(|_| GeminiError::Unavailable)?;
-            if !self.shared.target(&s, target) {
-                return Err(GeminiError::StaleTarget);
-            }
-            self.shared.control(&s, deadline)?;
-            if s.active.is_some() || s.cancel.is_some() {
-                return Err(GeminiError::Busy);
-            }
-            if s.policy_blocked || !s.permissions.is_empty() {
-                return Err(GeminiError::OwnerInterventionRequired);
-            }
-            self.reserve()?;
-            let generation = s.next_generation;
-            s.next_generation = s
-                .next_generation
-                .checked_add(1)
-                .ok_or(GeminiError::Capacity)?;
-            Captured {
-                saved: SavedOperation {
-                    schema: "chinwag-gemini-operation/v1".into(),
-                    id: id.into(),
-                    kind: ActionKind::Prompt,
-                    text: text.into(),
-                    session_epoch: s.epoch.clone(),
-                    session_id: s.session.clone(),
-                    prompt_rpc_id: format!("prompt-{id}"),
-                    prompt_generation: generation,
-                    startup: None,
-                },
-                deadline,
-            }
+        let now = Instant::now();
+        if deadline <= now {
+            return Err(GeminiError::PermissionDenied);
+        }
+        if deadline > now + Duration::from_secs(30) {
+            return Err(GeminiError::InvalidInput);
+        }
+        let control = self
+            .shared
+            .input_admission
+            .lock()
+            .map_err(|_| GeminiError::Unavailable)?;
+        let sequence = control.prepare_sequence()?;
+        if self.commands.capacity() == 0 {
+            return Err(GeminiError::Busy);
+        }
+        let s = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GeminiError::Unavailable)?;
+        self.prompt_target(&s, target, deadline)?;
+        if s.records.len() >= MAX_OPERATIONS && !s.records.contains_key(id) {
+            return Err(GeminiError::Capacity);
+        }
+        let operation = SavedOperation {
+            schema: "chinwag-gemini-operation/v1".into(),
+            id: id.into(),
+            kind: ActionKind::Prompt,
+            text: text.into(),
+            session_epoch: s.epoch.clone(),
+            session_id: s.session.clone(),
+            prompt_rpc_id: format!("prompt-{id}"),
+            prompt_generation: s.next_generation,
+            startup: None,
         };
-        self.queue(Command::Prompt(captured))
+        Ok(PreparedPrompt {
+            target: target.clone(),
+            operation,
+            deadline,
+            sequence,
+        })
+    }
+    fn submit_prepared_prompt(&self, prepared: PreparedPrompt) -> Result<()> {
+        let mut control = self
+            .shared
+            .input_admission
+            .lock()
+            .map_err(|_| GeminiError::Unavailable)?;
+        let mut s = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GeminiError::Unavailable)?;
+        self.prompt_target(&s, &prepared.target, prepared.deadline)?;
+        if s.next_generation != prepared.operation.prompt_generation {
+            return Err(GeminiError::StaleTarget);
+        }
+        let next = s
+            .next_generation
+            .checked_add(1)
+            .ok_or(GeminiError::Capacity)?;
+        let permit = self.commands.try_reserve().map_err(|_| GeminiError::Busy)?;
+        let ticket = control.admit(Some(prepared.sequence), &prepared.operation.id)?;
+        s.next_generation = next;
+        self.shared.flight.store(true, Ordering::Release);
+        permit.send(Queued {
+            command: Command::Prompt(Captured {
+                saved: prepared.operation,
+                deadline: prepared.deadline,
+                ticket: ticket.clone(),
+            }),
+            ticket: Some(ticket),
+        });
+        drop(s);
+        self.shared.publish();
+        Ok(())
     }
     fn cancel(&self, target: &ObservedActivePrompt, id: &str) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(30);
         if !valid_uuid(id) {
             return Err(GeminiError::InvalidInput);
         }
-        let captured = {
-            let mut s = self
-                .shared
-                .state
-                .lock()
-                .map_err(|_| GeminiError::Unavailable)?;
-            if !self.shared.target(&s, &target.session) {
-                return Err(GeminiError::StaleTarget);
-            }
-            self.shared.control(&s, deadline)?;
-            let Some(active) = s.active.as_ref().filter(|a| {
-                a.rpc_id == target.rpc_id
-                    && a.generation == target.generation
-                    && a.operation_id == target.operation_id
-                    && a.may_written
-            }) else {
-                return Err(GeminiError::StaleTarget);
-            };
-            if s.cancel.is_some() {
-                return Err(GeminiError::Busy);
-            }
-            let saved = SavedOperation {
-                schema: "chinwag-gemini-operation/v1".into(),
-                id: id.into(),
-                kind: ActionKind::Cancel,
-                text: String::new(),
-                session_epoch: s.epoch.clone(),
-                session_id: s.session.clone(),
-                prompt_rpc_id: active.rpc_id.clone(),
-                prompt_generation: active.generation,
-                startup: None,
-            };
-            self.reserve()?;
-            s.cancel = Some(CancelWindow {
-                saved: saved.clone(),
-                deadline,
-                committed: false,
-                writer_retired: false,
-                terminal_seen: false,
-                jobs: 0,
-                written: 0,
-                scheduled: BTreeSet::new(),
-            });
-            Captured { saved, deadline }
-        };
-        if let Err(e) = self.queue(Command::Cancel(captured)) {
-            if let Ok(mut s) = self.shared.state.lock() {
-                s.cancel = None;
-            }
-            self.shared.publish();
-            return Err(e);
+        let mut control = self
+            .shared
+            .input_admission
+            .lock()
+            .map_err(|_| GeminiError::Unavailable)?;
+        let mut s = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| GeminiError::Unavailable)?;
+        if !self.shared.target(&s, &target.session) {
+            return Err(GeminiError::StaleTarget);
         }
+        self.shared.control(&s, deadline)?;
+        let Some(active) = s.active.as_ref().filter(|a| {
+            a.rpc_id == target.rpc_id
+                && a.generation == target.generation
+                && a.operation_id == target.operation_id
+                && a.may_written
+        }) else {
+            return Err(GeminiError::StaleTarget);
+        };
+        if s.cancel.is_some() {
+            return Err(GeminiError::Busy);
+        }
+        let saved = SavedOperation {
+            schema: "chinwag-gemini-operation/v1".into(),
+            id: id.into(),
+            kind: ActionKind::Cancel,
+            text: String::new(),
+            session_epoch: s.epoch.clone(),
+            session_id: s.session.clone(),
+            prompt_rpc_id: active.rpc_id.clone(),
+            prompt_generation: active.generation,
+            startup: None,
+        };
+        let permit = self.commands.try_reserve().map_err(|_| GeminiError::Busy)?;
+        let ticket = control.admit(None, id)?;
+        s.cancel = Some(CancelWindow {
+            saved: saved.clone(),
+            deadline,
+            committed: false,
+            writer_retired: false,
+            terminal_seen: false,
+            jobs: 0,
+            written: 0,
+            scheduled: BTreeSet::new(),
+        });
+        self.shared.flight.store(true, Ordering::Release);
+        permit.send(Queued {
+            command: Command::Cancel(Captured {
+                saved,
+                deadline,
+                ticket: ticket.clone(),
+            }),
+            ticket: Some(ticket),
+        });
+        drop(s);
+        self.shared.publish();
         Ok(())
     }
     fn lookup(&self, id: &str) -> Result<()> {
@@ -454,7 +539,10 @@ impl HumanWorkPort for Client {
             return Err(GeminiError::InvalidInput);
         }
         self.commands
-            .try_send(Command::Lookup(id.into()))
+            .try_send(Queued {
+                command: Command::Lookup(id.into()),
+                ticket: None,
+            })
             .map_err(|_| GeminiError::Busy)
     }
     fn end_input(&self) -> Result<()> {
@@ -532,6 +620,7 @@ fn new_shared(config: WorkConfig) -> (Arc<Shared>, EvidenceChannel) {
             writer: tokio::sync::Mutex::new(None),
             write_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             admission: Arc::new(Mutex::new(())),
+            input_admission: Mutex::new(Admission::default()),
             events,
             publication,
             publication_rx: Mutex::new(Some(publication_rx)),
@@ -568,7 +657,7 @@ async fn persist(shared: &Arc<Shared>, j: &Store, id: &str, e: Evidence) -> Resu
 }
 async fn run(
     shared: Arc<Shared>,
-    mut commands: mpsc::Receiver<Command>,
+    mut commands: mpsc::Receiver<Queued>,
     mut events: EvidenceChannel,
     spawner: Arc<dyn Spawner>,
 ) {
@@ -597,8 +686,9 @@ async fn run(
         _ => {
             shared.fence();
             while let Some(c) = commands.recv().await {
-                let (id, kind) = label(&c);
+                let (id, kind) = label(&c.command);
                 shared.completed(id, kind, false, Some(GeminiError::Storage));
+                shared.release(c.ticket.as_ref());
             }
             return;
         }
@@ -632,10 +722,19 @@ async fn run(
             }
         }
     });
-    while let Some(command) = commands.recv().await {
-        match command {
+    while let Some(queued) = commands.recv().await {
+        match queued.command {
             Command::Start { id, text, deadline } => {
-                start(&shared, &journal, spawner.as_ref(), id, text, deadline).await
+                start(
+                    &shared,
+                    &journal,
+                    spawner.as_ref(),
+                    id,
+                    text,
+                    deadline,
+                    queued.ticket.as_ref().expect("input ticket"),
+                )
+                .await
             }
             Command::Prompt(action) => {
                 let id = action.saved.id.clone();
@@ -679,6 +778,7 @@ async fn run(
                 }
             }
         }
+        shared.release(queued.ticket.as_ref());
     }
 }
 fn label(c: &Command) -> (String, ActionKind) {
@@ -696,6 +796,7 @@ async fn start(
     id: String,
     text: String,
     deadline: Instant,
+    ticket: &Ticket,
 ) {
     let wanted = id.clone();
     match store(j, move |j| j.lookup(&wanted)).await {
@@ -780,6 +881,7 @@ async fn start(
         s.records.insert(
             id.clone(),
             Pending {
+                ticket: ticket.clone(),
                 saved: saved.clone(),
                 evidence: Evidence::default(),
                 may_written: false,
@@ -922,7 +1024,11 @@ async fn consume(
     shared: &Arc<Shared>,
     j: &Store,
     saved: &SavedOperation,
+    ticket: &Ticket,
 ) -> Result<Option<Receipt>> {
+    if !ticket.permits(&saved.id) {
+        return Err(GeminiError::PermissionDenied);
+    }
     let wanted = saved.id.clone();
     if let Some(r) = store(j, move |j| j.lookup(&wanted)).await? {
         return if r.operation == *saved {
@@ -951,6 +1057,7 @@ async fn consume(
                 .insert(
                     saved.id.clone(),
                     Pending {
+                        ticket: ticket.clone(),
                         saved: saved.clone(),
                         evidence: Evidence::default(),
                         may_written: false,
@@ -971,14 +1078,14 @@ async fn project_consume_failure(shared: &Arc<Shared>, j: &Store, saved: &SavedO
     shared.publish();
 }
 async fn submit_prompt(shared: &Arc<Shared>, j: &Store, action: Captured) -> Result<Receipt> {
-    if let Some(r) = consume(shared, j, &action.saved).await? {
+    if let Some(r) = consume(shared, j, &action.saved, &action.ticket).await? {
         return Ok(r);
     }
     let e = io::write_prompt(shared, &action.saved, action.deadline).await;
     persist(shared, j, &action.saved.id, e).await
 }
 async fn submit_cancel(shared: &Arc<Shared>, j: &Store, action: Captured) -> Result<Receipt> {
-    if let Some(r) = consume(shared, j, &action.saved).await? {
+    if let Some(r) = consume(shared, j, &action.saved, &action.ticket).await? {
         if let Ok(mut s) = shared.state.lock() {
             abandon_cancel_reservation(&mut s);
         }

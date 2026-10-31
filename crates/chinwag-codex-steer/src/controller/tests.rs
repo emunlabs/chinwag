@@ -423,7 +423,12 @@ async fn consumed_fresh_bootstrap_then_live_steer_does_not_wait_for_initial_ack(
     .await
     .unwrap();
     let action = controller
-        .capture_human_action(&target, "steer-controller-live1", TEXT)
+        .capture_human_action_before(
+            &target,
+            "steer-controller-live1",
+            TEXT,
+            Instant::now() + Duration::from_secs(30),
+        )
         .unwrap();
     let grant = owner.authorize_action(&action).unwrap();
     let receipt = controller

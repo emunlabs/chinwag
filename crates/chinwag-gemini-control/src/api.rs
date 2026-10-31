@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tokio::sync::watch;
 pub const MAX_TEXT_BYTES: usize = 8192;
@@ -399,11 +400,43 @@ impl WorkSnapshot {
         }
     }
 }
+
+/// Read-only captured human input; data summaries cannot recreate its authority.
+pub struct PreparedPrompt {
+    pub(crate) target: ObservedSession,
+    pub(crate) operation: SavedOperation,
+    pub(crate) deadline: Instant,
+    pub(crate) sequence: u64,
+}
+impl PreparedPrompt {
+    pub fn operation(&self) -> &SavedOperation {
+        &self.operation
+    }
+    pub fn captured_sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
 pub trait HumanWorkPort: Send + Sync {
     fn subscribe(&self) -> watch::Receiver<WorkSnapshot>;
     fn start(&self, id: &str, text: &str) -> Result<()>;
     fn prompt(&self, target: &ObservedSession, id: &str, text: &str) -> Result<()>;
     fn cancel(&self, target: &ObservedActivePrompt, id: &str) -> Result<()>;
+    fn prepare_prompt(
+        &self,
+        _target: &ObservedSession,
+        _id: &str,
+        _text: &str,
+        _deadline: Instant,
+    ) -> Result<PreparedPrompt> {
+        Err(GeminiError::Unavailable)
+    }
+    fn submit_prepared_prompt(&self, _prepared: PreparedPrompt) -> Result<()> {
+        Err(GeminiError::Unavailable)
+    }
     fn lookup(&self, id: &str) -> Result<()>;
     fn end_input(&self) -> Result<()>;
 }

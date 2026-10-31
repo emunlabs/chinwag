@@ -4,6 +4,7 @@
 //! The explicit human-work port initializes one declared owner Unix connection
 //! and starts one fresh task only after consumed human intent. No process is
 //! spawned, no GUI session is adopted, and no generic RPC interface is exposed.
+mod admission;
 
 mod connection;
 mod controller;
@@ -28,6 +29,6 @@ mod work_journal;
 mod work_socket;
 pub use work::open_work_service;
 pub use work_api::{
-    HumanWorkPort, RuntimePolicyDeclaration, WorkActionKind, WorkConfig, WorkPhase, WorkSnapshot,
-    WorkStartReceipt, WorkSubmission,
+    HumanWorkPort, PreparedWorkSteer, RuntimePolicyDeclaration, WorkActionKind, WorkConfig,
+    WorkPhase, WorkSnapshot, WorkStartReceipt, WorkSubmission,
 };

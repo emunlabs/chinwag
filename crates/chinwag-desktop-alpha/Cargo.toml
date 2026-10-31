@@ -12,6 +12,7 @@ chinwag-bus-model = { path = "../chinwag-bus-model" }
 chinwag-codex-steer = { path = "../chinwag-codex-steer" }
 chinwag-claude-control = { path = "../chinwag-claude-control" }
 chinwag-gemini-control = { path = "../chinwag-gemini-control" }
+chinwag-team-direction = { path = "../chinwag-team-direction" }
 tokio = { version = "=1.54.1", default-features = false, features = ["sync"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
@@ -21,6 +22,7 @@ rustix = { version = "1", features = ["fs"] }
 [dev-dependencies]
 chinwag-claude-control = { path = "../chinwag-claude-control", features = ["test-support"] }
 chinwag-gemini-control = { path = "../chinwag-gemini-control", features = ["test-support"] }
+chinwag-team-direction = { path = "../chinwag-team-direction", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "=1.54.1", default-features = false, features = ["rt-multi-thread", "io-util", "time"] }
 gpui-kit = { version = "=0.8.1", features = ["gpui-fast", "test-support"] }

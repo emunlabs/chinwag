@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tokio::sync::watch;
 pub const MAX_TEXT_BYTES: usize = 8192;
@@ -327,6 +328,26 @@ impl WorkSnapshot {
         }
     }
 }
+
+/// Read-only captured human input; data summaries cannot recreate its authority.
+pub struct PreparedDirection {
+    pub(crate) target: ObservedSession,
+    pub(crate) operation: SavedInput,
+    pub(crate) deadline: Instant,
+    pub(crate) sequence: u64,
+}
+impl PreparedDirection {
+    pub fn operation(&self) -> &SavedInput {
+        &self.operation
+    }
+    pub fn captured_sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
 pub trait HumanWorkPort: Send + Sync {
     fn subscribe(&self) -> watch::Receiver<WorkSnapshot>;
     fn start(&self, id: &str, text: &str) -> Result<()>;
@@ -337,6 +358,19 @@ pub trait HumanWorkPort: Send + Sync {
         text: &str,
         timing: InputTiming,
     ) -> Result<()>;
+    fn prepare_direction(
+        &self,
+        _target: &ObservedSession,
+        _id: &str,
+        _text: &str,
+        _timing: InputTiming,
+        _deadline: Instant,
+    ) -> Result<PreparedDirection> {
+        Err(ClaudeError::Unavailable)
+    }
+    fn submit_prepared_direction(&self, _prepared: PreparedDirection) -> Result<()> {
+        Err(ClaudeError::Unavailable)
+    }
     fn lookup(&self, id: &str) -> Result<()>;
     fn end_input(&self) -> Result<()>;
 }

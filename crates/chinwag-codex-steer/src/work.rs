@@ -2,8 +2,9 @@
 //! never the sole stream owner. Only explicit Close releases the connection.
 
 use crate::{
-    ConnectionOwner, HumanWorkPort, Result, SteerController, SteerError, WorkActionKind,
-    WorkConfig, WorkPhase, WorkSnapshot, WorkSubmission,
+    ConnectionOwner, HumanWorkPort, PreparedWorkSteer, Result, SteerController, SteerError,
+    WorkActionKind, WorkConfig, WorkPhase, WorkSnapshot, WorkSubmission,
+    admission::{Admission, Ticket},
     connection::{ConnectionActivity, HumanSteerAction},
     record::{valid_operation_id, valid_text},
     unix_wire::{WsRead, WsWrite},
@@ -34,11 +35,16 @@ enum Command {
     Lookup(String),
 }
 
+struct Queued {
+    command: Command,
+    ticket: Option<Ticket>,
+}
 struct Client {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<Queued>,
     snapshots: watch::Receiver<WorkSnapshot>,
     close: watch::Sender<bool>,
     flight: Arc<AtomicBool>,
+    admission: Arc<Mutex<Admission>>,
     controller: Arc<Mutex<Option<SteerController>>>,
     #[cfg(test)]
     command_seen: Arc<tokio::sync::Notify>,
@@ -56,6 +62,7 @@ fn open_client(config: WorkConfig) -> Result<Arc<Client>> {
     let (close, closed) = watch::channel(false);
     let flight = Arc::new(AtomicBool::new(false));
     let controller = Arc::new(Mutex::new(None));
+    let admission = Arc::new(Mutex::new(Admission::default()));
     #[cfg(test)]
     let command_seen = Arc::new(tokio::sync::Notify::new());
     let client = Arc::new(Client {
@@ -63,6 +70,7 @@ fn open_client(config: WorkConfig) -> Result<Arc<Client>> {
         snapshots: observations,
         close: close.clone(),
         flight: flight.clone(),
+        admission: admission.clone(),
         controller: controller.clone(),
         #[cfg(test)]
         command_seen: command_seen.clone(),
@@ -83,7 +91,7 @@ fn open_client(config: WorkConfig) -> Result<Arc<Client>> {
                     rx,
                     closed,
                     snapshots,
-                    flight,
+                    (flight, admission),
                     controller,
                     #[cfg(test)]
                     command_seen,
@@ -100,25 +108,29 @@ fn open_client(config: WorkConfig) -> Result<Arc<Client>> {
 }
 
 impl Client {
-    fn submit(&self, command: Command) -> Result<()> {
+    fn submit_start(&self, id: String, text: String, deadline: Instant) -> Result<()> {
+        let mut admission = self.admission.lock().map_err(|_| SteerError::Unavailable)?;
         if *self.close.borrow() {
             return Err(SteerError::Unavailable);
         }
-        if self
-            .flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(SteerError::Busy);
-        }
-        if self.commands.try_send(command).is_err() {
-            self.flight.store(false, Ordering::Release);
-            return Err(SteerError::Busy);
-        }
+        let permit = self.commands.try_reserve().map_err(|_| SteerError::Busy)?;
+        let ticket = admission.admit(None, &id)?;
+        self.flight.store(true, Ordering::Release);
+        permit.send(Queued {
+            command: Command::Start { id, text, deadline },
+            ticket: Some(ticket),
+        });
         Ok(())
     }
 }
-
+fn release(admission: &Arc<Mutex<Admission>>, flight: &Arc<AtomicBool>, ticket: Option<&Ticket>) {
+    if let Some(ticket) = ticket
+        && let Ok(mut control) = admission.lock()
+        && control.release(ticket)
+    {
+        flight.store(false, Ordering::Release);
+    }
+}
 impl HumanWorkPort for Client {
     fn subscribe(&self) -> watch::Receiver<WorkSnapshot> {
         self.snapshots.clone()
@@ -128,33 +140,88 @@ impl HumanWorkPort for Client {
         if !valid_operation_id(id) || !valid_text(text) {
             return Err(SteerError::InvalidInput);
         }
-        self.submit(Command::Start {
-            id: id.into(),
-            text: text.into(),
-            deadline,
-        })
+        self.submit_start(id.into(), text.into(), deadline)
     }
     fn steer(&self, target: &crate::ObservedActiveTurn, id: &str, text: &str) -> Result<()> {
-        let controller = self
+        let prepared =
+            self.prepare_steer(target, id, text, Instant::now() + Duration::from_secs(30))?;
+        self.submit_prepared_steer(prepared)
+    }
+    fn prepare_steer(
+        &self,
+        target: &crate::ObservedActiveTurn,
+        id: &str,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<PreparedWorkSteer> {
+        let admission = self.admission.lock().map_err(|_| SteerError::Unavailable)?;
+        if *self.close.borrow() {
+            return Err(SteerError::Unavailable);
+        }
+        let sequence = admission.prepare_sequence()?;
+        if self.commands.capacity() == 0 {
+            return Err(SteerError::Busy);
+        }
+        let slot = self
             .controller
             .lock()
             .map_err(|_| SteerError::Unavailable)?;
-        let controller = controller.as_ref().ok_or(SteerError::NoActiveTurn)?;
-        // Capture exact authority and its original deadline at the human action,
-        // before queueing or any blocking journal work.
-        let action = controller.capture_human_action(target, id, text)?;
-        self.submit(Command::Steer(action))
+        let controller = slot.as_ref().ok_or(SteerError::NoActiveTurn)?;
+        let action = controller.capture_human_action_before(target, id, text, deadline)?;
+        let operation = action.operation();
+        Ok(PreparedWorkSteer {
+            action,
+            operation,
+            sequence,
+            owner: self.admission.clone(),
+        })
+    }
+    fn submit_prepared_steer(&self, prepared: PreparedWorkSteer) -> Result<()> {
+        if !Arc::ptr_eq(&prepared.owner, &self.admission) {
+            return Err(SteerError::StaleTarget);
+        }
+        let mut admission = self.admission.lock().map_err(|_| SteerError::Unavailable)?;
+        if *self.close.borrow() {
+            return Err(SteerError::Unavailable);
+        }
+        let slot = self
+            .controller
+            .lock()
+            .map_err(|_| SteerError::Unavailable)?;
+        let controller = slot.as_ref().ok_or(SteerError::NoActiveTurn)?;
+        controller.capture_human_action_before(
+            prepared.action.target(),
+            prepared.action.id(),
+            prepared.action.text(),
+            prepared.action.deadline(),
+        )?;
+        let permit = self.commands.try_reserve().map_err(|_| SteerError::Busy)?;
+        let ticket = admission.admit(Some(prepared.sequence), prepared.action.id())?;
+        let action = prepared.action.admit(ticket.clone());
+        self.flight.store(true, Ordering::Release);
+        permit.send(Queued {
+            command: Command::Steer(action),
+            ticket: Some(ticket),
+        });
+        Ok(())
     }
     fn lookup(&self, id: &str) -> Result<()> {
         if !valid_operation_id(id) {
             return Err(SteerError::InvalidInput);
         }
         self.commands
-            .try_send(Command::Lookup(id.into()))
+            .try_send(Queued {
+                command: Command::Lookup(id.into()),
+                ticket: None,
+            })
             .map_err(|_| SteerError::Busy)
     }
     fn close(&self) -> Result<()> {
-        self.close.send_replace(true);
+        {
+            let mut admission = self.admission.lock().map_err(|_| SteerError::Unavailable)?;
+            admission.invalidate();
+            self.close.send_replace(true);
+        }
         // Explicit human Close fences an already installed controller even if
         // the owner is awaiting blocking persistence for an admitted action.
         if let Ok(slot) = self.controller.lock()
@@ -212,13 +279,14 @@ fn completed(
 
 async fn run(
     config: WorkConfig,
-    mut commands: mpsc::Receiver<Command>,
+    mut commands: mpsc::Receiver<Queued>,
     mut close: watch::Receiver<bool>,
     tx: watch::Sender<WorkSnapshot>,
-    flight: Arc<AtomicBool>,
+    control: (Arc<AtomicBool>, Arc<Mutex<Admission>>),
     slot: Arc<Mutex<Option<SteerController>>>,
     #[cfg(test)] command_seen: Arc<tokio::sync::Notify>,
 ) {
+    let (flight, admission) = control;
     let mut snapshot = tx.borrow().clone();
     let open_config = config.clone();
     let journal = tokio::task::spawn_blocking(move || WorkJournal::open(open_config)).await;
@@ -231,12 +299,12 @@ async fn run(
                 tokio::select! {biased;
                     _=close.changed()=>break,
                     command=commands.recv()=>{
-                        let Some(command)=command else {break;};
-                        let (id,kind)=match command {Command::Start{id,..}=>(id,WorkActionKind::Start),
+                        let Some(queued)=command else {break;};
+                        let (id,kind)=match queued.command {Command::Start{id,..}=>(id,WorkActionKind::Start),
                             Command::Steer(action)=>(action.id().into(),WorkActionKind::Steer),
                             Command::Lookup(id)=>(id,WorkActionKind::Lookup)};
                         completed(&mut snapshot,id,kind,false,Some(SteerError::Storage));
-                        flight.store(false,Ordering::Release); publish(&tx,&mut snapshot);
+                        release(&admission,&flight,queued.ticket.as_ref()); publish(&tx,&mut snapshot);
                     }
                 }
             }
@@ -301,8 +369,8 @@ async fn run(
         tokio::select! {biased;
             _=close.changed()=>break,
             command=commands.recv()=>{
-                let Some(command)=command else {continue;};
-                match command {
+                let Some(queued)=command else {continue;};
+                match queued.command {
                     Command::Start{id,text,deadline}=>{
                         let id_for_save=id.clone();
                         let consumed=store(&journal,move|j|j.consume(&id_for_save,&text,deadline)).await;
@@ -342,7 +410,7 @@ async fn run(
                             }
                             Err(error)=>completed(&mut snapshot,id,WorkActionKind::Start,false,Some(error)),
                         }
-                        flight.store(false,Ordering::Release);
+
                     }
                     Command::Steer(action)=>{
                         #[cfg(test)]
@@ -359,7 +427,6 @@ async fn run(
                                 completed(&mut snapshot,id,WorkActionKind::Steer,true,None);},
                             Err(error)=>completed(&mut snapshot,id,WorkActionKind::Steer,false,Some(error)),
                         }
-                        flight.store(false,Ordering::Release);
                     }
                     Command::Lookup(id)=>{
                         let result=if snapshot.start.as_ref().is_some_and(|r|r.id==id){
@@ -385,6 +452,7 @@ async fn run(
                         completed(&mut snapshot,id,WorkActionKind::Lookup,result.is_ok(),result.err());
                     }
                 }
+                release(&admission,&flight,queued.ticket.as_ref());
                 if let Some(active)=&session {refresh(active,&journal,&ids,&mut snapshot).await;}
                 publish(&tx,&mut snapshot);
                 if *close.borrow(){break;}
