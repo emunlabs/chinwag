@@ -27,5 +27,10 @@ gpui-fast = { path = "vendor/gpui-fast" }
 
 [profile.dev]
 panic = "abort"
+
+# Native executable pins hash large files inside fixed startup budgets.
+[profile.dev.package."sha2:0.10.9"]
+opt-level = 3
+
 [profile.release]
 panic = "abort"
