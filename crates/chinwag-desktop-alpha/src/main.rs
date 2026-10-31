@@ -825,6 +825,11 @@ impl Workbench {
                 !store.blocks(&endpoint, installation_id)
                     && (action != OpeningAction::VsCodeMcpSetup
                         || !store.has_acknowledged_vscode_setup(&endpoint, installation_id))
+                    && !(self.mode == AppMode::Workbench
+                        && action == OpeningAction::CursorMcpSetup
+                        && store
+                            .latest_acknowledged_cursor_setup(&endpoint, installation_id)
+                            .is_some())
             })
     }
 
@@ -1887,6 +1892,11 @@ impl Workbench {
                     .any(|(copy, _)| copy == &id);
                 let setup_enabled =
                     self.can_act_on_installation(OpeningAction::CursorMcpSetup, &id, cx);
+                let setup_sent = self.openings.as_ref().is_some_and(|store| {
+                    store
+                        .latest_acknowledged_cursor_setup(&configured_endpoint, &id)
+                        .is_some()
+                });
                 let vscode_preparing = self.opening_selection.as_ref().is_some_and(|selection| {
                     selection.app.id == id
                         && selection.endpoint == configured_endpoint
@@ -1945,6 +1955,8 @@ impl Workbench {
                                         .small()
                                         .label(if setup_preparing {
                                             "Checking selected app…"
+                                        } else if setup_sent {
+                                            "Cursor setup request sent"
                                         } else {
                                             "Set up Cursor"
                                         })

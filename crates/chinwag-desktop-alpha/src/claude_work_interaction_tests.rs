@@ -943,3 +943,265 @@ fn native_clicks_cross_the_real_owner_wire_and_journal_before_the_turn_ends(
     drop(view);
     drop(port);
 }
+
+fn start_for_submission_report_test(
+    cx: &mut TestAppContext,
+) -> (
+    Arc<FakePort>,
+    gpui_kit::AnyWindowHandle,
+    Entity<ClaudeWorkView>,
+    String,
+    String,
+) {
+    let port = FakePort::new();
+    let (window, view) = mount(cx, port.clone());
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.editor
+                .update(cx, |editor, cx| editor.focus(window, cx))
+        });
+        window.draw(cx).clear(cx);
+        window.input("Original explicit task", cx);
+        window.draw(cx).clear(cx);
+        window.click("submit-claude-work", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (id, text) = port.start_call();
+    (port, window, view, id, text)
+}
+
+#[gpui_kit::test]
+fn adapter_completion_saved_start_then_success_then_late_error_preserves_new_draft(
+    cx: &mut TestAppContext,
+) {
+    let (port, window, view, id, text) = start_for_submission_report_test(cx);
+    let session = test_support::observed_session().unwrap();
+    let saved = receipt(
+        id.clone(),
+        text.clone(),
+        ActionKind::Start,
+        InputTiming::Now,
+        &session,
+        InputEvidence::default(),
+    );
+    port.publish(|snapshot| {
+        snapshot.phase = WorkPhase::Starting;
+        snapshot.start = Some(saved.clone());
+    });
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.flight.is_none());
+            assert_eq!(view.editor.read(cx).value(), "");
+            view.editor
+                .update(cx, |editor, cx| editor.focus(window, cx));
+        });
+        window.draw(cx).clear(cx);
+        window.input("Keep this newer draft", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // Codex emits this early success before a later bootstrap failure. It must
+    // not discard the exact issued identity after its short UI flight ended.
+    port.publish(|snapshot| {
+        snapshot.last_submission = Some(WorkSubmission {
+            id: id.clone(),
+            kind: ActionKind::Start,
+            saved: true,
+            error: None,
+        })
+    });
+    cx.run_until_parked();
+    for (report_id, kind) in [
+        ("foreign-operation".to_string(), ActionKind::Start),
+        (id.clone(), ActionKind::Lookup),
+    ] {
+        port.publish(|snapshot| {
+            snapshot.last_submission = Some(WorkSubmission {
+                id: report_id,
+                kind,
+                saved: true,
+                error: Some(ClaudeError::Storage),
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| assert!(view.read(cx).notice.is_none()));
+    }
+    port.publish(|snapshot| {
+        snapshot.last_submission = Some(WorkSubmission {
+            id: id.clone(),
+            kind: ActionKind::Start,
+            saved: true,
+            error: Some(ClaudeError::Unavailable),
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.notice, Some(error_message(ClaudeError::Unavailable)));
+        assert_eq!(view.editor.read(cx).value(), "Keep this newer draft");
+        assert_eq!(view.snapshot.start.as_ref().unwrap().operation.id, id);
+        assert_eq!(
+            view.snapshot.start.as_ref().unwrap().evidence,
+            saved.evidence
+        );
+    });
+    assert_eq!(
+        port.calls.lock().unwrap().len(),
+        1,
+        "reports do not invoke the port"
+    );
+    cx.update(|cx| view.update(cx, |view, cx| view.lookup(&id, cx)));
+    let checking = cx.update(|cx| view.read(cx).notice);
+    assert!(checking.is_some());
+    port.publish(|snapshot| snapshot.agent_text = Some("Later harmless progress".into()));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(
+            view.notice, checking,
+            "unchanged reports cannot overwrite a newer lookup notice"
+        );
+        assert_eq!(view.editor.read(cx).value(), "Keep this newer draft");
+    });
+    assert_eq!(
+        port.calls.lock().unwrap().len(),
+        2,
+        "only the explicit lookup was added"
+    );
+}
+
+#[gpui_kit::test]
+fn adapter_completion_coalesced_saved_start_and_error_stays_visible_without_replay(
+    cx: &mut TestAppContext,
+) {
+    let (port, window, view, id, text) = start_for_submission_report_test(cx);
+    let session = test_support::observed_session().unwrap();
+    let saved = receipt(
+        id.clone(),
+        text.clone(),
+        ActionKind::Start,
+        InputTiming::Now,
+        &session,
+        InputEvidence::default(),
+    );
+    port.publish(|snapshot| {
+        snapshot.phase = WorkPhase::OwnerActionRequired;
+        snapshot.start = Some(saved.clone());
+        snapshot.last_submission = Some(WorkSubmission {
+            id: id.clone(),
+            kind: ActionKind::Start,
+            saved: true,
+            error: Some(ClaudeError::PermissionDenied),
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.flight.is_none());
+        assert_eq!(
+            view.notice,
+            Some(error_message(ClaudeError::PermissionDenied))
+        );
+        assert_eq!(
+            view.snapshot.start.as_ref().unwrap().evidence,
+            saved.evidence
+        );
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.click("submit-claude-work", cx);
+    })
+    .unwrap();
+    assert_eq!(
+        port.calls.lock().unwrap().len(),
+        1,
+        "an error does not rearm Start or resend"
+    );
+}
+
+#[gpui_kit::test]
+fn adapter_completion_older_start_report_cannot_replace_a_newer_direction_result(
+    cx: &mut TestAppContext,
+) {
+    let session = test_support::observed_session().unwrap();
+    let (port, window, view, start_id, start_text) = start_for_submission_report_test(cx);
+    port.publish(|snapshot| {
+        snapshot.phase = WorkPhase::Working;
+        snapshot.session = Some(session.clone());
+        snapshot.start = Some(receipt(
+            start_id.clone(),
+            start_text,
+            ActionKind::Start,
+            InputTiming::Now,
+            &session,
+            InputEvidence::default(),
+        ));
+    });
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.editor
+                .update(cx, |editor, cx| editor.focus(window, cx))
+        });
+        window.draw(cx).clear(cx);
+        window.input("Second explicit direction", cx);
+        window.draw(cx).clear(cx);
+        window.click("submit-claude-work", cx);
+        view.update(cx, |view, cx| {
+            view.editor
+                .update(cx, |editor, cx| editor.focus(window, cx))
+        });
+        window.input("; keep this next draft", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (id, text, captured, timing) = port.direction_call();
+    port.publish(|snapshot| {
+        snapshot.last_submission = Some(WorkSubmission {
+            id: start_id,
+            kind: ActionKind::Start,
+            saved: true,
+            error: Some(ClaudeError::Unavailable),
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.flight.is_some());
+        assert!(view.notice.is_none(), "a replaced action's report is stale");
+    });
+    port.publish(|snapshot| {
+        snapshot.inputs.push(receipt(
+            id.clone(),
+            text,
+            ActionKind::Direction,
+            timing,
+            &captured,
+            InputEvidence {
+                frame_written: true,
+                ..InputEvidence::default()
+            },
+        ));
+        snapshot.last_submission = Some(WorkSubmission {
+            id,
+            kind: ActionKind::Direction,
+            saved: true,
+            error: Some(ClaudeError::Storage),
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.notice, Some(error_message(ClaudeError::Storage)));
+        assert!(view.flight.is_none());
+        assert_eq!(
+            view.editor.read(cx).value(),
+            "Second explicit direction; keep this next draft"
+        );
+        assert!(view.snapshot.inputs[0].evidence.frame_written);
+    });
+    assert_eq!(port.calls.lock().unwrap().len(), 2);
+}

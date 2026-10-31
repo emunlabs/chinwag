@@ -765,6 +765,50 @@ impl Render for TeamWorkView {
                 .child(Button::new(("lookup-team-direction",index)).small().label("Check original records")
                     .on_click(cx.listener(move|this,_,_,cx|this.lookup(&id,cx))))
         }).collect::<Vec<_>>();
+        let failed_submissions = self
+            .snapshot
+            .submissions
+            .iter()
+            .filter_map(|(id, report)| {
+                let error = report.error?;
+                if report.id != *id
+                    || report.kind != ReportKind::Submit
+                    || report.lookup_serial.is_some()
+                    || !report.admitted
+                    || !report.stage_retired
+                    || self
+                        .snapshot
+                        .directions
+                        .iter()
+                        .any(|receipt| receipt.intent.id == report.id)
+                {
+                    return None;
+                }
+                Some((report, error))
+            })
+            .enumerate()
+            .map(|(index, (report, error))| {
+                let id = report.id.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .py_4()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Original team submission"))
+                    .child(div().text_sm().child(error_message(error)))
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child(
+                        "A saved parent receipt is not available in this view. Check this original record; no direction is sent again.",
+                    ))
+                    .child(
+                        Button::new(("lookup-team-failed-submission", index))
+                            .small()
+                            .label(format!("Check original records · {id}"))
+                            .on_click(cx.listener(move |this, _, _, cx| this.lookup(&id, cx))),
+                    )
+            })
+            .collect::<Vec<_>>();
         let ready = plan
             .as_ref()
             .map(|plan| plan.ready().to_vec())
@@ -792,10 +836,10 @@ impl Render for TeamWorkView {
                 .child(div().id("team-members").w(px(310.)).flex_shrink_0().overflow_y_scroll().px_5().border_r_1().border_color(cx.theme().border).children(rows))
                 .child(div().flex().flex_col().flex_1().min_w_0()
                     .child(div().id("team-direction-history").flex_1().min_h_0().overflow_y_scroll().px_6()
-                        .when(history.is_empty(),|this|this.child(div().flex().flex_col().gap_2().py_8()
+                        .when(history.is_empty() && failed_submissions.is_empty(),|this|this.child(div().flex().flex_col().gap_2().py_8()
                             .child(div().text_lg().font_weight(FontWeight::MEDIUM).child("Give your running work one clear direction"))
                             .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Choose the exact work members, write once, then review each native action. Busy Gemini cancellation stays in its own work window."))))
-                        .children(history))
+                        .children(history).children(failed_submissions))
                     .child(div().flex().flex_col().gap_3().px_6().py_5().border_t_1().border_color(cx.theme().border)
                         .child(div().capture_action(cx.listener(|this,action:&Enter,_,cx|{
                             if action.secondary&&!action.shift { cx.stop_propagation(); if !this.shortcut_held { this.shortcut_held=true;

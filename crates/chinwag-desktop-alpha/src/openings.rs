@@ -320,6 +320,20 @@ impl OpeningStore {
                 "this installation has an unconfirmed opening; use Check opening status",
             ));
         }
+        let mut next = self.attempts.clone();
+        while next.len() >= MAX_ATTEMPTS {
+            let index = next
+                .iter()
+                .position(|attempt| {
+                    !attempt.unresolved()
+                        && !acknowledged_cursor_setup(attempt)
+                        && !acknowledged_vscode_setup(attempt)
+                })
+                .ok_or_else(|| {
+                    invalid("opening history is full of protected or unconfirmed attempts")
+                })?;
+            next.remove(index);
+        }
         let attempt = OpeningAttempt {
             id: new_request_id().map_err(|error| invalid(&error.to_string()))?,
             endpoint: endpoint.into(),
@@ -328,16 +342,6 @@ impl OpeningStore {
             state: OpeningState::Pending,
             human_confirmation: None,
         };
-        let mut next = self.attempts.clone();
-        while next.len() >= MAX_ATTEMPTS {
-            let index = next
-                .iter()
-                .position(|attempt| !attempt.unresolved() && !acknowledged_vscode_setup(attempt))
-                .ok_or_else(|| {
-                    invalid("opening history is full of protected or unconfirmed attempts")
-                })?;
-            next.remove(index);
-        }
         next.push(attempt.clone());
         self.save(&next)?;
         self.attempts = next;

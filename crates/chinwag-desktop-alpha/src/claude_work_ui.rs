@@ -23,6 +23,12 @@ struct Flight {
     draft_identity: Option<Arc<()>>,
 }
 
+struct IssuedSubmission {
+    id: String,
+    kind: ActionKind,
+    report: Option<(bool, Option<ClaudeError>)>,
+}
+
 pub(crate) struct ClaudeWorkView {
     port: Arc<dyn HumanWorkPort>,
     snapshot: WorkSnapshot,
@@ -30,6 +36,7 @@ pub(crate) struct ClaudeWorkView {
     draft_identity: Arc<()>,
     timing: InputTiming,
     flight: Option<Flight>,
+    issued_submission: Option<IssuedSubmission>,
     start_admitted: bool,
     input_end_requested: bool,
     lookup_pending: Option<String>,
@@ -87,6 +94,7 @@ impl ClaudeWorkView {
             draft_identity: Arc::new(()),
             timing: InputTiming::Now,
             flight: None,
+            issued_submission: None,
             start_admitted,
             input_end_requested: false,
             lookup_pending: None,
@@ -165,6 +173,21 @@ impl ClaudeWorkView {
                 Some(error) => error_message(error),
                 None => "Original receipt checked. Nothing was sent again.",
             });
+        }
+        // Receipt publication can precede the final submission result. Retain
+        // only this view's latest issued identity, independently of its flight.
+        if let Some(issued) = &mut self.issued_submission
+            && let Some(report) = &snapshot.last_submission
+            && report.id == issued.id
+            && report.kind == issued.kind
+        {
+            let fingerprint = (report.saved, report.error);
+            if issued.report != Some(fingerprint) {
+                issued.report = Some(fingerprint);
+                if let Some(error) = report.error {
+                    self.notice = Some(error_message(error));
+                }
+            }
         }
         self.start_admitted |= snapshot.start.is_some() || snapshot.phase != WorkPhase::Ready;
         self.snapshot = snapshot;
@@ -250,6 +273,11 @@ impl ClaudeWorkView {
         match result {
             Ok(()) => {
                 self.start_admitted |= kind == ActionKind::Start;
+                self.issued_submission = Some(IssuedSubmission {
+                    id: id.clone(),
+                    kind,
+                    report: None,
+                });
                 let baseline_id = id.clone();
                 self.flight = Some(Flight {
                     id,
@@ -398,7 +426,7 @@ fn error_message(error: ClaudeError) -> &'static str {
             "This input ID belongs to different content. It will not be resent."
         }
         ClaudeError::Unavailable => {
-            "The owned Claude session is unavailable. Your draft stays here."
+            "The owned Claude session is unavailable. Nothing will be resent automatically."
         }
         ClaudeError::Uncertain => {
             "The original outcome is unknown. Check its receipt instead of sending it again."

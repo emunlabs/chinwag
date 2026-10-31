@@ -223,6 +223,109 @@ fn full_protected_or_unresolved_history_refuses_capacity_without_changing_disk_o
 }
 
 #[test]
+fn adapter_completion_cursor_ack_and_original_human_confirmation_survive_capacity_and_reopen() {
+    let directory = Directory::new();
+    let endpoint = "http://127.0.0.1:44341";
+    let id = format!("{:064x}", 0);
+    write_full_history_fixture(&directory.file(), endpoint, 0, 0);
+    let mut fixture: Value = serde_json::from_slice(&fs::read(directory.file()).unwrap()).unwrap();
+    fixture["attempts"][0]["action"] = json!("cursor_mcp_setup");
+    fs::write(directory.file(), serde_json::to_vec(&fixture).unwrap()).unwrap();
+    let mut store = OpeningStore::open(directory.file()).unwrap();
+    let confirmed_at = 1_793_400_000_000;
+    store
+        .confirm_cursor_tools_listed(endpoint, &id, confirmed_at)
+        .unwrap();
+    let original = store.attempts[0].clone();
+    let saved: Value = serde_json::from_slice(&fs::read(directory.file()).unwrap()).unwrap();
+    let original_row = serde_json::to_vec(&saved["attempts"][0]).unwrap();
+    for index in 0..4 {
+        let attempt = store
+            .prepare(
+                OpeningAction::OrdinaryOpen,
+                endpoint,
+                &format!("{:064x}", MAX_ATTEMPTS + index),
+            )
+            .unwrap();
+        store
+            .apply_receipt(
+                &attempt.id,
+                receipt(&attempt, NativeOpenState::OpenedOrReused),
+            )
+            .unwrap();
+        assert_eq!(store.attempts.len(), MAX_ATTEMPTS);
+        assert_eq!(store.attempts[0], original);
+        let saved: Value = serde_json::from_slice(&fs::read(directory.file()).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&saved["attempts"][0]).unwrap(),
+            original_row
+        );
+    }
+    assert!(
+        !store
+            .attempts
+            .iter()
+            .any(|row| row.id == "ui-history-capacity-0001")
+    );
+    drop(store);
+    let mut reopened = OpeningStore::open(directory.file()).unwrap();
+    assert_eq!(
+        reopened.latest_acknowledged_cursor_setup(endpoint, &id),
+        Some(&original)
+    );
+    let saved = fs::read(directory.file()).unwrap();
+    reopened
+        .confirm_cursor_tools_listed(endpoint, &id, confirmed_at + 999)
+        .unwrap();
+    assert_eq!(fs::read(directory.file()).unwrap(), saved);
+    assert!(
+        reopened
+            .latest_acknowledged_cursor_setup("http://127.0.0.1:44342", &id)
+            .is_none()
+    );
+}
+
+#[test]
+fn adapter_completion_full_cursor_mixed_setup_and_pending_history_fails_without_save_or_eviction() {
+    for (cursor_count, vscode_count, pending) in [(128, 0, 0), (64, 64, 0), (32, 32, 64)] {
+        let directory = Directory::new();
+        let endpoint = "http://127.0.0.1:44341";
+        write_full_history_fixture(
+            &directory.file(),
+            endpoint,
+            cursor_count + vscode_count,
+            pending,
+        );
+        let mut fixture: Value =
+            serde_json::from_slice(&fs::read(directory.file()).unwrap()).unwrap();
+        for index in 0..cursor_count {
+            fixture["attempts"][index]["action"] = json!("cursor_mcp_setup");
+            fixture["attempts"][index]["human_confirmation"] = json!({
+                "evidence":"human_reported_enabled_with_tools", "confirmed_at_unix_ms":index + 1
+            });
+        }
+        fs::write(directory.file(), serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let mut store = OpeningStore::open(directory.file()).unwrap();
+        let original = store.attempts.clone();
+        let saved = fs::read(directory.file()).unwrap();
+        let inode = fs::metadata(directory.file()).unwrap().ino();
+        let entries = fs::read_dir(&directory.0).unwrap().count();
+        for action in [OpeningAction::OrdinaryOpen, OpeningAction::CursorMcpSetup] {
+            assert!(store.prepare(action, endpoint, &"f".repeat(64)).is_err());
+            assert_eq!(store.attempts, original);
+            assert_eq!(fs::read(directory.file()).unwrap(), saved);
+            assert_eq!(fs::metadata(directory.file()).unwrap().ino(), inode);
+            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), entries);
+        }
+        drop(store);
+        assert_eq!(
+            OpeningStore::open(directory.file()).unwrap().attempts,
+            original
+        );
+    }
+}
+
+#[test]
 fn malformed_or_foreign_receipt_cannot_claim_opened_or_unblock_an_attempt() {
     let directory = Directory::new();
     let mut store = OpeningStore::open(directory.file()).unwrap();

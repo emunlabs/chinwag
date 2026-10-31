@@ -23,12 +23,19 @@ struct Flight {
     draft_identity: Option<Arc<()>>,
 }
 
+struct IssuedSubmission {
+    id: String,
+    kind: ActionKind,
+    report: Option<(bool, Option<GeminiError>)>,
+}
+
 pub(crate) struct GeminiWorkView {
     port: Arc<dyn HumanWorkPort>,
     snapshot: WorkSnapshot,
     editor: Entity<TextareaState>,
     draft_identity: Arc<()>,
     flight: Option<Flight>,
+    issued_submission: Option<IssuedSubmission>,
     start_admitted: bool,
     input_end_requested: bool,
     lookup_pending: Option<String>,
@@ -84,6 +91,7 @@ impl GeminiWorkView {
             editor,
             draft_identity: Arc::new(()),
             flight: None,
+            issued_submission: None,
             start_admitted,
             input_end_requested: false,
             lookup_pending: None,
@@ -168,6 +176,21 @@ impl GeminiWorkView {
                 Some(error) => error_message(error),
                 None => "Original receipt checked. No input or cancellation was sent again.",
             });
+        }
+        // Receipt publication can precede the final submission result. Retain
+        // only this view's latest issued identity, independently of its flight.
+        if let Some(issued) = &mut self.issued_submission
+            && let Some(report) = &snapshot.last_submission
+            && report.id == issued.id
+            && report.kind == issued.kind
+        {
+            let fingerprint = (report.saved, report.error);
+            if issued.report != Some(fingerprint) {
+                issued.report = Some(fingerprint);
+                if let Some(error) = report.error {
+                    self.notice = Some(error_message(error));
+                }
+            }
         }
         self.start_admitted |= snapshot.start.is_some() || snapshot.phase != WorkPhase::Ready;
         self.snapshot = snapshot;
@@ -259,6 +282,11 @@ impl GeminiWorkView {
         match result {
             Ok(()) => {
                 self.start_admitted |= kind == ActionKind::Start;
+                self.issued_submission = Some(IssuedSubmission {
+                    id: id.clone(),
+                    kind,
+                    report: None,
+                });
                 self.flight = Some(Flight {
                     id: id.clone(),
                     kind,
@@ -322,6 +350,11 @@ impl GeminiWorkView {
         };
         match self.port.cancel(captured, &id) {
             Ok(()) => {
+                self.issued_submission = Some(IssuedSubmission {
+                    id: id.clone(),
+                    kind: ActionKind::Cancel,
+                    report: None,
+                });
                 self.flight = Some(Flight {
                     id,
                     kind: ActionKind::Cancel,
@@ -491,7 +524,7 @@ fn error_message(error: GeminiError) -> &'static str {
             "This operation ID belongs to different content. It will not be sent again."
         }
         GeminiError::Unavailable => {
-            "The declared Gemini runtime is unavailable. Your draft stays here."
+            "The declared Gemini runtime is unavailable. Nothing will be resent automatically."
         }
         GeminiError::Uncertain => {
             "The original outcome is unknown. Check its receipt instead of repeating the action."

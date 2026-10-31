@@ -578,6 +578,260 @@ fn newer_same_parent_lookup_uses_its_actual_outcome_and_never_retires_submit_fli
         .unwrap();
 }
 
+#[gpui_kit::test]
+fn adapter_completion_failed_team_save_exposes_original_lookup_and_preserves_newer_draft(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    use serde_json::json;
+    let mut actual = actual_team();
+    let rt = runtime();
+    let start = chinwag_claude_control::new_operation_id().unwrap();
+    actual
+        .claude
+        .start(&start, "Original synthetic work")
+        .unwrap();
+    let init = rt.block_on(read_frame(&mut actual.claude_peer.io));
+    rt.block_on(send_frame(
+        &mut actual.claude_peer.io,
+        json!({
+            "type":"control_response","response":{"subtype":"success",
+            "request_id":init["request_id"],"response":{"claude_code_version":"2.1.314"}}
+        }),
+    ));
+    let initial = rt.block_on(read_frame(&mut actual.claude_peer.io));
+    assert_eq!(initial["uuid"], start);
+    rt.block_on(send_frame(
+        &mut actual.claude_peer.io,
+        json!({
+            "type":"system","subtype":"init","session_id":initial["session_id"],
+            "claude_code_version":"2.1.314","cwd":actual.claude_peer.workdir,
+            "tools":[],"permissionMode":"default"
+        }),
+    ));
+    wait_team(&rt, &actual.host, |snapshot| {
+        snapshot.members.iter().any(|member| {
+            matches!(&member.native, NativeSnapshot::Claude(native)
+                if native.session.is_some()
+                    && native.start.as_ref().is_some_and(|r| r.evidence.frame_written)
+                    && native.last_submission.as_ref().is_some_and(|r|
+                        r.id == start && r.saved && r.error.is_none()))
+        })
+    });
+    let (window, view) = mount(cx, actual.host.clone());
+    cx.run_until_parked();
+    let root = actual._directory.path().canonicalize().unwrap();
+    let actions = root.join("team-state/actions");
+    let marker = actions.join("team-direction-domain.json");
+    // Break only this temporary parent domain, before the human direction.
+    // Real preparation succeeds, but saving the parent fails before any child call.
+    std::fs::write(&marker, b"invalid fixture domain\n").unwrap();
+    let original_draft = "Keep the original failed direction";
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.editor
+                .update(cx, |editor, cx| editor.focus(window, cx));
+        });
+        window.draw(cx).clear(cx);
+        window.click(("team-member", 0_usize), cx);
+        view.update(cx, |view, cx| {
+            view.editor
+                .update(cx, |editor, cx| editor.focus(window, cx));
+        });
+        window.input(original_draft, cx);
+        window.draw(cx).clear(cx);
+        window.click("send-team-direction", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let failed = wait_team(&rt, &actual.host, |snapshot| {
+        snapshot.submissions.values().any(|r| {
+            r.kind == ReportKind::Submit && r.stage_retired && r.error == Some(TeamError::Storage)
+        })
+    });
+    let parent = failed.submissions.keys().next().unwrap().clone();
+    assert_eq!(failed.submissions.len(), 1);
+    assert!(failed.directions.is_empty());
+    cx.run_until_parked();
+    {
+        let state = actual.host.presentation.lock().unwrap();
+        assert!(state.flight.is_none());
+        assert!(state.consumed());
+        assert_eq!(state.draft, original_draft);
+    }
+    let native_path = root.join("claude-native").join(format!("{start}.jsonl"));
+    let native_before = std::fs::read(&native_path).unwrap();
+    let label = format!("Check original records · {parent}");
+    let newer_draft = "A newer human draft must survive the original check";
+    let serial = cx
+        .update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find_by_label(&label).visible(),
+                "original ID and read-only check are visible"
+            );
+            window.click(("lookup-team-failed-submission", 0_usize), cx);
+            let pending = actual
+                .host
+                .presentation
+                .lock()
+                .unwrap()
+                .lookup_pending
+                .clone()
+                .unwrap();
+            assert_eq!(pending.0, parent);
+            window.click(("lookup-team-failed-submission", 0_usize), cx);
+            assert_eq!(
+                actual.host.presentation.lock().unwrap().lookup_pending,
+                Some(pending.clone())
+            );
+            view.update(cx, |view, cx| {
+                view.editor
+                    .update(cx, |editor, cx| editor.focus(window, cx));
+            });
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-a"
+                } else {
+                    "ctrl-a"
+                },
+                cx,
+            );
+            window.input(newer_draft, cx);
+            pending.1
+        })
+        .unwrap();
+    let checked = wait_team(&rt, &actual.host, |snapshot| {
+        snapshot.lookups.get(&parent).is_some_and(|r| {
+            r.kind == ReportKind::Lookup
+                && r.lookup_serial == Some(serial)
+                && r.stage_retired
+                && r.error == Some(TeamError::Storage)
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| assert_eq!(view.read(cx).editor.read(cx).value(), newer_draft));
+    {
+        let state = actual.host.presentation.lock().unwrap();
+        assert!(state.lookup_pending.is_none());
+        assert_eq!(state.draft, newer_draft);
+    }
+    assert_eq!(checked.submissions.len(), 1, "lookup mints no parent");
+    assert!(checked.directions.is_empty());
+    assert!(std::fs::read_dir(&actions).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".jsonl")
+    }));
+    assert_eq!(std::fs::read(&native_path).unwrap(), native_before);
+    assert!(actual.claude.subscribe().borrow().inputs.is_empty());
+    assert!(actual.gemini.subscribe().borrow().start.is_none());
+    no_frame(&rt, &mut actual.claude_peer.io);
+    no_frame(&rt, &mut actual.gemini_peer.io);
+    actual.host.close_controls();
+    actual.claude_peer.finish(0);
+    actual.gemini_peer.finish(0);
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+}
+
+#[gpui_kit::test]
+fn adapter_completion_failed_team_row_requires_submit_error_and_deduplicates_saved_parent(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let mut actual = actual_team();
+    let rt = runtime();
+    wait_team(&rt, &actual.host, |snapshot| snapshot.members.len() == 2);
+    let (window, view) = mount(cx, actual.host.clone());
+    cx.run_until_parked();
+    let parent = format!("team-{}", "a".repeat(64));
+    let label = format!("Check original records · {parent}");
+    let original = SubmissionReport {
+        id: parent.clone(),
+        kind: ReportKind::Submit,
+        lookup_serial: None,
+        admitted: true,
+        stage_retired: true,
+        error: Some(TeamError::Storage),
+    };
+    for variant in 0..8 {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let mut snapshot = view.snapshot.clone();
+                snapshot.revision = snapshot.revision.saturating_add(100);
+                snapshot.submissions.clear();
+                snapshot.lookups.clear();
+                snapshot.directions.clear();
+                let mut report = original.clone();
+                match variant {
+                    1 => report.kind = ReportKind::Lookup,
+                    2 => report.error = None,
+                    3 => report.stage_retired = false,
+                    4 => report.admitted = false,
+                    5 => report.id = format!("team-{}", "b".repeat(64)),
+                    6 => report.lookup_serial = Some(1),
+                    7 => {
+                        snapshot.lookups.insert(parent.clone(), report.clone());
+                    }
+                    _ => {}
+                }
+                if variant != 7 {
+                    snapshot.submissions.insert(parent.clone(), report);
+                }
+                view.apply_snapshot(snapshot, window, cx);
+            });
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                window.find_all_by_label(&label).len(),
+                usize::from(variant == 0)
+            );
+        })
+        .unwrap();
+    }
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            let mut snapshot = view.snapshot.clone();
+            snapshot.revision = snapshot.revision.saturating_add(100);
+            snapshot
+                .submissions
+                .insert(parent.clone(), original.clone());
+            // A later saved parent owns the normal history/check row. No
+            // second failed-save row is manufactured from the retained report.
+            snapshot.directions.push(DirectionReceipt {
+                intent: chinwag_team_direction::SavedDirection {
+                    id: parent.clone(),
+                    host_instance: format!("host-{}", "c".repeat(64)),
+                    text: "Original parent text".into(),
+                    human_revision: 1,
+                    selected: vec!["claude-review".into()],
+                    effective: vec!["claude-review".into()],
+                    members: Vec::new(),
+                },
+                members: Vec::new(),
+                stage_retired: true,
+                persistence_failed: true,
+                recovered: false,
+            });
+            view.apply_snapshot(snapshot, window, cx);
+        });
+        window.draw(cx).clear(cx);
+        assert!(window.find_all_by_label(&label).is_empty());
+        assert_eq!(window.find_all_by_label("Check original records").len(), 1);
+    })
+    .unwrap();
+    no_frame(&rt, &mut actual.claude_peer.io);
+    no_frame(&rt, &mut actual.gemini_peer.io);
+    assert!(actual.host.core.subscribe().borrow().directions.is_empty());
+    actual.host.close_controls();
+    actual.claude_peer.finish(0);
+    actual.gemini_peer.finish(0);
+    cx.update_window(window, |_, window, _| window.remove_window())
+        .unwrap();
+}
+
 /// Crosses the real team coordinator, parent journal, two real native actors,
 /// their child journals and existing native Start/Cancel views. Only external
 /// CLI child IO is synthetic; no model or installed runtime is invoked.

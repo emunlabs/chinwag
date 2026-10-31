@@ -20,12 +20,19 @@ struct Flight {
     draft_identity: Option<Arc<()>>,
 }
 
+struct IssuedSubmission {
+    id: String,
+    kind: WorkActionKind,
+    report: Option<(bool, Option<SteerError>)>,
+}
+
 pub(crate) struct CodexWorkView {
     port: Arc<dyn HumanWorkPort>,
     snapshot: WorkSnapshot,
     editor: Entity<TextareaState>,
     draft_identity: Arc<()>,
     flight: Option<Flight>,
+    issued_submission: Option<IssuedSubmission>,
     start_admitted: bool,
     close_requested: bool,
     lookup_pending: Option<String>,
@@ -77,6 +84,7 @@ impl CodexWorkView {
             editor,
             draft_identity: Arc::new(()),
             flight: None,
+            issued_submission: None,
             start_admitted,
             close_requested: false,
             lookup_pending: None,
@@ -161,6 +169,22 @@ impl CodexWorkView {
                 None => "Original receipt checked. No request was sent again.",
             });
         }
+        // Saved intent can settle the short flight before bootstrap finishes.
+        // Keep the issued identity across an early successful report so a later
+        // matching error remains visible without reapplying unchanged reports.
+        if let Some(issued) = &mut self.issued_submission
+            && let Some(report) = &snapshot.last_submission
+            && report.id == issued.id
+            && report.kind == issued.kind
+        {
+            let fingerprint = (report.saved, report.error);
+            if issued.report != Some(fingerprint) {
+                issued.report = Some(fingerprint);
+                if let Some(error) = report.error {
+                    self.notice = Some(error_message(error));
+                }
+            }
+        }
         self.start_admitted |= snapshot.start.is_some() || snapshot.phase != WorkPhase::Ready;
         self.snapshot = snapshot;
         cx.notify();
@@ -244,6 +268,11 @@ impl CodexWorkView {
         match result {
             Ok(()) => {
                 self.start_admitted |= kind == WorkActionKind::Start;
+                self.issued_submission = Some(IssuedSubmission {
+                    id: id.clone(),
+                    kind,
+                    report: None,
+                });
                 let baseline_id = id.clone();
                 self.flight = Some(Flight {
                     id,
@@ -391,7 +420,7 @@ fn error_message(error: SteerError) -> &'static str {
             "This request ID belongs to different input. No automatic resend is permitted."
         }
         SteerError::Unavailable => {
-            "The declared control connection is unavailable. Your draft stays here."
+            "The declared control connection is unavailable. Nothing will be resent automatically."
         }
         SteerError::Uncertain => {
             "The original outcome is unknown. Check its receipt instead of sending it again."

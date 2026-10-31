@@ -231,6 +231,164 @@ fn save_setup_acknowledgement(
 }
 
 #[gpui_kit::test]
+fn adapter_completion_workbench_preserves_capacity_ack_and_rejects_click_stale_handler_and_refresh(
+    cx: &mut TestAppContext,
+) {
+    let directory = Directory::new();
+    let drafts = directory.drafts();
+    let path = openings::path_for_drafts(&drafts).unwrap();
+    let (endpoint, worker) = fixture(3, |request, index| {
+        assert!(
+            request.starts_with("GET "),
+            "only initial Find metadata is expected"
+        );
+        match index {
+            0 => {
+                assert!(request.starts_with("GET /api/bus/clients "));
+                (200, cursor_copies_inventory(true))
+            }
+            1 => {
+                assert!(request.starts_with("GET /api/onboarding/status "));
+                (200, status(true))
+            }
+            _ => {
+                assert!(request.starts_with("GET /api/onboarding/cursor-mcp/status "));
+                (200, status(true))
+            }
+        }
+    });
+    let original = {
+        let mut store = OpeningStore::open(path.clone()).unwrap();
+        save_setup_acknowledgement(&mut store, &endpoint, &"a".repeat(64));
+        store
+            .confirm_cursor_tools_listed(&endpoint, &"a".repeat(64), 1_793_400_000_000)
+            .unwrap();
+        let original = store.attempts[0].clone();
+        drop(store);
+        let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for index in 1..128 {
+            let id = format!("ui-cursor-capacity-{index:04}");
+            let installation = format!("{index:064x}");
+            saved["attempts"].as_array_mut().unwrap().push(json!({
+                "id":id,"endpoint":endpoint,"installation_id":installation,
+                "action":"ordinary_open","state":"receipt",
+                "receipt":{"schema":"chinwag-native-open/v1","request_id":id,
+                    "installation_id":installation,"state":"opened_or_reused",
+                    "message":"Synthetic unrelated OS acknowledgement"}
+            }));
+        }
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut store = OpeningStore::open(path.clone()).unwrap();
+        let extra = store
+            .prepare(OpeningAction::OrdinaryOpen, &endpoint, &"c".repeat(64))
+            .unwrap();
+        store
+            .apply_receipt(
+                &extra.id,
+                NativeOpenReceipt {
+                    schema: "chinwag-native-open/v1".into(),
+                    request_id: extra.id.clone(),
+                    installation_id: extra.installation_id.clone(),
+                    state: chinwag_bus_client::NativeOpenState::OpenedOrReused,
+                    message: "Synthetic unrelated OS acknowledgement".into(),
+                },
+            )
+            .unwrap();
+        original
+    };
+    let saved = std::fs::read(&path).unwrap();
+    cx.update(init);
+    let (window, view) = cx.update(|cx| {
+        open_window(WindowOptions::default(), cx, |window, cx| {
+            cx.new(|cx| {
+                Workbench::with_settings(window, cx, endpoint.clone(), Some(drafts.clone()))
+            })
+        })
+        .unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.click("find-client-apps", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let requests = worker.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|request| request.starts_with("GET ")));
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            window.find(("setup-cursor-mcp", 0_usize)).label(),
+            Some("Cursor setup request sent")
+        );
+        assert_eq!(
+            window.find(("setup-cursor-mcp", 0_usize)).disabled(),
+            Some(true)
+        );
+        window.click(("setup-cursor-mcp", 0_usize), cx);
+        view.update(cx, |view, cx| {
+            assert!(view.opening_warning.is_none());
+            let sequence = view.opening_sequence;
+            view.act_on_installation(OpeningAction::CursorMcpSetup, &"a".repeat(64), cx);
+            assert_eq!(
+                view.opening_sequence, sequence,
+                "no selection or request ID is allocated"
+            );
+            assert!(view.selection_task.is_none());
+            assert!(view.opening_tasks.is_empty());
+            assert!(view.opening_generations.is_empty());
+            assert!(!view.can_act_on_installation(
+                OpeningAction::CursorMcpSetup,
+                &"a".repeat(64),
+                cx
+            ));
+            assert!(view.can_act_on_installation(
+                OpeningAction::CursorMcpSetup,
+                &"b".repeat(64),
+                cx
+            ));
+            assert!(view.can_open_installation(&"a".repeat(64), cx));
+            let selection = OpeningSelection {
+                app: view
+                    .client_inventory
+                    .installed_copy(&"a".repeat(64))
+                    .unwrap(),
+                endpoint: endpoint.clone(),
+                epoch: view.opening_epoch,
+                inventory_generation: view.client_inventory.generation(),
+                connection_generation: view.connection_generation,
+                generation: sequence,
+                action: OpeningAction::CursorMcpSetup,
+            };
+            // A stale preflight completion must recheck the current acknowledgment.
+            view.opening_selection = Some(selection.clone());
+            assert!(view.apply_selection_refresh(
+                &selection,
+                AppInventoryRead {
+                    inventory: Ok(serde_json::from_value(cursor_copies_inventory(true)).unwrap()),
+                    opening_status: None,
+                    cursor_mcp_status: Some(Ok(serde_json::from_value(status(true)).unwrap())),
+                    vscode_mcp_status: None,
+                },
+                cx
+            ));
+            assert!(view.selection_task.is_none());
+            assert!(view.opening_tasks.is_empty());
+            assert!(view.opening_generations.is_empty());
+            let store = view.openings.as_ref().unwrap();
+            assert_eq!(store.attempts.len(), 128);
+            assert_eq!(
+                store.latest_acknowledged_cursor_setup(&endpoint, &"a".repeat(64)),
+                Some(&original)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn acknowledged_setup_beyond_recent_history_cap_cannot_repeat_from_primary(
     cx: &mut TestAppContext,
 ) {
