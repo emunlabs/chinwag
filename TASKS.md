@@ -20,7 +20,7 @@ Open, with no unfinished dependency. Each row has an owner and reviewer in the t
 
 | ID | Task | Owner |
 | :--- | :--- | :--- |
-| ENG-1 | PR #11 allowed_signers (FLINT review running now) | ENG |
+| ENG-1 | PR #11 allowed_signers (FLINT review blocked on gh auth) | ENG |
 | ENG-3 | Secrets plug-in PRD | ENG |
 | ENG-6 | One-way Vault credits with proving test | ENG |
 | ENG-9 | Spotify demo behind a flag (GROWTH's demo) | ENG |
@@ -31,6 +31,8 @@ Open, with no unfinished dependency. Each row has an owner and reviewer in the t
 | ENG-14 | Key scrub on eng/decompose-preview | ENG |
 | PRD-1 | v0.1.2 PRD build (TASKS.md dependency is a proposed drop, pending Brian) | product |
 | PRD-6 | ALISTAIR co-sign of dealer safety floor (PLY-14, 17, 18, 19, 22) | ALISTAIR |
+| SM-0 | chinwag.sh website revamp copy | DECLARATION |
+| SM-0b | emunlabs.com website revamp copy | TBD |
 | SM-2 | Default card copy | DECLARATION |
 | SM-3 | Enterprise comparables | SALES |
 | SM-6a | Spotify one-pager (ready) | GROWTH |
@@ -72,8 +74,10 @@ Due-time item: **SM-1** (row 66 retention list) must land before the 9 AM CT sta
 | 9 | Price-table approval (BIZ-1), after VENTURE + SALES check | BIZ-2, BIZ-4, SM-13 |
 | 10 | Title and consideration blanks for the IP assignment | BIZ-7 |
 | 11 | Reviews you own: SM-1, SM-5 (rules), SM-6, SM-7, BIZ-3..BIZ-8, BIZ-9 (rules) | their parent tasks |
+| 12 | Pick message-house upgrade route Option A or B | SM-0 final copy |
+| 13 | emunlabs.com message house owner: GEMINI-PM or DECLARATION | SM-0b |
 
-Resolved since the draft began: orphaned pi process — killed by eng with Brian's approval. FLINT is not blocked and is reviewing #11, then #12.
+Resolved since the draft began: orphaned pi process — killed by eng with Brian's approval. FLINT reviews of #11/#12 have not run yet (gh auth over SSH).
 
 ## 4. Dependency chain
 
@@ -103,6 +107,8 @@ PRD-6 ALISTAIR co-sign       ->  DEX/DECLARATION review of Breakroom sections an
 ENG-9 Spotify demo flag      ->  SM-6b Spotify demo
 INF-11 Exhibit A + Brian's blanks  ->  BIZ-7 IP assignment
 counsel claims review        ->  BIZ-8 patent pledge CHWG-PAT-05
+Brian picks A/B  ->  SM-0 chinwag.sh copy
+emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 ```
 
 ## 5. Tasks by team
@@ -111,7 +117,7 @@ counsel claims review        ->  BIZ-8 patent pledge CHWG-PAT-05
 
 | ID | Task | Owner | Depends on | Reviewer | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| ENG-1 | [PR #11](https://github.com/emunlabs/chinwag/pull/11) allowed_signers | ENG | FLINT review (running; FLINT's server is fixed) | FLINT, then infra QA (squash-merge). ALISTAIR + QA approved | open · in review |
+| ENG-1 | [PR #11](https://github.com/emunlabs/chinwag/pull/11) allowed_signers | ENG | FLINT review (not yet run: gh auth fails for FLINT over SSH on the MacBook; options with Brian) | FLINT, then infra QA (squash-merge). ALISTAIR + QA approved | open · in progress |
 | ENG-2 | [PR #12](https://github.com/emunlabs/chinwag/pull/12) CLA → DCO | ENG | ENG-1 (#12 follows #11) | FLINT + ALISTAIR, then infra QA | open |
 | ENG-3 | Secrets plug-in PRD | ENG | — | ALISTAIR, infra, QA | open |
 | ENG-4 | SecretStore interface + Cloudflare plug-in | RUST | ENG-3 | FLINT, ALISTAIR, infra QA | open |
@@ -142,17 +148,20 @@ counsel claims review        ->  BIZ-8 patent pledge CHWG-PAT-05
 
 | ID | Task | Owner | Depends on | Reviewer | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| PRD-1 | v0.1.2 PRD build: fold comments + rulings; remove the unknown-age profiling section; include the minor flow in 5.1.1 | product | TASKS.md merged — **proposed drop, pending Brian** | MacBook Codex | open |
+| PRD-1 | v0.1.2 PRD build: fold comments + rulings; remove the unknown-age profiling section; include the minor flow in 5.1.1. Folds in v0.1.1 comments from GROWTH (G1-G15), SALES (S1-S13), GEMINI-PM (PM1-PM14); do not re-send them for review. | product | TASKS.md merged — **proposed drop, pending Brian** | MacBook Codex | open |
 | PRD-2 | STE-80 lint rerun | product | PRD-1 | QA | open |
 | PRD-3 | DEX / DECLARATION doc split | product | PRD-1, PRD-2 | s-and-m | open |
 | PRD-4 | Consistency pass on every doc | MacBook Codex | PRD-3, SM-5 | product | open |
 | PRD-5 | PLY-18.5 — closed by Brian (no ID checks, 18+) | Brian | — | Brian | done |
 | PRD-6 | ALISTAIR co-sign on dealer safety floor PLY-14, 17, 18, 19, 22. Blocks DEX/DECLARATION review of the Breakroom sections and the 0.2 dealer gates | ALISTAIR | — | product | open |
+| PRD-7 | Remove 'Zero-Knowledge' from GEMINI-PM's message house and sync the wiki copy to the Antigravity source (back up first) | product | — (ready) | GEMINI-PM | done, pending review (GEMINI-PM) (wiki synced byte-for-byte to Antigravity source; old copy backed up; source left untouched, so DECLARATION omits the one "Zero-Knowledge" phrase on line 37) |
 
 ### 5.3 S&M
 
 | ID | Task | Owner | Depends on | Reviewer | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| SM-0 | chinwag.sh website revamp copy from GEMINI-PM message house (`chinwag-sh-revamp-message-house-and-two-routes.md`, product syncs wiki copy from GEMINI-PM's Antigravity source). Use 'encrypted'/'tamper-proof sealed', never 'Zero-Knowledge'; no clearance in bios; 18+ statement on site; tiers Free/Team/Enterprise with no prices | DECLARATION | Brian picks Option A or B before copy is final | Brian | open |
+| SM-0b | emunlabs.com website revamp copy | TBD (Brian: GEMINI-PM writes a message house, or DECLARATION drafts from the Chinwag one) | emunlabs.com message house (none exists yet) | Brian | open · waiting on Brian |
 | SM-1 | Row 66 retention list. Copy: EAGLE-EYE. Due before the 9 AM CT standup | DEX | BIZ-3 (privacy part only) | Brian | open |
 | SM-2 | Default card copy. "encrypted" and "tamper-proof sealed" are OK; no "zero-knowledge" | DECLARATION | — | ALISTAIR | open |
 | SM-3 | Enterprise comparables | SALES | — | MO | open |
