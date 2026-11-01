@@ -29,7 +29,7 @@ Open, with no unfinished dependency. Each row has an owner and reviewer in the t
 | ENG-12 | Per-worker build dirs | ENG |
 | ENG-13 | PRs #4, #5, #8, #10 | ENG |
 | ENG-14 | Key scrub on eng/decompose-preview | ENG |
-| PRD-1 | v0.1.2 PRD build (TASKS.md dependency is a proposed drop, pending Brian) | product |
+| PRD-1 | v0.1.2 PRD build | product |
 | PRD-6 | ALISTAIR co-sign of dealer safety floor (PLY-14, 17, 18, 19, 22) | ALISTAIR |
 | SM-0 | chinwag.sh website revamp copy | DECLARATION |
 | SM-0b | emunlabs.com website revamp copy | TBD |
@@ -72,7 +72,6 @@ Due-time item: **SM-1** (row 66 retention list) must land before the 9 AM CT sta
 | 5 | D&B email send before ~8 AM CT Nov 2 (PA-1) | none |
 | 6 | IRS 8822-B signature (PA-3) | none |
 | 7 | itsaplan R2 bucket + token | INF-3 |
-| 8 | Ruling on `proposed drop`: v0.1.2 no longer depends on TASKS.md being merged | PRD-1 (starts regardless; the dependency is shown in section 4) |
 | 9 | Price-table approval (BIZ-1), after VENTURE + SALES check | BIZ-2, BIZ-4, SM-13 |
 | 10 | Title and consideration blanks for the IP assignment | BIZ-7 |
 | 11 | Reviews you own: SM-1, SM-5 (rules), SM-6, SM-7, BIZ-3..BIZ-8, BIZ-9 (rules) | their parent tasks |
@@ -86,7 +85,6 @@ Resolved since the draft began: orphaned pi process — killed by eng with Brian
 Read top to bottom. `A -> B` means B waits on A.
 
 ```
-TASKS.md merged  ->  v0.1.2 PRD build           (proposed drop, pending Brian)
 v0.1.2 PRD build (fold comments + rulings)
    ->  STE-80 lint rerun
    ->  split for DEX / DECLARATION
@@ -150,7 +148,7 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 
 | ID | Task | Owner | Depends on | Reviewer | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| PRD-1 | v0.1.2 PRD build: fold comments + rulings; remove the unknown-age profiling section; include the minor flow in 5.1.1. Folds in v0.1.1 comments from GROWTH (G1-G15), SALES (S1-S13), GEMINI-PM (PM1-PM14); do not re-send them for review. | product | TASKS.md merged — **proposed drop, pending Brian** | MacBook Codex | open |
+| PRD-1 | v0.1.2 PRD build: fold comments + rulings; remove the unknown-age profiling section; include the minor flow in 5.1.1. Folds in v0.1.1 comments from GROWTH (G1-G15), SALES (S1-S13), GEMINI-PM (PM1-PM14); do not re-send them for review. | product | — | MacBook Codex | open |
 | PRD-2 | STE-80 lint rerun | product | PRD-1 | QA | open |
 | PRD-3 | DEX / DECLARATION doc split | product | PRD-1, PRD-2 | s-and-m | open |
 | PRD-4 | Consistency pass on every doc | MacBook Codex | PRD-3, SM-5 | product | open |
