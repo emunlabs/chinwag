@@ -46,6 +46,9 @@ const USD_PER_M_INPUT: f64 = 0.30;
 const USD_PER_M_OUTPUT: f64 = 1.20;
 const USD_PER_M_CACHED_INPUT: f64 = 0.006;
 const MAX_COMPLETION_TOKENS: u64 = 16_000;
+/// Appended as a system message. Without it the model's default `high` reasoning can eat the whole
+/// completion budget and return `content: ""` with `finish_reason: "length"`.
+const OUTPUT_CONTRACT: &str = "Answer in the requested output format only; when JSON is requested, return only that JSON with no preamble or code fences. Keep your reasoning brief and always finish the answer; never use your whole output budget on reasoning.";
 const CURL_MAX_TIME_SECS: u64 = 600;
 const SLOT_WAIT: Duration = Duration::from_secs(300);
 
@@ -61,6 +64,22 @@ impl Pool {
             Pool::Dev => "dev",
             Pool::Qa => "qa",
         }
+    }
+}
+
+/// Reasoning effort sent to Workers AI. Env `EPHEMERAL_DEEPSEEK_REASONING` (none|low|high|max)
+/// overrides; otherwise DEV seats use `low` and QA seats `none`. (The model defaults to `high`,
+/// which burned the entire output budget on hidden reasoning and left `content` empty.)
+pub fn reasoning_effort_for(pool: Pool, env_override: Option<&str>) -> &'static str {
+    match env_override.map(str::trim) {
+        Some("none") => "none",
+        Some("low") => "low",
+        Some("high") => "high",
+        Some("max") => "max",
+        _ => match pool {
+            Pool::Dev => "low",
+            Pool::Qa => "none",
+        },
     }
 }
 
@@ -217,8 +236,42 @@ impl Usage {
     }
 }
 
+/// A parsed Workers AI completion, before any emptiness/truncation judgement.
+#[derive(Debug, PartialEq)]
+pub struct Completion {
+    pub text: String,
+    pub usage: Usage,
+    pub finish_reason: Option<String>,
+}
+
+impl Completion {
+    /// `Some(reason)` when the answer must not be treated as a result: empty content, or cut off
+    /// by the token limit. Names finish_reason and completion_tokens so the cause is visible.
+    pub fn failure(&self) -> Option<String> {
+        let fin = self.finish_reason.as_deref();
+        let detail = format!(
+            "finish_reason={}, completion_tokens={}",
+            fin.unwrap_or("none"),
+            self.usage.completion_tokens
+        );
+        if self.text.is_empty() {
+            let hint = if fin == Some("length") {
+                "; reasoning likely consumed the whole budget"
+            } else {
+                ""
+            };
+            Some(format!("empty completion ({detail}){hint}"))
+        } else if fin == Some("length") {
+            Some(format!("truncated completion ({detail})"))
+        } else {
+            None
+        }
+    }
+}
+
 /// Parses both the native `{"result":{...}}` envelope and a bare OpenAI-style body.
-pub fn parse_response(raw: &str) -> Result<(String, Usage), String> {
+/// Does not judge emptiness/truncation; see [`Completion::failure`].
+pub fn parse_completion(raw: &str) -> Result<Completion, String> {
     let v: Value = serde_json::from_str(raw.trim()).map_err(|_| "non-JSON response".to_owned())?;
     if v.get("success").and_then(Value::as_bool) == Some(false) {
         let msg = v
@@ -254,15 +307,28 @@ pub fn parse_response(raw: &str) -> Result<(String, Usage), String> {
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
-    let usage = Usage {
-        prompt_tokens: n("/prompt_tokens"),
-        cached_tokens: n("/prompt_tokens_details/cached_tokens"),
-        completion_tokens: n("/completion_tokens"),
-    };
-    if text.trim().is_empty() {
-        return Err("empty completion".to_owned());
+    Ok(Completion {
+        text: text.trim().to_owned(),
+        usage: Usage {
+            prompt_tokens: n("/prompt_tokens"),
+            cached_tokens: n("/prompt_tokens_details/cached_tokens"),
+            completion_tokens: n("/completion_tokens"),
+        },
+        finish_reason: root
+            .pointer("/choices/0/finish_reason")
+            .or_else(|| root.get("finish_reason"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Strict form: errors on empty content or `finish_reason: "length"`.
+pub fn parse_response(raw: &str) -> Result<(String, Usage), String> {
+    let c = parse_completion(raw)?;
+    match c.failure() {
+        Some(why) => Err(why),
+        None => Ok((c.text, c.usage)),
     }
-    Ok((text.trim().to_owned(), usage))
 }
 
 fn civil_from_days(z: i64) -> (i64, u32) {
@@ -305,7 +371,9 @@ fn ledger_append(dir: &Path, pool: Pool, agent: &str, ok: bool, usage: &Usage) {
         "prompt_tokens": usage.prompt_tokens,
         "cached_tokens": usage.cached_tokens,
         "completion_tokens": usage.completion_tokens,
-        "cost_usd": if ok { usage.cost_usd() } else { 0.0 },
+        // Tokens are billed even when the answer is empty/truncated; a transport failure passes
+        // Usage::default() so its cost is still 0.
+        "cost_usd": usage.cost_usd(),
     });
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
@@ -317,16 +385,16 @@ fn ledger_append(dir: &Path, pool: Pool, agent: &str, ok: bool, usage: &Usage) {
     }
 }
 
-fn call_workers_ai(dir: &Path, token: &str, prompt: &str) -> Result<String, String> {
+fn call_workers_ai(dir: &Path, token: &str, prompt: &str, pool: Pool) -> Result<String, String> {
     let mut body = json!({
-        "messages": [{ "role": "user", "content": prompt }],
+        "messages": [
+            { "role": "system", "content": OUTPUT_CONTRACT },
+            { "role": "user", "content": prompt },
+        ],
         "max_completion_tokens": MAX_COMPLETION_TOKENS,
     });
-    if let Ok(effort) = std::env::var("EPHEMERAL_DEEPSEEK_REASONING")
-        && matches!(effort.as_str(), "none" | "low" | "high" | "max")
-    {
-        body["reasoning_effort"] = json!(effort);
-    }
+    let env_effort = std::env::var("EPHEMERAL_DEEPSEEK_REASONING").ok();
+    body["reasoning_effort"] = json!(reasoning_effort_for(pool, env_effort.as_deref()));
     let tmp = dir.join("tmp").join(format!(
         "{}-{}",
         std::process::id(),
@@ -427,10 +495,15 @@ pub fn run(pool: Pool, agent_upper: &str, prompt: &str) -> (String, &'static str
             pool.tag()
         ));
     }
-    match call_workers_ai(&dir, &token, prompt).and_then(|raw| parse_response(&raw)) {
-        Ok((text, usage)) => {
-            ledger_append(&dir, pool, agent_upper, true, &usage);
-            (text, ENGINE_LABEL)
+    match call_workers_ai(&dir, &token, prompt, pool).and_then(|raw| parse_completion(&raw)) {
+        Ok(c) => {
+            if let Some(why) = c.failure() {
+                // Billed but unusable: record the real cost with ok=false and say why.
+                ledger_append(&dir, pool, agent_upper, false, &c.usage);
+                return note(format!("DeepSeek call failed: {why}"));
+            }
+            ledger_append(&dir, pool, agent_upper, true, &c.usage);
+            (c.text, ENGINE_LABEL)
         }
         Err(e) => {
             ledger_append(&dir, pool, agent_upper, false, &Usage::default());
@@ -496,6 +569,85 @@ mod tests {
         assert!(parse_response(err).unwrap_err().contains("7003"));
         assert!(parse_response("<html>").is_err());
         assert!(parse_response(r#"{"result":{"choices":[{"message":{"content":""}}]}}"#).is_err());
+    }
+
+    #[test]
+    fn empty_and_truncated_completions_name_finish_reason() {
+        let empty_len = r#"{"result":{"choices":[{"message":{"content":"","reasoning":"thinking"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":16000}}}"#;
+        let c = parse_completion(empty_len).unwrap();
+        assert_eq!(c.finish_reason.as_deref(), Some("length"));
+        assert_eq!(c.usage.completion_tokens, 16000);
+        let why = c.failure().unwrap();
+        assert!(
+            why.contains("empty completion") && why.contains("finish_reason=length"),
+            "{why}"
+        );
+        assert!(
+            why.contains("completion_tokens=16000") && why.contains("reasoning"),
+            "{why}"
+        );
+        assert!(
+            parse_response(empty_len)
+                .unwrap_err()
+                .contains("finish_reason=length")
+        );
+
+        let partial = r#"{"choices":[{"message":{"content":"half"},"finish_reason":"length"}]}"#;
+        assert!(
+            parse_completion(partial)
+                .unwrap()
+                .failure()
+                .unwrap()
+                .starts_with("truncated completion")
+        );
+        assert!(parse_response(partial).is_err());
+
+        let empty_stop = r#"{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}"#;
+        assert!(
+            parse_completion(empty_stop)
+                .unwrap()
+                .failure()
+                .unwrap()
+                .contains("finish_reason=stop")
+        );
+
+        let ok = r#"{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}"#;
+        assert_eq!(parse_completion(ok).unwrap().failure(), None);
+        assert_eq!(parse_response(ok).unwrap().0, "{}");
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_and_override() {
+        assert_eq!(reasoning_effort_for(Pool::Dev, None), "low");
+        assert_eq!(reasoning_effort_for(Pool::Qa, None), "none");
+        assert_eq!(reasoning_effort_for(Pool::Qa, Some("high")), "high");
+        assert_eq!(reasoning_effort_for(Pool::Dev, Some(" none ")), "none");
+        assert_eq!(reasoning_effort_for(Pool::Dev, Some("turbo")), "low");
+        assert_eq!(reasoning_effort_for(Pool::Qa, Some("")), "none");
+    }
+
+    #[test]
+    fn ledger_records_cost_of_unusable_answers() {
+        let dir = tmpdir("ledger");
+        let u = Usage {
+            prompt_tokens: 1_000_000,
+            cached_tokens: 0,
+            completion_tokens: 1_000_000,
+        };
+        ledger_append(&dir, Pool::Dev, "DEV-1", false, &u);
+        ledger_append(&dir, Pool::Dev, "DEV-1", false, &Usage::default());
+        let file = dir
+            .join("usage")
+            .join(format!("{}.jsonl", month_key(now_secs())));
+        let rows: Vec<Value> = fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows[0]["ok"], json!(false));
+        assert!((rows[0]["cost_usd"].as_f64().unwrap() - 1.50).abs() < 1e-9);
+        assert_eq!(rows[1]["cost_usd"].as_f64().unwrap(), 0.0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
