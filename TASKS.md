@@ -6,23 +6,34 @@
 
 ## Release schedule
 
-Slots marked `(proposed)` are not a ruling by Brian. Connector work G0–G3 is `v0.2` (Brian ruled). G4–G7 use his label `v0.3+ (proposed)`. Those gates are not separate rows on this board. Target date stays TBD.
+Slots marked `(proposed)` are not a ruling by Brian. Ruled below: connector G0–G3 is `v0.2`; G4–G7 keep his label `v0.3+ (proposed)`; Founding Enterprise sales start now, pre-release; ENG-15 is a v0.1.1 hotfix and v0.1.1 does not depend on it. Those connector gates are not separate rows on this board. Target date stays TBD except the ruled Sun Nov 1, 2026 dues.
 
 | Release | Tasks | Target date |
 | :--- | :--- | :--- |
 | v0.1.1 (proposed) | SM-4 | TBD |
-| v0.1.2 (proposed) | ENG-1..ENG-15; PRD-1..PRD-7; SM-0, SM-0b, SM-1, SM-2, SM-3, SM-5, SM-6a, SM-6b, SM-7, SM-8a, SM-8b, SM-9, SM-10, SM-11, SM-12, SM-13; BIZ-1, BIZ-2, BIZ-3, BIZ-3a, BIZ-4, BIZ-5, BIZ-6, BIZ-7, BIZ-8, BIZ-9, BIZ-10, BIZ-11; PA-1..PA-4; INF-1..INF-11 | TBD |
+| v0.1.1 hotfix | ENG-15 (CHWG-011-1 Apple signing). Needs Brian's OK on the $99 Apple developer fee (PA-2). v0.1.1 does not depend on it | TBD |
+| v0.1.2 (proposed) | ENG-1..ENG-14; PRD-1..PRD-7; SM-0, SM-0b, SM-1, SM-2, SM-3, SM-5, SM-6a, SM-6b, SM-7, SM-8a, SM-8b, SM-9, SM-10, SM-11, SM-12; BIZ-1, BIZ-2, BIZ-3, BIZ-3a, BIZ-4, BIZ-5, BIZ-6, BIZ-7, BIZ-8, BIZ-9, BIZ-10, BIZ-11; PA-1, PA-3, PA-4; INF-1..INF-11 | TBD |
+| now, pre-release | SM-13 Founding Enterprise sales | now |
 | v0.2 | Connector G0, G1, G2, G3 | TBD |
 | v0.3+ (proposed) | Connector G4, G5, G6, G7 | TBD |
 | TBD (proposed) | TASK-26, TASK-31, TASK-33, TASK-35, TASK-36, TASK-37, TASK-38 | TBD |
+| due end of Sun Nov 1, 2026 | Enterprise pricing (Brian) | end of Sun Nov 1, 2026 |
+| due end of Sun Nov 1, 2026 | EAGLE-EYE founding contract approval | end of Sun Nov 1, 2026 |
+| due end of Sun Nov 1, 2026 | Emun Mercury set up to receive payments | end of Sun Nov 1, 2026 |
+
+### Rulings (Brian, Nov 1, 1:46 AM CT)
+
+- **Founding Enterprise sales** start now, pre-release. Marketing targets a release weeks or months out. This replaces the proposed s-and-m constraint that a purchasable release land by early December.
+- **Due end of Sun Nov 1, 2026:** Enterprise pricing (Brian), EAGLE-EYE founding contract approval, and Emun Mercury set up to receive payments.
+- **v0.1.1 does not depend on Apple signing.** Apple signing (CHWG-011-1, ENG-15) needs Brian's OK on the $99 Apple developer fee and ships as a v0.1.1 hotfix.
 
 ### Constraints (proposed, not Brian rulings)
 
-From bizfin and s-and-m. Not rulings. Reconcile with the Oct 27 roadmap on Brian's Mac: `~/WORKSPACE/docuswiki/wiki/projects/Chinwag/prd/delivery-and-release-roadmap.md` (older than the rulings above; not read for this edit).
+From bizfin and personal-assistant. Not rulings. Reconcile with the Oct 27 roadmap on Brian's Mac: `~/WORKSPACE/docuswiki/wiki/projects/Chinwag/prd/delivery-and-release-roadmap.md` (older than the rulings above; not read for this edit).
 
 - **Release names (proposed):** v0.1, v0.2, enterprise. Reconcile with this board's `v0.1.2 (proposed)` rows, Brian's ruled connector slot `v0.2` (G0–G3), and his label `v0.3+ (proposed)` (G4–G7).
 - **Before first public release (bizfin, proposed):** BIZ-3 and BIZ-3a (terms, privacy, 18+) and BIZ-10 (Nic's IP assignment signed) must be done.
-- **Founding-Enterprise purchasable release (s-and-m, proposed):** land by early December. Three deals signed and prepaid Nov 16–Dec 15. Website copy and sales materials go live just before that release.
+- **ALISTAIR dealer co-sign (personal-assistant, proposed):** PRD-6 gates the v0.2 dealer work.
 - **Engineering sizes:** TBD from eng at the walkthrough.
 
 ## 1. Rules
@@ -60,7 +71,7 @@ Open, with no unfinished dependency. Each row has an owner and reviewer in the t
 | SM-7 | Founder bio without clearance mention | DECLARATION | v0.1.2 (proposed) |
 | SM-8b | Concierge playbook | SALES | v0.1.2 (proposed) |
 | SM-9 | Dioxus → GPUI in S&M materials | DECLARATION | v0.1.2 (proposed) |
-| BIZ-1 | MO price table | MO | v0.1.2 (proposed) |
+| BIZ-1 | MO price table (enterprise pricing due end of Sun Nov 1, 2026) | MO | v0.1.2 (proposed) |
 | BIZ-3 | EAGLE-EYE customer terms + privacy wording | EAGLE-EYE | v0.1.2 (proposed) |
 | BIZ-3a | One-page disclaimer-protection note | EAGLE-EYE | v0.1.2 (proposed) |
 | BIZ-5 | Spotify terms | EAGLE-EYE | v0.1.2 (proposed) |
@@ -152,7 +163,7 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | ENG-12 | Per-worker build dirs | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
 | ENG-13 | PRs [#4](https://github.com/emunlabs/chinwag/pull/4), [#5](https://github.com/emunlabs/chinwag/pull/5), [#8](https://github.com/emunlabs/chinwag/pull/8), [#10](https://github.com/emunlabs/chinwag/pull/10) | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
 | ENG-14 | Key scrub on eng/decompose-preview | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
-| ENG-15 | CHWG-011-1 signing work | ENG | PA-2 (Apple $99 fee OK), Brian's OK on the work | FLINT, infra QA | open · waiting on Brian | v0.1.2 (proposed) |
+| ENG-15 | CHWG-011-1 signing work | ENG | PA-2 (Apple $99 fee OK), Brian's OK on the work | FLINT, infra QA | open · waiting on Brian | v0.1.1 hotfix |
 
 #### 5.1.1 ENG-8 spec: minor-report handling
 
@@ -197,17 +208,17 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | SM-10 | INIT-07 slide 14 | s-and-m | Brian | s-and-m | open · waiting on Brian | v0.1.2 (proposed) |
 | SM-11 | fleet-skills PR #5 + seat setup | s-and-m | infra seat config | eng | open | v0.1.2 (proposed) |
 | SM-12 | 18+ signup and marketing copy | DECLARATION | BIZ-3 (EAGLE-EYE clause) | ALISTAIR | open | v0.1.2 (proposed) |
-| SM-13 | Founding Enterprise sales materials | SALES | BIZ-1 (MO final price table) | MO (pricing), EAGLE-EYE (contract terms); Brian final OK before anything goes to a prospect | open | v0.1.2 (proposed) |
+| SM-13 | Founding Enterprise sales materials | SALES | BIZ-1 (MO final price table) | MO (pricing), EAGLE-EYE (contract terms); Brian final OK before anything goes to a prospect | open | now, pre-release |
 
 ### 5.4 BIZFIN
 
 | ID | Task | Owner | Depends on | Reviewer | Status | Release |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| BIZ-1 | MO price table. Unblocks SM-13, BIZ-2, BIZ-4 | MO | — (ready) | VENTURE + SALES check; Brian approves | open | v0.1.2 (proposed) |
+| BIZ-1 | MO price table. Unblocks SM-13, BIZ-2, BIZ-4. Enterprise pricing (Brian) due end of Sun Nov 1, 2026 | MO | — (ready) | VENTURE + SALES check; Brian approves | open | v0.1.2 (proposed) |
 | BIZ-2 | MO revenue model | MO | BIZ-1 | VENTURE | open | v0.1.2 (proposed) |
 | BIZ-3 | EAGLE-EYE customer terms + privacy wording: 18+ clause ("verified within a reasonable time"), IP/tag language, customer-owned cards. Unblocks ENG-8, SM-12, privacy part of SM-1 | EAGLE-EYE | — (ready) | Brian | open · waiting on Brian (review) | v0.1.2 (proposed) |
 | BIZ-3a | One-page note on disclaimer protection under COPPA, GDPR Art 8, UK Children's Code, APPI | EAGLE-EYE | — (ready; Brian reviews with BIZ-3) | Brian | open · waiting on Brian (review) | v0.1.2 (proposed) |
-| BIZ-4 | Founding contract template: SOC 2 by month 12, with credit if missed | EAGLE-EYE | BIZ-1 | Brian | open | v0.1.2 (proposed) |
+| BIZ-4 | Founding contract template: SOC 2 by month 12, with credit if missed. EAGLE-EYE founding contract approval due end of Sun Nov 1, 2026 | EAGLE-EYE | BIZ-1 | Brian | open | v0.1.2 (proposed) |
 | BIZ-5 | Spotify terms | EAGLE-EYE | — (ready) | Brian | open | v0.1.2 (proposed) |
 | BIZ-6 | Security pack | EAGLE-EYE | — (ready) | ALISTAIR | open | v0.1.2 (proposed) |
 | BIZ-7 | RMM → Emun IP assignment | EAGLE-EYE | Brian's title + consideration blanks; INF-11 (Exhibit A) | Counsel + Brian | open | v0.1.2 (proposed) |
@@ -221,7 +232,7 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | ID | Task | Owner | Depends on | Reviewer | Status | Release |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | PA-1 | D&B email send — before ~8 AM CT Nov 2 | Brian | — | Brian | open · waiting on Brian | v0.1.2 (proposed) |
-| PA-2 | Apple $99 fee OK. Blocks ENG-15 | Brian | — | Brian | open · waiting on Brian | v0.1.2 (proposed) |
+| PA-2 | Apple $99 fee OK. Blocks ENG-15. v0.1.1 does not depend on Apple signing | Brian | — | Brian | open · waiting on Brian | v0.1.1 hotfix |
 | PA-3 | Unsigned IRS 8822-B signature | Brian | — | Brian | open · waiting on Brian | v0.1.2 (proposed) |
 | PA-4 | 9 AM CT standup list | Brian | — | Brian | open | v0.1.2 (proposed) |
 
