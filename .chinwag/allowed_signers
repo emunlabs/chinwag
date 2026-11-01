@@ -16,3 +16,10 @@ architect-agent@chinwag.sh ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGPkT7tQVOBzB5Oyv
 2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKghii8r3JsRhBMlJN9PqsQ9i2cN2LKTe2Qv4M6rhK+A chinwag PRODUCT signing
 2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILPl5i4lZk3WZ99V484hc2Yg8+OZ96rCw4u8gSOapL8Z chinwag DELIVERY signing
 2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBZxrlz7lH5AZZQwjwuKicmd++RHSddkWjm0+V8p/Gu+ chinwag BRIAN signing
+2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINJsmuh/qx+GTV6oxBjc7FaiSEr2Vpb9/m16EIQ9NiL5 chinwag DEV-4 signing
+2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKJbJWUASqc+IK027WOgkIVTPxkHxnHzo52PNkxq3oKq chinwag DEV-5 signing
+2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMRF/rATtfdaHWqw194ghmaiXJH6NMjQ0xRVlp766+4 chinwag QA-1 signing
+2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEo/tb+Pr2hvFROCzNAbiQ4kBmZvjw7Ieg69MYu4oXka chinwag QA-2 signing
+2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1JyerU+pxAxEUIdWXyU4IYAv/ljtzlTxiyFJ0ckwJ3 chinwag QA-3 signing
+2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBc6k9vpHGqTYjNmbFU567Izs361iQ0yLIzt8R+g20Bw chinwag QA-4 signing
+2736922+spector-in-london@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFieYxN1rm6pXs0dC8B4IhlUckW9S+q70lBpl4JUnJrp chinwag QA-5 signing
