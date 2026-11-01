@@ -615,41 +615,8 @@ pub fn auto_advance_tasks_markdown(
         changed = true;
     }
 
-    // Continuous Rolling-Wave Backlog Synthesizer (INV-UTIL-01 — 0% Idle Tolerance):
-    // If a seat finishes its task and has no remaining [IN_PROGRESS] or [READY] task in TASKS.md,
-    // automatically synthesize and append the next continuous verification & hardening wave task.
-    if !seat_has_in_progress && promoted_tid.is_none() && !target_seat.is_empty() {
-        let mut max_num: u32 = 25;
-        for l in &lines {
-            let mut rest = l.as_str();
-            while let Some(pos) = rest.find("TASK-") {
-                let after = &rest[pos + 5..];
-                let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(n) = digits.parse::<u32>()
-                    && n > max_num
-                {
-                    max_num = n;
-                }
-                rest = after;
-            }
-        }
-        let next_tid = format!("TASK-{}", max_num + 1);
-        lines.push(String::new());
-        lines.push(format!(
-            "### `[IN_PROGRESS]` `{next_tid}` (`CHWG-CONT-{target_seat}-{}`) — Continuous Rolling-Wave Verification & Hardening",
-            max_num + 1
-        ));
-        lines.push(format!("- **Owner:** `■ {target_seat}`"));
-        lines.push(
-            "- **Files:** `crates/chinwag-cli/src/bus_run.rs`, `crates/chinwag-cli/src/feature_cli_run.rs`, `crates/chinwag-ui/src/app.rs`"
-                .to_string(),
-        );
-        lines.push(format!(
-            "- **Scope:** Continuous zero-idle verification wave after `{target_tid}`: run `cargo test -p chinwag-cli --bin chinwag`, `cargo test -p chinwag-ui`, `chinwag bond verify --json`, `chinwag plugin verify --json`, and `chinwag cwcard verify --json`."
-        ));
-        promoted_tid = Some(next_tid);
-        changed = true;
-    }
+    // Synthetic rolling-wave task generator disabled per Brian (2026-11-01):
+    // Only dispatch real [READY] tasks explicitly listed in TASKS.md.
 
     if changed {
         let mut updated = lines.join("\n");
