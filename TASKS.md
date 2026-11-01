@@ -6,7 +6,7 @@
 
 ## Release schedule
 
-Slots marked `(proposed)` are not a ruling by Brian. Connector work G0–G3 is `v0.2` (Brian ruled). G4–G7 use his label `v0.3+ (proposed)`. Those gates are not separate rows on this board. No dates are set.
+Slots marked `(proposed)` are not a ruling by Brian. Connector work G0–G3 is `v0.2` (Brian ruled). G4–G7 use his label `v0.3+ (proposed)`. Those gates are not separate rows on this board. Target date stays TBD.
 
 | Release | Tasks | Target date |
 | :--- | :--- | :--- |
@@ -15,6 +15,15 @@ Slots marked `(proposed)` are not a ruling by Brian. Connector work G0–G3 is `
 | v0.2 | Connector G0, G1, G2, G3 | TBD |
 | v0.3+ (proposed) | Connector G4, G5, G6, G7 | TBD |
 | TBD (proposed) | TASK-26, TASK-31, TASK-33, TASK-35, TASK-36, TASK-37, TASK-38 | TBD |
+
+### Constraints (proposed, not Brian rulings)
+
+From bizfin and s-and-m. Not rulings. Reconcile with the Oct 27 roadmap on Brian's Mac: `~/WORKSPACE/docuswiki/wiki/projects/Chinwag/prd/delivery-and-release-roadmap.md` (older than the rulings above; not read for this edit).
+
+- **Release names (proposed):** v0.1, v0.2, enterprise. Reconcile with this board's `v0.1.2 (proposed)` rows, Brian's ruled connector slot `v0.2` (G0–G3), and his label `v0.3+ (proposed)` (G4–G7).
+- **Before first public release (bizfin, proposed):** BIZ-3 and BIZ-3a (terms, privacy, 18+) and BIZ-10 (Nic's IP assignment signed) must be done.
+- **Founding-Enterprise purchasable release (s-and-m, proposed):** land by early December. Three deals signed and prepaid Nov 16–Dec 15. Website copy and sales materials go live just before that release.
+- **Engineering sizes:** TBD from eng at the walkthrough.
 
 ## 1. Rules
 
