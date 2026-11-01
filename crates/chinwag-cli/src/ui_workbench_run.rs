@@ -964,7 +964,7 @@ mod tests {
         assert!(r4.contains("403 Forbidden"), "{r4}");
 
         // 5. CSRF & Seat Spoofing Guard (`FLINT #213 F1`): reject POST /api/bus/send as ALISTAIR
-        let body = br#"{"sender":"ALISTAIR","room":"#mgmt","body":"spoof"}"#;
+        let body = br##"{"sender":"ALISTAIR","room":"#mgmt","body":"spoof"}"##;
         let req5 = format!(
             "POST /api/bus/send HTTP/1.1\r\n\
              Host: 127.0.0.1\r\n\
