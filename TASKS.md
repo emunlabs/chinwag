@@ -44,6 +44,8 @@ Open, with no unfinished dependency. Each row has an owner and reviewer in the t
 | BIZ-3a | One-page disclaimer-protection note | EAGLE-EYE |
 | BIZ-5 | Spotify terms | EAGLE-EYE |
 | BIZ-6 | Security pack | EAGLE-EYE |
+| BIZ-10 | Nic's IP assignment to Emun Labs, Inc. (covers Captionize code) | EAGLE-EYE |
+| BIZ-11 | Consulting agreement with Nic, with IP assignment clause; contracting party left blank until she picks her LLC or herself personally | EAGLE-EYE |
 | PA-1 | D&B email send (before ~8 AM CT Nov 2) | Brian |
 | PA-3 | Sign IRS 8822-B | Brian |
 | PA-4 | 9 AM CT standup list | Brian |
@@ -154,16 +156,16 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | PRD-4 | Consistency pass on every doc | MacBook Codex | PRD-3, SM-5 | product | open |
 | PRD-5 | PLY-18.5 — closed by Brian (no ID checks, 18+) | Brian | — | Brian | done |
 | PRD-6 | ALISTAIR co-sign on dealer safety floor PLY-14, 17, 18, 19, 22. Blocks DEX/DECLARATION review of the Breakroom sections and the 0.2 dealer gates | ALISTAIR | — | product | open |
-| PRD-7 | Remove 'Zero-Knowledge' from GEMINI-PM's message house and sync the wiki copy to the Antigravity source (back up first) | product | — (ready) | GEMINI-PM | done, pending review (GEMINI-PM) (wiki synced byte-for-byte to Antigravity source; old copy backed up; source left untouched, so DECLARATION omits the one "Zero-Knowledge" phrase on line 37) |
+| PRD-7 | Sync the wiki copy of GEMINI-PM's message house to the Antigravity source (back up first) | product | — (ready) | GEMINI-PM | done, pending review (GEMINI-PM) (wiki copy of GEMINI-PM's message house was synced) |
 
 ### 5.3 S&M
 
 | ID | Task | Owner | Depends on | Reviewer | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| SM-0 | chinwag.sh website revamp copy from GEMINI-PM message house (`chinwag-sh-revamp-message-house-and-two-routes.md`, product syncs wiki copy from GEMINI-PM's Antigravity source). Use 'encrypted'/'tamper-proof sealed', never 'Zero-Knowledge'; no clearance in bios; 18+ statement on site; tiers Free/Team/Enterprise with no prices | DECLARATION | Brian picks Option A or B before copy is final | Brian | open |
+| SM-0 | chinwag.sh website revamp copy from GEMINI-PM message house (`chinwag-sh-revamp-message-house-and-two-routes.md`, product syncs wiki copy from GEMINI-PM's Antigravity source). Use 'encrypted'/'tamper-proof sealed'. Drop "zero-knowledge" from caption card copy only; BBS+ ZKP wording stays; no clearance in bios; 18+ statement on site; tiers Free/Team/Enterprise with no prices | DECLARATION | Brian picks Option A or B before copy is final | Brian | open |
 | SM-0b | emunlabs.com website revamp copy | TBD (Brian: GEMINI-PM writes a message house, or DECLARATION drafts from the Chinwag one) | emunlabs.com message house (none exists yet) | Brian | open · waiting on Brian |
 | SM-1 | Row 66 retention list. Copy: EAGLE-EYE. Due before the 9 AM CT standup | DEX | BIZ-3 (privacy part only) | Brian | open |
-| SM-2 | Default card copy. "encrypted" and "tamper-proof sealed" are OK; no "zero-knowledge" | DECLARATION | — | ALISTAIR | open |
+| SM-2 | Default card copy. "encrypted" and "tamper-proof sealed" are OK; no "zero-knowledge" on caption card copy only; BBS+ ZKP wording stays | DECLARATION | — | ALISTAIR | open |
 | SM-3 | Enterprise comparables | SALES | — | MO | open |
 | SM-4 | PRD v0.1.1 review: GROWTH (15 comments), SALES (13), GEMINI-PM (14) | GROWTH, SALES, GEMINI-PM | — | Brian | done |
 | SM-5 | PRD v0.1.2 review, this round: DEX and DECLARATION review their split docs. ALISTAIR and QA also get the full doc. Breakroom sections and 0.2 dealer gates also wait on PRD-6 | DEX, DECLARATION (s-and-m relays) | PRD-3, PRD-6 (for those sections) | Brian rules | open |
@@ -192,6 +194,8 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | BIZ-7 | RMM → Emun IP assignment | EAGLE-EYE | Brian's title + consideration blanks; INF-11 (Exhibit A) | Counsel + Brian | open |
 | BIZ-8 | Patent pledge CHWG-PAT-05 | EAGLE-EYE | Counsel claims review | Brian | open |
 | BIZ-9 | BIZFIN commercial/legal review of full v0.1.2 (no separate split doc unless Brian wants one) | BIZFIN | PRD-1 (full v0.1.2) | Brian rules | open |
+| BIZ-10 | Nic's IP assignment to Emun Labs, Inc. (covers Captionize code) | EAGLE-EYE | — | Brian | open |
+| BIZ-11 | Consulting agreement with Nic, with IP assignment clause; contracting party left blank until she picks her LLC or herself personally | EAGLE-EYE | — | Brian | open |
 
 ### 5.5 PERSONAL-ASSISTANT (Brian owns)
 
