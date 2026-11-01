@@ -39,6 +39,18 @@ fn default_repo_root() -> PathBuf {
     PathBuf::from(user_home()).join("WORKSPACE/chinwag")
 }
 
+/// Arguments for `flint-agent run`. FLINT must always be pointed at the real
+/// repo root with `--cwd`; without it the agent falls back to an empty default
+/// workspace and verification tasks (e.g. CHWG-CONT-FLINT-*) fail.
+fn flint_run_args(prompt: &str, repo_dir: &Path) -> Vec<String> {
+    vec![
+        "run".to_owned(),
+        prompt.to_owned(),
+        "--cwd".to_owned(),
+        repo_dir.to_string_lossy().into_owned(),
+    ]
+}
+
 fn wiki_agents_dir() -> PathBuf {
     PathBuf::from(user_home()).join("WORKSPACE/paperclip-wiki/wiki/agents")
 }
@@ -381,7 +393,7 @@ fn dispatch_to_engine(
     if is_flint
         && flint_bin.exists()
         && let Ok(out) = Command::new(&flint_bin)
-            .args(["run", full_prompt, "--cwd", &repo_dir.to_string_lossy()])
+            .args(flint_run_args(full_prompt, &repo_dir))
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .envs(signing_env.iter().cloned())
@@ -767,5 +779,17 @@ mod claude_model_args_tests {
         for seat in ["ALISTAIR", "QA", "MO", "FLINT", "type"] {
             assert!(claude_model_args(seat).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod flint_run_args_tests {
+    use super::flint_run_args;
+    use std::path::Path;
+
+    #[test]
+    fn flint_dispatch_passes_cwd_repo_root() {
+        let args = flint_run_args("do the thing", Path::new("/repo/root"));
+        assert_eq!(args, ["run", "do the thing", "--cwd", "/repo/root"]);
     }
 }
