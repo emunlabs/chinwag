@@ -11,7 +11,7 @@ The Release column is a GitHub-milestone semver only: `v0.1.1`, `v0.1.2`, `v0.2.
 | Release | Tasks | Target date |
 | :--- | :--- | :--- |
 | v0.1.1 (proposed) | SM-4 | TBD |
-| v0.1.1 | ENG-15 (CHWG-011-1 Apple signing, hotfix). Needs Brian's OK on the $99 Apple developer fee (PA-2). v0.1.1 does not depend on it | TBD |
+| v0.1.1 | ENG-15 (CHWG-011-1 Apple signing, hotfix). PA-2 fee approved; pending Apple account setup (Brian enrolls/pays via his Apple ID). v0.1.1 does not depend on it | TBD |
 | v0.1.2 (proposed) | ENG-1..ENG-14; PRD-1..PRD-7; SM-0, SM-0b, SM-1, SM-2, SM-3, SM-5, SM-6a, SM-6b, SM-7, SM-8a, SM-8b, SM-9, SM-10, SM-11, SM-12, SM-13; BIZ-1, BIZ-2, BIZ-3, BIZ-3a, BIZ-4, BIZ-5, BIZ-6, BIZ-7, BIZ-8, BIZ-9, BIZ-10, BIZ-11; PA-1, PA-3, PA-4; INF-1..INF-11; TASK-26, TASK-31, TASK-33, TASK-35, TASK-36, TASK-37, TASK-38 | TBD |
 | v0.1.2 (proposed) | Enterprise pricing (Brian), on BIZ-1; EAGLE-EYE founding contract approval (BIZ-4); Emun Mercury set up to receive payments | end of Sun Nov 1, 2026 |
 | v0.2.0 | Connector G0, G1, G2, G3 | TBD |
@@ -21,7 +21,12 @@ The Release column is a GitHub-milestone semver only: `v0.1.1`, `v0.1.2`, `v0.2.
 
 - **Founding Enterprise sales** start now, pre-release. Marketing targets a release weeks or months out. This replaces the proposed s-and-m constraint that a purchasable release land by early December.
 - **Due end of Sun Nov 1, 2026:** Enterprise pricing (Brian), EAGLE-EYE founding contract approval, and Emun Mercury set up to receive payments.
-- **v0.1.1 does not depend on Apple signing.** Apple signing (CHWG-011-1, ENG-15) needs Brian's OK on the $99 Apple developer fee and ships as a v0.1.1 hotfix. Release column: `v0.1.1`.
+- **v0.1.1 does not depend on Apple signing.** Apple signing (CHWG-011-1, ENG-15) ships as a v0.1.1 hotfix. Release column: `v0.1.1`. Fee OK followed at 1:54 AM CT.
+
+### Rulings (Brian, Nov 1, 1:54 AM CT)
+
+- **PA-2 approved.** Brian approved the $99 Apple developer fee. He enrolls and pays via his Apple ID.
+- **ENG-15 unblocked** (CHWG-011-1 v0.1.1 signing hotfix), pending Apple account setup.
 
 ### Rulings (Brian, Nov 1, 1:49 AM CT)
 
@@ -99,8 +104,7 @@ Due-time item: **SM-1** (row 66 retention list) must land before the 9 AM CT sta
 | :--- | :--- | :--- |
 | 1 | INIT-07 slide 14 | SM-10 |
 | 2 | EAGLE-EYE 18+ clause and disclaimer-note review (BIZ-3, BIZ-3a) | ENG-8, SM-12, privacy part of SM-1 |
-| 3 | Apple $99 fee OK (PA-2) | ENG-15 (CHWG-011-1 signing work) |
-| 4 | CHWG-011-1 signing work OK | ENG-15 |
+| 3 | Apple account setup: Brian enrolls/pays the approved $99 fee via his Apple ID (PA-2 approved) | ENG-15 (CHWG-011-1 v0.1.1 signing hotfix) |
 | 5 | D&B email send before ~8 AM CT Nov 2 (PA-1) | none |
 | 6 | IRS 8822-B signature (PA-3) | none |
 | 7 | itsaplan R2 bucket + token | INF-3 |
@@ -134,7 +138,7 @@ BIZ-1 MO price table (Brian approves)  ->  BIZ-2 revenue model
                                        ->  BIZ-4 founding contract template
                                        ->  SM-13 Founding Enterprise sales materials
 INF seat config              ->  SM-11 fleet-skills PR #5 + seat setup
-PA-2 Apple $99 fee OK        ->  ENG-15 CHWG-011-1 signing work
+Apple account setup (Brian enrolls/pays via his Apple ID; PA-2 fee approved)  ->  ENG-15 CHWG-011-1 v0.1.1 signing hotfix
 PRD-6 ALISTAIR co-sign       ->  DEX/DECLARATION review of Breakroom sections and the 0.2 dealer gates
 ENG-9 Spotify demo flag      ->  SM-6b Spotify demo
 INF-11 Exhibit A + Brian's blanks  ->  BIZ-7 IP assignment
@@ -163,7 +167,7 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | ENG-12 | Per-worker build dirs | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
 | ENG-13 | PRs [#4](https://github.com/emunlabs/chinwag/pull/4), [#5](https://github.com/emunlabs/chinwag/pull/5), [#8](https://github.com/emunlabs/chinwag/pull/8), [#10](https://github.com/emunlabs/chinwag/pull/10) | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
 | ENG-14 | Key scrub on eng/decompose-preview | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
-| ENG-15 | CHWG-011-1 signing work | ENG | PA-2 (Apple $99 fee OK), Brian's OK on the work | FLINT, infra QA | open · waiting on Brian | v0.1.1 |
+| ENG-15 | CHWG-011-1 v0.1.1 signing hotfix | ENG | Apple account setup (Brian enrolls/pays via his Apple ID). PA-2 fee approved | FLINT, infra QA | open | v0.1.1 |
 
 #### 5.1.1 ENG-8 spec: minor-report handling
 
@@ -232,7 +236,7 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | ID | Task | Owner | Depends on | Reviewer | Status | Release |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | PA-1 | D&B email send — before ~8 AM CT Nov 2 | Brian | — | Brian | open · waiting on Brian | v0.1.2 (proposed) |
-| PA-2 | Apple $99 fee OK. Blocks ENG-15. v0.1.1 does not depend on Apple signing | Brian | — | Brian | open · waiting on Brian | v0.1.1 |
+| PA-2 | Apple $99 fee approved. Brian enrolls/pays via his Apple ID. v0.1.1 does not depend on Apple signing | Brian | — | Brian | done | v0.1.1 |
 | PA-3 | Unsigned IRS 8822-B signature | Brian | — | Brian | open · waiting on Brian | v0.1.2 (proposed) |
 | PA-4 | 9 AM CT standup list | Brian | — | Brian | open | v0.1.2 (proposed) |
 
