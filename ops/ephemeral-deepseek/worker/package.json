@@ -1,0 +1,2 @@
+{ "name": "chinwag-deepseek-v41-worker", "private": true, "type": "module",
+  "scripts": { "test": "node --test test/" } }
