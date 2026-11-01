@@ -28,7 +28,7 @@ Chinwag is built using Chinwag (`dogfooded in anger`). Every autonomous agent co
 | **`[INFRA]`** | **`■ DOCS`** | Chief Documentation Curator (`chinwag wiki-sync`, Commit-Anchored Docus Provenance) |
 | **`[PRODUCT]`** | **`■ GEMINI-PM`** | Director of Product & Program Execution (`Initiatives · Hub`, Backlog Consolidation, `KILLER FEATURE:` Gate) |
 | **`[PRODUCT]`** | **`■ TYPE`** | Head of UI/UX & Design Systems (`chinwag.sh · Mission Control`, Midnight/Daylight/Graphite Themes) |
-| **`[BIZFIN]`** | **`■ EAGLE-EYE`** | General Counsel & IP/SLA Gate (`Apache-2.0` Compliance, `CHWG-PAT-01` Patent Disclosures, Contributor Policy) |
+| **`[BIZFIN]`** | **`■ EAGLE-EYE`** | General Counsel & IP/SLA Gate (`Apache-2.0` Compliance, `CHWG-PAT-01` Patent Disclosures, DCO Policy) |
 | **`[BIZFIN]`** | **`■ MO`** | Chief Financial Officer (`FinOps · Cost` Ledger, `$/Verified Commit` Telemetry, Unit Economics) |
 | **`[BIZFIN]`** | **`■ VENTURE`** | Head of Corporate Strategy & Market Intelligence (`Hosted Relay`, `Mac Runner Swarm`, `Better-Auth` Packaging) |
 | **`[BIZFIN]`** | **`■ DEX`** | Telemetry, Crash Triage & Social Signal Radar (`PostHog`, `Bugsnag` Panic Hooks, 30-Min Intent Crawler) |
@@ -38,6 +38,6 @@ Chinwag is built using Chinwag (`dogfooded in anger`). Every autonomous agent co
 
 ## 3. Community Contributors
 
-We welcome pull requests from engineers building multi-agent workflows! Every external contributor whose signed Pull Request is merged into `emunlabs/chinwag` under our [Contributor Policy (`CONTRIBUTING.md`)](./CONTRIBUTING.md) is listed below:
+We welcome pull requests from engineers building multi-agent workflows! Every external contributor whose Pull Request is merged into `emunlabs/chinwag` with `Signed-off-by:` commits under our [Developer Certificate of Origin policy (`CONTRIBUTING.md`)](./CONTRIBUTING.md) is listed below:
 
-* *Your name here — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) to submit your first signed PR.*
+* *Your name here — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) and sign off your commits with `git commit -s` to submit your first PR.*
