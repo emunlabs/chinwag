@@ -6,34 +6,34 @@
 
 ## Release schedule
 
-Slots marked `(proposed)` are not a ruling by Brian. Ruled below: connector G0–G3 is `v0.2`; G4–G7 keep his label `v0.3+ (proposed)`; Founding Enterprise sales start now, pre-release; ENG-15 is a v0.1.1 hotfix and v0.1.1 does not depend on it. Those connector gates are not separate rows on this board. Target date stays TBD except the ruled Sun Nov 1, 2026 dues.
+The Release column is a GitHub-milestone semver only: `v0.1.1`, `v0.1.2`, `v0.2.0`, `v0.3.0` (Brian ruled, Nov 1, 1:49 AM CT). Slots marked `(proposed)` are not a ruling. Ruled: connector G0–G3 ship in `v0.2.0`; ENG-15 ships in `v0.1.1` (hotfix; v0.1.1 does not depend on it). G4–G7 are `v0.3.0 (proposed)`. Founding Enterprise sales still start now, pre-release; that timing is not a Release value. Connector gates are not separate rows on this board. Target date stays TBD except the ruled Sun Nov 1, 2026 dues.
 
 | Release | Tasks | Target date |
 | :--- | :--- | :--- |
 | v0.1.1 (proposed) | SM-4 | TBD |
-| v0.1.1 hotfix | ENG-15 (CHWG-011-1 Apple signing). Needs Brian's OK on the $99 Apple developer fee (PA-2). v0.1.1 does not depend on it | TBD |
-| v0.1.2 (proposed) | ENG-1..ENG-14; PRD-1..PRD-7; SM-0, SM-0b, SM-1, SM-2, SM-3, SM-5, SM-6a, SM-6b, SM-7, SM-8a, SM-8b, SM-9, SM-10, SM-11, SM-12; BIZ-1, BIZ-2, BIZ-3, BIZ-3a, BIZ-4, BIZ-5, BIZ-6, BIZ-7, BIZ-8, BIZ-9, BIZ-10, BIZ-11; PA-1, PA-3, PA-4; INF-1..INF-11 | TBD |
-| now, pre-release | SM-13 Founding Enterprise sales | now |
-| v0.2 | Connector G0, G1, G2, G3 | TBD |
-| v0.3+ (proposed) | Connector G4, G5, G6, G7 | TBD |
-| TBD (proposed) | TASK-26, TASK-31, TASK-33, TASK-35, TASK-36, TASK-37, TASK-38 | TBD |
-| due end of Sun Nov 1, 2026 | Enterprise pricing (Brian) | end of Sun Nov 1, 2026 |
-| due end of Sun Nov 1, 2026 | EAGLE-EYE founding contract approval | end of Sun Nov 1, 2026 |
-| due end of Sun Nov 1, 2026 | Emun Mercury set up to receive payments | end of Sun Nov 1, 2026 |
+| v0.1.1 | ENG-15 (CHWG-011-1 Apple signing, hotfix). Needs Brian's OK on the $99 Apple developer fee (PA-2). v0.1.1 does not depend on it | TBD |
+| v0.1.2 (proposed) | ENG-1..ENG-14; PRD-1..PRD-7; SM-0, SM-0b, SM-1, SM-2, SM-3, SM-5, SM-6a, SM-6b, SM-7, SM-8a, SM-8b, SM-9, SM-10, SM-11, SM-12, SM-13; BIZ-1, BIZ-2, BIZ-3, BIZ-3a, BIZ-4, BIZ-5, BIZ-6, BIZ-7, BIZ-8, BIZ-9, BIZ-10, BIZ-11; PA-1, PA-3, PA-4; INF-1..INF-11; TASK-26, TASK-31, TASK-33, TASK-35, TASK-36, TASK-37, TASK-38 | TBD |
+| v0.1.2 (proposed) | Enterprise pricing (Brian), on BIZ-1; EAGLE-EYE founding contract approval (BIZ-4); Emun Mercury set up to receive payments | end of Sun Nov 1, 2026 |
+| v0.2.0 | Connector G0, G1, G2, G3 | TBD |
+| v0.3.0 (proposed) | Connector G4, G5, G6, G7 | TBD |
 
 ### Rulings (Brian, Nov 1, 1:46 AM CT)
 
 - **Founding Enterprise sales** start now, pre-release. Marketing targets a release weeks or months out. This replaces the proposed s-and-m constraint that a purchasable release land by early December.
 - **Due end of Sun Nov 1, 2026:** Enterprise pricing (Brian), EAGLE-EYE founding contract approval, and Emun Mercury set up to receive payments.
-- **v0.1.1 does not depend on Apple signing.** Apple signing (CHWG-011-1, ENG-15) needs Brian's OK on the $99 Apple developer fee and ships as a v0.1.1 hotfix.
+- **v0.1.1 does not depend on Apple signing.** Apple signing (CHWG-011-1, ENG-15) needs Brian's OK on the $99 Apple developer fee and ships as a v0.1.1 hotfix. Release column: `v0.1.1`.
+
+### Rulings (Brian, Nov 1, 1:49 AM CT)
+
+- **Release column** uses GitHub-milestone semver: `v0.1.1`, `v0.1.2`, `v0.2.0`, `v0.3.0`. Each task is the release it ships in. No `Enterprise`, `later`, or `v0.3+` buckets. A slot that is not decided keeps the semver and is marked `(proposed)`. Connector G0–G3 are `v0.2.0`. G4–G7 are `v0.3.0 (proposed)`.
 
 ### Constraints (proposed, not Brian rulings)
 
 From bizfin and personal-assistant. Not rulings. Reconcile with the Oct 27 roadmap on Brian's Mac: `~/WORKSPACE/docuswiki/wiki/projects/Chinwag/prd/delivery-and-release-roadmap.md` (older than the rulings above; not read for this edit).
 
-- **Release names (proposed):** v0.1, v0.2, enterprise. Reconcile with this board's `v0.1.2 (proposed)` rows, Brian's ruled connector slot `v0.2` (G0–G3), and his label `v0.3+ (proposed)` (G4–G7).
+- **Oct 27 roadmap names (proposed, superseded for the Release column):** v0.1, v0.2, enterprise. The Release column follows the Nov 1, 1:49 AM CT semver ruling instead. Reconcile the roadmap with `v0.1.1`, `v0.1.2`, `v0.2.0`, and `v0.3.0`.
 - **Before first public release (bizfin, proposed):** BIZ-3 and BIZ-3a (terms, privacy, 18+) and BIZ-10 (Nic's IP assignment signed) must be done.
-- **ALISTAIR dealer co-sign (personal-assistant, proposed):** PRD-6 gates the v0.2 dealer work.
+- **ALISTAIR dealer co-sign (personal-assistant, proposed):** PRD-6 gates the v0.2.0 dealer work.
 - **Engineering sizes:** TBD from eng at the walkthrough.
 
 ## 1. Rules
@@ -163,7 +163,7 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | ENG-12 | Per-worker build dirs | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
 | ENG-13 | PRs [#4](https://github.com/emunlabs/chinwag/pull/4), [#5](https://github.com/emunlabs/chinwag/pull/5), [#8](https://github.com/emunlabs/chinwag/pull/8), [#10](https://github.com/emunlabs/chinwag/pull/10) | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
 | ENG-14 | Key scrub on eng/decompose-preview | ENG | — | FLINT, infra QA | open | v0.1.2 (proposed) |
-| ENG-15 | CHWG-011-1 signing work | ENG | PA-2 (Apple $99 fee OK), Brian's OK on the work | FLINT, infra QA | open · waiting on Brian | v0.1.1 hotfix |
+| ENG-15 | CHWG-011-1 signing work | ENG | PA-2 (Apple $99 fee OK), Brian's OK on the work | FLINT, infra QA | open · waiting on Brian | v0.1.1 |
 
 #### 5.1.1 ENG-8 spec: minor-report handling
 
@@ -208,7 +208,7 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | SM-10 | INIT-07 slide 14 | s-and-m | Brian | s-and-m | open · waiting on Brian | v0.1.2 (proposed) |
 | SM-11 | fleet-skills PR #5 + seat setup | s-and-m | infra seat config | eng | open | v0.1.2 (proposed) |
 | SM-12 | 18+ signup and marketing copy | DECLARATION | BIZ-3 (EAGLE-EYE clause) | ALISTAIR | open | v0.1.2 (proposed) |
-| SM-13 | Founding Enterprise sales materials | SALES | BIZ-1 (MO final price table) | MO (pricing), EAGLE-EYE (contract terms); Brian final OK before anything goes to a prospect | open | now, pre-release |
+| SM-13 | Founding Enterprise sales materials | SALES | BIZ-1 (MO final price table) | MO (pricing), EAGLE-EYE (contract terms); Brian final OK before anything goes to a prospect | open | v0.1.2 (proposed) |
 
 ### 5.4 BIZFIN
 
@@ -232,7 +232,7 @@ emunlabs.com message house (owner TBD)  ->  SM-0b emunlabs.com copy
 | ID | Task | Owner | Depends on | Reviewer | Status | Release |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | PA-1 | D&B email send — before ~8 AM CT Nov 2 | Brian | — | Brian | open · waiting on Brian | v0.1.2 (proposed) |
-| PA-2 | Apple $99 fee OK. Blocks ENG-15. v0.1.1 does not depend on Apple signing | Brian | — | Brian | open · waiting on Brian | v0.1.1 hotfix |
+| PA-2 | Apple $99 fee OK. Blocks ENG-15. v0.1.1 does not depend on Apple signing | Brian | — | Brian | open · waiting on Brian | v0.1.1 |
 | PA-3 | Unsigned IRS 8822-B signature | Brian | — | Brian | open · waiting on Brian | v0.1.2 (proposed) |
 | PA-4 | 9 AM CT standup list | Brian | — | Brian | open | v0.1.2 (proposed) |
 
@@ -258,12 +258,12 @@ The old board's seat table is stale (all heartbeats 2026-10-29) and is dropped. 
 
 | Legacy ID | Name | Owner (then) | Status (then) | Release |
 | :--- | :--- | :--- | :--- | :--- |
-| TASK-26 | CHWG-TRIPLE-B-CLI-01: `chinwag bond status \| verify \| inspect` | RUST | in progress | TBD (proposed) |
-| TASK-31 | CHWG-UI-LIVE-SERVER-01: `chinwag ui` API + `POST /api/bus/send` verification | RUST | ready | TBD (proposed) |
-| TASK-33 | CHWG-UI-CAPTIONIZM-PLUGIN-01: Captionizm / chinwag.tv asset + audio verification | TYPE | in progress | TBD (proposed) |
-| TASK-35 | CHWG-CONT-ALISTAIR-35: rolling-wave verification | ALISTAIR | in progress | TBD (proposed) |
-| TASK-36 | CHWG-CONT-ARCHITECT-36: rolling-wave UI + protocol verification | ARCHITECT | in progress | TBD (proposed) |
-| TASK-37 | CHWG-CONT-FLINT-37: verify FLINT #213 F1/F2 remediations | FLINT | in progress | TBD (proposed) |
-| TASK-38 | CHWG-CONT-QA-38: full-suite + live workbench verification | QA | in progress | TBD (proposed) |
+| TASK-26 | CHWG-TRIPLE-B-CLI-01: `chinwag bond status \| verify \| inspect` | RUST | in progress | v0.1.2 (proposed) |
+| TASK-31 | CHWG-UI-LIVE-SERVER-01: `chinwag ui` API + `POST /api/bus/send` verification | RUST | ready | v0.1.2 (proposed) |
+| TASK-33 | CHWG-UI-CAPTIONIZM-PLUGIN-01: Captionizm / chinwag.tv asset + audio verification | TYPE | in progress | v0.1.2 (proposed) |
+| TASK-35 | CHWG-CONT-ALISTAIR-35: rolling-wave verification | ALISTAIR | in progress | v0.1.2 (proposed) |
+| TASK-36 | CHWG-CONT-ARCHITECT-36: rolling-wave UI + protocol verification | ARCHITECT | in progress | v0.1.2 (proposed) |
+| TASK-37 | CHWG-CONT-FLINT-37: verify FLINT #213 F1/F2 remediations | FLINT | in progress | v0.1.2 (proposed) |
+| TASK-38 | CHWG-CONT-QA-38: full-suite + live workbench verification | QA | in progress | v0.1.2 (proposed) |
 
 Parser note: the old file was read every 45 s by the bus daemon (`CHWG-DYNAMIC-TASKS-PARSER-01`), which looked for `[IN_PROGRESS]` / `[READY]` task headings. This file uses tables, so that parser will find none until it is updated to read them. Infra owns checking this before merge.
