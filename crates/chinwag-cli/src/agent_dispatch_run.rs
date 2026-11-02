@@ -330,6 +330,31 @@ fn claude_model_args(agent_upper: &str) -> &'static [&'static str] {
     }
 }
 
+/// Warn (stderr) when an engine process ran but yielded no usable stdout, so the dispatcher is
+/// about to silently fall through to the next engine. Logs only the engine, seat, reason and
+/// exit code plus the stderr size; never stderr content (engines may echo secrets).
+fn warn_engine_fallthrough(
+    engine: &str,
+    agent_upper: &str,
+    out: &std::process::Output,
+    text_empty: bool,
+) {
+    let reason = match (out.status.success(), text_empty) {
+        (true, true) => "empty stdout",
+        (false, true) => "empty stdout and non-zero exit",
+        (false, false) => "non-zero exit",
+        (true, false) => return,
+    };
+    let code = out
+        .status
+        .code()
+        .map_or_else(|| "signal".to_owned(), |c| c.to_string());
+    eprintln!(
+        "chinwag: warning: engine {engine} for {agent_upper} produced no usable output ({reason}; exit {code}; stderr {} bytes); falling through to the next engine",
+        out.stderr.len()
+    );
+}
+
 fn dispatch_to_engine(
     agent_upper: &str,
     full_prompt: &str,
@@ -391,6 +416,7 @@ fn dispatch_to_engine(
         if out.status.success() && !text.is_empty() {
             return (text, "flint-agent");
         }
+        warn_engine_fallthrough("flint-agent", agent_upper, &out, text.is_empty());
     }
 
     // 2. Official Gemini CLI Engine for GEMINI-PM
@@ -407,6 +433,7 @@ fn dispatch_to_engine(
         if out.status.success() && !text.is_empty() {
             return (text, "gemini-cli");
         }
+        warn_engine_fallthrough("gemini-cli", agent_upper, &out, text.is_empty());
     }
 
     // 3. OpenAI Codex / ChatGPT Engine for ARCHITECT, RUST, DEV-1
@@ -424,6 +451,7 @@ fn dispatch_to_engine(
         if out.status.success() && !text.is_empty() {
             return (text, "codex-chatgpt");
         }
+        warn_engine_fallthrough("codex-chatgpt", agent_upper, &out, text.is_empty());
     }
 
     // 4. Grok CLI Engine for DELIVERY, SPARK, GROWTH, HOUSEKEEPING, INFRA BOT (GROK)
@@ -444,6 +472,7 @@ fn dispatch_to_engine(
         if out.status.success() && !text.is_empty() {
             return (text, "grok-cli");
         }
+        warn_engine_fallthrough("grok-cli", agent_upper, &out, text.is_empty());
     }
 
     // 5. Claude Code Engine (Primary for MO, TYPE, VENTURE, EAGLE-EYE, DECLARATION, ALISTAIR, SCRIBE & Fallback)
@@ -767,5 +796,22 @@ mod claude_model_args_tests {
         for seat in ["ALISTAIR", "QA", "MO", "FLINT", "type"] {
             assert!(claude_model_args(seat).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_fallthrough_warning_tests {
+    use super::warn_engine_fallthrough;
+    use std::process::Command;
+
+    #[test]
+    fn warns_without_panicking_for_empty_and_failed_engines() {
+        let ok = Command::new("true").output().unwrap();
+        let bad = Command::new("false").output().unwrap();
+        // Only logs to stderr; this guards against panics/format regressions for every branch.
+        warn_engine_fallthrough("test-engine", "DEV-1", &ok, true);
+        warn_engine_fallthrough("test-engine", "DEV-1", &bad, true);
+        warn_engine_fallthrough("test-engine", "DEV-1", &bad, false);
+        warn_engine_fallthrough("test-engine", "DEV-1", &ok, false);
     }
 }

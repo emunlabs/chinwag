@@ -1,0 +1,8 @@
+# Source-of-record config reconstructed from the deployed Worker's bindings.
+# NOT deployed by this PR. Secrets (AUTH_SECRET) are set out-of-band; never commit values.
+name = "chinwag-deepseek-v41"
+main = "src/worker.mjs"
+compatibility_date = "2026-10-01"
+
+[ai]
+binding = "WORKERS_AI"
