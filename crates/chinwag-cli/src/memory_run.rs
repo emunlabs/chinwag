@@ -23,6 +23,7 @@ use chinwag_snapshot_session_private::{
 };
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -135,7 +136,30 @@ struct MemoryPinWrite<'a> {
     ts_ms: i64,
 }
 
+pub(crate) fn clear_stale_crdb_operation_artifacts(repo_root: &Path) {
+    let chinwag_dir = repo_root.join(".chinwag");
+    for name in [
+        "state.crdb.lock",
+        "state.crdb.next",
+        "state.crdb.intent",
+        "state.crdb.complete",
+        "state.crdb-journal",
+        "state.crdb-wal",
+        "state.crdb-shm",
+    ] {
+        let p = chinwag_dir.join(name);
+        if let Ok(meta) = fs::metadata(&p)
+            && let Ok(modified) = meta.modified()
+            && let Ok(elapsed) = modified.elapsed()
+            && elapsed.as_secs() >= 10
+        {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
 fn persist_tombstone_to_crdb(repo_root: &Path, write: &TombstoneWrite<'_>) -> Result<i64, String> {
+    clear_stale_crdb_operation_artifacts(repo_root);
     let TombstoneWrite {
         id,
         source_commit,
@@ -179,6 +203,7 @@ fn persist_tombstone_to_crdb(repo_root: &Path, write: &TombstoneWrite<'_>) -> Re
 }
 
 fn persist_memory_pin_to_crdb(repo_root: &Path, write: &MemoryPinWrite<'_>) -> Result<i64, String> {
+    clear_stale_crdb_operation_artifacts(repo_root);
     let MemoryPinWrite {
         id,
         bank,
@@ -220,6 +245,7 @@ fn persist_memory_pin_to_crdb(repo_root: &Path, write: &MemoryPinWrite<'_>) -> R
 }
 
 fn read_crdb_snapshot(repo_root: &Path) -> Result<(Vec<Json>, Vec<Json>, Json), String> {
+    clear_stale_crdb_operation_artifacts(repo_root);
     let owner = ReadOwner::acquire_existing_private_fixture(repo_root)
         .map_err(|e| format!("read_owner: {}", e.reason))?;
     let session = SnapshotSession::from_owner(owner).map_err(|e| e.to_string())?;
