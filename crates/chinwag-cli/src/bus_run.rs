@@ -13,6 +13,7 @@
 //! - `CHWG-CONTINUOUS-LOOP-01` & `CHWG-DYNAMIC-TASKS-PARSER-01`: Autonomous 45s governor that
 //!   dynamically parses `[IN_PROGRESS]` and `[READY]` items from `TASKS.md`.
 
+use chinwag_cli::agent_instance::{self, ActorAddress, InstanceError};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Signature, TransportAddr,
     address_lookup::memory::MemoryLookup, endpoint::presets,
@@ -24,10 +25,10 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
@@ -195,60 +196,34 @@ fn base_seat_str(actor: &str) -> &str {
     actor.split('#').next().unwrap_or(actor)
 }
 
-fn sanitize_instance_tag(raw_tag: &str) -> String {
-    raw_tag
-        .trim()
-        .trim_start_matches('#')
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-        .take(24)
-        .collect()
+pub fn resolve_actor_with_instance(
+    raw_actor: &str,
+    explicit_instance: Option<&str>,
+) -> Result<String, InstanceError> {
+    agent_instance::resolve_from_environment(raw_actor, explicit_instance)
+        .map(|address| address.to_string())
 }
 
-fn auto_thread_instance_tag(base_seat: &str) -> String {
-    for env_key in [
-        "CHINWAG_INSTANCE_ID",
-        "CHINWAG_THREAD_ID",
-        "ANTIGRAVITY_CONVERSATION_ID",
-        "CONVERSATION_ID",
-        "TERM_SESSION_ID",
-    ] {
-        if let Ok(val) = std::env::var(env_key) {
-            let clean = sanitize_instance_tag(&val);
-            if !clean.is_empty() {
-                let short: String = clean.chars().take(8).collect();
-                return short.to_lowercase();
-            }
-        }
-    }
-    let ppid = std::os::unix::process::parent_id();
-    let mut hasher = Sha256::new();
-    hasher.update(format!("chinwag-thread-v1:{base_seat}:{ppid}"));
-    let hex = bytes_to_hex(&hasher.finalize());
-    format!("t{}", &hex[..6])
+/// Internal supervisor actors share one CSPRNG process instance. Public agent
+/// sends must provide their conversation context through the CLI boundary.
+fn service_actor(seat: &str) -> Result<String, InstanceError> {
+    static INSTANCE: OnceLock<Result<String, InstanceError>> = OnceLock::new();
+    let instance = INSTANCE
+        .get_or_init(agent_instance::new_instance_id)
+        .as_ref()
+        .map_err(|error| *error)?;
+    agent_instance::resolve_actor(seat, Some(instance), None).map(|address| address.to_string())
 }
 
-/// Ensures every non-human agent thread carries a unique `<SEAT>#<INSTANCE_ID>` tag (`INV-THREAD-ID-01`).
-pub fn resolve_actor_with_instance(raw_actor: &str, explicit_instance: Option<&str>) -> String {
-    let (norm, _) = normalize_actor(raw_actor);
-    if norm == "Brian" || norm == "Nic" {
-        if let Some(inst) = explicit_instance.map(sanitize_instance_tag)
-            && !inst.is_empty()
-        {
-            return format!("{norm}#{inst}");
-        }
-        return norm;
-    }
-    if norm.contains('#') {
-        return norm;
-    }
-    if let Some(inst) = explicit_instance.map(sanitize_instance_tag)
-        && !inst.is_empty()
-    {
-        return format!("{norm}#{inst}");
-    }
-    let auto_tag = auto_thread_instance_tag(&norm);
-    format!("{norm}#{auto_tag}")
+fn send_service_message_sync(
+    repo_root: &Path,
+    service: &str,
+    room: &str,
+    to: Option<String>,
+    task_id: Option<String>,
+    body: &str,
+) -> Result<(BusMessage, BusAck), InstanceError> {
+    send_bus_message_sync(repo_root, &service_actor(service)?, room, to, task_id, body)
 }
 
 fn seat_slug_clean(actor: &str) -> String {
@@ -288,16 +263,19 @@ fn os_csprng_32_bytes() -> [u8; 32] {
 /// Loads the seat's real OpenSSH Ed25519 signing key (`~/.chinwag/signing/<seat>_ed25519`)
 /// or raw 32-byte CSPRNG seed (`~/.chinwag/signing/<seat>_ed25519.key`) for detached message signing (`BUS-HARDEN-01` & `BUS-HARDEN-06`).
 /// Never derives a predictable key from the public seat name and rejects any path-traversal or invalid seat slug (`FLINT #213 F2`).
-pub fn actor_signing_secret(actor: &str) -> SecretKey {
-    let Some(slug) = valid_seat_slug(actor) else {
-        return SecretKey::from_bytes(&os_csprng_32_bytes());
-    };
+pub fn actor_signing_secret(actor: &str) -> Result<SecretKey, InstanceError> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let signing_dir = PathBuf::from(format!("{home}/.chinwag/signing"));
+    actor_signing_secret_at(actor, &signing_dir)
+}
+
+fn actor_signing_secret_at(actor: &str, signing_dir: &Path) -> Result<SecretKey, InstanceError> {
+    ActorAddress::parse(actor)?;
+    let slug = valid_seat_slug(actor).ok_or(InstanceError::InvalidAddress)?;
     let ssh_key_path = signing_dir.join(format!("{slug}_ed25519"));
     let resolved_path = fs::canonicalize(&ssh_key_path).unwrap_or(ssh_key_path);
     if let Ok(identity) = chinwag_swarm::identity::Identity::from_ssh_signing_file(&resolved_path) {
-        return identity.iroh_secret_key();
+        return Ok(identity.iroh_secret_key());
     }
 
     let raw_key_path = signing_dir.join(format!("{slug}_ed25519.key"));
@@ -306,36 +284,10 @@ pub fn actor_signing_secret(actor: &str) -> SecretKey {
     {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
-        return SecretKey::from_bytes(&arr);
+        return Ok(SecretKey::from_bytes(&arr));
     }
 
-    let known_seat = matches!(
-        slug.as_str(),
-        "architect"
-            | "rust"
-            | "flint"
-            | "qa"
-            | "alistair"
-            | "type"
-            | "gemini-pm"
-            | "product"
-            | "delivery"
-            | "brian"
-            | "nic"
-            | "eng"
-            | "infra"
-            | "index"
-            | "dev-1"
-            | "dev-2"
-            | "dev-3"
-    );
-    let arr = os_csprng_32_bytes();
-    if known_seat {
-        let _ = fs::create_dir_all(&signing_dir);
-        let _ = fs::write(&raw_key_path, arr);
-        let _ = fs::set_permissions(&raw_key_path, fs::Permissions::from_mode(0o600));
-    }
-    SecretKey::from_bytes(&arr)
+    Err(InstanceError::SigningIdentityUnavailable)
 }
 
 fn actor_transport_secret(_actor: &str) -> SecretKey {
@@ -403,6 +355,15 @@ pub fn sign_bus_message(msg: &mut BusMessage, secret: &SecretKey) {
 /// (b) that `pubkey_ed25519` is registered for `msg.sender` in `<repo_root>/.chinwag/allowed_signers` (`BUS-HARDEN-04`).
 /// Fails closed if `.chinwag/allowed_signers` is missing, unreadable, empty, or does not map `pubkey` to `msg.sender`.
 pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> bool {
+    if ActorAddress::parse(&msg.sender).is_err()
+        || msg
+            .to
+            .as_deref()
+            .is_some_and(|to| agent_instance::parse_recipients(to).is_err())
+    {
+        msg.sig_verified = false;
+        return false;
+    }
     let (Some(pub_str), Some(sig_str)) = (
         msg.pubkey_ed25519.as_deref(),
         msg.signature_ed25519.as_deref(),
@@ -451,30 +412,10 @@ pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> 
     true
 }
 
-fn normalize_actor(raw: &str) -> (String, String) {
-    let trimmed = raw
-        .trim()
-        .trim_start_matches('●')
-        .trim_start_matches('■')
-        .trim_start_matches('◆')
-        .trim_start_matches('@')
-        .trim();
-    let (base_part, inst_opt) = match trimmed.split_once('#') {
-        Some((b, i)) => (b.trim(), Some(sanitize_instance_tag(i))),
-        None => (trimmed, None),
-    };
-    let upper = base_part.to_uppercase();
-    let (base_norm, cast) = if upper == "BRIAN" || upper == "ACTOR-BRIAN" {
-        ("Brian".to_string(), "●".to_string())
-    } else if upper == "NIC" || upper == "NICOLA" || upper == "ACTOR-NIC" {
-        ("Nic".to_string(), "●".to_string())
-    } else {
-        (upper, "■".to_string())
-    };
-    match inst_opt {
-        Some(inst) if !inst.is_empty() => (format!("{base_norm}#{inst}"), cast),
-        _ => (base_norm, cast),
-    }
+fn normalize_actor(raw: &str) -> Result<(String, String), InstanceError> {
+    let address = ActorAddress::parse(raw)?;
+    let cast = if address.is_human() { "●" } else { "■" };
+    Ok((address.to_string(), cast.to_owned()))
 }
 
 fn normalize_room(raw: &str) -> String {
@@ -1053,14 +994,85 @@ fn dispatch_continuous_backlog_wave(repo_root: &Path, target_seat: &str) -> Vec<
 }
 
 fn seat_pid_path(repo_root: &Path, seat: &str) -> PathBuf {
-    bus_dir(repo_root)
-        .join("workers")
-        .join(format!("{}.pid", seat.to_lowercase()))
+    let workers = bus_dir(repo_root).join("workers");
+    if seat.contains('#') {
+        workers
+            .join("instances")
+            .join(format!("{}.pid", worker_file_component(seat)))
+    } else {
+        workers.join(format!("{}.pid", seat.to_ascii_lowercase()))
+    }
 }
 
 fn is_seat_worker_active(repo_root: &Path, seat: &str) -> bool {
-    let pid_file = seat_pid_path(repo_root, seat);
-    let Ok(raw) = fs::read_to_string(&pid_file) else {
+    if seat.contains('#') {
+        return pid_file_is_active(&seat_pid_path(repo_root, seat));
+    }
+    let legacy = seat_pid_path(repo_root, seat);
+    if pid_file_is_active(&legacy) {
+        return true;
+    }
+    let instances = bus_dir(repo_root).join("workers").join("instances");
+    let Ok(entries) = fs::read_dir(instances) else {
+        return false;
+    };
+    let prefix = format!("{}--", seat.to_ascii_lowercase());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".pid"))
+            && pid_file_is_active(&entry.path())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn worker_file_component(actor: &str) -> String {
+    let digest = Sha256::digest(actor.as_bytes());
+    format!(
+        "{}--{}",
+        base_seat_str(actor).to_ascii_lowercase(),
+        bytes_to_hex(&digest)
+    )
+}
+
+struct WorkerRegistration {
+    path: PathBuf,
+    file: File,
+}
+
+impl WorkerRegistration {
+    fn acquire(repo_root: &Path, actor: &str) -> std::io::Result<Self> {
+        let path = seat_pid_path(repo_root, actor);
+        fs::create_dir_all(path.parent().ok_or(std::io::ErrorKind::InvalidInput)?)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let mut registration = Self { path, file };
+        writeln!(registration.file, "{}", std::process::id())?;
+        Ok(registration)
+    }
+}
+
+impl Drop for WorkerRegistration {
+    fn drop(&mut self) {
+        if let (Ok(held), Ok(current)) = (self.file.metadata(), self.path.symlink_metadata())
+            && current.is_file()
+            && held.dev() == current.dev()
+            && held.ino() == current.ino()
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn pid_file_is_active(pid_file: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(pid_file) else {
         return false;
     };
     let Ok(pid) = raw.trim().parse::<u32>() else {
@@ -1172,7 +1184,7 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
                 tokio::task::spawn_blocking(move || {
                     let spawned = dispatch_continuous_backlog_wave(&repo_gov, "ALL");
                     if !spawned.is_empty() {
-                        let _ = send_bus_message_sync(
+                        let _ = send_service_message_sync(
                             &repo_gov,
                             "PRODUCT",
                             "#mgmt",
@@ -1266,10 +1278,22 @@ pub fn send_bus_message_sync(
     to: Option<String>,
     task_id: Option<String>,
     body: &str,
-) -> (BusMessage, BusAck) {
-    let (sender, sender_cast) = normalize_actor(from);
+) -> Result<(BusMessage, BusAck), InstanceError> {
+    let address = ActorAddress::parse(from)?.require_instance()?;
+    let (sender, sender_cast) = normalize_actor(&address.to_string())?;
+    let to = to
+        .map(|target| {
+            agent_instance::parse_recipients(&target).map(|targets| {
+                targets
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        })
+        .transpose()?;
     let room_norm = normalize_room(room);
-    let signing_secret = actor_signing_secret(&sender);
+    let signing_secret = actor_signing_secret(&sender)?;
     let transport_secret = actor_transport_secret(&sender);
     let sender_endpoint_id = signing_secret.public().to_string();
     let ts_unix = unix_now();
@@ -1303,7 +1327,9 @@ pub fn send_bus_message_sync(
         sig_verified: false,
     };
     sign_bus_message(&mut msg, &signing_secret);
-    let _ = verify_detached_bus_signature(repo_root, &mut msg);
+    if !verify_detached_bus_signature(repo_root, &mut msg) {
+        return Err(InstanceError::SigningIdentityUnavailable);
+    }
 
     if let Some(daemon) = read_daemon_state(repo_root)
         && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -1311,9 +1337,12 @@ pub fn send_bus_message_sync(
             .build()
         && let Ok(ack) = rt.block_on(publish_over_iroh_quic(&daemon, transport_secret, &msg))
     {
+        if !ack.ok || !ack.sig_verified || ack.message_id != msg.id {
+            return Err(InstanceError::PublicationRejected);
+        }
         msg.seq = ack.seq;
         msg.sig_verified = ack.sig_verified;
-        return (msg, ack);
+        return Ok((msg, ack));
     }
 
     let seq = append_message_to_disk_and_crdb(repo_root, &msg);
@@ -1328,7 +1357,7 @@ pub fn send_bus_message_sync(
         subscribers_notified: 0,
         sig_verified: msg.sig_verified,
     };
-    (msg, ack)
+    Ok((msg, ack))
 }
 
 fn run_worker_sync(
@@ -1338,27 +1367,27 @@ fn run_worker_sync(
     prompt: &str,
     caller_opt: Option<&str>,
 ) -> u8 {
-    let base_seat = base_seat_str(seat).trim().to_uppercase();
-    let worker_instance = if seat.contains('#') {
-        normalize_actor(seat).0
-    } else {
-        let pid = std::process::id();
-        let ts = unix_now();
-        let mut hasher = Sha256::new();
-        hasher.update(format!("chinwag-worker-v1:{base_seat}:{task_id}:{pid}:{ts}"));
-        let hex = bytes_to_hex(&hasher.finalize());
-        format!("{base_seat}#w{}", &hex[..6])
+    let identities = (|| -> Result<(ActorAddress, String), InstanceError> {
+        let mut child = ActorAddress::parse(seat)?;
+        if child.instance().is_none() {
+            child = child.with_instance(&agent_instance::new_instance_id()?)?;
+        }
+        let parent = caller_opt.ok_or(InstanceError::MissingInstance)?;
+        Ok((
+            child.require_instance()?,
+            resolve_actor_with_instance(parent, None)?,
+        ))
+    })();
+    let Ok((child, caller)) = identities else {
+        return 2;
     };
-    let pid_file = seat_pid_path(repo_root, &base_seat);
-    let _ = fs::write(&pid_file, format!("{}", std::process::id()));
-
-    let parent_clause = caller_opt
-        .filter(|c| !c.trim().is_empty())
-        .map(|c| format!(" (spawned by {c})"))
-        .unwrap_or_default();
-    let reply_to = caller_opt
-        .filter(|c| !c.trim().is_empty())
-        .map(|c| c.to_string());
+    let base_seat = child.seat().to_owned();
+    let worker_instance = child.to_string();
+    let Ok(_registration) = WorkerRegistration::acquire(repo_root, &worker_instance) else {
+        return 2;
+    };
+    let parent_clause = format!(" (spawned by {caller})");
+    let reply_to = Some(caller.clone());
 
     let _ = send_bus_message_sync(
         repo_root,
@@ -1377,7 +1406,7 @@ fn run_worker_sync(
         .join(".chinwag/state.crdb")
         .to_string_lossy()
         .to_string();
-    let sender_for_dispatch = caller_opt.unwrap_or("DELIVERY");
+    let sender_for_dispatch = caller.as_str();
     if let chinwag_cli::Dispatch::AgentDispatch(req) = chinwag_cli::dispatch(
         std::ffi::OsStr::new("chinwag"),
         [
@@ -1438,7 +1467,7 @@ fn run_worker_sync(
     );
 
     let short_summary: String = collapsed.chars().take(1800).collect();
-    let _ = send_bus_message_sync(
+    let _ = send_service_message_sync(
         repo_root,
         "DELIVERY",
         "#mgmt",
@@ -1448,17 +1477,30 @@ fn run_worker_sync(
             "■ DELIVERY Receipt: ■ {worker_instance}{parent_clause} completed {task_id} -> {short_summary}"
         ),
     );
-    let _ = fs::remove_file(&pid_file);
     0
 }
 
 fn spawn_seat_workstream(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) -> bool {
+    let Ok(parent) = service_actor("DELIVERY") else {
+        return false;
+    };
+    let child = ActorAddress::parse(seat).and_then(|child| {
+        if child.instance().is_some() {
+            Ok(child)
+        } else {
+            child.with_instance(&agent_instance::new_instance_id()?)
+        }
+    });
+    let Ok(child) = child else {
+        return false;
+    };
+    let seat = child.to_string();
     let logs_dir = bus_dir(repo_root).join("workers");
     let _ = fs::create_dir_all(&logs_dir);
     let log_file = logs_dir.join(format!(
-        "{}-{}.log",
-        seat.to_lowercase(),
-        task_id.to_lowercase()
+        "{}--{}.log",
+        worker_file_component(&seat),
+        bytes_to_hex(&Sha256::digest(task_id.as_bytes()))
     ));
     let bin_chinwag = "/Users/brianspector/.local/bin/chinwag";
 
@@ -1472,7 +1514,9 @@ fn spawn_seat_workstream(repo_root: &Path, seat: &str, task_id: &str, prompt: &s
                 "--repo",
                 &repo_root.to_string_lossy(),
                 "--seat",
-                seat,
+                &seat,
+                "--from",
+                &parent,
                 "--task",
                 task_id,
                 "--message",
@@ -1498,21 +1542,33 @@ fn spawn_seat_workstream(repo_root: &Path, seat: &str, task_id: &str, prompt: &s
     false
 }
 
+fn print_bus_help(stdout: &mut dyn Write) -> u8 {
+    let _ = writeln!(
+        stdout,
+        r#"Usage:
+  chinwag bus instance
+  chinwag bus status [--json]
+  chinwag bus daemon [--port <44330>] [--repo <path>]
+  chinwag bus send --from <SEAT#INSTANCE> [--room <ROOM>] [--to <ADDRESS,...>] [--task <TASK-ID>] [--json] --message <BODY>
+  chinwag bus send --from <SEAT> --instance <INSTANCE> [options] --message <BODY>
+  chinwag bus inbox --for <SEAT#INSTANCE|SEAT> [--limit <N>] [--json]
+  chinwag bus tail [--room <ROOM>] [--task <TASK-ID>] [--limit <N>] [-f] [--json]
+  chinwag bus worker --seat <SEAT> --from <CALLER#INSTANCE> --task <TASK-ID> --message <BODY>
+  chinwag bus wake [--seat <SEAT|ALL>]
+
+Agent sends require a stable conversation instance via --from, --instance or inherited conversation context.
+Use 'bus instance' once to allocate a full random ID, then reuse it for that conversation.
+A base-seat recipient is an explicit seat broadcast; a base-seat inbox aggregates that seat's instances.
+--wake with a base-seat recipient creates a new child instance. Send to an existing instance without --wake.
+"#
+    );
+    0
+}
+
 pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     if sub == "--help" || sub == "-h" || sub == "help" {
-        let _ = writeln!(
-            stdout,
-            "Usage:\n  \
-             chinwag bus status [--json]\n  \
-             chinwag bus daemon [--port <44330>] [--repo <path>]\n  \
-             chinwag bus send [--from <ACTOR>] [--room <#mgmt|#eng|#qa>] [--to <@SEAT>] [--task <TASK-ID>] [--json] \"<MESSAGE>\"\n  \
-             chinwag bus tail [--room <#mgmt|#eng|#all>] [--task <TASK-ID>] [--limit <N>] [-f | --follow] [--json]\n  \
-             chinwag bus inbox [--for <ACTOR>] [--limit <N>] [--json]\n  \
-             chinwag bus wake [--seat <ALL|RUST|ARCHITECT|FLINT|QA|ALISTAIR>]\n\n\
-             Multi-party iroh QUIC messaging bus (ALPN: chinwag/bus/1) + ■ PRODUCT Utilization & ■ DELIVERY Work-Stream Router."
-        );
-        return 0;
+        return print_bus_help(stdout);
     }
 
     let mut repo_arg: Option<String> = None;
@@ -1535,6 +1591,11 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     while i < args.len() {
         let a = args[i].as_str();
         match a {
+            "--help" | "-h" => return print_bus_help(stdout),
+            "--" => {
+                positionals.extend_from_slice(&args[i + 1..]);
+                break;
+            }
             "--repo" if i + 1 < args.len() => {
                 repo_arg = Some(args[i + 1].clone());
                 i += 2;
@@ -1544,7 +1605,10 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 i += 2;
             }
             "--instance" | "--thread" | "--thread-id" if i + 1 < args.len() => {
-                instance_arg = Some(args[i + 1].clone());
+                if instance_arg.replace(args[i + 1].clone()).is_some() {
+                    let _ = writeln!(stderr, "chinwag bus: conflicting_actor_instance");
+                    return 2;
+                }
                 i += 2;
             }
             "--room" | "--channel" | "-c" if i + 1 < args.len() => {
@@ -1595,6 +1659,10 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 positionals.push(args[i + 1].clone());
                 i += 2;
             }
+            flag if flag.starts_with('-') => {
+                let _ = writeln!(stderr, "chinwag bus: invalid_arguments");
+                return 2;
+            }
             _ => {
                 positionals.push(args[i].clone());
                 i += 1;
@@ -1605,18 +1673,32 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     let repo_root = resolve_repo_root(repo_arg.as_deref());
 
     match sub {
+        "instance" | "new-instance" => match agent_instance::new_instance_id() {
+            Ok(instance) => {
+                let _ = writeln!(stdout, "{instance}");
+                0
+            }
+            Err(error) => {
+                let _ = writeln!(stderr, "chinwag bus: {error}");
+                2
+            }
+        },
         "worker" => {
             let seat_raw = seat_arg
                 .or_else(|| from_arg.clone())
                 .unwrap_or_else(|| "RUST".to_string());
             let seat = if let Some(ref inst) = instance_arg {
-                resolve_actor_with_instance(&seat_raw, Some(inst))
+                match resolve_actor_with_instance(&seat_raw, Some(inst)) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "chinwag bus: {error}");
+                        return 2;
+                    }
+                }
             } else {
                 seat_raw
             };
-            let caller = from_arg
-                .as_deref()
-                .map(|f| resolve_actor_with_instance(f, None));
+            let caller = from_arg.or_else(|| std::env::var("CHINWAG_ACTOR").ok());
             let task = task_arg.unwrap_or_else(|| "TASK-15".to_string());
             let mut prompt = positionals.join(" ").trim().to_string();
             if prompt.is_empty()
@@ -1650,12 +1732,34 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 );
                 return 2;
             }
-            let sender_raw = from_arg
-                .or_else(|| std::env::var("CHINWAG_ACTOR").ok())
-                .unwrap_or_else(|| "Brian".to_string());
-            let sender = resolve_actor_with_instance(&sender_raw, instance_arg.as_deref());
+            let sender_raw = from_arg.or_else(|| std::env::var("CHINWAG_ACTOR").ok());
+            let Some(sender_raw) = sender_raw else {
+                let _ = writeln!(stderr, "chinwag bus: actor_required");
+                return 2;
+            };
+            let sender = match resolve_actor_with_instance(&sender_raw, instance_arg.as_deref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = writeln!(stderr, "chinwag bus: {error}");
+                    return 2;
+                }
+            };
+            if wake_on_send {
+                let Some(targets) = to_arg.as_deref() else {
+                    let _ = writeln!(stderr, "chinwag bus: wake_target_required");
+                    return 2;
+                };
+                let Ok(targets) = agent_instance::parse_recipients(targets) else {
+                    let _ = writeln!(stderr, "chinwag bus: invalid_actor_instance");
+                    return 2;
+                };
+                if targets.iter().any(|target| target.instance().is_some()) {
+                    let _ = writeln!(stderr, "chinwag bus: existing_instance_wake_unsupported");
+                    return 2;
+                }
+            }
             let room = room_arg.unwrap_or_else(|| "#mgmt".to_string());
-            let (msg, ack) = send_bus_message_sync(
+            let result = send_bus_message_sync(
                 &repo_root,
                 &sender,
                 &room,
@@ -1663,6 +1767,13 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 task_arg.clone(),
                 &body,
             );
+            let (msg, ack) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = writeln!(stderr, "chinwag bus: {error}");
+                    return 2;
+                }
+            };
             if is_json {
                 let out = json!({
                     "ok": true,
@@ -1767,37 +1878,27 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             let target_raw = for_arg
                 .or_else(|| positionals.first().cloned())
                 .unwrap_or_else(|| "Brian".to_string());
-            let target_with_inst = if let Some(ref inst) = instance_arg {
-                resolve_actor_with_instance(&target_raw, Some(inst))
-            } else {
-                normalize_actor(&target_raw).0
+            let target = ActorAddress::parse(&target_raw).and_then(|target| {
+                if let Some(instance) = instance_arg.as_deref() {
+                    target.with_instance(instance)
+                } else {
+                    Ok(target)
+                }
+            });
+            let target = match target {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = writeln!(stderr, "chinwag bus: {error}");
+                    return 2;
+                }
             };
-            let has_explicit_inst = target_with_inst.contains('#');
-            let target_base = base_seat_str(&target_with_inst).to_string();
-            let mention_token = format!("@{}", target_with_inst.to_uppercase());
-            let base_mention_token = format!("@{}", target_base.to_uppercase());
             let all = read_all_messages(&repo_root);
             let matching: Vec<BusMessage> = all
                 .into_iter()
                 .filter(|m| {
-                    let direct = m.to.as_ref().is_some_and(|t| {
-                        let t_clean = t.trim().trim_start_matches('@');
-                        if has_explicit_inst {
-                            t_clean.eq_ignore_ascii_case(&target_with_inst)
-                                || t_clean.eq_ignore_ascii_case(&target_base)
-                        } else {
-                            base_seat_str(t_clean).eq_ignore_ascii_case(&target_base)
-                        }
-                    });
-                    let body_upper = m.body.to_uppercase();
-                    let mentioned = if has_explicit_inst {
-                        body_upper.contains(&mention_token) || body_upper.contains("@ALL")
-                    } else {
-                        body_upper.contains(&base_mention_token) || body_upper.contains("@ALL")
-                    };
-                    let mgmt_for_human =
-                        (target_base == "Brian" || target_base == "Nic") && m.room == "#mgmt";
-                    direct || mentioned || mgmt_for_human
+                    m.sig_verified
+                        && (agent_instance::inbox_matches(&target, m.to.as_deref(), &m.body)
+                            || (target.is_human() && m.room == "#mgmt"))
                 })
                 .collect();
             let start = matching.len().saturating_sub(limit_arg);
@@ -1812,7 +1913,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 let _ = writeln!(
                     stdout,
                     "📬 Chinwag iroh Bus Inbox for {} ({} messages):",
-                    target_with_inst,
+                    target,
                     slice.len()
                 );
                 for m in slice {
@@ -1827,7 +1928,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 .unwrap_or_else(|| "ALL".to_string())
                 .to_uppercase();
 
-            let _ = send_bus_message_sync(
+            let _ = send_service_message_sync(
                 &repo_root,
                 "PRODUCT",
                 "#mgmt",
@@ -1840,7 +1941,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
 
             let spawned = dispatch_continuous_backlog_wave(&repo_root, &target_seat);
 
-            let (_, ack) = send_bus_message_sync(
+            let result = send_service_message_sync(
                 &repo_root,
                 "DELIVERY",
                 "#eng",
@@ -1856,6 +1957,13 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     }
                 ),
             );
+            let (_, ack) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = writeln!(stderr, "chinwag bus: {error}");
+                    return 2;
+                }
+            };
 
             let out = json!({
                 "ok": true,
@@ -2106,10 +2214,19 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
 mod tests {
     use super::*;
 
+    fn fixture_key(signing_dir: &Path, seat: &str) -> SecretKey {
+        fs::create_dir_all(signing_dir).unwrap();
+        let slug = valid_seat_slug(seat).unwrap();
+        let path = signing_dir.join(format!("{slug}_ed25519.key"));
+        fs::write(&path, [7_u8; 32]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        actor_signing_secret_at(seat, signing_dir).unwrap()
+    }
+
     #[test]
     fn detached_ed25519_bus_signature_verifies_allowed_signers_and_rejects_tampering() {
         let temp = tempfile::tempdir().unwrap();
-        let secret = actor_signing_secret("ARCHITECT");
+        let secret = fixture_key(&temp.path().join("fixture-signing"), "ARCHITECT");
         let mut msg = BusMessage {
             id: "bus-1793250000-deadbeef".to_string(),
             seq: 1,
@@ -2236,20 +2353,22 @@ mod tests {
         legacy_hasher.update(b"chinwag-iroh-bus-seat-ed25519-v1:ephemeral_probe");
         let legacy_digest = legacy_hasher.finalize();
         let unique_seat = format!("ephemeral_probe_{}", std::process::id());
-        let signing = actor_signing_secret(&unique_seat);
+        let temp = tempfile::tempdir().unwrap();
+        let signing = fixture_key(temp.path(), &unique_seat);
         assert_ne!(&signing.to_bytes()[..], &legacy_digest[..]);
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let _ = fs::remove_file(format!("{home}/.chinwag/signing/{unique_seat}_ed25519.key"));
+        assert!(actor_signing_secret_at("MISSING", temp.path()).is_err());
+        assert!(!temp.path().join("missing_ed25519.key").exists());
     }
 
     #[test]
     fn thread_instance_id_signs_with_base_seat_key_and_verifies_against_allowed_signers() {
         let temp = tempfile::tempdir().unwrap();
-        let secret = actor_signing_secret("GEMINI-PM#f19f15");
-        let base_secret = actor_signing_secret("GEMINI-PM");
+        let signing_dir = temp.path().join("fixture-signing");
+        let secret = fixture_key(&signing_dir, "GEMINI-PM#f19f15");
+        let base_secret = actor_signing_secret_at("GEMINI-PM", &signing_dir).unwrap();
         assert_eq!(secret.public(), base_secret.public());
 
-        let (norm_sender, cast) = normalize_actor("gemini-pm#f19f15");
+        let (norm_sender, cast) = normalize_actor("gemini-pm#f19f15").unwrap();
         assert_eq!(norm_sender, "GEMINI-PM#f19f15");
         assert_eq!(cast, "■");
 
@@ -2295,5 +2414,171 @@ mod tests {
             temp.path(),
             &mut spoofed_instance
         ));
+
+        let mut spoofed_recipient = msg.clone();
+        spoofed_recipient.to = Some("WORKHORSE#prd-02".to_owned());
+        assert!(!verify_detached_bus_signature(
+            temp.path(),
+            &mut spoofed_recipient
+        ));
+
+        // Even a valid seat signature cannot make malformed addresses routable.
+        let mut malformed = msg.clone();
+        malformed.sender = "GEMINI-PM#bad/tag".to_owned();
+        sign_bus_message(&mut malformed, &secret);
+        assert!(!verify_detached_bus_signature(temp.path(), &mut malformed));
+
+        let mut wrong_seat = msg.clone();
+        wrong_seat.sender = "WORKHORSE#f19f15".to_owned();
+        sign_bus_message(&mut wrong_seat, &secret);
+        assert!(!verify_detached_bus_signature(temp.path(), &mut wrong_seat));
+
+        // Read the actual CLI inbox from an isolated signed fixture journal.
+        let mut journal = Vec::new();
+        for (seq, to, body) in [
+            (1, Some("WORKHORSE#one"), "own"),
+            (2, Some("WORKHORSE#one-sibling"), "quote @WORKHORSE#one"),
+            (3, Some("WORKHORSE"), "seat broadcast"),
+            (4, Some("ALL"), "all broadcast"),
+            (5, None, "@WORKHORSE#one mention"),
+            (6, None, "@WORKHORSE#one-sibling mention"),
+        ] {
+            let mut row = msg.clone();
+            row.id = format!("fixture-{seq}");
+            row.seq = seq;
+            row.to = to.map(str::to_owned);
+            row.body = body.to_owned();
+            sign_bus_message(&mut row, &secret);
+            journal.push(serde_json::to_string(&row).unwrap());
+        }
+        let mut forged = msg.clone();
+        forged.id = "forged".to_owned();
+        forged.seq = 7;
+        forged.to = Some("WORKHORSE#one".to_owned());
+        journal.push(serde_json::to_string(&forged).unwrap());
+        let path = messages_jsonl_path(temp.path());
+        fs::write(path, journal.join("\n") + "\n").unwrap();
+        for (query, expected) in [
+            ("WORKHORSE#one", vec![1, 3, 4, 5]),
+            ("WORKHORSE", vec![1, 2, 3, 4, 5, 6]),
+        ] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                run_bus_cli(
+                    &[
+                        "inbox".into(),
+                        "--repo".into(),
+                        temp.path().to_string_lossy().into_owned(),
+                        "--for".into(),
+                        query.into(),
+                        "--json".into()
+                    ],
+                    &mut out,
+                    &mut err
+                ),
+                0
+            );
+            let rows: Vec<BusMessage> = serde_json::from_slice(&out).unwrap();
+            assert_eq!(rows.iter().map(|row| row.seq).collect::<Vec<_>>(), expected);
+            assert!(rows.iter().all(|row| row.sig_verified));
+        }
+    }
+
+    #[test]
+    fn worker_files_are_owned_by_the_exact_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = seat_pid_path(temp.path(), "WORKHORSE#one");
+        let b = seat_pid_path(temp.path(), "WORKHORSE#two");
+        let case_distinct = seat_pid_path(temp.path(), "WORKHORSE#ONE");
+        assert_ne!(a, b);
+        assert_ne!(a, case_distinct);
+        let first = WorkerRegistration::acquire(temp.path(), "WORKHORSE#one").unwrap();
+        assert!(WorkerRegistration::acquire(temp.path(), "WORKHORSE#one").is_err());
+        let sibling = WorkerRegistration::acquire(temp.path(), "WORKHORSE#two").unwrap();
+        drop(first);
+        assert!(!a.exists());
+        assert!(b.exists());
+        drop(sibling);
+
+        let original = WorkerRegistration::acquire(temp.path(), "WORKHORSE#one").unwrap();
+        fs::remove_file(&a).unwrap();
+        fs::write(&a, "replacement must survive").unwrap();
+        drop(original);
+        assert_eq!(fs::read_to_string(a).unwrap(), "replacement must survive");
+    }
+
+    #[test]
+    fn retained_worker_logs_do_not_mark_idle_seats_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let workers = bus_dir(temp.path()).join("workers");
+        fs::create_dir_all(&workers).unwrap();
+        let component = worker_file_component("WORKHORSE#retained");
+        for index in 0..4097 {
+            fs::write(
+                workers.join(format!("{component}--{index}.log")),
+                "retained",
+            )
+            .unwrap();
+        }
+        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE"));
+        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE#retained"));
+
+        let registration = WorkerRegistration::acquire(temp.path(), "WORKHORSE#live").unwrap();
+        assert!(is_seat_worker_active(temp.path(), "WORKHORSE"));
+        assert!(is_seat_worker_active(temp.path(), "WORKHORSE#live"));
+        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE#other"));
+        drop(registration);
+        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE"));
+    }
+
+    #[test]
+    fn seat_activity_preserves_legacy_pid_and_ignores_other_instance_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = seat_pid_path(temp.path(), "WORKHORSE");
+        let workers = bus_dir(temp.path()).join("workers");
+        assert_eq!(legacy, workers.join("workhorse.pid"));
+        fs::create_dir_all(&workers).unwrap();
+        fs::write(&legacy, std::process::id().to_string()).unwrap();
+        assert!(is_seat_worker_active(temp.path(), "WORKHORSE"));
+        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE#one"));
+        fs::remove_file(&legacy).unwrap();
+
+        let registration = WorkerRegistration::acquire(temp.path(), "ARCHITECT#one").unwrap();
+        assert_eq!(
+            registration.path.parent(),
+            Some(workers.join("instances").as_path())
+        );
+        assert!(is_seat_worker_active(temp.path(), "ARCHITECT"));
+        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE"));
+        let stale = seat_pid_path(temp.path(), "WORKHORSE#stale");
+        fs::write(&stale, "invalid-pid").unwrap();
+        fs::write(stale.with_extension("log"), "retained").unwrap();
+        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE"));
+        drop(registration);
+        assert!(!is_seat_worker_active(temp.path(), "ARCHITECT"));
+    }
+
+    #[test]
+    fn subcommand_help_does_not_publish_or_start_a_worker() {
+        for subcommand in ["send", "worker", "wake", "inbox"] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![subcommand.to_owned(), "--help".to_owned()];
+            assert_eq!(run_bus_cli(&args, &mut out, &mut err), 0);
+            assert!(String::from_utf8(out).unwrap().starts_with("Usage:"));
+            assert!(err.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_flags_cannot_become_message_text() {
+        for flag in ["--instance", "--from", "--unknown"] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec!["send".to_owned(), flag.to_owned()];
+            assert_eq!(run_bus_cli(&args, &mut out, &mut err), 2);
+            assert!(out.is_empty());
+        }
     }
 }

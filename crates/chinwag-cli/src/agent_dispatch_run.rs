@@ -22,7 +22,6 @@ use chinwag_snapshot_session_private::replacement::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -161,17 +160,6 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     text[..end].to_owned()
-}
-
-fn short_hash(parts: &[&str], ts_ms: i64) -> String {
-    let mut hasher = Sha256::new();
-    for p in parts {
-        hasher.update(p.as_bytes());
-        hasher.update(b"|");
-    }
-    hasher.update(ts_ms.to_be_bytes());
-    let digest = hasher.finalize();
-    digest[..6].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
@@ -385,6 +373,7 @@ fn dispatch_to_engine(
     full_prompt: &str,
     custom: Option<&CustomAgentMeta>,
     signing_env: &[(String, String)],
+    identity: &crate::agent_instance::DispatchIdentity,
 ) -> (String, &'static str) {
     if let Ok(mock) = std::env::var("CHINWAG_AGENT_MOCK_REPLY")
         && !mock.trim().is_empty()
@@ -401,7 +390,7 @@ fn dispatch_to_engine(
     if let Some(pool) = crate::deepseek_pool::pool_for_agent(agent_upper)
         && crate::deepseek_pool::enabled()
     {
-        return crate::deepseek_pool::run(pool, agent_upper, full_prompt);
+        return crate::deepseek_pool::run(pool, agent_upper, full_prompt, identity);
     }
 
     let home = user_home();
@@ -493,6 +482,7 @@ fn dispatch_to_engine(
     }
 
     // 3. Node 2 MacBook Pro (100.108.108.25) Remote Dispatch for ■ WORKHORSE (Codex - GPT-6.1-SOL Max)
+    let remote_command = workhorse_remote_command(identity);
     if is_workhorse
         && let Ok(mut child) = Command::new("/usr/bin/ssh")
             .args([
@@ -501,7 +491,7 @@ fn dispatch_to_engine(
                 "-o",
                 "ConnectTimeout=5",
                 "brianspector@100.108.108.25",
-                "PATH=/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin /Users/brianspector/.local/bin/codex exec --skip-git-repo-check --ephemeral -m gpt-6.1-sol -c 'model_reasoning_effort=\"max\"' -c 'service_tier=\"priority\"' -",
+                &remote_command,
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -636,49 +626,76 @@ fn resolve_repo_root(crdb_path: Option<&Path>) -> PathBuf {
 
 /// One inbound/outbound dispatch exchange to persist into the CRDB store.
 struct DispatchExchange<'a> {
-    thread_id: &'a str,
+    identity: &'a crate::agent_instance::DispatchIdentity,
+    item_key: &'a str,
     inbound_id: &'a str,
-    sender: &'a str,
     inbound_body: &'a str,
     outbound_id: &'a str,
-    agent_upper: &'a str,
     outbound_body: &'a str,
     now_ms: i64,
 }
 
+fn workhorse_remote_command(identity: &crate::agent_instance::DispatchIdentity) -> String {
+    format!(
+        "PATH=/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin {} /Users/brianspector/.local/bin/codex exec --skip-git-repo-check --ephemeral -m gpt-6.1-sol -c 'model_reasoning_effort=\"max\"' -c 'service_tier=\"priority\"' -",
+        identity.remote_environment()
+    )
+}
+
+/// Merge explicit CLI and stdin context before any persona, signing or engine I/O.
+fn prepare_dispatch_identity(
+    request: &AgentDispatchRequest,
+    payload: &StdinDispatchPayload,
+    ambient_actor: Option<&str>,
+) -> Result<crate::agent_instance::DispatchIdentity, crate::agent_instance::InstanceError> {
+    use crate::agent_instance::{ActorAddress, DispatchIdentity, InstanceError};
+    let agent = request
+        .agent
+        .as_deref()
+        .or(payload.agent.as_deref())
+        .ok_or(InstanceError::InvalidAddress)?;
+    let mut child = ActorAddress::parse(agent)?;
+    if child.instance().is_none() {
+        child = child.with_instance(&crate::agent_instance::new_instance_id()?)?;
+    }
+    let sender = request
+        .sender
+        .as_deref()
+        .or(payload.sender.as_deref())
+        .or(ambient_actor)
+        .ok_or(InstanceError::MissingCaller)?;
+    let parent =
+        crate::agent_instance::resolve_from_environment(sender, request.instance.as_deref())?;
+    DispatchIdentity::new(child, parent)
+}
+
 fn persist_to_crdb_once(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<(), String> {
     let DispatchExchange {
-        thread_id,
+        identity,
+        item_key,
         inbound_id,
-        sender,
         inbound_body,
         outbound_id,
-        agent_upper,
         outbound_body,
         now_ms,
     } = *exchange;
+    let thread_id = identity.child().to_string();
     crate::memory_run::clear_stale_crdb_operation_artifacts(repo_root);
     let owner = WriteOwner::acquire_existing_private_fixture(repo_root)
         .map_err(|e| format!("acquire_write_owner: {}", e.reason))?;
     let session =
         WriteSession::from_owner(owner).map_err(|e| format!("write_session: {}", e.reason))?;
     let record = AgentDispatchRecord::try_new(
-        thread_id.to_owned(),
+        thread_id.clone(),
         "emunlabs/chinwag".to_owned(),
         "refs/heads/feat/v0.1.1-invariants-and-memory".to_owned(),
-        format!("Chinwag Agent Comms · {thread_id}"),
+        format!("Chinwag Agent Comms · {thread_id} · {item_key}"),
         inbound_id.to_owned(),
-        format!(
-            "{}@chinwag.sh",
-            sender.to_ascii_lowercase().replace(' ', "-")
-        ),
+        identity.parent().record_author(),
         "user".to_owned(),
         truncate_utf8(inbound_body, MAX_CRDB_TEXT_BYTES),
         outbound_id.to_owned(),
-        format!(
-            "{}@chinwag.sh",
-            agent_upper.to_ascii_lowercase().replace(' ', "-")
-        ),
+        identity.child().record_author(),
         "assistant".to_owned(),
         truncate_utf8(outbound_body, MAX_CRDB_TEXT_BYTES),
         now_ms,
@@ -737,20 +754,16 @@ pub fn run_agent_dispatch(
         }
     }
 
-    let Some(agent_raw) = request.agent.or(stdin_payload.agent) else {
-        let _ = writeln!(err, "chinwag: invalid_arguments");
-        return 2;
-    };
-    let agent_trimmed = agent_raw
-        .trim()
-        .trim_start_matches('@')
-        .trim_start_matches('■')
-        .trim();
-    let (agent_base_part, agent_inst_opt) = match agent_trimmed.split_once('#') {
-        Some((b, i)) => (b.trim(), Some(i.trim().to_owned())),
-        None => (agent_trimmed, None),
-    };
-    let agent_upper = agent_base_part.to_ascii_uppercase();
+    let ambient_actor = std::env::var("CHINWAG_ACTOR").ok();
+    let identity =
+        match prepare_dispatch_identity(&request, &stdin_payload, ambient_actor.as_deref()) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = writeln!(err, "chinwag: {error}");
+                return 2;
+            }
+        };
+    let agent_upper = identity.child().seat().to_owned();
     let Some(body) = request
         .body
         .or(stdin_payload.body)
@@ -764,10 +777,7 @@ pub fn run_agent_dispatch(
         return 2;
     }
 
-    let sender = request
-        .sender
-        .or(stdin_payload.sender)
-        .unwrap_or_else(|| "Brian".to_owned());
+    let sender = identity.parent().to_string();
     let item_key = request
         .item
         .or(stdin_payload.item_key)
@@ -785,11 +795,14 @@ pub fn run_agent_dispatch(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let hash_suffix = short_hash(&[&agent_upper, &sender, &item_key, &body], now_ms);
-    let agent_instance_tag = agent_inst_opt
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("d{}", &hash_suffix[..6.min(hash_suffix.len())]));
-    let agent_instance = format!("{agent_upper}#{agent_instance_tag}");
+    let hash_suffix = match crate::agent_instance::new_instance_id() {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = writeln!(err, "chinwag: {error}");
+            return 2;
+        }
+    };
+    let agent_instance = identity.child().to_string();
 
     let repo_root = resolve_repo_root(crdb_path.as_deref());
     let persona = load_persona(&agent_upper, stdin_payload.custom_agent.as_ref());
@@ -837,14 +850,14 @@ pub fn run_agent_dispatch(
     let full_prompt = prompt_parts.join("\n");
 
     let mut engine_env = signing.env.clone();
-    engine_env.push(("CHINWAG_ACTOR".to_owned(), agent_instance.clone()));
-    engine_env.push(("CHINWAG_INSTANCE_ID".to_owned(), agent_instance_tag));
+    engine_env.extend(identity.environment());
 
     let (reply, engine_used) = dispatch_to_engine(
         &agent_upper,
         &full_prompt,
         stdin_payload.custom_agent.as_ref(),
         &engine_env,
+        &identity,
     );
 
     let inbound_id = format!("msg-in-{now_ms}-{hash_suffix}");
@@ -853,12 +866,11 @@ pub fn run_agent_dispatch(
     let (crdb_status, crdb_persisted) = match persist_to_crdb(
         &repo_root,
         &DispatchExchange {
-            thread_id: &item_key,
+            identity: &identity,
+            item_key: &item_key,
             inbound_id: &inbound_id,
-            sender: &sender,
             inbound_body: &body,
             outbound_id: &outbound_id,
-            agent_upper: &agent_instance,
             outbound_body: &reply,
             now_ms,
         },
@@ -890,7 +902,8 @@ pub fn run_agent_dispatch(
         "reply": reply,
         "crdb_message_id": outbound_id,
         "crdb_inbound_id": inbound_id,
-        "crdb_thread_id": item_key,
+        "crdb_thread_id": agent_instance,
+        "item_key": item_key,
         "crdb_persisted": crdb_persisted,
         "crdb_status": crdb_status
     });
@@ -919,5 +932,77 @@ mod codex_effort_tests {
         for seat in ["TYPE", "INDEX", "DECLARATION", "CLOUDFLARE"] {
             assert_eq!(codex_effort_arg(seat), "model_reasoning_effort=\"high\"");
         }
+    }
+}
+
+#[cfg(test)]
+mod instance_dispatch_tests {
+    use super::*;
+    use crate::agent_instance::{ActorAddress, DispatchIdentity, InstanceError};
+
+    fn request(args: &[&str]) -> AgentDispatchRequest {
+        let mut args = args
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        args.push("--stdin".into());
+        crate::parse_agent_dispatch(&args).unwrap()
+    }
+
+    #[test]
+    fn stdin_sender_and_explicit_instance_are_merged_before_dispatch() {
+        let payload: StdinDispatchPayload = serde_json::from_str(
+            r#"{"agent":"RUST#child-long-id","sender":"WORKHORSE","body":"fixture"}"#,
+        )
+        .unwrap();
+        let req = request(&["--instance", "parent-long-id"]);
+        let identity = prepare_dispatch_identity(&req, &payload, Some("OTHER#ambient")).unwrap();
+        assert_eq!(identity.parent().to_string(), "WORKHORSE#parent-long-id");
+        assert_eq!(identity.child().to_string(), "RUST#child-long-id");
+    }
+
+    #[test]
+    fn inherited_caller_is_used_without_human_default_and_each_spawn_is_fresh() {
+        let payload: StdinDispatchPayload = serde_json::from_str(r#"{"agent":"RUST"}"#).unwrap();
+        let req = request(&[]);
+        assert_eq!(
+            prepare_dispatch_identity(&req, &payload, None),
+            Err(InstanceError::MissingCaller)
+        );
+        let a = prepare_dispatch_identity(&req, &payload, Some("WORKHORSE#parent")).unwrap();
+        let b = prepare_dispatch_identity(&req, &payload, Some("WORKHORSE#parent")).unwrap();
+        assert_eq!(a.parent().to_string(), "WORKHORSE#parent");
+        assert_ne!(a.child(), b.child());
+        assert_eq!(a.child().instance().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn conflicting_stdin_identity_stops_before_files_or_engine_io() {
+        let req = request(&["--instance", "one"]);
+        let mut input = std::io::Cursor::new(
+            br#"{"agent":"RUST#child","sender":"WORKHORSE#two","body":"fixture"}"#,
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(run_agent_dispatch(req, &mut input, &mut out, &mut err), 2);
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "chinwag: conflicting_actor_instance\n"
+        );
+    }
+
+    #[test]
+    fn remote_workhorse_command_contains_full_validated_lineage() {
+        let identity = DispatchIdentity::new(
+            ActorAddress::parse("WORKHORSE#01a146d0-d769-7a02-a1a5-75c407ffaa3c").unwrap(),
+            ActorAddress::parse("GEMINI-PM#parent-long-id").unwrap(),
+        )
+        .unwrap();
+        let command = workhorse_remote_command(&identity);
+        assert!(command.contains("CHINWAG_ACTOR='WORKHORSE#01a146d0-d769-7a02-a1a5-75c407ffaa3c'"));
+        assert!(command.contains("CHINWAG_INSTANCE_ID='01a146d0-d769-7a02-a1a5-75c407ffaa3c'"));
+        assert!(command.contains("CHINWAG_CALLER='GEMINI-PM#parent-long-id'"));
+        assert!(command.contains("CHINWAG_PARENT_INSTANCE='GEMINI-PM#parent-long-id'"));
     }
 }

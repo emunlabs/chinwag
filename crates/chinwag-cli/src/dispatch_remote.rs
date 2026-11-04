@@ -46,6 +46,14 @@ struct StdinPayload {
     custom_agent: Option<wire::CustomAgent>,
 }
 fn read_payload(input: &mut dyn Read) -> Result<Payload, Refused> {
+    let ambient_actor = std::env::var("CHINWAG_ACTOR").ok();
+    read_payload_with_actor(input, ambient_actor.as_deref())
+}
+
+fn read_payload_with_actor(
+    input: &mut dyn Read,
+    ambient_actor: Option<&str>,
+) -> Result<Payload, Refused> {
     let mut bytes = Vec::new();
     input
         .take(wire::MAX_REQUEST_BYTES as u64 + 1)
@@ -65,9 +73,20 @@ fn read_payload(input: &mut dyn Read) -> Result<Payload, Refused> {
     if raw.history.len() > 10 {
         raw.history.drain(..raw.history.len() - 10);
     }
+    let sender = raw.sender.as_deref().or(ambient_actor).ok_or(Refused)?;
+    let parent =
+        crate::agent_instance::resolve_from_environment(sender, None).map_err(|_| Refused)?;
+    let mut child = crate::agent_instance::ActorAddress::parse(&raw.agent).map_err(|_| Refused)?;
+    if child.instance().is_none() {
+        child = child
+            .with_instance(&crate::agent_instance::new_instance_id().map_err(|_| Refused)?)
+            .map_err(|_| Refused)?;
+    }
+    let identity =
+        crate::agent_instance::DispatchIdentity::new(child, parent).map_err(|_| Refused)?;
     let payload = Payload {
-        agent: raw.agent,
-        sender: raw.sender.unwrap_or_else(|| "Brian".into()),
+        agent: identity.child().to_string(),
+        sender: identity.parent().to_string(),
         body: raw.body.or(raw.message).ok_or(Refused)?,
         item_key: raw
             .item_key
@@ -319,7 +338,7 @@ mod tests {
     #[test]
     fn stdin_preserves_signed_context_and_last_ten_history_entries() {
         let history = (0..12).map(|i|serde_json::json!({"sender":"Brian", "role":"user", "body":format!("fixture {i}")})).collect::<Vec<_>>();
-        let input = serde_json::json!({"agent":"RUST","body":"hello","history":history,"customAgent":{"role":"engineer","dept":"engineering","engine":"codex","system_prompt":"inert fixture"}});
+        let input = serde_json::json!({"agent":"RUST","sender":"WORKHORSE#parent-id","body":"hello","history":history,"customAgent":{"role":"engineer","dept":"engineering","engine":"codex","system_prompt":"inert fixture"}});
         let payload = read_payload(&mut serde_json::to_vec(&input).unwrap().as_slice()).unwrap();
         assert_eq!(payload.history.len(), 10);
         assert_eq!(payload.history[0].body.as_deref(), Some("fixture 2"));
@@ -330,10 +349,11 @@ mod tests {
     }
 
     #[test]
-    fn stdin_matches_local_core_fields_defaults_and_aliases() {
-        let payload =
-            read_payload(&mut br#"{"agent":"RUST","message":"hello","item":"task"}"#.as_slice())
-                .unwrap();
+    fn stdin_matches_local_core_fields_and_explicit_human_aliases() {
+        let payload = read_payload(
+            &mut br#"{"agent":"RUST","sender":"Brian","message":"hello","item":"task"}"#.as_slice(),
+        )
+        .unwrap();
         assert_eq!(payload.sender, "Brian");
         assert_eq!(payload.item_key, "task");
         assert_eq!(payload.body, "hello");
@@ -342,8 +362,11 @@ mod tests {
         assert_eq!(payload.body, "preferred");
         assert_eq!(payload.item_key, "preferred");
         assert!(
-            read_payload(&mut br#"{"agent":"RUST","body":"hello","crdb":"/tmp/other"}"#.as_slice())
-                .is_ok()
+            read_payload(
+                &mut br#"{"agent":"RUST","sender":"Brian","body":"hello","crdb":"/tmp/other"}"#
+                    .as_slice()
+            )
+            .is_ok()
         );
         for input in [
             br#"{"agent":"RUST","body":"hello","extra":1}"#.as_slice(),
@@ -351,6 +374,31 @@ mod tests {
         ] {
             let mut reader: &[u8] = input;
             assert!(read_payload(&mut reader).is_err());
+        }
+    }
+
+    #[test]
+    fn remote_request_requires_caller_and_signs_complete_child_context() {
+        let raw = br#"{"agent":"RUST","body":"fixture"}"#;
+        assert!(read_payload_with_actor(&mut raw.as_slice(), None).is_err());
+        let a =
+            read_payload_with_actor(&mut raw.as_slice(), Some("WORKHORSE#parent-long-id")).unwrap();
+        let b =
+            read_payload_with_actor(&mut raw.as_slice(), Some("WORKHORSE#parent-long-id")).unwrap();
+        assert_eq!(a.sender, "WORKHORSE#parent-long-id");
+        assert!(a.agent.starts_with("RUST#"));
+        assert_ne!(a.agent, b.agent);
+        let explicit = br#"{"agent":"RUST#child-MixedCase","sender":"GEMINI-PM#explicit-parent","body":"fixture"}"#;
+        let payload =
+            read_payload_with_actor(&mut explicit.as_slice(), Some("WORKHORSE#ambient")).unwrap();
+        assert_eq!(payload.sender, "GEMINI-PM#explicit-parent");
+        assert_eq!(payload.agent, "RUST#child-MixedCase");
+        for invalid in [
+            br#"{"agent":"RUST#bad/tag","sender":"Brian","body":"fixture"}"#.as_slice(),
+            br#"{"agent":"RUST","sender":"WORKHORSE#bad/tag","body":"fixture"}"#.as_slice(),
+        ] {
+            let mut input = invalid;
+            assert!(read_payload_with_actor(&mut input, None).is_err());
         }
     }
 }

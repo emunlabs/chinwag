@@ -5,7 +5,7 @@
 //! verification against `.chinwag/allowed_signers`), and `TASK-14` (`chinwag a509`).
 
 use crate::bus_run;
-use iroh::{EndpointId, Signature};
+use iroh::{EndpointId, SecretKey, Signature};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -214,8 +214,12 @@ fn canonical_plugin_manifest_payload(v: &Value) -> Option<String> {
     Some(format!("chinwag-plugin-manifest-sig-v2|{jcs}"))
 }
 
-pub fn build_signed_breakroom_manifest(signer_seat: &str) -> Value {
-    let secret = bus_run::actor_signing_secret(signer_seat);
+pub fn build_signed_breakroom_manifest(signer_seat: &str) -> Result<Value, String> {
+    let secret = bus_run::actor_signing_secret(signer_seat).map_err(|e| e.to_string())?;
+    Ok(sign_breakroom_manifest(signer_seat, &secret))
+}
+
+fn sign_breakroom_manifest(signer_seat: &str, secret: &SecretKey) -> Value {
     let pubkey_hex = secret.public().to_string();
     let mut base = json!({
         "schema": "chinwag-plugin-manifest/v1",
@@ -336,8 +340,14 @@ pub fn run_plugin_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
     let manifest_path = repo_plugin_dir.join("manifest.json");
 
     if sub == "init" && !manifest_path.exists() {
+        let signed_manifest = match build_signed_breakroom_manifest("ALISTAIR") {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = writeln!(stderr, "plugin init: {error}");
+                return 1;
+            }
+        };
         let _ = fs::create_dir_all(&repo_plugin_dir);
-        let signed_manifest = build_signed_breakroom_manifest("ALISTAIR");
         if let Ok(text) = serde_json::to_string_pretty(&signed_manifest) {
             let _ = fs::write(&manifest_path, &text);
         }
@@ -630,8 +640,12 @@ fn canonical_cwcard_payload(v: &Value) -> Option<String> {
     Some(format!("chinwag-cwcard-envelope-sig-v1|{jcs}"))
 }
 
-pub fn build_signed_cwcard_envelope(signer_seat: &str) -> Value {
-    let secret = bus_run::actor_signing_secret(signer_seat);
+pub fn build_signed_cwcard_envelope(signer_seat: &str) -> Result<Value, String> {
+    let secret = bus_run::actor_signing_secret(signer_seat).map_err(|e| e.to_string())?;
+    Ok(sign_cwcard_envelope(signer_seat, &secret))
+}
+
+fn sign_cwcard_envelope(signer_seat: &str, secret: &SecretKey) -> Value {
     let pubkey_hex = secret.public().to_string();
     let mut base = json!({
         "schema": "chinwag-cwcard-envelope/v1",
@@ -735,10 +749,16 @@ pub fn run_cwcard_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
         .join("sample.cwcard.json");
 
     if sub == "init" && !cwcard_path.exists() {
+        let env = match build_signed_cwcard_envelope("ALISTAIR") {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                let _ = writeln!(stderr, "cwcard init: {error}");
+                return 1;
+            }
+        };
         if let Some(parent) = cwcard_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let env = build_signed_cwcard_envelope("ALISTAIR");
         if let Ok(text) = serde_json::to_string_pretty(&env) {
             let _ = fs::write(&cwcard_path, text);
         }
@@ -860,8 +880,24 @@ pub fn build_signed_bond_envelope(
     agent_handle: &str,
     chincred_score: u64,
     signer_seat: &str,
+) -> Result<Value, String> {
+    let secret = bus_run::actor_signing_secret(signer_seat).map_err(|e| e.to_string())?;
+    Ok(sign_bond_envelope(
+        bond_id,
+        agent_handle,
+        chincred_score,
+        signer_seat,
+        &secret,
+    ))
+}
+
+fn sign_bond_envelope(
+    bond_id: &str,
+    agent_handle: &str,
+    chincred_score: u64,
+    signer_seat: &str,
+    secret: &SecretKey,
 ) -> Value {
-    let secret = bus_run::actor_signing_secret(signer_seat);
     let pubkey_hex = secret.public().to_string();
     let slug = agent_handle.to_lowercase();
     let mut base = json!({
@@ -965,14 +1001,35 @@ pub fn run_bond_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
     if sub == "init" {
         let _ = fs::create_dir_all(&bonds_dir);
         if !axel_path.exists() {
-            let axel = build_signed_bond_envelope("cwbond-2026-axel-0001", "AXEL", 942, "ALISTAIR");
+            let axel = match build_signed_bond_envelope(
+                "cwbond-2026-axel-0001",
+                "AXEL",
+                942,
+                "ALISTAIR",
+            ) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    let _ = writeln!(stderr, "bond init: {error}");
+                    return 1;
+                }
+            };
             if let Ok(t) = serde_json::to_string_pretty(&axel) {
                 let _ = fs::write(&axel_path, t);
             }
         }
         if !rando_path.exists() {
-            let rando =
-                build_signed_bond_envelope("cwbond-2026-rando-0002", "RANDO", 918, "ALISTAIR");
+            let rando = match build_signed_bond_envelope(
+                "cwbond-2026-rando-0002",
+                "RANDO",
+                918,
+                "ALISTAIR",
+            ) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    let _ = writeln!(stderr, "bond init: {error}");
+                    return 1;
+                }
+            };
             if let Ok(t) = serde_json::to_string_pretty(&rando) {
                 let _ = fs::write(&rando_path, t);
             }
@@ -1098,7 +1155,7 @@ mod tests {
     #[test]
     fn plugin_verify_checks_real_ed25519_signature_and_rejects_tampered_manifest() {
         let temp = tempfile::tempdir().unwrap();
-        let manifest = build_signed_breakroom_manifest("ALISTAIR");
+        let manifest = sign_breakroom_manifest("ALISTAIR", &SecretKey::from_bytes(&[37; 32]));
         let raw = serde_json::to_string_pretty(&manifest).unwrap();
 
         // Missing .chinwag/allowed_signers -> fails closed
@@ -1176,7 +1233,7 @@ mod tests {
     #[test]
     fn cwcard_verify_checks_hpke_blake3_ed25519_envelope_and_rejects_tampering() {
         let temp = tempfile::tempdir().unwrap();
-        let env = build_signed_cwcard_envelope("ALISTAIR");
+        let env = sign_cwcard_envelope("ALISTAIR", &SecretKey::from_bytes(&[41; 32]));
         let raw = serde_json::to_string_pretty(&env).unwrap();
 
         let pub_hex = env["signer_pubkey_ed25519"].as_str().unwrap();
@@ -1205,7 +1262,13 @@ mod tests {
     #[test]
     fn bond_verify_checks_triple_b_ed25519_envelope_and_rejects_tampering() {
         let temp = tempfile::tempdir().unwrap();
-        let bond = build_signed_bond_envelope("cwbond-2026-axel-0001", "AXEL", 942, "ALISTAIR");
+        let bond = sign_bond_envelope(
+            "cwbond-2026-axel-0001",
+            "AXEL",
+            942,
+            "ALISTAIR",
+            &SecretKey::from_bytes(&[43; 32]),
+        );
         let raw = serde_json::to_string_pretty(&bond).unwrap();
 
         let pub_hex = bond["signer_pubkey_ed25519"].as_str().unwrap();

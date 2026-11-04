@@ -11,6 +11,7 @@
 //!   `Rogue Machine Media LLC (d/b/a Lag Lords)` (`INV-BRAND-FIREWALL-01`) plugin/card envelopes.
 
 use crate::{bus_run, feature_cli_run};
+use chinwag_cli::agent_instance::{ActorAddress, InstanceError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
@@ -326,6 +327,17 @@ fn parse_query_param(query: &str, key: &str) -> Option<String> {
     None
 }
 
+fn admit_ui_bus_sender(raw: &str) -> Result<ActorAddress, InstanceError> {
+    let address = ActorAddress::parse(raw)?;
+    if !matches!(
+        address.seat(),
+        "Brian" | "Nic" | "DELIVERY" | "PRODUCT" | "GEMINI-PM"
+    ) {
+        return Err(InstanceError::InvalidAddress);
+    }
+    address.require_instance()
+}
+
 fn write_http_response(
     stream: &mut std::net::TcpStream,
     status_line: &str,
@@ -560,20 +572,10 @@ pub fn handle_workbench_http_connection(
                 .get("sender")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Brian");
-            let sender_clean = sender
-                .trim()
-                .trim_start_matches('●')
-                .trim_start_matches('■')
-                .trim_start_matches('◆')
-                .trim()
-                .to_ascii_uppercase();
-            if !matches!(
-                sender_clean.as_str(),
-                "BRIAN" | "NIC" | "DELIVERY" | "PRODUCT" | "GEMINI-PM"
-            ) {
+            let Ok(sender) = admit_ui_bus_sender(sender) else {
                 let err_json = serde_json::to_vec(&json!({
                     "ok": false,
-                    "error": "UI POST /api/bus/send sender restricted to human/operator seats (Brian, Nic, DELIVERY, PRODUCT, GEMINI-PM)"
+                    "error": "UI POST /api/bus/send sender restricted to human/operator seats (Brian, Nic, DELIVERY, PRODUCT, GEMINI-PM); agent senders require #instance"
                 }))
                 .unwrap_or_default();
                 write_http_response(
@@ -583,7 +585,7 @@ pub fn handle_workbench_http_connection(
                     &err_json,
                 );
                 return;
-            }
+            };
             let room = parsed
                 .get("room")
                 .and_then(|v| v.as_str())
@@ -617,8 +619,31 @@ pub fn handle_workbench_http_connection(
                 );
                 return;
             }
-            let (msg, ack) =
-                bus_run::send_bus_message_sync(repo_root, sender, room, to, task_id, msg_body);
+            let result = bus_run::send_bus_message_sync(
+                repo_root,
+                &sender.to_string(),
+                room,
+                to,
+                task_id,
+                msg_body,
+            );
+            let (msg, ack) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    let body = serde_json::to_vec(&json!({
+                        "ok": false,
+                        "error": error.to_string()
+                    }))
+                    .unwrap_or_default();
+                    write_http_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json; charset=utf-8",
+                        &body,
+                    );
+                    return;
+                }
+            };
             if parsed
                 .get("wake")
                 .and_then(|v| v.as_bool())
@@ -949,6 +974,54 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+
+    #[test]
+    fn ui_sender_admission_preserves_allowed_seat_and_exact_instance() {
+        for (raw, expected) in [
+            ("Brian", "Brian"),
+            ("@actor-brian", "Brian"),
+            ("nic", "Nic"),
+            ("Nicola", "Nic"),
+            ("Nic#HumanThread", "Nic#HumanThread"),
+            ("@■ delivery#Thread-One", "DELIVERY#Thread-One"),
+            ("product#run_2", "PRODUCT#run_2"),
+            ("gemini-pm#MixedCase", "GEMINI-PM#MixedCase"),
+        ] {
+            assert_eq!(admit_ui_bus_sender(raw).unwrap().to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn ui_sender_admission_rejects_bare_agents_without_falling_back_to_brian() {
+        for sender in ["DELIVERY", "PRODUCT", "GEMINI-PM"] {
+            assert_eq!(
+                admit_ui_bus_sender(sender),
+                Err(InstanceError::MissingInstance)
+            );
+        }
+    }
+
+    #[test]
+    fn ui_sender_admission_rejects_other_seats_and_malformed_instances() {
+        for sender in [
+            "ALISTAIR#one",
+            "WORKHORSE#one",
+            "RUST#one",
+            "ALL",
+            "DELIVERY-OTHER#one",
+            "",
+            "DELIVERY#",
+            "PRODUCT#bad/tag",
+            "GEMINI-PM#one#two",
+            "Brian#bad tag",
+        ] {
+            assert_eq!(
+                admit_ui_bus_sender(sender),
+                Err(InstanceError::InvalidAddress),
+                "{sender}"
+            );
+        }
+    }
 
     #[test]
     fn workbench_http_server_serves_live_api_and_injects_bus_bridge() {

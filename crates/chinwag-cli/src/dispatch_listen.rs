@@ -27,6 +27,14 @@ pub(crate) struct LocalDispatcher {
 }
 impl Dispatcher for LocalDispatcher {
     fn dispatch(&self, payload: Payload, output: &mut dyn Write) -> u8 {
+        // A remote agent must carry its own caller instance. Never complete a
+        // bare remote caller with the listener process's environment.
+        if crate::agent_instance::ActorAddress::parse(&payload.sender)
+            .and_then(|sender| sender.require_instance())
+            .is_err()
+        {
+            return 2;
+        }
         // CRDB is fixed by the Studio. The signed optional history/persona
         // context follows the existing stdin path without changing its runner.
         let Ok(bytes) = serde_json::to_vec(&payload) else {
@@ -37,6 +45,7 @@ impl Dispatcher for LocalDispatcher {
                 agent: None,
                 item: None,
                 sender: None,
+                instance: None,
                 body: None,
                 crdb: Some(self.repo.join(".chinwag/state.crdb")),
                 stdin_json: true,
@@ -318,6 +327,26 @@ impl Write for CappedOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_dispatcher_refuses_unqualified_remote_agent_before_io() {
+        let temp = tempfile::tempdir().unwrap();
+        let dispatcher = LocalDispatcher {
+            repo: temp.path().to_owned(),
+        };
+        let payload = Payload {
+            agent: "RUST#child".into(),
+            sender: "WORKHORSE".into(),
+            body: "inert fixture".into(),
+            item_key: "CHWG-THREAD-ID-01".into(),
+            history: vec![],
+            custom_agent: None,
+        };
+        let mut out = Vec::new();
+        assert_eq!(dispatcher.dispatch(payload, &mut out), 2);
+        assert!(out.is_empty());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
     use iroh::{RelayMode, SecretKey, address_lookup::memory::MemoryLookup, endpoint::presets};
     use ssh_key::{LineEnding, PrivateKey, private::Ed25519Keypair};
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -290,7 +290,14 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn ledger_append(dir: &Path, pool: Pool, agent: &str, ok: bool, usage: &Usage) {
+fn ledger_append(
+    dir: &Path,
+    pool: Pool,
+    agent: &str,
+    identity: &crate::agent_instance::DispatchIdentity,
+    ok: bool,
+    usage: &Usage,
+) {
     let secs = now_secs();
     let usage_dir = dir.join("usage");
     if fs::create_dir_all(&usage_dir).is_err() {
@@ -300,6 +307,8 @@ fn ledger_append(dir: &Path, pool: Pool, agent: &str, ok: bool, usage: &Usage) {
         "ts": secs,
         "pool": pool.tag(),
         "agent": agent,
+        "agent_instance": identity.child().to_string(),
+        "parent_instance": identity.parent().to_string(),
         "model": MODEL_ID,
         "ok": ok,
         "prompt_tokens": usage.prompt_tokens,
@@ -317,7 +326,12 @@ fn ledger_append(dir: &Path, pool: Pool, agent: &str, ok: bool, usage: &Usage) {
     }
 }
 
-fn call_workers_ai(dir: &Path, token: &str, prompt: &str) -> Result<String, String> {
+fn call_workers_ai(
+    dir: &Path,
+    token: &str,
+    prompt: &str,
+    identity: &crate::agent_instance::DispatchIdentity,
+) -> Result<String, String> {
     let mut body = json!({
         "messages": [{ "role": "user", "content": prompt }],
         "max_completion_tokens": MAX_COMPLETION_TOKENS,
@@ -369,6 +383,7 @@ fn call_workers_ai(dir: &Path, token: &str, prompt: &str) -> Result<String, Stri
                 "\n%{http_code}",
                 &url,
             ])
+            .envs(identity.environment())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -402,7 +417,15 @@ fn call_workers_ai(dir: &Path, token: &str, prompt: &str) -> Result<String, Stri
 }
 
 /// Entry point used by `dispatch_to_engine`. Never falls back to another engine.
-pub fn run(pool: Pool, agent_upper: &str, prompt: &str) -> (String, &'static str) {
+pub fn run(
+    pool: Pool,
+    agent_upper: &str,
+    prompt: &str,
+    identity: &crate::agent_instance::DispatchIdentity,
+) -> (String, &'static str) {
+    if identity.child().seat() != agent_upper {
+        return ("invalid_dispatch_identity".to_owned(), ENGINE_LABEL);
+    }
     let dir = state_dir();
     let note = |msg: String| (format!("[{agent_upper} note]: {msg}"), ENGINE_LABEL);
 
@@ -427,13 +450,13 @@ pub fn run(pool: Pool, agent_upper: &str, prompt: &str) -> (String, &'static str
             pool.tag()
         ));
     }
-    match call_workers_ai(&dir, &token, prompt).and_then(|raw| parse_response(&raw)) {
+    match call_workers_ai(&dir, &token, prompt, identity).and_then(|raw| parse_response(&raw)) {
         Ok((text, usage)) => {
-            ledger_append(&dir, pool, agent_upper, true, &usage);
+            ledger_append(&dir, pool, agent_upper, identity, true, &usage);
             (text, ENGINE_LABEL)
         }
         Err(e) => {
-            ledger_append(&dir, pool, agent_upper, false, &Usage::default());
+            ledger_append(&dir, pool, agent_upper, identity, false, &Usage::default());
             note(format!("DeepSeek call failed: {e}"))
         }
     }
