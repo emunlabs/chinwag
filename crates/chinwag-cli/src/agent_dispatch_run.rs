@@ -741,7 +741,16 @@ pub fn run_agent_dispatch(
         let _ = writeln!(err, "chinwag: invalid_arguments");
         return 2;
     };
-    let agent_upper = agent_raw.trim().to_ascii_uppercase();
+    let agent_trimmed = agent_raw
+        .trim()
+        .trim_start_matches('@')
+        .trim_start_matches('■')
+        .trim();
+    let (agent_base_part, agent_inst_opt) = match agent_trimmed.split_once('#') {
+        Some((b, i)) => (b.trim(), Some(i.trim().to_owned())),
+        None => (agent_trimmed, None),
+    };
+    let agent_upper = agent_base_part.to_ascii_uppercase();
     let Some(body) = request
         .body
         .or(stdin_payload.body)
@@ -772,6 +781,16 @@ pub fn run_agent_dispatch(
             .map(PathBuf::from)
     });
 
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let hash_suffix = short_hash(&[&agent_upper, &sender, &item_key, &body], now_ms);
+    let agent_instance_tag = agent_inst_opt
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("d{}", &hash_suffix[..6.min(hash_suffix.len())]));
+    let agent_instance = format!("{agent_upper}#{agent_instance_tag}");
+
     let repo_root = resolve_repo_root(crdb_path.as_deref());
     let persona = load_persona(&agent_upper, stdin_payload.custom_agent.as_ref());
     let memories = recall_native_memory(&agent_upper.to_ascii_lowercase(), &body, &repo_root);
@@ -783,7 +802,7 @@ pub fn run_agent_dispatch(
         ));
     }
     prompt_parts.push(format!(
-        "\n--- Active Work Item Context ---\nLinked item: {item_key}"
+        "\n--- Active Work Item & Thread Instance Context ---\nLinked item: {item_key}\nYour unique thread instance ID: {agent_instance}\nCaller thread instance ID: {sender}\n(When posting to the Chinwag bus, always pass --from \"{agent_instance}\" --to \"@{sender}\")"
     ));
     if !stdin_payload.history.is_empty() {
         let mut transcript = Vec::new();
@@ -813,22 +832,21 @@ pub fn run_agent_dispatch(
         prompt_parts.push(seat_signing::brief_note(&agent_upper));
     }
     prompt_parts.push(format!(
-        "\n--- New Message from {sender} ---\n{body}\n\nReply directly as {agent_upper}:"
+        "\n--- New Message from {sender} ---\n{body}\n\nReply directly as {agent_instance}:"
     ));
     let full_prompt = prompt_parts.join("\n");
+
+    let mut engine_env = signing.env.clone();
+    engine_env.push(("CHINWAG_ACTOR".to_owned(), agent_instance.clone()));
+    engine_env.push(("CHINWAG_INSTANCE_ID".to_owned(), agent_instance_tag));
 
     let (reply, engine_used) = dispatch_to_engine(
         &agent_upper,
         &full_prompt,
         stdin_payload.custom_agent.as_ref(),
-        &signing.env,
+        &engine_env,
     );
 
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let hash_suffix = short_hash(&[&agent_upper, &sender, &item_key, &body], now_ms);
     let inbound_id = format!("msg-in-{now_ms}-{hash_suffix}");
     let outbound_id = format!("msg-out-{now_ms}-{hash_suffix}");
 
@@ -840,7 +858,7 @@ pub fn run_agent_dispatch(
             sender: &sender,
             inbound_body: &body,
             outbound_id: &outbound_id,
-            agent_upper: &agent_upper,
+            agent_upper: &agent_instance,
             outbound_body: &reply,
             now_ms,
         },
@@ -866,6 +884,8 @@ pub fn run_agent_dispatch(
     let output = json!({
         "ok": true,
         "agent": agent_upper,
+        "agent_instance": agent_instance,
+        "sender_instance": sender,
         "engine": engine_used,
         "reply": reply,
         "crdb_message_id": outbound_id,

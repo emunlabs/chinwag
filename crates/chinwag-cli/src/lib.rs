@@ -628,6 +628,13 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
             "--sender" | "--from" | "-s" => sender = Some(val),
             "--body" | "--message" | "--prompt" | "--content" | "-m" => body = Some(val),
             "--crdb" | "--repo" => crdb = Some(PathBuf::from(val)),
+            "--instance" | "--thread" | "--thread-id" => {
+                if let Some(ref mut s) = sender
+                    && !s.contains('#')
+                {
+                    *s = format!("{s}#{val}");
+                }
+            }
             "--room" | "--channel" | "-c" => {}
             _ => return None,
         }

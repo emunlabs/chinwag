@@ -191,12 +191,73 @@ fn load_or_create_daemon_secret(repo_root: &Path) -> SecretKey {
     SecretKey::from_bytes(&arr)
 }
 
+fn base_seat_str(actor: &str) -> &str {
+    actor.split('#').next().unwrap_or(actor)
+}
+
+fn sanitize_instance_tag(raw_tag: &str) -> String {
+    raw_tag
+        .trim()
+        .trim_start_matches('#')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(24)
+        .collect()
+}
+
+fn auto_thread_instance_tag(base_seat: &str) -> String {
+    for env_key in [
+        "CHINWAG_INSTANCE_ID",
+        "CHINWAG_THREAD_ID",
+        "ANTIGRAVITY_CONVERSATION_ID",
+        "CONVERSATION_ID",
+        "TERM_SESSION_ID",
+    ] {
+        if let Ok(val) = std::env::var(env_key) {
+            let clean = sanitize_instance_tag(&val);
+            if !clean.is_empty() {
+                let short: String = clean.chars().take(8).collect();
+                return short.to_lowercase();
+            }
+        }
+    }
+    let ppid = std::os::unix::process::parent_id();
+    let mut hasher = Sha256::new();
+    hasher.update(format!("chinwag-thread-v1:{base_seat}:{ppid}"));
+    let hex = bytes_to_hex(&hasher.finalize());
+    format!("t{}", &hex[..6])
+}
+
+/// Ensures every non-human agent thread carries a unique `<SEAT>#<INSTANCE_ID>` tag (`INV-THREAD-ID-01`).
+pub fn resolve_actor_with_instance(raw_actor: &str, explicit_instance: Option<&str>) -> String {
+    let (norm, _) = normalize_actor(raw_actor);
+    if norm == "Brian" || norm == "Nic" {
+        if let Some(inst) = explicit_instance.map(sanitize_instance_tag)
+            && !inst.is_empty()
+        {
+            return format!("{norm}#{inst}");
+        }
+        return norm;
+    }
+    if norm.contains('#') {
+        return norm;
+    }
+    if let Some(inst) = explicit_instance.map(sanitize_instance_tag)
+        && !inst.is_empty()
+    {
+        return format!("{norm}#{inst}");
+    }
+    let auto_tag = auto_thread_instance_tag(&norm);
+    format!("{norm}#{auto_tag}")
+}
+
 fn seat_slug_clean(actor: &str) -> String {
-    actor
+    base_seat_str(actor)
         .trim()
         .trim_start_matches('●')
         .trim_start_matches('■')
         .trim_start_matches('◆')
+        .trim_start_matches('@')
         .trim()
         .to_lowercase()
 }
@@ -374,7 +435,7 @@ pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> 
         msg.sig_verified = false;
         return false;
     }
-    let sender_norm = msg.sender.trim().to_uppercase();
+    let sender_norm = base_seat_str(&msg.sender).trim().to_uppercase();
     let in_allowed = signers.iter().any(|(seat_opt, bytes)| {
         bytes == pubkey.as_bytes()
             && seat_opt
@@ -396,14 +457,23 @@ fn normalize_actor(raw: &str) -> (String, String) {
         .trim_start_matches('●')
         .trim_start_matches('■')
         .trim_start_matches('◆')
+        .trim_start_matches('@')
         .trim();
-    let upper = trimmed.to_uppercase();
-    if upper == "BRIAN" || upper == "ACTOR-BRIAN" {
+    let (base_part, inst_opt) = match trimmed.split_once('#') {
+        Some((b, i)) => (b.trim(), Some(sanitize_instance_tag(i))),
+        None => (trimmed, None),
+    };
+    let upper = base_part.to_uppercase();
+    let (base_norm, cast) = if upper == "BRIAN" || upper == "ACTOR-BRIAN" {
         ("Brian".to_string(), "●".to_string())
     } else if upper == "NIC" || upper == "NICOLA" || upper == "ACTOR-NIC" {
         ("Nic".to_string(), "●".to_string())
     } else {
         (upper, "■".to_string())
+    };
+    match inst_opt {
+        Some(inst) if !inst.is_empty() => (format!("{base_norm}#{inst}"), cast),
+        _ => (base_norm, cast),
     }
 }
 
@@ -540,7 +610,7 @@ pub fn auto_advance_tasks_markdown(
     let tasks_path = repo_root.join("TASKS.md");
     let raw = fs::read_to_string(&tasks_path).ok()?;
     let target_tid = completed_task_id.trim().to_uppercase();
-    let target_seat = seat.trim().to_uppercase();
+    let target_seat = base_seat_str(seat).trim().to_uppercase();
     if !target_tid.starts_with("TASK-") {
         return None;
     }
@@ -1261,17 +1331,44 @@ pub fn send_bus_message_sync(
     (msg, ack)
 }
 
-fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) -> u8 {
-    let pid_file = seat_pid_path(repo_root, seat);
+fn run_worker_sync(
+    repo_root: &Path,
+    seat: &str,
+    task_id: &str,
+    prompt: &str,
+    caller_opt: Option<&str>,
+) -> u8 {
+    let base_seat = base_seat_str(seat).trim().to_uppercase();
+    let worker_instance = if seat.contains('#') {
+        normalize_actor(seat).0
+    } else {
+        let pid = std::process::id();
+        let ts = unix_now();
+        let mut hasher = Sha256::new();
+        hasher.update(format!("chinwag-worker-v1:{base_seat}:{task_id}:{pid}:{ts}"));
+        let hex = bytes_to_hex(&hasher.finalize());
+        format!("{base_seat}#w{}", &hex[..6])
+    };
+    let pid_file = seat_pid_path(repo_root, &base_seat);
     let _ = fs::write(&pid_file, format!("{}", std::process::id()));
+
+    let parent_clause = caller_opt
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| format!(" (spawned by {c})"))
+        .unwrap_or_default();
+    let reply_to = caller_opt
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| c.to_string());
 
     let _ = send_bus_message_sync(
         repo_root,
-        seat,
+        &worker_instance,
         "#eng",
-        None,
+        reply_to.clone(),
         Some(task_id.to_string()),
-        &format!("ACK from ■ {seat}: Executing work stream on {task_id} now."),
+        &format!(
+            "ACK from ■ {worker_instance}{parent_clause}: Executing work stream on {task_id} now."
+        ),
     );
 
     let mut out_buf: Vec<u8> = Vec::new();
@@ -1280,16 +1377,17 @@ fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) ->
         .join(".chinwag/state.crdb")
         .to_string_lossy()
         .to_string();
+    let sender_for_dispatch = caller_opt.unwrap_or("DELIVERY");
     if let chinwag_cli::Dispatch::AgentDispatch(req) = chinwag_cli::dispatch(
         std::ffi::OsStr::new("chinwag"),
         [
             "agent-dispatch",
             "--agent",
-            seat,
+            &worker_instance,
             "--item",
             task_id,
             "--sender",
-            "DELIVERY",
+            sender_for_dispatch,
             "--crdb",
             &crdb_str,
             "--body",
@@ -1325,16 +1423,16 @@ fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) ->
     // Full-length 1800-char bus receipt so engineering/audit findings are never clipped (`TASK-15`)
     let summary: String = collapsed.chars().take(1800).collect();
 
-    let target_room = if seat.eq_ignore_ascii_case("QA") {
+    let target_room = if base_seat.eq_ignore_ascii_case("QA") {
         "#qa"
     } else {
         "#eng"
     };
     let _ = send_bus_message_sync(
         repo_root,
-        seat,
+        &worker_instance,
         target_room,
-        None,
+        reply_to,
         Some(task_id.to_string()),
         &format!("COMPLETED {task_id}: {summary}"),
     );
@@ -1346,7 +1444,9 @@ fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) ->
         "#mgmt",
         Some("Brian".to_string()),
         Some(task_id.to_string()),
-        &format!("■ DELIVERY Receipt: ■ {seat} completed {task_id} -> {short_summary}"),
+        &format!(
+            "■ DELIVERY Receipt: ■ {worker_instance}{parent_clause} completed {task_id} -> {short_summary}"
+        ),
     );
     let _ = fs::remove_file(&pid_file);
     0
@@ -1417,6 +1517,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
 
     let mut repo_arg: Option<String> = None;
     let mut from_arg: Option<String> = None;
+    let mut instance_arg: Option<String> = None;
     let mut room_arg: Option<String> = None;
     let mut to_arg: Option<String> = None;
     let mut task_arg: Option<String> = None;
@@ -1440,6 +1541,10 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             }
             "--from" | "-s" | "--sender" if i + 1 < args.len() => {
                 from_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--instance" | "--thread" | "--thread-id" if i + 1 < args.len() => {
+                instance_arg = Some(args[i + 1].clone());
                 i += 2;
             }
             "--room" | "--channel" | "-c" if i + 1 < args.len() => {
@@ -1501,9 +1606,17 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
 
     match sub {
         "worker" => {
-            let seat = seat_arg
+            let seat_raw = seat_arg
                 .or_else(|| from_arg.clone())
                 .unwrap_or_else(|| "RUST".to_string());
+            let seat = if let Some(ref inst) = instance_arg {
+                resolve_actor_with_instance(&seat_raw, Some(inst))
+            } else {
+                seat_raw
+            };
+            let caller = from_arg
+                .as_deref()
+                .map(|f| resolve_actor_with_instance(f, None));
             let task = task_arg.unwrap_or_else(|| "TASK-15".to_string());
             let mut prompt = positionals.join(" ").trim().to_string();
             if prompt.is_empty()
@@ -1511,7 +1624,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             {
                 prompt = s;
             }
-            run_worker_sync(&repo_root, &seat, &task, &prompt)
+            run_worker_sync(&repo_root, &seat, &task, &prompt, caller.as_deref())
         }
         "daemon" => {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
@@ -1533,13 +1646,14 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             if body.is_empty() {
                 let _ = writeln!(
                     stderr,
-                    "Usage: chinwag bus send [--from <ACTOR>] [--room <#mgmt|#eng>] [--to <@SEAT>] [--task <TASK-ID>] [--wake] \"<MESSAGE>\""
+                    "Usage: chinwag bus send [--from <SEAT#THREAD_ID>] [--instance <THREAD_ID>] [--room <#mgmt|#eng>] [--to <@SEAT>] [--task <TASK-ID>] [--wake] \"<MESSAGE>\""
                 );
                 return 2;
             }
-            let sender = from_arg
+            let sender_raw = from_arg
                 .or_else(|| std::env::var("CHINWAG_ACTOR").ok())
                 .unwrap_or_else(|| "Brian".to_string());
+            let sender = resolve_actor_with_instance(&sender_raw, instance_arg.as_deref());
             let room = room_arg.unwrap_or_else(|| "#mgmt".to_string());
             let (msg, ack) = send_bus_message_sync(
                 &repo_root,
@@ -1578,12 +1692,19 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                         .trim_start_matches('@')
                         .trim_start_matches('■')
                         .trim();
-                    if !clean_seat.is_empty()
-                        && !clean_seat.eq_ignore_ascii_case("ALL")
-                        && !clean_seat.eq_ignore_ascii_case("BRIAN")
-                        && !clean_seat.eq_ignore_ascii_case("NIC")
+                    let base_target = base_seat_str(clean_seat);
+                    if !base_target.is_empty()
+                        && !base_target.eq_ignore_ascii_case("ALL")
+                        && !base_target.eq_ignore_ascii_case("BRIAN")
+                        && !base_target.eq_ignore_ascii_case("NIC")
                     {
-                        let _ = run_worker_sync(&repo_root, clean_seat, &task_for_wake, &body);
+                        let _ = run_worker_sync(
+                            &repo_root,
+                            clean_seat,
+                            &task_for_wake,
+                            &body,
+                            Some(&sender),
+                        );
                     }
                 }
             }
@@ -1646,19 +1767,36 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             let target_raw = for_arg
                 .or_else(|| positionals.first().cloned())
                 .unwrap_or_else(|| "Brian".to_string());
-            let (target_norm, _) = normalize_actor(&target_raw);
-            let mention_token = format!("@{}", target_norm.to_uppercase());
+            let target_with_inst = if let Some(ref inst) = instance_arg {
+                resolve_actor_with_instance(&target_raw, Some(inst))
+            } else {
+                normalize_actor(&target_raw).0
+            };
+            let has_explicit_inst = target_with_inst.contains('#');
+            let target_base = base_seat_str(&target_with_inst).to_string();
+            let mention_token = format!("@{}", target_with_inst.to_uppercase());
+            let base_mention_token = format!("@{}", target_base.to_uppercase());
             let all = read_all_messages(&repo_root);
             let matching: Vec<BusMessage> = all
                 .into_iter()
                 .filter(|m| {
-                    let direct =
-                        m.to.as_ref()
-                            .is_some_and(|t| t.eq_ignore_ascii_case(&target_norm));
-                    let mentioned = m.body.to_uppercase().contains(&mention_token)
-                        || m.body.to_uppercase().contains("@ALL");
+                    let direct = m.to.as_ref().is_some_and(|t| {
+                        let t_clean = t.trim().trim_start_matches('@');
+                        if has_explicit_inst {
+                            t_clean.eq_ignore_ascii_case(&target_with_inst)
+                                || t_clean.eq_ignore_ascii_case(&target_base)
+                        } else {
+                            base_seat_str(t_clean).eq_ignore_ascii_case(&target_base)
+                        }
+                    });
+                    let body_upper = m.body.to_uppercase();
+                    let mentioned = if has_explicit_inst {
+                        body_upper.contains(&mention_token) || body_upper.contains("@ALL")
+                    } else {
+                        body_upper.contains(&base_mention_token) || body_upper.contains("@ALL")
+                    };
                     let mgmt_for_human =
-                        (target_norm == "Brian" || target_norm == "Nic") && m.room == "#mgmt";
+                        (target_base == "Brian" || target_base == "Nic") && m.room == "#mgmt";
                     direct || mentioned || mgmt_for_human
                 })
                 .collect();
@@ -1674,7 +1812,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 let _ = writeln!(
                     stdout,
                     "📬 Chinwag iroh Bus Inbox for {} ({} messages):",
-                    target_norm,
+                    target_with_inst,
                     slice.len()
                 );
                 for m in slice {
@@ -1819,12 +1957,12 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     .unwrap_or_else(|| "-".to_string());
                 let msg_count = all
                     .iter()
-                    .filter(|m| m.sender.eq_ignore_ascii_case(seat))
+                    .filter(|m| base_seat_str(&m.sender).eq_ignore_ascii_case(seat))
                     .count();
                 let last_msg = all
                     .iter()
                     .rev()
-                    .find(|m| m.sender.eq_ignore_ascii_case(seat));
+                    .find(|m| base_seat_str(&m.sender).eq_ignore_ascii_case(seat));
                 let last_ts = last_msg
                     .map(|m| format_local_wall_clock(&m.ts_iso))
                     .unwrap_or_else(|| "-".to_string());
@@ -2102,5 +2240,60 @@ mod tests {
         assert_ne!(&signing.to_bytes()[..], &legacy_digest[..]);
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let _ = fs::remove_file(format!("{home}/.chinwag/signing/{unique_seat}_ed25519.key"));
+    }
+
+    #[test]
+    fn thread_instance_id_signs_with_base_seat_key_and_verifies_against_allowed_signers() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret = actor_signing_secret("GEMINI-PM#f19f15");
+        let base_secret = actor_signing_secret("GEMINI-PM");
+        assert_eq!(secret.public(), base_secret.public());
+
+        let (norm_sender, cast) = normalize_actor("gemini-pm#f19f15");
+        assert_eq!(norm_sender, "GEMINI-PM#f19f15");
+        assert_eq!(cast, "■");
+
+        let mut msg = BusMessage {
+            id: "bus-1793250001-beefcafe".to_string(),
+            seq: 1,
+            ts_unix: 1_793_250_001,
+            ts_iso: "2026-11-04T00:50:00-0600 CST".to_string(),
+            room: "#mgmt".to_string(),
+            sender: norm_sender,
+            sender_cast: cast,
+            sender_endpoint_id: secret.public().to_string(),
+            to: Some("WORKHORSE#prd-01".to_string()),
+            task_id: Some("CHWG-PRD-FINAL".to_string()),
+            body: "Thread-scoped message from GEMINI-PM#f19f15 to WORKHORSE#prd-01".to_string(),
+            digest_sha256: "beefcafe".repeat(8),
+            pubkey_ed25519: None,
+            signature_ed25519: None,
+            sig_verified: false,
+        };
+        sign_bus_message(&mut msg, &secret);
+
+        let ssh_pub = ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(
+            *secret.public().as_bytes(),
+        ));
+        let openssh_line = ssh_pub.to_openssh().unwrap();
+        let chinwag_dir = temp.path().join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::write(
+            chinwag_dir.join("allowed_signers"),
+            format!(
+                "gemini-pm-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag GEMINI-PM\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(verify_detached_bus_signature(temp.path(), &mut msg));
+
+        // Tampering with the #instance suffix invalidates the 7-field Ed25519 signature
+        let mut spoofed_instance = msg.clone();
+        spoofed_instance.sender = "GEMINI-PM#other99".to_string();
+        assert!(!verify_detached_bus_signature(
+            temp.path(),
+            &mut spoofed_instance
+        ));
     }
 }
