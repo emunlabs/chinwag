@@ -421,7 +421,11 @@ where
         };
     }
     if args.first().is_some_and(|arg| arg == "agent-dispatch") {
-        if args.len() == 2 && args[1] == "--help" {
+        if args.len() == 1
+            || args[1..]
+                .iter()
+                .any(|a| a == "--help" || a == "-h" || a == "help")
+        {
             return Dispatch::Immediate(Exit::AgentDispatchHelp(invocation));
         }
         return match parse_agent_dispatch(&args[1..]) {
@@ -430,7 +434,11 @@ where
         };
     }
     if args.first().is_some_and(|arg| arg == "memory") {
-        if args.len() == 1 || (args.len() == 2 && args[1] == "--help") {
+        if args.len() == 1
+            || args[1..]
+                .iter()
+                .any(|a| a == "--help" || a == "-h" || a == "help")
+        {
             return Dispatch::Immediate(Exit::MemoryHelp(invocation));
         }
         return match parse_memory(&args[1..]) {
@@ -589,25 +597,43 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
     let mut body = None;
     let mut crdb = None;
     let mut stdin_json = false;
+    let mut positionals: Vec<String> = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
-        let flag = args[idx].to_str()?;
-        if flag == "--stdin" || flag == "--stdin-json" {
+        let raw_flag = args[idx].to_str()?;
+        if raw_flag == "--stdin" || raw_flag == "--stdin-json" {
             stdin_json = true;
             idx += 1;
             continue;
         }
-        idx += 1;
-        let val = args.get(idx)?.to_str()?.to_owned();
+        if !raw_flag.starts_with('-') {
+            positionals.push(raw_flag.to_owned());
+            idx += 1;
+            continue;
+        }
+        let (flag, val) = if let Some((f, v)) = raw_flag.split_once('=') {
+            idx += 1;
+            (f, v.to_owned())
+        } else {
+            idx += 1;
+            let v = args.get(idx)?.to_str()?.to_owned();
+            idx += 1;
+            (raw_flag, v)
+        };
         match flag {
-            "--agent" => agent = Some(val),
-            "--item" | "--item-key" => item = Some(val),
-            "--sender" => sender = Some(val),
-            "--body" | "--message" => body = Some(val),
+            "--agent" | "--seat" | "--to" | "-a" => {
+                agent = Some(val.trim_start_matches('@').to_owned())
+            }
+            "--item" | "--item-key" | "--task" | "--ticket" | "-k" => item = Some(val),
+            "--sender" | "--from" | "-s" => sender = Some(val),
+            "--body" | "--message" | "--prompt" | "--content" | "-m" => body = Some(val),
             "--crdb" | "--repo" => crdb = Some(PathBuf::from(val)),
+            "--room" | "--channel" | "-c" => {}
             _ => return None,
         }
-        idx += 1;
+    }
+    if body.is_none() && !positionals.is_empty() {
+        body = Some(positionals.join(" "));
     }
     if !stdin_json && (agent.is_none() || body.is_none()) {
         return None;
@@ -641,10 +667,16 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
     let mut alternative = None;
     let mut url = None;
     let mut crdb = None;
+    let mut positionals: Vec<String> = Vec::new();
 
     let mut idx = 0;
     while idx < rest.len() {
         let raw_flag = rest[idx].to_str()?;
+        if !raw_flag.starts_with('-') {
+            positionals.push(raw_flag.to_owned());
+            idx += 1;
+            continue;
+        }
         let (flag, val) = if let Some((f, v)) = raw_flag.split_once('=') {
             idx += 1;
             (f, v.to_owned())
@@ -656,12 +688,12 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
         };
         match flag {
             "--id" => id = Some(val),
-            "--bank" => bank = Some(val),
+            "--bank" | "-b" => bank = Some(val),
             "--context" | "--ctx" | "--category" => context = Some(val),
-            "--content" | "--text" | "--body" => content = Some(val),
+            "--content" | "--text" | "--body" | "--message" | "-m" => content = Some(val),
             "--commit" | "--source-commit" => commit = Some(val),
             "--file-scope" | "--file-path" | "--scope" => file_scope = Some(val),
-            "--agent" | "--author" => agent = Some(val),
+            "--agent" | "--author" | "--from" => agent = Some(val),
             "--tags" => tags = Some(val),
             "--query" | "-q" => query = Some(val),
             "--limit" | "-n" => limit = Some(val.parse().ok()?),
@@ -675,27 +707,31 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
         }
     }
 
+    let positional_joined = (!positionals.is_empty()).then(|| positionals.join(" "));
+
     let action = match sub {
         "retain" => MemoryAction::Retain {
             id,
             bank: bank.unwrap_or_else(|| "spector-fleet".to_owned()),
             context: context.unwrap_or_else(|| "chinwag-memory".to_owned()),
-            content: content?,
+            content: content.or(positional_joined)?,
             commit,
             file_scope,
             agent,
             tags,
         },
         "recall" => MemoryAction::Recall {
-            query: query.unwrap_or_else(|| file_scope.clone().unwrap_or_default()),
+            query: query
+                .or(positional_joined)
+                .unwrap_or_else(|| file_scope.clone().unwrap_or_default()),
             limit: limit.unwrap_or(10),
             bank,
             file_scope,
         },
         "tombstone" => MemoryAction::Tombstone {
             id: id?,
-            file_scope: file_scope?,
-            reason: reason.or(content)?,
+            file_scope: file_scope.unwrap_or_else(|| "*".to_owned()),
+            reason: reason.or(content).or(positional_joined)?,
             commit,
             attempted_action,
             failure,

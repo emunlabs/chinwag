@@ -1030,7 +1030,7 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         );
         let hub_ok = status_line.contains(" 200 ");
         let whoami_json: serde_json::Value =
-            serde_json::from_slice(&body).unwrap_or_else(|_| json!(null));
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         let out = json!({
             "ok": hub_ok,
             "command": "chinwag beam",
@@ -1098,7 +1098,7 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         let (probe_ok, whoami_val) = match probe_out {
             Ok(o) if o.status.success() => {
                 let parsed: serde_json::Value =
-                    serde_json::from_slice(&o.stdout).unwrap_or_else(|_| json!(null));
+                    serde_json::from_slice(&o.stdout).unwrap_or(serde_json::Value::Null);
                 let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                 (ok, parsed)
             }

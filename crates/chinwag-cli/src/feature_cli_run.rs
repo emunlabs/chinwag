@@ -148,7 +148,7 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
             }
             0
         }
-        "status" | _ => {
+        _ => {
             if is_json {
                 let payload = json!({
                     "ok": true,
@@ -461,7 +461,7 @@ pub fn run_plugin_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
                 1
             }
         },
-        "list" | _ => {
+        _ => {
             let ok_sig = verification.is_ok();
             let payload_sha256 = verification
                 .as_ref()
@@ -544,8 +544,7 @@ pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn W
             .trim()
             .to_string();
         let pub_key_token = pub_line.split_whitespace().nth(1).unwrap_or("");
-        let in_allowed_signers =
-            !pub_key_token.is_empty() && allowed_raw.contains(pub_key_token);
+        let in_allowed_signers = !pub_key_token.is_empty() && allowed_raw.contains(pub_key_token);
         let ok = endpoint_id.is_some() && in_allowed_signers;
         if !ok {
             all_verified = false;
@@ -590,7 +589,10 @@ pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn W
                 .and_then(|v| v.as_str())
                 .unwrap_or("missing");
             let short_ep = if ep.len() >= 12 { &ep[..12] } else { ep };
-            let ok = rec.get("verified").and_then(|v| v.as_bool()).unwrap_or(false);
+            let ok = rec
+                .get("verified")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let badge = if ok { "✓" } else { "✗" };
             let _ = writeln!(
                 stdout,
@@ -890,8 +892,7 @@ pub fn build_signed_bond_envelope(
 }
 
 pub fn verify_bond_json(repo_root: &Path, raw_json: &str) -> Result<Value, String> {
-    let v: Value =
-        serde_json::from_str(raw_json).map_err(|e| format!("invalid bond json: {e}"))?;
+    let v: Value = serde_json::from_str(raw_json).map_err(|e| format!("invalid bond json: {e}"))?;
     let canonical =
         canonical_bond_payload(&v).ok_or_else(|| "missing required bond fields".to_string())?;
     let mut hasher = Sha256::new();
@@ -1106,15 +1107,16 @@ mod tests {
         // Populate .chinwag/allowed_signers with ALISTAIR's public key
         let pub_hex = manifest["signer_pubkey_ed25519"].as_str().unwrap();
         let endpoint_id: EndpointId = pub_hex.parse().unwrap();
-        let ssh_pub = ssh_key::PublicKey::from(
-            ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()),
-        );
+        let ssh_pub =
+            ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()));
         let openssh_line = ssh_pub.to_openssh().unwrap();
         let chinwag_dir = temp.path().join(".chinwag");
         fs::create_dir_all(&chinwag_dir).unwrap();
         fs::write(
             chinwag_dir.join("allowed_signers"),
-            format!("alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"),
+            format!(
+                "alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"
+            ),
         )
         .unwrap();
 
@@ -1179,15 +1181,16 @@ mod tests {
 
         let pub_hex = env["signer_pubkey_ed25519"].as_str().unwrap();
         let endpoint_id: EndpointId = pub_hex.parse().unwrap();
-        let ssh_pub = ssh_key::PublicKey::from(
-            ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()),
-        );
+        let ssh_pub =
+            ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()));
         let openssh_line = ssh_pub.to_openssh().unwrap();
         let chinwag_dir = temp.path().join(".chinwag");
         fs::create_dir_all(&chinwag_dir).unwrap();
         fs::write(
             chinwag_dir.join("allowed_signers"),
-            format!("alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"),
+            format!(
+                "alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"
+            ),
         )
         .unwrap();
 
@@ -1207,15 +1210,16 @@ mod tests {
 
         let pub_hex = bond["signer_pubkey_ed25519"].as_str().unwrap();
         let endpoint_id: EndpointId = pub_hex.parse().unwrap();
-        let ssh_pub = ssh_key::PublicKey::from(
-            ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()),
-        );
+        let ssh_pub =
+            ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(*endpoint_id.as_bytes()));
         let openssh_line = ssh_pub.to_openssh().unwrap();
         let chinwag_dir = temp.path().join(".chinwag");
         fs::create_dir_all(&chinwag_dir).unwrap();
         fs::write(
             chinwag_dir.join("allowed_signers"),
-            format!("alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"),
+            format!(
+                "alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"
+            ),
         )
         .unwrap();
 

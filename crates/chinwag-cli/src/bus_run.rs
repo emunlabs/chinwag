@@ -59,6 +59,7 @@ pub struct BusMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 enum BusFrame {
     Publish { message: BusMessage },
     Ping,
@@ -717,11 +718,7 @@ fn read_daemon_state(repo_root: &Path) -> Option<DaemonState> {
         .stderr(Stdio::null())
         .status()
         .ok()?;
-    if status.success() {
-        Some(state)
-    } else {
-        None
-    }
+    if status.success() { Some(state) } else { None }
 }
 
 fn write_daemon_state(repo_root: &Path, state: &DaemonState) {
@@ -744,8 +741,7 @@ pub fn discover_non_loopback_ipv4() -> Vec<String> {
     let mut iface_active = false;
     for line in text.lines() {
         if !line.starts_with('\t') && !line.starts_with(' ') && line.contains("flags=") {
-            let has_up =
-                line.contains("<UP,") || line.contains(",UP,") || line.contains(",UP>");
+            let has_up = line.contains("<UP,") || line.contains(",UP,") || line.contains(",UP>");
             let has_running = line.contains("RUNNING");
             iface_active = has_up && has_running;
         }
@@ -827,13 +823,10 @@ async fn publish_over_iroh_quic(
     lookup.set_endpoint_info(addr.clone());
 
     let client = bind_bus_endpoint(actor_secret, 0, lookup).await?;
-    let connect_res = tokio::time::timeout(
-        Duration::from_secs(3),
-        client.connect(addr, BUS_ALPN),
-    )
-    .await
-    .map_err(|_| "iroh QUIC connect timeout".to_string())?
-    .map_err(|e| format!("iroh QUIC connect error: {e}"))?;
+    let connect_res = tokio::time::timeout(Duration::from_secs(3), client.connect(addr, BUS_ALPN))
+        .await
+        .map_err(|_| "iroh QUIC connect timeout".to_string())?
+        .map_err(|e| format!("iroh QUIC connect error: {e}"))?;
 
     let (mut send, mut recv) = connect_res
         .open_bi()
@@ -849,13 +842,11 @@ async fn publish_over_iroh_quic(
         .map_err(|e| format!("write_all failed: {e}"))?;
     let _ = send.finish();
 
-    let resp_bytes = tokio::time::timeout(
-        Duration::from_secs(3),
-        recv.read_to_end(MAX_FRAME_BYTES),
-    )
-    .await
-    .map_err(|_| "read ack timeout".to_string())?
-    .map_err(|e| format!("read ack error: {e}"))?;
+    let resp_bytes =
+        tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(MAX_FRAME_BYTES))
+            .await
+            .map_err(|_| "read ack timeout".to_string())?
+            .map_err(|e| format!("read ack error: {e}"))?;
 
     client.close().await;
     serde_json::from_slice::<BusAck>(&resp_bytes).map_err(|e| format!("invalid ack json: {e}"))
@@ -896,12 +887,11 @@ fn format_bus_line(m: &BusMessage) -> String {
         .filter(|s| !s.is_empty())
         .map(|t| format!(" [{t}]"))
         .unwrap_or_default();
-    let to_badge = m
-        .to
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|t| format!(" -> @{t}"))
-        .unwrap_or_default();
+    let to_badge =
+        m.to.as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|t| format!(" -> @{t}"))
+            .unwrap_or_default();
     format!(
         "#{:03} [{}] [{}] [{} {} · iroh:{}{}]{}{}: {}",
         m.seq,
@@ -956,8 +946,7 @@ pub fn parse_active_tasks_from_markdown(repo_root: &Path) -> Vec<(String, String
                 &mut current_seat,
                 &mut current_scope,
             );
-            let is_active =
-                trimmed.contains("`[IN_PROGRESS]`") || trimmed.contains("`[READY]`");
+            let is_active = trimmed.contains("`[IN_PROGRESS]`") || trimmed.contains("`[READY]`");
             if is_active {
                 // Extract `TASK-XX` token
                 for part in trimmed.split('`') {
@@ -1055,22 +1044,20 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
     let endpoint = match bind_bus_endpoint(secret, port, lookup).await {
         Ok(ep) => ep,
         Err(e) => {
-            let _ = writeln!(stdout, "chinwag bus daemon failed to bind iroh endpoint: {e}");
+            let _ = writeln!(
+                stdout,
+                "chinwag bus daemon failed to bind iroh endpoint: {e}"
+            );
             return 1;
         }
     };
 
     let endpoint_id = endpoint.id().to_string();
     let actual_sockets = endpoint.bound_sockets();
-    let actual_port = actual_sockets
-        .first()
-        .map(|s| s.port())
-        .unwrap_or(port);
+    let actual_port = actual_sockets.first().map(|s| s.port()).unwrap_or(port);
 
-    let mut bound_sockets: Vec<String> = actual_sockets
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut bound_sockets: Vec<String> =
+        actual_sockets.into_iter().map(|s| s.to_string()).collect();
     let loopback_sock = format!("127.0.0.1:{actual_port}");
     if !bound_sockets.contains(&loopback_sock) {
         bound_sockets.push(loopback_sock);
@@ -1104,10 +1091,10 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
         started_at,
         last_heartbeat: started_at,
         total_messages: initial_count,
-        product_governor:
-            "ACTIVE (CHWG-CONTINUOUS-LOOP-01 · Dynamic TASKS.md 45s Governor)".to_string(),
-        delivery_router:
-            "ACTIVE (Ed25519+allowed_signers Verified Router on 0.0.0.0:44330)".to_string(),
+        product_governor: "ACTIVE (CHWG-CONTINUOUS-LOOP-01 · Dynamic TASKS.md 45s Governor)"
+            .to_string(),
+        delivery_router: "ACTIVE (Ed25519+allowed_signers Verified Router on 0.0.0.0:44330)"
+            .to_string(),
     }));
     if let Ok(guard) = state.lock() {
         write_daemon_state(&repo_root, &guard);
@@ -1342,18 +1329,18 @@ fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) ->
             prompt,
         ],
     ) {
-        let _ = chinwag_cli::run_agent_dispatch(
-            req,
-            &mut std::io::empty(),
-            &mut out_buf,
-            &mut err_buf,
-        );
+        let _ =
+            chinwag_cli::run_agent_dispatch(req, &mut std::io::empty(), &mut out_buf, &mut err_buf);
     }
 
     let raw_out = String::from_utf8_lossy(&out_buf).trim().to_string();
     let reply_text = serde_json::from_str::<Value>(&raw_out)
         .ok()
-        .and_then(|v| v.get("reply").and_then(|r| r.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("reply")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| {
             if !raw_out.is_empty() {
                 raw_out
@@ -1401,7 +1388,11 @@ fn run_worker_sync(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) ->
 fn spawn_seat_workstream(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) -> bool {
     let logs_dir = bus_dir(repo_root).join("workers");
     let _ = fs::create_dir_all(&logs_dir);
-    let log_file = logs_dir.join(format!("{}-{}.log", seat.to_lowercase(), task_id.to_lowercase()));
+    let log_file = logs_dir.join(format!(
+        "{}-{}.log",
+        seat.to_lowercase(),
+        task_id.to_lowercase()
+    ));
     let bin_chinwag = "/Users/brianspector/.local/bin/chinwag";
 
     if let Ok(out_file) = OpenOptions::new().create(true).append(true).open(&log_file)
@@ -1464,6 +1455,8 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     let mut task_arg: Option<String> = None;
     let mut for_arg: Option<String> = None;
     let mut seat_arg: Option<String> = None;
+    let mut summary_arg: Option<String> = None;
+    let mut wake_on_send = false;
     let mut limit_arg: usize = 30;
     let mut port_arg: u16 = DEFAULT_BUS_PORT;
     let mut follow = false;
@@ -1490,7 +1483,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 to_arg = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--task" | "--item" | "-k" if i + 1 < args.len() => {
+            "--task" | "--item" | "--ticket" | "-k" if i + 1 < args.len() => {
                 task_arg = Some(args[i + 1].clone());
                 i += 2;
             }
@@ -1498,9 +1491,17 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 for_arg = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--seat" if i + 1 < args.len() => {
+            "--seat" | "--agent" if i + 1 < args.len() => {
                 seat_arg = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--summary" | "--title" | "--subject" if i + 1 < args.len() => {
+                summary_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--wake" | "--dispatch" => {
+                wake_on_send = true;
+                i += 1;
             }
             "--limit" | "-n" if i + 1 < args.len() => {
                 limit_arg = args[i + 1].parse().unwrap_or(30);
@@ -1518,7 +1519,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 is_json = true;
                 i += 1;
             }
-            "--message" | "-m" if i + 1 < args.len() => {
+            "--message" | "--body" | "--prompt" | "-m" if i + 1 < args.len() => {
                 positionals.push(args[i + 1].clone());
                 i += 2;
             }
@@ -1537,7 +1538,12 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 .or_else(|| from_arg.clone())
                 .unwrap_or_else(|| "RUST".to_string());
             let task = task_arg.unwrap_or_else(|| "TASK-15".to_string());
-            let prompt = positionals.join(" ").trim().to_string();
+            let mut prompt = positionals.join(" ").trim().to_string();
+            if prompt.is_empty()
+                && let Some(s) = summary_arg
+            {
+                prompt = s;
+            }
             run_worker_sync(&repo_root, &seat, &task, &prompt)
         }
         "daemon" => {
@@ -1551,11 +1557,16 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             rt.block_on(run_daemon_loop(repo_root, port_arg, stdout))
         }
         "send" | "pub" | "publish" | "post" => {
-            let body = positionals.join(" ").trim().to_string();
+            let pos_body = positionals.join(" ").trim().to_string();
+            let body = match (summary_arg, pos_body.is_empty()) {
+                (Some(s), true) => s,
+                (Some(s), false) => format!("{s} — {pos_body}"),
+                (None, _) => pos_body,
+            };
             if body.is_empty() {
                 let _ = writeln!(
                     stderr,
-                    "Usage: chinwag bus send [--from <ACTOR>] [--room <#mgmt|#eng>] [--task <TASK-ID>] \"<MESSAGE>\""
+                    "Usage: chinwag bus send [--from <ACTOR>] [--room <#mgmt|#eng>] [--to <@SEAT>] [--task <TASK-ID>] [--wake] \"<MESSAGE>\""
                 );
                 return 2;
             }
@@ -1563,8 +1574,14 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 .or_else(|| std::env::var("CHINWAG_ACTOR").ok())
                 .unwrap_or_else(|| "Brian".to_string());
             let room = room_arg.unwrap_or_else(|| "#mgmt".to_string());
-            let (msg, ack) =
-                send_bus_message_sync(&repo_root, &sender, &room, to_arg, task_arg, &body);
+            let (msg, ack) = send_bus_message_sync(
+                &repo_root,
+                &sender,
+                &room,
+                to_arg.clone(),
+                task_arg.clone(),
+                &body,
+            );
             if is_json {
                 let out = json!({
                     "ok": true,
@@ -1585,6 +1602,23 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     &ack.daemon_endpoint_id[..12.min(ack.daemon_endpoint_id.len())],
                     ack.sig_verified
                 );
+            }
+            if wake_on_send && let Some(ref targets) = to_arg {
+                let task_for_wake = task_arg.unwrap_or_else(|| "CHWG-BUS-WAKE".to_string());
+                for raw_target in targets.split(',') {
+                    let clean_seat = raw_target
+                        .trim()
+                        .trim_start_matches('@')
+                        .trim_start_matches('■')
+                        .trim();
+                    if !clean_seat.is_empty()
+                        && !clean_seat.eq_ignore_ascii_case("ALL")
+                        && !clean_seat.eq_ignore_ascii_case("BRIAN")
+                        && !clean_seat.eq_ignore_ascii_case("NIC")
+                    {
+                        let _ = run_worker_sync(&repo_root, clean_seat, &task_for_wake, &body);
+                    }
+                }
             }
             0
         }
@@ -1651,10 +1685,9 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             let matching: Vec<BusMessage> = all
                 .into_iter()
                 .filter(|m| {
-                    let direct = m
-                        .to
-                        .as_ref()
-                        .is_some_and(|t| t.eq_ignore_ascii_case(&target_norm));
+                    let direct =
+                        m.to.as_ref()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(&target_norm));
                     let mentioned = m.body.to_uppercase().contains(&mention_token)
                         || m.body.to_uppercase().contains("@ALL");
                     let mgmt_for_human =
@@ -1751,16 +1784,22 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             let all = read_all_messages(&repo_root);
             let active_tasks = parse_active_tasks_from_markdown(&repo_root);
             let seats = [
-                ("RUST", "GPT-5.4 / Codex"),
-                ("ARCHITECT", "GPT-5.4 / Codex"),
-                ("FLINT", "Claude Opus 4.7"),
-                ("QA", "Claude Sonnet 4.6"),
-                ("ALISTAIR", "Claude Sonnet 4.6"),
-                ("TYPE", "Claude Sonnet 4.6"),
-                ("GEMINI-PM", "Gemini 3.1 Pro"),
-                ("PRODUCT", "45s Autonomous Governor"),
-                ("DELIVERY", "iroh Work-Stream Router"),
-                ("BRIAN", "Principal Founder"),
+                ("RUST", "Codex - GPT-6.1-SOL Ultra"),
+                ("ARCHITECT", "Codex - GPT-6.1-SOL Ultra"),
+                ("GAMEDEV", "Codex - GPT-6.1-SOL Ultra"),
+                ("WORKHORSE", "Codex - GPT-6.1-SOL Max (Node 2)"),
+                ("FLINT", "Recursive Flint MLX 262k (Node 2)"),
+                ("H", "Codex - GPT-6.1-SOL Ultra (Node 3)"),
+                ("AUSDRA", "Codex - GPT-6.1-SOL Ultra (Node 3)"),
+                ("TYPE", "Codex - GPT-6.1-SOL High"),
+                ("ALISTAIR", "Gemini 4 Argon High"),
+                ("EAGLE-EYE", "Gemini 4 Argon High"),
+                ("PATENT", "Gemini 4 Argon High"),
+                ("QA", "Gemini 4 Argon High"),
+                ("GEMINI-PM", "Gemini 4 Argon High"),
+                ("DELIVERY", "Gemini 4 Argon High"),
+                ("BRIAN", "Principal Founder & CEO"),
+                ("NIC", "Co-Founder & CCO"),
             ];
 
             let mut rows = Vec::new();
@@ -1820,8 +1859,8 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 let _ = writeln!(
                     stdout,
                     "📊 Chinwag 10-Seat Swarm Utilization Roster (INV-UTIL-01 · Central Time CDT):\n  \
-                     {:<11} {:<24} {:<12} {:<10} {:<6} {:<14} {}",
-                    "SEAT", "ENGINE", "STATE", "ASSIGNED", "MSGS", "LAST_RECEIPT", "LAST_TASK"
+                     {:<11} {:<24} {:<12} {:<10} {:<6} {:<14} LAST_TASK",
+                    "SEAT", "ENGINE", "STATE", "ASSIGNED", "MSGS", "LAST_RECEIPT"
                 );
                 for r in &rows {
                     let _ = writeln!(
@@ -1839,7 +1878,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             }
             0
         }
-        "status" | _ => {
+        _ => {
             let daemon = read_daemon_state(&repo_root);
             let all = read_all_messages(&repo_root);
             let mgmt_count = all.iter().filter(|m| m.room == "#mgmt").count();
@@ -1895,7 +1934,9 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     tasks_path.display()
                 );
             } else {
-                let fallback_ep = load_or_create_daemon_secret(&repo_root).public().to_string();
+                let fallback_ep = load_or_create_daemon_secret(&repo_root)
+                    .public()
+                    .to_string();
                 let _ = writeln!(
                     stdout,
                     "🟡 Chinwag iroh Multi-Party Bus: DAEMON STOPPED (Run `chinwag bus daemon` to bind QUIC)\n\
@@ -1947,15 +1988,17 @@ mod tests {
         assert!(!verify_detached_bus_signature(temp.path(), &mut msg));
 
         // Populate .chinwag/allowed_signers for ARCHITECT
-        let ssh_pub = ssh_key::PublicKey::from(
-            ssh_key::public::Ed25519PublicKey(*secret.public().as_bytes()),
-        );
+        let ssh_pub = ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(
+            *secret.public().as_bytes(),
+        ));
         let openssh_line = ssh_pub.to_openssh().unwrap();
         let chinwag_dir = temp.path().join(".chinwag");
         fs::create_dir_all(&chinwag_dir).unwrap();
         fs::write(
             chinwag_dir.join("allowed_signers"),
-            format!("architect-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ARCHITECT\n"),
+            format!(
+                "architect-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ARCHITECT\n"
+            ),
         )
         .unwrap();
 
@@ -1965,13 +2008,19 @@ mod tests {
         // Tamper with task_id -> 7-field signature must fail closed
         let mut tampered_task = msg.clone();
         tampered_task.task_id = Some("TASK-99".to_string());
-        assert!(!verify_detached_bus_signature(temp.path(), &mut tampered_task));
+        assert!(!verify_detached_bus_signature(
+            temp.path(),
+            &mut tampered_task
+        ));
 
         // Colon-shifting between task_id and body -> length-prefixed payload must fail closed
         let mut colon_shift = msg.clone();
         colon_shift.task_id = Some("TASK-15:Verified".to_string());
         colon_shift.body = " detached Ed25519 signature + allowed_signers".to_string();
-        assert!(!verify_detached_bus_signature(temp.path(), &mut colon_shift));
+        assert!(!verify_detached_bus_signature(
+            temp.path(),
+            &mut colon_shift
+        ));
 
         // Tamper with body -> verification must fail closed
         msg.body.push_str(" tampered");

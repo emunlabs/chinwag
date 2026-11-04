@@ -43,6 +43,14 @@ fn wiki_agents_dir() -> PathBuf {
     PathBuf::from(user_home()).join("WORKSPACE/paperclip-wiki/wiki/agents")
 }
 
+fn docuswiki_agents_dir() -> PathBuf {
+    PathBuf::from(user_home()).join("WORKSPACE/docuswiki/wiki/agents")
+}
+
+fn fleet_skills_agents_dir() -> PathBuf {
+    PathBuf::from(user_home()).join("fleet-skills/agents")
+}
+
 fn pilot_company_agents_dir() -> PathBuf {
     PathBuf::from(user_home())
         .join(".paperclip-pilot/control/instances/pilot/companies/055c2eb5-1b6e-4255-9c29-5a562c0be9e9/agents")
@@ -170,19 +178,64 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
     let mut parts = Vec::new();
     if agent_upper == "GEMINI-PM" {
         parts.push(
-            "You are ■ GEMINI-PM (Antigravity Product Owner & Chief Orchestrator for Chinwag & Rogue Machine), talking directly with Brian Spector on Mission Control (:5487).\nKeep your answers concise, sharp, and grounded in live repo & database state. You coordinate all agent engines across Mac Studio and MacBook Pro: Claude Code, OpenAI Codex/ChatGPT, Grok CLI, Recursive Flint (Local MLX 262k on MacBook Pro), and Grok Bot Department Relays.".to_owned(),
+            "You are ■ GEMINI-PM (Antigravity Product Owner & Chief Orchestrator for Chinwag & Emun Labs on Gemini 4 Argon High), talking directly with Brian Spector on Mission Control (:5487).\nKeep your answers concise, sharp, and grounded in live repo & database state. You coordinate the 3-Node Multi-Host Fleet across Node 1 Mac Studio (127.0.0.1), Node 2 Brian's MacBook Pro (100.108.108.25: ■ WORKHORSE on GPT-6.1-SOL Max & ■ FLINT on Recursive Flint MLX 262k), and Node 3 Nicola's MacBook Pro (100.89.25.127: ■ H, ■ AUSDRA, ⚡ H-SWARM).".to_owned(),
         );
     } else if agent_upper == "FLINT" {
         parts.push(
-            "You are ■ FLINT (Flint from Recursive · flint-int4 MLX · 262k context running on MacBook Pro 100.108.108.25:11500), Local Adversarial Code Auditor & Rust/CRDT Verifier for Chinwag at Emun Labs.\nRespond with surgical Rust/CRDT/concurrency rigor.".to_owned(),
+            "You are ■ FLINT (Flint from Recursive · flint-int4 MLX · 262k context running on Node 2 MacBook Pro 100.108.108.25:11500), Local Adversarial Code Auditor & Rust/CRDT Verifier for Chinwag at Emun Labs.\nRespond with surgical Rust/CRDT/concurrency rigor.".to_owned(),
+        );
+    } else if agent_upper == "WORKHORSE" {
+        parts.push(
+            "You are ■ WORKHORSE (Codex - GPT-6.1-SOL Max running on Node 2 Brian's MacBook Pro 100.108.108.25), Principal Engineering Workhorse, PRD Reviewer & Ephemeral Dev/QA Pool Coordinator at Emun Labs.\nRespond with concrete systems rigor, exact file/schema/state-machine boundaries, and zero fluff.".to_owned(),
+        );
+    } else if agent_upper == "H" {
+        parts.push(
+            "You are ■ H (Codex - GPT-6.1-SOL Ultra on Node 3 Nicola's MacBook Pro 100.89.25.127 · nicolas-macbook-pro), Lead Creative & Technical Agent for Nicola Spector (Co-Founder & Chief Creative Officer) leading laglords.tv, chinwag.tv, and Captionizm™.".to_owned(),
+        );
+    } else if agent_upper == "AUSDRA" {
+        parts.push(
+            "You are ■ AUSDRA (Codex - GPT-6.1-SOL Ultra on Node 3 Nicola's MacBook Pro 100.89.25.127), Business, Legal & Governance Advisor to Nicola Spector.".to_owned(),
         );
     } else {
         parts.push(format!(
-            "You are {agent_upper}, a core specialist agent at Emun Labs / Rogue Machine working directly with Brian and Nic.\nRespond directly, helpfully, and in your authentic specialist persona."
+            "You are ■ {agent_upper}, a core specialist agent at Emun Labs working directly with Brian and Nicola Spector.\nRespond directly, helpfully, and in your authentic specialist persona."
         ));
     }
 
-    let wiki_dir = wiki_agents_dir().join(&agent_lower);
+    let fleet_dir = fleet_skills_agents_dir().join(agent_upper);
+    for fname in [
+        "SOUL.md",
+        "AGENT.md",
+        "AGENTS.md",
+        "TOOL.md",
+        "TOOLS.md",
+        "SKILLS.md",
+        "MEMORY.md",
+    ] {
+        let fpath = fleet_dir.join(fname);
+        if let Ok(content) = fs::read_to_string(&fpath) {
+            parts.push(format!(
+                "\n--- {fname} (fleet-skills/{agent_upper}) ---\n{}",
+                truncate_utf8(&content, 3500)
+            ));
+        }
+    }
+    if agent_upper == "TYPE" {
+        let design_path = fleet_dir.join("DESIGN.md");
+        if let Ok(content) = fs::read_to_string(&design_path) {
+            parts.push(format!(
+                "\n--- DESIGN.md (TYPE Only · INV-DESIGN-TYPE-ONLY-01) ---\n{}",
+                truncate_utf8(&content, 3500)
+            ));
+        }
+    }
+
+    let docus_dir = docuswiki_agents_dir().join(&agent_lower);
+    let wiki_dir = if docus_dir.exists() {
+        docus_dir
+    } else {
+        wiki_agents_dir().join(&agent_lower)
+    };
     for fname in [
         "SOUL.md",
         "AGENT.md",
@@ -195,7 +248,7 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
         if let Ok(content) = fs::read_to_string(&fpath) {
             parts.push(format!(
                 "\n--- {fname} (Wiki) ---\n{}",
-                truncate_utf8(&content, 4000)
+                truncate_utf8(&content, 3000)
             ));
         }
     }
@@ -207,7 +260,7 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
             if let Ok(content) = fs::read_to_string(&fpath) {
                 parts.push(format!(
                     "\n--- {fname} (Instructions) ---\n{}",
-                    truncate_utf8(&content, 3000)
+                    truncate_utf8(&content, 2500)
                 ));
             }
         }
@@ -347,17 +400,49 @@ fn dispatch_to_engine(
         .to_ascii_lowercase();
 
     let is_flint = agent_upper == "FLINT" || engine_hint.contains("flint");
-    let is_gemini = agent_upper == "GEMINI-PM"
-        || engine_hint == "gemini-cli"
-        || engine_hint == "gemini"
-        || engine_hint.contains("gemini-cli");
+    let is_deepseek = agent_upper.starts_with("DEV-")
+        || agent_upper.starts_with("EPHEMERAL-DEV-")
+        || agent_upper.starts_with("QA-")
+        || agent_upper.starts_with("EPHEMERAL-QA-")
+        || matches!(
+            agent_upper,
+            "SKILL"
+                | "MANNY"
+                | "SUMMARIZER"
+                | "RECORD"
+                | "SUPPORT"
+                | "EPHEMERAL-ANALYST"
+                | "EPHEMERAL-SDR"
+                | "EPHEMERAL-SUPPORT"
+        )
+        || engine_hint.contains("deepseek");
+    let is_workhorse = agent_upper == "WORKHORSE" || engine_hint.contains("workhorse");
+    let is_codex = matches!(
+        agent_upper,
+        "ARCHITECT"
+            | "RUST"
+            | "GAMEDEV"
+            | "WORKHORSE"
+            | "H"
+            | "AUSDRA"
+            | "H-SWARM"
+            | "TYPE"
+            | "INDEX"
+            | "DECLARATION"
+            | "CLOUDFLARE"
+    ) || engine_hint.contains("codex")
+        || engine_hint.contains("gpt-6.1-sol");
+    let is_grok = matches!(agent_upper, "GROWTH" | "SALES") || engine_hint.contains("grok");
 
-    // 1. Recursive Flint (Local MLX 262k on MacBook Pro 100.108.108.25:11500)
+    // Pass full prompt context up to 48,000 bytes (never truncate at 3,200 bytes)
+    let rich_prompt = truncate_utf8(full_prompt, 48_000);
+
+    // 1. Recursive Flint (Local MLX 262k on Node 2 MacBook Pro 100.108.108.25:11500)
     let flint_bin = Path::new(&local_bin).join("flint-agent");
     if is_flint
         && flint_bin.exists()
         && let Ok(out) = Command::new(&flint_bin)
-            .args(["run", full_prompt, "--cwd", &repo_dir.to_string_lossy()])
+            .args(["run", &rich_prompt, "--cwd", &repo_dir.to_string_lossy()])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .envs(signing_env.iter().cloned())
@@ -369,11 +454,12 @@ fn dispatch_to_engine(
         }
     }
 
-    // 2. Official Gemini CLI Engine for GEMINI-PM
-    if is_gemini
-        && Path::new("/opt/homebrew/bin/gemini").exists()
-        && let Ok(out) = Command::new("/opt/homebrew/bin/node")
-            .args(["/opt/homebrew/bin/gemini", "-p", full_prompt, "--yolo"])
+    // 2. DeepSeek 4.1 on Cloudflare Workers AI (@cf/deepseek-ai/deepseek-v4.1-flash-1017)
+    let deepseek_bin = Path::new(&local_bin).join("deepseek-agent");
+    if is_deepseek
+        && deepseek_bin.exists()
+        && let Ok(out) = Command::new(&deepseek_bin)
+            .args(["run", &rich_prompt, "--cwd", &repo_dir.to_string_lossy()])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .envs(signing_env.iter().cloned())
@@ -381,36 +467,86 @@ fn dispatch_to_engine(
     {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         if out.status.success() && !text.is_empty() {
-            return (text, "gemini-cli");
+            return (text, "deepseek-workers-ai");
         }
     }
 
-    // 3. OpenAI Codex / ChatGPT Engine for ARCHITECT, RUST, DEV-1
-    let codex_bin = Path::new(&local_bin).join("codex");
-    if (matches!(agent_upper, "ARCHITECT" | "RUST" | "DEV-1") || engine_hint.contains("codex"))
-        && codex_bin.exists()
-        && let Ok(out) = Command::new(&codex_bin)
-            .args(["exec", "--skip-git-repo-check", full_prompt])
+    // 3. Node 2 MacBook Pro (100.108.108.25) Remote Dispatch for ■ WORKHORSE (Codex - GPT-6.1-SOL Max)
+    if is_workhorse
+        && let Ok(mut child) = Command::new("/usr/bin/ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "brianspector@100.108.108.25",
+                "PATH=/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin /Users/brianspector/.local/bin/codex exec --skip-git-repo-check --ephemeral -m gpt-6.1-sol -c 'model_reasoning_effort=\"max\"' -c 'service_tier=\"priority\"' -",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    {
+        if let Some(mut stdin_pipe) = child.stdin.take() {
+            let _ = stdin_pipe.write_all(rich_prompt.as_bytes());
+        }
+        if let Ok(out) = child.wait_with_output() {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if out.status.success() && !text.is_empty() {
+                return (text, "codex-gpt-6.1-sol-max-node2");
+            }
+        }
+    }
+
+    // 4. OpenAI Codex (GPT-6.1-SOL Ultra / Max / High) Engine
+    let local_codex = Path::new(&local_bin).join("codex");
+    let codex_bin: PathBuf = if local_codex.exists() {
+        local_codex
+    } else {
+        PathBuf::from("/opt/homebrew/bin/codex")
+    };
+    if is_codex && codex_bin.exists() {
+        let effort = if is_workhorse {
+            "model_reasoning_effort=\"max\""
+        } else if matches!(
+            agent_upper,
+            "ARCHITECT" | "RUST" | "GAMEDEV" | "H" | "AUSDRA"
+        ) {
+            "model_reasoning_effort=\"ultra\""
+        } else {
+            "model_reasoning_effort=\"high\""
+        };
+        if let Ok(out) = Command::new(&codex_bin)
+            .args([
+                "exec",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                effort,
+                "-c",
+                "service_tier=\"priority\"",
+                &rich_prompt,
+            ])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .envs(signing_env.iter().cloned())
             .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if out.status.success() && !text.is_empty() {
-            return (text, "codex-chatgpt");
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if out.status.success() && !text.is_empty() {
+                return (text, "codex-gpt-6.1-sol");
+            }
         }
     }
 
-    // 4. Grok CLI Engine for DELIVERY, SPARK, GROWTH, HOUSEKEEPING, INFRA BOT (GROK)
+    // 5. Grok 4.7 High CLI Engine (Strictly #s-and-m Outbound Execution: GROWTH, SALES)
     let grok_bin = Path::new(&local_bin).join("grok");
-    if (matches!(
-        agent_upper,
-        "DELIVERY" | "SPARK" | "GROWTH" | "HOUSEKEEPING" | "INFRA BOT (GROK)"
-    ) || engine_hint.contains("grok"))
+    if is_grok
         && grok_bin.exists()
         && let Ok(out) = Command::new(&grok_bin)
-            .args(["agent", "--always-approve", full_prompt])
+            .args(["agent", "--always-approve", &rich_prompt])
             .current_dir(&default_cwd)
             .env("PATH", &path_env)
             .envs(signing_env.iter().cloned())
@@ -418,37 +554,47 @@ fn dispatch_to_engine(
     {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         if out.status.success() && !text.is_empty() {
-            return (text, "grok-cli");
+            return (text, "grok-4.7-high");
         }
     }
 
-    // 5. Claude Code Engine (Primary for MO, TYPE, VENTURE, EAGLE-EYE, DECLARATION, ALISTAIR, SCRIBE & Fallback)
-    let local_claude = Path::new(&local_bin).join("claude");
-    let claude_bin: PathBuf = if local_claude.exists() {
-        local_claude
-    } else {
-        PathBuf::from("/opt/homebrew/bin/claude")
-    };
-    if let Ok(out) = Command::new(&claude_bin)
-        .args(["--print", "--dangerously-skip-permissions", full_prompt])
-        .current_dir(&default_cwd)
-        .env("PATH", &path_env)
-        .envs(signing_env.iter().cloned())
-        .output()
+    // 6. Official Gemini 4 Argon High CLI Engine (Primary for GEMINI-PM, DELIVERY, QA, INFRAJR, HOUSEKEEPING, SPARK, PATENT, EAGLE-EYE, ALISTAIR, MO, VENTURE, SCRIBE, FREQUENCY, MOTION, DEX, DOCS, SOCIAL & Fleet Default — Zero Anthropic Seats)
+    if Path::new("/opt/homebrew/bin/gemini").exists()
+        && let Ok(out) = Command::new("/opt/homebrew/bin/node")
+            .args(["/opt/homebrew/bin/gemini", "-p", &rich_prompt, "--yolo"])
+            .current_dir(&default_cwd)
+            .env("PATH", &path_env)
+            .envs(signing_env.iter().cloned())
+            .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if out.status.success() && !text.is_empty() {
+            return (text, "gemini-4-argon-high");
+        }
+    }
+
+    // 7. Secondary Fallback to Codex GPT-6.1-SOL if Gemini CLI is unavailable
+    if codex_bin.exists()
+        && let Ok(out) = Command::new(&codex_bin)
+            .args([
+                "exec",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                &rich_prompt,
+            ])
+            .current_dir(&default_cwd)
+            .env("PATH", &path_env)
+            .envs(signing_env.iter().cloned())
+            .output()
     {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         if !text.is_empty() {
-            return (text, "claude-code");
+            return (text, "codex-gpt-6.1-sol");
         }
-        let err_text = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-        return (
-            format!(
-                "[{agent_upper} note]: Engine exited with {:?}. {}",
-                out.status.code(),
-                truncate_utf8(&err_text, 400)
-            ),
-            "claude-code",
-        );
     }
 
     (
@@ -499,6 +645,7 @@ fn persist_to_crdb_once(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Re
         outbound_body,
         now_ms,
     } = *exchange;
+    crate::memory_run::clear_stale_crdb_operation_artifacts(repo_root);
     let owner = WriteOwner::acquire_existing_private_fixture(repo_root)
         .map_err(|e| format!("acquire_write_owner: {}", e.reason))?;
     let session =

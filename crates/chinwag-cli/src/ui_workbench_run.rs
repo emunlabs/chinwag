@@ -6,9 +6,9 @@
 //!
 //! Serves the 12-View `workbench-v5` UI + `Captionizm™` (`07-workbench-captionizm-game.html`)
 //! + `chinwag.tv` (`12-chinwag-tv-broadcast-arena.html`) on `http://127.0.0.1:44331` with a
-//! real-time bridge (`live-bus-bridge.js`) backed by the live `0.0.0.0:44330` `iroh` QUIC bus,
-//! `TASKS.md`, `.chinwag/allowed_signers`, `A.509` souls, `CHWG-PAT-05` `Triple-B` bonds, and
-//! `Rogue Machine Media LLC (d/b/a Lag Lords)` (`INV-BRAND-FIREWALL-01`) plugin/card envelopes.
+//!   real-time bridge (`live-bus-bridge.js`) backed by the live `0.0.0.0:44330` `iroh` QUIC bus,
+//!   `TASKS.md`, `.chinwag/allowed_signers`, `A.509` souls, `CHWG-PAT-05` `Triple-B` bonds, and
+//!   `Rogue Machine Media LLC (d/b/a Lag Lords)` (`INV-BRAND-FIREWALL-01`) plugin/card envelopes.
 
 use crate::{bus_run, feature_cli_run};
 use serde::{Deserialize, Serialize};
@@ -77,7 +77,8 @@ fn resolve_workbench_dir(repo_root: &Path) -> PathBuf {
             return p;
         }
     }
-    let backup_v5 = PathBuf::from("/Users/brianspector/WORKSPACE/backups/type-style-20261028/workbench-v5");
+    let backup_v5 =
+        PathBuf::from("/Users/brianspector/WORKSPACE/backups/type-style-20261028/workbench-v5");
     if backup_v5.is_dir() {
         return backup_v5;
     }
@@ -455,7 +456,12 @@ pub fn handle_workbench_http_connection(
                 "brand_firewall_invariant": "INV-BRAND-FIREWALL-01"
             }))
             .unwrap_or_default();
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("GET", "/api/bus/status") => {
             let args = vec![
@@ -465,7 +471,12 @@ pub fn handle_workbench_http_connection(
                 repo_str,
             ];
             let payload = run_cli_to_json_bytes(|out, err| bus_run::run_bus_cli(&args, out, err));
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("GET", "/api/bus/messages") => {
             let limit = parse_query_param(query, "limit").unwrap_or_else(|| "40".to_string());
@@ -482,7 +493,12 @@ pub fn handle_workbench_http_connection(
                 args.push(room);
             }
             let payload = run_cli_to_json_bytes(|out, err| bus_run::run_bus_cli(&args, out, err));
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("POST", "/api/bus/send") => {
             // CSRF & Origin/Intent/Sender Guard (`FLINT #213 F1`)
@@ -603,7 +619,11 @@ pub fn handle_workbench_http_connection(
             }
             let (msg, ack) =
                 bus_run::send_bus_message_sync(repo_root, sender, room, to, task_id, msg_body);
-            if parsed.get("wake").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if parsed
+                .get("wake")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 let repo_clone = repo_root.to_path_buf();
                 std::thread::spawn(move || {
                     let wake_args = vec![
@@ -622,7 +642,12 @@ pub fn handle_workbench_http_connection(
                 "ack": ack
             }))
             .unwrap_or_default();
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &resp);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &resp,
+            );
         }
         ("GET", "/api/bus/roster") => {
             let args = vec![
@@ -632,36 +657,66 @@ pub fn handle_workbench_http_connection(
                 repo_str,
             ];
             let payload = run_cli_to_json_bytes(|out, err| bus_run::run_bus_cli(&args, out, err));
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("GET", "/api/tasks") => {
             let payload =
                 serde_json::to_vec_pretty(&parse_all_tasks_json(repo_root)).unwrap_or_default();
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("GET", "/api/a509") => {
             let args = vec!["verify".to_string(), "--json".to_string()];
             let payload =
                 run_cli_to_json_bytes(|out, err| feature_cli_run::run_a509_cli(&args, out, err));
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("GET", "/api/bonds") => {
             let args = vec!["status".to_string(), "--json".to_string()];
             let payload =
                 run_cli_to_json_bytes(|out, err| feature_cli_run::run_bond_cli(&args, out, err));
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("GET", "/api/plugins") => {
             let args = vec!["verify".to_string(), "--json".to_string()];
             let payload =
                 run_cli_to_json_bytes(|out, err| feature_cli_run::run_plugin_cli(&args, out, err));
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("GET", "/api/cwcards") => {
             let args = vec!["verify".to_string(), "--json".to_string()];
             let payload =
                 run_cli_to_json_bytes(|out, err| feature_cli_run::run_cwcard_cli(&args, out, err));
-            write_http_response(&mut stream, "200 OK", "application/json; charset=utf-8", &payload);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+            );
         }
         ("GET", "/live-bus-bridge.js") => {
             write_http_response(
@@ -767,11 +822,7 @@ pub fn handle_workbench_http_connection(
     }
 }
 
-pub fn run_ui_workbench_cli(
-    args: &[String],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> u8 {
+pub fn run_ui_workbench_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("serve");
     let is_json = args.iter().any(|a| a == "--json");
 
@@ -883,14 +934,12 @@ pub fn run_ui_workbench_cli(
         state.pid
     );
 
-    for incoming in listener.incoming() {
-        if let Ok(stream) = incoming {
-            let repo_c = repo_root.clone();
-            let wb_c = workbench_dir.clone();
-            std::thread::spawn(move || {
-                handle_workbench_http_connection(stream, &repo_c, &wb_c);
-            });
-        }
+    for stream in listener.incoming().flatten() {
+        let repo_c = repo_root.clone();
+        let wb_c = workbench_dir.clone();
+        std::thread::spawn(move || {
+            handle_workbench_http_connection(stream, &repo_c, &wb_c);
+        });
     }
     0
 }
@@ -911,10 +960,8 @@ mod tests {
         let repo_c = repo_root.clone();
         let wb_c = wb_dir.clone();
         std::thread::spawn(move || {
-            for incoming in listener.incoming().take(5) {
-                if let Ok(s) = incoming {
-                    handle_workbench_http_connection(s, &repo_c, &wb_c);
-                }
+            for s in listener.incoming().take(5).flatten() {
+                handle_workbench_http_connection(s, &repo_c, &wb_c);
             }
         });
 
@@ -964,7 +1011,7 @@ mod tests {
         assert!(r4.contains("403 Forbidden"), "{r4}");
 
         // 5. CSRF & Seat Spoofing Guard (`FLINT #213 F1`): reject POST /api/bus/send as ALISTAIR
-        let body = br#"{"sender":"ALISTAIR","room":"#mgmt","body":"spoof"}"#;
+        let body = br##"{"sender":"ALISTAIR","room":"#mgmt","body":"spoof"}"##;
         let req5 = format!(
             "POST /api/bus/send HTTP/1.1\r\n\
              Host: 127.0.0.1\r\n\
