@@ -142,8 +142,9 @@ fn agent_uuid(agent_upper: &str) -> Option<&'static str> {
 fn grokbot_dept(agent_upper: &str) -> &'static str {
     match agent_upper {
         "ALISTAIR" | "HOUSEKEEPING" | "INFRA BOT (GROK)" | "INFRAJR" | "QA" | "FLINT" | "DOCS"
-        | "MGMT-INFRA" | "INFRA" => "infra",
-        "ARCHITECT" | "RUST" | "INDEX" | "DEV-1" | "DEV-2" | "DEV-3" | "ENG" | "MGMT-ENG" => "eng",
+        | "MGMT-INFRA" | "INFRA" | "EPHEMERAL-QA" => "infra",
+        "ARCHITECT" | "RUST" | "INDEX" | "DEV-1" | "DEV-2" | "DEV-3" | "ENG" | "MGMT-ENG"
+        | "EPHEMERAL-DEV" => "eng",
         "VENTURE" | "MO" | "EAGLE-EYE" | "BIZFIN" | "INVESTIGATIONS" | "RECORD" | "DEX"
         | "MGMT-BIZFIN" => "bizfin",
         "DECLARATION" | "GROWTH" | "SOCIAL" | "S-AND-M" | "SALES" | "MGMT-S-AND-M" => "s-and-m",
@@ -371,6 +372,14 @@ fn strip_flint_banner(raw: &str) -> String {
     raw.trim().to_owned()
 }
 
+fn codex_effort_arg(agent_upper: &str) -> &'static str {
+    match agent_upper {
+        "WORKHORSE" => "model_reasoning_effort=\"max\"",
+        "ARCHITECT" | "RUST" | "GAMEDEV" | "H" | "AUSDRA" => "model_reasoning_effort=\"ultra\"",
+        _ => "model_reasoning_effort=\"high\"",
+    }
+}
+
 fn dispatch_to_engine(
     agent_upper: &str,
     full_prompt: &str,
@@ -381,6 +390,18 @@ fn dispatch_to_engine(
         && !mock.trim().is_empty()
     {
         return (mock, "mock-engine");
+    }
+
+    // 0. Ephemeral seats DEV-1..5 and QA-1..5 (plus legacy EPHEMERAL-DEV /
+    //    EPHEMERAL-QA) use Cloudflare Workers AI DeepSeek v4.1 Flash once the
+    //    credential file exists. Plain QA is NOT routed here. Off-switch:
+    //    EPHEMERAL_DEEPSEEK_DISABLE=1. The kill switch, 10-slot concurrency cap
+    //    and spend ledger live in deepseek_pool. Once active there is no
+    //    fallback to another engine.
+    if let Some(pool) = crate::deepseek_pool::pool_for_agent(agent_upper)
+        && crate::deepseek_pool::enabled()
+    {
+        return crate::deepseek_pool::run(pool, agent_upper, full_prompt);
     }
 
     let home = user_home();
@@ -506,16 +527,7 @@ fn dispatch_to_engine(
         PathBuf::from("/opt/homebrew/bin/codex")
     };
     if is_codex && codex_bin.exists() {
-        let effort = if is_workhorse {
-            "model_reasoning_effort=\"max\""
-        } else if matches!(
-            agent_upper,
-            "ARCHITECT" | "RUST" | "GAMEDEV" | "H" | "AUSDRA"
-        ) {
-            "model_reasoning_effort=\"ultra\""
-        } else {
-            "model_reasoning_effort=\"high\""
-        };
+        let effort = codex_effort_arg(agent_upper);
         if let Ok(out) = Command::new(&codex_bin)
             .args([
                 "exec",
@@ -869,4 +881,23 @@ pub fn run_agent_dispatch(
         return 1;
     }
     0
+}
+
+#[cfg(test)]
+mod codex_effort_tests {
+    use super::codex_effort_arg;
+
+    #[test]
+    fn ultra_max_and_high_tiers_match_3node_roster() {
+        for seat in ["ARCHITECT", "RUST", "GAMEDEV", "H", "AUSDRA"] {
+            assert_eq!(codex_effort_arg(seat), "model_reasoning_effort=\"ultra\"");
+        }
+        assert_eq!(
+            codex_effort_arg("WORKHORSE"),
+            "model_reasoning_effort=\"max\""
+        );
+        for seat in ["TYPE", "INDEX", "DECLARATION", "CLOUDFLARE"] {
+            assert_eq!(codex_effort_arg(seat), "model_reasoning_effort=\"high\"");
+        }
+    }
 }
