@@ -884,7 +884,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.write("tasks.md", b"private");
         let path = fixture.root.path.join("tasks.md");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
         let result = fixture.resolve("tasks.md");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(result, Err(SourcePathHoldReason::HeldSourceInaccessible));

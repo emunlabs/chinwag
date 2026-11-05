@@ -7,6 +7,8 @@ pub mod agent_instance;
 #[cfg(target_os = "macos")]
 pub mod task_dependency;
 #[cfg(target_os = "macos")]
+pub mod task_legacy;
+#[cfg(target_os = "macos")]
 pub mod task_normalization;
 #[cfg(target_os = "macos")]
 pub mod task_ref;
@@ -14,6 +16,8 @@ pub mod task_ref;
 pub mod task_source;
 #[cfg(target_os = "macos")]
 pub mod task_source_path;
+#[cfg(target_os = "macos")]
+pub mod task_wire;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invocation {
