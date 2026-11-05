@@ -18,6 +18,8 @@ pub const MAX_SOURCE_FILE_BYTES: u64 = 1_048_576;
 pub const MAX_ID_UTF8_BYTES: usize = 256;
 pub const MAX_CANONICAL_PATH_BYTES: usize = 4096;
 pub const MAX_REV_COUNTER: u64 = i64::MAX as u64;
+pub const SUPPORTED_NORMALIZATION_VERSION: u32 = 1;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// A visible refusal to enroll or admit a new effect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +28,7 @@ pub enum HeldReason {
     InvalidIdentifier,
     InvalidSourceId,
     InvalidRevision,
+    UnsupportedVersion,
     InvalidSourceLimit,
     PolicyBindingMismatch,
     ContradictoryOrMissingControls,
@@ -52,18 +55,17 @@ fn identifier(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-/// Validate the spelling of an existing enrolled ID, without minting authority.
-/// Dotted names and conventional host aliases are excluded in this profile;
-/// lexical validation cannot distinguish every single-label hostname from an ID.
+/// Validate an opaque bounded workspace ID: 1..=256 UTF-8 bytes, no whitespace
+/// or control characters, no filesystem path separators `/` or `\`, no leading
+/// `~`, and neither `.` nor `..`. Workspace enrollment authority is enforced by
+/// `record.workspace_id == policy.workspace_id`, not by lexical validation.
 pub fn validate_workspace_id(value: &str) -> Result<(), HeldReason> {
     if !identifier(value)
-        || value.contains(['/', '\\', '.', ':', '@', '?', '#'])
         || value.chars().any(char::is_whitespace)
-        || !value.chars().any(char::is_alphanumeric)
-        || matches!(
-            value.to_ascii_lowercase().as_str(),
-            "localhost" | "localhostlocaldomain"
-        )
+        || value == "."
+        || value == ".."
+        || value.starts_with('~')
+        || value.contains(['/', '\\'])
     {
         return Err(HeldReason::InvalidWorkspaceId);
     }
@@ -273,6 +275,7 @@ pub struct TaskSourceRecord {
     pub task_source_id: String,
     pub display_name: String,
     pub canonical_relative_path: String,
+    /// Checked nonnegative signed-64-bit revision, independent of root generation.
     pub source_generation: u64,
     pub normalization_version: u32,
     pub schema_version: u32,
@@ -286,6 +289,11 @@ pub struct TaskSourceRecord {
 impl TaskSourceRecord {
     pub fn validate(&self, policy: &WorkspaceTaskPolicy) -> Result<(), HeldReason> {
         policy.validate()?;
+        if self.normalization_version != SUPPORTED_NORMALIZATION_VERSION
+            || self.schema_version != SUPPORTED_SCHEMA_VERSION
+        {
+            return Err(HeldReason::UnsupportedVersion);
+        }
         validate_workspace_id(&self.workspace_id)?;
         validate_task_source_id(&self.task_source_id)?;
         if !identifier(&self.repo_id)
@@ -295,10 +303,7 @@ impl TaskSourceRecord {
         {
             return Err(HeldReason::InvalidIdentifier);
         }
-        if self.source_generation == 0
-            || self.source_generation > MAX_REV_COUNTER
-            || self.writer_epoch > MAX_REV_COUNTER
-        {
+        if self.source_generation > MAX_REV_COUNTER || self.writer_epoch > MAX_REV_COUNTER {
             return Err(HeldReason::InvalidRevision);
         }
         if self.workspace_id != policy.workspace_id
@@ -943,18 +948,24 @@ mod tests {
     }
 
     #[test]
-    fn p0_source_workspace_id_rejects_path_url_and_db_filename() {
+    fn p0_source_workspace_id_is_opaque_bounded_and_not_a_path() {
         for invalid in [
             "",
+            ".",
+            "..",
+            "~workspace",
+            "~/ws",
+            "a/b",
+            "a\\b",
             "/workspace",
             "C:\\workspace",
             "https://host/repo",
-            "host.example",
-            "...",
-            "state.crdb",
-            "state.db",
-            "localhost",
+            "ws with space",
+            " ws",
+            "ws\n",
             "ws\nforged",
+            "ws\0",
+            "ws\u{a0}id",
         ] {
             assert_eq!(
                 validate_workspace_id(invalid),
@@ -962,10 +973,125 @@ mod tests {
                 "{invalid:?}"
             );
         }
-        assert!(validate_workspace_id("workspace-enrolled-01").is_ok());
-        assert!(validate_workspace_id(&"a".repeat(MAX_ID_UTF8_BYTES)).is_ok());
-        assert!(validate_workspace_id(&"a".repeat(MAX_ID_UTF8_BYTES + 1)).is_err());
-        assert!(validate_workspace_id(&"é".repeat(129)).is_err());
+        for valid in [
+            "workspace-enrolled-01",
+            "workspace.v1",
+            "workspace.local",
+            "urn:workspace",
+            "urn:workspace:fixture",
+            "host.example",
+            "...",
+            "state.crdb",
+            "state.db",
+            "localhost",
+            "localhostlocaldomain",
+            "@?#",
+        ] {
+            assert_eq!(validate_workspace_id(valid), Ok(()), "{valid:?}");
+        }
+        assert_eq!(
+            validate_workspace_id(&"a".repeat(MAX_ID_UTF8_BYTES)),
+            Ok(())
+        );
+        assert_eq!(validate_workspace_id(&"é".repeat(128)), Ok(()));
+        for invalid in ["a".repeat(MAX_ID_UTF8_BYTES + 1), "é".repeat(129)] {
+            assert_eq!(
+                validate_workspace_id(&invalid),
+                Err(HeldReason::InvalidWorkspaceId)
+            );
+        }
+    }
+
+    #[test]
+    fn p0_source_opaque_workspace_id_requires_exact_policy_binding() {
+        for workspace_id in ["workspace.v1", "urn:workspace:fixture"] {
+            let mut record = source(1, "TASKS.md");
+            record.workspace_id = workspace_id.into();
+            assert_eq!(
+                record.validate(&policy()),
+                Err(HeldReason::PolicyBindingMismatch)
+            );
+            let mut enrolled_policy = policy();
+            enrolled_policy.workspace_id = workspace_id.into();
+            assert_eq!(record.validate(&enrolled_policy), Ok(()));
+        }
+    }
+
+    #[test]
+    fn p0_source_unsupported_versions_rejected_by_record_and_enrollment() {
+        let directory = TempDir::new().expect("temporary root");
+        let mut registry = registry(&directory);
+        for unsupported in [0, 2, u32::MAX] {
+            for normalization in [true, false] {
+                let mut record = source(1, "TASKS.md");
+                if normalization {
+                    record.normalization_version = unsupported;
+                } else {
+                    record.schema_version = unsupported;
+                }
+                assert_eq!(
+                    record.validate(&policy()),
+                    Err(HeldReason::UnsupportedVersion)
+                );
+                assert_eq!(
+                    registry.enroll(record),
+                    Err(HeldReason::UnsupportedVersion)
+                );
+                assert_eq!(registry.sources().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn p0_source_unsupported_versions_rejected_by_all_admission_gates() {
+        let directory = TempDir::new().expect("temporary root");
+        fs::write(directory.path().join("TASKS.md"), b"source").expect("source");
+        let mut registry = registry(&directory);
+        let mut record = source(1, "TASKS.md");
+        record.controls.deployment_authorized = true;
+        record.controls.automatic_dispatch = true;
+        let id = record.task_source_id.clone();
+        registry.enroll(record).expect("supported versions enroll");
+        assert_eq!(registry.check_dispatch_admission(&id, "implement"), Ok(()));
+        assert_eq!(registry.check_deployment_admission(&id, "deploy"), Ok(()));
+        assert_eq!(
+            registry.check_automatic_dispatch_admission(&id, "implement"),
+            Ok(())
+        );
+        assert_eq!(
+            registry.check_review_admission(&id, "document-review"),
+            Ok(())
+        );
+        for unsupported in [0, 2, u32::MAX] {
+            for normalization in [true, false] {
+                // Model stale stored metadata after a valid enrollment. Public
+                // accessors are immutable; each admission must still revalidate.
+                let record = &mut registry.sources[0].record;
+                record.normalization_version = SUPPORTED_NORMALIZATION_VERSION;
+                record.schema_version = SUPPORTED_SCHEMA_VERSION;
+                if normalization {
+                    record.normalization_version = unsupported;
+                } else {
+                    record.schema_version = unsupported;
+                }
+                assert_eq!(
+                    registry.check_dispatch_admission(&id, "implement"),
+                    Err(HeldReason::UnsupportedVersion)
+                );
+                assert_eq!(
+                    registry.check_deployment_admission(&id, "deploy"),
+                    Err(HeldReason::UnsupportedVersion)
+                );
+                assert_eq!(
+                    registry.check_automatic_dispatch_admission(&id, "implement"),
+                    Err(HeldReason::UnsupportedVersion)
+                );
+                assert_eq!(
+                    registry.check_review_admission(&id, "document-review"),
+                    Err(HeldReason::UnsupportedVersion)
+                );
+            }
+        }
     }
 
     #[test]
@@ -985,6 +1111,8 @@ mod tests {
         assert_eq!(candidate.validate(), Err(HeldReason::InvalidRevision));
         let mut record = source(1, "TASKS.md");
         record.source_generation = 0;
+        assert_eq!(record.validate(&policy()), Ok(()));
+        record.source_generation = MAX_REV_COUNTER + 1;
         assert_eq!(record.validate(&policy()), Err(HeldReason::InvalidRevision));
         record.source_generation = MAX_REV_COUNTER;
         record.writer_epoch = MAX_REV_COUNTER;

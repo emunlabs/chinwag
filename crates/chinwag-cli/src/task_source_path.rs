@@ -87,7 +87,9 @@ pub fn validate_enrolled_relative_path(path: &str) -> Result<Vec<&str>, SourcePa
     }
     if path.is_empty()
         || path.starts_with('/')
-        || path.bytes().any(|byte| byte == 0 || byte == b'\\')
+        || path
+            .bytes()
+            .any(|byte| matches!(byte, 0 | b'\r' | b'\n' | b'\\'))
     {
         return Err(SourcePathHoldReason::InvalidRelativePath);
     }
@@ -517,6 +519,21 @@ mod tests {
                 Err(SourcePathHoldReason::InvalidRelativePath),
                 "{path:?}"
             );
+        }
+    }
+
+    #[test]
+    fn p0_source_path_rejects_line_breaks_without_rewriting_valid_bytes() {
+        for path in ["tasks\r/TASKS.md", "tasks\n/TASKS.md"] {
+            assert_eq!(
+                validate_enrolled_relative_path(path),
+                Err(SourcePathHoldReason::InvalidRelativePath),
+                "{path:?}"
+            );
+        }
+        for path in [" Tasks/é.tasks.md ", "stream:v1/TASKS.md"] {
+            let components = validate_enrolled_relative_path(path).unwrap();
+            assert_eq!(components.join("/").as_bytes(), path.as_bytes());
         }
     }
 

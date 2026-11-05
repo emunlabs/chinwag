@@ -49,6 +49,9 @@ pub fn canonicalize_dependencies(
     }
     for dependency in &dependencies {
         dependency.validate()?;
+        if dependency.target_key.workspace_id != dependent_key.workspace_id {
+            return Err(TaskContractError::CrossWorkspaceDependency);
+        }
         if &dependency.target_key == dependent_key {
             return Err(TaskContractError::SelfDependency);
         }
@@ -136,6 +139,9 @@ impl DependencySourceBinding {
     }
 }
 
+/// Supplied by the authoritative enrolled source/index caller, which projects
+/// only current enrolled-source tasks and enforces exact CAS commitment sets at
+/// the index boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDependency {
     pub task_ref: TaskRefV1,
@@ -144,6 +150,9 @@ pub struct ResolvedDependency {
 }
 
 /// No prose or pending-review state can satisfy a qualified dependency.
+/// `current_source` and `resolved` must come from the authoritative enrolled
+/// source/index caller, which projects only current enrolled-source tasks and
+/// enforces exact CAS commitment sets at the index boundary.
 pub fn validate_dependency_satisfaction(
     required: &DependencyCommitment,
     resolved: &ResolvedDependency,
@@ -170,6 +179,7 @@ pub struct DependencyNode {
 
 /// Validates graph structure and commitments, independently of task completion.
 /// Every referenced target must be present, including targets in other sources.
+/// All nodes and edges must remain in one workspace and one repository.
 /// The caller must resolve each source against its current enrolled binding.
 pub fn validate_dependency_graph(nodes: &[DependencyNode]) -> Result<(), TaskContractError> {
     if nodes.len() > MAX_TASK_SOURCES * MAX_TASKS_PER_SOURCE {
@@ -180,6 +190,14 @@ pub fn validate_dependency_graph(nodes: &[DependencyNode]) -> Result<(), TaskCon
     let mut edge_count = 0usize;
     for (index, node) in nodes.iter().enumerate() {
         node.task_ref.validate()?;
+        if let Some(first) = nodes.first() {
+            if node.task_ref.workspace_id != first.task_ref.workspace_id {
+                return Err(TaskContractError::CrossWorkspaceDependency);
+            }
+            if node.task_ref.repo_id != first.task_ref.repo_id {
+                return Err(TaskContractError::CrossRepositoryDependency);
+            }
+        }
         let key = node.task_ref.task_key();
         if indices.insert(key.clone(), index).is_some() {
             return Err(TaskContractError::DuplicateDependency);
@@ -212,6 +230,9 @@ pub fn validate_dependency_graph(nodes: &[DependencyNode]) -> Result<(), TaskCon
         for dependency in canonical {
             let target = *indices.get(&dependency.target_key)
                 .ok_or(TaskContractError::DependencyTargetMissing)?;
+            if nodes[target].task_ref.repo_id != node.task_ref.repo_id {
+                return Err(TaskContractError::CrossRepositoryDependency);
+            }
             if nodes[target].task_ref.task_spec_digest != dependency.target_spec_digest
                 || nodes[target].completion_policy_digest != dependency.completion_policy_digest
             {
@@ -351,7 +372,63 @@ mod tests {
         second.target_key.task_source_id = "00000000000000000000000000000002".into();
         let mut third = first.clone();
         third.target_key.workspace_id = "other-workspace".into();
-        assert_eq!(canonicalize_dependencies(&key("A"), vec![first, second, third]).unwrap().len(), 3);
+        assert_ne!(first.target_key, second.target_key);
+        assert_ne!(first.target_key, third.target_key);
+        assert_ne!(second.target_key, third.target_key);
+        assert_eq!(canonicalize_dependencies(&key("A"), vec![first, second]).unwrap().len(), 2);
+        assert_eq!(canonicalize_dependencies(&key("A"), vec![third]),
+            Err(TaskContractError::CrossWorkspaceDependency));
+    }
+
+    #[test]
+    fn p0_contract_dependency_same_workspace_repository_cross_source_succeeds() {
+        let mut dependent = node("same-id");
+        let mut target = node("same-id");
+        target.task_ref.task_source_id = "00000000000000000000000000000002".into();
+        let required = commitment(&target);
+        assert_eq!(canonicalize_dependencies(&dependent.task_ref.task_key(), vec![required.clone()]),
+            Ok(vec![required.clone()]));
+        dependent.dependencies.push(required);
+        assert_eq!(validate_dependency_graph(&[dependent, target]), Ok(()));
+    }
+
+    #[test]
+    fn p0_contract_dependency_cross_workspace_edge_rejected() {
+        let mut dependent = node("A");
+        let mut target = node("B");
+        target.task_ref.workspace_id = "other-workspace".into();
+        let required = commitment(&target);
+        assert_eq!(canonicalize_dependencies(&dependent.task_ref.task_key(), vec![required.clone()]),
+            Err(TaskContractError::CrossWorkspaceDependency));
+        dependent.dependencies.push(required);
+        assert_eq!(validate_dependency_graph(&[dependent.clone(), target]),
+            Err(TaskContractError::CrossWorkspaceDependency));
+        assert_eq!(validate_dependency_graph(&[dependent]),
+            Err(TaskContractError::CrossWorkspaceDependency));
+    }
+
+    #[test]
+    fn p0_contract_dependency_cross_repository_edge_rejected() {
+        let mut dependent = node("A");
+        let mut target = node("B");
+        target.task_ref.task_source_id = "00000000000000000000000000000002".into();
+        target.task_ref.repo_id = "other-repo".into();
+        dependent.dependencies.push(commitment(&target));
+        assert_eq!(validate_dependency_graph(&[dependent, target]),
+            Err(TaskContractError::CrossRepositoryDependency));
+    }
+
+    #[test]
+    fn p0_contract_dependency_disconnected_graph_domain_rejected() {
+        let first = node("A");
+        let mut other = node("B");
+        other.task_ref.workspace_id = "other-workspace".into();
+        assert_eq!(validate_dependency_graph(&[first.clone(), other.clone()]),
+            Err(TaskContractError::CrossWorkspaceDependency));
+        other.task_ref.workspace_id = first.task_ref.workspace_id.clone();
+        other.task_ref.repo_id = "other-repo".into();
+        assert_eq!(validate_dependency_graph(&[first, other]),
+            Err(TaskContractError::CrossRepositoryDependency));
     }
 
     #[test]

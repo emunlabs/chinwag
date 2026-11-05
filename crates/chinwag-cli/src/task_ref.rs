@@ -11,6 +11,7 @@ use std::str::FromStr;
 
 pub const MAX_ID_UTF8_BYTES: usize = 256;
 pub const MAX_CANONICAL_PATH_BYTES: usize = 4096;
+pub const MAX_DESCENT_COMPONENTS: usize = 64;
 pub const MAX_SCALAR_BYTES: usize = 65536;
 pub const MAX_LIST_ITEMS: usize = 256;
 pub const MAX_TASK_SOURCES: usize = 16;
@@ -50,6 +51,8 @@ pub enum TaskContractError {
     RebaseLimitExceeded,
     DuplicateDependency,
     SelfDependency,
+    CrossWorkspaceDependency,
+    CrossRepositoryDependency,
     DependencyUnsatisfied,
     DependencyTargetMissing,
     DependencyCycleDetected,
@@ -244,11 +247,14 @@ pub fn validate_id(value: &str, field: &'static str) -> Result<(), TaskContractE
     Ok(())
 }
 
-/// Reject locator-shaped identifiers. Enrollment remains an external requirement.
+/// An opaque bounded identifier: 1..=256 UTF-8 bytes, no whitespace or control
+/// characters, no filesystem path separators '/' or '\\', no leading '~', and
+/// neither "." nor "..". Enrollment authority is enforced by
+/// `DependencySourceBinding` / `WorkspaceTaskPolicy`.
 pub fn validate_workspace_id(value: &str) -> Result<(), TaskContractError> {
     validate_id(value, "workspace_id")?;
-    if value.contains(['/', '\\', ':', '.', '@']) || value.starts_with('~')
-        || value.eq_ignore_ascii_case("localhost")
+    if value.chars().any(|character| character.is_whitespace() || character.is_control())
+        || value == "." || value == ".." || value.starts_with('~') || value.contains(['/', '\\'])
     {
         return Err(TaskContractError::InvalidField("workspace_id"));
     }
@@ -266,10 +272,15 @@ pub fn validate_canonical_task_path(value: &str) -> Result<(), TaskContractError
     if value.len() > MAX_CANONICAL_PATH_BYTES {
         return Err(TaskContractError::LimitExceeded("canonical_task_path"));
     }
-    if value.is_empty() || value.trim() != value || value.starts_with('/')
-        || value.contains(['\0', '\r', '\n', '\\', ':'])
-        || value.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    if value.is_empty() || value.starts_with('/')
+        || value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n' | b'\\'))
     {
+        return Err(TaskContractError::InvalidField("canonical_task_path"));
+    }
+    if value.split('/').count() > MAX_DESCENT_COMPONENTS {
+        return Err(TaskContractError::LimitExceeded("canonical_task_path"));
+    }
+    if value.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
         return Err(TaskContractError::InvalidField("canonical_task_path"));
     }
     Ok(())
@@ -782,18 +793,50 @@ mod tests {
         for bad in ["", " task", "task\t", "task\r\n", "ta\0sk"] {
             assert!(validate_id(bad, "task_id").is_err());
         }
-        for bad in ["/TASKS.md", "../TASKS.md", "a/../b", "a//b", "a/./b", "a\\b", " TASKS.md", "TASKS.md\r\n"] {
-            assert!(validate_canonical_task_path(bad).is_err());
+        for bad in ["", "/abs", "a//b", "./TASKS.md", "../TASKS.md", "a/../b", "a/./b", "a\\b", "a\rb", "a\nb", "a\0b"] {
+            assert_eq!(validate_canonical_task_path(bad),
+                Err(TaskContractError::InvalidField("canonical_task_path")));
         }
         assert!(validate_canonical_task_path(&"a".repeat(MAX_CANONICAL_PATH_BYTES)).is_ok());
         assert!(validate_canonical_task_path(&"a".repeat(MAX_CANONICAL_PATH_BYTES + 1)).is_err());
         assert_ne!(encode_str_field("TASKS.md"), encode_str_field("tasks.md"));
         assert_ne!(encode_str_field("é"), encode_str_field("e\u{301}"));
-        for bad in ["host.example", "localhost", "https://host", "/workspace", "db.sqlite"] {
-            assert!(validate_workspace_id(bad).is_err());
-        }
         assert!(validate_task_source_id("0000000000000000000000000000000A").is_err());
         assert!(validate_task_source_id("1").is_err());
+    }
+
+    #[test]
+    fn p0_contract_workspace_id_opaque_bounded_and_enrollment_external() {
+        for valid in ["workspace.v1", "urn:workspace:fixture", "workspace@fixture", "localhost"] {
+            assert_eq!(validate_workspace_id(valid), Ok(()));
+            let mut reference = fixture();
+            reference.workspace_id = valid.into();
+            assert_eq!(TaskRefV1::decode(&reference.encode().unwrap()).unwrap(), reference);
+        }
+        for bad in ["", ".", "..", "~/ws", "a/b", "a\\b", "ws with space", "ws\tname", "ws\u{00a0}name", "ws\u{001b}name"] {
+            assert_eq!(validate_workspace_id(bad),
+                Err(TaskContractError::InvalidField("workspace_id")));
+        }
+        assert_eq!(validate_workspace_id(&"é".repeat(128)), Ok(()));
+        assert_eq!(validate_workspace_id(&"é".repeat(129)),
+            Err(TaskContractError::LimitExceeded("workspace_id")));
+    }
+
+    #[test]
+    fn p0_contract_canonical_task_path_preserves_exact_utf8_and_bounds_descent() {
+        for path in [" Tasks/é.tasks.md ", "stream:v1/TASKS.md"] {
+            let mut reference = fixture();
+            reference.canonical_task_path = path.into();
+            assert_eq!(reference.validate(), Ok(()));
+            let decoded = TaskRefV1::decode(&reference.encode().unwrap()).unwrap();
+            assert_eq!(decoded.canonical_task_path.as_bytes(), path.as_bytes());
+            assert_eq!(decoded, reference);
+        }
+        let exact = format!("{}TASKS.md", "a/".repeat(MAX_DESCENT_COMPONENTS - 1));
+        assert_eq!(validate_canonical_task_path(&exact), Ok(()));
+        let too_deep = format!("a/{exact}");
+        assert_eq!(validate_canonical_task_path(&too_deep),
+            Err(TaskContractError::LimitExceeded("canonical_task_path")));
     }
 
     #[test]
