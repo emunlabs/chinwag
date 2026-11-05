@@ -4,6 +4,16 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 pub mod agent_instance;
+#[cfg(target_os = "macos")]
+pub mod task_dependency;
+#[cfg(target_os = "macos")]
+pub mod task_normalization;
+#[cfg(target_os = "macos")]
+pub mod task_ref;
+#[cfg(target_os = "macos")]
+pub mod task_source;
+#[cfg(target_os = "macos")]
+pub mod task_source_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invocation {
