@@ -529,116 +529,8 @@ fn append_message_to_disk_and_crdb(repo_root: &Path, msg: &BusMessage) -> u64 {
             .stderr(Stdio::null())
             .status();
 
-        if verified_msg.sig_verified
-            && (verified_msg.body.starts_with("COMPLETED ")
-                || verified_msg.body.starts_with("[DONE]"))
-            && let Some(ref tid) = verified_msg.task_id
-        {
-            let _ = auto_advance_tasks_markdown(repo_root, tid, &verified_msg.sender);
-        }
-
         next_seq
     })
-}
-
-/// Automatically transitions a completed `TASK-XX` from `[IN_PROGRESS]`/`[READY]` to `[DONE]` in `TASKS.md`
-/// and promotes the next `[READY]` task owned by `seat` to `[IN_PROGRESS]` (`TASK-21` / `CHWG-AUTO-ADVANCE-TASKS-01`).
-pub fn auto_advance_tasks_markdown(
-    repo_root: &Path,
-    completed_task_id: &str,
-    seat: &str,
-) -> Option<String> {
-    let tasks_path = repo_root.join("TASKS.md");
-    let raw = fs::read_to_string(&tasks_path).ok()?;
-    let target_tid = completed_task_id.trim().to_uppercase();
-    let target_seat = base_seat_str(seat).trim().to_uppercase();
-    if !target_tid.starts_with("TASK-") {
-        return None;
-    }
-
-    let mut lines: Vec<String> = raw.lines().map(|l| l.to_string()).collect();
-    let mut changed = false;
-
-    for line in &mut lines {
-        let trimmed = line.trim();
-        if trimmed.starts_with("### ") {
-            let matches_tid = trimmed.contains(&format!("`{target_tid}`"))
-                || trimmed.contains(&format!(" {target_tid} "))
-                || trimmed.ends_with(&format!(" {target_tid}"));
-            if matches_tid && (trimmed.contains("[IN_PROGRESS]") || trimmed.contains("[READY]")) {
-                *line = line
-                    .replace("[IN_PROGRESS]", "[DONE]")
-                    .replace("[READY]", "[DONE]");
-                changed = true;
-            }
-        }
-    }
-
-    // Check if seat already has another [IN_PROGRESS] item; if not, promote its first [READY] item
-    let mut current_heading_idx: Option<usize> = None;
-    let mut current_heading_tid: Option<String> = None;
-    let mut current_heading_is_ready = false;
-    let mut current_heading_is_in_progress = false;
-    let mut seat_has_in_progress = false;
-    let mut first_ready_for_seat: Option<(usize, String)> = None;
-
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("### ") {
-            current_heading_idx = Some(idx);
-            current_heading_is_ready = trimmed.contains("[READY]");
-            current_heading_is_in_progress = trimmed.contains("[IN_PROGRESS]");
-            current_heading_tid = None;
-            if let Some(pos) = trimmed.find("TASK-") {
-                let rest = &trimmed[pos..];
-                let tid: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                    .collect();
-                if tid.len() >= 6 {
-                    current_heading_tid = Some(tid);
-                }
-            }
-            continue;
-        }
-        if trimmed.starts_with("- **Owner:**") {
-            let upper = trimmed.to_uppercase();
-            if upper.contains(&target_seat) {
-                if current_heading_is_in_progress {
-                    seat_has_in_progress = true;
-                } else if current_heading_is_ready
-                    && first_ready_for_seat.is_none()
-                    && let (Some(h_idx), Some(tid)) =
-                        (current_heading_idx, current_heading_tid.clone())
-                {
-                    first_ready_for_seat = Some((h_idx, tid));
-                }
-            }
-        }
-    }
-
-    let mut promoted_tid: Option<String> = None;
-    if !seat_has_in_progress
-        && let Some((h_idx, tid)) = first_ready_for_seat
-        && let Some(line) = lines.get_mut(h_idx)
-    {
-        *line = line.replace("[READY]", "[IN_PROGRESS]");
-        promoted_tid = Some(tid);
-        changed = true;
-    }
-
-    // Synthetic rolling-wave task generator disabled per Brian (2026-11-01):
-    // Only dispatch real [READY] tasks explicitly listed in TASKS.md.
-
-    if changed {
-        let mut updated = lines.join("\n");
-        if raw.ends_with('\n') {
-            updated.push('\n');
-        }
-        let _ = fs::write(&tasks_path, updated);
-    }
-
-    promoted_tid
 }
 
 fn compute_message_digest(
@@ -2323,24 +2215,59 @@ mod tests {
     }
 
     #[test]
-    fn auto_advance_tasks_md_transitions_completed_task_to_done_and_promotes_next_ready() {
-        let temp = tempfile::tempdir().unwrap();
-        let sample = "# TASKS\n\
-            ### `[IN_PROGRESS]` `TASK-15` — Hardened Bus Signatures\n\
-            - **Owner:** `■ RUST` (`GPT / Codex`)\n\
-            - **Scope:** Verify 7-field Ed25519 signature.\n\
-            ### `[READY]` `TASK-22` — Remove Predictable Seat-Derived Key Fallback\n\
-            - **Owner:** `■ RUST` (`GPT / Codex`)\n\
-            - **Scope:** Replace SHA-256 fallback with CSPRNG.\n";
-        let tasks_path = temp.path().join("TASKS.md");
-        fs::write(&tasks_path, sample).unwrap();
+    fn p0_acceptance_signed_legacy_completion_cannot_mutate_or_promote_tasks() {
+        use std::os::unix::fs::MetadataExt;
 
-        let promoted = auto_advance_tasks_markdown(temp.path(), "TASK-15", "RUST");
-        assert_eq!(promoted.as_deref(), Some("TASK-22"));
-
-        let updated = fs::read_to_string(&tasks_path).unwrap();
-        assert!(updated.contains("### `[DONE]` `TASK-15`"));
-        assert!(updated.contains("### `[IN_PROGRESS]` `TASK-22`"));
+        for body in ["COMPLETED TASK-15", "[DONE] TASK-15"] {
+            let temp = tempfile::tempdir().unwrap();
+            let secret = fixture_key(&temp.path().join("fixture-signing"), "RUST");
+            let ssh_pub = ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(
+                *secret.public().as_bytes(),
+            ));
+            let chinwag = temp.path().join(".chinwag");
+            fs::create_dir_all(&chinwag).unwrap();
+            fs::write(
+                chinwag.join("allowed_signers"),
+                format!(
+                    "rust-agent@chinwag.sh namespaces=\"git\" {} chinwag RUST\n",
+                    ssh_pub.to_openssh().unwrap()
+                ),
+            )
+            .unwrap();
+            let sample = "# TASKS\n### [IN_PROGRESS] TASK-15 — original task\n- **Owner:** RUST\n### [READY] TASK-22 — next task\n- **Owner:** RUST\n";
+            let tasks_path = temp.path().join("TASKS.md");
+            fs::write(&tasks_path, sample).unwrap();
+            fs::set_permissions(&tasks_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::metadata(&tasks_path).unwrap();
+            let mut msg = BusMessage {
+                id: "bus-1793250000-p006-legacy-fixture".to_string(),
+                seq: 0,
+                ts_unix: 1_793_250_000,
+                ts_iso: "2026-10-29T18:15:00-0500 CDT".to_string(),
+                room: "#eng".to_string(),
+                sender: "RUST".to_string(),
+                sender_cast: "■".to_string(),
+                sender_endpoint_id: secret.public().to_string(),
+                to: Some("ARCHITECT".to_string()),
+                task_id: Some("TASK-15".to_string()),
+                body: body.to_string(),
+                digest_sha256: "deadbeef".repeat(8),
+                pubkey_ed25519: None,
+                signature_ed25519: None,
+                sig_verified: false,
+            };
+            sign_bus_message(&mut msg, &secret);
+            assert!(verify_detached_bus_signature(temp.path(), &mut msg));
+            assert_eq!(append_message_to_disk_and_crdb(temp.path(), &msg), 1);
+            let stored = read_all_messages(temp.path());
+            assert_eq!(stored.len(), 1);
+            assert!(stored[0].sig_verified);
+            assert_eq!(stored[0].body, body);
+            assert_eq!(fs::read(&tasks_path).unwrap(), sample.as_bytes());
+            let after = fs::metadata(&tasks_path).unwrap();
+            assert_eq!((after.dev(), after.ino(), after.uid(), after.mode(), after.nlink()),
+                (before.dev(), before.ino(), before.uid(), before.mode(), before.nlink()));
+        }
     }
 
     #[test]
