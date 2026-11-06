@@ -1,9 +1,9 @@
 //! Qualified dependency commitments and finite, nonrecursive DAG validation.
 
 use crate::task_ref::{
-    CanonicalDecoder, GitOid, MAX_DEPENDENCY_DEPTH, MAX_DEPENDENCY_EDGES,
-    MAX_LIST_ITEMS, MAX_TASK_SOURCES, MAX_TASKS_PER_SOURCE, Sha256Digest, TaskContractError, TaskKey,
-    TaskRefV1, encode_list,
+    CanonicalDecoder, GitOid, MAX_DEPENDENCY_DEPTH, MAX_DEPENDENCY_EDGES, MAX_LIST_ITEMS,
+    MAX_TASK_SOURCES, MAX_TASKS_PER_SOURCE, Sha256Digest, TaskContractError, TaskKey, TaskRefV1,
+    encode_list,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -57,7 +57,10 @@ pub fn canonicalize_dependencies(
         }
     }
     dependencies.sort_by(|a, b| a.target_key.cmp(&b.target_key));
-    if dependencies.windows(2).any(|pair| pair[0].target_key == pair[1].target_key) {
+    if dependencies
+        .windows(2)
+        .any(|pair| pair[0].target_key == pair[1].target_key)
+    {
         return Err(TaskContractError::DuplicateDependency);
     }
     Ok(dependencies)
@@ -216,7 +219,8 @@ pub fn validate_dependency_graph(nodes: &[DependencyNode]) -> Result<(), TaskCon
         if node.dependencies.len() > MAX_LIST_ITEMS {
             return Err(TaskContractError::LimitExceeded("dependencies"));
         }
-        edge_count = edge_count.checked_add(node.dependencies.len())
+        edge_count = edge_count
+            .checked_add(node.dependencies.len())
             .ok_or(TaskContractError::LimitExceeded("dependency edges"))?;
         if edge_count > MAX_DEPENDENCY_EDGES {
             return Err(TaskContractError::LimitExceeded("dependency edges"));
@@ -226,9 +230,11 @@ pub fn validate_dependency_graph(nodes: &[DependencyNode]) -> Result<(), TaskCon
     let mut edges = vec![Vec::new(); nodes.len()];
     let mut incoming = vec![0usize; nodes.len()];
     for (index, node) in nodes.iter().enumerate() {
-        let canonical = canonicalize_dependencies(&node.task_ref.task_key(), node.dependencies.clone())?;
+        let canonical =
+            canonicalize_dependencies(&node.task_ref.task_key(), node.dependencies.clone())?;
         for dependency in canonical {
-            let target = *indices.get(&dependency.target_key)
+            let target = *indices
+                .get(&dependency.target_key)
                 .ok_or(TaskContractError::DependencyTargetMissing)?;
             if nodes[target].task_ref.repo_id != node.task_ref.repo_id {
                 return Err(TaskContractError::CrossRepositoryDependency);
@@ -245,8 +251,11 @@ pub fn validate_dependency_graph(nodes: &[DependencyNode]) -> Result<(), TaskCon
 
     // Kahn's algorithm detects cycles without consuming the call stack. Longest
     // path propagation also catches depth hidden behind an earlier short path.
-    let mut ready: VecDeque<usize> = incoming.iter().enumerate()
-        .filter_map(|(index, count)| (*count == 0).then_some(index)).collect();
+    let mut ready: VecDeque<usize> = incoming
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect();
     let mut depths = vec![0usize; nodes.len()];
     let mut visited = 0;
     while let Some(index) = ready.pop_front() {
@@ -273,7 +282,12 @@ mod tests {
     use super::*;
 
     fn key(task_id: &str) -> TaskKey {
-        TaskKey::new("p0-fixture-workspace", "00000000000000000000000000000001", task_id).unwrap()
+        TaskKey::new(
+            "p0-fixture-workspace",
+            "00000000000000000000000000000001",
+            task_id,
+        )
+        .unwrap()
     }
 
     fn node(task_id: &str) -> DependencyNode {
@@ -319,20 +333,28 @@ mod tests {
         let encoded = dependency.encode();
         assert_eq!(encoded.len(), 185);
         let hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(hex, concat!(
-            "000000000000001470302d666978747572652d776f726b7370616365",
-            "00000000000000203030303030303030303030303030303030303030303030303030303030303031",
-            "00000000000000014200000000000000067368613235360000000000000020",
-            "1111111111111111111111111111111111111111111111111111111111111111",
-            "00000000000000067368613235360000000000000020",
-            "2222222222222222222222222222222222222222222222222222222222222222"
-        ));
-        assert_eq!(Sha256Digest::of(&encoded).to_string(),
-            "2de60a32b3dc1e7d35c1389b572553834938aa72e0472d842107cc5a152f6772");
+        assert_eq!(
+            hex,
+            concat!(
+                "000000000000001470302d666978747572652d776f726b7370616365",
+                "00000000000000203030303030303030303030303030303030303030303030303030303030303031",
+                "00000000000000014200000000000000067368613235360000000000000020",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "00000000000000067368613235360000000000000020",
+                "2222222222222222222222222222222222222222222222222222222222222222"
+            )
+        );
+        assert_eq!(
+            Sha256Digest::of(&encoded).to_string(),
+            "2de60a32b3dc1e7d35c1389b572553834938aa72e0472d842107cc5a152f6772"
+        );
         assert_eq!(DependencyCommitment::decode(&encoded).unwrap(), dependency);
         let mut trailing = encoded;
         trailing.push(0);
-        assert_eq!(DependencyCommitment::decode(&trailing), Err(TaskContractError::TrailingBytes));
+        assert_eq!(
+            DependencyCommitment::decode(&trailing),
+            Err(TaskContractError::TrailingBytes)
+        );
     }
 
     #[test]
@@ -341,28 +363,45 @@ mod tests {
         let b = commitment(&node("aa"));
         let sorted = canonicalize_dependencies(&key("A"), vec![b.clone(), a.clone()]).unwrap();
         assert_eq!(sorted, vec![a.clone(), b]);
-        assert_eq!(canonicalize_dependencies(&key("A"), vec![a.clone(), a.clone()]),
-            Err(TaskContractError::DuplicateDependency));
+        assert_eq!(
+            canonicalize_dependencies(&key("A"), vec![a.clone(), a.clone()]),
+            Err(TaskContractError::DuplicateDependency)
+        );
         let mut changed = a.clone();
         changed.target_spec_digest = Sha256Digest([9; 32]);
-        assert_eq!(canonicalize_dependencies(&key("A"), vec![changed, a.clone()]),
-            Err(TaskContractError::DuplicateDependency));
+        assert_eq!(
+            canonicalize_dependencies(&key("A"), vec![changed, a.clone()]),
+            Err(TaskContractError::DuplicateDependency)
+        );
         let mut changed = a.clone();
         changed.completion_policy_digest = Sha256Digest([9; 32]);
-        assert_eq!(canonicalize_dependencies(&key("A"), vec![a, changed]),
-            Err(TaskContractError::DuplicateDependency));
+        assert_eq!(
+            canonicalize_dependencies(&key("A"), vec![a, changed]),
+            Err(TaskContractError::DuplicateDependency)
+        );
     }
 
     #[test]
     fn p0_contract_dependency_self_and_list_limit_rejected() {
         let target = node("A");
-        assert_eq!(canonicalize_dependencies(&key("A"), vec![commitment(&target)]),
-            Err(TaskContractError::SelfDependency));
-        let too_many = (0..=MAX_LIST_ITEMS).map(|i| commitment(&node(&format!("B-{i}")))).collect();
-        assert!(matches!(canonicalize_dependencies(&key("A"), too_many),
-            Err(TaskContractError::LimitExceeded("dependencies"))));
-        let exact = (0..MAX_LIST_ITEMS).map(|i| commitment(&node(&format!("B-{i}")))).collect();
-        assert_eq!(canonicalize_dependencies(&key("A"), exact).unwrap().len(), MAX_LIST_ITEMS);
+        assert_eq!(
+            canonicalize_dependencies(&key("A"), vec![commitment(&target)]),
+            Err(TaskContractError::SelfDependency)
+        );
+        let too_many = (0..=MAX_LIST_ITEMS)
+            .map(|i| commitment(&node(&format!("B-{i}"))))
+            .collect();
+        assert!(matches!(
+            canonicalize_dependencies(&key("A"), too_many),
+            Err(TaskContractError::LimitExceeded("dependencies"))
+        ));
+        let exact = (0..MAX_LIST_ITEMS)
+            .map(|i| commitment(&node(&format!("B-{i}"))))
+            .collect();
+        assert_eq!(
+            canonicalize_dependencies(&key("A"), exact).unwrap().len(),
+            MAX_LIST_ITEMS
+        );
     }
 
     #[test]
@@ -375,9 +414,16 @@ mod tests {
         assert_ne!(first.target_key, second.target_key);
         assert_ne!(first.target_key, third.target_key);
         assert_ne!(second.target_key, third.target_key);
-        assert_eq!(canonicalize_dependencies(&key("A"), vec![first, second]).unwrap().len(), 2);
-        assert_eq!(canonicalize_dependencies(&key("A"), vec![third]),
-            Err(TaskContractError::CrossWorkspaceDependency));
+        assert_eq!(
+            canonicalize_dependencies(&key("A"), vec![first, second])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            canonicalize_dependencies(&key("A"), vec![third]),
+            Err(TaskContractError::CrossWorkspaceDependency)
+        );
     }
 
     #[test]
@@ -386,8 +432,10 @@ mod tests {
         let mut target = node("same-id");
         target.task_ref.task_source_id = "00000000000000000000000000000002".into();
         let required = commitment(&target);
-        assert_eq!(canonicalize_dependencies(&dependent.task_ref.task_key(), vec![required.clone()]),
-            Ok(vec![required.clone()]));
+        assert_eq!(
+            canonicalize_dependencies(&dependent.task_ref.task_key(), vec![required.clone()]),
+            Ok(vec![required.clone()])
+        );
         dependent.dependencies.push(required);
         assert_eq!(validate_dependency_graph(&[dependent, target]), Ok(()));
     }
@@ -398,13 +446,19 @@ mod tests {
         let mut target = node("B");
         target.task_ref.workspace_id = "other-workspace".into();
         let required = commitment(&target);
-        assert_eq!(canonicalize_dependencies(&dependent.task_ref.task_key(), vec![required.clone()]),
-            Err(TaskContractError::CrossWorkspaceDependency));
+        assert_eq!(
+            canonicalize_dependencies(&dependent.task_ref.task_key(), vec![required.clone()]),
+            Err(TaskContractError::CrossWorkspaceDependency)
+        );
         dependent.dependencies.push(required);
-        assert_eq!(validate_dependency_graph(&[dependent.clone(), target]),
-            Err(TaskContractError::CrossWorkspaceDependency));
-        assert_eq!(validate_dependency_graph(&[dependent]),
-            Err(TaskContractError::CrossWorkspaceDependency));
+        assert_eq!(
+            validate_dependency_graph(&[dependent.clone(), target]),
+            Err(TaskContractError::CrossWorkspaceDependency)
+        );
+        assert_eq!(
+            validate_dependency_graph(&[dependent]),
+            Err(TaskContractError::CrossWorkspaceDependency)
+        );
     }
 
     #[test]
@@ -414,8 +468,10 @@ mod tests {
         target.task_ref.task_source_id = "00000000000000000000000000000002".into();
         target.task_ref.repo_id = "other-repo".into();
         dependent.dependencies.push(commitment(&target));
-        assert_eq!(validate_dependency_graph(&[dependent, target]),
-            Err(TaskContractError::CrossRepositoryDependency));
+        assert_eq!(
+            validate_dependency_graph(&[dependent, target]),
+            Err(TaskContractError::CrossRepositoryDependency)
+        );
     }
 
     #[test]
@@ -423,12 +479,16 @@ mod tests {
         let first = node("A");
         let mut other = node("B");
         other.task_ref.workspace_id = "other-workspace".into();
-        assert_eq!(validate_dependency_graph(&[first.clone(), other.clone()]),
-            Err(TaskContractError::CrossWorkspaceDependency));
+        assert_eq!(
+            validate_dependency_graph(&[first.clone(), other.clone()]),
+            Err(TaskContractError::CrossWorkspaceDependency)
+        );
         other.task_ref.workspace_id = first.task_ref.workspace_id.clone();
         other.task_ref.repo_id = "other-repo".into();
-        assert_eq!(validate_dependency_graph(&[first, other]),
-            Err(TaskContractError::CrossRepositoryDependency));
+        assert_eq!(
+            validate_dependency_graph(&[first, other]),
+            Err(TaskContractError::CrossRepositoryDependency)
+        );
     }
 
     #[test]
@@ -442,10 +502,17 @@ mod tests {
             status: TaskStatus::Done,
         };
         validate_dependency_satisfaction(&required, &resolved, &current).unwrap();
-        for status in [TaskStatus::Todo, TaskStatus::InProgress, TaskStatus::DonePendingReview, TaskStatus::Blocked] {
+        for status in [
+            TaskStatus::Todo,
+            TaskStatus::InProgress,
+            TaskStatus::DonePendingReview,
+            TaskStatus::Blocked,
+        ] {
             resolved.status = status;
-            assert_eq!(validate_dependency_satisfaction(&required, &resolved, &current),
-                Err(TaskContractError::DependencyUnsatisfied));
+            assert_eq!(
+                validate_dependency_satisfaction(&required, &resolved, &current),
+                Err(TaskContractError::DependencyUnsatisfied)
+            );
         }
         resolved.status = TaskStatus::Done;
         for field in 0..3 {
@@ -455,8 +522,10 @@ mod tests {
                 1 => changed.task_ref.task_spec_digest = Sha256Digest([9; 32]),
                 _ => changed.completion_policy_digest = Sha256Digest([9; 32]),
             }
-            assert_eq!(validate_dependency_satisfaction(&required, &changed, &current),
-                Err(TaskContractError::DependencyUnsatisfied));
+            assert_eq!(
+                validate_dependency_satisfaction(&required, &changed, &current),
+                Err(TaskContractError::DependencyUnsatisfied)
+            );
         }
         for bad in ["COMPLETED", "DONE", "done ", "Completed successfully"] {
             assert!(TaskStatus::parse(bad).is_err());
@@ -483,20 +552,27 @@ mod tests {
                 3 => stale.task_ref.canonical_task_path = "tasks/TASKS.md".into(),
                 _ => stale.task_ref.task_source_id = "00000000000000000000000000000002".into(),
             }
-            assert_eq!(validate_dependency_satisfaction(&required, &stale, &current),
-                Err(TaskContractError::AcceptanceInvalidated));
+            assert_eq!(
+                validate_dependency_satisfaction(&required, &stale, &current),
+                Err(TaskContractError::AcceptanceInvalidated)
+            );
         }
     }
 
     #[test]
     fn p0_contract_dependency_cycle_and_depth_128_enforced() {
         assert!(validate_dependency_graph(&chain(MAX_DEPENDENCY_DEPTH)).is_ok());
-        assert_eq!(validate_dependency_graph(&chain(MAX_DEPENDENCY_DEPTH + 1)),
-            Err(TaskContractError::DependencyDepthExceeded));
+        assert_eq!(
+            validate_dependency_graph(&chain(MAX_DEPENDENCY_DEPTH + 1)),
+            Err(TaskContractError::DependencyDepthExceeded)
+        );
         let mut cycle = chain(2);
         let back = commitment(&cycle[0]);
         cycle[2].dependencies.push(back);
-        assert_eq!(validate_dependency_graph(&cycle), Err(TaskContractError::DependencyCycleDetected));
+        assert_eq!(
+            validate_dependency_graph(&cycle),
+            Err(TaskContractError::DependencyCycleDetected)
+        );
     }
 
     #[test]
@@ -505,16 +581,24 @@ mod tests {
         let direct = commitment(nodes.last().unwrap());
         nodes[0].dependencies.push(direct);
         nodes.reverse();
-        assert_eq!(validate_dependency_graph(&nodes), Err(TaskContractError::DependencyDepthExceeded));
+        assert_eq!(
+            validate_dependency_graph(&nodes),
+            Err(TaskContractError::DependencyDepthExceeded)
+        );
         assert!(validate_dependency_graph(&[]).is_ok());
     }
 
     #[test]
     fn p0_contract_dependency_graph_missing_duplicate_and_stale_commitments_held() {
         let original = chain(1);
-        assert_eq!(validate_dependency_graph(&original[..1]), Err(TaskContractError::DependencyTargetMissing));
-        assert_eq!(validate_dependency_graph(&[original[0].clone(), original[0].clone()]),
-            Err(TaskContractError::DuplicateDependency));
+        assert_eq!(
+            validate_dependency_graph(&original[..1]),
+            Err(TaskContractError::DependencyTargetMissing)
+        );
+        assert_eq!(
+            validate_dependency_graph(&[original[0].clone(), original[0].clone()]),
+            Err(TaskContractError::DuplicateDependency)
+        );
         for field in 0..2 {
             let mut nodes = original.clone();
             if field == 0 {
@@ -522,20 +606,32 @@ mod tests {
             } else {
                 nodes[1].completion_policy_digest = Sha256Digest([9; 32]);
             }
-            assert_eq!(validate_dependency_graph(&nodes), Err(TaskContractError::DependencyUnsatisfied));
+            assert_eq!(
+                validate_dependency_graph(&nodes),
+                Err(TaskContractError::DependencyUnsatisfied)
+            );
         }
         let mut nodes = original;
         nodes[1].task_ref.source_generation += 1;
-        assert_eq!(validate_dependency_graph(&nodes), Err(TaskContractError::AcceptanceInvalidated));
+        assert_eq!(
+            validate_dependency_graph(&nodes),
+            Err(TaskContractError::AcceptanceInvalidated)
+        );
     }
 
     #[test]
     fn p0_contract_dependency_graph_tasks_per_source_bound() {
-        let mut nodes: Vec<_> = (0..MAX_TASKS_PER_SOURCE).map(|i| node(&format!("N-{i}"))).collect();
+        let mut nodes: Vec<_> = (0..MAX_TASKS_PER_SOURCE)
+            .map(|i| node(&format!("N-{i}")))
+            .collect();
         assert!(validate_dependency_graph(&nodes).is_ok());
         nodes.push(node("overflow"));
-        assert_eq!(validate_dependency_graph(&nodes), Err(TaskContractError::LimitExceeded("tasks per source")));
-        nodes.last_mut().unwrap().task_ref.task_source_id = "00000000000000000000000000000002".into();
+        assert_eq!(
+            validate_dependency_graph(&nodes),
+            Err(TaskContractError::LimitExceeded("tasks per source"))
+        );
+        nodes.last_mut().unwrap().task_ref.task_source_id =
+            "00000000000000000000000000000002".into();
         assert!(validate_dependency_graph(&nodes).is_ok());
     }
 
@@ -550,22 +646,30 @@ mod tests {
         assert!(validate_dependency_graph(&nodes).is_ok());
         let additional = commitment(&nodes[65]);
         nodes[64].dependencies.push(additional);
-        assert_eq!(validate_dependency_graph(&nodes), Err(TaskContractError::LimitExceeded("dependency edges")));
+        assert_eq!(
+            validate_dependency_graph(&nodes),
+            Err(TaskContractError::LimitExceeded("dependency edges"))
+        );
     }
 
     #[test]
     fn p0_contract_dependency_graph_source_bound_and_cross_source_target() {
-        let mut nodes: Vec<_> = (0..MAX_TASK_SOURCES).map(|i| {
-            let mut target = node("same-id");
-            target.task_ref.task_source_id = format!("{i:032x}");
-            target
-        }).collect();
+        let mut nodes: Vec<_> = (0..MAX_TASK_SOURCES)
+            .map(|i| {
+                let mut target = node("same-id");
+                target.task_ref.task_source_id = format!("{i:032x}");
+                target
+            })
+            .collect();
         let required = commitment(&nodes[1]);
         nodes[0].dependencies.push(required);
         assert!(validate_dependency_graph(&nodes).is_ok());
         let mut additional = node("same-id");
         additional.task_ref.task_source_id = format!("{:032x}", MAX_TASK_SOURCES);
         nodes.push(additional);
-        assert_eq!(validate_dependency_graph(&nodes), Err(TaskContractError::LimitExceeded("task sources")));
+        assert_eq!(
+            validate_dependency_graph(&nodes),
+            Err(TaskContractError::LimitExceeded("task sources"))
+        );
     }
 }

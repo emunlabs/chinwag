@@ -1,0 +1,152 @@
+name: Chinwag Core CI & Automated Review Merge Gate
+
+on:
+  push:
+    branches:
+      - main
+      - 'review/**'
+      - 'feat/**'
+      - 'eng/**'
+      - 'fix/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: chinwag-core-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RATCHET_WORKHORSE_COMBINED_FLOOR: "288"
+  RATCHET_CHINWAG_CLI_LIB_FLOOR: "284"
+  RATCHET_CHINWAG_CLI_P0_ADV_FLOOR: "22"
+  RATCHET_CHINWAG_CLI_TOTAL_FLOOR: "392"
+  RATCHET_WORKSPACE_TOTAL_FLOOR: "750"
+
+jobs:
+  stage1-h2-cleanroom-rust-gate:
+    name: "Stage 1 — H2 Cleanroom Rust & WORKHORSE 288+ Test Ratchet Gate"
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify WORKHORSE Test Suite, Clippy, Formatting & Monotonic Ratchet (288+ Floor)
+        run: |
+          chmod +x ./scripts/verify-workhorse-test-suite.sh
+          ./scripts/verify-workhorse-test-suite.sh --sync-node2
+
+  stage2-h-board-security-sentinel:
+    name: "Stage 2 — H_board & Security Sentinel (INV-ZERO-ANTHROPIC-01 / INV-BOARD-ZERO-LEAK-01)"
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Check INV-ZERO-ANTHROPIC-01 (Zero Anthropic/Claude Fleet Seats in Active Code)"
+        run: |
+          echo "Checking active source files for forbidden claude-code seat assignments..."
+          if git grep -n -E 'engine[[:space:]]*=[[:space:]]*"claude-code"|model[[:space:]]*=[[:space:]]*"claude-' -- 'crates/' 'scripts/' '.github/'; then
+            echo "FAIL: INV-ZERO-ANTHROPIC-01 violated — active claude-code engine or model assignment detected." >&2
+            exit 1
+          fi
+          echo "OK: INV-ZERO-ANTHROPIC-01 verified."
+
+      - name: "Check Tombstone Guard (No New Dioxus Additions Outside Legacy Crate)"
+        run: |
+          echo "Checking active crates (excluding legacy crates/chinwag-ui and ui_gate refusal tests) for forbidden framework usage..."
+          if git grep -n -i 'dioxus' -- 'crates/chinwag-cli/' 'crates/chinwag-seed/' ':(exclude)crates/chinwag-cli/src/ui_gate_run.rs' ':(exclude)crates/chinwag-cli/tests/ui_gate.rs'; then
+            echo "FAIL: Forbidden UI framework reference detected in active crates." >&2
+            exit 1
+          fi
+          echo "OK: Tombstone framework guard verified."
+
+      - name: "Check INV-BOARD-ZERO-LEAK-01 (No Tracked .crdb Databases, Private Keys, or Secret Leaks)"
+        run: |
+          echo "Checking tracked git index for forbidden .crdb state files or private keys..."
+          LEAKED_FILES="$(git ls-files | grep -E '\.(crdb|crdb-shm|crdb-wal|leann|pem)$|_ed25519$' || true)"
+          if [[ -n "$LEAKED_FILES" ]]; then
+            echo "FAIL: INV-BOARD-ZERO-LEAK-01 violated — tracked database or private key files found:" >&2
+            echo "$LEAKED_FILES" >&2
+            exit 1
+          fi
+          if git grep -n -E 'BEGIN (OPENSSH|RSA|EC|PRIVATE) KEY|sk-proj-[A-Za-z0-9_-]{20,}|xai-[A-Za-z0-9_-]{20,}' -- 'crates/' 'scripts/' '.github/'; then
+            echo "FAIL: INV-BOARD-ZERO-LEAK-01 violated — hardcoded secret key material detected." >&2
+            exit 1
+          fi
+          if git grep -n -E '\b100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b' -- '.github/' 'scripts/verify-workhorse-test-suite.sh'; then
+            echo "FAIL: INV-BOARD-ZERO-LEAK-01 violated — hardcoded Tailscale CGNAT IP detected." >&2
+            exit 1
+          fi
+          echo "OK: INV-BOARD-ZERO-LEAK-01 verified."
+
+  stage3-h5-automated-review-merge:
+    name: "Stage 3 — H5 Automated Review & Fast-Forward Merge Gate (review/** -> main)"
+    needs:
+      - stage1-h2-cleanroom-rust-gate
+      - stage2-h-board-security-sentinel
+    if: ${{ always() && startsWith(github.ref, 'refs/heads/review/') }}
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Promote verified review/** branch into main or emit failure receipt
+        env:
+          STAGE1_RESULT: ${{ needs.stage1-h2-cleanroom-rust-gate.result }}
+          STAGE2_RESULT: ${{ needs.stage2-h-board-security-sentinel.result }}
+          REVIEW_BRANCH: ${{ github.ref_name }}
+          REVIEW_SHA: ${{ github.sha }}
+        run: |
+          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+          if [[ "$STAGE1_RESULT" != "success" || "$STAGE2_RESULT" != "success" ]]; then
+            echo "FAIL: Gate failure on $REVIEW_BRANCH ($REVIEW_SHA): Stage1=$STAGE1_RESULT Stage2=$STAGE2_RESULT" >&2
+            if command -v chinwag >/dev/null 2>&1 && [[ -d "/Users/brianspector/WORKSPACE/chinwag" ]]; then
+              CHINWAG_INSTANCE_ID="$(chinwag bus instance)"
+              export CHINWAG_INSTANCE_ID
+              export CHINWAG_ACTOR="ARCHITECT#${CHINWAG_INSTANCE_ID}"
+              chinwag bus send \
+                --repo /Users/brianspector/WORKSPACE/chinwag \
+                --from "$CHINWAG_ACTOR" \
+                --room "#eng" \
+                --to "@WORKHORSE" \
+                --task "CHWG-CORE-CI-MERGE-01" \
+                "CI/CD Gate FAILED on ${REVIEW_BRANCH} (${REVIEW_SHA}): Stage1=${STAGE1_RESULT}, Stage2=${STAGE2_RESULT}." || true
+            fi
+            exit 1
+          fi
+
+          echo "Stages 1 & 2 PASSED for ${REVIEW_BRANCH} (${REVIEW_SHA}). Merging into main..."
+          git config user.name "chinwag-ci-merger"
+          git config user.email "ci-merger@emunlabs.ai"
+          git fetch origin main
+          git checkout -B main origin/main
+
+          if git merge --ff-only "$REVIEW_SHA"; then
+            echo "Fast-forwarded main to $REVIEW_SHA"
+          else
+            git merge --no-ff -m "chore(ci): merge verified ${REVIEW_BRANCH} (${REVIEW_SHA}) via H5 gate [CHWG-CORE-CI-MERGE-01]" "$REVIEW_SHA"
+          fi
+
+          git push origin main
+          echo "Successfully promoted ${REVIEW_BRANCH} (${REVIEW_SHA}) -> origin/main."
+
+          if [[ -x "/Users/brianspector/chinwag-main-deploy-supervisor/tracker.sh" ]]; then
+            /Users/brianspector/chinwag-main-deploy-supervisor/tracker.sh || true
+          fi

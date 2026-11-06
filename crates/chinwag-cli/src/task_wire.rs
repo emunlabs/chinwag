@@ -1384,7 +1384,10 @@ mod tests {
             verified.authenticated().signer_principal(),
             "rust-principal"
         );
-        assert_eq!(verified.authenticated().signer_public_key(), frame.signer_pubkey);
+        assert_eq!(
+            verified.authenticated().signer_public_key(),
+            frame.signer_pubkey
+        );
         // Recompute the transported digest on every substitution: only the
         // original K1 signature must remain unable to authenticate these bytes.
         for field in 0..18 {

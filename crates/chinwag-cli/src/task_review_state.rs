@@ -210,6 +210,7 @@ pub enum ReconciliationDispositionV1 {
     UnknownStateHeld,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 enum EventV1 {
@@ -656,10 +657,10 @@ impl ReviewStateStoreV1 {
         {
             return Err(ReviewStateError::CorruptState);
         }
-        if let Some(h) = event_highwater(&record.event) {
-            if !self.highwater.permits(h) {
-                return Err(ReviewStateError::HighwaterRollback);
-            }
+        if let Some(h) = event_highwater(&record.event)
+            && !self.highwater.permits(h)
+        {
+            return Err(ReviewStateError::HighwaterRollback);
         }
         match &record.event {
             EventV1::Assignment(a) => {
@@ -910,14 +911,13 @@ impl ReviewStateStoreV1 {
                 candidate: c,
                 transition: t,
             } = &record.event
+                && t.payload.next == transition.payload.next
             {
-                if t.payload.next == transition.payload.next {
-                    return if c == candidate && t == transition {
-                        Ok(())
-                    } else {
-                        Err(ReviewStateError::ReplayConflict)
-                    };
-                }
+                return if c == candidate && t == transition {
+                    Ok(())
+                } else {
+                    Err(ReviewStateError::ReplayConflict)
+                };
             }
         }
         self.append(
@@ -931,11 +931,11 @@ impl ReviewStateStoreV1 {
     fn find_reservation(&self, next: &ReservedV1) -> Result<Option<&ReservedV1>, ReviewStateError> {
         let mut found = None;
         for record in &self.records {
-            if let EventV1::Reserved(old) = &record.event {
-                if old.as_ref() == next {
-                    found = Some(old.as_ref());
-                    continue;
-                }
+            if let EventV1::Reserved(old) = &record.event
+                && old.as_ref() == next
+            {
+                found = Some(old.as_ref());
+                continue;
             }
             if event_approvals(&record.event)
                 .iter()
@@ -978,6 +978,7 @@ impl ReviewStateStoreV1 {
     /// Only an exact durable reserved cohort may use its authenticated prior
     /// boundary. ROOT must supply freshly qualified current observations here;
     /// historical signatures alone do not establish external host freshness.
+    #[allow(dead_code)]
     pub(crate) fn revalidate_reserved_cohort(
         &mut self,
         p: &TrustedFixtureVerifier,
@@ -1170,13 +1171,11 @@ impl ReviewStateStoreV1 {
                 evidence,
                 highwater,
             } = &record.event
+                && bundle.as_ref() == t.signed_bundle()
+                && evidence.as_ref() == t.evidence()
+                && *highwater == t.highwater()
             {
-                if bundle.as_ref() == t.signed_bundle()
-                    && evidence.as_ref() == t.evidence()
-                    && *highwater == t.highwater()
-                {
-                    return Ok(());
-                }
+                return Ok(());
             }
         }
         if t.provenance() != &self.provenance {

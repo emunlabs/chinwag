@@ -7,8 +7,6 @@ pub mod agent_instance;
 #[cfg(target_os = "macos")]
 pub mod task_acceptance;
 #[cfg(target_os = "macos")]
-pub mod task_review_state;
-#[cfg(target_os = "macos")]
 pub mod task_dependency;
 #[cfg(target_os = "macos")]
 pub mod task_legacy;
@@ -16,6 +14,8 @@ pub mod task_legacy;
 pub mod task_normalization;
 #[cfg(target_os = "macos")]
 pub mod task_ref;
+#[cfg(target_os = "macos")]
+pub mod task_review_state;
 #[cfg(target_os = "macos")]
 pub mod task_source;
 #[cfg(target_os = "macos")]

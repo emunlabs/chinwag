@@ -185,6 +185,15 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
     }
 }
 
+fn jcs_sorted_object(obj: &serde_json::Map<String, Value>, omit: &[&str]) -> Option<String> {
+    let sorted: std::collections::BTreeMap<&str, &Value> = obj
+        .iter()
+        .filter(|(k, _)| !omit.contains(&k.as_str()))
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    serde_json::to_string(&sorted).ok()
+}
+
 fn canonical_plugin_manifest_payload(v: &Value) -> Option<String> {
     let obj = v.as_object()?;
     if obj.get("schema")?.as_str()? != "chinwag-plugin-manifest/v1" {
@@ -207,10 +216,7 @@ fn canonical_plugin_manifest_payload(v: &Value) -> Option<String> {
     let _invariants = obj.get("invariants")?.as_array()?;
     let _egress = obj.get("egress_allowlist")?.as_array()?;
 
-    let mut stripped = obj.clone();
-    stripped.remove("payload_sha256");
-    stripped.remove("signature_ed25519");
-    let jcs = serde_json::to_string(&Value::Object(stripped)).ok()?;
+    let jcs = jcs_sorted_object(obj, &["payload_sha256", "signature_ed25519"])?;
     Some(format!("chinwag-plugin-manifest-sig-v2|{jcs}"))
 }
 
@@ -633,10 +639,7 @@ fn canonical_cwcard_payload(v: &Value) -> Option<String> {
     let _signer_seat = obj.get("signer_seat")?.as_str()?;
     let _signer_pubkey = obj.get("signer_pubkey_ed25519")?.as_str()?;
 
-    let mut stripped = obj.clone();
-    stripped.remove("payload_sha256");
-    stripped.remove("signature_ed25519");
-    let jcs = serde_json::to_string(&Value::Object(stripped)).ok()?;
+    let jcs = jcs_sorted_object(obj, &["payload_sha256", "signature_ed25519"])?;
     Some(format!("chinwag-cwcard-envelope-sig-v1|{jcs}"))
 }
 
@@ -868,10 +871,7 @@ fn canonical_bond_payload(v: &Value) -> Option<String> {
     let _signer_seat = obj.get("signer_seat")?.as_str()?;
     let _signer_pubkey = obj.get("signer_pubkey_ed25519")?.as_str()?;
 
-    let mut stripped = obj.clone();
-    stripped.remove("payload_sha256");
-    stripped.remove("signature_ed25519");
-    let jcs = serde_json::to_string(&Value::Object(stripped)).ok()?;
+    let jcs = jcs_sorted_object(obj, &["payload_sha256", "signature_ed25519"])?;
     Some(format!("chinwag-triple-b-bond-sig-v2|{jcs}"))
 }
 

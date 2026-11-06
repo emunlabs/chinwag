@@ -80,7 +80,9 @@ pub fn encode_checked_rev(revision: u64) -> Result<[u8; 8], TaskContractError> {
 
 pub fn checked_next_revision(revision: u64) -> Result<u64, TaskContractError> {
     encode_checked_rev(revision)?;
-    revision.checked_add(1).filter(|next| *next <= MAX_REV_COUNTER)
+    revision
+        .checked_add(1)
+        .filter(|next| *next <= MAX_REV_COUNTER)
         .ok_or(TaskContractError::RevisionExhausted)
 }
 
@@ -253,8 +255,13 @@ pub fn validate_id(value: &str, field: &'static str) -> Result<(), TaskContractE
 /// `DependencySourceBinding` / `WorkspaceTaskPolicy`.
 pub fn validate_workspace_id(value: &str) -> Result<(), TaskContractError> {
     validate_id(value, "workspace_id")?;
-    if value.chars().any(|character| character.is_whitespace() || character.is_control())
-        || value == "." || value == ".." || value.starts_with('~') || value.contains(['/', '\\'])
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+        || value == "."
+        || value == ".."
+        || value.starts_with('~')
+        || value.contains(['/', '\\'])
     {
         return Err(TaskContractError::InvalidField("workspace_id"));
     }
@@ -262,7 +269,11 @@ pub fn validate_workspace_id(value: &str) -> Result<(), TaskContractError> {
 }
 
 pub fn validate_task_source_id(value: &str) -> Result<(), TaskContractError> {
-    if value.len() != 32 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(TaskContractError::InvalidField("task_source_id"));
     }
     Ok(())
@@ -272,15 +283,21 @@ pub fn validate_canonical_task_path(value: &str) -> Result<(), TaskContractError
     if value.len() > MAX_CANONICAL_PATH_BYTES {
         return Err(TaskContractError::LimitExceeded("canonical_task_path"));
     }
-    if value.is_empty() || value.starts_with('/')
-        || value.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n' | b'\\'))
+    if value.is_empty()
+        || value.starts_with('/')
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, 0 | b'\r' | b'\n' | b'\\'))
     {
         return Err(TaskContractError::InvalidField("canonical_task_path"));
     }
     if value.split('/').count() > MAX_DESCENT_COMPONENTS {
         return Err(TaskContractError::LimitExceeded("canonical_task_path"));
     }
-    if value.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+    if value
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
         return Err(TaskContractError::InvalidField("canonical_task_path"));
     }
     Ok(())
@@ -425,7 +442,9 @@ impl<'a> CanonicalDecoder<'a> {
             return Err(TaskContractError::InvalidDigestType);
         }
         let bytes = self.bytes(32)?;
-        let raw = bytes.try_into().map_err(|_| TaskContractError::InvalidDigestType)?;
+        let raw = bytes
+            .try_into()
+            .map_err(|_| TaskContractError::InvalidDigestType)?;
         Ok(Sha256Digest(raw))
     }
 
@@ -461,8 +480,14 @@ impl<'a> CanonicalDecoder<'a> {
         let algorithm = self.bytes(10)?;
         let raw = self.bytes(32)?;
         match algorithm {
-            b"git-sha1" => Ok(GitOid::Sha1(raw.try_into().map_err(|_| TaskContractError::InvalidGitOid)?)),
-            b"git-sha256" => Ok(GitOid::Sha256(raw.try_into().map_err(|_| TaskContractError::InvalidGitOid)?)),
+            b"git-sha1" => Ok(GitOid::Sha1(
+                raw.try_into()
+                    .map_err(|_| TaskContractError::InvalidGitOid)?,
+            )),
+            b"git-sha256" => Ok(GitOid::Sha256(
+                raw.try_into()
+                    .map_err(|_| TaskContractError::InvalidGitOid)?,
+            )),
             _ => Err(TaskContractError::InvalidGitOid),
         }
     }
@@ -647,11 +672,19 @@ mod tests {
         assert_eq!(hex(&encode_u64(0)), "0000000000000000");
         assert_eq!(hex(&encode_u64(1)), "0000000000000001");
         assert_eq!(hex(&encode_str_field("é")), "0000000000000002c3a9");
-        assert_eq!(hex(&encode_str_field("e\u{0301}")), "000000000000000365cc81");
+        assert_eq!(
+            hex(&encode_str_field("e\u{0301}")),
+            "000000000000000365cc81"
+        );
         assert_eq!(hex(&encode_opt::<str>(None, encode_str_field)), "00");
-        assert_eq!(hex(&encode_opt(Some("x"), encode_str_field)), "01000000000000000178");
-        assert_eq!(hex(&encode_list(&["a", "b"], |s| encode_str_field(s)).unwrap()),
-            "0000000000000002000000000000000161000000000000000162");
+        assert_eq!(
+            hex(&encode_opt(Some("x"), encode_str_field)),
+            "01000000000000000178"
+        );
+        assert_eq!(
+            hex(&encode_list(&["a", "b"], |s| encode_str_field(s)).unwrap()),
+            "0000000000000002000000000000000161000000000000000162"
+        );
     }
 
     #[test]
@@ -659,21 +692,26 @@ mod tests {
         let reference = fixture();
         let encoded = reference.encode().unwrap();
         assert_eq!(encoded.len(), 268);
-        assert_eq!(hex(&encoded), concat!(
-            "6368696e7761672d7461736b7265662d763100",
-            "000000000000001470302d666978747572652d776f726b7370616365",
-            "000000000000000f70302d666978747572652d7265706f",
-            "00000000000000203030303030303030303030303030303030303030303030303030303030303031",
-            "000000000000000100000000000000085441534b532e6d64",
-            "000000000000000c50302d464958545552452d31",
-            "00000000000000067368613235360000000000000020",
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "00000000000000000000000000000000",
-            "00000000000000086769742d736861310000000000000014",
-            "c4f8395af729fd7aecf5365f6a4b261a824d83ce"
-        ));
-        assert_eq!(reference.task_ref_digest().unwrap().to_string(),
-            "ac2421645d450eebef30a65a069427ecf86a32952faa647fa29babe9cdcef997");
+        assert_eq!(
+            hex(&encoded),
+            concat!(
+                "6368696e7761672d7461736b7265662d763100",
+                "000000000000001470302d666978747572652d776f726b7370616365",
+                "000000000000000f70302d666978747572652d7265706f",
+                "00000000000000203030303030303030303030303030303030303030303030303030303030303031",
+                "000000000000000100000000000000085441534b532e6d64",
+                "000000000000000c50302d464958545552452d31",
+                "00000000000000067368613235360000000000000020",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "00000000000000000000000000000000",
+                "00000000000000086769742d736861310000000000000014",
+                "c4f8395af729fd7aecf5365f6a4b261a824d83ce"
+            )
+        );
+        assert_eq!(
+            reference.task_ref_digest().unwrap().to_string(),
+            "ac2421645d450eebef30a65a069427ecf86a32952faa647fa29babe9cdcef997"
+        );
     }
 
     #[test]
@@ -685,29 +723,55 @@ mod tests {
             assert!(TaskRefV1::decode(&encoded[..length]).is_err());
         }
         encoded.push(0);
-        assert_eq!(TaskRefV1::decode(&encoded), Err(TaskContractError::TrailingBytes));
+        assert_eq!(
+            TaskRefV1::decode(&encoded),
+            Err(TaskContractError::TrailingBytes)
+        );
         encoded[0] ^= 1;
-        assert_eq!(TaskRefV1::decode(&encoded), Err(TaskContractError::InvalidDomain));
+        assert_eq!(
+            TaskRefV1::decode(&encoded),
+            Err(TaskContractError::InvalidDomain)
+        );
     }
 
     #[test]
     fn p0_contract_decoder_rejects_huge_lengths_invalid_utf8_and_tags() {
         let huge = u64::MAX.to_be_bytes();
-        assert!(matches!(CanonicalDecoder::new(&huge).bytes(256),
-            Err(TaskContractError::LimitExceeded(_))));
-        assert!(matches!(CanonicalDecoder::new(&huge).list(|d| d.u64()),
-            Err(TaskContractError::LimitExceeded(_))));
+        assert!(matches!(
+            CanonicalDecoder::new(&huge).bytes(256),
+            Err(TaskContractError::LimitExceeded(_))
+        ));
+        assert!(matches!(
+            CanonicalDecoder::new(&huge).list(|d| d.u64()),
+            Err(TaskContractError::LimitExceeded(_))
+        ));
         let invalid = encode_bytes_field(&[0xff]);
-        assert_eq!(CanonicalDecoder::new(&invalid).string(256), Err(TaskContractError::InvalidUtf8));
-        assert_eq!(CanonicalDecoder::new(&[2]).optional(|d| d.u64()), Err(TaskContractError::InvalidOptionTag));
+        assert_eq!(
+            CanonicalDecoder::new(&invalid).string(256),
+            Err(TaskContractError::InvalidUtf8)
+        );
+        assert_eq!(
+            CanonicalDecoder::new(&[2]).optional(|d| d.u64()),
+            Err(TaskContractError::InvalidOptionTag)
+        );
     }
 
     #[test]
     fn p0_contract_primitive_decoder_roundtrips_option_and_list() {
         let absent = encode_opt::<str>(None, encode_str_field);
         let present = encode_opt(Some("x"), encode_str_field);
-        assert_eq!(CanonicalDecoder::new(&absent).optional(|d| d.string(256)).unwrap(), None);
-        assert_eq!(CanonicalDecoder::new(&present).optional(|d| d.string(256)).unwrap(), Some("x".into()));
+        assert_eq!(
+            CanonicalDecoder::new(&absent)
+                .optional(|d| d.string(256))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            CanonicalDecoder::new(&present)
+                .optional(|d| d.string(256))
+                .unwrap(),
+            Some("x".into())
+        );
         let list = encode_list(&["a", "é"], |s| encode_str_field(s)).unwrap();
         let mut decoder = CanonicalDecoder::new(&list);
         assert_eq!(decoder.list(|d| d.string(256)).unwrap(), vec!["a", "é"]);
@@ -719,13 +783,22 @@ mod tests {
         let hex_digest = "Ab".repeat(32);
         let digest = Sha256Digest::from_hex(&hex_digest).unwrap();
         assert_eq!(digest.to_string(), "ab".repeat(32));
-        assert_eq!(CanonicalDecoder::new(&digest.encode_typed()).sha256_digest().unwrap(), digest);
+        assert_eq!(
+            CanonicalDecoder::new(&digest.encode_typed())
+                .sha256_digest()
+                .unwrap(),
+            digest
+        );
         for oid in [GitOid::Sha1([7; 20]), GitOid::Sha256([7; 32])] {
             let encoded = oid.encode_typed();
             assert_eq!(CanonicalDecoder::new(&encoded).git_oid().unwrap(), oid);
             assert!(CanonicalDecoder::new(&encoded).sha256_digest().is_err());
         }
-        assert!(CanonicalDecoder::new(&digest.encode_typed()).git_oid().is_err());
+        assert!(
+            CanonicalDecoder::new(&digest.encode_typed())
+                .git_oid()
+                .is_err()
+        );
         for bad in ["", "abc", &"z".repeat(64), &"0".repeat(63)] {
             assert!(Sha256Digest::from_hex(bad).is_err());
             assert!(GitOid::from_hex(bad).is_err());
@@ -736,7 +809,11 @@ mod tests {
     fn p0_contract_typed_encodings_reject_wrong_lengths_and_algorithms() {
         let mut wrong_length = encode_str_field("sha256");
         wrong_length.extend(encode_bytes_field(&[0; 31]));
-        assert!(CanonicalDecoder::new(&wrong_length).sha256_digest().is_err());
+        assert!(
+            CanonicalDecoder::new(&wrong_length)
+                .sha256_digest()
+                .is_err()
+        );
         let mut unknown = encode_str_field("git-md5");
         unknown.extend(encode_bytes_field(&[0; 20]));
         assert!(CanonicalDecoder::new(&unknown).git_oid().is_err());
@@ -748,9 +825,18 @@ mod tests {
     #[test]
     fn p0_contract_revision_counter_i64_max_exhaustion_held() {
         assert!(encode_checked_rev(MAX_REV_COUNTER).is_ok());
-        assert_eq!(checked_next_revision(MAX_REV_COUNTER - 1).unwrap(), MAX_REV_COUNTER);
-        assert_eq!(checked_next_revision(MAX_REV_COUNTER), Err(TaskContractError::RevisionExhausted));
-        assert_eq!(encode_checked_rev(MAX_REV_COUNTER + 1), Err(TaskContractError::RevisionExhausted));
+        assert_eq!(
+            checked_next_revision(MAX_REV_COUNTER - 1).unwrap(),
+            MAX_REV_COUNTER
+        );
+        assert_eq!(
+            checked_next_revision(MAX_REV_COUNTER),
+            Err(TaskContractError::RevisionExhausted)
+        );
+        assert_eq!(
+            encode_checked_rev(MAX_REV_COUNTER + 1),
+            Err(TaskContractError::RevisionExhausted)
+        );
         for field in 0..3 {
             let mut reference = fixture();
             match field {
@@ -758,13 +844,22 @@ mod tests {
                 1 => reference.task_status_rev = MAX_REV_COUNTER + 1,
                 _ => reference.file_cas_rev = MAX_REV_COUNTER + 1,
             }
-            assert_eq!(reference.encode(), Err(TaskContractError::RevisionExhausted));
+            assert_eq!(
+                reference.encode(),
+                Err(TaskContractError::RevisionExhausted)
+            );
         }
         let mut reference = fixture();
         reference.task_status_rev = MAX_REV_COUNTER;
-        assert_eq!(advance_task_revision(&reference, true), Err(TaskContractError::RevisionExhausted));
+        assert_eq!(
+            advance_task_revision(&reference, true),
+            Err(TaskContractError::RevisionExhausted)
+        );
         reference.file_cas_rev = MAX_REV_COUNTER;
-        assert_eq!(advance_task_revision(&reference, false), Err(TaskContractError::RevisionExhausted));
+        assert_eq!(
+            advance_task_revision(&reference, false),
+            Err(TaskContractError::RevisionExhausted)
+        );
     }
 
     #[test]
@@ -793,9 +888,23 @@ mod tests {
         for bad in ["", " task", "task\t", "task\r\n", "ta\0sk"] {
             assert!(validate_id(bad, "task_id").is_err());
         }
-        for bad in ["", "/abs", "a//b", "./TASKS.md", "../TASKS.md", "a/../b", "a/./b", "a\\b", "a\rb", "a\nb", "a\0b"] {
-            assert_eq!(validate_canonical_task_path(bad),
-                Err(TaskContractError::InvalidField("canonical_task_path")));
+        for bad in [
+            "",
+            "/abs",
+            "a//b",
+            "./TASKS.md",
+            "../TASKS.md",
+            "a/../b",
+            "a/./b",
+            "a\\b",
+            "a\rb",
+            "a\nb",
+            "a\0b",
+        ] {
+            assert_eq!(
+                validate_canonical_task_path(bad),
+                Err(TaskContractError::InvalidField("canonical_task_path"))
+            );
         }
         assert!(validate_canonical_task_path(&"a".repeat(MAX_CANONICAL_PATH_BYTES)).is_ok());
         assert!(validate_canonical_task_path(&"a".repeat(MAX_CANONICAL_PATH_BYTES + 1)).is_err());
@@ -807,19 +916,42 @@ mod tests {
 
     #[test]
     fn p0_contract_workspace_id_opaque_bounded_and_enrollment_external() {
-        for valid in ["workspace.v1", "urn:workspace:fixture", "workspace@fixture", "localhost"] {
+        for valid in [
+            "workspace.v1",
+            "urn:workspace:fixture",
+            "workspace@fixture",
+            "localhost",
+        ] {
             assert_eq!(validate_workspace_id(valid), Ok(()));
             let mut reference = fixture();
             reference.workspace_id = valid.into();
-            assert_eq!(TaskRefV1::decode(&reference.encode().unwrap()).unwrap(), reference);
+            assert_eq!(
+                TaskRefV1::decode(&reference.encode().unwrap()).unwrap(),
+                reference
+            );
         }
-        for bad in ["", ".", "..", "~/ws", "a/b", "a\\b", "ws with space", "ws\tname", "ws\u{00a0}name", "ws\u{001b}name"] {
-            assert_eq!(validate_workspace_id(bad),
-                Err(TaskContractError::InvalidField("workspace_id")));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "~/ws",
+            "a/b",
+            "a\\b",
+            "ws with space",
+            "ws\tname",
+            "ws\u{00a0}name",
+            "ws\u{001b}name",
+        ] {
+            assert_eq!(
+                validate_workspace_id(bad),
+                Err(TaskContractError::InvalidField("workspace_id"))
+            );
         }
         assert_eq!(validate_workspace_id(&"é".repeat(128)), Ok(()));
-        assert_eq!(validate_workspace_id(&"é".repeat(129)),
-            Err(TaskContractError::LimitExceeded("workspace_id")));
+        assert_eq!(
+            validate_workspace_id(&"é".repeat(129)),
+            Err(TaskContractError::LimitExceeded("workspace_id"))
+        );
     }
 
     #[test]
@@ -835,17 +967,24 @@ mod tests {
         let exact = format!("{}TASKS.md", "a/".repeat(MAX_DESCENT_COMPONENTS - 1));
         assert_eq!(validate_canonical_task_path(&exact), Ok(()));
         let too_deep = format!("a/{exact}");
-        assert_eq!(validate_canonical_task_path(&too_deep),
-            Err(TaskContractError::LimitExceeded("canonical_task_path")));
+        assert_eq!(
+            validate_canonical_task_path(&too_deep),
+            Err(TaskContractError::LimitExceeded("canonical_task_path"))
+        );
     }
 
     #[test]
     fn p0_contract_sorted_sets_reject_duplicates_and_bound_lists() {
         let a = encode_str_field("a");
         let b = encode_str_field("b");
-        assert_eq!(encode_sorted_distinct_set(vec![b.clone(), a.clone()]).unwrap(),
-            encode_list(&[a.clone(), b], Clone::clone).unwrap());
-        assert_eq!(encode_sorted_distinct_set(vec![a.clone(), a]), Err(TaskContractError::DuplicateSetItem));
+        assert_eq!(
+            encode_sorted_distinct_set(vec![b.clone(), a.clone()]).unwrap(),
+            encode_list(&[a.clone(), b], Clone::clone).unwrap()
+        );
+        assert_eq!(
+            encode_sorted_distinct_set(vec![a.clone(), a]),
+            Err(TaskContractError::DuplicateSetItem)
+        );
         assert!(encode_list(&vec![0; MAX_LIST_ITEMS + 1], |_| vec![]).is_err());
         assert!(encode_sorted_distinct_set(vec![vec![]; MAX_LIST_ITEMS + 1]).is_err());
         assert!(encode_list(&vec![0; MAX_LIST_ITEMS], |_| vec![0]).is_ok());
@@ -854,14 +993,22 @@ mod tests {
     #[test]
     fn p0_contract_set_decoder_rejects_unsorted_and_duplicate_bytes() {
         let canonical = encode_list(&["a", "b"], |s| encode_str_field(s)).unwrap();
-        assert_eq!(CanonicalDecoder::new(&canonical)
-            .sorted_distinct_set(|d| d.string(256)).unwrap(), vec!["a", "b"]);
+        assert_eq!(
+            CanonicalDecoder::new(&canonical)
+                .sorted_distinct_set(|d| d.string(256))
+                .unwrap(),
+            vec!["a", "b"]
+        );
         let unsorted = encode_list(&["b", "a"], |s| encode_str_field(s)).unwrap();
-        assert_eq!(CanonicalDecoder::new(&unsorted).sorted_distinct_set(|d| d.string(256)),
-            Err(TaskContractError::InvalidSetOrder));
+        assert_eq!(
+            CanonicalDecoder::new(&unsorted).sorted_distinct_set(|d| d.string(256)),
+            Err(TaskContractError::InvalidSetOrder)
+        );
         let duplicate = encode_list(&["a", "a"], |s| encode_str_field(s)).unwrap();
-        assert_eq!(CanonicalDecoder::new(&duplicate).sorted_distinct_set(|d| d.string(256)),
-            Err(TaskContractError::DuplicateSetItem));
+        assert_eq!(
+            CanonicalDecoder::new(&duplicate).sorted_distinct_set(|d| d.string(256)),
+            Err(TaskContractError::DuplicateSetItem)
+        );
     }
 
     #[test]
@@ -871,7 +1018,10 @@ mod tests {
         reference.source_generation = 0;
         reference.task_status_rev = MAX_REV_COUNTER;
         reference.file_cas_rev = MAX_REV_COUNTER;
-        assert_eq!(TaskRefV1::decode(&reference.encode().unwrap()).unwrap(), reference);
+        assert_eq!(
+            TaskRefV1::decode(&reference.encode().unwrap()).unwrap(),
+            reference
+        );
         let mut bytes = reference.encode().unwrap();
         let generation_offset = TASK_REF_V1_DOMAIN.len()
             + encode_str_field(&reference.workspace_id).len()
@@ -879,24 +1029,42 @@ mod tests {
             + encode_str_field(&reference.task_source_id).len();
         bytes[generation_offset..generation_offset + 8]
             .copy_from_slice(&(MAX_REV_COUNTER + 1).to_be_bytes());
-        assert_eq!(TaskRefV1::decode(&bytes), Err(TaskContractError::RevisionExhausted));
+        assert_eq!(
+            TaskRefV1::decode(&bytes),
+            Err(TaskContractError::RevisionExhausted)
+        );
     }
 
     #[test]
     fn p0_contract_unrelated_file_rebase_bounded_and_status_conflicts() {
         let admitted = fixture();
-        assert_eq!(check_cas_eligibility(&admitted, &admitted, 0).unwrap(), CasEligibility::Exact);
+        assert_eq!(
+            check_cas_eligibility(&admitted, &admitted, 0).unwrap(),
+            CasEligibility::Exact
+        );
         let unrelated = advance_task_revision(&admitted, false).unwrap();
         assert_eq!(unrelated.task_status_rev, admitted.task_status_rev);
         for used in 0..MAX_UNRELATED_FILE_REBASES {
-            assert_eq!(check_cas_eligibility(&admitted, &unrelated, used).unwrap(), CasEligibility::UnrelatedFileRebase);
+            assert_eq!(
+                check_cas_eligibility(&admitted, &unrelated, used).unwrap(),
+                CasEligibility::UnrelatedFileRebase
+            );
         }
-        assert_eq!(check_cas_eligibility(&admitted, &unrelated, 2), Err(TaskContractError::RebaseLimitExceeded));
+        assert_eq!(
+            check_cas_eligibility(&admitted, &unrelated, 2),
+            Err(TaskContractError::RebaseLimitExceeded)
+        );
         let changed = advance_task_revision(&admitted, true).unwrap();
         assert_eq!(changed.file_cas_rev, 1);
         assert_eq!(changed.task_status_rev, 1);
-        assert_eq!(check_cas_eligibility(&admitted, &changed, 0), Err(TaskContractError::TaskStatusConflict));
-        assert_eq!(check_cas_eligibility(&unrelated, &admitted, 0), Err(TaskContractError::FileRevisionConflict));
+        assert_eq!(
+            check_cas_eligibility(&admitted, &changed, 0),
+            Err(TaskContractError::TaskStatusConflict)
+        );
+        assert_eq!(
+            check_cas_eligibility(&unrelated, &admitted, 0),
+            Err(TaskContractError::FileRevisionConflict)
+        );
     }
 
     #[test]
@@ -910,10 +1078,16 @@ mod tests {
                 2 => changed.baseline_commit = GitOid::Sha1([1; 20]),
                 _ => changed.canonical_task_path = "tasks/TASKS.md".into(),
             }
-            assert_eq!(check_cas_eligibility(&admitted, &changed, 0), Err(TaskContractError::AcceptanceInvalidated));
+            assert_eq!(
+                check_cas_eligibility(&admitted, &changed, 0),
+                Err(TaskContractError::AcceptanceInvalidated)
+            );
         }
         let mut changed = admitted.clone();
         changed.task_id = "another-task".into();
-        assert_eq!(check_cas_eligibility(&admitted, &changed, 0), Err(TaskContractError::IdentityConflict));
+        assert_eq!(
+            check_cas_eligibility(&admitted, &changed, 0),
+            Err(TaskContractError::IdentityConflict)
+        );
     }
 }

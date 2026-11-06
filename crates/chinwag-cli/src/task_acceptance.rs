@@ -732,10 +732,10 @@ impl TrustedFixtureVerifier {
     pub(crate) fn provenance(&self) -> &FixtureProvenanceV1 {
         &self.provenance
     }
-    fn check_mode<'a, P: LegacyReviewVerifierProvider>(
-        p: &'a P,
+    fn check_mode<P: LegacyReviewVerifierProvider>(
+        p: &P,
         mode: LegacyReviewProfileMode,
-    ) -> Result<&'a Self, AcceptanceError> {
+    ) -> Result<&Self, AcceptanceError> {
         if mode == LegacyReviewProfileMode::ProductionHeld {
             return Err(AcceptanceError::UnsupportedLegacyReviewProfileHeld);
         }
