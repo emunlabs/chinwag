@@ -8,7 +8,9 @@ use crate::task_dependency::{
     DependencyNode, DependencySourceBinding, ResolvedDependency, TaskStatus,
     validate_dependency_graph, validate_dependency_satisfaction,
 };
-use crate::task_ref::{MAX_REV_COUNTER, Sha256Digest, TaskKey, TaskRefV1, validate_id};
+use crate::task_ref::{
+    MAX_REV_COUNTER, Sha256Digest, TaskContractError, TaskKey, TaskRefV1, validate_id,
+};
 use crate::task_scheduler_journal::{
     MAX_SCHEDULER_FILE_BYTES, MAX_SCHEDULER_RECORD_BYTES, MAX_SCHEDULER_RECORDS, SchedulerJournal,
 };
@@ -43,6 +45,7 @@ pub enum SchedulerError {
     UnsupportedAdapters,
     Grant,
     Dependency,
+    DependencyBlocked(DependencyBlockReason),
     NoEligibleTask,
     NotFairTurn,
     Capacity,
@@ -57,6 +60,27 @@ impl std::fmt::Display for SchedulerError {
     }
 }
 impl std::error::Error for SchedulerError {}
+
+/// Observational diagnostics for one affected full TaskKey, never admission
+/// authority. Structural closure errors are reported before completion checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyBlockReason {
+    UnresolvedTarget {
+        target: TaskKey,
+    },
+    SourceUnavailable {
+        target: TaskKey,
+        state: TaskSourceState,
+    },
+    Cycle,
+    InvalidGraph(TaskContractError),
+    UnacceptedCompletion {
+        target: TaskKey,
+    },
+    UnsatisfiedCommitment {
+        target: TaskKey,
+    },
+}
 
 type Result<T> = std::result::Result<T, SchedulerError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +351,8 @@ pub struct WorkspaceScheduler {
     assignments: BTreeMap<String, Assignment>,
     max_time: u64,
     catalog: BTreeMap<TaskKey, CatalogTask>,
+    unavailable_sources: BTreeMap<String, TaskSourceState>,
+    blocked_dependencies: BTreeMap<TaskKey, DependencyBlockReason>,
 }
 impl WorkspaceScheduler {
     pub fn open(directory: &File, policy: &WorkspaceTaskPolicy) -> Result<Self> {
@@ -352,6 +378,8 @@ impl WorkspaceScheduler {
             assignments: BTreeMap::new(),
             max_time: 0,
             catalog: BTreeMap::new(),
+            unavailable_sources: BTreeMap::new(),
+            blocked_dependencies: BTreeMap::new(),
         };
         let mut replay_bytes = 0usize;
         for (index, b) in records.into_iter().enumerate() {
@@ -542,6 +570,7 @@ impl WorkspaceScheduler {
         result
     }
     pub fn synchronize_sources(&mut self, registry: &WorkspaceSourceRegistry) -> Result<()> {
+        self.blocked_dependencies.clear();
         if Policy::from(registry.policy()) != self.policy {
             return Err(SchedulerError::PolicyChanged);
         }
@@ -549,6 +578,10 @@ impl WorkspaceScheduler {
             .verify()
             .map_err(|e| SchedulerError::Journal(e.to_string()))?;
         let mut catalog = BTreeMap::new();
+        let mut unavailable_sources: BTreeMap<_, _> = registry
+            .sources()
+            .map(|s| (s.task_source_id.clone(), s.state))
+            .collect();
         for source in registry
             .sources()
             .filter(|r| r.state == TaskSourceState::Enrolled)
@@ -566,6 +599,7 @@ impl WorkspaceScheduler {
             {
                 continue;
             }
+            unavailable_sources.remove(&source.task_source_id);
             for entry in &doc.tasks {
                 let reference = doc.task_ref(entry, &source.canonical_relative_path);
                 catalog.insert(
@@ -605,6 +639,7 @@ impl WorkspaceScheduler {
             self.append(Data::Graph { digest })?;
         }
         self.catalog = catalog;
+        self.unavailable_sources = unavailable_sources;
         Ok(())
     }
     fn now(&self, a: &CurrentAuthority<'_>) -> Result<u64> {
@@ -635,29 +670,58 @@ impl WorkspaceScheduler {
             if !seen.insert(k.clone()) {
                 continue;
             }
-            let n = self.catalog.get(&k).ok_or(SchedulerError::Dependency)?;
+            let n = self
+                .catalog
+                .get(&k)
+                .ok_or_else(|| self.missing_dependency(&k))?;
             nodes.push(DependencyNode {
                 task_ref: n.reference.clone(),
                 completion_policy_digest: n.entry.completion_policy_digest,
                 dependencies: n.entry.dependencies.clone(),
             });
             for d in &n.entry.dependencies {
+                if !self.catalog.contains_key(&d.target_key) {
+                    return Err(self.missing_dependency(&d.target_key));
+                }
+                pending.push(d.target_key.clone());
+            }
+        }
+        validate_dependency_graph(&nodes).map_err(|error| {
+            SchedulerError::DependencyBlocked(
+                if error == TaskContractError::DependencyCycleDetected {
+                    DependencyBlockReason::Cycle
+                } else {
+                    DependencyBlockReason::InvalidGraph(error)
+                },
+            )
+        })?;
+        for n in &nodes {
+            for d in &n.dependencies {
                 let resolved = self
                     .catalog
                     .get(&d.target_key)
-                    .ok_or(SchedulerError::Dependency)?;
-                let status = TaskStatus::parse(resolved.entry.status.as_str())
-                    .map_err(|_| SchedulerError::Dependency)?;
-                let accepted = p
-                    .accepted_dependencies
-                    .get(&d.target_key)
-                    .ok_or(SchedulerError::Dependency)?;
+                    .ok_or_else(|| self.missing_dependency(&d.target_key))?;
+                let status =
+                    TaskStatus::parse(resolved.entry.status.as_str()).map_err(|error| {
+                        SchedulerError::DependencyBlocked(DependencyBlockReason::InvalidGraph(
+                            error,
+                        ))
+                    })?;
+                let accepted = p.accepted_dependencies.get(&d.target_key).ok_or_else(|| {
+                    SchedulerError::DependencyBlocked(DependencyBlockReason::UnacceptedCompletion {
+                        target: d.target_key.clone(),
+                    })
+                })?;
                 if accepted.reference != resolved.reference
                     || accepted.controls != resolved.entry.task_control_digest
                     || accepted.policy != resolved.entry.completion_policy_digest
                     || accepted.verified_acceptance == Sha256Digest([0; 32])
                 {
-                    return Err(SchedulerError::Dependency);
+                    return Err(SchedulerError::DependencyBlocked(
+                        DependencyBlockReason::UnacceptedCompletion {
+                            target: d.target_key.clone(),
+                        },
+                    ));
                 }
                 validate_dependency_satisfaction(
                     d,
@@ -666,14 +730,43 @@ impl WorkspaceScheduler {
                         completion_policy_digest: resolved.entry.completion_policy_digest,
                         status,
                     },
-                    &DependencySourceBinding::from_task_ref(&resolved.reference)
-                        .map_err(|_| SchedulerError::Dependency)?,
+                    &DependencySourceBinding::from_task_ref(&resolved.reference).map_err(
+                        |error| {
+                            SchedulerError::DependencyBlocked(DependencyBlockReason::InvalidGraph(
+                                error,
+                            ))
+                        },
+                    )?,
                 )
-                .map_err(|_| SchedulerError::Dependency)?;
-                pending.push(d.target_key.clone());
+                .map_err(|_| {
+                    SchedulerError::DependencyBlocked(
+                        DependencyBlockReason::UnsatisfiedCommitment {
+                            target: d.target_key.clone(),
+                        },
+                    )
+                })?;
             }
         }
-        validate_dependency_graph(&nodes).map_err(|_| SchedulerError::Dependency)
+        Ok(())
+    }
+    fn missing_dependency(&self, target: &TaskKey) -> SchedulerError {
+        SchedulerError::DependencyBlocked(
+            match self.unavailable_sources.get(&target.task_source_id) {
+                Some(state) => DependencyBlockReason::SourceUnavailable {
+                    target: target.clone(),
+                    state: *state,
+                },
+                None => DependencyBlockReason::UnresolvedTarget {
+                    target: target.clone(),
+                },
+            },
+        )
+    }
+    /// Latest selection's explicit dependency holds, keyed by the complete
+    /// affected TaskKey. Refresh with select_next[_for_trigger] or admit; these
+    /// diagnostics confer no grant and are cleared by source synchronization.
+    pub fn dependency_blocked_reasons(&self) -> &BTreeMap<TaskKey, DependencyBlockReason> {
+        &self.blocked_dependencies
     }
     fn available(&self, r: &AssignmentRequest, p: &ControlledProfile) -> Result<()> {
         self.available_except(r, p, None)
@@ -745,6 +838,14 @@ impl WorkspaceScheduler {
         Ok(g)
     }
     pub fn select_next(&mut self, a: &CurrentAuthority<'_>) -> Result<SelectedTask> {
+        self.select_next_for_trigger(AdmissionTrigger::Manual, a)
+    }
+    pub fn select_next_for_trigger(
+        &mut self,
+        trigger: AdmissionTrigger,
+        a: &CurrentAuthority<'_>,
+    ) -> Result<SelectedTask> {
+        self.blocked_dependencies.clear();
         self.trusted_store(a)?;
         self.synchronize_sources(a.registry)?;
         let now = self.now(a)?;
@@ -760,9 +861,22 @@ impl WorkspaceScheduler {
             }) {
                 continue;
             }
-            let Ok(g) = self.grant(t, p, now) else {
-                continue;
+            let g = match self.grant(t, p, now) {
+                Ok(grant) => grant,
+                Err(SchedulerError::DependencyBlocked(reason)) => {
+                    self.blocked_dependencies.insert(k.clone(), reason);
+                    continue;
+                }
+                Err(_) => continue,
             };
+            if matches!(trigger, AdmissionTrigger::Timer | AdmissionTrigger::Event)
+                && t.source
+                    .controls
+                    .check_automatic_dispatch_admission(&g.action)
+                    .is_err()
+            {
+                continue;
+            }
             let r = AssignmentRequest {
                 action: g.action.clone(),
                 executor_actor: g.executor.clone(),
@@ -887,8 +1001,16 @@ impl WorkspaceScheduler {
                 Err(SchedulerError::ReplayConflict)
             };
         }
-        let selected = self.select_next(a)?;
+        let selected = match self.select_next_for_trigger(trigger, a) {
+            Ok(selected) => Some(selected),
+            Err(SchedulerError::NoEligibleTask) => None,
+            Err(error) => return Err(error),
+        };
+        // Preserve the submitted task's specific refusal even when its trigger
+        // has no eligible fair turn. Only the ordinary no-turn case is deferred;
+        // journal, clock and authority errors above are never masked.
         let e = self.eligible(m, trigger, a)?;
+        let selected = selected.ok_or(SchedulerError::NoEligibleTask)?;
         if self
             .assignments
             .values()
@@ -1083,6 +1205,13 @@ mod tests {
             Self::with_auto(sources, true)
         }
         fn with_auto(sources: Vec<Vec<TaskEntrySnapshotV1>>, automatic: bool) -> Self {
+            let automatic = vec![automatic; sources.len()];
+            Self::with_automatic_sources(sources, automatic)
+        }
+        fn with_automatic_sources(
+            sources: Vec<Vec<TaskEntrySnapshotV1>>,
+            automatic: Vec<bool>,
+        ) -> Self {
             let root = TempDir::new().unwrap();
             let store = TempDir::new().unwrap();
             fs::set_permissions(store.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1165,7 +1294,7 @@ mod tests {
                             mode: SourceExecutionMode::Implementation,
                             implementation_authorized: true,
                             deployment_authorized: false,
-                            automatic_dispatch: automatic,
+                            automatic_dispatch: automatic[index],
                             allowed_actions: vec!["implement".into()],
                         },
                     })
@@ -1674,6 +1803,153 @@ mod tests {
             admitted.status("one-workspace"),
             Some(AdmissionStatus::Claimed)
         );
+    }
+    #[test]
+    fn p007_qa_regression_automatic_turn_skips_manual_only_source_across_reopen() {
+        for trigger in [AdmissionTrigger::Timer, AdmissionTrigger::Event] {
+            let mut f = Fixture::with_automatic_sources(
+                vec![vec![entry("A1")], vec![entry("B1")]],
+                vec![false, true],
+            );
+            let b = f
+                .profile
+                .grants
+                .keys()
+                .find(|k| k.task_id == "B1")
+                .unwrap()
+                .clone();
+            f.profile.grants.get_mut(&b).unwrap().resource = "other".into();
+            let mut s = f.open();
+            assert_eq!(
+                s.select_next(&f.authority(150)).unwrap().task_ref.task_id,
+                "A1"
+            );
+            let m = message(&s, &f, &b, "automatic-B", |_| {});
+            drop(s);
+            let mut s = f.open();
+            assert!(s.last_source.is_none());
+            assert_eq!(
+                s.select_next(&f.authority(150)).unwrap().task_ref.task_id,
+                "A1"
+            );
+            let result = s.admit(&m, trigger, &f.authority(150));
+            assert!(
+                matches!(result, Ok(AdmissionDisposition::Claimed(_))),
+                "manual-only A must not block automatic B"
+            );
+        }
+    }
+    fn dependency_to(source: usize, id: &str) -> DependencyCommitment {
+        DependencyCommitment {
+            target_key: TaskKey::new("scheduler-fixture", format!("{source:032x}"), id).unwrap(),
+            target_spec_digest: Sha256Digest::of(id.as_bytes()),
+            completion_policy_digest: Sha256Digest([3; 32]),
+        }
+    }
+    #[test]
+    fn p007_qa_regression_unresolved_target_has_exact_reason_without_blocking_other_source() {
+        let mut blocked = entry("A1");
+        let dependency = dependency_to(3, "MISSING");
+        blocked.dependencies.push(dependency.clone());
+        let f = Fixture::new(vec![vec![blocked], vec![entry("B1")]]);
+        let mut s = f.open();
+        assert_eq!(
+            s.select_next(&f.authority(150)).unwrap().task_ref.task_id,
+            "B1"
+        );
+        let task = s
+            .catalog
+            .values()
+            .find(|t| t.entry.task_id == "A1")
+            .unwrap();
+        let reason = format!("{:?}", s.dependencies(task, &f.profile));
+        assert!(
+            reason.contains("UnresolvedTarget")
+                && reason.contains("MISSING")
+                && reason.contains(&dependency.target_key.task_source_id),
+            "exact target reason required: {reason}"
+        );
+        assert_eq!(
+            s.dependency_blocked_reasons()
+                .get(&task.reference.task_key()),
+            Some(&DependencyBlockReason::UnresolvedTarget {
+                target: dependency.target_key
+            })
+        );
+        assert_eq!(s.dependency_blocked_reasons().len(), 1);
+    }
+    #[test]
+    fn p007_qa_regression_removed_target_has_exact_reason_without_blocking_other_source() {
+        let mut blocked = entry("A1");
+        let dependency = dependency_to(2, "DONE");
+        blocked.dependencies.push(dependency.clone());
+        let mut done = entry("DONE");
+        done.status = CanonicalTaskStatus::Done;
+        let mut f = Fixture::new(vec![vec![blocked], vec![done], vec![entry("C1")]]);
+        f.registry
+            .transition_source(
+                &dependency.target_key.task_source_id,
+                TaskSourceState::Retired,
+            )
+            .unwrap();
+        let mut s = f.open();
+        assert_eq!(
+            s.select_next(&f.authority(150)).unwrap().task_ref.task_id,
+            "C1"
+        );
+        let task = s
+            .catalog
+            .values()
+            .find(|t| t.entry.task_id == "A1")
+            .unwrap();
+        let reason = format!("{:?}", s.dependencies(task, &f.profile));
+        assert!(
+            reason.contains("SourceUnavailable")
+                && reason.contains("Retired")
+                && reason.contains("DONE")
+                && reason.contains(&dependency.target_key.task_source_id),
+            "removed source reason required: {reason}"
+        );
+        assert_eq!(
+            s.dependency_blocked_reasons()
+                .get(&task.reference.task_key()),
+            Some(&DependencyBlockReason::SourceUnavailable {
+                target: dependency.target_key,
+                state: TaskSourceState::Retired
+            })
+        );
+        assert_eq!(s.dependency_blocked_reasons().len(), 1);
+    }
+    #[test]
+    fn p007_qa_regression_cycle_has_reason_without_blocking_other_source() {
+        let mut a1 = entry("A1");
+        let mut a2 = entry("A2");
+        a1.dependencies.push(dependency_to(1, "A2"));
+        a2.dependencies.push(dependency_to(1, "A1"));
+        let f = Fixture::new(vec![vec![a1, a2], vec![entry("B1")]]);
+        let mut s = f.open();
+        assert_eq!(
+            s.select_next(&f.authority(150)).unwrap().task_ref.task_id,
+            "B1"
+        );
+        let task = s
+            .catalog
+            .values()
+            .find(|t| t.entry.task_id == "A1")
+            .unwrap();
+        let reason = format!("{:?}", s.dependencies(task, &f.profile));
+        assert!(
+            reason.contains("Cycle"),
+            "cycle must not collapse into generic dependency failure: {reason}"
+        );
+        for id in ["A1", "A2"] {
+            let key = TaskKey::new("scheduler-fixture", format!("{:032x}", 1), id).unwrap();
+            assert_eq!(
+                s.dependency_blocked_reasons().get(&key),
+                Some(&DependencyBlockReason::Cycle)
+            );
+        }
+        assert_eq!(s.dependency_blocked_reasons().len(), 2);
     }
     #[test]
     fn p007_original_outcome_for_another_operation_cannot_release_unknown_claim() {

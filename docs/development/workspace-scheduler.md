@@ -16,6 +16,10 @@ This first profile conservatively refuses another assignment for a completed Tas
 
 Ordinary sources receive round-robin turns in canonical source-ID order. Within each source, the scheduler retains first-seen task order. The cursor advances only with the durable admitted claim. A blocked source does not prevent an eligible source with nonconflicting resources from proceeding. Manual requests have no implicit priority exception.
 
+Selection uses the requested trigger. Timer and event selection skip sources that permit only manual dispatch; manual selection keeps its ordinary shared-ledger fairness. `select_next_for_trigger` exposes that decision, while `select_next` retains manual selection.
+
+`dependency_blocked_reasons` exposes the latest selection's dependency holds by full TaskKey, including unresolved targets, unavailable source states, cycles and missing or mismatched accepted completion evidence. Unaffected eligible tasks can still proceed. These are observations, cleared on source synchronization and refreshed by selection or admission; they confer no grant.
+
 The scheduler's locked local journal is authoritative for its original admissions and cursor; replicas remain observations. Records and total journal size are bounded. Failed or ambiguous persistence cannot return a usable claim or reopen as an empty authority. Protected file/directory identity and sync checks are part of the journal boundary; ordinary path checks are not claims of arbitrary same-user process containment.
 
 ## Current CLI boundary
