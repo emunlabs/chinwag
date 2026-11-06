@@ -443,8 +443,12 @@ impl RegisteredExpectation {
         store: &mut impl ConsumerOutcomeStore,
     ) -> Result<Self, DeliveryError> {
         let key = original.commitment()?;
-        if provider.verified_now()? != original.created_at {
-            return Err(DeliveryError::Correlation);
+        let now = provider.verified_now()?;
+        if now < original.created_at {
+            return Err(DeliveryError::ClockRollback);
+        }
+        if now > original.deadline {
+            return Err(DeliveryError::Expired);
         }
         let record = OutcomeRecord {
             schema: "chinwag.consumer-outcome.v1".into(),
@@ -799,6 +803,45 @@ mod tests {
         };
         e.signature = host.key.sign(e.signing_payload().as_bytes()).to_bytes();
         e
+    }
+
+    #[test]
+    fn consumer01_registration_accepts_verified_time_within_original_window() {
+        let (mut host, mut store, original) = fixture();
+        for now in [
+            original.original.created_at + 10,
+            original.original.deadline,
+        ] {
+            host.now = Ok(now);
+            let mut expectation = original.original.clone();
+            expectation.id = format!("delayed-registration-{now}");
+            let registered =
+                RegisteredExpectation::register(expectation.clone(), &host, &mut store).unwrap();
+            let reopened = RegisteredExpectation::reopen(registered.key(), &store).unwrap();
+            assert_eq!(reopened.original, expectation);
+        }
+    }
+
+    #[test]
+    fn consumer01_registration_rejects_outside_original_window_without_writing() {
+        let (mut host, mut store, original) = fixture();
+        let prior_writes = store.writes;
+        for (now, error) in [
+            (
+                original.original.created_at - 1,
+                DeliveryError::ClockRollback,
+            ),
+            (original.original.deadline + 1, DeliveryError::Expired),
+        ] {
+            host.now = Ok(now);
+            let mut expectation = original.original.clone();
+            expectation.id = format!("invalid-registration-{now}");
+            assert!(matches!(
+                RegisteredExpectation::register(expectation, &host, &mut store),
+                Err(actual) if actual == error
+            ));
+        }
+        assert_eq!(store.writes, prior_writes);
     }
 
     #[test]
