@@ -120,6 +120,7 @@ impl Fixture {
                 binding: row.binding.clone(),
                 generation: row.generation,
                 receipt: format!("quiescent-{id}-{}", row.generation),
+                phase_revision: row.phase_revision,
             },
         );
     }
@@ -162,6 +163,161 @@ fn request(scopes: Vec<ResourceScope>) -> LeaseRequest {
 fn unknown() -> InvocationOutcome {
     InvocationOutcome::Unknown {
         reason: "fixture-reply-lost".into(),
+    }
+}
+
+fn stale_retirement_must_not_release_later_effect(late_delivery: bool) {
+    let f = Fixture::new((11, 22));
+    f.write("x", b"original");
+    let a = f.assignment("a");
+    let mut store = f.open();
+    let cap = f.acquire(&mut store, &a, request(vec![file("x")]));
+    f.prove_retired(&store, "a");
+    let old = f
+        .retired
+        .borrow()
+        .get(&a.binding().operation)
+        .unwrap()
+        .clone();
+    if late_delivery {
+        f.retired.borrow_mut().remove(&a.binding().operation);
+    }
+    let calls = Cell::new(0);
+    store
+        .invoke(cap, &a, &f.authority(), |writer| {
+            calls.set(calls.get() + 1);
+            writer.write_file(0, b"later uncertain effect").unwrap();
+            unknown()
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 1);
+    if late_delivery {
+        f.retired
+            .borrow_mut()
+            .insert(a.binding().operation.clone(), old);
+    }
+    assert_eq!(store.status("a"), Some(LeaseStatus::Unknown));
+    assert!(
+        matches!(
+            store.reconcile_original("a", &f.authority()),
+            Err(LeaseError::Authority)
+        ),
+        "a pre-invocation quiescence witness cannot retire later uncertain effects"
+    );
+    let b = f.assignment("b");
+    f.register(&b);
+    assert!(matches!(
+        store.prepare(&b, request(vec![file("x")]), &f.authority()),
+        Err(LeaseError::Conflict)
+    ));
+    drop(store);
+    let mut reopened = f.open();
+    assert!(matches!(
+        reopened.reconcile_original("a", &f.authority()),
+        Err(LeaseError::Authority)
+    ));
+    f.prove_retired(&reopened, "a");
+    assert_eq!(
+        reopened.reconcile_original("a", &f.authority()).unwrap(),
+        LeaseStatus::Retired
+    );
+    assert!(matches!(
+        reopened
+            .prepare(&b, request(vec![file("x")]), &f.authority())
+            .unwrap(),
+        LeasePreparation::Prepared(_)
+    ));
+}
+#[test]
+fn p008_stale_retirement_cached_before_invocation_cannot_release_unknown() {
+    stale_retirement_must_not_release_later_effect(false);
+}
+#[test]
+fn p008_stale_retirement_delivered_after_invocation_cannot_release_unknown() {
+    stale_retirement_must_not_release_later_effect(true);
+}
+
+#[test]
+fn p008_stale_retirement_before_checked_write_is_fenced_by_durable_write_phase() {
+    let f = Fixture::new((11, 22));
+    f.write("x", b"before");
+    let a = f.assignment("a");
+    let mut store = f.open();
+    let cap = f.acquire(&mut store, &a, request(vec![file("x")]));
+    store
+        .invoke(cap, &a, &f.authority(), |writer| {
+            f.prove_retired(writer.store, "a");
+            let before = writer.store.rows["a"].phase_revision;
+            writer.write_file(0, b"after phase witness").unwrap();
+            assert!(writer.store.rows["a"].phase_revision > before);
+            assert!(matches!(
+                writer.store.reconcile_original("a", &f.authority()),
+                Err(LeaseError::Authority)
+            ));
+            unknown()
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read(f.root.path().join("x")).unwrap(),
+        b"after phase witness"
+    );
+    assert!(matches!(
+        store.reconcile_original("a", &f.authority()),
+        Err(LeaseError::Authority)
+    ));
+}
+
+#[test]
+fn p008_retirement_record_replay_validates_witnessed_predecessor_phase() {
+    for forged in [false, true] {
+        let f = Fixture::new((11, 22));
+        f.write("x", b"before");
+        let a = f.assignment("a");
+        let mut store = f.open();
+        let cap = f.acquire(&mut store, &a, request(vec![file("x")]));
+        let stale = store.rows["a"].phase_revision;
+        store
+            .invoke(cap, &a, &f.authority(), |writer| {
+                writer.write_file(0, b"effect").unwrap();
+                unknown()
+            })
+            .unwrap();
+        if forged {
+            let mut row = store.rows["a"].clone();
+            row.status = LeaseStatus::Retired;
+            row.retirement = Some("stale-phase-receipt".into());
+            row.retirement_phase_revision = Some(stale);
+            row.phase_revision = store.next_revision;
+            let record = Record {
+                revision: store.next_revision,
+                data: Data::Lease {
+                    row: Box::new(row),
+                    observed: 100,
+                },
+            };
+            let bytes = serde_json::to_vec(&record).unwrap();
+            drop(store);
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(f.store.path().join("repository-resource-leases-v1.ndjson"))
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+            file.write_all(b"\n").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            assert!(matches!(
+                ResourceLeaseStore::open(&f.store_fd, f.policy.clone()),
+                Err(LeaseError::Authority)
+            ));
+        } else {
+            let predecessor = store.rows["a"].phase_revision;
+            f.prove_retired(&store, "a");
+            store.reconcile_original("a", &f.authority()).unwrap();
+            assert_eq!(store.rows["a"].retirement_phase_revision, Some(predecessor));
+            assert!(store.rows["a"].phase_revision > predecessor);
+            drop(store);
+            assert_eq!(f.open().status("a"), Some(LeaseStatus::Retired));
+        }
     }
 }
 

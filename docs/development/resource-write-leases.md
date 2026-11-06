@@ -20,6 +20,8 @@ Acquire the complete scope set deterministically. A conflict cannot leave a part
 
 The existing `chinwag-claim` maximum TTL remains **120 seconds**. Expiry fences further protected writes; it does not establish that a previous executor or filesystem writer retired. Conflicting work remains held until the admitted retirement protocol proves a safe transfer. A PID observation, cancellation, status change or caller-provided quiescent label supplies no such proof.
 
+Retirement evidence also names the exact current durable lease phase. Invocation and checked-write records advance that phase. A proof made before a later effect cannot release that effect's UNKNOWN reservation, including when the old proof arrives late. The retirement record retains its witnessed predecessor phase for replay validation.
+
 ## Protected effects and limits
 
 The supported invocation boundary requires the original scheduler capability and a committed lease capability. Before each protected effect, revalidate current authority, generation, owner, original assignment/deadline and filesystem scope. A protected writer must not expose writable handles that escape those checks. Replacement must retain the pathname reservation and old/new alias evidence through any uncertain outcome.

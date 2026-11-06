@@ -19,11 +19,11 @@ pub mod task_normalization;
 #[cfg(target_os = "macos")]
 pub mod task_ref;
 #[cfg(target_os = "macos")]
-pub mod task_review_state;
-#[cfg(target_os = "macos")]
 pub mod task_resource_lease;
 #[cfg(target_os = "macos")]
 pub(crate) mod task_resource_path;
+#[cfg(target_os = "macos")]
+pub mod task_review_state;
 #[cfg(target_os = "macos")]
 pub mod task_scheduler;
 #[cfg(target_os = "macos")]

@@ -111,12 +111,16 @@ struct LeaseRow {
     expires: u64,
     status: LeaseStatus,
     retirement: Option<String>,
+    phase_revision: u64,
+    retirement_phase_revision: Option<u64>,
 }
 impl LeaseRow {
     fn immutable(&self) -> Self {
         let mut r = self.clone();
         r.status = LeaseStatus::Prepared;
         r.retirement = None;
+        r.phase_revision = 0;
+        r.retirement_phase_revision = None;
         r
     }
 }
@@ -178,6 +182,7 @@ struct RetirementWitness {
     binding: QualifiedLeaseBinding,
     generation: u64,
     receipt: String,
+    phase_revision: u64,
 }
 pub struct CurrentLeaseAuthority<'a> {
     profile: Option<ControlledAuthority<'a>>,
@@ -404,7 +409,7 @@ impl ResourceLeaseStore {
                 generation,
                 observed,
             } => {
-                let row = self.rows.get(id).ok_or(LeaseError::Invalid)?;
+                let row = self.rows.get_mut(id).ok_or(LeaseError::Invalid)?;
                 if r.revision == 1
                     || row.status != LeaseStatus::Bound
                     || row.generation != *generation
@@ -415,9 +420,11 @@ impl ResourceLeaseStore {
                     return Err(LeaseError::Invalid);
                 }
                 self.max_time = *observed;
+                row.phase_revision = r.revision;
             }
             Data::Lease { row, observed } => {
                 if r.revision == 1
+                    || row.phase_revision != r.revision
                     || !binding_valid(&row.binding)
                     || row.binding.repo != self.policy.repo_id
                     || row.binding.authority_epoch != self.policy.authority_epoch
@@ -436,6 +443,11 @@ impl ResourceLeaseStore {
                     return Err(LeaseError::Invalid);
                 }
                 if let Some(old) = self.rows.get(&row.id) {
+                    if row.status == LeaseStatus::Retired
+                        && row.retirement_phase_revision != Some(old.phase_revision)
+                    {
+                        return Err(LeaseError::Authority);
+                    }
                     if old.immutable() != row.immutable()
                         || !matches!(
                             (old.status, row.status),
@@ -480,6 +492,9 @@ impl ResourceLeaseStore {
                 if (row.status == LeaseStatus::Retired) != row.retirement.is_some() {
                     return Err(LeaseError::Invalid);
                 }
+                if (row.status == LeaseStatus::Retired) != row.retirement_phase_revision.is_some() {
+                    return Err(LeaseError::Invalid);
+                }
                 self.rows.insert(row.id.clone(), row.as_ref().clone());
                 self.max_time = *observed;
             }
@@ -490,7 +505,10 @@ impl ResourceLeaseStore {
             .ok_or(LeaseError::Invalid)?;
         Ok(())
     }
-    fn append(&mut self, data: Data) -> Result<()> {
+    fn append(&mut self, mut data: Data) -> Result<()> {
+        if let Data::Lease { row, .. } = &mut data {
+            row.phase_revision = self.next_revision;
+        }
         let r = Record {
             revision: self.next_revision,
             data,
@@ -726,6 +744,8 @@ impl ResourceLeaseStore {
             expires,
             status: LeaseStatus::Prepared,
             retirement: None,
+            phase_revision: 0,
+            retirement_phase_revision: None,
         };
         let prepared = PreparedLease {
             id: row.id.clone(),
@@ -864,12 +884,14 @@ impl ResourceLeaseStore {
             .ok_or(LeaseError::Unknown)?;
         if evidence.binding != row.binding
             || evidence.generation != row.generation
+            || evidence.phase_revision != row.phase_revision
             || validate_id(&evidence.receipt, "retirement receipt").is_err()
         {
             return Err(LeaseError::Authority);
         }
         row.status = LeaseStatus::Retired;
         row.retirement = Some(evidence.receipt);
+        row.retirement_phase_revision = Some(evidence.phase_revision);
         self.append(Data::Lease {
             row: Box::new(row),
             observed: now,
