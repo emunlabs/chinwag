@@ -794,6 +794,8 @@ mod agent_dispatch_run;
 #[cfg(target_os = "macos")]
 mod deepseek_pool;
 #[cfg(target_os = "macos")]
+pub mod hosted_agent;
+#[cfg(target_os = "macos")]
 pub mod seat_signing;
 #[cfg(target_os = "macos")]
 pub use agent_dispatch_run::run_agent_dispatch;
