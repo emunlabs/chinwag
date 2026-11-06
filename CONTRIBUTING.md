@@ -1,4 +1,4 @@
-# Contributing to Chinwag & Contributor License Policy
+# Contributing to Chinwag & Developer Certificate of Origin (DCO)
 
 **Corporate Steward:** `Emun Labs, Inc. · 1401 Lavaca St STE 81335, Austin, TX 78701`
 **Core Repository License:** `Apache License, Version 2.0` (`SPDX-License-Identifier: Apache-2.0`)
@@ -6,7 +6,7 @@
 
 Thank you for your interest in contributing to **Chinwag** (`emunlabs/chinwag`)—the local-first Multi-Agent Swarm Coordination Bus, Atomic Lease Engine, and Cryptographic Flight Recorder built in Rust.
 
-Because Chinwag is an **Open-Core** infrastructure project maintained by **Emun Labs, Inc.**, every contribution must satisfy our **Contributor License Grant**, **Developer Certificate of Origin (DCO 1.1)**, and **Cleanroom Architectural Invariant Gates** described below.
+Because Chinwag is an **Open-Core** infrastructure project maintained by **Emun Labs, Inc.**, every contribution must be certified under the **Developer Certificate of Origin (DCO 1.1)** and pass the **Cleanroom Architectural Invariant Gates** described below. Chinwag does **not** require a Contributor License Agreement (CLA); the DCO replaces it.
 
 ---
 
@@ -17,24 +17,35 @@ Because Chinwag is an **Open-Core** infrastructure project maintained by **Emun 
 
 ---
 
-## 2. Contributor License Agreement (CLA) & Developer Certificate of Origin (DCO 1.1)
+## 2. Developer Certificate of Origin (DCO 1.1)
 
-To keep contribution friction near zero while protecting both the Apache-2.0 commons and Emun Labs' ability to maintain commercial and enterprise distributions, **every Pull Request or patch submitted to `emunlabs/chinwag` is governed by the following two-part Contributor Policy**:
+Chinwag uses the [Developer Certificate of Origin](./DCO) instead of a Contributor License Agreement. There is no CLA to sign and no separate agreement to accept. Instead, every commit you submit must carry a `Signed-off-by:` line certifying that you wrote the change, or otherwise have the right to submit it, under the project's `Apache-2.0` license. Inbound contributions are licensed under the same `Apache-2.0` terms as the project (Apache License 2.0, Section 5).
 
-### 2.1 Inbound License Grant to Emun Labs, Inc.
-By submitting a Pull Request, commit, issue patch, or documentation change ("Contribution") to any repository owned by `Emun Labs, Inc.` (`emunlabs/*`):
+### 2.1 Sign Off Every Commit (`git commit -s`)
 
-1. **Apache-2.0 Section 5 Grant:** You grant to `Emun Labs, Inc.` and to recipients of software distributed by `Emun Labs, Inc.` a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable copyright license and patent license (as defined in Sections 2 and 3 of the Apache License, Version 2.0) to reproduce, prepare derivative works of, publicly display, publicly perform, sublicense, and distribute your Contribution and such derivative works.
-2. **Open-Core Commercial & Relicensing Right:** In addition to the Apache-2.0 grant above, you grant **`Emun Labs, Inc.` (`1401 Lavaca St STE 81335, Austin, TX 78701`)**, its successors, and assigns a **perpetual, worldwide, non-exclusive, transferable, no-charge, royalty-free, irrevocable copyright and patent license** to use, modify, distribute, and sublicense your Contribution as part of any open-source, dual-licensed, or commercial/proprietary product or service offered by `Emun Labs, Inc.` (including `chinwag.sh` Hosted Relay, Team Swarm Grid, and Enterprise editions), without any duty of accounting or attribution beyond listing in [`CONTRIBUTORS.md`](./CONTRIBUTORS.md).
-3. **AI-Assisted Contributions Permitted With Provenance:** Contributions written with the assistance of AI coding agents (Claude Code, Cursor, Codex, Grok, Gemini) are welcome—and encouraged to be coordinated via `chinwag` itself—provided you have reviewed the generated code, verified that it contains no third-party copyleft (`GPL`/`AGPL`) material, and take full DCO responsibility for the submission.
+Every commit in a Pull Request **must** include a `Signed-off-by:` trailer whose name and email match the commit author:
 
-### 2.2 Mandatory Developer Certificate of Origin (`Signed-off-by:` + SSH Signature)
-Every commit in a Pull Request **must** include both:
-1. A **`Signed-off-by:`** trailer (`git commit -s`) certifying the [Developer Certificate of Origin v1.1](https://developercertificate.org/):
-   ```text
-   Signed-off-by: Your Full Name <your.email@example.com>
-   ```
-2. A **cryptographic Git commit signature** (`git commit -S` using an Ed25519 SSH key; you can initialize local SSH commit signing automatically with `chinwag init --repo <path>`).
+```text
+Signed-off-by: Your Full Name <your.email@example.com>
+```
+
+Add it automatically with the `-s` (`--signoff`) flag:
+
+```bash
+git commit -s -m "fix(scope): short description"
+```
+
+Forgot to sign off? Fix the most recent commit with `git commit --amend -s --no-edit`, or an entire branch with `git rebase --signoff origin/main`, then `git push --force-with-lease`.
+
+By adding the `Signed-off-by:` line you certify the full text of the [DCO 1.1](./DCO) (also at <https://developercertificate.org/>). Pull Requests containing any commit without a valid sign-off will not be merged.
+
+### 2.2 Cryptographic Commit Signature
+
+In addition to the DCO sign-off, every commit must carry a **cryptographic Git commit signature** (`git commit -S` using an Ed25519 SSH key; you can initialize local SSH commit signing automatically with `chinwag init --repo <path>`). The sign-off (`-s`, a text trailer) and the signature (`-S`, a cryptographic seal) are independent; use both: `git commit -s -S`.
+
+### 2.3 AI-Assisted Contributions
+
+Contributions written with the assistance of AI coding agents (Claude Code, Cursor, Codex, Grok, Gemini) are welcome, and encouraged to be coordinated via `chinwag` itself, provided you have reviewed the generated code, verified that it contains no third-party copyleft (`GPL`/`AGPL`) material, and take full responsibility for the DCO certification by signing off. The `Signed-off-by:` line must name the human or accountable operator, not the tool.
 
 ---
 
