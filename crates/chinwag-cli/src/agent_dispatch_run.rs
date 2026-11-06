@@ -433,23 +433,21 @@ fn dispatch_to_engine(
                     Ok(hosted_reply) => {
                         return (hosted_reply.text, "hosted-agent-api");
                     }
-                    Err(err) if has_explicit_providers_file => {
+                    Err(err) => {
                         return (
                             format!("[{agent_upper} error]: {err}"),
                             "hosted-agent-error",
                         );
                     }
-                    Err(_) => {}
                 }
             }
             Ok(_) => {}
-            Err(err) if has_explicit_providers_file => {
+            Err(err) => {
                 return (
                     format!("[{agent_upper} error]: {err}"),
                     "hosted-agent-error",
                 );
             }
-            Err(_) => {}
         }
     }
 

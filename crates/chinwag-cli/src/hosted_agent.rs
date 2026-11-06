@@ -141,10 +141,10 @@ pub struct RunLimits {
 }
 
 fn default_max_turns() -> usize {
-    6
+    24
 }
 fn default_max_tool_calls() -> usize {
-    12
+    48
 }
 fn default_max_output_tokens() -> u32 {
     8192
