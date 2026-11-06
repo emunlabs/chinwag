@@ -2265,8 +2265,22 @@ mod tests {
             assert_eq!(stored[0].body, body);
             assert_eq!(fs::read(&tasks_path).unwrap(), sample.as_bytes());
             let after = fs::metadata(&tasks_path).unwrap();
-            assert_eq!((after.dev(), after.ino(), after.uid(), after.mode(), after.nlink()),
-                (before.dev(), before.ino(), before.uid(), before.mode(), before.nlink()));
+            assert_eq!(
+                (
+                    after.dev(),
+                    after.ino(),
+                    after.uid(),
+                    after.mode(),
+                    after.nlink()
+                ),
+                (
+                    before.dev(),
+                    before.ino(),
+                    before.uid(),
+                    before.mode(),
+                    before.nlink()
+                )
+            );
         }
     }
 

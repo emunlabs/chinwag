@@ -1824,7 +1824,9 @@ impl WriterCommitProof {
         Self::from_bound_record(record, lease, WriterProofOriginV1::Production)
     }
     fn from_bound_record(
-        record: &JournalRecordV1, lease: WriterLeaseV1, origin: WriterProofOriginV1,
+        record: &JournalRecordV1,
+        lease: WriterLeaseV1,
+        origin: WriterProofOriginV1,
     ) -> Result<Self, WriterError> {
         let prepared = record
             .prepared
@@ -1888,13 +1890,15 @@ pub fn validate_fixture_reviewed_proposal_payload(bytes: &[u8]) -> bool {
     if bytes.len() > 32_768 {
         return false;
     }
-    std::str::from_utf8(bytes).ok()
+    std::str::from_utf8(bytes)
+        .ok()
         .and_then(|raw| crate::task_acceptance::parse_signed_acceptance_bundle(raw).ok())
         .and_then(|bundle| serde_json::to_vec(&bundle).ok())
         .is_some_and(|canonical| canonical == bytes)
 }
 
-pub fn fixture_reviewed_proposal_payload_profile() -> crate::task_wire::RatifiedPayloadProfile<'static> {
+pub fn fixture_reviewed_proposal_payload_profile()
+-> crate::task_wire::RatifiedPayloadProfile<'static> {
     crate::task_wire::RatifiedPayloadProfile {
         kind: crate::task_wire::TaskMessageKind::TaskProposal,
         name: FIXTURE_REVIEWED_PROPOSAL_PROFILE,
@@ -2128,12 +2132,29 @@ pub fn commit_task_write(
         journal_phase(journal, &mut entry, WriteOperationState::Held)?;
         return Err(WriterError::SourceHeld);
     }
-    let mut authorization = ProductionCommitAuthorityV1 { context, request,
-        refresh: &mut refresh_authority, projection: &mut record_projection };
-    commit_planned_task_write(context, journal, entry, PlannedTaskMutationV1 {
-        target, stamp, hash, live, postimage, used, admitted_ref: admitted.clone(),
-        temp_name: format!(".chinwag-tmp-{}", request.operation_id),
-    }, &mut authorization, &mut hook)
+    let mut authorization = ProductionCommitAuthorityV1 {
+        context,
+        request,
+        refresh: &mut refresh_authority,
+        projection: &mut record_projection,
+    };
+    commit_planned_task_write(
+        context,
+        journal,
+        entry,
+        PlannedTaskMutationV1 {
+            target,
+            stamp,
+            hash,
+            live,
+            postimage,
+            used,
+            admitted_ref: admitted.clone(),
+            temp_name: format!(".chinwag-tmp-{}", request.operation_id),
+        },
+        &mut authorization,
+        &mut hook,
+    )
 }
 
 struct PlannedTaskMutationV1 {
@@ -2153,8 +2174,15 @@ struct PlannedTaskMutationV1 {
 trait PreparedCommitAuthorityV1 {
     fn before_replace(&mut self) -> Result<(), WriterError>;
     fn expected_projection(&self) -> Option<serde_json::Value>;
-    fn project(&mut self, record: &JournalRecordV1) -> Result<Option<serde_json::Value>, WriterError>;
-    fn finalize_recorded(&mut self, journal: &mut Journal, record: &JournalRecordV1) -> Result<WriterCommitProof, WriterError>;
+    fn project(
+        &mut self,
+        record: &JournalRecordV1,
+    ) -> Result<Option<serde_json::Value>, WriterError>;
+    fn finalize_recorded(
+        &mut self,
+        journal: &mut Journal,
+        record: &JournalRecordV1,
+    ) -> Result<WriterCommitProof, WriterError>;
 }
 
 struct ProductionCommitAuthorityV1<'a, 'root, F, P> {
@@ -2164,22 +2192,37 @@ struct ProductionCommitAuthorityV1<'a, 'root, F, P> {
     projection: &'a mut P,
 }
 impl<F, P> PreparedCommitAuthorityV1 for ProductionCommitAuthorityV1<'_, '_, F, P>
-where F: FnMut() -> Result<WriterAuthoritySnapshot, WriterError>,
-      P: FnMut(&WriterCommitProof) -> Result<(), WriterError> {
+where
+    F: FnMut() -> Result<WriterAuthoritySnapshot, WriterError>,
+    P: FnMut(&WriterCommitProof) -> Result<(), WriterError>,
+{
     fn before_replace(&mut self) -> Result<(), WriterError> {
         let current = (self.refresh)()?;
         self.context.lease.verify(&current)?;
         verify_proposal_fence(self.request.authority()?, &current)?;
         verify_current_review_grant(&self.request.authorization, &current)?;
-        verify_current_transition_grant(&self.request.authorization, self.request.next_status, &current)
+        verify_current_transition_grant(
+            &self.request.authorization,
+            self.request.next_status,
+            &current,
+        )
     }
-    fn expected_projection(&self) -> Option<serde_json::Value> { None }
-    fn project(&mut self, record: &JournalRecordV1) -> Result<Option<serde_json::Value>, WriterError> {
+    fn expected_projection(&self) -> Option<serde_json::Value> {
+        None
+    }
+    fn project(
+        &mut self,
+        record: &JournalRecordV1,
+    ) -> Result<Option<serde_json::Value>, WriterError> {
         let proof = WriterCommitProof::from_record(record)?;
         (self.projection)(&proof)?;
         Ok(None)
     }
-    fn finalize_recorded(&mut self, _journal: &mut Journal, record: &JournalRecordV1) -> Result<WriterCommitProof, WriterError> {
+    fn finalize_recorded(
+        &mut self,
+        _journal: &mut Journal,
+        record: &JournalRecordV1,
+    ) -> Result<WriterCommitProof, WriterError> {
         WriterCommitProof::from_record(record)
     }
 }
@@ -2192,7 +2235,16 @@ fn commit_planned_task_write(
     authorization: &mut impl PreparedCommitAuthorityV1,
     hook: &mut impl FnMut(WriterStep, &File, &str) -> Result<(), WriterError>,
 ) -> Result<WriterWriteOutcome, WriterError> {
-    let PlannedTaskMutationV1 { target, stamp, hash, live, postimage, used, admitted_ref, temp_name } = mutation;
+    let PlannedTaskMutationV1 {
+        target,
+        stamp,
+        hash,
+        live,
+        postimage,
+        used,
+        admitted_ref,
+        temp_name,
+    } = mutation;
     let lease = context.lease;
     let admitted = &admitted_ref;
     if entry.state == WriteOperationState::Received {
@@ -2235,7 +2287,11 @@ fn commit_planned_task_write(
     let expected_projection = authorization.expected_projection();
     let mut terminal = preflight.clone();
     terminal.state = WriteOperationState::Acknowledged;
-    terminal.result = Some(expected_projection.clone().unwrap_or_else(|| serde_json::json!({"disposition": "Acknowledged"})));
+    terminal.result = Some(
+        expected_projection
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"disposition": "Acknowledged"})),
+    );
     if let Err(error) = journal.preflight_record_size(&terminal) {
         journal_phase(journal, &mut entry, WriteOperationState::Rejected)?;
         return Err(error.into());
@@ -2391,13 +2447,26 @@ impl<'a> FixtureReviewWriterContextV1<'a> {
             return Err(WriterError::PolicyBindingMismatch);
         }
         PinnedTarget::open(writer.root, &writer.lease.canonical_relative_path)?;
-        let namespace = PinnedTarget::open(writer.root, &format!("{}/{}", fixture_namespace_relative_path, crate::task_review_state::REVIEW_STATE_FILE_NAME))?;
+        let namespace = PinnedTarget::open(
+            writer.root,
+            &format!(
+                "{}/{}",
+                fixture_namespace_relative_path,
+                crate::task_review_state::REVIEW_STATE_FILE_NAME
+            ),
+        )?;
         let stat = fstat(namespace.parent())?;
         let identity = FileStamp::of(&stat, writer.root.uid, true)?.identity;
         if (identity.dev, identity.ino) != (p.namespace_dev, p.namespace_ino)
             || stat.st_mode & 0o7777 != 0o700
-        { return Err(WriterError::PolicyBindingMismatch); }
-        Ok(Self { writer, verifier, namespace })
+        {
+            return Err(WriterError::PolicyBindingMismatch);
+        }
+        Ok(Self {
+            writer,
+            verifier,
+            namespace,
+        })
     }
     pub fn require_production(&self) -> Result<(), WriterError> {
         Err(WriterError::DoneRequiresP006ReviewAttestation)
@@ -2426,7 +2495,10 @@ pub struct FixtureReviewedWriteRequestV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum FixtureWriterDecisionV1 { ApprovedDone, RejectedBlocked }
+enum FixtureWriterDecisionV1 {
+    ApprovedDone,
+    RejectedBlocked,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2498,37 +2570,56 @@ impl FixtureWriterMetadataV1 {
     fn projection(&self) -> Result<serde_json::Value, WriterError> {
         let i = &self.intent;
         serde_json::to_value(FixtureWriterProjectionV1 {
-            schema: FIXTURE_PROJECTION_SCHEMA.into(), intent_digest: self.digest()?,
+            schema: FIXTURE_PROJECTION_SCHEMA.into(),
+            intent_digest: self.digest()?,
             operation_id: i.original_operation_id.clone(),
-            acceptance_digest: i.primary_acceptance_digest, candidate_digest: i.candidate_digest,
+            acceptance_digest: i.primary_acceptance_digest,
+            candidate_digest: i.candidate_digest,
             target_transition_id: i.target_transition_id.clone(),
             target_task_id: i.signed_task_ref.task_id.clone(),
-            target_task_status: i.target_task_status, target_task_status_rev: i.target_task_status_rev,
+            target_task_status: i.target_task_status,
+            target_task_status_rev: i.target_task_status_rev,
             committed_file_cas_rev: i.successor_file_rev,
-            committed_postimage_sha256: i.successor_sha256, committed_bytes: i.successor_bytes,
+            committed_postimage_sha256: i.successor_sha256,
+            committed_bytes: i.successor_bytes,
             fixture_provenance: i.fixture_provenance.clone(),
-        }).map_err(|_| WriterError::InvalidDocument)
+        })
+        .map_err(|_| WriterError::InvalidDocument)
     }
     fn request(&self) -> Result<JournalRequestV1, WriterError> {
         let i = &self.intent;
         let first = i.decisions.first().ok_or(WriterError::AuthorityMismatch)?;
         Ok(JournalRequestV1 {
-            workspace_id: self.lease.workspace_id.clone(), task_source_id: self.lease.task_source_id.clone(),
-            operation_id: i.original_operation_id.clone(), signer_principal: first.reviewer_principal.clone(),
-            request_id: i.request_message_id.clone(), request_digest: self.digest()?.0, nonce: first.nonce,
-            writer_epoch: i.writer_epoch, signed_task_ref: i.signed_task_ref.encode()?,
+            workspace_id: self.lease.workspace_id.clone(),
+            task_source_id: self.lease.task_source_id.clone(),
+            operation_id: i.original_operation_id.clone(),
+            signer_principal: first.reviewer_principal.clone(),
+            request_id: i.request_message_id.clone(),
+            request_digest: self.digest()?.0,
+            nonce: first.nonce,
+            writer_epoch: i.writer_epoch,
+            signed_task_ref: i.signed_task_ref.encode()?,
             metadata: serde_json::to_value(self).map_err(|_| WriterError::InvalidDocument)?,
         })
     }
-    fn reservation(&self) -> Result<crate::task_review_state::ReviewReservationRequestV1, WriterError> {
+    fn reservation(
+        &self,
+    ) -> Result<crate::task_review_state::ReviewReservationRequestV1, WriterError> {
         let i = &self.intent;
         Ok(crate::task_review_state::ReviewReservationRequestV1 {
-            original_operation_id: i.original_operation_id.clone(), assignment_id: i.assignment_id.clone(),
-            target_transition_id: i.target_transition_id.clone(), request_digest: self.digest()?,
-            predecessor_sha256: i.predecessor_sha256, successor_sha256: i.successor_sha256,
-            predecessor_bytes: i.predecessor_bytes, successor_bytes: i.successor_bytes,
-            predecessor_file_rev: i.predecessor_file_rev, successor_file_rev: i.successor_file_rev,
-            writer_epoch: i.writer_epoch, authority_epoch: i.authority_epoch, maximum_outcome_bytes: 4096,
+            original_operation_id: i.original_operation_id.clone(),
+            assignment_id: i.assignment_id.clone(),
+            target_transition_id: i.target_transition_id.clone(),
+            request_digest: self.digest()?,
+            predecessor_sha256: i.predecessor_sha256,
+            successor_sha256: i.successor_sha256,
+            predecessor_bytes: i.predecessor_bytes,
+            successor_bytes: i.successor_bytes,
+            predecessor_file_rev: i.predecessor_file_rev,
+            successor_file_rev: i.successor_file_rev,
+            writer_epoch: i.writer_epoch,
+            authority_epoch: i.authority_epoch,
+            maximum_outcome_bytes: 4096,
         })
     }
 }
@@ -2554,226 +2645,391 @@ struct FixtureWriterProjectionV1 {
     fixture_provenance: FixtureProvenanceV1,
 }
 
-fn fixture_error(_: impl fmt::Debug) -> WriterError { WriterError::AcceptanceInvalidated }
+fn fixture_error(_: impl fmt::Debug) -> WriterError {
+    WriterError::AcceptanceInvalidated
+}
 
 fn fixture_proposal_identity(
-    writer: &WriterContextV1<'_>, p: &FixtureProposalObservationV1,
+    writer: &WriterContextV1<'_>,
+    p: &FixtureProposalObservationV1,
 ) -> Result<FixtureDecisionIdentityV1, WriterError> {
-    use crate::task_wire::{TaskActionableBodyV1, TaskMessageKind, RatifiedPayloadProfile};
-    crate::task_acceptance::fixture_statement("bounded-writer-bundle-evidence", &(&p.bundle, &p.evidence)).map_err(fixture_error)?;
+    use crate::task_wire::{RatifiedPayloadProfile, TaskActionableBodyV1, TaskMessageKind};
+    crate::task_acceptance::fixture_statement(
+        "bounded-writer-bundle-evidence",
+        &(&p.bundle, &p.evidence),
+    )
+    .map_err(fixture_error)?;
     let auth = p.envelope.authenticated();
     let t = auth.transcript();
     let a = &p.bundle.acceptance.payload;
     let profiles = [RatifiedPayloadProfile {
-        kind: TaskMessageKind::TaskProposal, name: FIXTURE_REVIEWED_PROPOSAL_PROFILE,
+        kind: TaskMessageKind::TaskProposal,
+        name: FIXTURE_REVIEWED_PROPOSAL_PROFILE,
         validate_canonical_payload: validate_fixture_reviewed_proposal_payload,
     }];
     if t.message_kind != TaskMessageKind::TaskProposal {
         return Err(WriterError::AuthorityMismatch);
     }
-    let body = TaskActionableBodyV1::parse(&t.body_utf8, t.message_kind, &profiles).map_err(fixture_error)?;
+    let body = TaskActionableBodyV1::parse(&t.body_utf8, t.message_kind, &profiles)
+        .map_err(fixture_error)?;
     if body.payload_profile != FIXTURE_REVIEWED_PROPOSAL_PROFILE
         || body.canonical_payload != serde_json::to_vec(&p.bundle).map_err(fixture_error)?
         || auth.signer_principal() != a.reviewer_principal
         || auth.signer_public_key().as_bytes() != &p.bundle.acceptance.reviewer_k1.public_key
         || auth.signer_public_key().as_bytes() != &p.bundle.review.k1_pubkey
         || t.sender_full_actor_address != a.reviewer_full_instance
-        || t.task_ref != a.task_ref || t.assignment_id.as_deref() != Some(a.assignment_id.as_str())
+        || t.task_ref != a.task_ref
+        || t.assignment_id.as_deref() != Some(a.assignment_id.as_str())
         || t.operation_id.as_deref() != Some(a.operation_id.as_str())
         || t.config_digest.0 != writer.lease.config_digest
-        || t.task_control_digest != a.task_control_digest || t.nonce != a.nonce
-        || t.issued_at_unix != a.issued_at_unix || t.expires_at_unix != a.expires_at_unix
-    { return Err(WriterError::AuthorityMismatch); }
+        || t.task_control_digest != a.task_control_digest
+        || t.nonce != a.nonce
+        || t.issued_at_unix != a.issued_at_unix
+        || t.expires_at_unix != a.expires_at_unix
+    {
+        return Err(WriterError::AuthorityMismatch);
+    }
     Ok(FixtureDecisionIdentityV1 {
-        reviewer_principal: a.reviewer_principal.clone(), reviewer_full_instance: a.reviewer_full_instance.clone(),
-        review_round: a.review_round, nonce: a.nonce,
+        reviewer_principal: a.reviewer_principal.clone(),
+        reviewer_full_instance: a.reviewer_full_instance.clone(),
+        review_round: a.review_round,
+        nonce: a.nonce,
         acceptance_digest: a.canonical_digest().map_err(fixture_error)?,
-        verified_review_record_digest: p.bundle.review.complete_record_digest().map_err(fixture_error)?,
-        candidate_digest: p.bundle.candidate.payload.canonical_digest().map_err(fixture_error)?,
-        outer_message_id: t.message_id.clone(), outer_transcript_digest: auth.transcript_digest(),
+        verified_review_record_digest: p
+            .bundle
+            .review
+            .complete_record_digest()
+            .map_err(fixture_error)?,
+        candidate_digest: p
+            .bundle
+            .candidate
+            .payload
+            .canonical_digest()
+            .map_err(fixture_error)?,
+        outer_message_id: t.message_id.clone(),
+        outer_transcript_digest: auth.transcript_digest(),
     })
 }
 
 fn sorted_fixture_proposals(
-    writer: &WriterContextV1<'_>, proposals: &[FixtureProposalObservationV1],
+    writer: &WriterContextV1<'_>,
+    proposals: &[FixtureProposalObservationV1],
 ) -> Result<Vec<(FixtureDecisionIdentityV1, FixtureProposalObservationV1)>, WriterError> {
-    if proposals.is_empty() || proposals.len() > 64 { return Err(WriterError::AuthorityMismatch); }
-    let mut pairs = proposals.iter().map(|p| Ok((fixture_proposal_identity(writer, p)?, p.clone())))
+    if proposals.is_empty() || proposals.len() > 64 {
+        return Err(WriterError::AuthorityMismatch);
+    }
+    let mut pairs = proposals
+        .iter()
+        .map(|p| Ok((fixture_proposal_identity(writer, p)?, p.clone())))
         .collect::<Result<Vec<_>, WriterError>>()?;
-    pairs.sort_by(|a,b| (&a.0.reviewer_principal, &a.0.outer_message_id).cmp(&(&b.0.reviewer_principal, &b.0.outer_message_id)));
-    if pairs.windows(2).any(|p| p[0].0.reviewer_principal == p[1].0.reviewer_principal) {
+    pairs.sort_by(|a, b| {
+        (&a.0.reviewer_principal, &a.0.outer_message_id)
+            .cmp(&(&b.0.reviewer_principal, &b.0.outer_message_id))
+    });
+    if pairs
+        .windows(2)
+        .any(|p| p[0].0.reviewer_principal == p[1].0.reviewer_principal)
+    {
         return Err(WriterError::SelfReviewForbidden);
     }
     Ok(pairs)
 }
 
 fn verify_fixture_clock(
-    lease: &WriterLeaseV1, observation: &FixtureWriterObservationV1,
+    lease: &WriterLeaseV1,
+    observation: &FixtureWriterObservationV1,
     highwater: crate::task_acceptance::ReviewHighwaterV1,
 ) -> Result<(), WriterError> {
     lease.verify(&observation.authority)?;
     let HostClockState::Verified { now_unix } = observation.authority.clock else {
         return Err(WriterError::ClockFenceHeld);
     };
-    let now_us = now_unix.checked_mul(1_000_000).ok_or(WriterError::ClockFenceHeld)?;
-    if now_us < highwater.roughtime_us { return Err(WriterError::ClockFenceHeld); }
+    let now_us = now_unix
+        .checked_mul(1_000_000)
+        .ok_or(WriterError::ClockFenceHeld)?;
+    if now_us < highwater.roughtime_us {
+        return Err(WriterError::ClockFenceHeld);
+    }
     for p in &observation.proposals {
         let a = &p.bundle.acceptance.payload;
         let authority = &p.evidence.authority.payload;
-        if !observation.authority.reviewer_role_grants.iter().any(|grant| {
-            grant.reviewer_actor == a.reviewer_full_instance
-                && grant.authenticated_signer_principal == a.reviewer_principal
-                && grant.reviewer_role == a.reviewer_role
-                && grant.completion_policy_digest == a.policy_digest
-        }) { return Err(WriterError::AuthorityMismatch); }
-        if now_unix < a.issued_at_unix || now_unix > a.expires_at_unix
-            || now_us < authority.valid_from_us || now_us > authority.valid_until_us
+        if !observation
+            .authority
+            .reviewer_role_grants
+            .iter()
+            .any(|grant| {
+                grant.reviewer_actor == a.reviewer_full_instance
+                    && grant.authenticated_signer_principal == a.reviewer_principal
+                    && grant.reviewer_role == a.reviewer_role
+                    && grant.completion_policy_digest == a.policy_digest
+            })
+        {
+            return Err(WriterError::AuthorityMismatch);
+        }
+        if now_unix < a.issued_at_unix
+            || now_unix > a.expires_at_unix
+            || now_us < authority.valid_from_us
+            || now_us > authority.valid_until_us
             || authority.writer_principal != lease.writer_principal
             || authority.writer_epoch != lease.writer_epoch
             || authority.authority_epoch != lease.authority_epoch
-        { return Err(WriterError::ClockFenceHeld); }
+        {
+            return Err(WriterError::ClockFenceHeld);
+        }
     }
     Ok(())
 }
 
 fn qualify_fixture_decisions(
-    context: &FixtureReviewWriterContextV1<'_>, store: &crate::task_review_state::ReviewStateStoreV1,
-    request: &FixtureReviewedWriteRequestV1, observed: &FixtureWriterObservationV1,
-    snapshot: &TaskEntrySnapshotV1, current: &TaskRefV1, rebases_used: u8,
+    context: &FixtureReviewWriterContextV1<'_>,
+    store: &crate::task_review_state::ReviewStateStoreV1,
+    request: &FixtureReviewedWriteRequestV1,
+    observed: &FixtureWriterObservationV1,
+    snapshot: &TaskEntrySnapshotV1,
+    current: &TaskRefV1,
+    rebases_used: u8,
 ) -> Result<Vec<crate::task_acceptance::VerifiedFixtureAcceptanceV1>, WriterError> {
-    use crate::task_acceptance::{authorize_reviewed_acceptance, AcceptanceVerificationContextV1, LegacyReviewProfileMode};
+    use crate::task_acceptance::{
+        AcceptanceVerificationContextV1, LegacyReviewProfileMode, authorize_reviewed_acceptance,
+    };
     verify_fixture_clock(context.writer.lease, observed, store.highwater())?;
     let originals = sorted_fixture_proposals(context.writer, &request.original_proposals)?;
     let current_proposals = sorted_fixture_proposals(context.writer, &observed.proposals)?;
-    if originals != current_proposals { return Err(WriterError::AcceptanceInvalidated); }
-    current_proposals.iter().map(|(_,p)| authorize_reviewed_acceptance(
-        context.verifier, LegacyReviewProfileMode::FixtureProfileV1, &p.bundle, &p.evidence,
-        AcceptanceVerificationContextV1 {
-            snapshot, current, assignment: &request.assignment, history: &request.history,
-            dependencies: &observed.dependencies, rebases_used, persisted_highwater: store.highwater(),
-        },
-    ).map_err(fixture_error)).collect()
+    if originals != current_proposals {
+        return Err(WriterError::AcceptanceInvalidated);
+    }
+    current_proposals
+        .iter()
+        .map(|(_, p)| {
+            authorize_reviewed_acceptance(
+                context.verifier,
+                LegacyReviewProfileMode::FixtureProfileV1,
+                &p.bundle,
+                &p.evidence,
+                AcceptanceVerificationContextV1 {
+                    snapshot,
+                    current,
+                    assignment: &request.assignment,
+                    history: &request.history,
+                    dependencies: &observed.dependencies,
+                    rebases_used,
+                    persisted_highwater: store.highwater(),
+                },
+            )
+            .map_err(fixture_error)
+        })
+        .collect()
 }
 
 struct FixtureReviewWriterFinalizationV1 {
     proof: WriterCommitProof,
     binding: crate::task_review_state::ReviewWriterFinalizationBindingV1,
 }
-impl crate::task_review_state::writer_finalization_seal::Sealed for FixtureReviewWriterFinalizationV1 {}
-impl crate::task_review_state::QualifiedReviewWriterFinalizationV1 for FixtureReviewWriterFinalizationV1 {
-    fn writer_commit_proof(&self) -> &WriterCommitProof { &self.proof }
-    fn review_finalization_binding(&self) -> &crate::task_review_state::ReviewWriterFinalizationBindingV1 { &self.binding }
+impl crate::task_review_state::writer_finalization_seal::Sealed
+    for FixtureReviewWriterFinalizationV1
+{
+}
+impl crate::task_review_state::QualifiedReviewWriterFinalizationV1
+    for FixtureReviewWriterFinalizationV1
+{
+    fn writer_commit_proof(&self) -> &WriterCommitProof {
+        &self.proof
+    }
+    fn review_finalization_binding(
+        &self,
+    ) -> &crate::task_review_state::ReviewWriterFinalizationBindingV1 {
+        &self.binding
+    }
 }
 
 fn fixture_metadata_from_record(
-    context: &FixtureReviewWriterContextV1<'_>, record: &JournalRecordV1,
+    context: &FixtureReviewWriterContextV1<'_>,
+    record: &JournalRecordV1,
 ) -> Result<FixtureWriterMetadataV1, WriterError> {
     context.namespace.recheck()?;
-    let m: FixtureWriterMetadataV1 = serde_json::from_value(record.request.metadata.clone()).map_err(fixture_error)?;
-    if m.schema != FIXTURE_WRITER_SCHEMA || m.lease != *context.writer.lease
-        || m.intent.version != 1 || &m.intent.fixture_provenance != context.verifier.provenance()
+    let m: FixtureWriterMetadataV1 =
+        serde_json::from_value(record.request.metadata.clone()).map_err(fixture_error)?;
+    if m.schema != FIXTURE_WRITER_SCHEMA
+        || m.lease != *context.writer.lease
+        || m.intent.version != 1
+        || &m.intent.fixture_provenance != context.verifier.provenance()
         || m.request()? != record.request
-    { return Err(WriterError::PolicyBindingMismatch); }
+    {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
     Ok(m)
 }
 
 // Archival seals describe an original durable fact. They cannot authorize a
 // new rename, consume or source adoption, and need not use the current lease.
 fn fixture_archival_metadata(
-    context: &FixtureReviewWriterContextV1<'_>, record: &JournalRecordV1,
+    context: &FixtureReviewWriterContextV1<'_>,
+    record: &JournalRecordV1,
 ) -> Result<FixtureWriterMetadataV1, WriterError> {
     context.namespace.recheck()?;
-    let m: FixtureWriterMetadataV1 = serde_json::from_value(record.request.metadata.clone()).map_err(fixture_error)?;
+    let m: FixtureWriterMetadataV1 =
+        serde_json::from_value(record.request.metadata.clone()).map_err(fixture_error)?;
     let current = context.writer.lease;
-    if m.schema != FIXTURE_WRITER_SCHEMA || m.intent.version != 1
+    if m.schema != FIXTURE_WRITER_SCHEMA
+        || m.intent.version != 1
         || &m.intent.fixture_provenance != context.verifier.provenance()
-        || m.lease.workspace_id != current.workspace_id || m.lease.repo_id != current.repo_id
+        || m.lease.workspace_id != current.workspace_id
+        || m.lease.repo_id != current.repo_id
         || m.lease.source_worktree_id != current.source_worktree_id
         || m.lease.task_source_id != current.task_source_id
         || m.lease.canonical_relative_path != current.canonical_relative_path
         || m.lease.source_generation != current.source_generation
         || m.request()? != record.request
-    { return Err(WriterError::PolicyBindingMismatch); }
+    {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
     Ok(m)
 }
 
-fn validate_fixture_prepared(record: &JournalRecordV1, m: &FixtureWriterMetadataV1) -> Result<(), WriterError> {
-    let p = record.prepared.as_ref().ok_or(WriterError::OperationInProgress)?;
+fn validate_fixture_prepared(
+    record: &JournalRecordV1,
+    m: &FixtureWriterMetadataV1,
+) -> Result<(), WriterError> {
+    let p = record
+        .prepared
+        .as_ref()
+        .ok_or(WriterError::OperationInProgress)?;
     p.validate()?;
     let i = &m.intent;
-    if p.predecessor_hash != i.predecessor_sha256.0 || p.successor_hash != i.successor_sha256.0
-        || p.expected_preimage_bytes != i.predecessor_bytes || p.committed_postimage_bytes != i.successor_bytes
-        || p.predecessor_revision != i.predecessor_file_rev || p.successor_revision != i.successor_file_rev
+    if p.predecessor_hash != i.predecessor_sha256.0
+        || p.successor_hash != i.successor_sha256.0
+        || p.expected_preimage_bytes != i.predecessor_bytes
+        || p.committed_postimage_bytes != i.successor_bytes
+        || p.predecessor_revision != i.predecessor_file_rev
+        || p.successor_revision != i.successor_file_rev
         || p.proposal_expected_file_cas_rev != i.signed_task_ref.file_cas_rev
         || p.expected_file_cas_rev != i.qualified_predecessor_task_ref.file_cas_rev
-    { return Err(WriterError::PolicyBindingMismatch); }
-    let delta = i.predecessor_file_rev.checked_sub(i.signed_task_ref.file_cas_rev).ok_or(WriterError::FileCasConflict)?;
-    if delta > MAX_UNRELATED_FILE_REBASES as u64 || p.rebases_used as u64 != delta
+    {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
+    let delta = i
+        .predecessor_file_rev
+        .checked_sub(i.signed_task_ref.file_cas_rev)
+        .ok_or(WriterError::FileCasConflict)?;
+    if delta > MAX_UNRELATED_FILE_REBASES as u64
+        || p.rebases_used as u64 != delta
         || record.unrelated_file_rebases != p.rebases_used
         || p.canonical_relative_path != m.lease.canonical_relative_path
-        || p.target_name != m.lease.canonical_relative_path.rsplit('/').next().ok_or(WriterError::InvalidDocument)?
+        || p.target_name
+            != m.lease
+                .canonical_relative_path
+                .rsplit('/')
+                .next()
+                .ok_or(WriterError::InvalidDocument)?
         || i.successor_file_rev != checked_next_revision(i.predecessor_file_rev)?
-        || i.target_task_status_rev != checked_next_revision(i.predecessor_target_snapshot.task_status_rev)?
+        || i.target_task_status_rev
+            != checked_next_revision(i.predecessor_target_snapshot.task_status_rev)?
         || i.predecessor_target_snapshot.status != CanonicalTaskStatus::DonePendingReview
-        || i.target_task_status != match i.decision { FixtureWriterDecisionV1::ApprovedDone => CanonicalTaskStatus::Done, FixtureWriterDecisionV1::RejectedBlocked => CanonicalTaskStatus::Blocked }
-    { return Err(WriterError::PolicyBindingMismatch); }
+        || i.target_task_status
+            != match i.decision {
+                FixtureWriterDecisionV1::ApprovedDone => CanonicalTaskStatus::Done,
+                FixtureWriterDecisionV1::RejectedBlocked => CanonicalTaskStatus::Blocked,
+            }
+    {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
     Ok(())
 }
 
 fn verify_fixture_successor(
-    context: &FixtureReviewWriterContextV1<'_>, record: &JournalRecordV1, m: &FixtureWriterMetadataV1,
+    context: &FixtureReviewWriterContextV1<'_>,
+    record: &JournalRecordV1,
+    m: &FixtureWriterMetadataV1,
 ) -> Result<(), WriterError> {
     validate_fixture_prepared(record, m)?;
-    let p = record.prepared.as_ref().ok_or(WriterError::OperationInProgress)?;
+    let p = record
+        .prepared
+        .as_ref()
+        .ok_or(WriterError::OperationInProgress)?;
     let i = &m.intent;
     let target = PinnedTarget::open(context.writer.root, &m.lease.canonical_relative_path)?;
-    if inspect_prepared(target.parent(), p, context.writer.root.uid)? != RecoveryFileState::Successor {
+    if inspect_prepared(target.parent(), p, context.writer.root.uid)?
+        != RecoveryFileState::Successor
+    {
         return Err(WriterError::SourceIdentityChanged);
     }
     let (bytes, _) = target.read()?;
     let doc = CanonicalTaskDocumentV1::from_bytes(&bytes)?;
-    let target_task = doc.tasks.iter().find(|t| t.task_id == i.signed_task_ref.task_id)
+    let target_task = doc
+        .tasks
+        .iter()
+        .find(|t| t.task_id == i.signed_task_ref.task_id)
         .ok_or(WriterError::TargetTaskConflict)?;
     let mut expected = i.predecessor_target_snapshot.clone();
     expected.status = i.target_task_status;
     expected.task_status_rev = i.target_task_status_rev;
-    if target_task != &expected || doc.file_cas_rev != i.successor_file_rev
+    if target_task != &expected
+        || doc.file_cas_rev != i.successor_file_rev
         || doc.last_operation_id.as_deref() != Some(i.original_operation_id.as_str())
-        || doc.workspace_id != m.lease.workspace_id || doc.repo_id != m.lease.repo_id
-        || doc.task_source_id != m.lease.task_source_id || doc.source_generation != m.lease.source_generation
-    { return Err(WriterError::AcceptanceInvalidated); }
+        || doc.workspace_id != m.lease.workspace_id
+        || doc.repo_id != m.lease.repo_id
+        || doc.task_source_id != m.lease.task_source_id
+        || doc.source_generation != m.lease.source_generation
+    {
+        return Err(WriterError::AcceptanceInvalidated);
+    }
     Ok(())
 }
 
 fn fixture_finalization_from_journal(
-    context: &FixtureReviewWriterContextV1<'_>, journal: &Journal, operation: &str,
+    context: &FixtureReviewWriterContextV1<'_>,
+    journal: &Journal,
+    operation: &str,
 ) -> Result<FixtureReviewWriterFinalizationV1, WriterError> {
-    let record = journal.latest(&context.writer.lease.workspace_id, &context.writer.lease.task_source_id, operation)
+    let record = journal
+        .latest(
+            &context.writer.lease.workspace_id,
+            &context.writer.lease.task_source_id,
+            operation,
+        )
         .ok_or(WriterError::OperationInProgress)?;
     journal.lookup_request(&record.request)?;
-    if !matches!(record.state, WriteOperationState::Recorded | WriteOperationState::Acknowledged) {
+    if !matches!(
+        record.state,
+        WriteOperationState::Recorded | WriteOperationState::Acknowledged
+    ) {
         return Err(WriterError::OperationInProgress);
     }
     let m = fixture_metadata_from_record(context, record)?;
-    if record.result.as_ref() != Some(&m.projection()?) { return Err(WriterError::PolicyBindingMismatch); }
+    if record.result.as_ref() != Some(&m.projection()?) {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
     verify_fixture_successor(context, record, &m)?;
     fixture_finalization_for_record(record, &m)
 }
 
 fn fixture_finalization_for_record(
-    record: &JournalRecordV1, m: &FixtureWriterMetadataV1,
+    record: &JournalRecordV1,
+    m: &FixtureWriterMetadataV1,
 ) -> Result<FixtureReviewWriterFinalizationV1, WriterError> {
-    if !matches!(record.state, WriteOperationState::Recorded | WriteOperationState::Acknowledged)
-        || record.result.as_ref() != Some(&m.projection()?)
-    { return Err(WriterError::PolicyBindingMismatch); }
+    if !matches!(
+        record.state,
+        WriteOperationState::Recorded | WriteOperationState::Acknowledged
+    ) || record.result.as_ref() != Some(&m.projection()?)
+    {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
     validate_fixture_prepared(record, m)?;
-    let proof = WriterCommitProof::from_bound_record(record, m.lease.clone(), WriterProofOriginV1::Fixture(m.intent.fixture_provenance.clone()))?;
+    let proof = WriterCommitProof::from_bound_record(
+        record,
+        m.lease.clone(),
+        WriterProofOriginV1::Fixture(m.intent.fixture_provenance.clone()),
+    )?;
     let i = &m.intent;
     Ok(FixtureReviewWriterFinalizationV1 {
-        proof, binding: crate::task_review_state::ReviewWriterFinalizationBindingV1 {
-            request_digest: m.digest()?, acceptance_digest: i.primary_acceptance_digest,
-            candidate_digest: i.candidate_digest, target_transition_id: i.target_transition_id.clone(),
-            target_task_status_rev: i.target_task_status_rev, target_status: i.target_task_status,
+        proof,
+        binding: crate::task_review_state::ReviewWriterFinalizationBindingV1 {
+            request_digest: m.digest()?,
+            acceptance_digest: i.primary_acceptance_digest,
+            candidate_digest: i.candidate_digest,
+            target_transition_id: i.target_transition_id.clone(),
+            target_task_status_rev: i.target_task_status_rev,
+            target_status: i.target_task_status,
             fixture_provenance: i.fixture_provenance.clone(),
         },
     })
@@ -2783,8 +3039,10 @@ fn fixture_finalization_for_record(
 /// retained journal supplies the bounded original Recorded/ACK finalizations;
 /// active repair separately proves the current successor and fresh authority.
 pub fn reopen_fixture_review_state(
-    context: &FixtureReviewWriterContextV1<'_>, journal: &Journal,
-    parent: &File, namespace_name: &str,
+    context: &FixtureReviewWriterContextV1<'_>,
+    journal: &Journal,
+    parent: &File,
+    namespace_name: &str,
 ) -> Result<crate::task_review_state::ReviewStateStoreV1, WriterError> {
     use crate::task_review_state::QualifiedReviewWriterFinalizationV1;
     context.namespace.recheck()?;
@@ -2792,32 +3050,53 @@ pub fn reopen_fixture_review_state(
     for r in journal.latest_records().filter(|r| {
         r.request.workspace_id == context.writer.lease.workspace_id
             && r.request.task_source_id == context.writer.lease.task_source_id
-            && matches!(r.state, WriteOperationState::Recorded | WriteOperationState::Acknowledged)
-            && r.request.metadata.get("schema").and_then(|s| s.as_str()) == Some(FIXTURE_WRITER_SCHEMA)
+            && matches!(
+                r.state,
+                WriteOperationState::Recorded | WriteOperationState::Acknowledged
+            )
+            && r.request.metadata.get("schema").and_then(|s| s.as_str())
+                == Some(FIXTURE_WRITER_SCHEMA)
     }) {
         journal.lookup_request(&r.request)?;
-        if seals.len() >= crate::task_review_state::MAX_REVIEW_RECORDS { return Err(WriterError::FileTooLarge); }
+        if seals.len() >= crate::task_review_state::MAX_REVIEW_RECORDS {
+            return Err(WriterError::FileTooLarge);
+        }
         let m = fixture_archival_metadata(context, r)?;
         if m.intent.decision == FixtureWriterDecisionV1::ApprovedDone {
             seals.push(fixture_finalization_for_record(r, &m)?);
         }
     }
-    let references: Vec<&dyn QualifiedReviewWriterFinalizationV1> = seals.iter()
-        .map(|s| s as &dyn QualifiedReviewWriterFinalizationV1).collect();
+    let references: Vec<&dyn QualifiedReviewWriterFinalizationV1> = seals
+        .iter()
+        .map(|s| s as &dyn QualifiedReviewWriterFinalizationV1)
+        .collect();
     crate::task_review_state::ReviewStateStoreV1::reopen_with_finalizations(
-        parent, namespace_name, context.verifier, &references,
-    ).map_err(fixture_error)
+        parent,
+        namespace_name,
+        context.verifier,
+        &references,
+    )
+    .map_err(fixture_error)
 }
 
 /// Historical ACK readback grants no effect or current-source adoption. In
 /// particular, later canonical writes and lease changes do not rewrite history.
 pub fn read_fixture_recorded_outcome(
-    context: &FixtureReviewWriterContextV1<'_>, journal: &Journal, operation: &str,
+    context: &FixtureReviewWriterContextV1<'_>,
+    journal: &Journal,
+    operation: &str,
 ) -> Result<WriterCommitProof, WriterError> {
-    let r = journal.latest(&context.writer.lease.workspace_id, &context.writer.lease.task_source_id, operation)
+    let r = journal
+        .latest(
+            &context.writer.lease.workspace_id,
+            &context.writer.lease.task_source_id,
+            operation,
+        )
         .ok_or(WriterError::OperationInProgress)?;
     journal.lookup_request(&r.request)?;
-    if r.state != WriteOperationState::Acknowledged { return Err(WriterError::OperationInProgress); }
+    if r.state != WriteOperationState::Acknowledged {
+        return Err(WriterError::OperationInProgress);
+    }
     let m = fixture_archival_metadata(context, r)?;
     Ok(fixture_finalization_for_record(r, &m)?.proof)
 }
@@ -2832,49 +3111,88 @@ struct FixtureCommitAuthorityV1<'a, 'root, F> {
     refresh: &'a mut F,
 }
 impl<F> FixtureCommitAuthorityV1<'_, '_, F>
-where F: FnMut() -> Result<FixtureWriterObservationV1, WriterError> {
-    fn revalidate(&mut self) -> Result<Vec<crate::task_acceptance::VerifiedFixtureAcceptanceV1>, WriterError> {
+where
+    F: FnMut() -> Result<FixtureWriterObservationV1, WriterError>,
+{
+    fn revalidate(
+        &mut self,
+    ) -> Result<Vec<crate::task_acceptance::VerifiedFixtureAcceptanceV1>, WriterError> {
         use crate::task_acceptance::AcceptanceVerificationContextV1;
         self.context.namespace.recheck()?;
         let observed = (self.refresh)()?;
         verify_fixture_clock(self.context.writer.lease, &observed, self.store.highwater())?;
         let actual = sorted_fixture_proposals(self.context.writer, &observed.proposals)?;
         let identities: Vec<_> = actual.iter().map(|p| p.0.clone()).collect();
-        if identities != self.metadata.intent.decisions { return Err(WriterError::AcceptanceInvalidated); }
+        if identities != self.metadata.intent.decisions {
+            return Err(WriterError::AcceptanceInvalidated);
+        }
         let i = &self.metadata.intent;
         let tokens = if let Some(handle) = &self.reservation {
-            let pairs: Vec<_> = actual.iter().map(|(_,p)| (p.bundle.clone(),p.evidence.clone())).collect();
-            self.store.revalidate_reserved_cohort(self.context.verifier, handle, &pairs,
-                AcceptanceVerificationContextV1 {
-                    snapshot: &i.predecessor_target_snapshot, current: &i.qualified_predecessor_task_ref,
-                    assignment: &self.request.assignment, history: &self.request.history,
-                    dependencies: &observed.dependencies, rebases_used: i.qualification_rebases_used,
-                    persisted_highwater: self.store.highwater(),
-                }).map_err(fixture_error)?
+            let pairs: Vec<_> = actual
+                .iter()
+                .map(|(_, p)| (p.bundle.clone(), p.evidence.clone()))
+                .collect();
+            self.store
+                .revalidate_reserved_cohort(
+                    self.context.verifier,
+                    handle,
+                    &pairs,
+                    AcceptanceVerificationContextV1 {
+                        snapshot: &i.predecessor_target_snapshot,
+                        current: &i.qualified_predecessor_task_ref,
+                        assignment: &self.request.assignment,
+                        history: &self.request.history,
+                        dependencies: &observed.dependencies,
+                        rebases_used: i.qualification_rebases_used,
+                        persisted_highwater: self.store.highwater(),
+                    },
+                )
+                .map_err(fixture_error)?
         } else {
-            qualify_fixture_decisions(self.context, self.store, self.request, &observed,
-                &i.predecessor_target_snapshot, &i.qualified_predecessor_task_ref, i.qualification_rebases_used)?
+            qualify_fixture_decisions(
+                self.context,
+                self.store,
+                self.request,
+                &observed,
+                &i.predecessor_target_snapshot,
+                &i.qualified_predecessor_task_ref,
+                i.qualification_rebases_used,
+            )?
         };
         // Every original pair, not merely its digest, remains immutable.
-        if sorted_fixture_proposals(self.context.writer, &self.request.original_proposals)? != actual {
+        if sorted_fixture_proposals(self.context.writer, &self.request.original_proposals)?
+            != actual
+        {
             return Err(WriterError::AcceptanceInvalidated);
         }
         Ok(tokens)
     }
 }
 impl<F> PreparedCommitAuthorityV1 for FixtureCommitAuthorityV1<'_, '_, F>
-where F: FnMut() -> Result<FixtureWriterObservationV1, WriterError> {
+where
+    F: FnMut() -> Result<FixtureWriterObservationV1, WriterError>,
+{
     fn before_replace(&mut self) -> Result<(), WriterError> {
         self.revalidate()?;
         Ok(())
     }
-    fn expected_projection(&self) -> Option<serde_json::Value> { Some(self.projection.clone()) }
-    fn project(&mut self, record: &JournalRecordV1) -> Result<Option<serde_json::Value>, WriterError> {
+    fn expected_projection(&self) -> Option<serde_json::Value> {
+        Some(self.projection.clone())
+    }
+    fn project(
+        &mut self,
+        record: &JournalRecordV1,
+    ) -> Result<Option<serde_json::Value>, WriterError> {
         verify_fixture_successor(self.context, record, self.metadata)?;
         Ok(Some(self.metadata.projection()?))
     }
-    fn finalize_recorded(&mut self, journal: &mut Journal, record: &JournalRecordV1) -> Result<WriterCommitProof, WriterError> {
-        let finalization = fixture_finalization_from_journal(self.context, journal, &record.request.operation_id)?;
+    fn finalize_recorded(
+        &mut self,
+        journal: &mut Journal,
+        record: &JournalRecordV1,
+    ) -> Result<WriterCommitProof, WriterError> {
+        let finalization =
+            fixture_finalization_from_journal(self.context, journal, &record.request.operation_id)?;
         // This historical pending context is now qualified by the actual
         // successor and durable Recorded seal, not a fictional live snapshot.
         let tokens = self.revalidate()?;
@@ -2882,12 +3200,18 @@ where F: FnMut() -> Result<FixtureWriterObservationV1, WriterError> {
         // and the irreversible review consumption boundary.
         verify_fixture_successor(self.context, record, self.metadata)?;
         if let Some(handle) = &self.reservation {
-            self.store.consume(self.context.verifier, handle, &tokens, &finalization).map_err(fixture_error)?;
+            self.store
+                .consume(self.context.verifier, handle, &tokens, &finalization)
+                .map_err(fixture_error)?;
         } else {
-            if self.metadata.intent.decision != FixtureWriterDecisionV1::RejectedBlocked || tokens.len() != 1 {
+            if self.metadata.intent.decision != FixtureWriterDecisionV1::RejectedBlocked
+                || tokens.len() != 1
+            {
                 return Err(WriterError::AuthorityMismatch);
             }
-            self.store.reject(self.context.verifier, &tokens[0]).map_err(fixture_error)?;
+            self.store
+                .reject(self.context.verifier, &tokens[0])
+                .map_err(fixture_error)?;
         }
         verify_fixture_successor(self.context, record, self.metadata)?;
         Ok(finalization.proof)
@@ -2898,7 +3222,8 @@ where F: FnMut() -> Result<FixtureWriterObservationV1, WriterError> {
 /// TaskProposal records and the independent signed pair. Production APIs retain
 /// their Done hold. A failed/uncertain original operation must be reconciled.
 pub fn commit_fixture_reviewed_task(
-    context: &FixtureReviewWriterContextV1<'_>, journal: &mut Journal,
+    context: &FixtureReviewWriterContextV1<'_>,
+    journal: &mut Journal,
     store: &mut crate::task_review_state::ReviewStateStoreV1,
     request: &FixtureReviewedWriteRequestV1,
     mut refresh: impl FnMut() -> Result<FixtureWriterObservationV1, WriterError>,
@@ -2907,7 +3232,8 @@ pub fn commit_fixture_reviewed_task(
     use crate::task_acceptance::{ReviewVerdict, verify_fixture_quorum};
     use crate::task_review_state::ReservationDispositionV1;
     context.namespace.recheck()?;
-    crate::task_acceptance::fixture_statement("bounded-writer-history", &request.history).map_err(fixture_error)?;
+    crate::task_acceptance::fixture_statement("bounded-writer-history", &request.history)
+        .map_err(fixture_error)?;
     validate_id(&request.target_transition_id, "fixture transition")?;
     let originals = sorted_fixture_proposals(context.writer, &request.original_proposals)?;
     let primary = originals.first().ok_or(WriterError::AuthorityMismatch)?;
@@ -2915,221 +3241,457 @@ pub fn commit_fixture_reviewed_task(
     validate_task_source_id(operation)?;
     // Existing operations always use their original durable metadata, never a
     // newly computed request over the successor or resubmitted callback values.
-    if let Some(old) = journal.latest(&context.writer.lease.workspace_id, &context.writer.lease.task_source_id, operation).cloned() {
+    if let Some(old) = journal
+        .latest(
+            &context.writer.lease.workspace_id,
+            &context.writer.lease.task_source_id,
+            operation,
+        )
+        .cloned()
+    {
         let m = fixture_metadata_from_record(context, &old)?;
         if m.intent.decisions != originals.iter().map(|p| p.0.clone()).collect::<Vec<_>>()
             || m.intent.target_transition_id != request.target_transition_id
-        { return Err(WriterError::AuthorityMismatch); }
-        return recover_fixture_reviewed_task(context, journal, store, request, &m, &mut refresh, &mut hook);
+        {
+            return Err(WriterError::AuthorityMismatch);
+        }
+        return recover_fixture_reviewed_task(
+            context,
+            journal,
+            store,
+            request,
+            &m,
+            &mut refresh,
+            &mut hook,
+        );
     }
     let observation = refresh()?;
     context.writer.lease.verify(&observation.authority)?;
-    let target = PinnedTarget::open(context.writer.root, &context.writer.lease.canonical_relative_path)?;
+    let target = PinnedTarget::open(
+        context.writer.root,
+        &context.writer.lease.canonical_relative_path,
+    )?;
     let (bytes, stamp) = target.read()?;
-    if stamp.identity != context.writer.source_identity { return Err(WriterError::SourceIdentityChanged); }
+    if stamp.identity != context.writer.source_identity {
+        return Err(WriterError::SourceIdentityChanged);
+    }
     let live = CanonicalTaskDocumentV1::from_bytes(&bytes)?;
     let signed = &primary.1.bundle.acceptance.payload.task_ref;
     let lease = context.writer.lease;
-    if signed.workspace_id != lease.workspace_id || signed.repo_id != lease.repo_id
-        || signed.task_source_id != lease.task_source_id || signed.source_generation != lease.source_generation
+    if signed.workspace_id != lease.workspace_id
+        || signed.repo_id != lease.repo_id
+        || signed.task_source_id != lease.task_source_id
+        || signed.source_generation != lease.source_generation
         || signed.canonical_task_path != lease.canonical_relative_path
-    { return Err(WriterError::PolicyBindingMismatch); }
-    let task = live.tasks.iter().find(|t| t.task_id == signed.task_id).ok_or(WriterError::TargetTaskConflict)?;
-    if task.status != CanonicalTaskStatus::DonePendingReview { return Err(WriterError::InvalidTransition); }
+    {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
+    let task = live
+        .tasks
+        .iter()
+        .find(|t| t.task_id == signed.task_id)
+        .ok_or(WriterError::TargetTaskConflict)?;
+    if task.status != CanonicalTaskStatus::DonePendingReview {
+        return Err(WriterError::InvalidTransition);
+    }
     let current = live.task_ref(task, &context.writer.lease.canonical_relative_path);
     check_cas_eligibility(signed, &current, 0)?;
-    let delta = current.file_cas_rev.checked_sub(signed.file_cas_rev).ok_or(WriterError::FileCasConflict)?;
-    if delta > MAX_UNRELATED_FILE_REBASES as u64 { return Err(WriterError::RebaseLimitExceeded); }
-    if delta > 0 && !journal.latest_records().any(|r| {
-        r.request.workspace_id == live.workspace_id && r.request.task_source_id == live.task_source_id
-            && matches!(r.state, WriteOperationState::Recorded | WriteOperationState::Acknowledged)
-            && r.prepared.as_ref().is_some_and(|p| p.successor_hash == Sha256Digest::of(&bytes).0
-                && p.successor_revision == live.file_cas_rev && p.staged_dev == stamp.identity.dev && p.staged_ino == stamp.identity.ino)
-    }) { return Err(WriterError::SourceHeld); }
-    let tokens = qualify_fixture_decisions(context, store, request, &observation, task, &current, 0)?;
-    store.record_assignment(context.verifier, &request.assignment).map_err(fixture_error)?;
+    let delta = current
+        .file_cas_rev
+        .checked_sub(signed.file_cas_rev)
+        .ok_or(WriterError::FileCasConflict)?;
+    if delta > MAX_UNRELATED_FILE_REBASES as u64 {
+        return Err(WriterError::RebaseLimitExceeded);
+    }
+    if delta > 0
+        && !journal.latest_records().any(|r| {
+            r.request.workspace_id == live.workspace_id
+                && r.request.task_source_id == live.task_source_id
+                && matches!(
+                    r.state,
+                    WriteOperationState::Recorded | WriteOperationState::Acknowledged
+                )
+                && r.prepared.as_ref().is_some_and(|p| {
+                    p.successor_hash == Sha256Digest::of(&bytes).0
+                        && p.successor_revision == live.file_cas_rev
+                        && p.staged_dev == stamp.identity.dev
+                        && p.staged_ino == stamp.identity.ino
+                })
+        })
+    {
+        return Err(WriterError::SourceHeld);
+    }
+    let tokens =
+        qualify_fixture_decisions(context, store, request, &observation, task, &current, 0)?;
+    store
+        .record_assignment(context.verifier, &request.assignment)
+        .map_err(fixture_error)?;
     for transition in &request.history {
-        store.record_submission(context.verifier, &primary.1.bundle.candidate, transition).map_err(fixture_error)?;
+        store
+            .record_submission(context.verifier, &primary.1.bundle.candidate, transition)
+            .map_err(fixture_error)?;
     }
     let verdict = primary.1.bundle.acceptance.payload.verdict;
-    let (decision,next_status) = match verdict {
-        ReviewVerdict::Approved => { verify_fixture_quorum(&tokens).map_err(fixture_error)?; (FixtureWriterDecisionV1::ApprovedDone,CanonicalTaskStatus::Done) },
-        ReviewVerdict::Rejected if tokens.len() == 1 => (FixtureWriterDecisionV1::RejectedBlocked,CanonicalTaskStatus::Blocked),
+    let (decision, next_status) = match verdict {
+        ReviewVerdict::Approved => {
+            verify_fixture_quorum(&tokens).map_err(fixture_error)?;
+            (
+                FixtureWriterDecisionV1::ApprovedDone,
+                CanonicalTaskStatus::Done,
+            )
+        }
+        ReviewVerdict::Rejected if tokens.len() == 1 => (
+            FixtureWriterDecisionV1::RejectedBlocked,
+            CanonicalTaskStatus::Blocked,
+        ),
         _ => return Err(WriterError::AuthorityMismatch),
     };
     let advanced = advance_task_revision(&current, true)?;
     let mut postimage = live.clone();
     postimage.file_cas_rev = advanced.file_cas_rev;
     postimage.last_operation_id = Some(operation.clone());
-    let post_task = postimage.tasks.iter_mut().find(|t| t.task_id == signed.task_id).ok_or(WriterError::TargetTaskConflict)?;
-    post_task.status = next_status; post_task.task_status_rev = advanced.task_status_rev;
+    let post_task = postimage
+        .tasks
+        .iter_mut()
+        .find(|t| t.task_id == signed.task_id)
+        .ok_or(WriterError::TargetTaskConflict)?;
+    post_task.status = next_status;
+    post_task.task_status_rev = advanced.task_status_rev;
     let postbytes = postimage.to_canonical_bytes()?;
     let m = FixtureWriterMetadataV1 {
-        schema: FIXTURE_WRITER_SCHEMA.into(), lease: context.writer.lease.clone(),
+        schema: FIXTURE_WRITER_SCHEMA.into(),
+        lease: context.writer.lease.clone(),
         intent: FixtureReviewWriterIntentV1 {
-            version: 1, fixture_provenance: context.verifier.provenance().clone(), original_operation_id: operation.clone(),
-            assignment_id: primary.1.bundle.acceptance.payload.assignment_id.clone(), target_transition_id: request.target_transition_id.clone(),
-            request_message_id: primary.0.outer_message_id.clone(), request_transcript_digest: primary.0.outer_transcript_digest,
-            signed_task_ref: signed.clone(), qualified_predecessor_task_ref: current,
-            qualification_rebases_used: 0, predecessor_target_snapshot: task.clone(), decision,
-            primary_acceptance_digest: primary.0.acceptance_digest, candidate_digest: primary.0.candidate_digest,
+            version: 1,
+            fixture_provenance: context.verifier.provenance().clone(),
+            original_operation_id: operation.clone(),
+            assignment_id: primary.1.bundle.acceptance.payload.assignment_id.clone(),
+            target_transition_id: request.target_transition_id.clone(),
+            request_message_id: primary.0.outer_message_id.clone(),
+            request_transcript_digest: primary.0.outer_transcript_digest,
+            signed_task_ref: signed.clone(),
+            qualified_predecessor_task_ref: current,
+            qualification_rebases_used: 0,
+            predecessor_target_snapshot: task.clone(),
+            decision,
+            primary_acceptance_digest: primary.0.acceptance_digest,
+            candidate_digest: primary.0.candidate_digest,
             decisions: originals.iter().map(|p| p.0.clone()).collect(),
-            predecessor_sha256: Sha256Digest::of(&bytes), successor_sha256: Sha256Digest::of(&postbytes),
-            predecessor_bytes: bytes.len() as u64, successor_bytes: postbytes.len() as u64,
-            predecessor_file_rev: live.file_cas_rev, successor_file_rev: postimage.file_cas_rev,
-            target_task_status: next_status, target_task_status_rev: advanced.task_status_rev,
-            writer_epoch: context.writer.lease.writer_epoch, authority_epoch: context.writer.lease.authority_epoch,
+            predecessor_sha256: Sha256Digest::of(&bytes),
+            successor_sha256: Sha256Digest::of(&postbytes),
+            predecessor_bytes: bytes.len() as u64,
+            successor_bytes: postbytes.len() as u64,
+            predecessor_file_rev: live.file_cas_rev,
+            successor_file_rev: postimage.file_cas_rev,
+            target_task_status: next_status,
+            target_task_status_rev: advanced.task_status_rev,
+            writer_epoch: context.writer.lease.writer_epoch,
+            authority_epoch: context.writer.lease.authority_epoch,
         },
     };
     let writer_request = m.request()?;
     // No new unit can cross an unresolved predecessor, including production.
-    if journal.latest_records().any(|r| r.request.workspace_id == writer_request.workspace_id
-        && r.request.task_source_id == writer_request.task_source_id
-        && !matches!(r.state, WriteOperationState::Acknowledged | WriteOperationState::Rejected)) {
+    if journal.latest_records().any(|r| {
+        r.request.workspace_id == writer_request.workspace_id
+            && r.request.task_source_id == writer_request.task_source_id
+            && !matches!(
+                r.state,
+                WriteOperationState::Acknowledged | WriteOperationState::Rejected
+            )
+    }) {
         return Err(WriterError::SourceHeld);
     }
     // Preflight full Received metadata before the review reservation or stage.
     let entry = JournalRecordV1::received(writer_request.clone());
     journal.preflight_record_size(&entry)?;
     let reservation = if verdict == ReviewVerdict::Approved {
-        match store.reserve(context.verifier, &tokens, m.reservation()?).map_err(fixture_error)? {
-            ReservationDispositionV1::Reserved(h) | ReservationDispositionV1::PendingOriginalOperation(h) => Some(h),
+        match store
+            .reserve(context.verifier, &tokens, m.reservation()?)
+            .map_err(fixture_error)?
+        {
+            ReservationDispositionV1::Reserved(h)
+            | ReservationDispositionV1::PendingOriginalOperation(h) => Some(h),
             ReservationDispositionV1::Consumed(_) => return Err(WriterError::OperationInProgress),
         }
-    } else { store.reject(context.verifier, &tokens[0]).map_err(fixture_error)?; None };
+    } else {
+        store
+            .reject(context.verifier, &tokens[0])
+            .map_err(fixture_error)?;
+        None
+    };
     let entry = match journal.reserve(writer_request)? {
         ReplayDispositionV1::Fresh(e) => e,
         _ => return Err(WriterError::OperationInProgress),
     };
     let projection = m.projection()?;
-    let mut authorization = FixtureCommitAuthorityV1 { context, store, request, metadata: &m, reservation, projection, refresh: &mut refresh };
+    let mut authorization = FixtureCommitAuthorityV1 {
+        context,
+        store,
+        request,
+        metadata: &m,
+        reservation,
+        projection,
+        refresh: &mut refresh,
+    };
     authorization.before_replace()?;
-    commit_planned_task_write(context.writer,journal,entry,PlannedTaskMutationV1 {
-        target,stamp,hash:Sha256Digest::of(&bytes).0,live,postimage,used:delta as usize,
-        admitted_ref:signed.clone(),temp_name:format!(".chinwag-tmp-{}",operation),
-    },&mut authorization,&mut hook)
+    commit_planned_task_write(
+        context.writer,
+        journal,
+        entry,
+        PlannedTaskMutationV1 {
+            target,
+            stamp,
+            hash: Sha256Digest::of(&bytes).0,
+            live,
+            postimage,
+            used: delta as usize,
+            admitted_ref: signed.clone(),
+            temp_name: format!(".chinwag-tmp-{}", operation),
+        },
+        &mut authorization,
+        &mut hook,
+    )
 }
 
 fn recover_fixture_reviewed_task<F>(
-    context: &FixtureReviewWriterContextV1<'_>, journal: &mut Journal,
+    context: &FixtureReviewWriterContextV1<'_>,
+    journal: &mut Journal,
     store: &mut crate::task_review_state::ReviewStateStoreV1,
-    request: &FixtureReviewedWriteRequestV1, m: &FixtureWriterMetadataV1,
+    request: &FixtureReviewedWriteRequestV1,
+    m: &FixtureWriterMetadataV1,
     refresh: &mut F,
-    hook: &mut impl FnMut(WriterStep,&File,&str)->Result<(),WriterError>,
-) -> Result<WriterWriteOutcome,WriterError>
-where F: FnMut()->Result<FixtureWriterObservationV1,WriterError> {
+    hook: &mut impl FnMut(WriterStep, &File, &str) -> Result<(), WriterError>,
+) -> Result<WriterWriteOutcome, WriterError>
+where
+    F: FnMut() -> Result<FixtureWriterObservationV1, WriterError>,
+{
     use crate::task_review_state::ReservationDispositionV1;
-    let mut entry = journal.latest(&m.lease.workspace_id,&m.lease.task_source_id,&m.intent.original_operation_id)
-        .cloned().ok_or(WriterError::OperationInProgress)?;
+    let mut entry = journal
+        .latest(
+            &m.lease.workspace_id,
+            &m.lease.task_source_id,
+            &m.intent.original_operation_id,
+        )
+        .cloned()
+        .ok_or(WriterError::OperationInProgress)?;
     journal.lookup_request(&m.request()?)?;
-    if entry.state == WriteOperationState::Rejected { return Ok(WriterWriteOutcome::Rejected); }
-    if entry.state == WriteOperationState::Held { return Ok(WriterWriteOutcome::Held); }
-    let found = store.lookup_original(&m.intent.original_operation_id,m.intent.primary_acceptance_digest,m.digest()?).map_err(fixture_error)?;
+    if entry.state == WriteOperationState::Rejected {
+        return Ok(WriterWriteOutcome::Rejected);
+    }
+    if entry.state == WriteOperationState::Held {
+        return Ok(WriterWriteOutcome::Held);
+    }
+    let found = store
+        .lookup_original(
+            &m.intent.original_operation_id,
+            m.intent.primary_acceptance_digest,
+            m.digest()?,
+        )
+        .map_err(fixture_error)?;
     if entry.state == WriteOperationState::Acknowledged {
-        if m.intent.decision == FixtureWriterDecisionV1::ApprovedDone && !matches!(found,Some(ReservationDispositionV1::Consumed(_))) {
+        if m.intent.decision == FixtureWriterDecisionV1::ApprovedDone
+            && !matches!(found, Some(ReservationDispositionV1::Consumed(_)))
+        {
             return Err(WriterError::OperationInProgress);
         }
         // Exact old receipt only; never issues a new effect or approval.
-        return Ok(WriterWriteOutcome::DuplicateRecorded(fixture_finalization_for_record(&entry,m)?.proof));
+        return Ok(WriterWriteOutcome::DuplicateRecorded(
+            fixture_finalization_for_record(&entry, m)?.proof,
+        ));
     }
-    let reservation = match (&m.intent.decision,found) {
-        (FixtureWriterDecisionV1::ApprovedDone,Some(ReservationDispositionV1::PendingOriginalOperation(h))) => Some(h),
-        (FixtureWriterDecisionV1::ApprovedDone,Some(ReservationDispositionV1::Consumed(_))) if entry.state==WriteOperationState::Recorded => {
-            let f=fixture_finalization_from_journal(context,journal,&m.intent.original_operation_id)?;
-            let observed=refresh()?;
-            verify_fixture_clock(context.writer.lease,&observed,store.highwater())?;
-            if sorted_fixture_proposals(context.writer,&observed.proposals)?.iter().map(|p|p.0.clone()).collect::<Vec<_>>() != m.intent.decisions
-                || sorted_fixture_proposals(context.writer,&request.original_proposals)? != sorted_fixture_proposals(context.writer,&observed.proposals)?
-                || !matches!(store.lookup_original(&m.intent.original_operation_id,m.intent.primary_acceptance_digest,m.digest()?).map_err(fixture_error)?,Some(ReservationDispositionV1::Consumed(_)))
-            {return Err(WriterError::AuthorityMismatch);}
-            verify_fixture_successor(context,&entry,m)?;
-            journal_phase(journal,&mut entry,WriteOperationState::Acknowledged)?;
+    let reservation = match (&m.intent.decision, found) {
+        (
+            FixtureWriterDecisionV1::ApprovedDone,
+            Some(ReservationDispositionV1::PendingOriginalOperation(h)),
+        ) => Some(h),
+        (FixtureWriterDecisionV1::ApprovedDone, Some(ReservationDispositionV1::Consumed(_)))
+            if entry.state == WriteOperationState::Recorded =>
+        {
+            let f = fixture_finalization_from_journal(
+                context,
+                journal,
+                &m.intent.original_operation_id,
+            )?;
+            let observed = refresh()?;
+            verify_fixture_clock(context.writer.lease, &observed, store.highwater())?;
+            if sorted_fixture_proposals(context.writer, &observed.proposals)?
+                .iter()
+                .map(|p| p.0.clone())
+                .collect::<Vec<_>>()
+                != m.intent.decisions
+                || sorted_fixture_proposals(context.writer, &request.original_proposals)?
+                    != sorted_fixture_proposals(context.writer, &observed.proposals)?
+                || !matches!(
+                    store
+                        .lookup_original(
+                            &m.intent.original_operation_id,
+                            m.intent.primary_acceptance_digest,
+                            m.digest()?
+                        )
+                        .map_err(fixture_error)?,
+                    Some(ReservationDispositionV1::Consumed(_))
+                )
+            {
+                return Err(WriterError::AuthorityMismatch);
+            }
+            verify_fixture_successor(context, &entry, m)?;
+            journal_phase(journal, &mut entry, WriteOperationState::Acknowledged)?;
             return Ok(WriterWriteOutcome::DuplicateRecorded(f.proof));
-        },
-        (FixtureWriterDecisionV1::RejectedBlocked,None)=>None,
-        _=>return Err(WriterError::OperationInProgress),
+        }
+        (FixtureWriterDecisionV1::RejectedBlocked, None) => None,
+        _ => return Err(WriterError::OperationInProgress),
     };
     let projection = m.projection()?;
-    let mut authority=FixtureCommitAuthorityV1 {context,store,request,metadata:m,reservation,projection,refresh};
-    if matches!(entry.state,WriteOperationState::Received|WriteOperationState::Validated) {
+    let mut authority = FixtureCommitAuthorityV1 {
+        context,
+        store,
+        request,
+        metadata: m,
+        reservation,
+        projection,
+        refresh,
+    };
+    if matches!(
+        entry.state,
+        WriteOperationState::Received | WriteOperationState::Validated
+    ) {
         authority.before_replace()?;
-        let target=PinnedTarget::open(context.writer.root,&m.lease.canonical_relative_path)?;
-        let (bytes,stamp)=target.read()?;
-        if stamp.identity!=context.writer.source_identity || Sha256Digest::of(&bytes)!=m.intent.predecessor_sha256
-            || bytes.len() as u64!=m.intent.predecessor_bytes
-        {return Err(WriterError::SourceIdentityChanged);}
-        let live=CanonicalTaskDocumentV1::from_bytes(&bytes)?;
-        let task=live.tasks.iter().find(|t|t.task_id==m.intent.signed_task_ref.task_id).ok_or(WriterError::TargetTaskConflict)?;
-        if task!=&m.intent.predecessor_target_snapshot
-            || live.task_ref(task,&m.lease.canonical_relative_path)!=m.intent.qualified_predecessor_task_ref
-        {return Err(WriterError::AcceptanceInvalidated);}
-        let mut postimage=live.clone();
-        postimage.file_cas_rev=m.intent.successor_file_rev;
-        postimage.last_operation_id=Some(m.intent.original_operation_id.clone());
-        let t=postimage.tasks.iter_mut().find(|t|t.task_id==m.intent.signed_task_ref.task_id).ok_or(WriterError::TargetTaskConflict)?;
-        t.status=m.intent.target_task_status; t.task_status_rev=m.intent.target_task_status_rev;
-        let postbytes=postimage.to_canonical_bytes()?;
-        if Sha256Digest::of(&postbytes)!=m.intent.successor_sha256 || postbytes.len() as u64!=m.intent.successor_bytes {
+        let target = PinnedTarget::open(context.writer.root, &m.lease.canonical_relative_path)?;
+        let (bytes, stamp) = target.read()?;
+        if stamp.identity != context.writer.source_identity
+            || Sha256Digest::of(&bytes) != m.intent.predecessor_sha256
+            || bytes.len() as u64 != m.intent.predecessor_bytes
+        {
+            return Err(WriterError::SourceIdentityChanged);
+        }
+        let live = CanonicalTaskDocumentV1::from_bytes(&bytes)?;
+        let task = live
+            .tasks
+            .iter()
+            .find(|t| t.task_id == m.intent.signed_task_ref.task_id)
+            .ok_or(WriterError::TargetTaskConflict)?;
+        if task != &m.intent.predecessor_target_snapshot
+            || live.task_ref(task, &m.lease.canonical_relative_path)
+                != m.intent.qualified_predecessor_task_ref
+        {
             return Err(WriterError::AcceptanceInvalidated);
         }
-        return commit_planned_task_write(context.writer,journal,entry,PlannedTaskMutationV1 {
-            target,stamp,hash:m.intent.predecessor_sha256.0,live,postimage,
-            used:(m.intent.predecessor_file_rev-m.intent.signed_task_ref.file_cas_rev) as usize,
-            admitted_ref:m.intent.signed_task_ref.clone(),temp_name:format!(".chinwag-tmp-{}",m.intent.original_operation_id),
-        },&mut authority,hook);
+        let mut postimage = live.clone();
+        postimage.file_cas_rev = m.intent.successor_file_rev;
+        postimage.last_operation_id = Some(m.intent.original_operation_id.clone());
+        let t = postimage
+            .tasks
+            .iter_mut()
+            .find(|t| t.task_id == m.intent.signed_task_ref.task_id)
+            .ok_or(WriterError::TargetTaskConflict)?;
+        t.status = m.intent.target_task_status;
+        t.task_status_rev = m.intent.target_task_status_rev;
+        let postbytes = postimage.to_canonical_bytes()?;
+        if Sha256Digest::of(&postbytes) != m.intent.successor_sha256
+            || postbytes.len() as u64 != m.intent.successor_bytes
+        {
+            return Err(WriterError::AcceptanceInvalidated);
+        }
+        return commit_planned_task_write(
+            context.writer,
+            journal,
+            entry,
+            PlannedTaskMutationV1 {
+                target,
+                stamp,
+                hash: m.intent.predecessor_sha256.0,
+                live,
+                postimage,
+                used: (m.intent.predecessor_file_rev - m.intent.signed_task_ref.file_cas_rev)
+                    as usize,
+                admitted_ref: m.intent.signed_task_ref.clone(),
+                temp_name: format!(".chinwag-tmp-{}", m.intent.original_operation_id),
+            },
+            &mut authority,
+            hook,
+        );
     }
-    let prepared=entry.prepared.clone().ok_or(WriterError::OperationInProgress)?;
-    validate_fixture_prepared(&entry,m)?;
-    let target=PinnedTarget::open(context.writer.root,&m.lease.canonical_relative_path)?;
-    match inspect_prepared(target.parent(),&prepared,context.writer.root.uid)? {
-        RecoveryFileState::Successor=>{
-            verify_fixture_successor(context,&entry,m)?;
+    let prepared = entry
+        .prepared
+        .clone()
+        .ok_or(WriterError::OperationInProgress)?;
+    validate_fixture_prepared(&entry, m)?;
+    let target = PinnedTarget::open(context.writer.root, &m.lease.canonical_relative_path)?;
+    match inspect_prepared(target.parent(), &prepared, context.writer.root.uid)? {
+        RecoveryFileState::Successor => {
+            verify_fixture_successor(context, &entry, m)?;
             // Current recovery authority is required before any phase/projection
             // write. Consumption still requires the subsequent Recorded seal.
             authority.before_replace()?;
-            verify_fixture_successor(context,&entry,m)?;
-            if !matches!(entry.state,WriteOperationState::Recorded) {
-                if matches!(entry.state,WriteOperationState::Prepared|WriteOperationState::FileCommitted) {
-                    journal_phase(journal,&mut entry,WriteOperationState::Reconciling)?;
+            verify_fixture_successor(context, &entry, m)?;
+            if !matches!(entry.state, WriteOperationState::Recorded) {
+                if matches!(
+                    entry.state,
+                    WriteOperationState::Prepared | WriteOperationState::FileCommitted
+                ) {
+                    journal_phase(journal, &mut entry, WriteOperationState::Reconciling)?;
                 }
                 target.parent().sync_all()?;
-                entry.result=Some(m.projection()?);
-                journal_phase(journal,&mut entry,WriteOperationState::Recorded)?;
+                entry.result = Some(m.projection()?);
+                journal_phase(journal, &mut entry, WriteOperationState::Recorded)?;
             }
-        },
-        RecoveryFileState::Predecessor=>{
-            if journal.had_durable_file_commit(&entry.request) || entry.state==WriteOperationState::Recorded {
+        }
+        RecoveryFileState::Predecessor => {
+            if journal.had_durable_file_commit(&entry.request)
+                || entry.state == WriteOperationState::Recorded
+            {
                 return Err(WriterError::SourceHeld);
             }
-            let (bytes,stamp) = target.read()?;
+            let (bytes, stamp) = target.read()?;
             let live = CanonicalTaskDocumentV1::from_bytes(&bytes)?;
-            let task = live.tasks.iter().find(|t| t.task_id == m.intent.signed_task_ref.task_id)
+            let task = live
+                .tasks
+                .iter()
+                .find(|t| t.task_id == m.intent.signed_task_ref.task_id)
                 .ok_or(WriterError::TargetTaskConflict)?;
             if stamp.identity != context.writer.source_identity
                 || task != &m.intent.predecessor_target_snapshot
-                || live.task_ref(task,&m.lease.canonical_relative_path) != m.intent.qualified_predecessor_task_ref
-            { return Err(WriterError::SourceIdentityChanged); }
+                || live.task_ref(task, &m.lease.canonical_relative_path)
+                    != m.intent.qualified_predecessor_task_ref
+            {
+                return Err(WriterError::SourceIdentityChanged);
+            }
             authority.before_replace()?;
-            if entry.state==WriteOperationState::Prepared {journal_phase(journal,&mut entry,WriteOperationState::Reconciling)?;}
-            if entry.state!=WriteOperationState::Reconciling {return Err(WriterError::OperationInProgress);}
+            if entry.state == WriteOperationState::Prepared {
+                journal_phase(journal, &mut entry, WriteOperationState::Reconciling)?;
+            }
+            if entry.state != WriteOperationState::Reconciling {
+                return Err(WriterError::OperationInProgress);
+            }
             authority.before_replace()?;
-            verify_prepared_stage(target.parent(),&prepared,context.writer.root.uid)?;
+            verify_prepared_stage(target.parent(), &prepared, context.writer.root.uid)?;
             journal.preflight_completion(&entry)?;
-            hook(WriterStep::BeforeRename,target.parent(),target.leaf())?;
+            hook(WriterStep::BeforeRename, target.parent(), target.leaf())?;
             authority.before_replace()?;
-            if inspect_prepared(target.parent(),&prepared,context.writer.root.uid)?!=RecoveryFileState::Predecessor {return Err(WriterError::SourceIdentityChanged);}
-            verify_prepared_stage(target.parent(),&prepared,context.writer.root.uid)?;
-            renameat(target.parent(),prepared.temp_name.as_str(),target.parent(),target.leaf())?;
-            hook(WriterStep::AfterRename,target.parent(),target.leaf())?;
+            if inspect_prepared(target.parent(), &prepared, context.writer.root.uid)?
+                != RecoveryFileState::Predecessor
+            {
+                return Err(WriterError::SourceIdentityChanged);
+            }
+            verify_prepared_stage(target.parent(), &prepared, context.writer.root.uid)?;
+            renameat(
+                target.parent(),
+                prepared.temp_name.as_str(),
+                target.parent(),
+                target.leaf(),
+            )?;
+            hook(WriterStep::AfterRename, target.parent(), target.leaf())?;
             target.parent().sync_all()?;
-            verify_fixture_successor(context,&entry,m)?;
-            entry.result=Some(m.projection()?);
-            journal_phase(journal,&mut entry,WriteOperationState::Recorded)?;
-        },
-        _=>{return Err(WriterError::SourceIdentityChanged);},
+            verify_fixture_successor(context, &entry, m)?;
+            entry.result = Some(m.projection()?);
+            journal_phase(journal, &mut entry, WriteOperationState::Recorded)?;
+        }
+        _ => {
+            return Err(WriterError::SourceIdentityChanged);
+        }
     }
-    let proof=authority.finalize_recorded(journal,&entry)?;
-    journal_phase(journal,&mut entry,WriteOperationState::Acknowledged)?;
+    let proof = authority.finalize_recorded(journal, &entry)?;
+    journal_phase(journal, &mut entry, WriteOperationState::Acknowledged)?;
     Ok(WriterWriteOutcome::DuplicateRecorded(proof))
 }
 
@@ -3441,93 +4003,351 @@ mod tests {
     #[test]
     fn p0_fixture_writer_post_refresh_drift_cannot_consume_or_record() {
         use std::cell::Cell;
-        for finalization_window in [false,true] {
-            let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-            let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-            let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();
+        for finalization_window in [false, true] {
+            let f = ReviewedWriterFixture::new(false);
+            let writer = f.writer.context();
+            let context =
+                FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+            let mut journal = f.writer.journal();
+            let mut store = f.state();
+            let request = f.request();
             if !finalization_window {
-                assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|s,_,_|if s==WriterStep::AfterRename {Err(WriterError::InjectedCrash)} else {Ok(())}).is_err());
+                assert!(
+                    commit_fixture_reviewed_task(
+                        &context,
+                        &mut journal,
+                        &mut store,
+                        &request,
+                        || Ok(f.observation()),
+                        |s, _, _| if s == WriterStep::AfterRename {
+                            Err(WriterError::InjectedCrash)
+                        } else {
+                            Ok(())
+                        }
+                    )
+                    .is_err()
+                );
             }
-            let calls=Cell::new(0);
-            assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||{
-                calls.set(calls.get()+1);
-                if (finalization_window && calls.get()==4) || (!finalization_window && calls.get()==1) {
-                    fs::write(f.writer.root.path.join("TASKS.md"),b"drift during trusted refresh callback").unwrap();
+            let calls = Cell::new(0);
+            assert!(
+                commit_fixture_reviewed_task(
+                    &context,
+                    &mut journal,
+                    &mut store,
+                    &request,
+                    || {
+                        calls.set(calls.get() + 1);
+                        if (finalization_window && calls.get() == 4)
+                            || (!finalization_window && calls.get() == 1)
+                        {
+                            fs::write(
+                                f.writer.root.path.join("TASKS.md"),
+                                b"drift during trusted refresh callback",
+                            )
+                            .unwrap();
+                        }
+                        Ok(f.observation())
+                    },
+                    |_, _, _| Ok(())
+                )
+                .is_err()
+            );
+            let op = &f.review.bundle.acceptance.payload.operation_id;
+            assert_eq!(
+                journal
+                    .latest(
+                        &f.writer.lease.workspace_id,
+                        &f.writer.lease.task_source_id,
+                        op
+                    )
+                    .unwrap()
+                    .state,
+                if finalization_window {
+                    WriteOperationState::Recorded
+                } else {
+                    WriteOperationState::Prepared
                 }
-                Ok(f.observation())
-            },|_,_,_|Ok(())).is_err());
-            let op=&f.review.bundle.acceptance.payload.operation_id;
-            assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().state,
-                if finalization_window {WriteOperationState::Recorded} else {WriteOperationState::Prepared});
-            assert_ne!(store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),crate::task_review_state::TaskReviewLifecycleState::AcceptedDone);
+            );
+            assert_ne!(
+                store.lifecycle(
+                    f.review
+                        .bundle
+                        .acceptance
+                        .payload
+                        .canonical_digest()
+                        .unwrap()
+                ),
+                crate::task_review_state::TaskReviewLifecycleState::AcceptedDone
+            );
         }
     }
 
     #[test]
     fn p0_fixture_writer_consumed_missing_ack_requires_fresh_repair_authority() {
-        use std::cell::Cell;
         use crate::task_review_state::ReservationDispositionV1;
-        let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-        let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-        let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();let calls=Cell::new(0);
-        assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||{
-            calls.set(calls.get()+1);if calls.get()==4 {Err(WriterError::InjectedCrash)} else {Ok(f.observation())}
-        },|_,_,_|Ok(())).is_err());
-        let op=&f.review.bundle.acceptance.payload.operation_id;
-        let entry=journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().clone();
-        let metadata=fixture_metadata_from_record(&context,&entry).unwrap();
-        let handle=match store.lookup_original(op,metadata.intent.primary_acceptance_digest,metadata.digest().unwrap()).unwrap().unwrap() {
-            ReservationDispositionV1::PendingOriginalOperation(h)=>h,x=>panic!("{x:?}")
+        use std::cell::Cell;
+        let f = ReviewedWriterFixture::new(false);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        let calls = Cell::new(0);
+        assert!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 4 {
+                        Err(WriterError::InjectedCrash)
+                    } else {
+                        Ok(f.observation())
+                    }
+                },
+                |_, _, _| Ok(())
+            )
+            .is_err()
+        );
+        let op = &f.review.bundle.acceptance.payload.operation_id;
+        let entry = journal
+            .latest(
+                &f.writer.lease.workspace_id,
+                &f.writer.lease.task_source_id,
+                op,
+            )
+            .unwrap()
+            .clone();
+        let metadata = fixture_metadata_from_record(&context, &entry).unwrap();
+        let handle = match store
+            .lookup_original(
+                op,
+                metadata.intent.primary_acceptance_digest,
+                metadata.digest().unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+        {
+            ReservationDispositionV1::PendingOriginalOperation(h) => h,
+            x => panic!("{x:?}"),
         };
         // Execute the actual private Recorded->Consumed helper, then simulate
         // losing its caller before the separate ACK append. No fake proof fields.
         {
-            let mut refresh=||Ok(f.observation());
-            let mut authority=FixtureCommitAuthorityV1 {context:&context,store:&mut store,request:&request,metadata:&metadata,
-                reservation:Some(handle),projection:metadata.projection().unwrap(),refresh:&mut refresh};
-            authority.finalize_recorded(&mut journal,&entry).unwrap();
+            let mut refresh = || Ok(f.observation());
+            let mut authority = FixtureCommitAuthorityV1 {
+                context: &context,
+                store: &mut store,
+                request: &request,
+                metadata: &metadata,
+                reservation: Some(handle),
+                projection: metadata.projection().unwrap(),
+                refresh: &mut refresh,
+            };
+            authority.finalize_recorded(&mut journal, &entry).unwrap();
         }
-        let state_bytes=fs::read(f.writer.root.path.join("review").join(crate::task_review_state::REVIEW_STATE_FILE_NAME)).unwrap();
-        assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||{
-            let mut o=f.observation();o.authority.reviewer_role_grants.clear();Ok(o)
-        },|_,_,_|panic!("no rename")).is_err());
-        assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().state,WriteOperationState::Recorded);
-        assert!(matches!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|_,_,_|panic!("no rename")),Ok(WriterWriteOutcome::DuplicateRecorded(_))));
-        assert_eq!(fs::read(f.writer.root.path.join("review").join(crate::task_review_state::REVIEW_STATE_FILE_NAME)).unwrap(),state_bytes);
-        assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().state,WriteOperationState::Acknowledged);
+        let state_bytes = fs::read(
+            f.writer
+                .root
+                .path
+                .join("review")
+                .join(crate::task_review_state::REVIEW_STATE_FILE_NAME),
+        )
+        .unwrap();
+        assert!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || {
+                    let mut o = f.observation();
+                    o.authority.reviewer_role_grants.clear();
+                    Ok(o)
+                },
+                |_, _, _| panic!("no rename")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            journal
+                .latest(
+                    &f.writer.lease.workspace_id,
+                    &f.writer.lease.task_source_id,
+                    op
+                )
+                .unwrap()
+                .state,
+            WriteOperationState::Recorded
+        );
+        assert!(matches!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || Ok(f.observation()),
+                |_, _, _| panic!("no rename")
+            ),
+            Ok(WriterWriteOutcome::DuplicateRecorded(_))
+        ));
+        assert_eq!(
+            fs::read(
+                f.writer
+                    .root
+                    .path
+                    .join("review")
+                    .join(crate::task_review_state::REVIEW_STATE_FILE_NAME)
+            )
+            .unwrap(),
+            state_bytes
+        );
+        assert_eq!(
+            journal
+                .latest(
+                    &f.writer.lease.workspace_id,
+                    &f.writer.lease.task_source_id,
+                    op
+                )
+                .unwrap()
+                .state,
+            WriteOperationState::Acknowledged
+        );
     }
 
     #[test]
     fn p0_fixture_writer_production_complete_refuses_original_fixture_prepared_before_effects() {
-        let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-        let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-        let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();
-        assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|s,_,_|if s==WriterStep::Prepared {Err(WriterError::InjectedCrash)} else {Ok(())}).is_err());
-        let op=&f.review.bundle.acceptance.payload.operation_id;
-        let original=journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().clone();
-        let stage=f.writer.root.path.join(&original.prepared.as_ref().unwrap().temp_name);
-        let stage_bytes=fs::read(&stage).unwrap();let bytes=f.bytes();let inode=f.metadata();
-        let ordinary_fixture=Fixture::new();let mut ordinary=ordinary_fixture.request();ordinary.operation_id=op.clone();
-        assert!(matches!(complete_prepared_operation(&writer,&mut journal,&ordinary,&[],||panic!("must not refresh"),|_|panic!("must not project")),Err(WriterError::PolicyBindingMismatch)));
-        assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op),Some(&original));
-        assert_eq!(f.bytes(),bytes);assert_eq!(f.metadata(),inode);assert_eq!(fs::read(&stage).unwrap(),stage_bytes);
+        let f = ReviewedWriterFixture::new(false);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        assert!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || Ok(f.observation()),
+                |s, _, _| if s == WriterStep::Prepared {
+                    Err(WriterError::InjectedCrash)
+                } else {
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        let op = &f.review.bundle.acceptance.payload.operation_id;
+        let original = journal
+            .latest(
+                &f.writer.lease.workspace_id,
+                &f.writer.lease.task_source_id,
+                op,
+            )
+            .unwrap()
+            .clone();
+        let stage = f
+            .writer
+            .root
+            .path
+            .join(&original.prepared.as_ref().unwrap().temp_name);
+        let stage_bytes = fs::read(&stage).unwrap();
+        let bytes = f.bytes();
+        let inode = f.metadata();
+        let ordinary_fixture = Fixture::new();
+        let mut ordinary = ordinary_fixture.request();
+        ordinary.operation_id = op.clone();
+        assert!(matches!(
+            complete_prepared_operation(
+                &writer,
+                &mut journal,
+                &ordinary,
+                &[],
+                || panic!("must not refresh"),
+                |_| panic!("must not project")
+            ),
+            Err(WriterError::PolicyBindingMismatch)
+        ));
+        assert_eq!(
+            journal.latest(
+                &f.writer.lease.workspace_id,
+                &f.writer.lease.task_source_id,
+                op
+            ),
+            Some(&original)
+        );
+        assert_eq!(f.bytes(), bytes);
+        assert_eq!(f.metadata(), inode);
+        assert_eq!(fs::read(&stage).unwrap(), stage_bytes);
     }
 
     #[test]
     fn p0_fixture_writer_production_reject_refuses_received_and_validated_before_effects() {
         use std::cell::Cell;
-        let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-        let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-        let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();let calls=Cell::new(0);
-        assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||{calls.set(calls.get()+1);if calls.get()==2 {Err(WriterError::InjectedCrash)} else {Ok(f.observation())}},|_,_,_|Ok(())).is_err());
-        let op=&f.review.bundle.acceptance.payload.operation_id;let bytes=f.bytes();let inode=f.metadata();
-        for state in [WriteOperationState::Received,WriteOperationState::Validated] {
-            let mut original=journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().clone();
-            if state==WriteOperationState::Validated {journal_phase(&mut journal,&mut original,state).unwrap();}
-            assert_eq!(original.state,state);
-            assert!(matches!(reject_unprepared_operation(&writer,&mut journal,op,&f.writer.authority),Err(WriterError::PolicyBindingMismatch)));
-            assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op),Some(&original));
-            assert_eq!(f.bytes(),bytes);assert_eq!(f.metadata(),inode);
+        let f = ReviewedWriterFixture::new(false);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        let calls = Cell::new(0);
+        assert!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 2 {
+                        Err(WriterError::InjectedCrash)
+                    } else {
+                        Ok(f.observation())
+                    }
+                },
+                |_, _, _| Ok(())
+            )
+            .is_err()
+        );
+        let op = &f.review.bundle.acceptance.payload.operation_id;
+        let bytes = f.bytes();
+        let inode = f.metadata();
+        for state in [
+            WriteOperationState::Received,
+            WriteOperationState::Validated,
+        ] {
+            let mut original = journal
+                .latest(
+                    &f.writer.lease.workspace_id,
+                    &f.writer.lease.task_source_id,
+                    op,
+                )
+                .unwrap()
+                .clone();
+            if state == WriteOperationState::Validated {
+                journal_phase(&mut journal, &mut original, state).unwrap();
+            }
+            assert_eq!(original.state, state);
+            assert!(matches!(
+                reject_unprepared_operation(&writer, &mut journal, op, &f.writer.authority),
+                Err(WriterError::PolicyBindingMismatch)
+            ));
+            assert_eq!(
+                journal.latest(
+                    &f.writer.lease.workspace_id,
+                    &f.writer.lease.task_source_id,
+                    op
+                ),
+                Some(&original)
+            );
+            assert_eq!(f.bytes(), bytes);
+            assert_eq!(f.metadata(), inode);
         }
     }
 
@@ -3543,10 +4363,17 @@ mod tests {
         assert!(!validate_fixture_reviewed_proposal_payload(&pretty));
         let text = String::from_utf8(bytes).unwrap();
         let duplicate = text.replacen("{", "{\"candidate\":null,", 1);
-        assert!(!validate_fixture_reviewed_proposal_payload(duplicate.as_bytes()));
+        assert!(!validate_fixture_reviewed_proposal_payload(
+            duplicate.as_bytes()
+        ));
         let unknown = text.replacen("{", "{\"unexpected\":true,", 1);
-        assert!(!validate_fixture_reviewed_proposal_payload(unknown.as_bytes()));
-        assert!(!validate_fixture_reviewed_proposal_payload(&vec![b' '; 32_769]));
+        assert!(!validate_fixture_reviewed_proposal_payload(
+            unknown.as_bytes()
+        ));
+        assert!(!validate_fixture_reviewed_proposal_payload(&vec![
+            b' ';
+            32_769
+        ]));
         assert!(!validate_fixture_reviewed_proposal_payload(&[0xff]));
     }
 
@@ -3561,10 +4388,17 @@ mod tests {
             "canonical_payload_hex": hex,
             "payload_digest_sha256": Sha256Digest::of(&bytes).to_string(),
             "display_text": "COMPLETED is presentation only"
-        }).to_string();
+        })
+        .to_string();
         let profiles = [fixture_reviewed_proposal_payload_profile()];
-        assert!(TaskActionableBodyV1::parse(&body, TaskMessageKind::TaskProposal, &profiles).is_ok());
-        for kind in [TaskMessageKind::CandidateResult, TaskMessageKind::Assignment, TaskMessageKind::TaskReceipt] {
+        assert!(
+            TaskActionableBodyV1::parse(&body, TaskMessageKind::TaskProposal, &profiles).is_ok()
+        );
+        for kind in [
+            TaskMessageKind::CandidateResult,
+            TaskMessageKind::Assignment,
+            TaskMessageKind::TaskReceipt,
+        ] {
             assert!(TaskActionableBodyV1::parse(&body, kind, &profiles).is_err());
         }
         assert!(TaskActionableBodyV1::parse(&body, TaskMessageKind::TaskProposal, &[]).is_err());
@@ -3915,12 +4749,19 @@ mod tests {
         let mut journal = fixture.journal();
         let committed = proof(fixture.commit(&mut journal, &request).unwrap());
         for identity in [fixture.identity, committed.committed_identity()] {
-            assert!(committed.verify_for_source_record(
-                &fixture.authority.policy, &fixture.authority.record, Some(identity)
-            ).is_ok());
+            assert!(
+                committed
+                    .verify_for_source_record(
+                        &fixture.authority.policy,
+                        &fixture.authority.record,
+                        Some(identity)
+                    )
+                    .is_ok()
+            );
         }
         let metadata = fs::metadata(&fixture.root.path).unwrap();
-        let provider = crate::task_acceptance::fixtures::Fixture::new(metadata.dev(), metadata.ino());
+        let provider =
+            crate::task_acceptance::fixtures::Fixture::new(metadata.dev(), metadata.ino());
         // Negative classification fixture only: the underlying writer proof was
         // produced by a real commit above. This does not mint a qualified fixture
         // finalization or claim an Approved -> Done integration path exists yet.
@@ -3929,9 +4770,15 @@ mod tests {
         let cloned = tagged.clone();
         assert_eq!(cloned.origin, tagged.origin);
         for identity in [fixture.identity, committed.committed_identity()] {
-            assert!(cloned.verify_for_source_record(
-                &fixture.authority.policy, &fixture.authority.record, Some(identity)
-            ).is_err());
+            assert!(
+                cloned
+                    .verify_for_source_record(
+                        &fixture.authority.policy,
+                        &fixture.authority.record,
+                        Some(identity)
+                    )
+                    .is_err()
+            );
         }
     }
 
@@ -5628,328 +6475,911 @@ mod tests {
             .is_err()
         );
     }
-// ROOT private integration preparation; insert inside task_writer::tests.
-struct ReviewedWriterFixture {
-    writer: Fixture,
-    review: crate::task_acceptance::fixtures::Fixture,
-}
-impl ReviewedWriterFixture {
-    fn new(rejected: bool) -> Self {
-        use crate::task_acceptance::{fixtures::{signed, signature}, ReviewVerdict};
-        let mut writer = Fixture::new();
-        fs::create_dir(writer.root.path.join("review")).unwrap();
-        fs::set_permissions(writer.root.path.join("review"),fs::Permissions::from_mode(0o700)).unwrap();
-        let namespace = fs::metadata(writer.root.path.join("review")).unwrap();
-        let mut review = crate::task_acceptance::fixtures::Fixture::new(namespace.dev(),namespace.ino());
-        // Construct and sign a fresh finite fixture assignment with the writer's
-        // existing32hex operation policy. Never rename an existing signed ID.
-        let operation = "66666666666666666666666666666666";
-        review.assignment.payload.operation_id = operation.into();
-        review.assignment = signed("immutable-assignment",review.assignment.payload.clone(),40);
-        review.bundle.candidate.payload.operation_id = operation.into();
-        review.bundle.candidate.author_k1 = signature(1,&review.bundle.candidate.payload.canonical_bytes().unwrap());
-        for transition in &mut review.history {
-            transition.payload.operation_id = operation.into();
-            transition.payload.assignment_record_digest = crate::task_acceptance::assignment_digest(&review.assignment).unwrap();
-            transition.payload.candidate_digest = review.bundle.candidate.payload.canonical_digest().unwrap();
-            *transition = signed("qualified-submission-transition",transition.payload.clone(),40);
-        }
-        review.bundle.review.operation_id = operation.into();
-        review.bundle.acceptance.payload.operation_id = operation.into();
-        review.bundle.acceptance.payload.candidate_digest = review.bundle.candidate.payload.canonical_digest().unwrap();
-        if rejected {
-            review.bundle.review.verdict = ReviewVerdict::Rejected;
-            review.bundle.acceptance.payload.verdict = ReviewVerdict::Rejected;
-        }
-        review.refresh_signed_records();
-        assert!(review.verify(crate::task_acceptance::ReviewHighwaterV1::default()).is_ok());
-        writer.authority.policy.workspace_id = review.current.workspace_id.clone();
-        writer.authority.policy.repo_id = review.current.repo_id.clone();
-        writer.authority.policy.authority_epoch = 2;
-        writer.authority.record.workspace_id = review.current.workspace_id.clone();
-        writer.authority.record.repo_id = review.current.repo_id.clone();
-        writer.authority.record.canonical_relative_path = "TASKS.md".into();
-        writer.authority.record.source_generation = 1;
-        writer.authority.record.writer_principal = "fixture-writer".into();
-        writer.authority.record.writer_epoch = 3;
-        writer.authority.writer_principal = "fixture-writer".into();
-        writer.authority.writer_epoch = 3;
-        writer.authority.clock = HostClockState::Verified {now_unix:100};
-        writer.authority.execution_admissions.clear();
-        writer.authority.reviewer_role_grants = vec![ReviewerRoleGrantV1 {
-            reviewer_actor: review.bundle.acceptance.payload.reviewer_full_instance.clone(),
-            authenticated_signer_principal: review.bundle.acceptance.payload.reviewer_principal.clone(),
-            reviewer_role: review.bundle.acceptance.payload.reviewer_role.clone(),
-            completion_policy_digest: review.bundle.acceptance.payload.policy_digest,
-        }];
-        writer.lease.workspace_id = review.current.workspace_id.clone();
-        writer.lease.repo_id = review.current.repo_id.clone();
-        writer.lease.canonical_relative_path = "TASKS.md".into();
-        writer.lease.source_generation = 1;
-        writer.lease.writer_principal = "fixture-writer".into();
-        writer.lease.writer_epoch = 3;
-        writer.lease.authority_epoch = 2;
-        writer.lease.issued_at_unix = 90;
-        writer.lease.expires_at_unix = 110;
-        writer.document.workspace_id = review.current.workspace_id.clone();
-        writer.document.repo_id = review.current.repo_id.clone();
-        writer.document.source_generation = 1;
-        writer.document.file_cas_rev = 8;
-        writer.document.tasks = vec![review.snapshot.clone()];
-        fs::rename(writer.root.path.join("tasks.md"),writer.root.path.join("TASKS.md")).unwrap();
-        fs::write(writer.root.path.join("TASKS.md"),writer.document.to_canonical_bytes().unwrap()).unwrap();
-        let file = fs::metadata(writer.root.path.join("TASKS.md")).unwrap();
-        writer.identity = SourceFilesystemIdentity {dev:file.dev(),ino:file.ino()};
-        // Materialize the admitted review leaf through its real guarded store
-        // before the writer context pins that namespace.
-        let initial_store = crate::task_review_state::ReviewStateStoreV1::open(
-            &File::open(&writer.root.path).unwrap(), "review", &review.provider,
-        ).unwrap();
-        drop(initial_store);
-        Self {writer,review}
+    // ROOT private integration preparation; insert inside task_writer::tests.
+    struct ReviewedWriterFixture {
+        writer: Fixture,
+        review: crate::task_acceptance::fixtures::Fixture,
     }
-    fn proposal(&self) -> FixtureProposalObservationV1 {
-        self.proposal_with(2,crate::task_wire::TaskMessageKind::TaskProposal)
+    impl ReviewedWriterFixture {
+        fn new(rejected: bool) -> Self {
+            use crate::task_acceptance::{
+                ReviewVerdict,
+                fixtures::{signature, signed},
+            };
+            let mut writer = Fixture::new();
+            fs::create_dir(writer.root.path.join("review")).unwrap();
+            fs::set_permissions(
+                writer.root.path.join("review"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let namespace = fs::metadata(writer.root.path.join("review")).unwrap();
+            let mut review =
+                crate::task_acceptance::fixtures::Fixture::new(namespace.dev(), namespace.ino());
+            // Construct and sign a fresh finite fixture assignment with the writer's
+            // existing32hex operation policy. Never rename an existing signed ID.
+            let operation = "66666666666666666666666666666666";
+            review.assignment.payload.operation_id = operation.into();
+            review.assignment = signed(
+                "immutable-assignment",
+                review.assignment.payload.clone(),
+                40,
+            );
+            review.bundle.candidate.payload.operation_id = operation.into();
+            review.bundle.candidate.author_k1 = signature(
+                1,
+                &review.bundle.candidate.payload.canonical_bytes().unwrap(),
+            );
+            for transition in &mut review.history {
+                transition.payload.operation_id = operation.into();
+                transition.payload.assignment_record_digest =
+                    crate::task_acceptance::assignment_digest(&review.assignment).unwrap();
+                transition.payload.candidate_digest =
+                    review.bundle.candidate.payload.canonical_digest().unwrap();
+                *transition = signed(
+                    "qualified-submission-transition",
+                    transition.payload.clone(),
+                    40,
+                );
+            }
+            review.bundle.review.operation_id = operation.into();
+            review.bundle.acceptance.payload.operation_id = operation.into();
+            review.bundle.acceptance.payload.candidate_digest =
+                review.bundle.candidate.payload.canonical_digest().unwrap();
+            if rejected {
+                review.bundle.review.verdict = ReviewVerdict::Rejected;
+                review.bundle.acceptance.payload.verdict = ReviewVerdict::Rejected;
+            }
+            review.refresh_signed_records();
+            assert!(
+                review
+                    .verify(crate::task_acceptance::ReviewHighwaterV1::default())
+                    .is_ok()
+            );
+            writer.authority.policy.workspace_id = review.current.workspace_id.clone();
+            writer.authority.policy.repo_id = review.current.repo_id.clone();
+            writer.authority.policy.authority_epoch = 2;
+            writer.authority.record.workspace_id = review.current.workspace_id.clone();
+            writer.authority.record.repo_id = review.current.repo_id.clone();
+            writer.authority.record.canonical_relative_path = "TASKS.md".into();
+            writer.authority.record.source_generation = 1;
+            writer.authority.record.writer_principal = "fixture-writer".into();
+            writer.authority.record.writer_epoch = 3;
+            writer.authority.writer_principal = "fixture-writer".into();
+            writer.authority.writer_epoch = 3;
+            writer.authority.clock = HostClockState::Verified { now_unix: 100 };
+            writer.authority.execution_admissions.clear();
+            writer.authority.reviewer_role_grants = vec![ReviewerRoleGrantV1 {
+                reviewer_actor: review
+                    .bundle
+                    .acceptance
+                    .payload
+                    .reviewer_full_instance
+                    .clone(),
+                authenticated_signer_principal: review
+                    .bundle
+                    .acceptance
+                    .payload
+                    .reviewer_principal
+                    .clone(),
+                reviewer_role: review.bundle.acceptance.payload.reviewer_role.clone(),
+                completion_policy_digest: review.bundle.acceptance.payload.policy_digest,
+            }];
+            writer.lease.workspace_id = review.current.workspace_id.clone();
+            writer.lease.repo_id = review.current.repo_id.clone();
+            writer.lease.canonical_relative_path = "TASKS.md".into();
+            writer.lease.source_generation = 1;
+            writer.lease.writer_principal = "fixture-writer".into();
+            writer.lease.writer_epoch = 3;
+            writer.lease.authority_epoch = 2;
+            writer.lease.issued_at_unix = 90;
+            writer.lease.expires_at_unix = 110;
+            writer.document.workspace_id = review.current.workspace_id.clone();
+            writer.document.repo_id = review.current.repo_id.clone();
+            writer.document.source_generation = 1;
+            writer.document.file_cas_rev = 8;
+            writer.document.tasks = vec![review.snapshot.clone()];
+            fs::rename(
+                writer.root.path.join("tasks.md"),
+                writer.root.path.join("TASKS.md"),
+            )
+            .unwrap();
+            fs::write(
+                writer.root.path.join("TASKS.md"),
+                writer.document.to_canonical_bytes().unwrap(),
+            )
+            .unwrap();
+            let file = fs::metadata(writer.root.path.join("TASKS.md")).unwrap();
+            writer.identity = SourceFilesystemIdentity {
+                dev: file.dev(),
+                ino: file.ino(),
+            };
+            // Materialize the admitted review leaf through its real guarded store
+            // before the writer context pins that namespace.
+            let initial_store = crate::task_review_state::ReviewStateStoreV1::open(
+                &File::open(&writer.root.path).unwrap(),
+                "review",
+                &review.provider,
+            )
+            .unwrap();
+            drop(initial_store);
+            Self { writer, review }
+        }
+        fn proposal(&self) -> FixtureProposalObservationV1 {
+            self.proposal_with(2, crate::task_wire::TaskMessageKind::TaskProposal)
+        }
+        fn proposal_with(
+            &self,
+            seed: u8,
+            kind: crate::task_wire::TaskMessageKind,
+        ) -> FixtureProposalObservationV1 {
+            use crate::task_wire::*;
+            let a = &self.review.bundle.acceptance.payload;
+            let payload = serde_json::to_vec(&self.review.bundle).unwrap();
+            let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+            let body = serde_json::json!({
+                "payload_profile":FIXTURE_REVIEWED_PROPOSAL_PROFILE,
+                "canonical_payload_hex":hex,
+                "payload_digest_sha256":Sha256Digest::of(&payload).to_string(),
+                "display_text":"Presentation cannot change verified acceptance"
+            })
+            .to_string();
+            let transcript = TaskTranscriptV3 {
+                message_id: "77777777777777777777777777777777".into(),
+                issued_at_unix: a.issued_at_unix,
+                expires_at_unix: a.expires_at_unix,
+                nonce: a.nonce,
+                sender_full_actor_address: a.reviewer_full_instance.clone(),
+                parent_full_actor_address: None,
+                recipient_full_actor_addresses: vec!["WORKHORSE#fixture-writer".into()],
+                room: "#fixture".into(),
+                message_kind: kind,
+                receiver_authority_id: "fixture-authority".into(),
+                task_ref: a.task_ref.clone(),
+                assignment_id: Some(a.assignment_id.clone()),
+                operation_id: Some(a.operation_id.clone()),
+                request_id: None,
+                in_reply_to_message_id: None,
+                config_digest: Sha256Digest(self.writer.lease.config_digest),
+                task_control_digest: a.task_control_digest,
+                body_utf8: body,
+            };
+            // Alternate-kind ratification is deliberately local to this negative
+            // fixture. The reviewed-writer binder must still reject that kind.
+            let profiles = [RatifiedPayloadProfile {
+                kind,
+                name: FIXTURE_REVIEWED_PROPOSAL_PROFILE,
+                validate_canonical_payload: validate_fixture_reviewed_proposal_payload,
+            }];
+            let key = iroh::SecretKey::from_bytes(&[seed; 32]);
+            let frame = PublishTaskV1::sign(transcript, &key, &profiles).unwrap();
+            let roster = [SignerEnrollment {
+                workspace_id: a.task_ref.workspace_id.clone(),
+                repo_id: a.task_ref.repo_id.clone(),
+                seat: "REVIEW".into(),
+                authenticated_signer_principal: a.reviewer_principal.clone(),
+                signer_pubkey: key.public(),
+                key_epoch: 2,
+                config_digest: Sha256Digest(self.writer.lease.config_digest),
+                allowed_actions: vec![kind],
+                active: true,
+            }];
+            let envelope = frame
+                .verify(
+                    TASK_BUS_V2_ALPN,
+                    &roster,
+                    &TaskVerificationContext {
+                        receiver_authority_id: "fixture-authority",
+                        recipient_full_actor_address: "WORKHORSE#fixture-writer",
+                        current_task_ref: &a.task_ref,
+                        config_digest: Sha256Digest(self.writer.lease.config_digest),
+                        task_control_digest: a.task_control_digest,
+                        required_key_epoch: 2,
+                        current_granted_actions: &[kind],
+                        ratified_profiles: &profiles,
+                        host_clock: HostClockState::Verified { now_unix: 100 },
+                    },
+                )
+                .unwrap();
+            FixtureProposalObservationV1 {
+                envelope,
+                bundle: self.review.bundle.clone(),
+                evidence: self.review.evidence.clone(),
+            }
+        }
+        fn request(&self) -> FixtureReviewedWriteRequestV1 {
+            FixtureReviewedWriteRequestV1 {
+                target_transition_id: "fixture-reviewed-transition".into(),
+                assignment: self.review.assignment.clone(),
+                history: self.review.history.clone(),
+                original_proposals: vec![self.proposal()],
+            }
+        }
+        fn observation(&self) -> FixtureWriterObservationV1 {
+            FixtureWriterObservationV1 {
+                authority: self.writer.authority.clone(),
+                proposals: vec![self.proposal()],
+                dependencies: vec![],
+            }
+        }
+        fn bytes(&self) -> Vec<u8> {
+            fs::read(self.writer.root.path.join("TASKS.md")).unwrap()
+        }
+        fn state(&self) -> crate::task_review_state::ReviewStateStoreV1 {
+            crate::task_review_state::ReviewStateStoreV1::open(
+                &File::open(&self.writer.root.path).unwrap(),
+                "review",
+                &self.review.provider,
+            )
+            .unwrap()
+        }
+        fn metadata(&self) -> (u64, u64) {
+            let m = fs::metadata(self.writer.root.path.join("TASKS.md")).unwrap();
+            (m.dev(), m.ino())
+        }
     }
-    fn proposal_with(&self,seed:u8,kind:crate::task_wire::TaskMessageKind) -> FixtureProposalObservationV1 {
-        use crate::task_wire::*;
-        let a = &self.review.bundle.acceptance.payload;
-        let payload = serde_json::to_vec(&self.review.bundle).unwrap();
-        let hex:String = payload.iter().map(|b|format!("{b:02x}")).collect();
-        let body = serde_json::json!({
-            "payload_profile":FIXTURE_REVIEWED_PROPOSAL_PROFILE,
-            "canonical_payload_hex":hex,
-            "payload_digest_sha256":Sha256Digest::of(&payload).to_string(),
-            "display_text":"Presentation cannot change verified acceptance"
-        }).to_string();
-        let transcript = TaskTranscriptV3 {
-            message_id:"77777777777777777777777777777777".into(),
-            issued_at_unix:a.issued_at_unix,expires_at_unix:a.expires_at_unix,nonce:a.nonce,
-            sender_full_actor_address:a.reviewer_full_instance.clone(),parent_full_actor_address:None,
-            recipient_full_actor_addresses:vec!["WORKHORSE#fixture-writer".into()],room:"#fixture".into(),
-            message_kind:kind,receiver_authority_id:"fixture-authority".into(),task_ref:a.task_ref.clone(),
-            assignment_id:Some(a.assignment_id.clone()),operation_id:Some(a.operation_id.clone()),
-            request_id:None,in_reply_to_message_id:None,
-            config_digest:Sha256Digest(self.writer.lease.config_digest),task_control_digest:a.task_control_digest,body_utf8:body,
+
+    #[test]
+    fn p0_fixture_writer_real_independent_approved_done_and_replay() {
+        use crate::task_review_state::TaskReviewLifecycleState;
+        let f = ReviewedWriterFixture::new(false);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        let proof = match commit_fixture_reviewed_task(
+            &context,
+            &mut journal,
+            &mut store,
+            &request,
+            || Ok(f.observation()),
+            |_, _, _| Ok(()),
+        )
+        .unwrap()
+        {
+            WriterWriteOutcome::Committed(p) => p,
+            x => panic!("{x:?}"),
         };
-        // Alternate-kind ratification is deliberately local to this negative
-        // fixture. The reviewed-writer binder must still reject that kind.
-        let profiles=[RatifiedPayloadProfile {kind,name:FIXTURE_REVIEWED_PROPOSAL_PROFILE,validate_canonical_payload:validate_fixture_reviewed_proposal_payload}];
-        let key=iroh::SecretKey::from_bytes(&[seed;32]);
-        let frame=PublishTaskV1::sign(transcript,&key,&profiles).unwrap();
-        let roster=[SignerEnrollment {
-            workspace_id:a.task_ref.workspace_id.clone(),repo_id:a.task_ref.repo_id.clone(),seat:"REVIEW".into(),
-            authenticated_signer_principal:a.reviewer_principal.clone(),signer_pubkey:key.public(),key_epoch:2,
-            config_digest:Sha256Digest(self.writer.lease.config_digest),allowed_actions:vec![kind],active:true,
-        }];
-        let envelope=frame.verify(TASK_BUS_V2_ALPN,&roster,&TaskVerificationContext {
-            receiver_authority_id:"fixture-authority",recipient_full_actor_address:"WORKHORSE#fixture-writer",
-            current_task_ref:&a.task_ref,config_digest:Sha256Digest(self.writer.lease.config_digest),
-            task_control_digest:a.task_control_digest,required_key_epoch:2,current_granted_actions:&[kind],
-            ratified_profiles:&profiles,host_clock:HostClockState::Verified {now_unix:100},
-        }).unwrap();
-        FixtureProposalObservationV1 {envelope,bundle:self.review.bundle.clone(),evidence:self.review.evidence.clone()}
+        assert_eq!(
+            proof.origin,
+            WriterProofOriginV1::Fixture(f.review.provider.provenance().clone())
+        );
+        let document = CanonicalTaskDocumentV1::from_bytes(&f.bytes()).unwrap();
+        assert_eq!(document.tasks[0].status, CanonicalTaskStatus::Done);
+        assert_eq!(document.tasks[0].task_status_rev, 5);
+        assert_eq!(document.file_cas_rev, 9);
+        assert_eq!(
+            store.lifecycle(
+                f.review
+                    .bundle
+                    .acceptance
+                    .payload
+                    .canonical_digest()
+                    .unwrap()
+            ),
+            TaskReviewLifecycleState::AcceptedDone
+        );
+        let bytes = f.bytes();
+        let inode = f.metadata();
+        assert!(matches!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || panic!("no fresh approval for ACK replay"),
+                |_, _, _| panic!("no second rename")
+            ),
+            Ok(WriterWriteOutcome::DuplicateRecorded(_))
+        ));
+        assert_eq!(f.bytes(), bytes);
+        assert_eq!(f.metadata(), inode);
+        for identity in [proof.previous_identity(), proof.committed_identity()] {
+            assert!(
+                proof
+                    .clone()
+                    .verify_for_source_record(
+                        &f.writer.authority.policy,
+                        &f.writer.authority.record,
+                        Some(identity)
+                    )
+                    .is_err()
+            );
+        }
+        assert!(context.require_production().is_err());
     }
-    fn request(&self) -> FixtureReviewedWriteRequestV1 {
-        FixtureReviewedWriteRequestV1 {
-            target_transition_id:"fixture-reviewed-transition".into(),assignment:self.review.assignment.clone(),
-            history:self.review.history.clone(),original_proposals:vec![self.proposal()],
+
+    #[test]
+    fn p0_fixture_writer_independent_rejected_routes_blocked_not_accepted() {
+        use crate::task_review_state::TaskReviewLifecycleState;
+        let f = ReviewedWriterFixture::new(true);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        assert!(matches!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &f.request(),
+                || Ok(f.observation()),
+                |_, _, _| Ok(())
+            ),
+            Ok(WriterWriteOutcome::Committed(_))
+        ));
+        let doc = CanonicalTaskDocumentV1::from_bytes(&f.bytes()).unwrap();
+        assert_eq!(doc.tasks[0].status, CanonicalTaskStatus::Blocked);
+        assert_eq!(doc.file_cas_rev, 9);
+        assert_eq!(
+            store.lifecycle(
+                f.review
+                    .bundle
+                    .acceptance
+                    .payload
+                    .canonical_digest()
+                    .unwrap()
+            ),
+            TaskReviewLifecycleState::RejectedByReviewer
+        );
+    }
+
+    #[test]
+    fn p0_fixture_writer_wrong_actual_outer_k1_and_kind_have_no_effect() {
+        use crate::task_wire::TaskMessageKind;
+        for (seed, kind) in [
+            (3, TaskMessageKind::TaskProposal),
+            (2, TaskMessageKind::CandidateResult),
+            (2, TaskMessageKind::TaskReceipt),
+        ] {
+            let f = ReviewedWriterFixture::new(false);
+            let writer = f.writer.context();
+            let context =
+                FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+            let mut journal = f.writer.journal();
+            let mut store = f.state();
+            let bytes = f.bytes();
+            let inode = f.metadata();
+            let mut request = f.request();
+            request.original_proposals = vec![f.proposal_with(seed, kind)];
+            assert!(
+                commit_fixture_reviewed_task(
+                    &context,
+                    &mut journal,
+                    &mut store,
+                    &request,
+                    || Ok(f.observation()),
+                    |_, _, _| Ok(())
+                )
+                .is_err()
+            );
+            assert_eq!(f.bytes(), bytes);
+            assert_eq!(f.metadata(), inode);
+            assert_eq!(journal.latest_records().count(), 0);
         }
     }
-    fn observation(&self) -> FixtureWriterObservationV1 {
-        FixtureWriterObservationV1 {authority:self.writer.authority.clone(),proposals:vec![self.proposal()],dependencies:vec![]}
+
+    #[test]
+    fn p0_fixture_writer_current_reviewer_revocation_and_expiry_before_rename() {
+        use std::cell::Cell;
+        for expired in [false, true] {
+            let f = ReviewedWriterFixture::new(false);
+            let writer = f.writer.context();
+            let context =
+                FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+            let mut journal = f.writer.journal();
+            let mut store = f.state();
+            let bytes = f.bytes();
+            let inode = f.metadata();
+            let count = Cell::new(0);
+            assert!(
+                commit_fixture_reviewed_task(
+                    &context,
+                    &mut journal,
+                    &mut store,
+                    &f.request(),
+                    || {
+                        let n = count.get() + 1;
+                        count.set(n);
+                        let mut o = f.observation();
+                        if n >= 3 {
+                            if expired {
+                                o.authority.clock = HostClockState::Verified { now_unix: 111 };
+                            } else {
+                                o.authority.reviewer_role_grants.clear();
+                            }
+                        }
+                        Ok(o)
+                    },
+                    |_, _, _| Ok(())
+                )
+                .is_err()
+            );
+            assert_eq!(f.bytes(), bytes);
+            assert_eq!(f.metadata(), inode);
+            assert_ne!(
+                store.lifecycle(
+                    f.review
+                        .bundle
+                        .acceptance
+                        .payload
+                        .canonical_digest()
+                        .unwrap()
+                ),
+                crate::task_review_state::TaskReviewLifecycleState::AcceptedDone
+            );
+        }
     }
-    fn bytes(&self)->Vec<u8>{fs::read(self.writer.root.path.join("TASKS.md")).unwrap()}
-    fn state(&self)->crate::task_review_state::ReviewStateStoreV1 {
-        crate::task_review_state::ReviewStateStoreV1::open(&File::open(&self.writer.root.path).unwrap(),"review",&self.review.provider).unwrap()
+
+    #[test]
+    fn p0_fixture_writer_f0_and_f1_repair_original_without_second_rename() {
+        for crash in [WriterStep::Prepared, WriterStep::AfterRename] {
+            let f = ReviewedWriterFixture::new(false);
+            let writer = f.writer.context();
+            let context =
+                FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+            let mut journal = f.writer.journal();
+            let mut store = f.state();
+            let request = f.request();
+            assert!(matches!(
+                commit_fixture_reviewed_task(
+                    &context,
+                    &mut journal,
+                    &mut store,
+                    &request,
+                    || Ok(f.observation()),
+                    |step, _, _| if step == crash {
+                        Err(WriterError::InjectedCrash)
+                    } else {
+                        Ok(())
+                    }
+                ),
+                Err(WriterError::InjectedCrash)
+            ));
+            let inode_after_crash = f.metadata();
+            drop(store);
+            drop(journal);
+            let mut journal = f.writer.journal();
+            let mut store = reopen_fixture_review_state(
+                &context,
+                &journal,
+                &File::open(&f.writer.root.path).unwrap(),
+                "review",
+            )
+            .unwrap();
+            assert!(matches!(
+                commit_fixture_reviewed_task(
+                    &context,
+                    &mut journal,
+                    &mut store,
+                    &request,
+                    || Ok(f.observation()),
+                    |_, _, _| Ok(())
+                ),
+                Ok(WriterWriteOutcome::DuplicateRecorded(_))
+            ));
+            if crash == WriterStep::AfterRename {
+                assert_eq!(f.metadata(), inode_after_crash);
+            }
+            assert_eq!(
+                CanonicalTaskDocumentV1::from_bytes(&f.bytes())
+                    .unwrap()
+                    .file_cas_rev,
+                9
+            );
+            assert_eq!(
+                store.lifecycle(
+                    f.review
+                        .bundle
+                        .acceptance
+                        .payload
+                        .canonical_digest()
+                        .unwrap()
+                ),
+                crate::task_review_state::TaskReviewLifecycleState::AcceptedDone
+            );
+        }
     }
-    fn metadata(&self)->(u64,u64){let m=fs::metadata(self.writer.root.path.join("TASKS.md")).unwrap();(m.dev(),m.ino())}
-}
 
-#[test]
-fn p0_fixture_writer_real_independent_approved_done_and_replay() {
-    use crate::task_review_state::TaskReviewLifecycleState;
-    let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-    let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-    let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();
-    let proof=match commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|_,_,_|Ok(())).unwrap(){WriterWriteOutcome::Committed(p)=>p,x=>panic!("{x:?}")};
-    assert_eq!(proof.origin,WriterProofOriginV1::Fixture(f.review.provider.provenance().clone()));
-    let document=CanonicalTaskDocumentV1::from_bytes(&f.bytes()).unwrap();
-    assert_eq!(document.tasks[0].status,CanonicalTaskStatus::Done);
-    assert_eq!(document.tasks[0].task_status_rev,5);assert_eq!(document.file_cas_rev,9);
-    assert_eq!(store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),TaskReviewLifecycleState::AcceptedDone);
-    let bytes=f.bytes();let inode=f.metadata();
-    assert!(matches!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||panic!("no fresh approval for ACK replay"),|_,_,_|panic!("no second rename")),Ok(WriterWriteOutcome::DuplicateRecorded(_))));
-    assert_eq!(f.bytes(),bytes);assert_eq!(f.metadata(),inode);
-    for identity in [proof.previous_identity(),proof.committed_identity()] {
-        assert!(proof.clone().verify_for_source_record(&f.writer.authority.policy,&f.writer.authority.record,Some(identity)).is_err());
+    #[test]
+    fn p0_fixture_writer_recorded_pending_consumption_and_sealed_reopen() {
+        use std::cell::Cell;
+        let f = ReviewedWriterFixture::new(false);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        let calls = Cell::new(0);
+        assert!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 4 {
+                        return Err(WriterError::InjectedCrash);
+                    }
+                    Ok(f.observation())
+                },
+                |_, _, _| Ok(())
+            )
+            .is_err()
+        );
+        let operation = &f.review.bundle.acceptance.payload.operation_id;
+        assert_eq!(
+            journal
+                .latest(
+                    &f.writer.lease.workspace_id,
+                    &f.writer.lease.task_source_id,
+                    operation
+                )
+                .unwrap()
+                .state,
+            WriteOperationState::Recorded
+        );
+        let inode = f.metadata();
+        let bytes = f.bytes();
+        drop(store);
+        drop(journal);
+        let mut journal = f.writer.journal();
+        let parent = File::open(&f.writer.root.path).unwrap();
+        let mut store = reopen_fixture_review_state(&context, &journal, &parent, "review").unwrap();
+        assert!(matches!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || Ok(f.observation()),
+                |_, _, _| panic!("Recorded repair cannot rename")
+            ),
+            Ok(WriterWriteOutcome::DuplicateRecorded(_))
+        ));
+        assert_eq!(f.metadata(), inode);
+        assert_eq!(f.bytes(), bytes);
+        drop(store);
+        assert!(
+            crate::task_review_state::ReviewStateStoreV1::open(
+                &parent,
+                "review",
+                &f.review.provider
+            )
+            .is_err()
+        );
+        let store = reopen_fixture_review_state(&context, &journal, &parent, "review").unwrap();
+        assert_eq!(
+            store.lifecycle(
+                f.review
+                    .bundle
+                    .acceptance
+                    .payload
+                    .canonical_digest()
+                    .unwrap()
+            ),
+            crate::task_review_state::TaskReviewLifecycleState::AcceptedDone
+        );
     }
-    assert!(context.require_production().is_err());
-}
 
-#[test]
-fn p0_fixture_writer_independent_rejected_routes_blocked_not_accepted() {
-    use crate::task_review_state::TaskReviewLifecycleState;
-    let f=ReviewedWriterFixture::new(true);let writer=f.writer.context();
-    let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-    let mut journal=f.writer.journal();let mut store=f.state();
-    assert!(matches!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&f.request(),||Ok(f.observation()),|_,_,_|Ok(())),Ok(WriterWriteOutcome::Committed(_))));
-    let doc=CanonicalTaskDocumentV1::from_bytes(&f.bytes()).unwrap();
-    assert_eq!(doc.tasks[0].status,CanonicalTaskStatus::Blocked);assert_eq!(doc.file_cas_rev,9);
-    assert_eq!(store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),TaskReviewLifecycleState::RejectedByReviewer);
-}
-
-#[test]
-fn p0_fixture_writer_wrong_actual_outer_k1_and_kind_have_no_effect() {
-    use crate::task_wire::TaskMessageKind;
-    for (seed,kind) in [(3,TaskMessageKind::TaskProposal),(2,TaskMessageKind::CandidateResult),(2,TaskMessageKind::TaskReceipt)] {
-        let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-        let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-        let mut journal=f.writer.journal();let mut store=f.state();let bytes=f.bytes();let inode=f.metadata();
-        let mut request=f.request();request.original_proposals=vec![f.proposal_with(seed,kind)];
-        assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|_,_,_|Ok(())).is_err());
-        assert_eq!(f.bytes(),bytes);assert_eq!(f.metadata(),inode);assert_eq!(journal.latest_records().count(),0);
+    #[test]
+    fn p0_fixture_writer_received_resume_after_refresh_failure() {
+        use std::cell::Cell;
+        let f = ReviewedWriterFixture::new(false);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        let calls = Cell::new(0);
+        assert!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 2 {
+                        Err(WriterError::InjectedCrash)
+                    } else {
+                        Ok(f.observation())
+                    }
+                },
+                |_, _, _| Ok(())
+            )
+            .is_err()
+        );
+        let op = &f.review.bundle.acceptance.payload.operation_id;
+        assert_eq!(
+            journal
+                .latest(
+                    &f.writer.lease.workspace_id,
+                    &f.writer.lease.task_source_id,
+                    op
+                )
+                .unwrap()
+                .state,
+            WriteOperationState::Received
+        );
+        assert!(matches!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || Ok(f.observation()),
+                |_, _, _| Ok(())
+            ),
+            Ok(WriterWriteOutcome::Committed(_))
+        ));
     }
-}
 
-#[test]
-fn p0_fixture_writer_current_reviewer_revocation_and_expiry_before_rename() {
-    use std::cell::Cell;
-    for expired in [false,true] {
-        let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-        let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-        let mut journal=f.writer.journal();let mut store=f.state();let bytes=f.bytes();let inode=f.metadata();let count=Cell::new(0);
-        assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&f.request(),||{
-            let n=count.get()+1;count.set(n);let mut o=f.observation();
-            if n>=3 {if expired {o.authority.clock=HostClockState::Verified {now_unix:111};} else {o.authority.reviewer_role_grants.clear();}}
-            Ok(o)
-        },|_,_,_|Ok(())).is_err());
-        assert_eq!(f.bytes(),bytes);assert_eq!(f.metadata(),inode);
-        assert_ne!(store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),crate::task_review_state::TaskReviewLifecycleState::AcceptedDone);
+    #[test]
+    fn p0_fixture_writer_production_recovery_cannot_touch_real_fixture_f0() {
+        let f = ReviewedWriterFixture::new(false);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        assert!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || Ok(f.observation()),
+                |step, _, _| if step == WriterStep::Prepared {
+                    Err(WriterError::InjectedCrash)
+                } else {
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        let op = &f.review.bundle.acceptance.payload.operation_id;
+        let original = journal
+            .latest(
+                &f.writer.lease.workspace_id,
+                &f.writer.lease.task_source_id,
+                op,
+            )
+            .unwrap()
+            .clone();
+        let prepared = original.prepared.as_ref().unwrap();
+        let stage = f.writer.root.path.join(&prepared.temp_name);
+        let bytes = f.bytes();
+        let staging = fs::read(&stage).unwrap();
+        let inode = f.metadata();
+        assert!(
+            classify_and_recover_prepared_operation(
+                &writer,
+                &mut journal,
+                op,
+                || panic!("no production refresh"),
+                |_| panic!("no production projection")
+            )
+            .is_err()
+        );
+        assert!(
+            reject_unprepared_operation(&writer, &mut journal, op, &f.writer.authority).is_err()
+        );
+        assert_eq!(
+            journal.latest(
+                &f.writer.lease.workspace_id,
+                &f.writer.lease.task_source_id,
+                op
+            ),
+            Some(&original)
+        );
+        assert_eq!(f.bytes(), bytes);
+        assert_eq!(f.metadata(), inode);
+        assert_eq!(fs::read(&stage).unwrap(), staging);
     }
-}
 
-#[test]
-fn p0_fixture_writer_f0_and_f1_repair_original_without_second_rename() {
-    for crash in [WriterStep::Prepared,WriterStep::AfterRename] {
-        let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-        let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-        let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();
-        assert!(matches!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|step,_,_|if step==crash {Err(WriterError::InjectedCrash)} else {Ok(())}),Err(WriterError::InjectedCrash)));
-        let inode_after_crash=f.metadata();
-        drop(store);drop(journal);
-        let mut journal=f.writer.journal();
-        let mut store=reopen_fixture_review_state(&context,&journal,&File::open(&f.writer.root.path).unwrap(),"review").unwrap();
-        assert!(matches!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|_,_,_|Ok(())),Ok(WriterWriteOutcome::DuplicateRecorded(_))));
-        if crash==WriterStep::AfterRename {assert_eq!(f.metadata(),inode_after_crash);}
-        assert_eq!(CanonicalTaskDocumentV1::from_bytes(&f.bytes()).unwrap().file_cas_rev,9);
-        assert_eq!(store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),crate::task_review_state::TaskReviewLifecycleState::AcceptedDone);
+    #[test]
+    fn p0_fixture_writer_f1_revocation_or_third_state_cannot_record_or_ack() {
+        for drift in [false, true] {
+            let f = ReviewedWriterFixture::new(false);
+            let writer = f.writer.context();
+            let context =
+                FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+            let mut journal = f.writer.journal();
+            let mut store = f.state();
+            let request = f.request();
+            assert!(
+                commit_fixture_reviewed_task(
+                    &context,
+                    &mut journal,
+                    &mut store,
+                    &request,
+                    || Ok(f.observation()),
+                    |s, _, _| if s == WriterStep::AfterRename {
+                        Err(WriterError::InjectedCrash)
+                    } else {
+                        Ok(())
+                    }
+                )
+                .is_err()
+            );
+            if drift {
+                fs::write(
+                    f.writer.root.path.join("TASKS.md"),
+                    b"unqualified external third state",
+                )
+                .unwrap();
+            }
+            let op = &f.review.bundle.acceptance.payload.operation_id;
+            let original = journal
+                .latest(
+                    &f.writer.lease.workspace_id,
+                    &f.writer.lease.task_source_id,
+                    op,
+                )
+                .unwrap()
+                .clone();
+            let bytes = f.bytes();
+            let inode = f.metadata();
+            assert!(
+                commit_fixture_reviewed_task(
+                    &context,
+                    &mut journal,
+                    &mut store,
+                    &request,
+                    || {
+                        let mut o = f.observation();
+                        if !drift {
+                            o.authority.reviewer_role_grants.clear();
+                        }
+                        Ok(o)
+                    },
+                    |_, _, _| panic!("F1 cannot rename")
+                )
+                .is_err()
+            );
+            assert_eq!(
+                journal.latest(
+                    &f.writer.lease.workspace_id,
+                    &f.writer.lease.task_source_id,
+                    op
+                ),
+                Some(&original)
+            );
+            assert_eq!(f.bytes(), bytes);
+            assert_eq!(f.metadata(), inode);
+            assert_ne!(
+                store.lifecycle(
+                    f.review
+                        .bundle
+                        .acceptance
+                        .payload
+                        .canonical_digest()
+                        .unwrap()
+                ),
+                crate::task_review_state::TaskReviewLifecycleState::AcceptedDone
+            );
+        }
     }
-}
 
-#[test]
-fn p0_fixture_writer_recorded_pending_consumption_and_sealed_reopen() {
-    use std::cell::Cell;
-    let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-    let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-    let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();let calls=Cell::new(0);
-    assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||{
-        calls.set(calls.get()+1);if calls.get()==4 {return Err(WriterError::InjectedCrash);} Ok(f.observation())
-    },|_,_,_|Ok(())).is_err());
-    let operation=&f.review.bundle.acceptance.payload.operation_id;
-    assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,operation).unwrap().state,WriteOperationState::Recorded);
-    let inode=f.metadata();let bytes=f.bytes();drop(store);drop(journal);
-    let mut journal=f.writer.journal();let parent=File::open(&f.writer.root.path).unwrap();
-    let mut store=reopen_fixture_review_state(&context,&journal,&parent,"review").unwrap();
-    assert!(matches!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|_,_,_|panic!("Recorded repair cannot rename")),Ok(WriterWriteOutcome::DuplicateRecorded(_))));
-    assert_eq!(f.metadata(),inode);assert_eq!(f.bytes(),bytes);drop(store);
-    assert!(crate::task_review_state::ReviewStateStoreV1::open(&parent,"review",&f.review.provider).is_err());
-    let store=reopen_fixture_review_state(&context,&journal,&parent,"review").unwrap();
-    assert_eq!(store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),crate::task_review_state::TaskReviewLifecycleState::AcceptedDone);
-}
-
-#[test]
-fn p0_fixture_writer_received_resume_after_refresh_failure() {
-    use std::cell::Cell;
-    let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-    let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-    let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();let calls=Cell::new(0);
-    assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||{calls.set(calls.get()+1);if calls.get()==2 {Err(WriterError::InjectedCrash)} else {Ok(f.observation())}},|_,_,_|Ok(())).is_err());
-    let op=&f.review.bundle.acceptance.payload.operation_id;
-    assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().state,WriteOperationState::Received);
-    assert!(matches!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|_,_,_|Ok(())),Ok(WriterWriteOutcome::Committed(_))));
-}
-
-#[test]
-fn p0_fixture_writer_production_recovery_cannot_touch_real_fixture_f0() {
-    let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-    let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-    let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();
-    assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|step,_,_|if step==WriterStep::Prepared {Err(WriterError::InjectedCrash)} else {Ok(())}).is_err());
-    let op=&f.review.bundle.acceptance.payload.operation_id;
-    let original=journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().clone();
-    let prepared=original.prepared.as_ref().unwrap();let stage=f.writer.root.path.join(&prepared.temp_name);
-    let bytes=f.bytes();let staging=fs::read(&stage).unwrap();let inode=f.metadata();
-    assert!(classify_and_recover_prepared_operation(&writer,&mut journal,op,||panic!("no production refresh"),|_|panic!("no production projection")).is_err());
-    assert!(reject_unprepared_operation(&writer,&mut journal,op,&f.writer.authority).is_err());
-    assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op),Some(&original));
-    assert_eq!(f.bytes(),bytes);assert_eq!(f.metadata(),inode);assert_eq!(fs::read(&stage).unwrap(),staging);
-}
-
-#[test]
-fn p0_fixture_writer_f1_revocation_or_third_state_cannot_record_or_ack() {
-    for drift in [false,true] {
-        let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-        let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-        let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();
-        assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|s,_,_|if s==WriterStep::AfterRename {Err(WriterError::InjectedCrash)} else {Ok(())}).is_err());
-        if drift {fs::write(f.writer.root.path.join("TASKS.md"),b"unqualified external third state").unwrap();}
-        let op=&f.review.bundle.acceptance.payload.operation_id;
-        let original=journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op).unwrap().clone();
-        let bytes=f.bytes();let inode=f.metadata();
-        assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||{
-            let mut o=f.observation(); if !drift {o.authority.reviewer_role_grants.clear();} Ok(o)
-        },|_,_,_|panic!("F1 cannot rename")).is_err());
-        assert_eq!(journal.latest(&f.writer.lease.workspace_id,&f.writer.lease.task_source_id,op),Some(&original));
-        assert_eq!(f.bytes(),bytes);assert_eq!(f.metadata(),inode);
-        assert_ne!(store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),crate::task_review_state::TaskReviewLifecycleState::AcceptedDone);
+    #[test]
+    fn p0_fixture_writer_archival_seals_survive_later_bytes_and_lease_without_effects() {
+        let f = ReviewedWriterFixture::new(false);
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        assert!(
+            commit_fixture_reviewed_task(
+                &context,
+                &mut journal,
+                &mut store,
+                &request,
+                || Ok(f.observation()),
+                |_, _, _| Ok(())
+            )
+            .is_ok()
+        );
+        drop(store);
+        // This fixture does not attest the later bytes as a legitimate transition.
+        // It proves only that archival readback never authorizes or rewrites them.
+        fs::write(
+            f.writer.root.path.join("TASKS.md"),
+            b"later source bytes outside the original operation",
+        )
+        .unwrap();
+        let bytes = f.bytes();
+        let inode = f.metadata();
+        let mut later_lease = f.writer.lease.clone();
+        later_lease.writer_epoch += 1;
+        later_lease.authority_epoch += 1;
+        later_lease.issued_at_unix = 120;
+        later_lease.expires_at_unix = 130;
+        let later_writer = WriterContextV1 {
+            root: &f.writer.root,
+            lease: &later_lease,
+            source_identity: SourceFilesystemIdentity {
+                dev: inode.0,
+                ino: inode.1,
+            },
+        };
+        let later_context =
+            FixtureReviewWriterContextV1::bind(&later_writer, &f.review.provider, "review")
+                .unwrap();
+        let proof = read_fixture_recorded_outcome(
+            &later_context,
+            &journal,
+            &f.review.bundle.acceptance.payload.operation_id,
+        )
+        .unwrap();
+        assert_eq!(proof.writer_epoch(), 3);
+        let store = reopen_fixture_review_state(
+            &later_context,
+            &journal,
+            &File::open(&f.writer.root.path).unwrap(),
+            "review",
+        )
+        .unwrap();
+        assert_eq!(
+            store.lifecycle(
+                f.review
+                    .bundle
+                    .acceptance
+                    .payload
+                    .canonical_digest()
+                    .unwrap()
+            ),
+            crate::task_review_state::TaskReviewLifecycleState::AcceptedDone
+        );
+        assert_eq!(f.bytes(), bytes);
+        assert_eq!(f.metadata(), inode);
+        assert!(
+            proof
+                .verify_for_source_record(
+                    &f.writer.authority.policy,
+                    &f.writer.authority.record,
+                    Some(writer.source_identity)
+                )
+                .is_err()
+        );
     }
-}
 
-#[test]
-fn p0_fixture_writer_archival_seals_survive_later_bytes_and_lease_without_effects() {
-    let f=ReviewedWriterFixture::new(false);let writer=f.writer.context();
-    let context=FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review").unwrap();
-    let mut journal=f.writer.journal();let mut store=f.state();let request=f.request();
-    assert!(commit_fixture_reviewed_task(&context,&mut journal,&mut store,&request,||Ok(f.observation()),|_,_,_|Ok(())).is_ok());
-    drop(store);
-    // This fixture does not attest the later bytes as a legitimate transition.
-    // It proves only that archival readback never authorizes or rewrites them.
-    fs::write(f.writer.root.path.join("TASKS.md"),b"later source bytes outside the original operation").unwrap();
-    let bytes=f.bytes();let inode=f.metadata();
-    let mut later_lease=f.writer.lease.clone();later_lease.writer_epoch+=1;later_lease.authority_epoch+=1;
-    later_lease.issued_at_unix=120;later_lease.expires_at_unix=130;
-    let later_writer=WriterContextV1 {root:&f.writer.root,lease:&later_lease,source_identity:SourceFilesystemIdentity {dev:inode.0,ino:inode.1}};
-    let later_context=FixtureReviewWriterContextV1::bind(&later_writer,&f.review.provider,"review").unwrap();
-    let proof=read_fixture_recorded_outcome(&later_context,&journal,&f.review.bundle.acceptance.payload.operation_id).unwrap();
-    assert_eq!(proof.writer_epoch(),3);
-    let store=reopen_fixture_review_state(&later_context,&journal,&File::open(&f.writer.root.path).unwrap(),"review").unwrap();
-    assert_eq!(store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),crate::task_review_state::TaskReviewLifecycleState::AcceptedDone);
-    assert_eq!(f.bytes(),bytes);assert_eq!(f.metadata(),inode);
-    assert!(proof.verify_for_source_record(&f.writer.authority.policy,&f.writer.authority.record,Some(writer.source_identity)).is_err());
-}
-
-#[test]
-fn p0_fixture_writer_namespace_capability_cannot_bind_foreign_root() {
-    let f=ReviewedWriterFixture::new(false);let foreign=ReviewedWriterFixture::new(false);let writer=foreign.writer.context();
-    // Both logical bindings match and both real review leaves exist. Only the
-    // admission's physical namespace identity differs.
-    assert!(matches!(FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review"),Err(WriterError::PolicyBindingMismatch)));
-    let writer=f.writer.context();
-    let wrong=f.writer.root.path.join("journal").join(crate::task_review_state::REVIEW_STATE_FILE_NAME);
-    fs::write(&wrong,b"").unwrap();fs::set_permissions(&wrong,fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(matches!(FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"journal"),Err(WriterError::PolicyBindingMismatch)));
-    assert!(FixtureReviewWriterContextV1::bind(&writer,&f.review.provider,"review/../journal").is_err());
-}
-
+    #[test]
+    fn p0_fixture_writer_namespace_capability_cannot_bind_foreign_root() {
+        let f = ReviewedWriterFixture::new(false);
+        let foreign = ReviewedWriterFixture::new(false);
+        let writer = foreign.writer.context();
+        // Both logical bindings match and both real review leaves exist. Only the
+        // admission's physical namespace identity differs.
+        assert!(matches!(
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review"),
+            Err(WriterError::PolicyBindingMismatch)
+        ));
+        let writer = f.writer.context();
+        let wrong = f
+            .writer
+            .root
+            .path
+            .join("journal")
+            .join(crate::task_review_state::REVIEW_STATE_FILE_NAME);
+        fs::write(&wrong, b"").unwrap();
+        fs::set_permissions(&wrong, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "journal"),
+            Err(WriterError::PolicyBindingMismatch)
+        ));
+        assert!(
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review/../journal")
+                .is_err()
+        );
+    }
 }
