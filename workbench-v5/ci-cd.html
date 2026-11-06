@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="midnight">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chinwag v0.2.0 — Workbench v5 · Runners · CI → Versioned Workflow Policy &amp; UI-Gate (WP-01..WP-13)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="workbench-v5.css" />
+  <style>
+    /* =========================================================================
+       NATIVE CHINWAG UI WORKBENCH SCREEN (Runners · CI -> Workflow Policy & UI-Gate)
+       Pure Native HTML5/CSS3/ES2024 JS · 2 Themes (Midnight & Daylight) · INV-UI-BLEED: 0
+       ========================================================================= */
+    :root,
+    [data-theme="midnight"],
+    [data-theme="slate"] {
+      color-scheme: dark;
+      --bg-window: #070A0F;
+      --bg-sidebar: #0B1017;
+      --bg-surface: #0E131B;
+      --bg-panel: #111823;
+      --bg-elevated: #161F2E;
+      --bg-code: #05080D;
+      --fg-primary: #F8FAFC;
+      --fg-secondary: #A9B6C8;
+      --fg-muted: #6E8098;
+      --border-hairline: #1E293B;
+      --border-subtle: #223047;
+      --border-strong: rgba(56, 242, 175, 0.44);
+      --accent-primary: #38F2AF;
+      --accent-primary-ink: #04130D;
+      --accent-dim: rgba(56, 242, 175, 0.11);
+      --accent-blue: #58A6FF;
+      --accent-blue-dim: rgba(88, 166, 255, 0.12);
+      --accent-amber: #F5A524;
+      --accent-amber-dim: rgba(245, 165, 36, 0.14);
+      --accent-danger: #FF3B30;
+      --accent-danger-dim: rgba(255, 59, 48, 0.14);
+      --accent-magenta: #FF2E93;
+      --accent-magenta-dim: rgba(255, 46, 147, 0.12);
+    }
+
+    [data-theme="daylight"],
+    [data-theme="parchment"] {
+      color-scheme: light;
+      --bg-window: #FAF9F6;
+      --bg-sidebar: #F3F1EC;
+      --bg-surface: #FFFFFF;
+      --bg-panel: #F6F4EE;
+      --bg-elevated: #EFECE6;
+      --bg-code: #0F172A;
+      --fg-primary: #0F172A;
+      --fg-secondary: #334155;
+      --fg-muted: #526277;
+      --border-hairline: #D8D4CC;
+      --border-subtle: #CBD5E1;
+      --border-strong: rgba(11, 122, 83, 0.42);
+      --accent-primary: #0B7A53;
+      --accent-primary-ink: #FFFFFF;
+      --accent-dim: rgba(11, 122, 83, 0.09);
+      --accent-blue: #1D4ED8;
+      --accent-blue-dim: rgba(29, 78, 216, 0.09);
+      --accent-amber: #B45309;
+      --accent-amber-dim: rgba(180, 83, 9, 0.11);
+      --accent-danger: #BE123C;
+      --accent-danger-dim: rgba(190, 18, 60, 0.10);
+      --accent-magenta: #BE185D;
+      --accent-magenta-dim: rgba(190, 24, 93, 0.10);
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: var(--bg-window);
+      color: var(--fg-primary);
+      font-family: 'Hanken Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 13px;
+      line-height: 1.42;
+      overflow-x: hidden;
+    }
+
+    .mono, code, pre {
+      font-family: 'JetBrains Mono', monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .wb-app-window {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-window);
+    }
+
+    /* Titlebar */
+    .wb-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 14px;
+      background: var(--bg-sidebar);
+      border-bottom: 1px solid var(--border-hairline);
+      flex-shrink: 0;
+    }
+
+    .wb-topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .traffic-lights {
+      display: inline-flex;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .traffic-lights span {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+    .traffic-lights span:nth-child(1) { background: #FF5F56; }
+    .traffic-lights span:nth-child(2) { background: #FFBD2E; }
+    .traffic-lights span:nth-child(3) { background: #27C93F; }
+
+    .wb-crumb {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .wb-topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .wb-pill {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--accent-dim);
+      border: 1px solid var(--border-strong);
+      color: var(--accent-primary);
+      white-space: nowrap;
+    }
+
+    .wb-theme-group {
+      display: inline-flex;
+      gap: 3px;
+      padding: 2px;
+      border-radius: 6px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-hairline);
+    }
+
+    .wb-theme-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--fg-secondary);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+
+    .wb-theme-btn[aria-pressed="true"] {
+      background: var(--accent-primary);
+      color: var(--accent-primary-ink);
+      font-weight: 700;
+    }
+
+    /* 3-Column Workbench Grid */
+    .wb-body-grid {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 224px minmax(0, 1fr) 390px;
+    }
+
+    /* Left Sidebar */
+    .wb-left-rail {
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-hairline);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .rail-sec-title {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--fg-muted);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .rail-nav-btn {
+      width: 100%;
+      text-align: left;
+      padding: 7px 9px;
+      border-radius: 6px;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--fg-secondary);
+      font-family: 'Hanken Grotesk', sans-serif;
+      font-size: 12px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      cursor: pointer;
+      margin-bottom: 4px;
+      text-decoration: none;
+    }
+
+    .rail-nav-btn.is-active {
+      background: var(--accent-dim);
+      border-color: var(--border-strong);
+      color: var(--fg-primary);
+    }
+
+    .rail-card {
+      padding: 9px 10px;
+      border-radius: 7px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .sim-hook-btn {
+      appearance: none;
+      width: 100%;
+      padding: 7px 9px;
+      border-radius: 6px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-subtle);
+      color: var(--fg-primary);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .sim-hook-btn[aria-pressed="true"] {
+      background: var(--accent-amber-dim);
+      border-color: var(--accent-amber);
+      color: var(--accent-amber);
+    }
+
+    /* Center Coalface */
+    .wb-center-stage {
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+      overflow-y: auto;
+    }
+
+    .prov-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .prov-box {
+      padding: 8px 10px;
+      border-radius: 7px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      min-width: 0;
+    }
+
+    .prov-kicker {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: var(--fg-muted);
+      margin-bottom: 2px;
+    }
+
+    .prov-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--fg-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .scenario-tabs {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .scen-btn {
+      appearance: none;
+      text-align: left;
+      padding: 8px 10px;
+      border-radius: 7px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      color: var(--fg-secondary);
+      cursor: pointer;
+    }
+
+    .scen-btn[aria-selected="true"] {
+      background: var(--accent-dim);
+      border-color: var(--accent-primary);
+      color: var(--fg-primary);
+    }
+
+    .scen-kicker {
+      display: block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--accent-primary);
+    }
+
+    .scen-title {
+      display: block;
+      font-family: 'Space Grotesk', sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .status-strip {
+      padding: 8px 12px;
+      border-radius: 7px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11.5px;
+      font-weight: 700;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: var(--accent-dim);
+      border: 1px solid var(--border-strong);
+      color: var(--accent-primary);
+    }
+
+    .status-strip[data-tone="amber"] {
+      background: var(--accent-amber-dim);
+      border-color: var(--accent-amber);
+      color: var(--accent-amber);
+    }
+
+    .status-strip[data-tone="danger"] {
+      background: var(--accent-danger-dim);
+      border-color: var(--accent-danger);
+      color: var(--accent-danger);
+    }
+
+    .pipeline-6 {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .pipe-node {
+      padding: 8px 9px;
+      border-radius: 7px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .pipe-node[data-node-tone="pass"] { border-color: var(--border-strong); }
+    .pipe-node[data-node-tone="warn"] { border-color: var(--accent-amber); background: var(--accent-amber-dim); }
+    .pipe-node[data-node-tone="fail"] { border-color: var(--accent-danger); background: var(--accent-danger-dim); }
+    .pipe-node[data-node-tone="info"] { border-color: var(--accent-blue); background: var(--accent-blue-dim); }
+
+    .pipe-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+    }
+
+    .pipe-title {
+      font-family: 'Space Grotesk', sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .pipe-proof {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10.5px;
+      color: var(--fg-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .center-split {
+      display: grid;
+      grid-template-columns: 1.02fr 0.98fr;
+      gap: 10px;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .stage-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: 8px;
+      padding: 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+      min-height: 0;
+    }
+
+    .stage-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border-hairline);
+      font-family: 'Space Grotesk', sans-serif;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .code-pre {
+      background: var(--bg-code);
+      color: #E2E8F0;
+      border: 1px solid var(--border-hairline);
+      border-radius: 6px;
+      padding: 9px 11px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      line-height: 1.48;
+      overflow-x: auto;
+      white-space: pre;
+      flex: 1;
+    }
+
+    /* Right Inspector Rail: WP-13 Fiducial UI-Gate & Visual Tribunal */
+    .wb-right-rail {
+      background: var(--bg-sidebar);
+      border-left: 1px solid var(--border-hairline);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+      overflow-y: auto;
+    }
+
+    .fiducial-canvas-mock {
+      background: var(--bg-code);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 10px;
+      color: #F8FAFC;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10.5px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .fid-box-fail {
+      border: 2px solid #FF3B30;
+      background: rgba(255, 59, 48, 0.12);
+      border-radius: 5px;
+      padding: 6px 8px;
+      color: #FFD2CF;
+    }
+
+    .fid-box-eps {
+      border: 2px dashed #FF2E93;
+      background: transparent;
+      border-radius: 5px;
+      padding: 6px 8px;
+      color: #FF9CE3;
+    }
+
+    .fid-box-pass {
+      border: 1px solid #38F2AF;
+      background: rgba(56, 242, 175, 0.08);
+      border-radius: 5px;
+      padding: 6px 8px;
+      color: #A7F3D0;
+    }
+
+    .round-switch-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+    }
+
+    @media (max-width: 1180px) {
+      .wb-body-grid {
+        grid-template-columns: 1fr;
+      }
+      .wb-left-rail {
+        display: none;
+      }
+      .prov-row,
+      .scenario-tabs,
+      .center-split {
+        grid-template-columns: 1fr;
+      }
+      .pipeline-6 {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 640px) {
+      .wb-topbar {
+        padding: 6px 10px;
+      }
+      .wb-pill {
+        display: none;
+      }
+      .pipeline-6 {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wb-app-window">
+
+    <!-- NATIVE TITLEBAR -->
+    <header class="wb-topbar" role="banner">
+      <div class="wb-topbar-left">
+        <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
+        <span class="wb-crumb">chinwag ui · Runners · CI → Workflow Policy &amp; UI-Gate (WP-01..WP-13)</span>
+      </div>
+      <div class="wb-topbar-right">
+        <span class="wb-pill">🔓 Decrypted Locally · X25519MLKEM768 · 0B Cloud Plaintext</span>
+        <span class="wb-pill">INV-UI-BLEED: 0</span>
+        <div class="wb-theme-group" role="group" aria-label="Theme Switcher">
+          <button type="button" class="wb-theme-btn" data-set-theme="midnight" aria-pressed="true">Midnight</button>
+          <button type="button" class="wb-theme-btn" data-set-theme="daylight" aria-pressed="false">Daylight</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 3-COLUMN WORKBENCH -->
+    <div class="wb-body-grid">
+
+      <!-- LEFT SIDEBAR -->
+      <aside class="wb-left-rail" aria-label="Workbench Surfaces">
+        <div>
+          <div class="rail-sec-title"><span>Workbench Views</span><span>v5.3</span></div>
+          <a href="index.html" class="rail-nav-btn"><span>01 · Session &amp; Queue</span><span class="mono">⌘1</span></a>
+          <a href="03-workbench-mgmt-wiretap.html" class="rail-nav-btn"><span>03 · Fleet Wiretap</span><span class="mono">⌘3</span></a>
+          <a href="08-workbench-initiatives-finops.html" class="rail-nav-btn"><span>08 · Tasks &amp; FinOps</span><span class="mono">⌘8</span></a>
+          <a href="ci-cd.html" class="rail-nav-btn is-active"><span>14 · Runners · CI &amp; Policy</span><span class="mono" style="color:var(--accent-primary);">LIVE</span></a>
+        </div>
+
+        <div>
+          <div class="rail-sec-title"><span>Trusted Handoff Hooks</span><span>H1..H5</span></div>
+          <div class="rail-card">
+            <div id="rail-h1-status" style="color:var(--accent-primary);">✓ H1: git ls-remote</div>
+            <div style="color:var(--accent-primary);">✓ H2: Revision Binder</div>
+            <div style="color:var(--accent-primary);">✓ H3: Rust YAML Lattice</div>
+            <div style="color:var(--accent-primary);">✓ H4: X25519MLKEM768</div>
+            <div style="color:var(--accent-primary);">✓ H5: 32B Relay Gate</div>
+          </div>
+          <button type="button" class="sim-hook-btn" id="sim-h1-btn" aria-pressed="false" style="margin-top:6px;">
+            🔍 Toggle Missing H1 Hook
+          </button>
+        </div>
+
+        <div>
+          <div class="rail-sec-title"><span>Locked Invariants</span><span>.crdb</span></div>
+          <div class="rail-card">
+            <div>✓ WP-01 Revision Pin</div>
+            <div>✓ WP-04 Stale Guard</div>
+            <div>✓ WP-05 OrgFloor Epoch #4</div>
+            <div>✓ WP-06 Accept Separate</div>
+            <div>✓ WP-08 2-Seat Policy</div>
+            <div>✓ WP-13 UiGateReceiptV1</div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- CENTER COALFACE -->
+      <main class="wb-center-stage">
+
+        <!-- 3-Revision Provenance Header Strip (WP-01 + WP-05) -->
+        <div class="prov-row">
+          <div class="prov-box">
+            <div class="prov-kicker">Active Repo Policy (Tier 2)</div>
+            <div class="prov-val">chinwag.workflow.yaml · chinwag-way (v1) · d4e891a</div>
+          </div>
+          <div class="prov-box">
+            <div class="prov-kicker">Selected Run Pinned Policy (WP-01)</div>
+            <div class="prov-val">PolicyRevisionPinV1 · Pinned @ d4e891a (sha256:3d19..b210)</div>
+          </div>
+          <div class="prov-box">
+            <div class="prov-kicker">Protected Org Security Floor (Tier 1 · WP-05)</div>
+            <div class="prov-val">OrgPolicyFloorV1 · Epoch #4 · Signed by @SECURITY-ADMIN (✓ed25519)</div>
+          </div>
+        </div>
+
+        <!-- 4-State Scenario Bar -->
+        <div class="scenario-tabs" role="tablist" aria-label="Workflow Policy Scenarios">
+          <button type="button" class="scen-btn" role="tab" aria-selected="true" data-scen="satisfied">
+            <span class="scen-kicker">STATE 01 · NOMINAL</span>
+            <span class="scen-title">✓ Policy Satisfied (1.4s Fix)</span>
+          </button>
+          <button type="button" class="scen-btn" role="tab" aria-selected="false" data-scen="stale">
+            <span class="scen-kicker">STATE 02 · WP-04 GUARD</span>
+            <span class="scen-title">⚠️ Stale-Evidence Trap</span>
+          </button>
+          <button type="button" class="scen-btn" role="tab" aria-selected="false" data-scen="floor">
+            <span class="scen-kicker">STATE 03 · WP-05 / WP-08</span>
+            <span class="scen-title">🛡️ OrgPolicyFloorV1 Conflict</span>
+          </button>
+          <button type="button" class="scen-btn" role="tab" aria-selected="false" data-scen="breaker">
+            <span class="scen-kicker">STATE 04 · BILLING GUARD</span>
+            <span class="scen-title">🛑 2-Strike &amp; 0-Credit Sleep</span>
+          </button>
+        </div>
+
+        <!-- Status Banner -->
+        <div class="status-strip" id="wb-status-strip" data-tone="pass">
+          <span id="wb-status-left">✓ WORKFLOW POLICY SATISFIED (WP-01..WP-13 VERIFIED) · TASK ACCEPTANCE SEPARATE (WP-06)</span>
+          <span id="wb-status-right">0.42 ms Blind Gate · 20 Shards → 1 Credit (0.640¢)</span>
+        </div>
+
+        <!-- 6-Node Evidence Chain -->
+        <div class="pipeline-6">
+          <div class="pipe-node" id="pn-1" data-node-tone="pass">
+            <div class="pipe-top"><span>01 TASK</span><span id="pn-1-b">BOUND</span></div>
+            <div class="pipe-title" id="pn-1-t">Task ENG-412</div>
+            <div class="pipe-proof" id="pn-1-p">@RUST#7be266fc · 1.4s</div>
+          </div>
+          <div class="pipe-node" id="pn-2" data-node-tone="pass">
+            <div class="pipe-top"><span>02 CHECKPOINT</span><span id="pn-2-b">PASS</span></div>
+            <div class="pipe-title" id="pn-2-t">@- 80c1012d</div>
+            <div class="pipe-proof" id="pn-2-p">blake3:9f8a..c41e</div>
+          </div>
+          <div class="pipe-node" id="pn-3" data-node-tone="pass">
+            <div class="pipe-top"><span>03 REMOTE</span><span id="pn-3-b">H1 PASS</span></div>
+            <div class="pipe-title" id="pn-3-t">git ls-remote ✓</div>
+            <div class="pipe-proof" id="pn-3-p">RemoteReceiptV1</div>
+          </div>
+          <div class="pipe-node" id="pn-4" data-node-tone="pass">
+            <div class="pipe-top"><span>04 CI BUNDLE</span><span id="pn-4-b">H2 PASS</span></div>
+            <div class="pipe-title" id="pn-4-t">20/20 → 1 Cr</div>
+            <div class="pipe-proof" id="pn-4-p">T_coalesce · 0.640¢</div>
+          </div>
+          <div class="pipe-node" id="pn-5" data-node-tone="pass">
+            <div class="pipe-top"><span>05 REVIEW/UI</span><span id="pn-5-b">WP-13 PASS</span></div>
+            <div class="pipe-title" id="pn-5-t">@TYPE != @RUST</div>
+            <div class="pipe-proof" id="pn-5-p">UiGateReceiptV1 ✓</div>
+          </div>
+          <div class="pipe-node" id="pn-6" data-node-tone="info">
+            <div class="pipe-top"><span>06 ACCEPT</span><span id="pn-6-b">WP-06 SEP</span></div>
+            <div class="pipe-title" id="pn-6-t">Pending Human</div>
+            <div class="pipe-proof" id="pn-6-p">auto_merge: forbidden</div>
+          </div>
+        </div>
+
+        <!-- Lower Split: Commitment Diagnostics (Left) + chinwag.workflow.yaml (Right) -->
+        <div class="center-split">
+          <section class="stage-card">
+            <div class="stage-card-head">
+              <span id="diag-title">32-Byte Blinded Commitments &amp; Run Diagnostics</span>
+              <span class="wb-pill">H1..H5 Verified</span>
+            </div>
+            <p id="diag-desc" style="color:var(--fg-secondary);font-size:12px;">
+              20 failing shards coalesced via <code>T_coalesce</code> into 1 credit (<code>0.640¢</code>). Checkpoint <code>80c1012d</code> matches independent <code>git ls-remote</code> receipt (<code>H1</code>), CI Run <code>#1842</code> (<code>H2</code>), cross-model review (<code>@TYPE#91a4</code>), and <code>UiGateReceiptV1</code> (<code>WP-13</code>).
+            </p>
+            <pre class="code-pre" id="diag-code">C_checkpoint (JJ @- 80c1012d) : blake3:9f8a7c12..e4019b2c  [✓ MATCH]
+C_remote_ls  (git ls-remote)  : blake3:9f8a7c12..e4019b2c  [✓ MATCH · H1]
+C_ci_bundle  (Run #1842 · 20x): blake3:9f8a7c12..e4019b2c  [✓ MATCH · H2]
+C_reviewed   (@TYPE#91a4)     : blake3:9f8a7c12..e4019b2c  [✓ MATCH · != Author]
+C_uigate     (UiGateReceiptV1): blake3:9f8a7c12..e4019b2c  [✓ MATCH · 64ms CDP]
+WP-06 Task Acceptance         : PENDING AUTHORIZED ACCEPTOR (auto_merge: forbidden)</pre>
+          </section>
+
+          <section class="stage-card">
+            <div class="stage-card-head">
+              <span>Pinned <code>chinwag.workflow.yaml</code> (Tier 2) &amp; <code>OrgPolicyFloorV1</code></span>
+              <span class="wb-pill">chinwag.workflow/v1</span>
+            </div>
+            <pre class="code-pre"># chinwag.workflow.yaml — Pinned @ d4e891a (OrgPolicyFloorV1 Epoch #4)
+schema: chinwag.workflow/v1
+preset: chinwag-way
+org_floor_epoch: 4
+
+checkpoints:
+  vcs: jj-colocated-git
+  require_described_checkpoint: true
+
+publication:
+  require_remote_receipt: true
+  receipt_verifier: git-ls-remote
+  on_failure: preserve-local-checkpoint
+
+verification:
+  require_ci_on_exact_commit: true
+  coalesce_matrix_shards: true
+  max_auto_repair_attempts: 2
+  independent_review: required
+  ui_gate:
+    require_receipt: true
+    recheck_budget_ms: 200
+    separation_of_powers: workflow-only
+
+changes:
+  policy_edit_requires_independent_acceptor: true
+
+privacy:
+  envelope: x25519-mlkem768-chacha20poly1305</pre>
+          </section>
+        </div>
+      </main>
+
+      <!-- RIGHT INSPECTOR RAIL: WP-13 FIDUCIAL UI-GATE & VISUAL TRIBUNAL -->
+      <aside class="wb-right-rail" aria-label="WP-13 Fiducial UI-Gate Inspector">
+        <div class="rail-sec-title">
+          <span>WP-13 · Fiducial UI-Gate Inspector</span>
+          <span class="mono" style="color:var(--accent-primary);">EMUN-CHWG-PAT-01</span>
+        </div>
+
+        <div class="round-switch-row">
+          <button type="button" class="sim-hook-btn" id="ug-r1-btn" aria-pressed="false">Round 1 · HTTP 412</button>
+          <button type="button" class="sim-hook-btn" id="ug-r2-btn" aria-pressed="true">Round 2 · 64ms Fix ✓</button>
+        </div>
+
+        <div class="fiducial-canvas-mock" id="ug-canvas-box">
+          <div style="display:flex;justify-content:space-between;color:#94A3B8;">
+            <span>I_fid Framebuffer · 1440×900 &amp; 390×844</span>
+            <span id="ug-round-tag" style="color:#38F2AF;">ROUND 2 · PASS</span>
+          </div>
+          <div class="fid-box-pass" id="ug-box-1">
+            [✓ #1: 0,0,390,45] Mobile Topbar 1-Row (45px &lt;= 48px) · Bleed = 0.0px
+          </div>
+          <div class="fid-box-pass" id="ug-box-2">
+            [✓ #2: 24,280,620,340] Kinetic Wheel Probe (+240px) · ΔscrollTop = +240px
+          </div>
+          <div class="fid-box-eps" id="ug-box-3">
+            [?#3 ε: 48,312,640,42] (#FF2E93 Near-Miss gap=5.0px) · Ratified by @SPARK &amp; @FLINT
+          </div>
+        </div>
+
+        <div class="rail-card">
+          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-1 12-Tuple Predicates</span><span>G(e_i)</span></div>
+          <div id="ug-p1">✓ INV-UI-BLEED: OOB = 0 (δ_safe = 4px)</div>
+          <div id="ug-p2">✓ INV-UI-OVERLAP: 0.0 px² (Δy &lt;= 1.5px)</div>
+          <div id="ug-p3">✓ INV-UI-CRUSH/ORPHAN: min ρ = 0.78</div>
+          <div id="ug-p4">✓ INV-UI-SCROLL: ΔscrollTop = +240px</div>
+          <div id="ug-p5">✓ INV-UI-CONTRAST: min 7.4:1 (Midnight/Daylight)</div>
+        </div>
+
+        <div class="rail-card">
+          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-2 Heterogeneous Quorum</span><span>Claim 8</span></div>
+          <div>Builder: <strong>WORKHORSE</strong> (OpenAiGptCodex)</div>
+          <div>Prosecutor 1: <strong>SPARK</strong> (GoogleGemini) ✓</div>
+          <div>Prosecutor 2: <strong>FLINT</strong> (RecursiveFlint) ✓</div>
+          <div>Warm-CDP Re-Check: <strong>64 ms</strong> (&lt; 200 ms ✓)</div>
+        </div>
+
+        <div class="rail-card">
+          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-3 Signed Receipt</span><span>Claim 10</span></div>
+          <div>Schema: <code>chinwag-ui-gate-receipt/v1</code></div>
+          <div>Commit Pin: <code>80c1012d</code> (✓ed25519)</div>
+          <div>Auto-Tombstones: <code>0 new</code> (Claim 19)</div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      /* Theme Switcher (Midnight | Daylight) */
+      var STORAGE_KEY = 'chinwag_ui_theme_v2';
+      function applyTheme(raw) {
+        var t = (raw && String(raw).toLowerCase() === 'daylight') ? 'daylight' : 'midnight';
+        document.documentElement.setAttribute('data-theme', t);
+        try { localStorage.setItem(STORAGE_KEY, t); } catch (e) {}
+        document.querySelectorAll('[data-set-theme]').forEach(function (btn) {
+          btn.setAttribute('aria-pressed', btn.getAttribute('data-set-theme') === t ? 'true' : 'false');
+        });
+      }
+      var params = new URLSearchParams(window.location.search);
+      var initTheme = params.get('theme');
+      if (!initTheme) {
+        try { initTheme = localStorage.getItem(STORAGE_KEY); } catch (e) {}
+      }
+      applyTheme(initTheme || 'midnight');
+      document.querySelectorAll('[data-set-theme]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          applyTheme(btn.getAttribute('data-set-theme'));
+        });
+      });
+
+      /* 4-State Workbench + Missing H1 Toggle */
+      var curScen = 'satisfied';
+      var missingH1 = false;
+      var DATA = {
+        satisfied: {
+          tone: 'pass',
+          left: '✓ WORKFLOW POLICY SATISFIED (WP-01..WP-13 VERIFIED) · TASK ACCEPTANCE SEPARATE (WP-06)',
+          right: '0.42 ms Blind Gate · 20 Shards → 1 Credit (0.640¢)',
+          nodes: [
+            ['pass', 'BOUND', 'Task ENG-412', '@RUST#7be266fc · 1.4s'],
+            ['pass', 'PASS', '@- 80c1012d', 'blake3:9f8a..c41e'],
+            ['pass', 'H1 PASS', 'git ls-remote ✓', 'RemoteReceiptV1'],
+            ['pass', 'H2 PASS', '20/20 → 1 Cr', 'T_coalesce · 0.640¢'],
+            ['pass', 'WP-13 PASS', '@TYPE != @RUST', 'UiGateReceiptV1 ✓'],
+            ['info', 'WP-06 SEP', 'Pending Human', 'auto_merge: forbidden']
+          ],
+          desc: '20 failing shards coalesced via <code>T_coalesce</code> into 1 credit (<code>0.640¢</code>). Checkpoint <code>80c1012d</code> matches independent <code>git ls-remote</code> receipt (<code>H1</code>), CI Run <code>#1842</code> (<code>H2</code>), cross-model review (<code>@TYPE#91a4</code>), and <code>UiGateReceiptV1</code> (<code>WP-13</code>).',
+          code:
+'C_checkpoint (JJ @- 80c1012d) : blake3:9f8a7c12..e4019b2c  [✓ MATCH]\n' +
+'C_remote_ls  (git ls-remote)  : blake3:9f8a7c12..e4019b2c  [✓ MATCH · H1]\n' +
+'C_ci_bundle  (Run #1842 · 20x): blake3:9f8a7c12..e4019b2c  [✓ MATCH · H2]\n' +
+'C_reviewed   (@TYPE#91a4)     : blake3:9f8a7c12..e4019b2c  [✓ MATCH · != Author]\n' +
+'C_uigate     (UiGateReceiptV1): blake3:9f8a7c12..e4019b2c  [✓ MATCH · 64ms CDP]\n' +
+'WP-06 Task Acceptance         : PENDING AUTHORIZED ACCEPTOR (auto_merge: forbidden)'
+        },
+        stale: {
+          tone: 'amber',
+          left: '⚠️ HANDOFF BLOCKED BY WP-04 · STALE CI & REVIEW EVIDENCE (POST-CI 1-BYTE EDIT)',
+          right: 'C_checkpoint (b04a11c8) != C_ci (80c1012d) · Rejected in 0.42 ms',
+          nodes: [
+            ['pass', 'BOUND', 'Task ENG-412', '@RUST#7be266fc'],
+            ['warn', '+1 EDIT', '@- b04a11c8', 'Edited after CI #1842'],
+            ['pass', 'H1 PASS', 'git ls-remote ✓', 'Pushed b04a11c8'],
+            ['fail', 'STALE', 'Ran on 80c1012d', 'C_ci != C_checkpoint'],
+            ['fail', 'STALE', 'Reviewed 80c1012d', 'C_rev != C_checkpoint'],
+            ['fail', 'BLOCKED', 'Handoff Rejected', 'HTTP 412 StaleEvidence']
+          ],
+          desc: 'Agent modified 1 line in <code>src/auth.rs</code> (checkpoint <code>b04a11c8</code>) after CI Run <code>#1842</code> passed on <code>80c1012d</code>. Blind Relay detected <code>C_checkpoint != C_ci_bundle</code> in 0.42 ms and blocked handoff.',
+          code:
+'C_checkpoint (JJ @- b04a11c8) : blake3:f39a110b..77c012aa  [⚠️ NEW EDIT]\n' +
+'C_ci_bundle  (Run #1842)      : blake3:9f8a7c12..e4019b2c  [✕ STALE · 80c1012d]\n' +
+'C_reviewed   (@TYPE#91a4)     : blake3:9f8a7c12..e4019b2c  [✕ STALE · 80c1012d]\n' +
+'Verdict (WP-04 / H5)          : BLOCKED (Re-run CI & review on b04a11c8)'
+        },
+        floor: {
+          tone: 'danger',
+          left: '🛑 POLICY ACTIVATION REJECTED (WP-05 / WP-08) · ORG SECURITY FLOOR VIOLATION',
+          right: 'Candidate Branch YAML Inert · Active Policy Stays d4e891a',
+          nodes: [
+            ['pass', 'PROPOSAL', 'Task ENG-419', 'Branch YAML Edit'],
+            ['pass', 'COMMITTED', '@- f319c04a', 'chinwag.workflow.yaml'],
+            ['fail', 'WP-05 FAIL', 'H3 Validator', '3 Floor Violations'],
+            ['fail', 'WP-08 FAIL', 'Self-Activation', 'Acceptor == Author'],
+            ['pass', 'WP-01 SAFE', 'In-Flight Runs', 'Pinned to d4e891a'],
+            ['info', 'INERT', 'Active Unchanged', 'Epoch #4 Preserved']
+          ],
+          desc: 'Candidate branch YAML attempted to weaken <code>require_remote_receipt</code> and self-activate. Rejected by <code>#![forbid(unsafe_code)]</code> Rust validator (<code>H3</code>).',
+          code:
+'[ERROR WP-05] publication.require_remote_receipt: false < OrgPolicyFloorV1 (true)\n' +
+'[ERROR WP-05] verification.independent_review: optional < OrgPolicyFloorV1 (required)\n' +
+'[ERROR WP-08] PolicyActivationReceiptV1: acceptor (@RUST) == author (@RUST) forbidden'
+        },
+        breaker: {
+          tone: 'amber',
+          left: '🛑 2-STRIKE LOOP BREAKER ARMED (PAUSED_FOR_HUMAN) · 😴 SLEEPING HOST = 0 CREDITS',
+          right: 'Total Spend Before Halt: 2 Credits ($0.0128) · Offline Debit: 0 Credits',
+          nodes: [
+            ['pass', 'ROUTED', 'Task ENG-425', '@RUST#7be266fc'],
+            ['warn', 'STRIKE 1/2', 'Attempt 1 Failed', '1 Credit (0.640¢)'],
+            ['warn', 'STRIKE 2/2', 'Attempt 2 Failed', '1 Credit (0.640¢)'],
+            ['fail', 'HALTED', 'Attempt 3 Blocked', '0 Credits Charged'],
+            ['info', '0 CREDITS', 'Sleeping Laptop', 'Queued .hpke'],
+            ['pass', 'ESCALATED', 'PAUSED_FOR_HUMAN', 'Synced to Slack/Linear']
+          ],
+          desc: 'Auto-repair halts automatically after 2 failed attempts (<code>PAUSED_FOR_HUMAN</code>), and sleeping developer laptops queue <code>.hpke</code> envelopes at 0 credits reserved or debited.',
+          code:
+'Attempt 1/2 (20 shards coalesced) : COMMIT 1 credit ($0.0064)\n' +
+'Attempt 2/2 (20 shards coalesced) : COMMIT 1 credit ($0.0064)\n' +
+'Attempt 3   (2-Strike Breaker)    : HALTED (0 credits · PAUSED_FOR_HUMAN)\n' +
+'Sleeping Machine Queue (.hpke)    : 0 credits reserved/debited until wake'
+        }
+      };
+
+      function renderScen() {
+        var d = DATA[curScen] || DATA.satisfied;
+        var strip = document.getElementById('wb-status-strip');
+        var sLeft = document.getElementById('wb-status-left');
+        var sRight = document.getElementById('wb-status-right');
+        var h1Rail = document.getElementById('rail-h1-status');
+
+        if (missingH1) {
+          strip.setAttribute('data-tone', 'amber');
+          sLeft.textContent = '⚪ ENFORCEMENT: UNAVAILABLE (Hook H1 git ls-remote Verifier Not Installed)';
+          sRight.textContent = '0 False Compliance Claims (Mini-PRD v0.1 § 7 & v0.2 § 9.1)';
+          h1Rail.textContent = '⚪ H1: UNAVAILABLE';
+          h1Rail.style.color = 'var(--accent-amber)';
+        } else {
+          strip.setAttribute('data-tone', d.tone);
+          sLeft.textContent = d.left;
+          sRight.textContent = d.right;
+          h1Rail.textContent = '✓ H1: git ls-remote';
+          h1Rail.style.color = 'var(--accent-primary)';
+        }
+
+        for (var i = 0; i < 6; i++) {
+          var n = d.nodes[i];
+          var card = document.getElementById('pn-' + (i + 1));
+          if (missingH1 && i === 2) {
+            card.setAttribute('data-node-tone', 'warn');
+            document.getElementById('pn-3-b').textContent = 'UNAVAIL';
+            document.getElementById('pn-3-t').textContent = 'H1 Missing';
+            document.getElementById('pn-3-p').textContent = 'No Compliance Claim';
+          } else {
+            card.setAttribute('data-node-tone', n[0]);
+            document.getElementById('pn-' + (i + 1) + '-b').textContent = n[1];
+            document.getElementById('pn-' + (i + 1) + '-t').textContent = n[2];
+            document.getElementById('pn-' + (i + 1) + '-p').textContent = n[3];
+          }
+        }
+        document.getElementById('diag-desc').innerHTML = d.desc;
+        document.getElementById('diag-code').textContent = d.code;
+      }
+
+      document.querySelectorAll('[data-scen]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          curScen = btn.getAttribute('data-scen');
+          document.querySelectorAll('[data-scen]').forEach(function (b) {
+            b.setAttribute('aria-selected', b === btn ? 'true' : 'false');
+          });
+          renderScen();
+        });
+      });
+
+      var simBtn = document.getElementById('sim-h1-btn');
+      if (simBtn) {
+        simBtn.addEventListener('click', function () {
+          missingH1 = !missingH1;
+          simBtn.setAttribute('aria-pressed', missingH1 ? 'true' : 'false');
+          renderScen();
+        });
+      }
+
+      /* Right Rail Round 1 vs Round 2 UI-Gate Switcher */
+      var r1 = document.getElementById('ug-r1-btn');
+      var r2 = document.getElementById('ug-r2-btn');
+      if (r1 && r2) {
+        r1.addEventListener('click', function () {
+          r1.setAttribute('aria-pressed', 'true');
+          r2.setAttribute('aria-pressed', 'false');
+          document.getElementById('ug-round-tag').textContent = 'ROUND 1 · HTTP 412';
+          document.getElementById('ug-round-tag').style.color = '#FF3B30';
+          var b1 = document.getElementById('ug-box-1');
+          b1.className = 'fid-box-fail';
+          b1.textContent = '[!#1 FAIL: 372,12,84,32] (#FF3B30) INV-UI-BLEED: Mobile CTA +18px OOB';
+          var b2 = document.getElementById('ug-box-2');
+          b2.className = 'fid-box-fail';
+          b2.textContent = '[!#2 FAIL: 24,280,620,340] (#FF3B30) INV-UI-SCROLL: ΔscrollTop = 0px';
+          var b3 = document.getElementById('ug-box-3');
+          b3.className = 'fid-box-fail';
+          b3.textContent = '[!#3 FAIL: 980,0,390,844] (#FF3B30) INV-UI-CONTRAST: Daylight 1.38:1';
+        });
+        r2.addEventListener('click', function () {
+          r2.setAttribute('aria-pressed', 'true');
+          r1.setAttribute('aria-pressed', 'false');
+          document.getElementById('ug-round-tag').textContent = 'ROUND 2 · PASS (64ms)';
+          document.getElementById('ug-round-tag').style.color = '#38F2AF';
+          var b1 = document.getElementById('ug-box-1');
+          b1.className = 'fid-box-pass';
+          b1.textContent = '[✓ #1: 0,0,390,45] Mobile Topbar 1-Row (45px <= 48px) · Bleed = 0.0px';
+          var b2 = document.getElementById('ug-box-2');
+          b2.className = 'fid-box-pass';
+          b2.textContent = '[✓ #2: 24,280,620,340] Kinetic Wheel Probe (+240px) · ΔscrollTop = +240px';
+          var b3 = document.getElementById('ug-box-3');
+          b3.className = 'fid-box-eps';
+          b3.textContent = '[?#3 ε: 48,312,640,42] (#FF2E93 Near-Miss gap=5.0px) · Ratified by @SPARK & @FLINT';
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
