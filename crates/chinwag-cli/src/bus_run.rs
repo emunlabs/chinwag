@@ -1508,7 +1508,10 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 i += 2;
             }
             "--to" | "-t" if i + 1 < args.len() => {
-                to_arg = Some(args[i + 1].clone());
+                if to_arg.replace(args[i + 1].clone()).is_some() {
+                    let _ = writeln!(stderr, "chinwag bus: duplicate_recipient_flag; use one --to with a comma-separated recipient list");
+                    return 2;
+                }
                 i += 2;
             }
             "--task" | "--item" | "--ticket" | "-k" if i + 1 < args.len() => {
@@ -1669,6 +1672,17 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             if is_json {
                 let out = json!({
                     "ok": true,
+                    "completion_scope": "PUBLISH_ONLY",
+                    "delivery": chinwag_cli::bus_delivery::legacy_publication_report(
+                        &msg.id,
+                        &msg.digest_sha256,
+                        msg.to.as_deref(),
+                        chinwag_cli::bus_delivery::PublicationAck {
+                            message_id: &ack.message_id,
+                            ok: ack.ok,
+                            signature_verified: ack.sig_verified,
+                        },
+                    ),
                     "message": msg,
                     "ack": ack
                 });
@@ -1680,7 +1694,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             } else {
                 let _ = writeln!(
                     stdout,
-                    "{}\n  ↳ Delivered via {} (daemon iroh:{}, sig_verified={})",
+                    "{}\n  ↳ Publication acknowledged via {} (daemon iroh:{}, sig_verified={})\n  Completion scope: PUBLISH_ONLY; persistence: UNKNOWN; processing: UNKNOWN (existing-conversation control unsupported)",
                     format_bus_line(&msg),
                     ack.transport,
                     &ack.daemon_endpoint_id[..12.min(ack.daemon_endpoint_id.len())],
@@ -2105,6 +2119,22 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer01_duplicate_to_is_rejected_before_any_publication() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = [
+            "send", "--repo", repo.path().to_str().unwrap(),
+            "--to", "GEMINI-PM#one", "-t", "DELIVERY#two",
+            "--message", "must not publish",
+        ].map(str::to_owned);
+        assert_eq!(run_bus_cli(&args, &mut out, &mut err), 2);
+        assert!(String::from_utf8(err).unwrap().contains("duplicate_recipient_flag"));
+        assert!(out.is_empty());
+        assert_eq!(fs::read_dir(repo.path()).unwrap().count(), 0);
+    }
 
     fn fixture_key(signing_dir: &Path, seat: &str) -> SecretKey {
         fs::create_dir_all(signing_dir).unwrap();
