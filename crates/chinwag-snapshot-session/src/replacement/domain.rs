@@ -492,8 +492,18 @@ pub(super) fn agent_dispatch(native: &Connection, r: AgentDispatchRecord) -> Res
         decision.dirty = true;
     }
     for (id, author, role, body) in [
-        (r.inbound_id, r.inbound_author, r.inbound_role, r.inbound_body),
-        (r.outbound_id, r.outbound_author, r.outbound_role, r.outbound_body),
+        (
+            r.inbound_id,
+            r.inbound_author,
+            r.inbound_role,
+            r.inbound_body,
+        ),
+        (
+            r.outbound_id,
+            r.outbound_author,
+            r.outbound_role,
+            r.outbound_body,
+        ),
     ] {
         let existing_msg = one_row(native.query(
             c"SELECT id FROM messages WHERE id=?1",

@@ -257,10 +257,16 @@ mod tests {
 
     #[test]
     fn workbench_and_phase2_routes_parse_and_round_trip() {
-        assert_eq!("/workbench".parse::<Route>().ok(), Some(Route::Workbench {}));
+        assert_eq!(
+            "/workbench".parse::<Route>().ok(),
+            Some(Route::Workbench {})
+        );
         assert_eq!("/tasks".parse::<Route>().ok(), Some(Route::Tasks {}));
         assert_eq!("/roster".parse::<Route>().ok(), Some(Route::Roster {}));
-        assert_eq!("/captionizm".parse::<Route>().ok(), Some(Route::Captionizm {}));
+        assert_eq!(
+            "/captionizm".parse::<Route>().ok(),
+            Some(Route::Captionizm {})
+        );
         assert_eq!("/a509".parse::<Route>().ok(), Some(Route::A509 {}));
         let cap_html = render(Captionizm);
         assert!(cap_html.contains("Rogue Machine Media LLC (d/b/a Lag Lords)"));

@@ -5,11 +5,11 @@ use std::path::{Component, Path, PathBuf};
 
 pub mod agent_instance;
 #[cfg(target_os = "macos")]
+pub mod board;
+#[cfg(target_os = "macos")]
 pub mod bus_delivery;
 #[cfg(target_os = "macos")]
 pub mod task_acceptance;
-#[cfg(target_os = "macos")]
-pub mod task_review_state;
 #[cfg(target_os = "macos")]
 pub mod task_dependency;
 #[cfg(target_os = "macos")]
@@ -18,6 +18,8 @@ pub mod task_legacy;
 pub mod task_normalization;
 #[cfg(target_os = "macos")]
 pub mod task_ref;
+#[cfg(target_os = "macos")]
+pub mod task_review_state;
 #[cfg(target_os = "macos")]
 pub mod task_source;
 #[cfg(target_os = "macos")]
@@ -793,6 +795,8 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
 mod agent_dispatch_run;
 #[cfg(target_os = "macos")]
 mod deepseek_pool;
+#[cfg(target_os = "macos")]
+pub mod hosted_agent;
 #[cfg(target_os = "macos")]
 pub mod seat_signing;
 #[cfg(target_os = "macos")]

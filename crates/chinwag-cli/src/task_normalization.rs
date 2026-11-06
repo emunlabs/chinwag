@@ -2,9 +2,8 @@
 
 use crate::task_dependency::{DependencyCommitment, canonicalize_dependencies};
 use crate::task_ref::{
-    MAX_ID_UTF8_BYTES, MAX_LIST_ITEMS, MAX_SCALAR_BYTES, Sha256Digest,
-    TaskContractError, TaskKey, encode_bytes_field, encode_sorted_distinct_set,
-    encode_str_field, encode_u64, validate_id,
+    MAX_ID_UTF8_BYTES, MAX_LIST_ITEMS, MAX_SCALAR_BYTES, Sha256Digest, TaskContractError, TaskKey,
+    encode_bytes_field, encode_sorted_distinct_set, encode_str_field, encode_u64, validate_id,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -59,7 +58,10 @@ fn normalize_scalars(
     if items.len() > MAX_LIST_ITEMS {
         return Err(TaskContractError::LimitExceeded(field));
     }
-    items.iter().map(|item| normalize_scalar(item, field)).collect()
+    items
+        .iter()
+        .map(|item| normalize_scalar(item, field))
+        .collect()
 }
 
 /// A strict raw JSON-compatible schema: serde rejects missing/duplicate fields,
@@ -89,26 +91,50 @@ pub struct RawDependencyV1 {
 }
 
 impl RawTaskSpecV1 {
-    pub fn normalize(self, dependent_key: &TaskKey) -> Result<NormalizedTaskSpecV1, TaskContractError> {
+    pub fn normalize(
+        self,
+        dependent_key: &TaskKey,
+    ) -> Result<NormalizedTaskSpecV1, TaskContractError> {
         if self.dependencies.len() > MAX_LIST_ITEMS {
             return Err(TaskContractError::LimitExceeded("dependencies"));
         }
-        let dependencies = self.dependencies.into_iter().map(|raw| {
-            Ok(DependencyCommitment {
-                target_key: TaskKey::new(raw.workspace_id, raw.task_source_id, raw.task_id)?,
-                target_spec_digest: Sha256Digest::from_hex(&raw.target_spec_digest)?,
-                completion_policy_digest: Sha256Digest::from_hex(&raw.completion_policy_digest)?,
+        let dependencies = self
+            .dependencies
+            .into_iter()
+            .map(|raw| {
+                Ok(DependencyCommitment {
+                    target_key: TaskKey::new(raw.workspace_id, raw.task_source_id, raw.task_id)?,
+                    target_spec_digest: Sha256Digest::from_hex(&raw.target_spec_digest)?,
+                    completion_policy_digest: Sha256Digest::from_hex(
+                        &raw.completion_policy_digest,
+                    )?,
+                })
             })
-        }).collect::<Result<Vec<_>, TaskContractError>>()?;
-        NormalizedTaskSpecV1::from_fields(dependent_key, vec![
-            ("task_id".into(), RawSpecValue::Scalar(self.task_id)),
-            ("title".into(), RawSpecValue::Scalar(self.title)),
-            ("scope".into(), RawSpecValue::Scalar(self.scope)),
-            ("promised_interfaces".into(), RawSpecValue::List(self.promised_interfaces)),
-            ("acceptance_checks".into(), RawSpecValue::List(self.acceptance_checks)),
-            ("dependencies".into(), RawSpecValue::Dependencies(dependencies)),
-            ("reviewer_role".into(), RawSpecValue::Scalar(self.reviewer_role)),
-        ])
+            .collect::<Result<Vec<_>, TaskContractError>>()?;
+        NormalizedTaskSpecV1::from_fields(
+            dependent_key,
+            vec![
+                ("task_id".into(), RawSpecValue::Scalar(self.task_id)),
+                ("title".into(), RawSpecValue::Scalar(self.title)),
+                ("scope".into(), RawSpecValue::Scalar(self.scope)),
+                (
+                    "promised_interfaces".into(),
+                    RawSpecValue::List(self.promised_interfaces),
+                ),
+                (
+                    "acceptance_checks".into(),
+                    RawSpecValue::List(self.acceptance_checks),
+                ),
+                (
+                    "dependencies".into(),
+                    RawSpecValue::Dependencies(dependencies),
+                ),
+                (
+                    "reviewer_role".into(),
+                    RawSpecValue::Scalar(self.reviewer_role),
+                ),
+            ],
+        )
     }
 }
 
@@ -155,7 +181,9 @@ impl NormalizedTaskSpecV1 {
             }
         }
         let mut take = |field: &'static str| {
-            values.remove(field).ok_or(TaskContractError::MissingField(field))
+            values
+                .remove(field)
+                .ok_or(TaskContractError::MissingField(field))
         };
         let scalar = |field: &'static str, value: RawSpecValue| match value {
             RawSpecValue::Scalar(text) => Ok(text),
@@ -173,28 +201,54 @@ impl NormalizedTaskSpecV1 {
         let title = normalize_prose(&scalar("title", take("title")?)?, "title", MAX_SCALAR_BYTES)?;
         let scope = normalize_scalar(&scalar("scope", take("scope")?)?, "scope")?;
         let promised_interfaces = normalize_scalars(
-            &list("promised_interfaces", take("promised_interfaces")?)?, "promised_interfaces",
+            &list("promised_interfaces", take("promised_interfaces")?)?,
+            "promised_interfaces",
         )?;
         let acceptance_checks = normalize_scalars(
-            &list("acceptance_checks", take("acceptance_checks")?)?, "acceptance_checks",
+            &list("acceptance_checks", take("acceptance_checks")?)?,
+            "acceptance_checks",
         )?;
         let dependencies = match take("dependencies")? {
             RawSpecValue::Dependencies(items) => canonicalize_dependencies(dependent_key, items)?,
             _ => return Err(TaskContractError::AmbiguousField("dependencies")),
         };
         let reviewer_role = normalize_prose(
-            &scalar("reviewer_role", take("reviewer_role")?)?, "reviewer_role", MAX_ID_UTF8_BYTES,
+            &scalar("reviewer_role", take("reviewer_role")?)?,
+            "reviewer_role",
+            MAX_ID_UTF8_BYTES,
         )?;
-        Ok(Self { task_id, title, scope, promised_interfaces, acceptance_checks, dependencies, reviewer_role })
+        Ok(Self {
+            task_id,
+            title,
+            scope,
+            promised_interfaces,
+            acceptance_checks,
+            dependencies,
+            reviewer_role,
+        })
     }
 
-    pub fn task_id(&self) -> &str { &self.task_id }
-    pub fn title(&self) -> &str { &self.title }
-    pub fn scope(&self) -> &str { &self.scope }
-    pub fn promised_interfaces(&self) -> &[String] { &self.promised_interfaces }
-    pub fn acceptance_checks(&self) -> &[String] { &self.acceptance_checks }
-    pub fn dependencies(&self) -> &[DependencyCommitment] { &self.dependencies }
-    pub fn reviewer_role(&self) -> &str { &self.reviewer_role }
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+    pub fn promised_interfaces(&self) -> &[String] {
+        &self.promised_interfaces
+    }
+    pub fn acceptance_checks(&self) -> &[String] {
+        &self.acceptance_checks
+    }
+    pub fn dependencies(&self) -> &[DependencyCommitment] {
+        &self.dependencies
+    }
+    pub fn reviewer_role(&self) -> &str {
+        &self.reviewer_role
+    }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = TASK_SPEC_V1_DOMAIN.to_vec();
@@ -260,7 +314,9 @@ impl TaskControlV1 {
         validate_id(&self.owner_principal, "owner_principal")?;
         normalize_prose(&self.reviewer_role, "reviewer_role", MAX_ID_UTF8_BYTES)?;
         if self.execution_mode == ExecutionMode::ReviewOnly
-            && (self.implementation_authorized || self.deployment_authorized || self.automatic_dispatch)
+            && (self.implementation_authorized
+                || self.deployment_authorized
+                || self.automatic_dispatch)
         {
             return Err(TaskContractError::ContradictoryControls);
         }
@@ -274,8 +330,12 @@ impl TaskControlV1 {
             validate_id(action, "allowed action name")?;
         }
         // The set encoder rejects duplicates as well as producing its order.
-        encode_sorted_distinct_set(self.allowed_action_names.iter()
-            .map(|action| encode_str_field(action)).collect())?;
+        encode_sorted_distinct_set(
+            self.allowed_action_names
+                .iter()
+                .map(|action| encode_str_field(action))
+                .collect(),
+        )?;
         Ok(())
     }
 
@@ -285,7 +345,9 @@ impl TaskControlV1 {
         encoded.extend(encode_bytes_field(&self.task_key.encode()));
         encoded.extend(encode_str_field(&self.owner_principal));
         encoded.extend(encode_str_field(&normalize_prose(
-            &self.reviewer_role, "reviewer_role", MAX_ID_UTF8_BYTES,
+            &self.reviewer_role,
+            "reviewer_role",
+            MAX_ID_UTF8_BYTES,
         )?));
         encoded.extend(encode_str_field(self.execution_mode.as_str()));
         encoded.extend([
@@ -293,8 +355,12 @@ impl TaskControlV1 {
             u8::from(self.deployment_authorized),
             u8::from(self.automatic_dispatch),
         ]);
-        encoded.extend(encode_sorted_distinct_set(self.allowed_action_names.iter()
-            .map(|action| encode_str_field(action)).collect())?);
+        encoded.extend(encode_sorted_distinct_set(
+            self.allowed_action_names
+                .iter()
+                .map(|action| encode_str_field(action))
+                .collect(),
+        )?);
         encoded.extend(self.review_policy_digest.encode_typed());
         Ok(encoded)
     }
@@ -309,7 +375,12 @@ mod tests {
     use super::*;
 
     fn key(task_id: &str) -> TaskKey {
-        TaskKey::new("p0-fixture-workspace", "00000000000000000000000000000001", task_id).unwrap()
+        TaskKey::new(
+            "p0-fixture-workspace",
+            "00000000000000000000000000000001",
+            task_id,
+        )
+        .unwrap()
     }
 
     fn fields() -> Vec<(String, RawSpecValue)> {
@@ -317,8 +388,14 @@ mod tests {
             ("task_id".into(), RawSpecValue::Scalar("A".into())),
             ("title".into(), RawSpecValue::Scalar(" \tPlan\t ".into())),
             ("scope".into(), RawSpecValue::Scalar(" a\r\n".into())),
-            ("promised_interfaces".into(), RawSpecValue::List(vec![" api\t".into()])),
-            ("acceptance_checks".into(), RawSpecValue::List(vec![" run\r\n".into()])),
+            (
+                "promised_interfaces".into(),
+                RawSpecValue::List(vec![" api\t".into()]),
+            ),
+            (
+                "acceptance_checks".into(),
+                RawSpecValue::List(vec![" run\r\n".into()]),
+            ),
             ("dependencies".into(), RawSpecValue::Dependencies(vec![])),
             ("reviewer_role".into(), RawSpecValue::Scalar(" QA ".into())),
         ]
@@ -348,9 +425,15 @@ mod tests {
 
     #[test]
     fn p0_contract_crlf_normalized_and_bare_cr_rejected() {
-        assert_eq!(normalize_line_endings("a\r\nb\nc\r\n").unwrap(), "a\nb\nc\n");
+        assert_eq!(
+            normalize_line_endings("a\r\nb\nc\r\n").unwrap(),
+            "a\nb\nc\n"
+        );
         for raw in ["\r", "a\rb", "\r\r\n", "a\r\nb\r"] {
-            assert_eq!(normalize_line_endings(raw), Err(TaskContractError::BareCarriageReturn));
+            assert_eq!(
+                normalize_line_endings(raw),
+                Err(TaskContractError::BareCarriageReturn)
+            );
         }
     }
 
@@ -363,7 +446,10 @@ mod tests {
         assert_eq!(normalized.scope(), " a\n");
         assert_eq!(normalized.promised_interfaces(), &[" api\t"]);
         assert_eq!(normalized.acceptance_checks(), &[" run\n"]);
-        assert_eq!(normalize_prose("\u{a0}A\u{a0}", "title", 256).unwrap(), "\u{a0}A\u{a0}");
+        assert_eq!(
+            normalize_prose("\u{a0}A\u{a0}", "title", 256).unwrap(),
+            "\u{a0}A\u{a0}"
+        );
         assert_eq!(normalize_prose(" A  B ", "title", 256).unwrap(), "A  B");
         for raw in ["", " \t ", "a\nb", "a\r\nb"] {
             assert!(normalize_prose(raw, "title", 256).is_err());
@@ -387,17 +473,22 @@ mod tests {
     fn p0_contract_task_spec_v1_golden_transcript_and_digest() {
         let normalized = spec();
         assert_eq!(normalized.encode().len(), 133);
-        assert_eq!(hex(&normalized.encode()), concat!(
-            "6368696e7761672d7461736b2d737065632d763100",
-            "000000000000000c7461736b2d737065632d7631",
-            "0000000000000001410000000000000004506c616e",
-            "000000000000000320610a0000000000000001",
-            "000000000000000520617069090000000000000001",
-            "00000000000000052072756e0a0000000000000000",
-            "00000000000000025141"
-        ));
-        assert_eq!(normalized.task_spec_digest().to_string(),
-            "c521339112797b0363fd9d52d8bca2ca128b6c3b17b80b4d6e5890fa0228c7fc");
+        assert_eq!(
+            hex(&normalized.encode()),
+            concat!(
+                "6368696e7761672d7461736b2d737065632d763100",
+                "000000000000000c7461736b2d737065632d7631",
+                "0000000000000001410000000000000004506c616e",
+                "000000000000000320610a0000000000000001",
+                "000000000000000520617069090000000000000001",
+                "00000000000000052072756e0a0000000000000000",
+                "00000000000000025141"
+            )
+        );
+        assert_eq!(
+            normalized.task_spec_digest().to_string(),
+            "c521339112797b0363fd9d52d8bca2ca128b6c3b17b80b4d6e5890fa0228c7fc"
+        );
     }
 
     #[test]
@@ -405,7 +496,10 @@ mod tests {
         let original = spec();
         let mut reordered_fields = fields();
         reordered_fields.reverse();
-        assert_eq!(original, NormalizedTaskSpecV1::from_fields(&key("A"), reordered_fields).unwrap());
+        assert_eq!(
+            original,
+            NormalizedTaskSpecV1::from_fields(&key("A"), reordered_fields).unwrap()
+        );
         for field in [2, 3, 4] {
             let mut changed = fields();
             changed[field].1 = if field == 2 {
@@ -413,15 +507,25 @@ mod tests {
             } else {
                 RawSpecValue::List(vec!["run".into()])
             };
-            assert_ne!(original.task_spec_digest(),
-                NormalizedTaskSpecV1::from_fields(&key("A"), changed).unwrap().task_spec_digest());
+            assert_ne!(
+                original.task_spec_digest(),
+                NormalizedTaskSpecV1::from_fields(&key("A"), changed)
+                    .unwrap()
+                    .task_spec_digest()
+            );
         }
         let mut a = fields();
         a[3].1 = RawSpecValue::List(vec!["a".into(), "b".into()]);
         let mut b = a.clone();
         b[3].1 = RawSpecValue::List(vec!["b".into(), "a".into()]);
-        assert_ne!(NormalizedTaskSpecV1::from_fields(&key("A"), a).unwrap().task_spec_digest(),
-            NormalizedTaskSpecV1::from_fields(&key("A"), b).unwrap().task_spec_digest());
+        assert_ne!(
+            NormalizedTaskSpecV1::from_fields(&key("A"), a)
+                .unwrap()
+                .task_spec_digest(),
+            NormalizedTaskSpecV1::from_fields(&key("A"), b)
+                .unwrap()
+                .task_spec_digest()
+        );
     }
 
     #[test]
@@ -434,7 +538,9 @@ mod tests {
         let digest = |dependency| {
             let mut input = fields();
             input[5].1 = RawSpecValue::Dependencies(vec![dependency]);
-            NormalizedTaskSpecV1::from_fields(&key("A"), input).unwrap().task_spec_digest()
+            NormalizedTaskSpecV1::from_fields(&key("A"), input)
+                .unwrap()
+                .task_spec_digest()
         };
         let original = digest(dependency.clone());
         assert_ne!(original, spec().task_spec_digest());
@@ -453,16 +559,28 @@ mod tests {
     fn p0_contract_raw_field_stream_rejects_duplicate_unknown_ambiguous_missing() {
         let mut duplicate = fields();
         duplicate.push(duplicate[1].clone());
-        assert_eq!(NormalizedTaskSpecV1::from_fields(&key("A"), duplicate), Err(TaskContractError::DuplicateField("title")));
+        assert_eq!(
+            NormalizedTaskSpecV1::from_fields(&key("A"), duplicate),
+            Err(TaskContractError::DuplicateField("title"))
+        );
         let mut unknown = fields();
         unknown.push(("execute".into(), RawSpecValue::Scalar("yes".into())));
-        assert!(matches!(NormalizedTaskSpecV1::from_fields(&key("A"), unknown), Err(TaskContractError::UnknownField(_))));
+        assert!(matches!(
+            NormalizedTaskSpecV1::from_fields(&key("A"), unknown),
+            Err(TaskContractError::UnknownField(_))
+        ));
         let mut ambiguous = fields();
         ambiguous[2].1 = RawSpecValue::List(vec!["scope".into()]);
-        assert_eq!(NormalizedTaskSpecV1::from_fields(&key("A"), ambiguous), Err(TaskContractError::AmbiguousField("scope")));
+        assert_eq!(
+            NormalizedTaskSpecV1::from_fields(&key("A"), ambiguous),
+            Err(TaskContractError::AmbiguousField("scope"))
+        );
         let mut missing = fields();
         missing.pop();
-        assert_eq!(NormalizedTaskSpecV1::from_fields(&key("A"), missing), Err(TaskContractError::MissingField("reviewer_role")));
+        assert_eq!(
+            NormalizedTaskSpecV1::from_fields(&key("A"), missing),
+            Err(TaskContractError::MissingField("reviewer_role"))
+        );
     }
 
     #[test]
@@ -471,13 +589,24 @@ mod tests {
         let raw: RawTaskSpecV1 = serde_json::from_str(input).unwrap();
         assert_eq!(raw.normalize(&key("A")).unwrap(), spec());
         for malformed in [
-            input.replacen("\"title\":\"Plan\"", "\"title\":\"Plan\",\"title\":\"Other\"", 1),
+            input.replacen(
+                "\"title\":\"Plan\"",
+                "\"title\":\"Plan\",\"title\":\"Other\"",
+                1,
+            ),
             input.replacen("\"scope\":\" a\\r\\n\"", "\"scope\":[\"a\"]", 1),
-            input.replacen("\"title\":\"Plan\"", "\"title\":\"Plan\",\"execute\":true", 1),
+            input.replacen(
+                "\"title\":\"Plan\"",
+                "\"title\":\"Plan\",\"execute\":true",
+                1,
+            ),
             input.replacen("\"dependencies\":[]", "\"dependencies\":null", 1),
             format!("{input} trailing"),
         ] {
-            assert!(serde_json::from_str::<RawTaskSpecV1>(&malformed).is_err(), "{malformed}");
+            assert!(
+                serde_json::from_str::<RawTaskSpecV1>(&malformed).is_err(),
+                "{malformed}"
+            );
         }
     }
 
@@ -499,18 +628,23 @@ mod tests {
         let value = control();
         let encoded = value.encode().unwrap();
         assert_eq!(encoded.len(), 235);
-        assert_eq!(hex(&encoded), concat!(
-            "6368696e7761672d7461736b2d636f6e74726f6c2d763100",
-            "000000000000004d000000000000001470302d666978747572652d776f726b7370616365",
-            "00000000000000203030303030303030303030303030303030303030303030303030303030303031",
-            "0000000000000001410000000000000005494e444558",
-            "00000000000000025141000000000000000b5245564945575f4f4e4c59",
-            "000000000000000000000200000000000000016100000000000000027a7a",
-            "00000000000000067368613235360000000000000020",
-            "3333333333333333333333333333333333333333333333333333333333333333"
-        ));
-        assert_eq!(value.task_control_digest().unwrap().to_string(),
-            "2402bf136b5eddfe39f1bca7a7fbfa461a2e6e31a016dcbf9f96cbfa940b1c43");
+        assert_eq!(
+            hex(&encoded),
+            concat!(
+                "6368696e7761672d7461736b2d636f6e74726f6c2d763100",
+                "000000000000004d000000000000001470302d666978747572652d776f726b7370616365",
+                "00000000000000203030303030303030303030303030303030303030303030303030303030303031",
+                "0000000000000001410000000000000005494e444558",
+                "00000000000000025141000000000000000b5245564945575f4f4e4c59",
+                "000000000000000000000200000000000000016100000000000000027a7a",
+                "00000000000000067368613235360000000000000020",
+                "3333333333333333333333333333333333333333333333333333333333333333"
+            )
+        );
+        assert_eq!(
+            value.task_control_digest().unwrap().to_string(),
+            "2402bf136b5eddfe39f1bca7a7fbfa461a2e6e31a016dcbf9f96cbfa940b1c43"
+        );
     }
 
     #[test]
@@ -522,7 +656,10 @@ mod tests {
                 1 => value.deployment_authorized = true,
                 _ => value.automatic_dispatch = true,
             }
-            assert_eq!(value.encode(), Err(TaskContractError::ContradictoryControls));
+            assert_eq!(
+                value.encode(),
+                Err(TaskContractError::ContradictoryControls)
+            );
             value.execution_mode = ExecutionMode::Implementation;
             assert!(value.encode().is_ok());
         }
@@ -579,16 +716,24 @@ mod tests {
             input[5].1 = RawSpecValue::Dependencies(dependencies);
             NormalizedTaskSpecV1::from_fields(&key("A"), input)
         };
-        assert_eq!(build(vec![first.clone(), second.clone()]).unwrap(),
-            build(vec![second, first.clone()]).unwrap());
-        assert_eq!(build(vec![first.clone(), first]), Err(TaskContractError::DuplicateDependency));
+        assert_eq!(
+            build(vec![first.clone(), second.clone()]).unwrap(),
+            build(vec![second, first.clone()]).unwrap()
+        );
+        assert_eq!(
+            build(vec![first.clone(), first]),
+            Err(TaskContractError::DuplicateDependency)
+        );
     }
 
     #[test]
     fn p0_contract_task_control_normalizes_role_and_binds_boolean_bytes() {
         let mut value = control();
         value.reviewer_role = " \tQA\t ".into();
-        assert_eq!(value.task_control_digest().unwrap(), control().task_control_digest().unwrap());
+        assert_eq!(
+            value.task_control_digest().unwrap(),
+            control().task_control_digest().unwrap()
+        );
         value.execution_mode = ExecutionMode::Implementation;
         let original = value.task_control_digest().unwrap();
         for flag in 0..3 {

@@ -38,22 +38,16 @@ fn default_repo_root() -> PathBuf {
     PathBuf::from(user_home()).join("WORKSPACE/chinwag")
 }
 
-fn wiki_agents_dir() -> PathBuf {
-    PathBuf::from(user_home()).join("WORKSPACE/paperclip-wiki/wiki/agents")
-}
-
-fn docuswiki_agents_dir() -> PathBuf {
-    PathBuf::from(user_home()).join("WORKSPACE/docuswiki/wiki/agents")
-}
-
 fn fleet_skills_agents_dir() -> PathBuf {
+    if let Ok(override_dir) = std::env::var("CHINWAG_FLEET_AGENTS_DIR")
+        && !override_dir.trim().is_empty()
+    {
+        return PathBuf::from(override_dir);
+    }
     PathBuf::from(user_home()).join("fleet-skills/agents")
 }
 
-fn pilot_company_agents_dir() -> PathBuf {
-    PathBuf::from(user_home())
-        .join(".paperclip-pilot/control/instances/pilot/companies/055c2eb5-1b6e-4255-9c29-5a562c0be9e9/agents")
-}
+const MAX_PROMPT_BYTES: usize = 262_144;
 
 #[derive(Debug, Default, Deserialize)]
 struct StdinDispatchPayload {
@@ -99,45 +93,6 @@ struct CustomAgentMeta {
     system_prompt: Option<String>,
 }
 
-fn agent_uuid(agent_upper: &str) -> Option<&'static str> {
-    match agent_upper {
-        "GEMINI-PM" => Some("382e7010-ea4d-48f7-a1bb-96dca02a0921"),
-        "TYPE" => Some("712957a9-81c7-4421-860a-812c92935d2d"),
-        "MOTION" => Some("b825e467-2cd1-419b-8d7e-60bfa279e6d3"),
-        "FREQUENCY" => Some("81d5c117-b837-47d6-9a40-4d046cc5b43a"),
-        "SCRIBE" => Some("b994f8bd-c7a4-49a9-847e-b7573b3ad20a"),
-        "DELIVERY" => Some("27908fde-54f6-4e22-98e8-8b25c02fe405"),
-        "PRODUCT" => Some("48c077d3-d7cb-4d0c-95a8-0a861769ae1d"),
-        "VENTURE" => Some("d41eae97-03d6-4661-8041-595d35bdf8c1"),
-        "EAGLE-EYE" => Some("d54f57ec-d69f-49de-b970-296e056f6dbc"),
-        "MO" => Some("2be0efe4-8464-4631-a6a0-05ec43e171dd"),
-        "INVESTIGATIONS" => Some("ac426346-0c88-48d6-bd5e-e60fbacc70c8"),
-        "BIZFIN" => Some("a7a86d5b-f4b1-4c8f-b10f-a626bb8fa491"),
-        "RECORD" => Some("a5e93796-026f-429e-8eb5-cc57406e6134"),
-        "DECLARATION" => Some("0337b4c3-b7d5-4103-825f-3284d03eb99a"),
-        "GROWTH" => Some("89c93164-a28d-49d5-9762-d553b38ab4a3"),
-        "SPARK" => Some("b519d4d3-258b-406e-a888-897ccdca7119"),
-        "DEX" => Some("7ce8b26d-b874-42dc-bc4b-b8151ca44b2d"),
-        "SOCIAL" => Some("e804bfac-d3b9-41ad-901c-99e56ab6d6c4"),
-        "S-AND-M" => Some("decc277b-4bb2-4895-b239-b2b240b78782"),
-        "ENG" => Some("d11fb9f7-cd54-4871-96ea-a026ec27fd41"),
-        "ARCHITECT" => Some("507a20e1-4712-40a8-94b6-445af620af87"),
-        "RUST" => Some("1d8289f3-9215-4ad2-ab68-92b579d12f68"),
-        "INDEX" => Some("f7f321de-5a63-4d89-ab89-eb275bf44ae8"),
-        "DEV-1" => Some("20f1fef2-576e-4829-9107-2f2f6883e84a"),
-        "DEV-2" => Some("7259c85e-d752-42e9-ad3f-66be7f4225cf"),
-        "DEV-3" => Some("2d462326-c1cf-4863-ac4a-01d505e5be5f"),
-        "INFRA BOT (GROK)" => Some("93e39019-ca70-4875-a8f5-bf2d5edf6d9d"),
-        "INFRAJR" => Some("f4459182-97d5-4865-b6e9-6ad46a5c4e99"),
-        "ALISTAIR" => Some("a3c04053-bc91-467c-9e63-29ed08ae652a"),
-        "QA" => Some("2a4cbbfe-ca74-416c-8150-05d295350770"),
-        "HOUSEKEEPING" => Some("ee288c4e-b0d0-4eee-b40d-327c760408d7"),
-        "DOCS" => Some("9c3c7457-6605-4d0e-80f4-462ab4bf5df7"),
-        "SUMMARIZER" => Some("3d094e2a-2bec-41be-858e-6ae490e04411"),
-        _ => None,
-    }
-}
-
 fn grokbot_dept(agent_upper: &str) -> &'static str {
     match agent_upper {
         "ALISTAIR" | "HOUSEKEEPING" | "INFRA BOT (GROK)" | "INFRAJR" | "QA" | "FLINT" | "DOCS"
@@ -162,8 +117,23 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_owned()
 }
 
-fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
-    let agent_lower = agent_upper.to_ascii_lowercase();
+/// Ordered canonical persona document specification (`CHWG-PERSONA-LOADER-FIX-01`).
+///
+/// Reads ONLY from `<fleet_root>/<AGENT>/`:
+/// 1. `SOUL.md`
+/// 2. `AGENT.md`, otherwise `AGENTS.md` (only when `AGENT.md` is absent)
+/// 3. `TOOL.md`, otherwise `TOOLS.md` (only when `TOOL.md` is absent)
+/// 4. `SKILLS.md`
+/// 5. `MEMORY.md`
+/// 6. `DESIGN.md` for `TYPE` only (`INV-DESIGN-TYPE-ONLY-01`)
+///
+/// Preserves the complete UTF-8 content of each selected document without per-file truncation,
+/// and never loads legacy `docuswiki`, `paperclip-wiki`, or `.paperclip-pilot` directories.
+fn load_persona_from_root(
+    agent_upper: &str,
+    custom: Option<&CustomAgentMeta>,
+    fleet_root: &Path,
+) -> String {
     let mut parts = Vec::new();
     if agent_upper == "GEMINI-PM" {
         parts.push(
@@ -191,67 +161,35 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
         ));
     }
 
-    let fleet_dir = fleet_skills_agents_dir().join(agent_upper);
-    for fname in [
-        "SOUL.md",
-        "AGENT.md",
-        "AGENTS.md",
-        "TOOL.md",
-        "TOOLS.md",
-        "SKILLS.md",
-        "MEMORY.md",
-    ] {
-        let fpath = fleet_dir.join(fname);
-        if let Ok(content) = fs::read_to_string(&fpath) {
-            parts.push(format!(
-                "\n--- {fname} (fleet-skills/{agent_upper}) ---\n{}",
-                truncate_utf8(&content, 3500)
-            ));
+    let fleet_dir = fleet_root.join(agent_upper);
+    let doc_slots: &[&[&str]] = &[
+        &["SOUL.md"],
+        &["AGENT.md", "AGENTS.md"],
+        &["TOOL.md", "TOOLS.md"],
+        &["SKILLS.md"],
+        &["MEMORY.md"],
+    ];
+    for candidates in doc_slots {
+        for fname in *candidates {
+            let fpath = fleet_dir.join(fname);
+            match fs::read_to_string(&fpath) {
+                Ok(content) => {
+                    parts.push(format!(
+                        "\n--- {fname} (fleet-skills/{agent_upper}) ---\n{content}"
+                    ));
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => break,
+            }
         }
     }
     if agent_upper == "TYPE" {
         let design_path = fleet_dir.join("DESIGN.md");
         if let Ok(content) = fs::read_to_string(&design_path) {
             parts.push(format!(
-                "\n--- DESIGN.md (TYPE Only · INV-DESIGN-TYPE-ONLY-01) ---\n{}",
-                truncate_utf8(&content, 3500)
+                "\n--- DESIGN.md (TYPE Only · INV-DESIGN-TYPE-ONLY-01) ---\n{content}"
             ));
-        }
-    }
-
-    let docus_dir = docuswiki_agents_dir().join(&agent_lower);
-    let wiki_dir = if docus_dir.exists() {
-        docus_dir
-    } else {
-        wiki_agents_dir().join(&agent_lower)
-    };
-    for fname in [
-        "SOUL.md",
-        "AGENT.md",
-        "AGENTS.md",
-        "SKILLS.md",
-        "MEMORY.md",
-        "TOOLS.md",
-    ] {
-        let fpath = wiki_dir.join(fname);
-        if let Ok(content) = fs::read_to_string(&fpath) {
-            parts.push(format!(
-                "\n--- {fname} (Wiki) ---\n{}",
-                truncate_utf8(&content, 3000)
-            ));
-        }
-    }
-
-    if let Some(uid) = agent_uuid(agent_upper) {
-        let inst_dir = pilot_company_agents_dir().join(uid).join("instructions");
-        for fname in ["SOUL.md", "AGENT.md", "AGENTS.md", "MEMORY.md"] {
-            let fpath = inst_dir.join(fname);
-            if let Ok(content) = fs::read_to_string(&fpath) {
-                parts.push(format!(
-                    "\n--- {fname} (Instructions) ---\n{}",
-                    truncate_utf8(&content, 2500)
-                ));
-            }
         }
     }
 
@@ -267,6 +205,10 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
     }
 
     parts.join("\n")
+}
+
+fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
+    load_persona_from_root(agent_upper, custom, &fleet_skills_agents_dir())
 }
 
 fn recall_native_memory(agent_lower: &str, query: &str, repo_root: &Path) -> String {
@@ -444,8 +386,70 @@ fn dispatch_to_engine(
         || engine_hint.contains("gpt-6.1-sol");
     let is_grok = matches!(agent_upper, "GROWTH" | "SALES") || engine_hint.contains("grok");
 
-    // Pass full prompt context up to 48,000 bytes (never truncate at 3,200 bytes)
-    let rich_prompt = truncate_utf8(full_prompt, 48_000);
+    // Pass full prompt context up to MAX_PROMPT_BYTES (256 KiB) so complete 5-doc personas
+    // and the trailing message/identity/signing instructions are never clipped at 48 KB.
+    let rich_prompt = truncate_utf8(full_prompt, MAX_PROMPT_BYTES);
+
+    // 0b. Configurable Hosted-Model / AI-Service Agent Runner (`crates/chinwag-cli/src/hosted_agent.rs`).
+    //     Routes seats bound in `~/.chinwag/providers.json` (or `CHINWAG_PROVIDERS_CONFIG`, plus the
+    //     default `FREQUENCY` Gemini REST API binding when `~/.chinwag/gemini.env` is present) through
+    //     the native multi-turn tool loop without requiring Antigravity or external CLI wrappers.
+    let explicit_cfg_path = std::env::var("CHINWAG_PROVIDERS_CONFIG")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
+    let default_cfg_path = Path::new(&home).join(".chinwag/providers.json");
+    let has_explicit_providers_file =
+        explicit_cfg_path.is_some() || default_cfg_path.symlink_metadata().is_ok();
+    let default_gemini_env_ready =
+        agent_upper == "FREQUENCY" && Path::new(&home).join(".chinwag/gemini.env").is_file();
+
+    if has_explicit_providers_file || default_gemini_env_ready {
+        let workspace_dir = Path::new(&home).join("WORKSPACE");
+        match crate::hosted_agent::ProvidersConfig::load_or_default(
+            explicit_cfg_path.as_deref(),
+            Path::new(&home),
+            &workspace_dir,
+        ) {
+            Ok(providers_cfg) if providers_cfg.agents.contains_key(agent_upper) => {
+                let mut exec_env = vec![("PATH".to_owned(), path_env.clone())];
+                exec_env.extend(signing_env.iter().cloned());
+                let mut transport =
+                    crate::hosted_agent::CurlTransport::system_default(Path::new(&home));
+                let mut executor =
+                    crate::hosted_agent::StandardToolExecutor::new(default_cwd.clone(), exec_env);
+                let sys_instruction = format!(
+                    "You are ■ {agent_upper} ({}), executing over Chinwag's native hosted-agent library. Follow the canonical SOUL.md, AGENT.md, TOOL.md, SKILLS.md, and MEMORY.md instructions embedded in the prompt strictly.",
+                    identity.child()
+                );
+                match crate::hosted_agent::run_hosted_seat(
+                    &providers_cfg,
+                    agent_upper,
+                    &sys_instruction,
+                    &rich_prompt,
+                    &mut transport,
+                    &mut executor,
+                ) {
+                    Ok(hosted_reply) => {
+                        return (hosted_reply.text, "hosted-agent-api");
+                    }
+                    Err(err) => {
+                        return (
+                            format!("[{agent_upper} error]: {err}"),
+                            "hosted-agent-error",
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return (
+                    format!("[{agent_upper} error]: {err}"),
+                    "hosted-agent-error",
+                );
+            }
+        }
+    }
 
     // 1. Recursive Flint (Local MLX 262k on Node 2 MacBook Pro 100.108.108.25:11500)
     let flint_bin = Path::new(&local_bin).join("flint-agent");
@@ -808,32 +812,6 @@ pub fn run_agent_dispatch(
     let persona = load_persona(&agent_upper, stdin_payload.custom_agent.as_ref());
     let memories = recall_native_memory(&agent_upper.to_ascii_lowercase(), &body, &repo_root);
 
-    let mut prompt_parts = vec![persona];
-    if !memories.is_empty() {
-        prompt_parts.push(format!(
-            "\n--- Recalled Chinwag 3-Tier Memories & Tombstones ({agent_upper}) ---\n{memories}"
-        ));
-    }
-    prompt_parts.push(format!(
-        "\n--- Active Work Item & Thread Instance Context ---\nLinked item: {item_key}\nYour unique thread instance ID: {agent_instance}\nCaller thread instance ID: {sender}\n(When posting to the Chinwag bus, always pass --from \"{agent_instance}\" --to \"@{sender}\")"
-    ));
-    if !stdin_payload.history.is_empty() {
-        let mut transcript = Vec::new();
-        let len = stdin_payload.history.len();
-        let start = len.saturating_sub(10);
-        for h in &stdin_payload.history[start..] {
-            let who = if h.role.as_deref() == Some("user") {
-                h.sender.as_deref().unwrap_or("User")
-            } else {
-                &agent_upper
-            };
-            transcript.push(format!("{who}: {}", h.body.as_deref().unwrap_or("")));
-        }
-        prompt_parts.push(format!(
-            "\n--- Recent Conversation ---\n{}",
-            transcript.join("\n\n")
-        ));
-    }
     // Per-seat commit signing for the engine process. Fails safe: with no key
     // pair for the seat nothing is injected and only a warning is logged.
     let signing =
@@ -841,13 +819,28 @@ pub fn run_agent_dispatch(
     if let Some(warning) = &signing.warning {
         let _ = writeln!(err, "chinwag: warning: {warning}");
     }
-    if signing.is_active() {
-        prompt_parts.push(seat_signing::brief_note(&agent_upper));
-    }
-    prompt_parts.push(format!(
-        "\n--- New Message from {sender} ---\n{body}\n\nReply directly as {agent_instance}:"
-    ));
-    let full_prompt = prompt_parts.join("\n");
+    let signing_note = signing
+        .is_active()
+        .then(|| seat_signing::brief_note(&agent_upper));
+
+    let full_prompt = match assemble_dispatch_prompt(
+        &agent_upper,
+        &persona,
+        &memories,
+        &item_key,
+        &agent_instance,
+        &sender,
+        &stdin_payload.history,
+        signing_note.as_deref(),
+        &body,
+        MAX_PROMPT_BYTES,
+    ) {
+        Ok(prompt) => prompt,
+        Err(reason) => {
+            let _ = writeln!(err, "chinwag: {reason}");
+            return 2;
+        }
+    };
 
     let mut engine_env = signing.env.clone();
     engine_env.extend(identity.environment());
@@ -859,6 +852,7 @@ pub fn run_agent_dispatch(
         &engine_env,
         &identity,
     );
+    let dispatch_ok = !matches!(engine_used, "unavailable" | "hosted-agent-error");
 
     let inbound_id = format!("msg-in-{now_ms}-{hash_suffix}");
     let outbound_id = format!("msg-out-{now_ms}-{hash_suffix}");
@@ -894,7 +888,7 @@ pub fn run_agent_dispatch(
     );
 
     let output = json!({
-        "ok": true,
+        "ok": dispatch_ok,
         "agent": agent_upper,
         "agent_instance": agent_instance,
         "sender_instance": sender,
@@ -913,7 +907,71 @@ pub fn run_agent_dispatch(
     {
         return 1;
     }
-    0
+    if dispatch_ok { 0 } else { 1 }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_dispatch_prompt(
+    agent_upper: &str,
+    persona: &str,
+    memories: &str,
+    item_key: &str,
+    agent_instance: &str,
+    sender: &str,
+    history: &[HistoryEntry],
+    signing_note: Option<&str>,
+    body: &str,
+    max_bytes: usize,
+) -> Result<String, &'static str> {
+    let mut head_parts = vec![persona.to_owned()];
+    if !memories.is_empty() {
+        head_parts.push(format!(
+            "\n--- Recalled Chinwag 3-Tier Memories & Tombstones ({agent_upper}) ---\n{memories}"
+        ));
+    }
+    head_parts.push(format!(
+        "\n--- Active Work Item & Thread Instance Context ---\nLinked item: {item_key}\nYour unique thread instance ID: {agent_instance}\nCaller thread instance ID: {sender}\n(When posting to the Chinwag bus, always pass --from \"{agent_instance}\" --to \"@{sender}\")"
+    ));
+
+    let mut tail_parts = Vec::new();
+    if let Some(note) = signing_note {
+        tail_parts.push(note.to_owned());
+    }
+    tail_parts.push(format!(
+        "\n--- New Message from {sender} ---\n{body}\n\nReply directly as {agent_instance}:"
+    ));
+
+    let head = head_parts.join("\n");
+    let tail = tail_parts.join("\n");
+    let required_only = format!("{head}\n{tail}");
+    if required_only.len() > max_bytes {
+        return Err("prompt_too_large");
+    }
+
+    if history.is_empty() {
+        return Ok(required_only);
+    }
+
+    let len = history.len();
+    let base_start = len.saturating_sub(10);
+    for start in base_start..len {
+        let mut transcript = Vec::new();
+        for h in &history[start..] {
+            let who = if h.role.as_deref() == Some("user") {
+                h.sender.as_deref().unwrap_or("User")
+            } else {
+                agent_upper
+            };
+            transcript.push(format!("{who}: {}", h.body.as_deref().unwrap_or("")));
+        }
+        let history_block = format!("\n--- Recent Conversation ---\n{}", transcript.join("\n\n"));
+        let candidate = format!("{head}\n{history_block}\n{tail}");
+        if candidate.len() <= max_bytes {
+            return Ok(candidate);
+        }
+    }
+
+    Ok(required_only)
 }
 
 #[cfg(test)]
@@ -1004,5 +1062,129 @@ mod instance_dispatch_tests {
         assert!(command.contains("CHINWAG_INSTANCE_ID='01a146d0-d769-7a02-a1a5-75c407ffaa3c'"));
         assert!(command.contains("CHINWAG_CALLER='GEMINI-PM#parent-long-id'"));
         assert!(command.contains("CHINWAG_PARENT_INSTANCE='GEMINI-PM#parent-long-id'"));
+    }
+}
+
+#[cfg(test)]
+mod persona_loader_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn canonical_fleet_skills_loader_deduplicates_aliases_and_never_truncates_at_3500_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let freq_dir = tmp.path().join("FREQUENCY");
+        fs::create_dir_all(&freq_dir).unwrap();
+
+        let long_prefix = "A".repeat(5_000);
+        let tail_sentinel = "SENTINEL_PAST_3500_BYTES_SURVIVES";
+        fs::write(freq_dir.join("SOUL.md"), "SOUL_CANONICAL").unwrap();
+        fs::write(freq_dir.join("AGENT.md"), "AGENT_SINGULAR_WINS").unwrap();
+        fs::write(freq_dir.join("AGENTS.md"), "AGENTS_PLURAL_DUPLICATE").unwrap();
+        fs::write(
+            freq_dir.join("TOOL.md"),
+            format!("{long_prefix}\n{tail_sentinel}"),
+        )
+        .unwrap();
+        fs::write(freq_dir.join("TOOLS.md"), "TOOLS_PLURAL_DUPLICATE").unwrap();
+        fs::write(freq_dir.join("SKILLS.md"), "SKILLS_CANONICAL").unwrap();
+        fs::write(freq_dir.join("MEMORY.md"), "MEMORY_CANONICAL").unwrap();
+        fs::write(
+            freq_dir.join("DESIGN.md"),
+            "DESIGN_MUST_NOT_LOAD_FOR_FREQUENCY",
+        )
+        .unwrap();
+
+        let persona = load_persona_from_root("FREQUENCY", None, tmp.path());
+        assert!(persona.contains("SOUL_CANONICAL"));
+        assert!(persona.contains("AGENT_SINGULAR_WINS"));
+        assert!(
+            !persona.contains("AGENTS_PLURAL_DUPLICATE"),
+            "AGENTS.md must not be double-loaded when AGENT.md exists"
+        );
+        assert!(
+            persona.contains(tail_sentinel),
+            "content beyond 3,500 bytes must survive intact without truncation"
+        );
+        assert!(
+            !persona.contains("TOOLS_PLURAL_DUPLICATE"),
+            "TOOLS.md must not be double-loaded when TOOL.md exists"
+        );
+        assert!(persona.contains("SKILLS_CANONICAL"));
+        assert!(persona.contains("MEMORY_CANONICAL"));
+        assert!(
+            !persona.contains("DESIGN_MUST_NOT_LOAD_FOR_FREQUENCY"),
+            "DESIGN.md is strictly reserved for TYPE"
+        );
+        assert!(!persona.contains("(Wiki)"));
+        assert!(!persona.contains("(Instructions)"));
+    }
+
+    #[test]
+    fn plural_aliases_load_when_singular_files_are_absent_and_design_loads_for_type() {
+        let tmp = TempDir::new().unwrap();
+        let type_dir = tmp.path().join("TYPE");
+        fs::create_dir_all(&type_dir).unwrap();
+
+        fs::write(type_dir.join("AGENTS.md"), "AGENTS_FALLBACK_CONTENT").unwrap();
+        fs::write(type_dir.join("TOOLS.md"), "TOOLS_FALLBACK_CONTENT").unwrap();
+        fs::write(type_dir.join("DESIGN.md"), "TYPE_DESIGN_SYSTEM_CONTENT").unwrap();
+
+        let persona = load_persona_from_root("TYPE", None, tmp.path());
+        assert!(persona.contains("--- AGENTS.md (fleet-skills/TYPE) ---"));
+        assert!(persona.contains("AGENTS_FALLBACK_CONTENT"));
+        assert!(persona.contains("--- TOOLS.md (fleet-skills/TYPE) ---"));
+        assert!(persona.contains("TOOLS_FALLBACK_CONTENT"));
+        assert!(persona.contains("TYPE_DESIGN_SYSTEM_CONTENT"));
+    }
+
+    #[test]
+    fn assemble_dispatch_prompt_preserves_50kb_persona_and_trims_history_before_failing() {
+        let large_persona = "P".repeat(55_000);
+        let history = vec![
+            HistoryEntry {
+                sender: Some("User".to_owned()),
+                role: Some("user".to_owned()),
+                body: Some("OLD_HISTORY_TURN_".to_owned() + &"H".repeat(30_000)),
+            },
+            HistoryEntry {
+                sender: Some("User".to_owned()),
+                role: Some("user".to_owned()),
+                body: Some("RECENT_HISTORY_TURN".to_owned()),
+            },
+        ];
+        let assembled = assemble_dispatch_prompt(
+            "FREQUENCY",
+            &large_persona,
+            "MEMORIES_BLOCK",
+            "CHWG-TEST-1",
+            "FREQUENCY#instance123",
+            "GEMINI-PM#caller456",
+            &history,
+            Some("SIGNING_NOTE_SENTINEL"),
+            "FINAL_USER_MESSAGE_SENTINEL",
+            70_000,
+        )
+        .unwrap();
+
+        assert!(assembled.contains("RECENT_HISTORY_TURN"));
+        assert!(!assembled.contains("OLD_HISTORY_TURN_"));
+        assert!(assembled.contains("SIGNING_NOTE_SENTINEL"));
+        assert!(assembled.contains("FINAL_USER_MESSAGE_SENTINEL"));
+
+        // Required context larger than ceiling must return prompt_too_large.
+        let err = assemble_dispatch_prompt(
+            "FREQUENCY",
+            &large_persona,
+            "",
+            "CHWG-TEST-1",
+            "FREQUENCY#instance123",
+            "GEMINI-PM#caller456",
+            &[],
+            None,
+            "FINAL_USER_MESSAGE_SENTINEL",
+            10_000,
+        );
+        assert_eq!(err, Err("prompt_too_large"));
     }
 }
