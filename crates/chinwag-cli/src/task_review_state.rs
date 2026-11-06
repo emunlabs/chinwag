@@ -1350,6 +1350,43 @@ fn event_highwater(e: &EventV1) -> Option<ReviewHighwaterV1> {
     }
 }
 
+fn validate_finalization(
+    r: &ReservedV1,
+    provenance: &FixtureProvenanceV1,
+    proof: &WriterCommitProof,
+    joined: &ReviewWriterFinalizationBindingV1,
+) -> Result<(), ReviewStateError> {
+    let q = &r.request;
+    let a = &r.bundle.acceptance.payload;
+    if joined.request_digest != q.request_digest
+        || joined.acceptance_digest != r.acceptance_digest
+        || joined.candidate_digest != r.candidate_digest
+        || joined.target_transition_id != q.target_transition_id
+        || joined.target_status != crate::task_writer::CanonicalTaskStatus::Done
+        || joined.target_task_status_rev
+            != checked_next_revision(a.expected_task_status_rev).map_err(AcceptanceError::from)?
+        || joined.fixture_provenance != *provenance
+        || proof.operation_id() != q.original_operation_id
+        || proof.workspace_id() != a.task_ref.workspace_id
+        || proof.repo_id() != a.task_ref.repo_id
+        || proof.task_source_id() != a.task_ref.task_source_id
+        || proof.canonical_relative_path() != a.task_ref.canonical_task_path
+        || proof.source_generation() != a.task_ref.source_generation
+        || proof.writer_epoch() != q.writer_epoch
+        || proof.authority_epoch() != q.authority_epoch
+        || proof.writer_principal() != r.evidence.authority.payload.writer_principal
+        || proof.expected_file_cas_rev() != q.predecessor_file_rev
+        || proof.committed_file_cas_rev() != q.successor_file_rev
+        || proof.expected_preimage_sha256() != &q.predecessor_sha256.0
+        || proof.committed_postimage_sha256() != &q.successor_sha256.0
+        || proof.expected_preimage_bytes() != q.predecessor_bytes
+        || proof.committed_postimage_bytes() != q.successor_bytes
+    {
+        return Err(ReviewStateError::WriterProofMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1502,7 +1539,7 @@ mod tests {
                 _ => q.successor_sha256 = Sha256Digest([1; 32]),
             }
             assert!(matches!(
-                store.reserve(&f.fixture.provider, &[token.clone()], q),
+                store.reserve(&f.fixture.provider, std::slice::from_ref(&token), q),
                 Err(ReviewStateError::ReplayConflict)
             ));
         }
@@ -1866,7 +1903,7 @@ mod tests {
                 store.reject(&f.fixture.provider, &rejection).unwrap();
             } else {
                 store
-                    .reserve(&f.fixture.provider, &[approved.clone()], request())
+                    .reserve(&f.fixture.provider, std::slice::from_ref(&approved), request())
                     .unwrap();
             }
             let path = f.namespace.join(REVIEW_STATE_FILE_NAME);
@@ -2186,41 +2223,4 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
-}
-
-fn validate_finalization(
-    r: &ReservedV1,
-    provenance: &FixtureProvenanceV1,
-    proof: &WriterCommitProof,
-    joined: &ReviewWriterFinalizationBindingV1,
-) -> Result<(), ReviewStateError> {
-    let q = &r.request;
-    let a = &r.bundle.acceptance.payload;
-    if joined.request_digest != q.request_digest
-        || joined.acceptance_digest != r.acceptance_digest
-        || joined.candidate_digest != r.candidate_digest
-        || joined.target_transition_id != q.target_transition_id
-        || joined.target_status != crate::task_writer::CanonicalTaskStatus::Done
-        || joined.target_task_status_rev
-            != checked_next_revision(a.expected_task_status_rev).map_err(AcceptanceError::from)?
-        || joined.fixture_provenance != *provenance
-        || proof.operation_id() != q.original_operation_id
-        || proof.workspace_id() != a.task_ref.workspace_id
-        || proof.repo_id() != a.task_ref.repo_id
-        || proof.task_source_id() != a.task_ref.task_source_id
-        || proof.canonical_relative_path() != a.task_ref.canonical_task_path
-        || proof.source_generation() != a.task_ref.source_generation
-        || proof.writer_epoch() != q.writer_epoch
-        || proof.authority_epoch() != q.authority_epoch
-        || proof.writer_principal() != r.evidence.authority.payload.writer_principal
-        || proof.expected_file_cas_rev() != q.predecessor_file_rev
-        || proof.committed_file_cas_rev() != q.successor_file_rev
-        || proof.expected_preimage_sha256() != &q.predecessor_sha256.0
-        || proof.committed_postimage_sha256() != &q.successor_sha256.0
-        || proof.expected_preimage_bytes() != q.predecessor_bytes
-        || proof.committed_postimage_bytes() != q.successor_bytes
-    {
-        return Err(ReviewStateError::WriterProofMismatch);
-    }
-    Ok(())
 }

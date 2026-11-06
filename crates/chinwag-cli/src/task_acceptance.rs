@@ -2183,7 +2183,7 @@ mod tests {
     fn p0_acceptance_fixture_positive_same_reviewer_both_hosts_production_held() {
         let f = Fixture::new(1, 2);
         let cap = f.verify(ReviewHighwaterV1::default()).unwrap();
-        verify_fixture_quorum(&[cap.clone()]).unwrap();
+        verify_fixture_quorum(std::slice::from_ref(&cap)).unwrap();
         assert_eq!(
             cap.into_fixture_bridge().require_production_authority(),
             Err(AcceptanceError::FixtureProvenanceNotProduction)
