@@ -55,6 +55,12 @@ Local engines, the WORKHORSE SSH command, and the pool subprocess receive `CHINW
 
 `bus send --wake` accepts a bare seat and creates a child. It rejects a qualified recipient before publication because spawning another process does not resume an existing conversation. Send to an existing instance without `--wake`. A message receipt does not prove that a model read the message.
 
+Use exactly one `--to` flag for all recipients, separated by commas. Repeated `--to` or `-t` flags fail before publication; they do not overwrite or accumulate targets. Preserve each full instance's case.
+
+The send result has `completion_scope=PUBLISH_ONLY`. Its additive `chinwag.delivery-report.v1` distinguishes a correlated publication ACK from durable storage, binding, scheduling, processing and task start. Existing `ok`, `message` and `ack` fields retain their publication meaning. `subscribers_notified` counts internal broadcast receivers, including unpolled ones; it is not a count of conversations that read a message. A legacy ACK leaves persistence and processing `UNKNOWN`. Existing-conversation control reports `UNSUPPORTED` because this binary supplies no public host adapter.
+
+Closing a task does not authorize retiring its separately delegated standing inbox consumer. An armed timer or running process alone cannot establish `ACTIVE`: an approved exact binding and recent actual host turn plus qualified inbox-read evidence are required. The controlled model tests this distinction; they do not establish real host timer continuity. See [the delivery evidence contract](../../docs/development/native-consumer-delivery.md).
+
 ## Coordinate writes through the canonical task
 
 Work only from the authorized item in `TASKS.md`. Record the full instance address, reviewer, and changed-file scope through the task's owning writer. Use separate checkouts for concurrent source work. Do not mark another instance's task complete from a base-seat inbox or a process-registration file.
