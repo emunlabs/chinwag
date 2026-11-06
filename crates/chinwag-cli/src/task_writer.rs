@@ -6487,6 +6487,7 @@ mod tests {
                 fixtures::{signature, signed},
             };
             let mut writer = Fixture::new();
+            fs::set_permissions(&writer.root.path, fs::Permissions::from_mode(0o700)).unwrap();
             fs::create_dir(writer.root.path.join("review")).unwrap();
             fs::set_permissions(
                 writer.root.path.join("review"),
