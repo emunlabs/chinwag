@@ -324,17 +324,21 @@ impl ReviewStateStoreV1 {
             }
             EventV1::Reserved(r) => {
                 validate_request(&r.request)?;
-                self.validate_retained(p, &r.bundle, &r.evidence, r.highwater)?;
+                self.validate_retained(p, &r.bundle, &r.evidence, record_highwater(&r.bundle, &r.evidence))?;
                 if r.approvals.is_empty() || r.approvals.len() > 64 || r.approvals[0] != (r.bundle.clone(), r.evidence.clone()) { return Err(ReviewStateError::CorruptState); }
                 let mut principals = std::collections::BTreeSet::new(); let mut keys = std::collections::BTreeSet::new();
+                let mut aggregate = ReviewHighwaterV1::default();
                 for (b, e) in &r.approvals {
-                    let h = ReviewHighwaterV1 { authority_epoch: e.authority.payload.authority_epoch, writer_epoch: e.authority.payload.writer_epoch, roughtime_us: b.review.roughtime_midpoint_us };
+                    let h = record_highwater(b, e);
                     self.validate_retained(p, b, e, h)?;
+                    if !self.highwater.permits(h) { return Err(ReviewStateError::HighwaterRollback); }
+                    aggregate = merge_highwater(aggregate, h);
                     if e.authority != r.evidence.authority || b.acceptance.payload.candidate_digest != r.candidate_digest
                         || b.acceptance.payload.task_ref != r.bundle.acceptance.payload.task_ref || b.acceptance.payload.review_round != r.review_round
                         || b.review.verdict != ReviewVerdict::Approved || b.acceptance.payload.verdict != ReviewVerdict::Approved
                         || !principals.insert(&b.acceptance.payload.reviewer_principal) || !keys.insert(b.review.k1_pubkey) { return Err(ReviewStateError::ReplayConflict); }
                 }
+                if aggregate != r.highwater { return Err(ReviewStateError::HighwaterRollback); }
                 if principals.len() < r.evidence.authority.payload.quorum as usize { return Err(ReviewStateError::InvalidTransition); }
                 if r.bundle.acceptance.payload.verdict != ReviewVerdict::Approved || r.bundle.review.verdict != ReviewVerdict::Approved
                     || r.candidate_digest != r.bundle.candidate.payload.canonical_digest()?
@@ -350,8 +354,7 @@ impl ReviewStateStoreV1 {
             EventV1::Rejected { bundle, evidence, highwater } => {
                 self.validate_retained(p, bundle, evidence, *highwater)?;
                 if bundle.review.verdict != ReviewVerdict::Rejected || bundle.acceptance.payload.verdict != ReviewVerdict::Rejected { return Err(ReviewStateError::InvalidTransition); }
-                let digest = bundle.acceptance.payload.canonical_digest()?;
-                if self.records.iter().any(|r| matches!(&r.event, EventV1::Rejected { bundle, .. } if bundle.acceptance.payload.canonical_digest().ok() == Some(digest))) { return Err(ReviewStateError::ReplayConflict); }
+                if self.records.iter().any(|r| event_approvals(&r.event).iter().any(|old| replay_collision(old, bundle))) { return Err(ReviewStateError::ReplayConflict); }
             }
             EventV1::Consumed { reservation_digest: digest, outcome } => {
                 let r = self.records.iter().find_map(|record| match &record.event { EventV1::Reserved(r) if reservation_digest(r).ok().as_ref() == Some(digest) => Some(r.as_ref()), _ => None }).ok_or(ReviewStateError::MissingSubmission)?;
@@ -419,20 +422,55 @@ impl ReviewStateStoreV1 {
     fn find_reservation(&self, next: &ReservedV1) -> Result<Option<&ReservedV1>, ReviewStateError> {
         let mut found = None;
         for record in &self.records {
-            if let EventV1::Rejected { bundle, .. } = &record.event {
-                let a = &bundle.acceptance.payload;
-                if a.nonce == next.nonce || a.operation_id == next.request.original_operation_id
-                    || (a.reviewer_principal == next.reviewer_principal && a.review_round == next.review_round && a.task_ref.task_key() == next.bundle.acceptance.payload.task_ref.task_key()) { return Err(ReviewStateError::ReplayConflict); }
-            }
             if let EventV1::Reserved(old) = &record.event {
-                let collision = old.nonce == next.nonce || old.acceptance_digest == next.acceptance_digest
-                    || old.request.original_operation_id == next.request.original_operation_id
-                    || (old.reviewer_principal == next.reviewer_principal && old.review_round == next.review_round
-                        && old.bundle.acceptance.payload.task_ref.task_key() == next.bundle.acceptance.payload.task_ref.task_key());
-                if collision { if old.as_ref() != next { return Err(ReviewStateError::ReplayConflict); } found = Some(old.as_ref()); }
+                if old.as_ref() == next { found = Some(old.as_ref()); continue; }
+            }
+            if event_approvals(&record.event).iter().any(|old| next.approvals.iter().any(|(b, _)| replay_collision(old, b))) {
+                return Err(ReviewStateError::ReplayConflict);
             }
         }
         Ok(found)
+    }
+    fn require_exact_cohort(&self, r: &ReservedV1, tokens: &[VerifiedFixtureAcceptanceV1]) -> Result<(), ReviewStateError> {
+        verify_fixture_quorum(tokens)?;
+        if tokens.len() != r.approvals.len() || self.highwater != r.highwater { return Err(ReviewStateError::HighwaterRollback); }
+        let mut aggregate = ReviewHighwaterV1::default();
+        for t in tokens {
+            let pair = (t.signed_bundle().clone(), t.evidence().clone());
+            if !r.approvals.contains(&pair) || t.provenance() != &self.provenance
+                || self.assignment(&r.request.assignment_id) != Some(t.assignment()) || self.submissions(&r.request.assignment_id) != t.history()
+                || t.qualified_current() != &r.qualified_current || t.rebases_used() != r.rebases_used
+                || t.highwater() != record_highwater(t.signed_bundle(), t.evidence()) { return Err(ReviewStateError::ReplayConflict); }
+            aggregate = merge_highwater(aggregate, t.highwater());
+        }
+        if aggregate != r.highwater { return Err(ReviewStateError::HighwaterRollback); }
+        Ok(())
+    }
+    /// Only an exact durable reserved cohort may use its authenticated prior
+    /// boundary. ROOT must supply freshly qualified current observations here;
+    /// historical signatures alone do not establish external host freshness.
+    pub(crate) fn revalidate_reserved_cohort(&mut self, p: &TrustedFixtureVerifier, handle: &FixtureReservationV1,
+        observed: &[(SignedAcceptanceBundleV1, FixtureVerificationEvidenceV1)], context: acceptance::AcceptanceVerificationContextV1<'_>)
+        -> Result<Vec<VerifiedFixtureAcceptanceV1>, ReviewStateError> {
+        self.check_exact()?;
+        if handle.provenance != self.provenance || p.provenance() != &self.provenance { return Err(ReviewStateError::FixtureNamespaceMismatch); }
+        let r = self.find_reservation(&handle.reservation)?.ok_or(ReviewStateError::MissingSubmission)?;
+        if observed.len() != r.approvals.len() || observed.len() > 64 || self.highwater != r.highwater
+            || context.persisted_highwater != self.highwater
+            || observed.iter().any(|pair| !r.approvals.contains(pair)) { return Err(ReviewStateError::ReplayConflict); }
+        if self.assignment(&r.request.assignment_id) != Some(context.assignment) || self.submissions(&r.request.assignment_id) != context.history
+            || context.current != &r.qualified_current || context.rebases_used != r.rebases_used { return Err(ReviewStateError::ReplayConflict); }
+        let mut prior = ReviewHighwaterV1::default();
+        for record in &self.records {
+            if matches!(&record.event, EventV1::Reserved(old) if old.as_ref() == r) { break; }
+            prior = event_highwater(&record.event).unwrap_or(prior);
+        }
+        let tokens: Vec<_> = observed.iter().map(|(b, e)| acceptance::authorize_reviewed_acceptance(p, acceptance::LegacyReviewProfileMode::FixtureProfileV1, b, e,
+            acceptance::AcceptanceVerificationContextV1 { snapshot: context.snapshot, current: context.current, assignment: context.assignment,
+                history: context.history, dependencies: context.dependencies, rebases_used: context.rebases_used, persisted_highwater: prior }))
+            .collect::<Result<_, _>>()?;
+        self.require_exact_cohort(r, &tokens)?;
+        Ok(tokens)
     }
     pub fn reserve(&mut self, p: &TrustedFixtureVerifier, tokens: &[VerifiedFixtureAcceptanceV1], request: ReviewReservationRequestV1) -> Result<ReservationDispositionV1, ReviewStateError> {
         self.check_exact()?; verify_fixture_quorum(tokens)?;
@@ -445,13 +483,14 @@ impl ReviewStateStoreV1 {
         let a = &t.signed_bundle().acceptance.payload;
         let r = ReservedV1 { request, candidate_digest: t.candidate_digest()?, acceptance_digest: t.acceptance_digest()?, nonce: a.nonce,
             reviewer_principal: a.reviewer_principal.clone(), review_round: a.review_round, qualified_current: t.qualified_current().clone(), rebases_used: t.rebases_used(), bundle: t.signed_bundle().clone(), evidence: t.evidence().clone(),
-            approvals: tokens.iter().map(|t| (t.signed_bundle().clone(), t.evidence().clone())).collect(), highwater: t.highwater() };
+            approvals: tokens.iter().map(|t| (t.signed_bundle().clone(), t.evidence().clone())).collect(),
+            highwater: tokens.iter().fold(ReviewHighwaterV1::default(), |h, t| merge_highwater(h, t.highwater())) };
         if let Some(old) = self.find_reservation(&r)? {
             let digest = reservation_digest(old)?;
             if let Some(outcome) = self.records.iter().find_map(|record| match &record.event { EventV1::Consumed { reservation_digest, outcome } if *reservation_digest == digest => Some(outcome), _ => None }) { return Ok(ReservationDispositionV1::Consumed(outcome.clone())); }
             return Ok(ReservationDispositionV1::PendingOriginalOperation(FixtureReservationV1 { reservation: old.clone(), provenance: self.provenance.clone() }));
         }
-        if !self.highwater.permits(t.highwater()) { return Err(ReviewStateError::HighwaterRollback); }
+        if tokens.iter().any(|t| !self.highwater.permits(t.highwater())) { return Err(ReviewStateError::HighwaterRollback); }
         let receipt = serde_json::to_vec(&expected_outcome(&r, &self.provenance)).map_err(|_| ReviewStateError::RecordTooLarge)?;
         if receipt.len() as u64 > r.request.maximum_outcome_bytes { return Err(ReviewStateError::RecordTooLarge); }
         let handle = FixtureReservationV1 { reservation: r.clone(), provenance: self.provenance.clone() };
@@ -491,7 +530,7 @@ impl ReviewStateStoreV1 {
         let r = self.find_reservation(&handle.reservation)?.ok_or(ReviewStateError::MissingSubmission)?.clone();
         let digest = reservation_digest(&r)?;
         if let Some(outcome) = self.records.iter().find_map(|record| match &record.event { EventV1::Consumed { reservation_digest, outcome } if *reservation_digest == digest => Some(outcome), _ => None }) { return Ok(outcome.clone()); }
-        if token.acceptance_digest()? != r.acceptance_digest || token.candidate_digest()? != r.candidate_digest || !self.highwater.permits(token.highwater()) { return Err(ReviewStateError::ReplayConflict); }
+        self.require_exact_cohort(&r, revalidated)?;
         let q = &r.request;
         validate_finalization(&r, &self.provenance, proof, joined)?;
         let outcome = expected_outcome(&r, &self.provenance);
@@ -512,6 +551,20 @@ impl ReviewStateStoreV1 {
         if observed_hash == q.successor_sha256 && observed_rev == q.successor_file_rev { return Ok(ReconciliationDispositionV1::RepairOriginalConsumption); }
         Ok(ReconciliationDispositionV1::UnknownStateHeld)
     }
+}
+fn record_highwater(b: &SignedAcceptanceBundleV1, e: &FixtureVerificationEvidenceV1) -> ReviewHighwaterV1 {
+    ReviewHighwaterV1 { authority_epoch: e.authority.payload.authority_epoch, writer_epoch: e.authority.payload.writer_epoch, roughtime_us: b.review.roughtime_midpoint_us }
+}
+fn merge_highwater(a: ReviewHighwaterV1, b: ReviewHighwaterV1) -> ReviewHighwaterV1 {
+    ReviewHighwaterV1 { authority_epoch: a.authority_epoch.max(b.authority_epoch), writer_epoch: a.writer_epoch.max(b.writer_epoch), roughtime_us: a.roughtime_us.max(b.roughtime_us) }
+}
+fn replay_collision(a: &SignedAcceptanceBundleV1, b: &SignedAcceptanceBundleV1) -> bool {
+    let a = &a.acceptance.payload; let b = &b.acceptance.payload;
+    a.nonce == b.nonce || a.operation_id == b.operation_id
+        || (a.reviewer_principal == b.reviewer_principal && a.review_round == b.review_round && a.task_ref.task_key() == b.task_ref.task_key())
+}
+fn event_approvals(e: &EventV1) -> Vec<&SignedAcceptanceBundleV1> {
+    match e { EventV1::Reserved(r) => r.approvals.iter().map(|(b, _)| b).collect(), EventV1::Rejected { bundle, .. } => vec![bundle], _ => Vec::new() }
 }
 fn validate_request(q: &ReviewReservationRequestV1) -> Result<(), ReviewStateError> {
     for id in [&q.original_operation_id, &q.assignment_id, &q.target_transition_id] { validate_id(id, "review reservation").map_err(AcceptanceError::from)?; }
@@ -688,6 +741,174 @@ mod tests {
         assert!(matches!(store.capacity(&encoded, &event), Err(ReviewStateError::TooManyRecords)));
         store.records.truncate(3); store.exact_bytes.resize(MAX_REVIEW_FILE_BYTES as usize - MAX_REVIEW_RECORD_BYTES, 0);
         assert!(matches!(store.capacity(&encoded, &event), Err(ReviewStateError::FileTooLarge)));
+    }
+
+    fn rejected(f: &mut DiskFixture) -> VerifiedFixtureAcceptanceV1 {
+        f.fixture.bundle.review.verdict = ReviewVerdict::Rejected;
+        f.fixture.bundle.acceptance.payload.verdict = ReviewVerdict::Rejected;
+        f.fixture.refresh_signed_records();
+        f.fixture.verify(Default::default()).unwrap()
+    }
+    fn quorum_second(f: &mut DiskFixture) -> Fixture {
+        f.fixture.evidence.authority.payload.quorum = 2; f.fixture.resign_authority();
+        let ns = f.namespace.metadata().unwrap(); let mut other = Fixture::new(ns.dev(), ns.ino());
+        other.evidence.authority = f.fixture.evidence.authority.clone();
+        other.bundle.review.reviewer_id = "reviewer-two".into();
+        other.bundle.review.k1_pubkey = crate::task_acceptance::fixtures::key(3);
+        other.bundle.review.roughtime_midpoint_us = 105_000_000;
+        other.bundle.acceptance.payload.reviewer_principal = "reviewer-two".into();
+        other.bundle.acceptance.payload.reviewer_full_instance = "REVIEW2#fixture".into();
+        other.bundle.acceptance.payload.nonce = [9; 32];
+        other.evidence.scope.payload.reviewer_principal = "reviewer-two".into();
+        other.evidence.scope.payload.reviewer_instance = "REVIEW2#fixture".into();
+        other.evidence.scope.payload.nonce = [9; 32];
+        for t in &mut other.evidence.time { t.payload.nonce = [9; 32]; t.payload.midpoint_us = 105_000_000; }
+        other.refresh_reviewer(3); other
+    }
+    fn context<'a>(f: &'a Fixture, highwater: ReviewHighwaterV1) -> acceptance::AcceptanceVerificationContextV1<'a> {
+        acceptance::AcceptanceVerificationContextV1 { snapshot: &f.snapshot, current: &f.current, assignment: &f.assignment,
+            history: &f.history, dependencies: &[], rebases_used: 0, persisted_highwater: highwater }
+    }
+    #[test]
+    fn p0_acceptance_rejected_exact_replay_and_resigned_conflict_live_and_reopen() {
+        let mut f = DiskFixture::new(); let original = rejected(&mut f);
+        let mut store = f.open(); f.prepare(&mut store); store.reject(&f.fixture.provider, &original).unwrap();
+        let path = f.namespace.join(REVIEW_STATE_FILE_NAME); let before = std::fs::read(&path).unwrap();
+        store.reject(&f.fixture.provider, &original).unwrap(); assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(store); let mut store = f.open(); store.reject(&f.fixture.provider, &original).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        f.fixture.bundle.acceptance.payload.expires_at_unix = 111; f.fixture.refresh_signed_records();
+        let changed = f.fixture.verify(store.highwater()).unwrap();
+        assert!(matches!(store.reject(&f.fixture.provider, &changed), Err(ReviewStateError::ReplayConflict)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let event = EventV1::Rejected { bundle: Box::new(changed.signed_bundle().clone()), evidence: Box::new(changed.evidence().clone()), highwater: changed.highwater() };
+        let bytes = encode_record(&store.next_record(event).unwrap()).unwrap(); drop(store);
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap(); file.write_all(&bytes).unwrap(); file.sync_all().unwrap(); drop(file);
+        assert!(matches!(ReviewStateStoreV1::reopen(&f.parent, "fixture", &f.fixture.provider), Err(ReviewStateError::ReplayConflict)));
+    }
+    #[test]
+    fn p0_acceptance_reserved_rejected_replay_conflict_is_symmetric() {
+        for reject_first in [false, true] {
+            let mut f = DiskFixture::new(); let approved = f.fixture.verify(Default::default()).unwrap();
+            let rejection = rejected(&mut f); let mut store = f.open(); f.prepare(&mut store);
+            if reject_first { store.reject(&f.fixture.provider, &rejection).unwrap(); }
+            else { store.reserve(&f.fixture.provider, &[approved.clone()], request()).unwrap(); }
+            let path = f.namespace.join(REVIEW_STATE_FILE_NAME); let before = std::fs::read(&path).unwrap();
+            if reject_first { assert!(matches!(store.reserve(&f.fixture.provider, &[approved], request()), Err(ReviewStateError::ReplayConflict))); }
+            else { assert!(matches!(store.reject(&f.fixture.provider, &rejection), Err(ReviewStateError::ReplayConflict))); }
+            assert_eq!(std::fs::read(&path).unwrap(), before); drop(store); f.open();
+        }
+    }
+    #[test]
+    fn p0_acceptance_quorum_highwater_order_independent_reopen_and_exact_revalidation() {
+        for reverse in [false, true] {
+            let mut f = DiskFixture::new(); let mut other = quorum_second(&mut f); let mut store = f.open(); f.prepare(&mut store);
+            let mut tokens = vec![f.fixture.verify(Default::default()).unwrap(), other.verify(Default::default()).unwrap()];
+            if reverse { tokens.reverse(); }
+            let handle = match store.reserve(&f.fixture.provider, &tokens, request()).unwrap() { ReservationDispositionV1::Reserved(h) => h, _ => panic!("new reservation") };
+            assert_eq!(store.highwater().roughtime_us, 105_000_000); drop(store); let mut store = f.open();
+            assert_eq!(store.highwater().roughtime_us, 105_000_000);
+            let before = std::fs::read(f.namespace.join(REVIEW_STATE_FILE_NAME)).unwrap();
+            let observed = handle.reservation.approvals.clone();
+            let h = store.highwater(); let revalidated = store.revalidate_reserved_cohort(&f.fixture.provider, &handle, &observed, context(&f.fixture, h)).unwrap();
+            store.require_exact_cohort(&handle.reservation, &revalidated).unwrap();
+            assert_eq!(std::fs::read(f.namespace.join(REVIEW_STATE_FILE_NAME)).unwrap(), before);
+            other.bundle.review.roughtime_midpoint_us = 102_000_000;
+            for t in &mut other.evidence.time { t.payload.midpoint_us = 102_000_000; }
+            other.refresh_reviewer(3); assert!(other.verify(store.highwater()).is_err());
+        }
+    }
+    #[test]
+    fn p0_acceptance_reserved_cohort_changed_authority_time_or_members_held() {
+        let mut f = DiskFixture::new(); let other = quorum_second(&mut f); let mut store = f.open(); f.prepare(&mut store);
+        let tokens = vec![f.fixture.verify(Default::default()).unwrap(), other.verify(Default::default()).unwrap()];
+        let handle = match store.reserve(&f.fixture.provider, &tokens, request()).unwrap() { ReservationDispositionV1::Reserved(h) => h, _ => panic!("new reservation") };
+        for change in 0..5 {
+            let mut observed = handle.reservation.approvals.clone();
+            match change {
+                0 => { for (_, e) in &mut observed { e.authority.payload.authority_epoch += 1; e.authority = signed("current-authority", e.authority.payload.clone(), 40); } }
+                1 => { observed[0].1.time[0].payload.response_elapsed_ms += 1; observed[0].1.time[0] = signed("roughtime-response", observed[0].1.time[0].payload.clone(), 6); }
+                2 => { observed.pop(); }
+                3 => { observed[1] = observed[0].clone(); }
+                _ => { observed[0].1.authority.payload.principals[1].revoked = true; observed[0].1.authority = signed("current-authority", observed[0].1.authority.payload.clone(), 40); }
+            }
+            if change < 2 {
+                let valid: Vec<_> = observed.iter().map(|(b, e)| acceptance::authorize_reviewed_acceptance(&f.fixture.provider, acceptance::LegacyReviewProfileMode::FixtureProfileV1, b, e, context(&f.fixture, Default::default())).unwrap()).collect();
+                verify_fixture_quorum(&valid).unwrap(); assert!(store.require_exact_cohort(&handle.reservation, &valid).is_err());
+            }
+            let h = store.highwater(); assert!(store.revalidate_reserved_cohort(&f.fixture.provider, &handle, &observed, context(&f.fixture, h)).is_err(), "change {change}");
+        }
+        let original_h = store.highwater; store.highwater.roughtime_us += 1;
+        let h = store.highwater(); assert!(store.revalidate_reserved_cohort(&f.fixture.provider, &handle, &handle.reservation.approvals, context(&f.fixture, h)).is_err());
+        store.highwater = original_h;
+    }
+    #[test]
+    fn p0_acceptance_reopen_refuses_forged_first_only_quorum_highwater() {
+        let mut f = DiskFixture::new(); let other = quorum_second(&mut f); let mut store = f.open(); f.prepare(&mut store);
+        let tokens = vec![f.fixture.verify(Default::default()).unwrap(), other.verify(Default::default()).unwrap()];
+        let handle = match store.reserve(&f.fixture.provider, &tokens, request()).unwrap() { ReservationDispositionV1::Reserved(h) => h, _ => panic!("new reservation") };
+        let mut records = store.records.clone(); drop(store);
+        let mut r = handle.reservation; r.highwater.roughtime_us = 100_000_000;
+        records.last_mut().unwrap().event = EventV1::Reserved(Box::new(r));
+        let bytes: Vec<_> = records.iter().flat_map(|record| encode_record(record).unwrap()).collect();
+        std::fs::write(f.namespace.join(REVIEW_STATE_FILE_NAME), bytes).unwrap();
+        assert!(matches!(ReviewStateStoreV1::reopen(&f.parent, "fixture", &f.fixture.provider), Err(ReviewStateError::HighwaterRollback)));
+    }
+
+    fn another_task(mut f: Fixture) -> Fixture {
+        f.assignment.payload.assignment_id = "another-assignment".into(); f.assignment.payload.operation_id = "another-operation".into();
+        f.assignment.payload.original_task_ref.task_id = "ANOTHER".into();
+        f.assignment = signed("immutable-assignment", f.assignment.payload.clone(), 40);
+        f.current.task_id = "ANOTHER".into(); f.snapshot.task_id = "ANOTHER".into();
+        f.bundle.candidate.payload.original_assignment_task_ref = f.assignment.payload.original_task_ref.clone();
+        f.bundle.candidate.payload.assignment_id = "another-assignment".into(); f.bundle.candidate.payload.operation_id = "another-operation".into();
+        f.bundle.candidate.author_k1 = crate::task_acceptance::fixtures::signature(1, &f.bundle.candidate.payload.canonical_bytes().unwrap());
+        let digest = f.bundle.candidate.payload.canonical_digest().unwrap();
+        for t in &mut f.history {
+            t.payload.assignment_id = "another-assignment".into(); t.payload.operation_id = "another-operation".into();
+            t.payload.prior = f.assignment.payload.original_task_ref.clone(); t.payload.next = f.current.clone();
+            t.payload.assignment_record_digest = acceptance::assignment_digest(&f.assignment).unwrap(); t.payload.candidate_digest = digest;
+            *t = signed("qualified-submission-transition", t.payload.clone(), 40);
+        }
+        f.bundle.review.task_id = "ANOTHER".into(); f.bundle.review.assignment_id = "another-assignment".into(); f.bundle.review.operation_id = "another-operation".into();
+        f.bundle.acceptance.payload.task_ref = f.current.clone(); f.bundle.acceptance.payload.assignment_id = "another-assignment".into();
+        f.bundle.acceptance.payload.operation_id = "another-operation".into(); f.bundle.acceptance.payload.candidate_digest = digest;
+        f.bundle.review.verdict = ReviewVerdict::Rejected; f.bundle.acceptance.payload.verdict = ReviewVerdict::Rejected;
+        f.refresh_reviewer(3); f
+    }
+    #[test]
+    fn p0_acceptance_secondary_quorum_nonce_conflict_and_distinct_decision() {
+        let mut f = DiskFixture::new(); let mut other = another_task(quorum_second(&mut f));
+        let mut store = f.open(); f.prepare(&mut store); let second = quorum_second(&mut f);
+        let tokens = vec![f.fixture.verify(Default::default()).unwrap(), second.verify(Default::default()).unwrap()];
+        store.reserve(&f.fixture.provider, &tokens, request()).unwrap();
+        store.record_assignment(&f.fixture.provider, &other.assignment).unwrap();
+        for t in &other.history { store.record_submission(&f.fixture.provider, &other.bundle.candidate, t).unwrap(); }
+        let conflicting = other.verify(store.highwater()).unwrap();
+        assert!(!replay_collision(tokens[0].signed_bundle(), conflicting.signed_bundle()));
+        assert!(replay_collision(tokens[1].signed_bundle(), conflicting.signed_bundle()));
+        let path = f.namespace.join(REVIEW_STATE_FILE_NAME); let before = std::fs::read(&path).unwrap();
+        assert!(matches!(store.reject(&f.fixture.provider, &conflicting), Err(ReviewStateError::ReplayConflict)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        other.bundle.acceptance.payload.nonce = [10; 32]; other.evidence.scope.payload.nonce = [10; 32];
+        for t in &mut other.evidence.time { t.payload.nonce = [10; 32]; }
+        other.refresh_reviewer(3); let distinct = other.verify(store.highwater()).unwrap();
+        store.reject(&f.fixture.provider, &distinct).unwrap(); drop(store); f.open();
+    }
+    #[test]
+    fn p0_acceptance_each_quorum_member_must_pass_prior_water_guard() {
+        let mut f = DiskFixture::new(); let second = quorum_second(&mut f);
+        f.fixture.bundle.review.roughtime_midpoint_us = 99_000_000;
+        for t in &mut f.fixture.evidence.time { t.payload.midpoint_us = 99_000_000; }
+        f.fixture.refresh_signed_records();
+        let tokens = vec![f.fixture.verify(Default::default()).unwrap(), second.verify(Default::default()).unwrap()];
+        let mut store = f.open(); f.prepare(&mut store);
+        // Isolate the state guard with a supplied prior boundary; this is not a
+        // claim that the following scalar itself proves a durable observation.
+        store.highwater = ReviewHighwaterV1 { authority_epoch: 2, writer_epoch: 3, roughtime_us: 100_000_000 };
+        let path = f.namespace.join(REVIEW_STATE_FILE_NAME); let before = std::fs::read(&path).unwrap();
+        assert!(matches!(store.reserve(&f.fixture.provider, &tokens, request()), Err(ReviewStateError::HighwaterRollback)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
 }
