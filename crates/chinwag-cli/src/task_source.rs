@@ -561,6 +561,25 @@ impl WorkspaceSourceRegistry {
         Ok(&entry.record)
     }
 
+    /// Scheduler inputs come from the enrolled current file, never a caller's
+    /// eligibility flag or supplied task-status snapshot.
+    pub(crate) fn read_for_scheduler(
+        &self,
+        source_id: &str,
+    ) -> Result<(TaskSourceRecord, ResolvedTaskSourceFile), HeldReason> {
+        let record = self.validate_bound_source(source_id)?;
+        let file = resolve_enrolled_source_under_root(&self.root, &record.canonical_relative_path)
+            .map_err(HeldReason::SourcePath)?;
+        let index = self.index(source_id)?;
+        if self.sources[index].filesystem_identity != Some(SourceFilesystemIdentity::from(&file)) {
+            return Err(HeldReason::SourcePath(
+                SourcePathHoldReason::HeldSourceReplacedOrDrifted,
+            ));
+        }
+        self.check_alias(index, &file)?;
+        Ok((record.clone(), file))
+    }
+
     /// Adopt the exact same-path replacement produced by the fenced writer.
     /// Migration, enrollment state and source generation retain their bindings.
     pub fn adopt_writer_commit(

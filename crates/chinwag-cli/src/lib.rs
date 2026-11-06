@@ -21,6 +21,10 @@ pub mod task_ref;
 #[cfg(target_os = "macos")]
 pub mod task_review_state;
 #[cfg(target_os = "macos")]
+pub mod task_scheduler;
+#[cfg(target_os = "macos")]
+pub(crate) mod task_scheduler_journal;
+#[cfg(target_os = "macos")]
 pub mod task_source;
 #[cfg(target_os = "macos")]
 pub mod task_source_path;

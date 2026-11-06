@@ -25,10 +25,12 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
@@ -202,28 +204,6 @@ pub fn resolve_actor_with_instance(
 ) -> Result<String, InstanceError> {
     agent_instance::resolve_from_environment(raw_actor, explicit_instance)
         .map(|address| address.to_string())
-}
-
-/// Internal supervisor actors share one CSPRNG process instance. Public agent
-/// sends must provide their conversation context through the CLI boundary.
-fn service_actor(seat: &str) -> Result<String, InstanceError> {
-    static INSTANCE: OnceLock<Result<String, InstanceError>> = OnceLock::new();
-    let instance = INSTANCE
-        .get_or_init(agent_instance::new_instance_id)
-        .as_ref()
-        .map_err(|error| *error)?;
-    agent_instance::resolve_actor(seat, Some(instance), None).map(|address| address.to_string())
-}
-
-fn send_service_message_sync(
-    repo_root: &Path,
-    service: &str,
-    room: &str,
-    to: Option<String>,
-    task_id: Option<String>,
-    body: &str,
-) -> Result<(BusMessage, BusAck), InstanceError> {
-    send_bus_message_sync(repo_root, &service_actor(service)?, room, to, task_id, body)
 }
 
 fn seat_slug_clean(actor: &str) -> String {
@@ -857,32 +837,14 @@ pub fn parse_active_tasks_from_markdown(repo_root: &Path) -> Vec<(String, String
     results
 }
 
-/// Autonomous `■ PRODUCT` + `■ DELIVERY` Backlog Governor (`CHWG-CONTINUOUS-LOOP-01` + `CHWG-DYNAMIC-TASKS-PARSER-01`).
-fn dispatch_continuous_backlog_wave(repo_root: &Path, target_seat: &str) -> Vec<String> {
-    let mut spawned = Vec::new();
-    let target = target_seat.to_uppercase();
-    let parsed_tasks = parse_active_tasks_from_markdown(repo_root);
-
-    let mut dispatched_seats = std::collections::BTreeSet::new();
-    for (seat, task_id, prompt) in parsed_tasks {
-        if dispatched_seats.contains(&seat) {
-            continue;
-        }
-        if target == "ALL"
-            || target == seat
-            || (target == "GPT" && (seat == "RUST" || seat == "ARCHITECT" || seat == "ALISTAIR"))
-        {
-            if is_seat_worker_active(repo_root, &seat) {
-                dispatched_seats.insert(seat);
-                continue;
-            }
-            if spawn_seat_workstream(repo_root, &seat, &task_id, &prompt) {
-                spawned.push(format!("■ {seat} (-> {task_id})"));
-                dispatched_seats.insert(seat);
-            }
-        }
-    }
-    spawned
+/// Bare Markdown headings and advisory PID files cannot create a scheduler claim.
+fn scheduler_admission_required(stderr: &mut dyn Write) -> u8 {
+    let _ = writeln!(
+        stderr,
+        "chinwag bus: {}",
+        chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED
+    );
+    2
 }
 
 fn seat_pid_path(repo_root: &Path, seat: &str) -> PathBuf {
@@ -931,11 +893,13 @@ fn worker_file_component(actor: &str) -> String {
     )
 }
 
+#[cfg(test)]
 struct WorkerRegistration {
     path: PathBuf,
     file: File,
 }
 
+#[cfg(test)]
 impl WorkerRegistration {
     fn acquire(repo_root: &Path, actor: &str) -> std::io::Result<Self> {
         let path = seat_pid_path(repo_root, actor);
@@ -951,6 +915,7 @@ impl WorkerRegistration {
     }
 }
 
+#[cfg(test)]
 impl Drop for WorkerRegistration {
     fn drop(&mut self) {
         if let (Ok(held), Ok(current)) = (self.file.metadata(), self.path.symlink_metadata())
@@ -1032,10 +997,8 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
         started_at,
         last_heartbeat: started_at,
         total_messages: initial_count,
-        product_governor: "ACTIVE (CHWG-CONTINUOUS-LOOP-01 · Dynamic TASKS.md 45s Governor)"
-            .to_string(),
-        delivery_router: "ACTIVE (Ed25519+allowed_signers Verified Router on 0.0.0.0:44330)"
-            .to_string(),
+        product_governor: "RECONCILIATION_ONLY".to_string(),
+        delivery_router: chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED.to_owned(),
     }));
     if let Ok(guard) = state.lock() {
         write_daemon_state(&repo_root, &guard);
@@ -1072,24 +1035,13 @@ async fn run_daemon_loop(repo_root: PathBuf, port: u16, stdout: &mut dyn Write) 
                 }
             }
             _ = governor_tick.tick() => {
-                let repo_gov = repo_root.clone();
-                tokio::task::spawn_blocking(move || {
-                    let spawned = dispatch_continuous_backlog_wave(&repo_gov, "ALL");
-                    if !spawned.is_empty() {
-                        let _ = send_service_message_sync(
-                            &repo_gov,
-                            "PRODUCT",
-                            "#mgmt",
-                            Some("DELIVERY".to_string()),
-                            Some("TASK-18".to_string()),
-                            &format!(
-                                "■ PRODUCT × ■ DELIVERY Autonomous Governor (CHWG-DYNAMIC-TASKS-PARSER-01): Dynamically parsed TASKS.md and dispatched {} seat(s) ({}) under 0% idle tolerance.",
-                                spawned.len(),
-                                spawned.join(", ")
-                            ),
-                        );
-                    }
-                });
+                // Reconciliation is a trigger, not authority to create a new task invocation.
+                // This legacy bus has no verified qualified-assignment/lease adapter.
+                if let Ok(mut guard) = state.lock() {
+                    guard.product_governor = format!("RECONCILIATION_ONLY ({})", chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED);
+                    guard.delivery_router = chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED.to_owned();
+                    write_daemon_state(&repo_root, &guard);
+                }
             }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break; };
@@ -1252,188 +1204,6 @@ pub fn send_bus_message_sync(
     Ok((msg, ack))
 }
 
-fn run_worker_sync(
-    repo_root: &Path,
-    seat: &str,
-    task_id: &str,
-    prompt: &str,
-    caller_opt: Option<&str>,
-) -> u8 {
-    let identities = (|| -> Result<(ActorAddress, String), InstanceError> {
-        let mut child = ActorAddress::parse(seat)?;
-        if child.instance().is_none() {
-            child = child.with_instance(&agent_instance::new_instance_id()?)?;
-        }
-        let parent = caller_opt.ok_or(InstanceError::MissingInstance)?;
-        Ok((
-            child.require_instance()?,
-            resolve_actor_with_instance(parent, None)?,
-        ))
-    })();
-    let Ok((child, caller)) = identities else {
-        return 2;
-    };
-    let base_seat = child.seat().to_owned();
-    let worker_instance = child.to_string();
-    let Ok(_registration) = WorkerRegistration::acquire(repo_root, &worker_instance) else {
-        return 2;
-    };
-    let parent_clause = format!(" (spawned by {caller})");
-    let reply_to = Some(caller.clone());
-
-    let _ = send_bus_message_sync(
-        repo_root,
-        &worker_instance,
-        "#eng",
-        reply_to.clone(),
-        Some(task_id.to_string()),
-        &format!(
-            "ACK from ■ {worker_instance}{parent_clause}: Executing work stream on {task_id} now."
-        ),
-    );
-
-    let mut out_buf: Vec<u8> = Vec::new();
-    let mut err_buf: Vec<u8> = Vec::new();
-    let crdb_str = repo_root
-        .join(".chinwag/state.crdb")
-        .to_string_lossy()
-        .to_string();
-    let sender_for_dispatch = caller.as_str();
-    if let chinwag_cli::Dispatch::AgentDispatch(req) = chinwag_cli::dispatch(
-        std::ffi::OsStr::new("chinwag"),
-        [
-            "agent-dispatch",
-            "--agent",
-            &worker_instance,
-            "--item",
-            task_id,
-            "--sender",
-            sender_for_dispatch,
-            "--crdb",
-            &crdb_str,
-            "--body",
-            prompt,
-        ],
-    ) {
-        let _ =
-            chinwag_cli::run_agent_dispatch(req, &mut std::io::empty(), &mut out_buf, &mut err_buf);
-    }
-
-    let raw_out = String::from_utf8_lossy(&out_buf).trim().to_string();
-    let reply_text = serde_json::from_str::<Value>(&raw_out)
-        .ok()
-        .and_then(|v| {
-            v.get("reply")
-                .and_then(|r| r.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| {
-            if !raw_out.is_empty() {
-                raw_out
-            } else {
-                String::from_utf8_lossy(&err_buf).trim().to_string()
-            }
-        });
-
-    let collapsed = reply_text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    // Full-length 1800-char bus receipt so engineering/audit findings are never clipped (`TASK-15`)
-    let summary: String = collapsed.chars().take(1800).collect();
-
-    let target_room = if base_seat.eq_ignore_ascii_case("QA") {
-        "#qa"
-    } else {
-        "#eng"
-    };
-    let _ = send_bus_message_sync(
-        repo_root,
-        &worker_instance,
-        target_room,
-        reply_to,
-        Some(task_id.to_string()),
-        &format!("COMPLETED {task_id}: {summary}"),
-    );
-
-    let short_summary: String = collapsed.chars().take(1800).collect();
-    let _ = send_service_message_sync(
-        repo_root,
-        "DELIVERY",
-        "#mgmt",
-        Some("Brian".to_string()),
-        Some(task_id.to_string()),
-        &format!(
-            "■ DELIVERY Receipt: ■ {worker_instance}{parent_clause} completed {task_id} -> {short_summary}"
-        ),
-    );
-    0
-}
-
-fn spawn_seat_workstream(repo_root: &Path, seat: &str, task_id: &str, prompt: &str) -> bool {
-    let Ok(parent) = service_actor("DELIVERY") else {
-        return false;
-    };
-    let child = ActorAddress::parse(seat).and_then(|child| {
-        if child.instance().is_some() {
-            Ok(child)
-        } else {
-            child.with_instance(&agent_instance::new_instance_id()?)
-        }
-    });
-    let Ok(child) = child else {
-        return false;
-    };
-    let seat = child.to_string();
-    let logs_dir = bus_dir(repo_root).join("workers");
-    let _ = fs::create_dir_all(&logs_dir);
-    let log_file = logs_dir.join(format!(
-        "{}--{}.log",
-        worker_file_component(&seat),
-        bytes_to_hex(&Sha256::digest(task_id.as_bytes()))
-    ));
-    let bin_chinwag = "/Users/brianspector/.local/bin/chinwag";
-
-    if let Ok(out_file) = OpenOptions::new().create(true).append(true).open(&log_file)
-        && let Ok(err_file) = out_file.try_clone()
-    {
-        return Command::new(bin_chinwag)
-            .args([
-                "bus",
-                "worker",
-                "--repo",
-                &repo_root.to_string_lossy(),
-                "--seat",
-                &seat,
-                "--from",
-                &parent,
-                "--task",
-                task_id,
-                "--message",
-                prompt,
-            ])
-            .env(
-                "PATH",
-                "/opt/homebrew/opt/rustup/bin:/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-            )
-            .env("RUSTUP_TOOLCHAIN", "1.97.1")
-            .env("RUSTC", "/opt/homebrew/opt/rustup/bin/rustc")
-            .env("CARGO", "/opt/homebrew/opt/rustup/bin/cargo")
-            .env("RUSTDOC", "/opt/homebrew/opt/rustup/bin/rustdoc")
-            .env(
-                "CHINWAG_PRIVATE_CRSQL_INPUTS",
-                "/Users/brianspector/.chinwag-native-inputs",
-            )
-            .stdout(Stdio::from(out_file))
-            .stderr(Stdio::from(err_file))
-            .spawn()
-            .is_ok();
-    }
-    false
-}
-
 fn print_bus_help(stdout: &mut dyn Write) -> u8 {
     let _ = writeln!(
         stdout,
@@ -1451,7 +1221,7 @@ fn print_bus_help(stdout: &mut dyn Write) -> u8 {
 Agent sends require a stable conversation instance via --from, --instance or inherited conversation context.
 Use 'bus instance' once to allocate a full random ID, then reuse it for that conversation.
 A base-seat recipient is an explicit seat broadcast; a base-seat inbox aggregates that seat's instances.
---wake with a base-seat recipient creates a new child instance. Send to an existing instance without --wake.
+Engineering worker/wake/route dispatch requires a qualified shared-scheduler claim; this legacy CLI returns HELD before publication.
 Use one --to with a comma-separated list. Repeated --to/-t flags fail before publication.
 A legacy ACK acknowledges publication only: completion_scope=PUBLISH_ONLY, durability UNKNOWN.
 subscribers_notified counts broadcast receivers; it proves neither processing nor task start.
@@ -1474,7 +1244,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     let mut to_arg: Option<String> = None;
     let mut task_arg: Option<String> = None;
     let mut for_arg: Option<String> = None;
-    let mut seat_arg: Option<String> = None;
+    let mut _seat_arg: Option<String> = None;
     let mut summary_arg: Option<String> = None;
     let mut wake_on_send = false;
     let mut limit_arg: usize = 30;
@@ -1530,7 +1300,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 i += 2;
             }
             "--seat" | "--agent" if i + 1 < args.len() => {
-                seat_arg = Some(args[i + 1].clone());
+                _seat_arg = Some(args[i + 1].clone());
                 i += 2;
             }
             "--summary" | "--title" | "--subject" if i + 1 < args.len() => {
@@ -1585,31 +1355,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 2
             }
         },
-        "worker" => {
-            let seat_raw = seat_arg
-                .or_else(|| from_arg.clone())
-                .unwrap_or_else(|| "RUST".to_string());
-            let seat = if let Some(ref inst) = instance_arg {
-                match resolve_actor_with_instance(&seat_raw, Some(inst)) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = writeln!(stderr, "chinwag bus: {error}");
-                        return 2;
-                    }
-                }
-            } else {
-                seat_raw
-            };
-            let caller = from_arg.or_else(|| std::env::var("CHINWAG_ACTOR").ok());
-            let task = task_arg.unwrap_or_else(|| "TASK-15".to_string());
-            let mut prompt = positionals.join(" ").trim().to_string();
-            if prompt.is_empty()
-                && let Some(s) = summary_arg
-            {
-                prompt = s;
-            }
-            run_worker_sync(&repo_root, &seat, &task, &prompt, caller.as_deref())
-        }
+        "worker" => scheduler_admission_required(stderr),
         "daemon" => {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1660,6 +1406,9 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     return 2;
                 }
             }
+            if wake_on_send {
+                return scheduler_admission_required(stderr);
+            }
             let room = room_arg.unwrap_or_else(|| "#mgmt".to_string());
             let result = send_bus_message_sync(
                 &repo_root,
@@ -1707,30 +1456,6 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     &ack.daemon_endpoint_id[..12.min(ack.daemon_endpoint_id.len())],
                     ack.sig_verified
                 );
-            }
-            if wake_on_send && let Some(ref targets) = to_arg {
-                let task_for_wake = task_arg.unwrap_or_else(|| "CHWG-BUS-WAKE".to_string());
-                for raw_target in targets.split(',') {
-                    let clean_seat = raw_target
-                        .trim()
-                        .trim_start_matches('@')
-                        .trim_start_matches('■')
-                        .trim();
-                    let base_target = base_seat_str(clean_seat);
-                    if !base_target.is_empty()
-                        && !base_target.eq_ignore_ascii_case("ALL")
-                        && !base_target.eq_ignore_ascii_case("BRIAN")
-                        && !base_target.eq_ignore_ascii_case("NIC")
-                    {
-                        let _ = run_worker_sync(
-                            &repo_root,
-                            clean_seat,
-                            &task_for_wake,
-                            &body,
-                            Some(&sender),
-                        );
-                    }
-                }
             }
             0
         }
@@ -1835,77 +1560,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             }
             0
         }
-        "wake" | "route" => {
-            let target_seat = seat_arg
-                .or_else(|| positionals.first().cloned())
-                .unwrap_or_else(|| "ALL".to_string())
-                .to_uppercase();
-
-            let _ = send_service_message_sync(
-                &repo_root,
-                "PRODUCT",
-                "#mgmt",
-                Some("DELIVERY".to_string()),
-                Some("TASK-18".to_string()),
-                &format!(
-                    "■ PRODUCT Utilization Governor (CHWG-DYNAMIC-TASKS-PARSER-01): Dynamically parsed TASKS.md (target={target_seat}) and enforcing 0% idle tolerance across ■ RUST, ■ ARCHITECT, ■ FLINT, ■ ALISTAIR, and ■ QA."
-                ),
-            );
-
-            let spawned = dispatch_continuous_backlog_wave(&repo_root, &target_seat);
-
-            let result = send_service_message_sync(
-                &repo_root,
-                "DELIVERY",
-                "#eng",
-                None,
-                Some("TASK-18".to_string()),
-                &format!(
-                    "■ DELIVERY Work-Stream Router: Dispatched {} live worker stream(s) ({}). Streaming Ed25519+allowed_signers verified progress (1800-char full receipts) to #eng, #qa, and #mgmt.",
-                    spawned.len(),
-                    if spawned.is_empty() {
-                        "all target seats already executing".to_string()
-                    } else {
-                        spawned.join(", ")
-                    }
-                ),
-            );
-            let (_, ack) = match result {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = writeln!(stderr, "chinwag bus: {error}");
-                    return 2;
-                }
-            };
-
-            let out = json!({
-                "ok": true,
-                "command": "chinwag bus wake",
-                "spawned_workstreams": spawned,
-                "bus_seq": ack.seq,
-                "daemon_endpoint_id": ack.daemon_endpoint_id,
-                "sig_verified": ack.sig_verified
-            });
-            if is_json {
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::to_string_pretty(&out).unwrap_or_default()
-                );
-            } else {
-                let _ = writeln!(
-                    stdout,
-                    "🚀 ■ PRODUCT + ■ DELIVERY woke {} work stream(s) on the iroh bus:\n  • {}",
-                    spawned.len(),
-                    if spawned.is_empty() {
-                        "All target seats currently active".to_string()
-                    } else {
-                        spawned.join("\n  • ")
-                    }
-                );
-            }
-            0
-        }
+        "wake" | "route" => scheduler_admission_required(stderr),
         "roster" | "top" => {
             let all = read_all_messages(&repo_root);
             let active_tasks = parse_active_tasks_from_markdown(&repo_root);
@@ -1991,11 +1646,11 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     .and_then(|m| m.task_id.clone())
                     .unwrap_or_else(|| "-".to_string());
                 let status = if worker_active {
-                    "WORKING"
+                    "PROCESS_OBSERVED"
                 } else if seat == "PRODUCT" {
-                    "GOVERNOR_ON"
+                    "RECONCILIATION_ONLY"
                 } else if seat == "DELIVERY" {
-                    "ROUTER_ON"
+                    "ADMISSION_HELD"
                 } else {
                     "STANDBY"
                 };
@@ -2616,6 +2271,98 @@ mod tests {
             assert!(String::from_utf8(out).unwrap().starts_with("Usage:"));
             assert!(err.is_empty());
         }
+    }
+
+    #[test]
+    fn p007_unqualified_engineering_routes_refuse_without_publication_or_spawn() {
+        let cases = [
+            vec![
+                "worker",
+                "--seat",
+                "RUST#child",
+                "--from",
+                "WORKHORSE#parent",
+                "--task",
+                "P0-07",
+                "--message",
+                "work",
+            ],
+            vec!["worker", "--seat", "RUST"],
+            vec!["wake", "--seat", "RUST"],
+            vec!["route", "ALL"],
+            vec![
+                "send",
+                "--from",
+                "WORKHORSE#parent",
+                "--to",
+                "RUST",
+                "--wake",
+                "--message",
+                "work",
+            ],
+            vec![
+                "send",
+                "--from",
+                "WORKHORSE#parent",
+                "--to",
+                "RUST",
+                "--dispatch",
+                "--task",
+                "{\"workspace_id\":\"untrusted\"}",
+                "--message",
+                "work",
+            ],
+        ];
+        for case in cases {
+            let repo = tempfile::tempdir().unwrap();
+            fs::write(
+                repo.path().join("TASKS.md"),
+                "### `TASK-01` `[READY]`\n- **Owner:** RUST\n- **Scope:** arbitrary work\n",
+            )
+            .unwrap();
+            let mut args: Vec<String> = case.into_iter().map(str::to_owned).collect();
+            args.extend(["--repo".into(), repo.path().to_string_lossy().into_owned()]);
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(run_bus_cli(&args, &mut out, &mut err), 2);
+            assert!(out.is_empty());
+            assert!(
+                String::from_utf8(err)
+                    .unwrap()
+                    .contains(chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED)
+            );
+            assert!(!repo.path().join(".chinwag").exists());
+        }
+    }
+
+    #[test]
+    fn p007_existing_instance_wake_error_precedes_scheduler_admission() {
+        let repo = tempfile::tempdir().unwrap();
+        let args: Vec<String> = [
+            "send",
+            "--from",
+            "WORKHORSE#parent",
+            "--to",
+            "QA#existing",
+            "--wake",
+            "--message",
+            "work",
+            "--repo",
+            repo.path().to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(run_bus_cli(&args, &mut out, &mut err), 2);
+        assert!(out.is_empty());
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("existing_instance_wake_unsupported")
+        );
+        assert!(!repo.path().join(".chinwag").exists());
     }
 
     #[test]
