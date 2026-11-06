@@ -1657,6 +1657,15 @@ impl PinnedTarget {
     }
 }
 
+/// Immutable provenance survives every clone and cannot be selected by callers.
+/// Fixture finalization must use a distinct private constructor; production
+/// journal recovery continues to decode only the original production metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WriterProofOriginV1 {
+    Production,
+    Fixture(crate::task_acceptance::FixtureProvenanceV1),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriterCommitProof {
     pub(crate) operation_id: String,
@@ -1681,6 +1690,7 @@ pub struct WriterCommitProof {
     pub(crate) committed_postimage_sha256: [u8; 32],
     pub(crate) previous_identity: SourceFilesystemIdentity,
     pub(crate) committed_identity: SourceFilesystemIdentity,
+    origin: WriterProofOriginV1,
     _seal: (),
 }
 impl WriterCommitProof {
@@ -1765,6 +1775,11 @@ impl WriterCommitProof {
         record: &TaskSourceRecord,
         current_identity: Option<SourceFilesystemIdentity>,
     ) -> Result<SourceFilesystemIdentity, HeldReason> {
+        // A controlled fixture result can never adopt a live source record,
+        // even when every scalar and filesystem binding otherwise matches.
+        if self.origin != WriterProofOriginV1::Production {
+            return Err(HeldReason::PolicyBindingMismatch);
+        }
         record.validate(policy)?;
         record.state.check_new_admission()?;
         if self.workspace_id != policy.workspace_id
@@ -1854,6 +1869,7 @@ impl WriterCommitProof {
                 dev: prepared.staged_dev,
                 ino: prepared.staged_ino,
             },
+            origin: WriterProofOriginV1::Production,
             _seal: (),
         })
     }
@@ -2085,9 +2101,75 @@ pub fn commit_task_write(
         journal_phase(journal, &mut entry, WriteOperationState::Held)?;
         return Err(WriterError::SourceHeld);
     }
+    let mut authorization = ProductionCommitAuthorityV1 { context, request,
+        refresh: &mut refresh_authority, projection: &mut record_projection };
+    commit_planned_task_write(context, journal, entry, PlannedTaskMutationV1 {
+        target, stamp, hash, live, postimage, used, admitted_ref: admitted.clone(),
+        temp_name: format!(".chinwag-tmp-{}", request.operation_id),
+    }, &mut authorization, &mut hook)
+}
+
+struct PlannedTaskMutationV1 {
+    target: PinnedTarget,
+    stamp: FileStamp,
+    hash: [u8; 32],
+    live: CanonicalTaskDocumentV1,
+    postimage: CanonicalTaskDocumentV1,
+    used: usize,
+    admitted_ref: TaskRefV1,
+    temp_name: String,
+}
+
+/// Private transaction hooks keep transition authority separate from the shared
+/// descriptor-fenced staging/rename machinery. Only the authority-specific
+/// implementations below may supply projection and post-Recorded finalization.
+trait PreparedCommitAuthorityV1 {
+    fn before_replace(&mut self) -> Result<(), WriterError>;
+    fn expected_projection(&self) -> Option<serde_json::Value>;
+    fn project(&mut self, record: &JournalRecordV1) -> Result<Option<serde_json::Value>, WriterError>;
+    fn finalize_recorded(&mut self, journal: &mut Journal, record: &JournalRecordV1) -> Result<WriterCommitProof, WriterError>;
+}
+
+struct ProductionCommitAuthorityV1<'a, 'root, F, P> {
+    context: &'a WriterContextV1<'root>,
+    request: &'a TaskWriteRequestV1,
+    refresh: &'a mut F,
+    projection: &'a mut P,
+}
+impl<F, P> PreparedCommitAuthorityV1 for ProductionCommitAuthorityV1<'_, '_, F, P>
+where F: FnMut() -> Result<WriterAuthoritySnapshot, WriterError>,
+      P: FnMut(&WriterCommitProof) -> Result<(), WriterError> {
+    fn before_replace(&mut self) -> Result<(), WriterError> {
+        let current = (self.refresh)()?;
+        self.context.lease.verify(&current)?;
+        verify_proposal_fence(self.request.authority()?, &current)?;
+        verify_current_review_grant(&self.request.authorization, &current)?;
+        verify_current_transition_grant(&self.request.authorization, self.request.next_status, &current)
+    }
+    fn expected_projection(&self) -> Option<serde_json::Value> { None }
+    fn project(&mut self, record: &JournalRecordV1) -> Result<Option<serde_json::Value>, WriterError> {
+        let proof = WriterCommitProof::from_record(record)?;
+        (self.projection)(&proof)?;
+        Ok(None)
+    }
+    fn finalize_recorded(&mut self, _journal: &mut Journal, record: &JournalRecordV1) -> Result<WriterCommitProof, WriterError> {
+        WriterCommitProof::from_record(record)
+    }
+}
+
+fn commit_planned_task_write(
+    context: &WriterContextV1<'_>,
+    journal: &mut Journal,
+    mut entry: JournalRecordV1,
+    mutation: PlannedTaskMutationV1,
+    authorization: &mut impl PreparedCommitAuthorityV1,
+    hook: &mut impl FnMut(WriterStep, &File, &str) -> Result<(), WriterError>,
+) -> Result<WriterWriteOutcome, WriterError> {
+    let PlannedTaskMutationV1 { target, stamp, hash, live, postimage, used, admitted_ref, temp_name } = mutation;
+    let lease = context.lease;
+    let admitted = &admitted_ref;
     journal_phase(journal, &mut entry, WriteOperationState::Validated)?;
     let postimage = postimage.to_canonical_bytes()?;
-    let temp_name = format!(".chinwag-tmp-{}", request.operation_id);
     let parent = FileStamp::of(&fstat(target.parent())?, context.root.uid, true)?.identity;
     let mut prepared = PreparedWriteV1 {
         canonical_relative_path: lease.canonical_relative_path.clone(),
@@ -2119,9 +2201,10 @@ pub fn commit_task_write(
         journal_phase(journal, &mut entry, WriteOperationState::Rejected)?;
         return Err(error.into());
     }
+    let expected_projection = authorization.expected_projection();
     let mut terminal = preflight.clone();
     terminal.state = WriteOperationState::Acknowledged;
-    terminal.result = Some(serde_json::json!({"disposition": "Acknowledged"}));
+    terminal.result = Some(expected_projection.clone().unwrap_or_else(|| serde_json::json!({"disposition": "Acknowledged"})));
     if let Err(error) = journal.preflight_record_size(&terminal) {
         journal_phase(journal, &mut entry, WriteOperationState::Rejected)?;
         return Err(error.into());
@@ -2173,11 +2256,7 @@ pub fn commit_task_write(
         if current_stamp != stamp || Sha256Digest::of(&current).0 != hash {
             return Err(WriterError::SourceIdentityChanged);
         }
-        let current = refresh_authority()?;
-        context.lease.verify(&current)?;
-        verify_proposal_fence(authority, &current)?;
-        verify_current_review_grant(&request.authorization, &current)?;
-        verify_current_transition_grant(&request.authorization, request.next_status, &current)?;
+        authorization.before_replace()?;
         journal.preflight_completion(&entry)?;
         if FileStamp::of(
             &statat(target.parent(), target.leaf(), AtFlags::SYMLINK_NOFOLLOW)?,
@@ -2233,8 +2312,13 @@ pub fn commit_task_write(
         return Err(WriterError::SourceIdentityChanged);
     }
     journal_phase(journal, &mut entry, WriteOperationState::FileCommitted)?;
-    let proof = WriterCommitProof::from_record(&entry)?;
-    record_projection(&proof)?;
+    let actual_projection = authorization.project(&entry)?;
+    if actual_projection != expected_projection {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
+    if let Some(projection) = actual_projection {
+        entry.result = Some(projection);
+    }
     target.recheck()?;
     if inspect_prepared(target.parent(), &prepared, context.root.uid)?
         != RecoveryFileState::Successor
@@ -2243,6 +2327,7 @@ pub fn commit_task_write(
         return Err(WriterError::SourceIdentityChanged);
     }
     journal_phase(journal, &mut entry, WriteOperationState::Recorded)?;
+    let proof = authorization.finalize_recorded(journal, &entry)?;
     journal_phase(journal, &mut entry, WriteOperationState::Acknowledged)?;
     Ok(WriterWriteOutcome::Committed(proof))
 }
@@ -2264,6 +2349,23 @@ pub enum RecoveredCommitOutcome {
 /// the original prepared proposal through an operator reconciliation path.
 /// F1 needs current authority and durable projection reconciliation, never a
 /// second rename or revision increment. Fx preserves external evidence.
+fn require_production_recovery_request(
+    context: &WriterContextV1<'_>,
+    record: &JournalRecordV1,
+) -> Result<(), WriterError> {
+    // Reject fixture and unknown metadata before any recovery disposition,
+    // cleanup, projection or journal append. Production decoding is strict.
+    let lease: WriterLeaseV1 = serde_json::from_value(record.request.metadata.clone())
+        .map_err(|_| WriterError::PolicyBindingMismatch)?;
+    if lease != *context.lease
+        || record.request.workspace_id != lease.workspace_id
+        || record.request.task_source_id != lease.task_source_id
+    {
+        return Err(WriterError::PolicyBindingMismatch);
+    }
+    Ok(())
+}
+
 pub fn classify_and_recover_prepared_operation(
     context: &WriterContextV1<'_>,
     journal: &mut Journal,
@@ -2276,6 +2378,7 @@ pub fn classify_and_recover_prepared_operation(
         .latest(&lease.workspace_id, &lease.task_source_id, operation_id)
         .cloned()
         .ok_or(WriterError::OperationInProgress)?;
+    require_production_recovery_request(context, &entry)?;
     journal.lookup_request(&entry.request)?;
     let had_file_commit = journal.had_durable_file_commit(&entry.request);
     if matches!(
@@ -2378,6 +2481,7 @@ pub fn reject_unprepared_operation(
         )
         .cloned()
         .ok_or(WriterError::OperationInProgress)?;
+    require_production_recovery_request(context, &entry)?;
     journal.lookup_request(&entry.request)?;
     if !matches!(
         entry.state,
@@ -2408,6 +2512,7 @@ pub fn complete_prepared_operation(
         )
         .cloned()
         .ok_or(WriterError::OperationInProgress)?;
+    require_production_recovery_request(context, &entry)?;
     journal.lookup_request(&entry.request)?;
     // An F0 operator resume cannot erase any historically durable file commit.
     if journal.had_durable_file_commit(&entry.request) {
@@ -2868,6 +2973,33 @@ mod tests {
                 .join(format!(".chinwag-tmp-{}", request.operation_id))
                 .exists()
         );
+    }
+
+    #[test]
+    fn p0_acceptance_fixture_proof_origin_cannot_be_adopted_as_production() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        let mut journal = fixture.journal();
+        let committed = proof(fixture.commit(&mut journal, &request).unwrap());
+        for identity in [fixture.identity, committed.committed_identity()] {
+            assert!(committed.verify_for_source_record(
+                &fixture.authority.policy, &fixture.authority.record, Some(identity)
+            ).is_ok());
+        }
+        let metadata = fs::metadata(&fixture.root.path).unwrap();
+        let provider = crate::task_acceptance::fixtures::Fixture::new(metadata.dev(), metadata.ino());
+        // Negative classification fixture only: the underlying writer proof was
+        // produced by a real commit above. This does not mint a qualified fixture
+        // finalization or claim an Approved -> Done integration path exists yet.
+        let mut tagged = committed.clone();
+        tagged.origin = WriterProofOriginV1::Fixture(provider.provider.provenance().clone());
+        let cloned = tagged.clone();
+        assert_eq!(cloned.origin, tagged.origin);
+        for identity in [fixture.identity, committed.committed_identity()] {
+            assert!(cloned.verify_for_source_record(
+                &fixture.authority.policy, &fixture.authority.record, Some(identity)
+            ).is_err());
+        }
     }
 
     #[test]
