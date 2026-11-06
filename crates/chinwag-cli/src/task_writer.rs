@@ -2344,6 +2344,8 @@ fn commit_planned_task_write(
             return Err(WriterError::SourceIdentityChanged);
         }
         authorization.before_replace()?;
+        // Rebind the anchored path after the last external authority refresh.
+        target.recheck()?;
         journal.preflight_completion(&entry)?;
         if FileStamp::of(
             &statat(target.parent(), target.leaf(), AtFlags::SYMLINK_NOFOLLOW)?,
@@ -3120,6 +3122,7 @@ where
         use crate::task_acceptance::AcceptanceVerificationContextV1;
         self.context.namespace.recheck()?;
         let observed = (self.refresh)()?;
+        self.context.namespace.recheck()?;
         verify_fixture_clock(self.context.writer.lease, &observed, self.store.highwater())?;
         let actual = sorted_fixture_proposals(self.context.writer, &observed.proposals)?;
         let identities: Vec<_> = actual.iter().map(|p| p.0.clone()).collect();
@@ -3668,6 +3671,7 @@ where
             journal.preflight_completion(&entry)?;
             hook(WriterStep::BeforeRename, target.parent(), target.leaf())?;
             authority.before_replace()?;
+            target.recheck()?;
             if inspect_prepared(target.parent(), &prepared, context.writer.root.uid)?
                 != RecoveryFileState::Predecessor
             {
@@ -3958,6 +3962,7 @@ pub fn complete_prepared_operation(
     verify_proposal_fence(request.authority()?, &latest)?;
     verify_current_review_grant(&request.authorization, &latest)?;
     verify_current_transition_grant(&request.authorization, request.next_status, &latest)?;
+    target.recheck()?;
     verify_prepared_stage(target.parent(), &prepared, context.root.uid)?;
     journal.preflight_completion(&entry)?;
     if FileStamp::of(
@@ -3999,6 +4004,232 @@ pub fn complete_prepared_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    // S1 regressions move only fresh test-owned directories. Child dev/ino and
+    // bytes survive the move, so descriptor-relative child checks cannot suffice.
+    fn fixture_last_refresh_workspace_move_has_no_commit_effects(f0: bool) {
+        use crate::task_review_state::TaskReviewLifecycleState;
+        let moved_owner = tempfile::tempdir().unwrap();
+        let f = ReviewedWriterFixture::new(false);
+        let moved_root = moved_owner.path().join("moved-workspace");
+        let writer = f.writer.context();
+        let context =
+            FixtureReviewWriterContextV1::bind(&writer, &f.review.provider, "review").unwrap();
+        let mut journal = f.writer.journal();
+        let mut store = f.state();
+        let request = f.request();
+        let original = f.bytes();
+        let original_identity = f.metadata();
+        let operation = &f.review.bundle.acceptance.payload.operation_id;
+        let stage_name = format!(".chinwag-tmp-{operation}");
+        if f0 {
+            assert!(matches!(
+                commit_fixture_reviewed_task(
+                    &context,
+                    &mut journal,
+                    &mut store,
+                    &request,
+                    || Ok(f.observation()),
+                    |step, _, _| if step == WriterStep::Prepared {
+                        Err(WriterError::InjectedCrash)
+                    } else {
+                        Ok(())
+                    }
+                ),
+                Err(WriterError::InjectedCrash)
+            ));
+            drop(store);
+            drop(journal);
+            journal = f.writer.journal();
+            store = reopen_fixture_review_state(
+                &context,
+                &journal,
+                &File::open(&f.writer.root.path).unwrap(),
+                "review",
+            )
+            .unwrap();
+        }
+        let armed = Cell::new(false);
+        let moved = Cell::new(false);
+        let replacements = Cell::new(0);
+        let result = commit_fixture_reviewed_task(
+            &context,
+            &mut journal,
+            &mut store,
+            &request,
+            || {
+                let observation = f.observation();
+                if armed.replace(false) {
+                    assert!(!moved.get());
+                    let stage = fs::metadata(f.writer.root.path.join(&stage_name)).unwrap();
+                    fs::rename(&f.writer.root.path, &moved_root).unwrap();
+                    let target = fs::metadata(moved_root.join("TASKS.md")).unwrap();
+                    let moved_stage = fs::metadata(moved_root.join(&stage_name)).unwrap();
+                    assert_eq!((target.dev(), target.ino()), original_identity);
+                    assert_eq!((moved_stage.dev(), moved_stage.ino()), (stage.dev(), stage.ino()));
+                    assert_eq!(fs::read(moved_root.join("TASKS.md")).unwrap(), original);
+                    moved.set(true);
+                }
+                Ok(observation)
+            },
+            |step, _, _| {
+                if step == WriterStep::BeforeRename {
+                    armed.set(true);
+                } else if step == WriterStep::AfterRename {
+                    replacements.set(replacements.get() + 1);
+                }
+                Ok(())
+            },
+        );
+        assert!(moved.get(), "last refresh must actually move the test workspace");
+        assert!(result.is_err());
+        assert_eq!(replacements.get(), 0);
+        let target = fs::metadata(moved_root.join("TASKS.md")).unwrap();
+        assert_eq!((target.dev(), target.ino()), original_identity);
+        assert_eq!(fs::read(moved_root.join("TASKS.md")).unwrap(), original);
+        assert_eq!(
+            store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),
+            TaskReviewLifecycleState::ReviewAttestedApproved
+        );
+        assert!(journal.records().all(|record| !matches!(
+            record.state,
+            WriteOperationState::FileCommitted
+                | WriteOperationState::Recorded
+                | WriteOperationState::Acknowledged
+        )));
+    }
+
+    #[test]
+    fn p0_fixture_writer_normal_last_refresh_workspace_move_blocks_replace_consume_ack() {
+        fixture_last_refresh_workspace_move_has_no_commit_effects(false);
+    }
+
+    #[test]
+    fn p0_fixture_writer_f0_last_refresh_workspace_move_blocks_replace_consume_ack() {
+        fixture_last_refresh_workspace_move_has_no_commit_effects(true);
+    }
+
+    #[test]
+    fn p0_writer_non_done_last_refresh_parent_move_blocks_normal_and_f0() {
+        for f0 in [false, true] {
+            let mut fixture = Fixture::new();
+            let mut request = fixture.request();
+            let parent = fixture.root.path.join("source-parent");
+            let moved_parent = fixture.root.path.join("moved-source-parent");
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::rename(fixture.root.path.join("tasks.md"), parent.join("tasks.md")).unwrap();
+            fixture.lease.canonical_relative_path = "source-parent/tasks.md".into();
+            fixture.authority.record.canonical_relative_path = "source-parent/tasks.md".into();
+            request.admitted_task_ref.canonical_task_path = "source-parent/tasks.md".into();
+            if let TransitionAuthorization::Standard(authority) = &mut request.authorization {
+                authority.task_ref = request.admitted_task_ref.clone();
+            } else {
+                panic!("existing non-Done fixture must use standard authority");
+            }
+            seal(&mut request);
+            fixture.admit_request(&request);
+            assert_eq!(request.next_status, CanonicalTaskStatus::InProgress);
+            let original = fs::read(parent.join("tasks.md")).unwrap();
+            let target = fs::metadata(parent.join("tasks.md")).unwrap();
+            let identity = (target.dev(), target.ino());
+            let stage_name = format!(".chinwag-tmp-{}", request.operation_id);
+            let mut journal = fixture.journal();
+            if f0 {
+                assert!(matches!(
+                    commit_task_write(
+                        &fixture.context(),
+                        &mut journal,
+                        &request,
+                        &[],
+                        || Ok(fixture.authority.clone()),
+                        |step, _, _| if step == WriterStep::Prepared {
+                            Err(WriterError::InjectedCrash)
+                        } else {
+                            Ok(())
+                        },
+                        |_| Ok(())
+                    ),
+                    Err(WriterError::InjectedCrash)
+                ));
+                drop(journal);
+                journal = fixture.journal();
+            }
+            let armed = Cell::new(false);
+            let refreshes = Cell::new(0);
+            let moved = Cell::new(false);
+            let replacements = Cell::new(0);
+            let projections = Cell::new(0);
+            let mut refresh = || {
+                let observation = fixture.authority.clone();
+                refreshes.set(refreshes.get() + 1);
+                if (f0 && refreshes.get() == 2) || (!f0 && armed.replace(false)) {
+                    assert!(!moved.get());
+                    let stage = fs::metadata(parent.join(&stage_name)).unwrap();
+                    fs::rename(&parent, &moved_parent).unwrap();
+                    let target = fs::metadata(moved_parent.join("tasks.md")).unwrap();
+                    let moved_stage = fs::metadata(moved_parent.join(&stage_name)).unwrap();
+                    assert_eq!((target.dev(), target.ino()), identity);
+                    assert_eq!((moved_stage.dev(), moved_stage.ino()), (stage.dev(), stage.ino()));
+                    assert_eq!(fs::read(moved_parent.join("tasks.md")).unwrap(), original);
+                    moved.set(true);
+                }
+                Ok(observation)
+            };
+            let result = if f0 {
+                complete_prepared_operation(
+                    &fixture.context(),
+                    &mut journal,
+                    &request,
+                    &[],
+                    &mut refresh,
+                    |_| {
+                        projections.set(projections.get() + 1);
+                        Ok(())
+                    },
+                )
+                .map(|_| ())
+            } else {
+                commit_task_write(
+                    &fixture.context(),
+                    &mut journal,
+                    &request,
+                    &[],
+                    &mut refresh,
+                    |step, _, _| {
+                        if step == WriterStep::BeforeRename {
+                            armed.set(true);
+                        } else if step == WriterStep::AfterRename {
+                            replacements.set(replacements.get() + 1);
+                        }
+                        Ok(())
+                    },
+                    |_| {
+                        projections.set(projections.get() + 1);
+                        Ok(())
+                    },
+                )
+                .map(|_| ())
+            };
+            assert!(moved.get(), "the final trusted refresh must move the retained parent");
+            if f0 {
+                assert_eq!(refreshes.get(), 2);
+            }
+            assert!(result.is_err());
+            assert_eq!(replacements.get(), 0);
+            assert_eq!(projections.get(), 0);
+            let target = fs::metadata(moved_parent.join("tasks.md")).unwrap();
+            assert_eq!((target.dev(), target.ino()), identity);
+            assert_eq!(fs::read(moved_parent.join("tasks.md")).unwrap(), original);
+            assert!(journal.records().all(|record| !matches!(
+                record.state,
+                WriteOperationState::FileCommitted
+                    | WriteOperationState::Recorded
+                    | WriteOperationState::Acknowledged
+            )));
+        }
+    }
 
     #[test]
     fn p0_fixture_writer_post_refresh_drift_cannot_consume_or_record() {
