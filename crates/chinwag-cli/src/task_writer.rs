@@ -4005,7 +4005,6 @@ pub fn complete_prepared_operation(
 mod tests {
     use super::*;
 
-
     // S1 regressions move only fresh test-owned directories. Child dev/ino and
     // bytes survive the move, so descriptor-relative child checks cannot suffice.
     fn fixture_last_refresh_workspace_move_has_no_commit_effects(f0: bool) {
@@ -4067,7 +4066,10 @@ mod tests {
                     let target = fs::metadata(moved_root.join("TASKS.md")).unwrap();
                     let moved_stage = fs::metadata(moved_root.join(&stage_name)).unwrap();
                     assert_eq!((target.dev(), target.ino()), original_identity);
-                    assert_eq!((moved_stage.dev(), moved_stage.ino()), (stage.dev(), stage.ino()));
+                    assert_eq!(
+                        (moved_stage.dev(), moved_stage.ino()),
+                        (stage.dev(), stage.ino())
+                    );
                     assert_eq!(fs::read(moved_root.join("TASKS.md")).unwrap(), original);
                     moved.set(true);
                 }
@@ -4082,14 +4084,24 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(moved.get(), "last refresh must actually move the test workspace");
+        assert!(
+            moved.get(),
+            "last refresh must actually move the test workspace"
+        );
         assert!(result.is_err());
         assert_eq!(replacements.get(), 0);
         let target = fs::metadata(moved_root.join("TASKS.md")).unwrap();
         assert_eq!((target.dev(), target.ino()), original_identity);
         assert_eq!(fs::read(moved_root.join("TASKS.md")).unwrap(), original);
         assert_eq!(
-            store.lifecycle(f.review.bundle.acceptance.payload.canonical_digest().unwrap()),
+            store.lifecycle(
+                f.review
+                    .bundle
+                    .acceptance
+                    .payload
+                    .canonical_digest()
+                    .unwrap()
+            ),
             TaskReviewLifecycleState::ReviewAttestedApproved
         );
         assert!(journal.records().all(|record| !matches!(
@@ -4171,7 +4183,10 @@ mod tests {
                     let target = fs::metadata(moved_parent.join("tasks.md")).unwrap();
                     let moved_stage = fs::metadata(moved_parent.join(&stage_name)).unwrap();
                     assert_eq!((target.dev(), target.ino()), identity);
-                    assert_eq!((moved_stage.dev(), moved_stage.ino()), (stage.dev(), stage.ino()));
+                    assert_eq!(
+                        (moved_stage.dev(), moved_stage.ino()),
+                        (stage.dev(), stage.ino())
+                    );
                     assert_eq!(fs::read(moved_parent.join("tasks.md")).unwrap(), original);
                     moved.set(true);
                 }
@@ -4212,7 +4227,10 @@ mod tests {
                 )
                 .map(|_| ())
             };
-            assert!(moved.get(), "the final trusted refresh must move the retained parent");
+            assert!(
+                moved.get(),
+                "the final trusted refresh must move the retained parent"
+            );
             if f0 {
                 assert_eq!(refreshes.get(), 2);
             }
