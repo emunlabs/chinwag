@@ -535,6 +535,7 @@ impl PublishTaskV1 {
             transcript: self.transcript.clone(),
             transcript_digest: digest,
             signer_principal: signer.authenticated_signer_principal.clone(),
+            signer_public_key: self.signer_pubkey,
             key_epoch: signer.key_epoch,
             allowed_actions: signer.allowed_actions.clone(),
         })
@@ -627,6 +628,7 @@ pub struct AuthenticatedTaskMessage {
     transcript: TaskTranscriptV3,
     transcript_digest: Sha256Digest,
     signer_principal: String,
+    signer_public_key: EndpointId,
     key_epoch: u64,
     allowed_actions: Vec<TaskMessageKind>,
 }
@@ -642,6 +644,11 @@ impl AuthenticatedTaskMessage {
 
     pub fn transcript_digest(&self) -> Sha256Digest {
         self.transcript_digest
+    }
+
+    /// The enrolled K1 that actually verified this exact transcript.
+    pub fn signer_public_key(&self) -> EndpointId {
+        self.signer_public_key
     }
 }
 
@@ -1377,6 +1384,7 @@ mod tests {
             verified.authenticated().signer_principal(),
             "rust-principal"
         );
+        assert_eq!(verified.authenticated().signer_public_key(), frame.signer_pubkey);
         // Recompute the transported digest on every substitution: only the
         // original K1 signature must remain unable to authenticate these bytes.
         for field in 0..18 {

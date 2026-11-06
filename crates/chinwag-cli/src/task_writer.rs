@@ -1875,6 +1875,27 @@ impl WriterCommitProof {
     }
 }
 
+pub const FIXTURE_REVIEWED_PROPOSAL_PROFILE: &str = "FixtureReviewedProposalJSONV1";
+
+/// Canonical carrier validation grants neither fixture nor production authority.
+pub fn validate_fixture_reviewed_proposal_payload(bytes: &[u8]) -> bool {
+    if bytes.len() > 32_768 {
+        return false;
+    }
+    std::str::from_utf8(bytes).ok()
+        .and_then(|raw| crate::task_acceptance::parse_signed_acceptance_bundle(raw).ok())
+        .and_then(|bundle| serde_json::to_vec(&bundle).ok())
+        .is_some_and(|canonical| canonical == bytes)
+}
+
+pub fn fixture_reviewed_proposal_payload_profile() -> crate::task_wire::RatifiedPayloadProfile<'static> {
+    crate::task_wire::RatifiedPayloadProfile {
+        kind: crate::task_wire::TaskMessageKind::TaskProposal,
+        name: FIXTURE_REVIEWED_PROPOSAL_PROFILE,
+        validate_canonical_payload: validate_fixture_reviewed_proposal_payload,
+    }
+}
+
 pub struct WriterContextV1<'a> {
     pub root: &'a WorkspaceRootPin,
     pub lease: &'a WriterLeaseV1,
@@ -2636,6 +2657,45 @@ pub fn complete_prepared_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p0_fixture_carrier_requires_exact_canonical_bundle_and_bounds() {
+        let fixture = crate::task_acceptance::fixtures::Fixture::new(1, 2);
+        let bytes = serde_json::to_vec(&fixture.bundle).unwrap();
+        assert!(validate_fixture_reviewed_proposal_payload(&bytes));
+        let mut whitespace = bytes.clone();
+        whitespace.push(b' ');
+        assert!(!validate_fixture_reviewed_proposal_payload(&whitespace));
+        let pretty = serde_json::to_vec_pretty(&fixture.bundle).unwrap();
+        assert!(!validate_fixture_reviewed_proposal_payload(&pretty));
+        let text = String::from_utf8(bytes).unwrap();
+        let duplicate = text.replacen("{", "{\"candidate\":null,", 1);
+        assert!(!validate_fixture_reviewed_proposal_payload(duplicate.as_bytes()));
+        let unknown = text.replacen("{", "{\"unexpected\":true,", 1);
+        assert!(!validate_fixture_reviewed_proposal_payload(unknown.as_bytes()));
+        assert!(!validate_fixture_reviewed_proposal_payload(&vec![b' '; 32_769]));
+        assert!(!validate_fixture_reviewed_proposal_payload(&[0xff]));
+    }
+
+    #[test]
+    fn p0_fixture_carrier_profile_cannot_enable_other_message_kinds() {
+        use crate::task_wire::{TaskActionableBodyV1, TaskMessageKind};
+        let fixture = crate::task_acceptance::fixtures::Fixture::new(1, 2);
+        let bytes = serde_json::to_vec(&fixture.bundle).unwrap();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let body = serde_json::json!({
+            "payload_profile": FIXTURE_REVIEWED_PROPOSAL_PROFILE,
+            "canonical_payload_hex": hex,
+            "payload_digest_sha256": Sha256Digest::of(&bytes).to_string(),
+            "display_text": "COMPLETED is presentation only"
+        }).to_string();
+        let profiles = [fixture_reviewed_proposal_payload_profile()];
+        assert!(TaskActionableBodyV1::parse(&body, TaskMessageKind::TaskProposal, &profiles).is_ok());
+        for kind in [TaskMessageKind::CandidateResult, TaskMessageKind::Assignment, TaskMessageKind::TaskReceipt] {
+            assert!(TaskActionableBodyV1::parse(&body, kind, &profiles).is_err());
+        }
+        assert!(TaskActionableBodyV1::parse(&body, TaskMessageKind::TaskProposal, &[]).is_err());
+    }
     use crate::task_source::{SourceDispatchControls, SourceExecutionMode};
     use std::cell::Cell;
     use std::fs;
