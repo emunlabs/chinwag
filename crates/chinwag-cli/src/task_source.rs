@@ -561,6 +561,40 @@ impl WorkspaceSourceRegistry {
         Ok(&entry.record)
     }
 
+    /// Adopt the exact same-path replacement produced by the fenced writer.
+    /// Migration, enrollment state and source generation retain their bindings.
+    pub fn adopt_writer_commit(
+        &mut self,
+        proof: &crate::task_writer::WriterCommitProof,
+    ) -> Result<(), HeldReason> {
+        let index = self.index(proof.task_source_id())?;
+        let entry = &self.sources[index];
+        if entry.pending.is_some() {
+            return Err(HeldReason::InterruptedMigration);
+        }
+        entry.record.validate(&self.policy)?;
+        entry.record.state.check_new_admission()?;
+        let committed_identity = proof.verify_for_source_record(
+            &self.policy,
+            &entry.record,
+            entry.filesystem_identity,
+        )?;
+        let file =
+            resolve_enrolled_source_under_root(&self.root, &entry.record.canonical_relative_path)
+                .map_err(HeldReason::SourcePath)?;
+        if SourceFilesystemIdentity::from(&file) != committed_identity
+            || &file.sha256 != proof.committed_postimage_sha256()
+            || file.bytes.len() as u64 != proof.committed_postimage_bytes()
+        {
+            return Err(HeldReason::SourcePath(
+                SourcePathHoldReason::HeldSourceReplacedOrDrifted,
+            ));
+        }
+        self.check_alias(index, &file)?;
+        self.sources[index].filesystem_identity = Some(committed_identity);
+        Ok(())
+    }
+
     pub fn check_dispatch_admission(
         &self,
         source_id: &str,
@@ -1033,10 +1067,7 @@ mod tests {
                     record.validate(&policy()),
                     Err(HeldReason::UnsupportedVersion)
                 );
-                assert_eq!(
-                    registry.enroll(record),
-                    Err(HeldReason::UnsupportedVersion)
-                );
+                assert_eq!(registry.enroll(record), Err(HeldReason::UnsupportedVersion));
                 assert_eq!(registry.sources().count(), 0);
             }
         }

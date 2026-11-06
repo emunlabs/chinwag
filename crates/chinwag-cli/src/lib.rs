@@ -18,6 +18,10 @@ pub mod task_source;
 pub mod task_source_path;
 #[cfg(target_os = "macos")]
 pub mod task_wire;
+#[cfg(target_os = "macos")]
+pub mod task_write_journal;
+#[cfg(target_os = "macos")]
+pub mod task_writer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invocation {
