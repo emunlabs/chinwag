@@ -6,16 +6,14 @@
   <title>Chinwag v0.2.0 — Workbench v5 · Runners · CI → Versioned Workflow Policy &amp; UI-Gate (WP-01..WP-13)</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="workbench-v5.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Martian+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <style>
     /* =========================================================================
        NATIVE CHINWAG UI WORKBENCH SCREEN (Runners · CI -> Workflow Policy & UI-Gate)
        Pure Native HTML5/CSS3/ES2024 JS · 2 Themes (Midnight & Daylight) · INV-UI-BLEED: 0
        ========================================================================= */
     :root,
-    [data-theme="midnight"],
-    [data-theme="slate"] {
+    [data-theme="midnight"] {
       color-scheme: dark;
       --bg-window: #070A0F;
       --bg-sidebar: #0B1017;
@@ -42,8 +40,7 @@
       --accent-magenta-dim: rgba(255, 46, 147, 0.12);
     }
 
-    [data-theme="daylight"],
-    [data-theme="parchment"] {
+    [data-theme="daylight"] {
       color-scheme: light;
       --bg-window: #FAF9F6;
       --bg-sidebar: #F3F1EC;
@@ -53,13 +50,13 @@
       --bg-code: #0F172A;
       --fg-primary: #0F172A;
       --fg-secondary: #334155;
-      --fg-muted: #526277;
+      --fg-muted: #475569;
       --border-hairline: #D8D4CC;
       --border-subtle: #CBD5E1;
-      --border-strong: rgba(11, 122, 83, 0.42);
-      --accent-primary: #0B7A53;
+      --border-strong: rgba(6, 95, 70, 0.42);
+      --accent-primary: #065F46;
       --accent-primary-ink: #FFFFFF;
-      --accent-dim: rgba(11, 122, 83, 0.09);
+      --accent-dim: rgba(6, 95, 70, 0.09);
       --accent-blue: #1D4ED8;
       --accent-blue-dim: rgba(29, 78, 216, 0.09);
       --accent-amber: #B45309;
@@ -88,7 +85,7 @@
     }
 
     .mono, code, pre {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'Martian Mono', monospace;
       font-variant-numeric: tabular-nums;
     }
 
@@ -99,13 +96,14 @@
       background: var(--bg-window);
     }
 
-    /* Titlebar */
+    /* Titlebar (Strict 36px Desktop Chrome Contract) */
     .wb-topbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
-      padding: 8px 14px;
+      height: 36px;
+      padding: 0 12px;
       background: var(--bg-sidebar);
       border-bottom: 1px solid var(--border-hairline);
       flex-shrink: 0;
@@ -134,8 +132,8 @@
     .traffic-lights span:nth-child(3) { background: #27C93F; }
 
     .wb-crumb {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 12px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 11.5px;
       font-weight: 600;
       white-space: nowrap;
       overflow: hidden;
@@ -150,10 +148,10 @@
     }
 
     .wb-pill {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
       font-weight: 700;
-      padding: 3px 8px;
+      padding: 2px 7px;
       border-radius: 999px;
       background: var(--accent-dim);
       border: 1px solid var(--border-strong);
@@ -163,7 +161,7 @@
 
     .wb-theme-group {
       display: inline-flex;
-      gap: 3px;
+      gap: 2px;
       padding: 2px;
       border-radius: 6px;
       background: var(--bg-panel);
@@ -175,12 +173,12 @@
       border: none;
       background: transparent;
       color: var(--fg-secondary);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
       font-weight: 600;
-      padding: 3px 8px;
+      padding: 2px 7px;
       border-radius: 4px;
-      cursor: pointer;
+      cursor: default;
     }
 
     .wb-theme-btn[aria-pressed="true"] {
@@ -209,7 +207,7 @@
     }
 
     .rail-sec-title {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'Martian Mono', monospace;
       font-size: 10px;
       font-weight: 700;
       text-transform: uppercase;
@@ -236,7 +234,7 @@
       align-items: center;
       justify-content: space-between;
       gap: 6px;
-      cursor: pointer;
+      cursor: default;
       margin-bottom: 4px;
       text-decoration: none;
     }
@@ -252,7 +250,7 @@
       border-radius: 7px;
       background: var(--bg-surface);
       border: 1px solid var(--border-hairline);
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'Martian Mono', monospace;
       font-size: 11px;
       display: flex;
       flex-direction: column;
@@ -262,15 +260,15 @@
     .sim-hook-btn {
       appearance: none;
       width: 100%;
-      padding: 7px 9px;
+      padding: 6px 9px;
       border-radius: 6px;
       background: var(--bg-elevated);
       border: 1px solid var(--border-subtle);
       color: var(--fg-primary);
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
       font-weight: 700;
-      cursor: pointer;
+      cursor: default;
       text-align: left;
     }
 
@@ -305,7 +303,7 @@
     }
 
     .prov-kicker {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'Martian Mono', monospace;
       font-size: 10px;
       font-weight: 700;
       text-transform: uppercase;
@@ -314,8 +312,8 @@
     }
 
     .prov-val {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11.5px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 11px;
       font-weight: 600;
       color: var(--fg-primary);
       white-space: nowrap;
@@ -337,7 +335,7 @@
       background: var(--bg-surface);
       border: 1px solid var(--border-hairline);
       color: var(--fg-secondary);
-      cursor: pointer;
+      cursor: default;
     }
 
     .scen-btn[aria-selected="true"] {
@@ -348,15 +346,15 @@
 
     .scen-kicker {
       display: block;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 10px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 9.5px;
       font-weight: 700;
       color: var(--accent-primary);
     }
 
     .scen-title {
       display: block;
-      font-family: 'Space Grotesk', sans-serif;
+      font-family: 'Hanken Grotesk', sans-serif;
       font-size: 12px;
       font-weight: 700;
     }
@@ -364,8 +362,8 @@
     .status-strip {
       padding: 8px 12px;
       border-radius: 7px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11.5px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 11px;
       font-weight: 700;
       display: flex;
       flex-wrap: wrap;
@@ -415,13 +413,13 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 10px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 9.5px;
       font-weight: 700;
     }
 
     .pipe-title {
-      font-family: 'Space Grotesk', sans-serif;
+      font-family: 'Hanken Grotesk', sans-serif;
       font-size: 12px;
       font-weight: 700;
       white-space: nowrap;
@@ -430,8 +428,8 @@
     }
 
     .pipe-proof {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 10.5px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
       color: var(--fg-secondary);
       white-space: nowrap;
       overflow: hidden;
@@ -465,7 +463,7 @@
       gap: 8px;
       padding-bottom: 6px;
       border-bottom: 1px solid var(--border-hairline);
-      font-family: 'Space Grotesk', sans-serif;
+      font-family: 'Hanken Grotesk', sans-serif;
       font-size: 13px;
       font-weight: 700;
     }
@@ -476,8 +474,8 @@
       border: 1px solid var(--border-hairline);
       border-radius: 6px;
       padding: 9px 11px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
       line-height: 1.48;
       overflow-x: auto;
       white-space: pre;
@@ -502,8 +500,8 @@
       border-radius: 8px;
       padding: 10px;
       color: #F8FAFC;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 10.5px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
       display: flex;
       flex-direction: column;
       gap: 7px;
@@ -558,7 +556,8 @@
 
     @media (max-width: 640px) {
       .wb-topbar {
-        padding: 6px 10px;
+        height: 36px;
+        padding: 0 10px;
       }
       .wb-pill {
         display: none;
@@ -572,15 +571,17 @@
 <body>
   <div class="wb-app-window">
 
-    <!-- NATIVE TITLEBAR -->
+    <!-- NATIVE TITLEBAR (Strict 36px Height) -->
     <header class="wb-topbar" role="banner">
       <div class="wb-topbar-left">
         <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
-        <span class="wb-crumb">chinwag ui · Runners · CI → Workflow Policy &amp; UI-Gate (WP-01..WP-13)</span>
+        <span class="wb-crumb">chinwag ui · Runners · CI → Workflow Policy &amp; UI-Gate (Interactive Scenario Preview)</span>
       </div>
       <div class="wb-topbar-right">
-        <span class="wb-pill">🔓 Decrypted Locally · X25519MLKEM768 · 0B Cloud Plaintext</span>
-        <span class="wb-pill">INV-UI-BLEED: 0</span>
+        <button type="button" class="sim-hook-btn" id="sim-h1-top-btn" aria-pressed="false" style="width:auto;padding:2px 8px;">
+          [H1] Toggle Missing H1 Hook
+        </button>
+        <span class="wb-pill">Decrypted Locally · X25519MLKEM768 · 0B Cloud Plaintext</span>
         <div class="wb-theme-group" role="group" aria-label="Theme Switcher">
           <button type="button" class="wb-theme-btn" data-set-theme="midnight" aria-pressed="true">Midnight</button>
           <button type="button" class="wb-theme-btn" data-set-theme="daylight" aria-pressed="false">Daylight</button>
@@ -595,10 +596,10 @@
       <aside class="wb-left-rail" aria-label="Workbench Surfaces">
         <div>
           <div class="rail-sec-title"><span>Workbench Views</span><span>v5.3</span></div>
-          <a href="index.html" class="rail-nav-btn"><span>01 · Session &amp; Queue</span><span class="mono">⌘1</span></a>
-          <a href="03-workbench-mgmt-wiretap.html" class="rail-nav-btn"><span>03 · Fleet Wiretap</span><span class="mono">⌘3</span></a>
-          <a href="08-workbench-initiatives-finops.html" class="rail-nav-btn"><span>08 · Tasks &amp; FinOps</span><span class="mono">⌘8</span></a>
-          <a href="ci-cd.html" class="rail-nav-btn is-active"><span>14 · Runners · CI &amp; Policy</span><span class="mono" style="color:var(--accent-primary);">LIVE</span></a>
+          <a href="#session-queue" class="rail-nav-btn"><span>01 · Session &amp; Queue</span><span class="mono">⌘1</span></a>
+          <a href="#fleet-wiretap" class="rail-nav-btn"><span>03 · Fleet Wiretap</span><span class="mono">⌘3</span></a>
+          <a href="#tasks-finops" class="rail-nav-btn"><span>08 · Tasks &amp; FinOps</span><span class="mono">⌘8</span></a>
+          <a href="#runners-cicd" class="rail-nav-btn is-active"><span>14 · Runners · CI &amp; Policy</span><span class="mono" style="color:var(--accent-primary);">LIVE</span></a>
         </div>
 
         <div>
@@ -611,7 +612,7 @@
             <div style="color:var(--accent-primary);">✓ H5: 32B Relay Gate</div>
           </div>
           <button type="button" class="sim-hook-btn" id="sim-h1-btn" aria-pressed="false" style="margin-top:6px;">
-            🔍 Toggle Missing H1 Hook
+            [H1] Toggle Missing H1 Hook
           </button>
         </div>
 
@@ -651,25 +652,25 @@
         <div class="scenario-tabs" role="tablist" aria-label="Workflow Policy Scenarios">
           <button type="button" class="scen-btn" role="tab" aria-selected="true" data-scen="satisfied">
             <span class="scen-kicker">STATE 01 · NOMINAL</span>
-            <span class="scen-title">✓ Policy Satisfied (1.4s Fix)</span>
+            <span class="scen-title">✓ Policy Satisfied (1.4s Wakeup)</span>
           </button>
           <button type="button" class="scen-btn" role="tab" aria-selected="false" data-scen="stale">
             <span class="scen-kicker">STATE 02 · WP-04 GUARD</span>
-            <span class="scen-title">⚠️ Stale-Evidence Trap</span>
+            <span class="scen-title">[!] Stale-Evidence Trap</span>
           </button>
           <button type="button" class="scen-btn" role="tab" aria-selected="false" data-scen="floor">
             <span class="scen-kicker">STATE 03 · WP-05 / WP-08</span>
-            <span class="scen-title">🛡️ OrgPolicyFloorV1 Conflict</span>
+            <span class="scen-title">[§] OrgPolicyFloorV1 Conflict</span>
           </button>
           <button type="button" class="scen-btn" role="tab" aria-selected="false" data-scen="breaker">
             <span class="scen-kicker">STATE 04 · BILLING GUARD</span>
-            <span class="scen-title">🛑 2-Strike &amp; 0-Credit Sleep</span>
+            <span class="scen-title">[×] 2-Strike &amp; 0-Credit Sleep</span>
           </button>
         </div>
 
         <!-- Status Banner -->
         <div class="status-strip" id="wb-status-strip" data-tone="pass">
-          <span id="wb-status-left">✓ WORKFLOW POLICY SATISFIED (WP-01..WP-13 VERIFIED) · TASK ACCEPTANCE SEPARATE (WP-06)</span>
+          <span id="wb-status-left">✓ WORKFLOW POLICY SATISFIED (WP-01..WP-13 SCENARIO) · TASK ACCEPTANCE SEPARATE (WP-06)</span>
           <span id="wb-status-right">0.42 ms Blind Gate · 20 Shards → 1 Credit (0.640¢)</span>
         </div>
 
@@ -711,8 +712,8 @@
         <div class="center-split">
           <section class="stage-card">
             <div class="stage-card-head">
-              <span id="diag-title">32-Byte Blinded Commitments &amp; Run Diagnostics</span>
-              <span class="wb-pill">H1..H5 Verified</span>
+              <span id="diag-title">32-Byte Blinded Commitments &amp; Run Diagnostics (Scenario Preview)</span>
+              <span class="wb-pill" id="diag-pill">H1..H5 Scenario</span>
             </div>
             <p id="diag-desc" style="color:var(--fg-secondary);font-size:12px;">
               20 failing shards coalesced via <code>T_coalesce</code> into 1 credit (<code>0.640¢</code>). Checkpoint <code>80c1012d</code> matches independent <code>git ls-remote</code> receipt (<code>H1</code>), CI Run <code>#1842</code> (<code>H2</code>), cross-model review (<code>@TYPE#91a4</code>), and <code>UiGateReceiptV1</code> (<code>WP-13</code>).
@@ -766,19 +767,19 @@ privacy:
       <!-- RIGHT INSPECTOR RAIL: WP-13 FIDUCIAL UI-GATE & VISUAL TRIBUNAL -->
       <aside class="wb-right-rail" aria-label="WP-13 Fiducial UI-Gate Inspector">
         <div class="rail-sec-title">
-          <span>WP-13 · Fiducial UI-Gate Inspector</span>
+          <span>WP-13 · Fiducial UI-Gate (Scenario Preview)</span>
           <span class="mono" style="color:var(--accent-primary);">EMUN-CHWG-PAT-01</span>
         </div>
 
         <div class="round-switch-row">
-          <button type="button" class="sim-hook-btn" id="ug-r1-btn" aria-pressed="false">Round 1 · HTTP 412</button>
-          <button type="button" class="sim-hook-btn" id="ug-r2-btn" aria-pressed="true">Round 2 · 64ms Fix ✓</button>
+          <button type="button" class="sim-hook-btn" id="ug-r1-btn" aria-pressed="false">Scenario Round 1 · HTTP 412</button>
+          <button type="button" class="sim-hook-btn" id="ug-r2-btn" aria-pressed="true">Scenario Round 2 · 64ms Fix</button>
         </div>
 
         <div class="fiducial-canvas-mock" id="ug-canvas-box">
           <div style="display:flex;justify-content:space-between;color:#94A3B8;">
-            <span>I_fid Framebuffer · 1440×900 &amp; 390×844</span>
-            <span id="ug-round-tag" style="color:#38F2AF;">ROUND 2 · PASS</span>
+            <span>I_fid Framebuffer Preview · 1440×900 &amp; 390×844</span>
+            <span id="ug-round-tag" style="color:#38F2AF;">SCENARIO R2 · PASS</span>
           </div>
           <div class="fid-box-pass" id="ug-box-1">
             [✓ #1: 0,0,390,45] Mobile Topbar 1-Row (45px &lt;= 48px) · Bleed = 0.0px
@@ -792,27 +793,27 @@ privacy:
         </div>
 
         <div class="rail-card">
-          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-1 12-Tuple Predicates</span><span>G(e_i)</span></div>
+          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-1 12-Tuple Predicates (Target Spec)</span><span>G(e_i)</span></div>
           <div id="ug-p1">✓ INV-UI-BLEED: OOB = 0 (δ_safe = 4px)</div>
           <div id="ug-p2">✓ INV-UI-OVERLAP: 0.0 px² (Δy &lt;= 1.5px)</div>
           <div id="ug-p3">✓ INV-UI-CRUSH/ORPHAN: min ρ = 0.78</div>
           <div id="ug-p4">✓ INV-UI-SCROLL: ΔscrollTop = +240px</div>
-          <div id="ug-p5">✓ INV-UI-CONTRAST: min 7.4:1 (Midnight/Daylight)</div>
+          <div id="ug-p5">✓ INV-UI-CONTRAST: WCAG AA/AAA (Midnight/Daylight)</div>
         </div>
 
         <div class="rail-card">
-          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-2 Heterogeneous Quorum</span><span>Claim 8</span></div>
+          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-2 Heterogeneous Quorum (Target Spec)</span><span>Claim 8</span></div>
           <div>Builder: <strong>WORKHORSE</strong> (OpenAiGptCodex)</div>
           <div>Prosecutor 1: <strong>SPARK</strong> (GoogleGemini) ✓</div>
           <div>Prosecutor 2: <strong>FLINT</strong> (RecursiveFlint) ✓</div>
-          <div>Warm-CDP Re-Check: <strong>64 ms</strong> (&lt; 200 ms ✓)</div>
+          <div>Warm-CDP Re-Check Target: <strong>&lt; 200 ms</strong></div>
         </div>
 
         <div class="rail-card">
-          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-3 Signed Receipt</span><span>Claim 10</span></div>
+          <div class="rail-sec-title" style="margin-bottom:2px;"><span>Stage-3 Receipt Schema (Target Spec)</span><span>Claim 10</span></div>
           <div>Schema: <code>chinwag-ui-gate-receipt/v1</code></div>
-          <div>Commit Pin: <code>80c1012d</code> (✓ed25519)</div>
-          <div>Auto-Tombstones: <code>0 new</code> (Claim 19)</div>
+          <div>Commit Pin: <code>80c1012d</code> (Ed25519)</div>
+          <div>Live CLI Status: <code>pending WORKHORSE implementation</code></div>
         </div>
       </aside>
     </div>
@@ -848,7 +849,7 @@ privacy:
       var DATA = {
         satisfied: {
           tone: 'pass',
-          left: '✓ WORKFLOW POLICY SATISFIED (WP-01..WP-13 VERIFIED) · TASK ACCEPTANCE SEPARATE (WP-06)',
+          left: '✓ WORKFLOW POLICY SATISFIED (WP-01..WP-13 SCENARIO) · TASK ACCEPTANCE SEPARATE (WP-06)',
           right: '0.42 ms Blind Gate · 20 Shards → 1 Credit (0.640¢)',
           nodes: [
             ['pass', 'BOUND', 'Task ENG-412', '@RUST#7be266fc · 1.4s'],
@@ -869,7 +870,7 @@ privacy:
         },
         stale: {
           tone: 'amber',
-          left: '⚠️ HANDOFF BLOCKED BY WP-04 · STALE CI & REVIEW EVIDENCE (POST-CI 1-BYTE EDIT)',
+          left: '[!] HANDOFF BLOCKED BY WP-04 · STALE CI & REVIEW EVIDENCE (POST-CI 1-BYTE EDIT)',
           right: 'C_checkpoint (b04a11c8) != C_ci (80c1012d) · Rejected in 0.42 ms',
           nodes: [
             ['pass', 'BOUND', 'Task ENG-412', '@RUST#7be266fc'],
@@ -881,14 +882,14 @@ privacy:
           ],
           desc: 'Agent modified 1 line in <code>src/auth.rs</code> (checkpoint <code>b04a11c8</code>) after CI Run <code>#1842</code> passed on <code>80c1012d</code>. Blind Relay detected <code>C_checkpoint != C_ci_bundle</code> in 0.42 ms and blocked handoff.',
           code:
-'C_checkpoint (JJ @- b04a11c8) : blake3:f39a110b..77c012aa  [⚠️ NEW EDIT]\n' +
+'C_checkpoint (JJ @- b04a11c8) : blake3:f39a110b..77c012aa  [!] NEW EDIT\n' +
 'C_ci_bundle  (Run #1842)      : blake3:9f8a7c12..e4019b2c  [✕ STALE · 80c1012d]\n' +
 'C_reviewed   (@TYPE#91a4)     : blake3:9f8a7c12..e4019b2c  [✕ STALE · 80c1012d]\n' +
 'Verdict (WP-04 / H5)          : BLOCKED (Re-run CI & review on b04a11c8)'
         },
         floor: {
           tone: 'danger',
-          left: '🛑 POLICY ACTIVATION REJECTED (WP-05 / WP-08) · ORG SECURITY FLOOR VIOLATION',
+          left: '[×] POLICY ACTIVATION REJECTED (WP-05 / WP-08) · ORG SECURITY FLOOR VIOLATION',
           right: 'Candidate Branch YAML Inert · Active Policy Stays d4e891a',
           nodes: [
             ['pass', 'PROPOSAL', 'Task ENG-419', 'Branch YAML Edit'],
@@ -906,7 +907,7 @@ privacy:
         },
         breaker: {
           tone: 'amber',
-          left: '🛑 2-STRIKE LOOP BREAKER ARMED (PAUSED_FOR_HUMAN) · 😴 SLEEPING HOST = 0 CREDITS',
+          left: '[×] 2-STRIKE LOOP BREAKER ARMED (PAUSED_FOR_HUMAN) · SLEEPING HOST = 0 CREDITS',
           right: 'Total Spend Before Halt: 2 Credits ($0.0128) · Offline Debit: 0 Credits',
           nodes: [
             ['pass', 'ROUTED', 'Task ENG-425', '@RUST#7be266fc'],
@@ -931,19 +932,22 @@ privacy:
         var sLeft = document.getElementById('wb-status-left');
         var sRight = document.getElementById('wb-status-right');
         var h1Rail = document.getElementById('rail-h1-status');
+        var diagPill = document.getElementById('diag-pill');
 
         if (missingH1) {
           strip.setAttribute('data-tone', 'amber');
-          sLeft.textContent = '⚪ ENFORCEMENT: UNAVAILABLE (Hook H1 git ls-remote Verifier Not Installed)';
+          sLeft.textContent = '[H1 UNAVAILABLE] ENFORCEMENT: UNAVAILABLE (Hook H1 git ls-remote Verifier Not Installed)';
           sRight.textContent = '0 False Compliance Claims (Mini-PRD v0.1 § 7 & v0.2 § 9.1)';
-          h1Rail.textContent = '⚪ H1: UNAVAILABLE';
+          h1Rail.textContent = '[H1] UNAVAILABLE';
           h1Rail.style.color = 'var(--accent-amber)';
+          if (diagPill) diagPill.textContent = 'H1 UNAVAILABLE · NO COMPLIANCE CLAIM';
         } else {
           strip.setAttribute('data-tone', d.tone);
           sLeft.textContent = d.left;
           sRight.textContent = d.right;
           h1Rail.textContent = '✓ H1: git ls-remote';
           h1Rail.style.color = 'var(--accent-primary)';
+          if (diagPill) diagPill.textContent = 'H1..H5 Scenario';
         }
 
         for (var i = 0; i < 6; i++) {
@@ -954,6 +958,11 @@ privacy:
             document.getElementById('pn-3-b').textContent = 'UNAVAIL';
             document.getElementById('pn-3-t').textContent = 'H1 Missing';
             document.getElementById('pn-3-p').textContent = 'No Compliance Claim';
+          } else if (missingH1 && i === 5) {
+            card.setAttribute('data-node-tone', 'warn');
+            document.getElementById('pn-6-b').textContent = 'UNAVAIL';
+            document.getElementById('pn-6-t').textContent = 'Compliance Refused';
+            document.getElementById('pn-6-p').textContent = 'Requires H1 Receipt';
           } else {
             card.setAttribute('data-node-tone', n[0]);
             document.getElementById('pn-' + (i + 1) + '-b').textContent = n[1];
@@ -961,8 +970,20 @@ privacy:
             document.getElementById('pn-' + (i + 1) + '-p').textContent = n[3];
           }
         }
-        document.getElementById('diag-desc').innerHTML = d.desc;
-        document.getElementById('diag-code').textContent = d.code;
+
+        if (missingH1) {
+          document.getElementById('diag-desc').innerHTML =
+            'Historical CI evidence (<code>Run #1842 · 20/20 shards coalesced</code>) and local checkpoint <code>80c1012d</code> remain separately identifiable, but <strong>Hook H1 (<code>git ls-remote</code> verifier)</strong> is not installed in this repository. Dependent compliance is unavailable.';
+          document.getElementById('diag-code').textContent =
+            'C_checkpoint (JJ @- 80c1012d) : blake3:9f8a7c12..e4019b2c  [LOCAL CHECKPOINT RECORDED]\n' +
+            'C_remote_ls  (git ls-remote)  : UNAVAILABLE                [H1 NOT INSTALLED · NO RECEIPT]\n' +
+            'C_ci_bundle  (Run #1842 · 20x): blake3:9f8a7c12..e4019b2c  [HISTORICAL CI EVIDENCE · 1 cr]\n' +
+            'C_reviewed   (@TYPE#91a4)     : blake3:9f8a7c12..e4019b2c  [HISTORICAL REVIEW EVIDENCE]\n' +
+            'Dependent Workflow Compliance : UNAVAILABLE                [REFUSED · REQUIRES H1 RemoteReceiptV1]';
+        } else {
+          document.getElementById('diag-desc').innerHTML = d.desc;
+          document.getElementById('diag-code').textContent = d.code;
+        }
       }
 
       document.querySelectorAll('[data-scen]').forEach(function (btn) {
@@ -975,14 +996,19 @@ privacy:
         });
       });
 
-      var simBtn = document.getElementById('sim-h1-btn');
-      if (simBtn) {
-        simBtn.addEventListener('click', function () {
-          missingH1 = !missingH1;
-          simBtn.setAttribute('aria-pressed', missingH1 ? 'true' : 'false');
-          renderScen();
-        });
+      function toggleMissingH1() {
+        missingH1 = !missingH1;
+        var b1 = document.getElementById('sim-h1-btn');
+        var b2 = document.getElementById('sim-h1-top-btn');
+        if (b1) b1.setAttribute('aria-pressed', missingH1 ? 'true' : 'false');
+        if (b2) b2.setAttribute('aria-pressed', missingH1 ? 'true' : 'false');
+        renderScen();
       }
+
+      var simBtn = document.getElementById('sim-h1-btn');
+      var simTopBtn = document.getElementById('sim-h1-top-btn');
+      if (simBtn) simBtn.addEventListener('click', toggleMissingH1);
+      if (simTopBtn) simTopBtn.addEventListener('click', toggleMissingH1);
 
       /* Right Rail Round 1 vs Round 2 UI-Gate Switcher */
       var r1 = document.getElementById('ug-r1-btn');
@@ -991,7 +1017,7 @@ privacy:
         r1.addEventListener('click', function () {
           r1.setAttribute('aria-pressed', 'true');
           r2.setAttribute('aria-pressed', 'false');
-          document.getElementById('ug-round-tag').textContent = 'ROUND 1 · HTTP 412';
+          document.getElementById('ug-round-tag').textContent = 'SCENARIO R1 · HTTP 412';
           document.getElementById('ug-round-tag').style.color = '#FF3B30';
           var b1 = document.getElementById('ug-box-1');
           b1.className = 'fid-box-fail';
@@ -1006,7 +1032,7 @@ privacy:
         r2.addEventListener('click', function () {
           r2.setAttribute('aria-pressed', 'true');
           r1.setAttribute('aria-pressed', 'false');
-          document.getElementById('ug-round-tag').textContent = 'ROUND 2 · PASS (64ms)';
+          document.getElementById('ug-round-tag').textContent = 'SCENARIO R2 · PASS';
           document.getElementById('ug-round-tag').style.color = '#38F2AF';
           var b1 = document.getElementById('ug-box-1');
           b1.className = 'fid-box-pass';
