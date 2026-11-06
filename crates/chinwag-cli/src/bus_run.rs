@@ -1513,7 +1513,10 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             }
             "--to" | "-t" if i + 1 < args.len() => {
                 if to_arg.replace(args[i + 1].clone()).is_some() {
-                    let _ = writeln!(stderr, "chinwag bus: duplicate_recipient_flag; use one --to with a comma-separated recipient list");
+                    let _ = writeln!(
+                        stderr,
+                        "chinwag bus: duplicate_recipient_flag; use one --to with a comma-separated recipient list"
+                    );
                     return 2;
                 }
                 i += 2;
@@ -2128,26 +2131,54 @@ mod tests {
     fn consumer01_receipt_transcript_matches_existing_bus_signature_and_wire() {
         let secret = SecretKey::from_bytes(&[9; 32]);
         let mut msg = BusMessage {
-            id: "receipt:1".into(), seq: 1, ts_unix: 123, ts_iso: String::new(),
-            sender: "QA#ExactCase".into(), sender_cast: String::new(),
-            sender_endpoint_id: secret.public().to_string(), to: Some("WORKHORSE#owner".into()),
-            room: "#é".into(), task_id: Some("C1".into()), body: "🙂|receipt".into(),
-            digest_sha256: "ab".repeat(32), pubkey_ed25519: None,
-            signature_ed25519: None, sig_verified: false,
+            id: "receipt:1".into(),
+            seq: 1,
+            ts_unix: 123,
+            ts_iso: String::new(),
+            sender: "QA#ExactCase".into(),
+            sender_cast: String::new(),
+            sender_endpoint_id: secret.public().to_string(),
+            to: Some("WORKHORSE#owner".into()),
+            room: "#é".into(),
+            task_id: Some("C1".into()),
+            body: "🙂|receipt".into(),
+            digest_sha256: "ab".repeat(32),
+            pubkey_ed25519: None,
+            signature_ed25519: None,
+            sig_verified: false,
         };
         sign_bus_message(&mut msg, &secret);
         let view = chinwag_cli::bus_delivery::ProcessingEnvelope {
-            id: msg.id.clone(), timestamp: msg.ts_unix, sender: msg.sender.clone(),
-            recipient: msg.to.clone().unwrap(), room: msg.room.clone(), task: msg.task_id.clone(),
-            body: msg.body.clone(), signature: hex_to_64_bytes(msg.signature_ed25519.as_ref().unwrap()).unwrap(),
+            id: msg.id.clone(),
+            timestamp: msg.ts_unix,
+            sender: msg.sender.clone(),
+            recipient: msg.to.clone().unwrap(),
+            room: msg.room.clone(),
+            task: msg.task_id.clone(),
+            body: msg.body.clone(),
+            signature: hex_to_64_bytes(msg.signature_ed25519.as_ref().unwrap()).unwrap(),
         };
         assert_eq!(view.signing_payload(), canonical_signing_payload(&msg));
-        secret.public().verify(view.signing_payload().as_bytes(), &Signature::from_bytes(&view.signature)).unwrap();
+        secret
+            .public()
+            .verify(
+                view.signing_payload().as_bytes(),
+                &Signature::from_bytes(&view.signature),
+            )
+            .unwrap();
         let bytes = serde_json::to_vec(&msg).unwrap();
         let decoded: BusMessage = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(canonical_signing_payload(&decoded), view.signing_payload());
-        let ack = BusAck { ok: true, seq: 1, message_id: msg.id, daemon_endpoint_id: String::new(),
-            transport: "controlled".into(), room: msg.room, subscribers_notified: 1, sig_verified: true };
+        let ack = BusAck {
+            ok: true,
+            seq: 1,
+            message_id: msg.id,
+            daemon_endpoint_id: String::new(),
+            transport: "controlled".into(),
+            room: msg.room,
+            subscribers_notified: 1,
+            sig_verified: true,
+        };
         let ack_json = serde_json::to_value(ack).unwrap();
         assert_eq!(ack_json.as_object().unwrap().len(), 8);
         assert_eq!(ack_json["subscribers_notified"], 1);
@@ -2160,12 +2191,23 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = [
-            "send", "--repo", repo.path().to_str().unwrap(),
-            "--to", "GEMINI-PM#one", "-t", "DELIVERY#two",
-            "--message", "must not publish",
-        ].map(str::to_owned);
+            "send",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--to",
+            "GEMINI-PM#one",
+            "-t",
+            "DELIVERY#two",
+            "--message",
+            "must not publish",
+        ]
+        .map(str::to_owned);
         assert_eq!(run_bus_cli(&args, &mut out, &mut err), 2);
-        assert!(String::from_utf8(err).unwrap().contains("duplicate_recipient_flag"));
+        assert!(
+            String::from_utf8(err)
+                .unwrap()
+                .contains("duplicate_recipient_flag")
+        );
         assert!(out.is_empty());
         assert_eq!(fs::read_dir(repo.path()).unwrap().count(), 0);
     }
