@@ -1,0 +1,1251 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="midnight">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="chinwag-csrf-token" content="dev-loopback-csrf-9f8a7c12e4019b2c3d19b2104e91c080" />
+  <title>Chinwag v0.20.0 — Workbench v5 · Slack #ci-builds Zero-Knowledge Bridge &amp; 320ms Local Unseal (CHWG-SLACK-APP-PRD-01 v2.0)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Martian+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    /* =========================================================================
+       Emun Labs, Inc. (1401 Lavaca St STE 81335, Austin, TX 78701)
+       SPDX-License-Identifier: Apache-2.0
+       CHWG-SLACK-APP-PRD-01 v2.0 — Zero-Dioxus Native HTML5/CSS3/ES2024
+       3 Breakpoints: 1440x900 (3-Pane), 1024x768 (2-Pane + ⌘B Drawer), 390x844 (1-Col)
+       INV-SLACK-ZK-01: Zero file paths or source code in Slack Block Kit
+       ========================================================================= */
+    :root,
+    [data-theme="midnight"] {
+      color-scheme: dark;
+      --bg-window: #070A0F;
+      --bg-sidebar: #0B1017;
+      --bg-surface: #0E131B;
+      --bg-panel: #111823;
+      --bg-elevated: #161F2E;
+      --bg-receipt: #0C0E0D;
+      --bg-receipt-surface: #141716;
+      --bg-code: #05080D;
+
+      --fg-primary: #F8FAFC;
+      --fg-bone: #ECEBE4;
+      --fg-secondary: #A9B6C8;
+      --fg-muted: #8B9BB4;
+
+      --border-hairline: #1E293B;
+      --border-subtle: #26354D;
+      --border-receipt: #33382F;
+      --border-strong: rgba(56, 242, 175, 0.44);
+
+      --accent-primary: #38F2AF;
+      --accent-primary-ink: #04130D;
+      --accent-dim: rgba(56, 242, 175, 0.11);
+
+      --enum-amber-fg: #FFB000;
+      --enum-amber-fill: #FFB000;
+      --enum-amber-ink: #0C0E0D;
+      --enum-amber-dim: rgba(255, 176, 0, 0.13);
+
+      --accent-blue: #58A6FF;
+      --accent-blue-dim: rgba(88, 166, 255, 0.12);
+      --accent-danger: #FF3B30;
+      --accent-danger-dim: rgba(255, 59, 48, 0.14);
+    }
+
+    [data-theme="daylight"] {
+      color-scheme: light;
+      --bg-window: #FAF9F6;
+      --bg-sidebar: #F3F1EC;
+      --bg-surface: #FFFFFF;
+      --bg-panel: #F6F4EE;
+      --bg-elevated: #EFECE6;
+      --bg-receipt: #FBF9F4;
+      --bg-receipt-surface: #FBF9F4;
+      --bg-code: #F1EFEA;
+
+      --fg-primary: #0F172A;
+      --fg-bone: #16181B;
+      --fg-secondary: #334155;
+      --fg-muted: #475569;
+
+      --border-hairline: #D8D4CC;
+      --border-subtle: #CBD5E1;
+      --border-receipt: #D5CFC2;
+      --border-strong: rgba(15, 118, 110, 0.42);
+
+      --accent-primary: #0F766E;
+      --accent-primary-ink: #FFFFFF;
+      --accent-dim: rgba(15, 118, 110, 0.09);
+
+      --enum-amber-fg: #9A5B00;
+      --enum-amber-fill: #B45309;
+      --enum-amber-ink: #FFFFFF;
+      --enum-amber-dim: rgba(180, 83, 9, 0.11);
+
+      --accent-blue: #1D4ED8;
+      --accent-blue-dim: rgba(29, 78, 216, 0.09);
+      --accent-danger: #BE123C;
+      --accent-danger-dim: rgba(190, 18, 60, 0.10);
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: var(--bg-window);
+      color: var(--fg-primary);
+      font-family: 'Hanken Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 12.5px;
+      line-height: 1.4;
+      overflow-x: hidden;
+      cursor: default;
+    }
+
+    button, a, select, summary, [role="button"], [role="tab"] {
+      cursor: default;
+      font-family: inherit;
+    }
+
+    input[type="text"], textarea {
+      cursor: text;
+      font-family: inherit;
+    }
+
+    .mono, code, pre {
+      font-family: 'Martian Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-variant-numeric: tabular-nums slashed-zero;
+      font-feature-settings: "tnum" 1, "zero" 1;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation: none !important;
+        transition-duration: 0ms !important;
+      }
+    }
+
+    .wb-app-window {
+      width: 100%;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-window);
+      overflow: hidden;
+    }
+
+    /* 36px Native Topbar */
+    .wb-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      height: 36px;
+      min-height: 36px;
+      max-height: 36px;
+      padding: 0 10px;
+      background: var(--bg-sidebar);
+      border-bottom: 1px solid var(--border-hairline);
+      flex-shrink: 0;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .wb-topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+    }
+
+    .traffic-lights {
+      display: inline-flex;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+    .traffic-lights span { width: 10px; height: 10px; border-radius: 50%; }
+    .traffic-lights span:nth-child(1) { background: #FF5F56; }
+    .traffic-lights span:nth-child(2) { background: #FFBD2E; }
+    .traffic-lights span:nth-child(3) { background: #27C93F; }
+
+    .wb-crumb {
+      font-family: 'Martian Mono', monospace;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+
+    .wb-topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .top-ledger-btn {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      height: 24px;
+      padding: 0 7px;
+      border-radius: 4px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-subtle);
+      color: var(--fg-primary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums slashed-zero;
+      white-space: nowrap;
+    }
+    .top-ledger-btn.is-emerald {
+      background: var(--accent-dim);
+      border-color: var(--border-strong);
+      color: var(--accent-primary);
+    }
+
+    .wb-theme-group {
+      display: inline-flex;
+      gap: 2px;
+      padding: 2px;
+      border-radius: 5px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-hairline);
+    }
+    .wb-theme-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--fg-secondary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .wb-theme-btn[aria-pressed="true"] {
+      background: var(--accent-primary);
+      color: var(--accent-primary-ink);
+      font-weight: 700;
+    }
+
+    /* Mobile Touch Strip */
+    .mobile-state-strip {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      height: 36px;
+      min-height: 36px;
+      padding: 0 10px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-hairline);
+      overflow-x: auto;
+      scrollbar-width: none;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .mobile-state-strip::-webkit-scrollbar { display: none; }
+
+    /* 3-Column Body Grid */
+    .wb-body-grid {
+      flex: 1;
+      min-height: 0;
+      min-width: 0;
+      display: grid;
+      grid-template-columns: 248px minmax(540px, 1fr) 364px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Left Rail */
+    .wb-left-rail {
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-hairline);
+      padding: 8px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    .rail-sec-title {
+      font-family: 'Martian Mono', monospace;
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--fg-muted);
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .rail-list {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .rail-row-btn {
+      appearance: none;
+      width: 100%;
+      min-height: 27px;
+      padding: 4px 7px;
+      border-radius: 5px;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--fg-secondary);
+      font-size: 11.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      text-align: left;
+      text-decoration: none;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .rail-row-btn.is-active {
+      background: var(--accent-dim);
+      border-color: var(--border-strong);
+      color: var(--fg-primary);
+    }
+
+    .rail-badge {
+      font-family: 'Martian Mono', monospace;
+      font-size: 9.5px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-hairline);
+      color: var(--fg-secondary);
+      flex-shrink: 0;
+    }
+    .rail-badge.emerald {
+      background: var(--accent-dim);
+      border-color: var(--border-strong);
+      color: var(--accent-primary);
+    }
+    .rail-badge.amber {
+      background: var(--enum-amber-dim);
+      border-color: var(--enum-amber-fg);
+      color: var(--enum-amber-fg);
+    }
+
+    /* Center Stage (Scrollable · INV-UI-SCROLL >= +240px) */
+    .wb-center-stage {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 10px 12px 20px;
+      min-width: 0;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    /* 4-State Selector Strip */
+    .state-tabs-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .state-tab-btn {
+      appearance: none;
+      text-align: left;
+      padding: 7px 9px;
+      border-radius: 5px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      color: var(--fg-secondary);
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .state-tab-btn[aria-selected="true"] {
+      background: var(--accent-dim);
+      border-color: var(--accent-primary);
+      color: var(--fg-primary);
+    }
+    .state-kicker {
+      font-family: 'Martian Mono', monospace;
+      font-size: 9.5px;
+      font-weight: 700;
+      color: var(--accent-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .state-title {
+      font-size: 11.5px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* =========================================================================
+       SLACK #ci-builds BLOCK KIT VIEWPORT (.slack-block-kit-viewport)
+       Fixed 3-Block Vertical Skeleton + 4-Line Aligned Monospace Receipt Block
+       (Slack Emojis 🔴 😴 🟢 ⚠️ Permitted Strictly Inside This Container per HB-04)
+       ========================================================================= */
+    .slack-block-kit-viewport {
+      background: var(--bg-receipt);
+      border: 1px solid var(--border-receipt);
+      border-radius: 6px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      flex-shrink: 0;
+    }
+
+    .slack-channel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding-bottom: 7px;
+      border-bottom: 1px solid var(--border-hairline);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+      color: var(--fg-secondary);
+      flex-wrap: wrap;
+    }
+
+    .slack-msg-card {
+      border-left: 3px solid var(--enum-amber-fg);
+      padding-left: 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .slack-msg-card[data-slack-rank="40"] {
+      border-left-color: var(--accent-primary);
+    }
+
+    /* Block 1: Fixed-Height 2-Line Headline */
+    .slack-block-1-headline {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      font-size: 13px;
+      line-height: 1.42;
+      color: var(--fg-primary);
+    }
+
+    /* Block 2: Iconic 4-Line Aligned Monospace Receipt Block (SLK-01a) */
+    .slack-block-2-receipt {
+      background: var(--bg-code);
+      color: var(--fg-primary);
+      border: 1px solid var(--border-receipt);
+      border-radius: 4px;
+      padding: 8px 11px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      white-space: pre;
+      overflow-x: auto;
+      font-variant-numeric: tabular-nums slashed-zero;
+    }
+
+    /* Block 3: Zero-Knowledge Context + Action Buttons + Persistent Viral Footer */
+    .slack-block-3-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .slack-zk-note {
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      color: var(--fg-secondary);
+    }
+
+    .slack-btn-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .act-btn {
+      appearance: none;
+      height: 26px;
+      padding: 0 9px;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface);
+      color: var(--fg-primary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .act-btn.primary-emerald {
+      background: var(--accent-primary);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary-ink);
+    }
+    .act-btn.primary-amber {
+      background: var(--enum-amber-fill);
+      border-color: var(--enum-amber-fill);
+      color: var(--enum-amber-ink);
+    }
+
+    .slack-viral-footer {
+      padding-top: 6px;
+      border-top: 1px dashed var(--border-hairline);
+      font-family: 'Martian Mono', monospace;
+      font-size: 9.5px;
+      color: var(--fg-muted);
+      line-height: 1.45;
+    }
+
+    /* =========================================================================
+       ZERO-KNOWLEDGE FRAGMENT BOUNCE SIMULATOR (chinwag.sh/open#... · SLK-03)
+       ========================================================================= */
+    .stage-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      flex-shrink: 0;
+    }
+
+    .stage-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding-bottom: 5px;
+      border-bottom: 1px solid var(--border-hairline);
+      font-family: 'Martian Mono', monospace;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .code-pre {
+      background: var(--bg-code);
+      color: var(--fg-primary);
+      border: 1px solid var(--border-hairline);
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+      line-height: 1.46;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    /* =========================================================================
+       RIGHT INSPECTOR RAIL: 320ms 3-Step Local Unseal Handshake (EMUN-09)
+       ========================================================================= */
+    .wb-right-rail {
+      background: var(--bg-sidebar);
+      border-left: 1px solid var(--border-hairline);
+      padding: 9px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      min-width: 0;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    .handshake-step-box {
+      padding: 7px 8px;
+      border-radius: 4px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      transition: border-color 90ms ease, background 90ms ease;
+    }
+    .handshake-step-box.is-active-step {
+      border-color: var(--enum-amber-fg);
+      background: var(--enum-amber-dim);
+    }
+    .handshake-step-box.is-done-step {
+      border-color: var(--border-strong);
+      background: var(--accent-dim);
+    }
+
+    /* Responsive Breakpoints (1024x768 Tablet 2-Pane + Slide-Over, 390x844 Mobile 1-Col) */
+    @media (max-width: 1199px) and (min-width: 768px) {
+      .wb-body-grid {
+        grid-template-columns: 212px minmax(0, 1fr);
+      }
+      .wb-right-rail {
+        position: fixed;
+        top: 36px;
+        right: 0;
+        bottom: 0;
+        width: 364px;
+        z-index: 45;
+        transform: translateX(100%);
+        transition: transform 150ms cubic-bezier(0.22, 1, 0.36, 1);
+        box-shadow: -12px 0 32px rgba(0, 0, 0, 0.45);
+      }
+      body[data-inspector-open="true"] .wb-right-rail {
+        transform: translateX(0);
+      }
+      .hide-tablet { display: none !important; }
+    }
+
+    @media (max-width: 767px) {
+      .wb-topbar {
+        height: 40px;
+        min-height: 40px;
+        max-height: 40px;
+        padding: 0 8px;
+      }
+      .hide-mobile { display: none !important; }
+      .mobile-state-strip { display: flex; }
+      .wb-body-grid { grid-template-columns: minmax(0, 1fr); }
+      .wb-left-rail { display: none; }
+      .wb-right-rail {
+        position: fixed;
+        top: 40px;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        max-width: 390px;
+        z-index: 45;
+        transform: translateX(100%);
+        transition: transform 150ms ease;
+      }
+      body[data-inspector-open="true"] .wb-right-rail {
+        transform: translateX(0);
+      }
+      .state-tabs-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .slack-block-2-receipt {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+    }
+  </style>
+</head>
+<body data-inspector-open="false">
+  <div class="wb-app-window">
+
+    <!-- 1. NATIVE 36PX TOPBAR (Zero OS Emojis in Native Chrome · INV-NO-OS-EMOJI-CHROME-01) -->
+    <header class="wb-topbar" role="banner">
+      <div class="wb-topbar-left">
+        <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
+        <span class="wb-crumb">chinwag ui · Slack #ci-builds Zero-Knowledge Bridge (CHWG-SLACK-APP-PRD-01 v2.0)</span>
+      </div>
+
+      <div class="wb-topbar-right">
+        <span class="top-ledger-btn is-emerald hide-tablet hide-mobile">
+          INV-SLACK-ZK-01: 0 File Paths or Code in Slack · 750ms Rank Coalescer
+        </span>
+
+        <button type="button" class="top-ledger-btn hide-mobile" id="top-trigger-unseal-btn" title="Run 320ms 3-Step Local 127.0.0.1 Verify-Before-Decrypt Handshake">
+          <span>◆ Run 320ms Unseal</span>
+        </button>
+
+        <div class="wb-theme-group" role="group" aria-label="Theme Switcher">
+          <button type="button" class="wb-theme-btn" data-set-theme="midnight" aria-pressed="true">Midnight</button>
+          <button type="button" class="wb-theme-btn" data-set-theme="daylight" aria-pressed="false">Daylight</button>
+        </div>
+
+        <button type="button" class="top-ledger-btn" id="top-inspector-btn" aria-expanded="false" title="Toggle Local 127.0.0.1 Unseal Inspector (⌘B)">
+          <span>⌘B</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Mobile Touch-Scrollable State & Bounce Strip (<= 767px) -->
+    <nav class="mobile-state-strip" aria-label="Mobile Slack State Strip">
+      <button type="button" class="top-ledger-btn is-emerald" data-mob-state="woken">S1 · Woken 1.4s</button>
+      <button type="button" class="top-ledger-btn" data-mob-state="asleep">S2 · Asleep 0 Cr</button>
+      <button type="button" class="top-ledger-btn" data-mob-state="staged">S3 · Fix Staged 38s</button>
+      <button type="button" class="top-ledger-btn" data-mob-state="blocked">S4 · Blocked Gate</button>
+      <button type="button" class="top-ledger-btn" id="mob-unseal-btn">◆ 320ms Unseal</button>
+    </nav>
+
+    <!-- 2. 3-PANE WORKBENCH BODY GRID -->
+    <div class="wb-body-grid">
+
+      <!-- LEFT RAIL: Surfaces, 4-State Coalescer, Bounce Modes & /chinwag Commands -->
+      <aside class="wb-left-rail" aria-label="Slack Bridge Controls and States">
+        <div>
+          <div class="rail-sec-title"><span>Workbench Surfaces</span><span>v5.4</span></div>
+          <div class="rail-list">
+            <a href="bus-wiretap.html" class="rail-row-btn">
+              <span>■ 03 · Bus &amp; Wiretap</span>
+              <span class="rail-badge">SSE</span>
+            </a>
+            <a href="ci-cd.html" class="rail-row-btn">
+              <span>■ 14 · Runners · CI Policy</span>
+              <span class="rail-badge">WP-13</span>
+            </a>
+            <a href="slack-bridge.html" class="rail-row-btn is-active">
+              <span>◈ 15 · Slack #ci-builds</span>
+              <span class="rail-badge emerald">LIVE</span>
+            </a>
+          </div>
+        </div>
+
+        <div>
+          <div class="rail-sec-title"><span>Monotonic State Rank</span><span>750ms</span></div>
+          <div class="rail-list">
+            <button type="button" class="rail-row-btn is-active" data-rail-state="woken">
+              <span>State 1 · Woken in 1.4s</span>
+              <span class="rail-badge amber">Rank 10</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-rail-state="asleep">
+              <span>State 2 · Host Asleep</span>
+              <span class="rail-badge">Rank 20</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-rail-state="blocked">
+              <span>State 4 · Human Gate</span>
+              <span class="rail-badge amber">Rank 30</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-rail-state="staged">
+              <span>State 3 · Fix Staged 38s</span>
+              <span class="rail-badge emerald">Rank 40</span>
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <div class="rail-sec-title"><span>chinwag.sh/open Bounce</span><span>SLK-03</span></div>
+          <div class="rail-list">
+            <button type="button" class="rail-row-btn is-active" data-bounce-mode="desktop_awake">
+              <span>● Desktop · 127.0.0.1 Awake</span>
+              <span class="rail-badge emerald">200 OK</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-bounce-mode="desktop_stopped">
+              <span>■ Desktop · Daemon Stopped</span>
+              <span class="rail-badge amber">Wake URL</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-bounce-mode="mobile_zk">
+              <span>◆ Mobile · iOS/Android ZK</span>
+              <span class="rail-badge">0 Refused</span>
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <div class="rail-sec-title"><span>/chinwag Slash &amp; Digest</span><span>0 Cr</span></div>
+          <div class="rail-list">
+            <button type="button" class="rail-row-btn" data-slash-cmd="status">
+              <span class="mono">/chinwag status</span>
+              <span class="rail-badge">0 Cr</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-slash-cmd="wake">
+              <span class="mono">/chinwag wake @RUST</span>
+              <span class="rail-badge">Mutex</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-slash-cmd="invite">
+              <span class="mono">/chinwag invite</span>
+              <span class="rail-badge emerald">+75 ◈</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-slash-cmd="digest">
+              <span>Friday Velocity Digest</span>
+              <span class="rail-badge">Dual-Rail</span>
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- CENTER STAGE: 4-State Slack Block Kit Viewport + Bounce Simulator + Digest -->
+      <main class="wb-center-stage" id="slack-center-scroll" tabindex="0">
+
+        <!-- 4-State Selector Tabs -->
+        <div class="state-tabs-grid" role="tablist" aria-label="Slack chat.update Lifecycle States">
+          <button type="button" class="state-tab-btn" role="tab" aria-selected="true" data-state-tab="woken">
+            <span class="state-kicker">STATE 1 · RANK 10</span>
+            <span class="state-title">WOKEN_IN_1_4S (1.4s)</span>
+          </button>
+          <button type="button" class="state-tab-btn" role="tab" aria-selected="false" data-state-tab="asleep">
+            <span class="state-kicker">STATE 2 · RANK 20</span>
+            <span class="state-title">MACHINE_ASLEEP (0 Cr)</span>
+          </button>
+          <button type="button" class="state-tab-btn" role="tab" aria-selected="false" data-state-tab="staged">
+            <span class="state-kicker">STATE 3 · RANK 40</span>
+            <span class="state-title">PATCH_STAGED (38.4s)</span>
+          </button>
+          <button type="button" class="state-tab-btn" role="tab" aria-selected="false" data-state-tab="blocked">
+            <span class="state-kicker">STATE 4 · RANK 30</span>
+            <span class="state-title">HUMAN_BLOCKED (0 Cr)</span>
+          </button>
+        </div>
+
+        <!-- ================================================================
+             SLACK #ci-builds BLOCK KIT VIEWPORT (Fixed 3-Block Skeleton)
+             ================================================================ -->
+        <section class="slack-block-kit-viewport" aria-label="Simulated Slack #ci-builds Channel Viewport">
+          <div class="slack-channel-header">
+            <span>Slack · <strong>#ci-builds</strong> · In-Place <code>chat.update</code> keyed by <code>(org_id: emunlabs, T_coalesce: build_1842)</code></span>
+            <span class="rail-badge emerald" id="slack-rank-pill">Rank 10 · 0 Additional Credits</span>
+          </div>
+
+          <div class="slack-msg-card" id="slack-card-container" data-slack-rank="10">
+            <!-- Block 1: Headline -->
+            <div class="slack-block-1-headline">
+              <div id="slack-hl-1">
+                🔴 <strong><code>emunlabs/chinwag</code> · Build #1842 intercepted on <code>feat/ENG-412-auth-token</code> (<code>4e91c08</code>)</strong>
+              </div>
+              <div id="slack-hl-2">
+                ⚡ <strong>Don't get up</strong> — <code>@brian</code>'s agent (<code>■ RUST#7be266fc</code> · <code>GPT-6.1-SOL Ultra</code>) caught this in <code>1.4s</code> and is already patching it.
+              </div>
+            </div>
+
+            <!-- Block 2: Iconic 4-Line Aligned Monospace Receipt Block (Zero File Paths per INV-SLACK-ZK-01) -->
+            <pre class="slack-block-2-receipt" id="slack-receipt-block">receipt  │ rcpt_01J9F4K8…7Q · T_coalesce: 20 shards → 1 credit (0.640¢)
+actor    │ ■ RUST#7be266fc (GPT-6.1-SOL Ultra · Node 1 Mac Studio)
+commit   │ 4e91c08 · est. 18 dev mins saved · 0B code or paths in Slack
+status   │ OriginSigV1 + CloudRelayBlobSigV1 verified ✓ed25519</pre>
+
+            <!-- Block 3: Context, Primary Actions & Persistent Viral Footer -->
+            <div class="slack-block-3-actions">
+              <div class="slack-zk-note" id="slack-context-line">
+                Zero source code, logs, or file paths in Slack (<code>INV-SLACK-ZK-01</code>). Encrypted <code>.hpke</code> bundle unseals only on <code>127.0.0.1</code>.
+              </div>
+
+              <div class="slack-btn-row" id="slack-action-buttons">
+                <button type="button" class="act-btn primary-emerald" id="slack-primary-inspect-btn">
+                  <span>Inspect Local Receipt (127.0.0.1) →</span>
+                </button>
+                <button type="button" class="act-btn" id="slack-secondary-btn">
+                  <span>Steer ■ RUST#7be266fc…</span>
+                </button>
+                <button type="button" class="act-btn" id="slack-tertiary-btn">
+                  <span>Pause Worker</span>
+                </button>
+              </div>
+
+              <div class="slack-viral-footer">
+                20 failing shards → 1 credit (0.640¢) · 0B code/paths in Slack (X25519MLKEM768) · Free $0/seat local viewer · Give/Get +250 Org Credits (B2B OrgWallet rebate, $0 cash value / 0 W-9, INV-B2B-REBATE-01): chinwag.sh/r/@emunlabs
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ================================================================
+             ZERO-KNOWLEDGE FRAGMENT BOUNCE SIMULATOR (https://chinwag.sh/open#...)
+             ================================================================ -->
+        <section class="stage-card" aria-label="Zero-Knowledge Deep-Link Bounce Simulator">
+          <div class="stage-card-head">
+            <span>Zero-Knowledge URL Fragment Bounce Simulator (<code>SLK-03</code> · Zero Raw <code>127.0.0.1</code> Links in Slack)</span>
+            <span class="rail-badge emerald" id="bounce-mode-pill">Desktop · 127.0.0.1 Awake</span>
+          </div>
+          <div style="font-size:12px;color:var(--fg-secondary);" id="bounce-desc">
+            Because the <code>#fragment</code> is never transmitted in HTTP requests, <code>chinwag.sh/open</code> sees zero incident metadata. Static JS probes <code>http://127.0.0.1:44331/api/bus/ping</code> (<code>250ms</code> timeout) and redirects immediately to the local Wiretap UI.
+          </div>
+          <pre class="code-pre" id="bounce-code">Bounce URL : https://chinwag.sh/open?org=emunlabs#port=44331&amp;incident=T_coalesce_1842&amp;rcpt=9f8a3c1d
+Step 1     : Browser keeps #port=44331&amp;incident=T_coalesce_1842 strictly client-side (0B sent to chinwag.sh)
+Step 2     : GET http://127.0.0.1:44331/api/bus/ping (CORS allowlisted) -> 200 OK { ok: true, version: "0.20.0" }
+Step 3     : window.location.replace("http://127.0.0.1:44331/workbench-v5/bus-wiretap.html?incident=T_coalesce_1842")
+Allowlist  : INV-DEEPLINK-ALLOWLIST-01 validated against ^[A-Za-z0-9._#-]{1,64}$ (Anti-SSRF PASS)</pre>
+        </section>
+
+        <!-- ================================================================
+             WEEKLY SPRINT VELOCITY DIGEST & /chinwag COMMAND PREVIEW (SLK-05..08)
+             ================================================================ -->
+        <section class="stage-card" aria-label="Weekly Velocity Digest and Slash Command Preview">
+          <div class="stage-card-head">
+            <span id="digest-title">Weekly Sprint Engineering Velocity Digest in <code>#engineering</code> (<code>MV-02</code> Dual-Rail CTAs · 0 Credits)</span>
+            <div style="display:inline-flex;gap:5px;">
+              <button type="button" class="act-btn" id="sim-cas-doubleclick-btn" title="Simulate two teammates clicking [Wake Cloud Remote Agent] within 50ms">
+                <span>Sim Simultaneous Click CAS (SLK-04)</span>
+              </button>
+            </div>
+          </div>
+          <pre class="code-pre" id="digest-code">◈ 28 broken builds intercepted in 1.4s · 540 failing matrix shards coalesced into 28 credits ($0.18 total)
+◆ Est. 8.4 developer hours saved this week · 4 cross-model race conditions caught before PR
+■ OrgWallet: 6,975 paid_365d + 840 promo_90d = 7,815 credits remaining (WAVE1_RESERVED +25%)
+Actions: [Instant $50 Growth / Auto-Top-Up (Stripe)] · [Request $280 Scale / $1,000 Volume B2B ACH Invoice ($0 Fee)] · [Gift a Peer Org +250 Credits (Get +250 / +500)]</pre>
+        </section>
+
+        <!-- ================================================================
+             OUTBOUND ZERO-KNOWLEDGE SANITIZER & 10-STATE MONOTONIC LADDER (INV-SLACK-ZK-01 & SLK-01a)
+             ================================================================ -->
+        <section class="stage-card" aria-label="Outbound Zero-Knowledge Sanitizer and Monotonic Priority Ladder">
+          <div class="stage-card-head">
+            <span>Outbound Zero-Knowledge Sanitizer (<code>INV-SLACK-ZK-01</code>) &amp; 10-State Monotonic Priority Ladder (<code>SLK-01a</code>)</span>
+            <span class="rail-badge emerald">Aho-Corasick 0-Path Gate PASS</span>
+          </div>
+          <div style="font-size:12px;color:var(--fg-secondary);">
+            Every outbound <code>chat.postMessage</code> and <code>chat.update</code> payload is constructed strictly from typed enums and integers—never regex-redacted strings. The Durable Object enforces monotonic state transitions (<code>incoming.rank &gt;= current.rank</code>) so late-arriving CI shard webhooks never regress a resolved card.
+          </div>
+          <pre class="code-pre" id="zk-ladder-code">Rank 10 : CI_INTERCEPTED_AWAKE      │ Local daemon awake (&lt;=45s heartbeat) · 0 extra spawn credits
+Rank 20 : CI_QUEUED_SLEEPING        │ Local laptop asleep (&gt;45s) · Queued locally or 1-click Cloud Wake (1 Cr)
+Rank 30 : PATCH_IN_PROGRESS         │ Worker leased &amp; streaming signed H1..H5 checkpoints
+Rank 40 : CROSS_MODEL_REVIEW        │ Driver != Reviewer orthogonal pair audit (GPT-6.1-SOL x Gemini 4 Argon High)
+Rank 50 : BLOCKED_HUMAN_APPROVAL    │ Paused on ApprovalGrantV1 (CTL-04) or 2-Strike Circuit Breaker
+Rank 60 : STALE_HEARTBEAT_HANDOVER  │ Worker lease expired (&gt;90s) · 1-click handover or Cloud Wake
+Rank 70 : VERIFIED_UNSEALED_READY   │ H1..H5 + WP-13 Visual Gate passed · Ready for local 127.0.0.1 unseal
+Rank 80 : MERGED_TERMINAL           │ Terminal state · Out-of-order lower-rank webhooks dropped (HTTP 202)
+────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────
+Aho-Corasick Disjointness Proof     │ 0 matches against git ls-files index (0 file paths, 0 symbols, 0 diffs)
+Slack Block Kit Ceiling             │ 3 blocks max (&lt;&lt; 50-block cap) · 4-line aligned monospace receipt block</pre>
+        </section>
+
+      </main>
+
+      <!-- ==================================================================
+           RIGHT INSPECTOR RAIL: Interactive 320ms 3-Step Local Unseal Handshake
+           ================================================================== -->
+      <aside class="wb-right-rail" id="right-inspector-rail" aria-label="Local 127.0.0.1 Verify-Before-Decrypt Inspector">
+
+        <div class="rail-sec-title">
+          <span>320ms Local 127.0.0.1 Unseal Handshake</span>
+          <span class="mono" style="color:var(--accent-primary);" id="unseal-timer-badge">0.35ms compute</span>
+        </div>
+
+        <div class="handshake-step-box is-done-step" id="hs-step-1">
+          <div style="display:flex;justify-content:space-between;font-weight:700;">
+            <span>Step 1 (0..90ms) · Frame Arrival</span>
+            <span style="color:var(--accent-primary);">PASS</span>
+          </div>
+          <div style="color:var(--fg-secondary);">
+            <code>SignedHpkeBlobV1</code> (<code>1,408B</code> header <code>CHWGHPKE</code> v2 · <code>sha256:9f8a…c41e</code>) received on <code>127.0.0.1</code>.
+          </div>
+        </div>
+
+        <div class="handshake-step-box is-done-step" id="hs-step-2">
+          <div style="display:flex;justify-content:space-between;font-weight:700;">
+            <span>Step 2 (90..190ms) · Dual Ed25519 Verify</span>
+            <span style="color:var(--accent-primary);">0.11ms ✓</span>
+          </div>
+          <div style="color:var(--fg-secondary);">
+            <code>OriginSigV1</code> + <code>CloudRelayBlobSigV1</code> verified via <code>verify_strict</code> before touching ciphertext.
+          </div>
+        </div>
+
+        <div class="handshake-step-box is-done-step" id="hs-step-3">
+          <div style="display:flex;justify-content:space-between;font-weight:700;">
+            <span>Step 3 (190..320ms) · X25519MLKEM768 Unseal</span>
+            <span style="color:var(--accent-primary);">0.24ms ✓</span>
+          </div>
+          <div style="color:var(--fg-secondary);">
+            Decapsulated locally + <code>InnerOriginAttestationV1</code> verified + bounded <code>zstd</code> (<code>&lt;= 16 MiB</code>).
+          </div>
+        </div>
+
+        <div class="rail-sec-title">
+          <span>Locally Unsealed Diff (127.0.0.1 Only)</span>
+          <span class="mono" style="color:var(--accent-primary);">0B in Slack</span>
+        </div>
+
+        <pre class="code-pre" id="unsealed-diff-box">// Unsealed strictly on 127.0.0.1 (Never sent to Slack per INV-SLACK-ZK-01)
+// File: crates/chinwag-cli/src/ui_auth.rs (+2 / -1 lines)
+- if host.starts_with("127.0.0.1") {
++ if host == expected_loopback_host_and_port
++     &amp;&amp; sec_fetch_site == Some("same-origin") {
+      verify_double_submit_csrf(&amp;req)?;
+  }</pre>
+
+        <div class="rail-sec-title">
+          <span>Slack Authority Ceiling (INV-SLACK-FLOOR-01)</span>
+          <span class="mono">SLK-04</span>
+        </div>
+
+        <div class="handshake-step-box">
+          <div style="font-weight:700;color:var(--enum-amber-fg);">
+            trust_tier = RelayedSlackAdvisory
+          </div>
+          <div style="color:var(--fg-secondary);">
+            • Webhook: <code>X-Slack-Signature</code> (<code>v0=HMAC_SHA256</code>) + <code>600s</code> replay cache.<br/>
+            • Modal MAC: <code>BLAKE3_keyed(K_slack_modal, ...)</code>.<br/>
+            • Sandbox: Wrapped in <code>&lt;untrusted_slack_steering&gt;</code>.<br/>
+            • Ceiling: Slack clicks <strong>CANNOT</strong> mint <code>ExactActionGrant</code>, approve <code>WP-06</code> merge, or weaken <code>OrgPolicyFloorV1</code> (<code>WP-05/08</code>).
+          </div>
+        </div>
+
+      </aside>
+    </div>
+  </div>
+
+  <script src="live-bus-bridge.js"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      /* 1. Theme Switcher (Midnight | Daylight) */
+      var THEME_KEY = "chinwag_ui_theme_v2";
+      function applyTheme(raw) {
+        var t = raw && String(raw).toLowerCase() === "daylight" ? "daylight" : "midnight";
+        document.documentElement.setAttribute("data-theme", t);
+        try { localStorage.setItem(THEME_KEY, t); } catch (_) {}
+        document.querySelectorAll("[data-set-theme]").forEach(function (btn) {
+          btn.setAttribute("aria-pressed", btn.getAttribute("data-set-theme") === t ? "true" : "false");
+        });
+      }
+      var params = new URLSearchParams(window.location.search);
+      applyTheme(params.get("theme") || (function () { try { return localStorage.getItem(THEME_KEY); } catch (_) { return null; } })() || "midnight");
+      document.querySelectorAll("[data-set-theme]").forEach(function (btn) {
+        btn.addEventListener("click", function () { applyTheme(btn.getAttribute("data-set-theme")); });
+      });
+
+      /* 2. Slide-Over Inspector Toggle (⌘B) */
+      var topInspBtn = document.getElementById("top-inspector-btn");
+      function toggleInspector(forceState) {
+        var cur = document.body.getAttribute("data-inspector-open") === "true";
+        var next = typeof forceState === "boolean" ? forceState : !cur;
+        document.body.setAttribute("data-inspector-open", next ? "true" : "false");
+        if (topInspBtn) topInspBtn.setAttribute("aria-expanded", next ? "true" : "false");
+      }
+      if (topInspBtn) topInspBtn.addEventListener("click", function () { toggleInspector(); });
+
+      /* 3. 4-State Slack Block Kit Data (SLK-01 · Fixed 3-Block Skeleton + Zero File Paths) */
+      var SLACK_STATES = {
+        woken: {
+          rank: "10",
+          rankLabel: "Rank 10 · 0 Additional Credits",
+          hl1: '🔴 <strong><code>emunlabs/chinwag</code> · Build #1842 intercepted on <code>feat/ENG-412-auth-token</code> (<code>4e91c08</code>)</strong>',
+          hl2: '⚡ <strong>Don\'t get up</strong> — <code>@brian</code>\'s agent (<code>■ RUST#7be266fc</code> · <code>GPT-6.1-SOL Ultra</code>) caught this in <code>1.4s</code> and is already patching it.',
+          receipt:
+            "receipt  │ rcpt_01J9F4K8…7Q · T_coalesce: 20 shards → 1 credit (0.640¢)\n" +
+            "actor    │ ■ RUST#7be266fc (GPT-6.1-SOL Ultra · Node 1 Mac Studio)\n" +
+            "commit   │ 4e91c08 · est. 18 dev mins saved · 0B code or paths in Slack\n" +
+            "status   │ OriginSigV1 + CloudRelayBlobSigV1 verified ✓ed25519",
+          context: "Zero source code, logs, or file paths in Slack (INV-SLACK-ZK-01). Encrypted .hpke bundle unseals only on 127.0.0.1.",
+          btn1: "Inspect Local Receipt (127.0.0.1) →",
+          btn2: "Steer ■ RUST#7be266fc…",
+          btn3: "Pause Worker"
+        },
+        asleep: {
+          rank: "20",
+          rankLabel: "Rank 20 · RESERVE Hold (0 Credits Charged)",
+          hl1: '😴 <strong><code>emunlabs/chinwag</code> · Build #1842 queued for <code>@brian</code> on <code>feat/ENG-412-auth-token</code> (<code>4e91c08</code>)</strong>',
+          hl2: '<strong>MacBook Pro is asleep</strong> — <code>SignedHpkeBlobV1</code> is held durably at the Blind Relay for <strong><code>0 credits</code></strong> until wake.',
+          receipt:
+            "receipt  │ rcpt_01J9F4K8…7Q · 20 failing shards coalesced\n" +
+            "billing  │ RESERVE hold active · 0 credits debited until ✓ed25519 ACK\n" +
+            "envelope │ SignedHpkeBlobV1 (X25519MLKEM768 · 1,408B dual-signed header)\n" +
+            "status   │ OriginSigV1 + CloudRelayBlobSigV1 verified ✓ed25519",
+          context: "Durable Relay Outbox (seq_no ordered) holds steering notes while workstation is asleep (< 200ms Slack modal ack).",
+          btn1: "Wake Cloud Remote Agent Now (1 Credit · 0.640¢)",
+          btn2: "Route to Teammate's Agent ($0/Seat)",
+          btn3: "Queue Steering Note (#seq_42)"
+        },
+        staged: {
+          rank: "40",
+          rankLabel: "Rank 40 · Fix Staged & Orthogonal Reviewed",
+          hl1: '🟢 <strong><code>emunlabs/chinwag</code> · Build #1842 fixed &amp; cross-model reviewed in <code>38.4s</code> on <code>review/ENG-412-fix</code></strong>',
+          hl2: '<strong>Ready for local inspection</strong> — orthogonal review passed (<code>Driver != Reviewer</code>) and <code>H1 git ls-remote</code> is verified.',
+          receipt:
+            "receipt  │ rcpt_01J9F4K8…7Q · H1 git ls-remote oid: 9f8a3c1…c91e\n" +
+            "delta    │ 1 file changed (+2 / -1 lines) · SignedHpkeBlobV1 (0.35ms local)\n" +
+            "review   │ Driver: GPT-6.1-SOL Ultra × Reviewer: Gemini 4 Argon High ✓\n" +
+            "status   │ Signatures verified ✓ed25519 · 18 dev mins saved (1 credit)",
+          context: "Strict SlackCardMetaV1 schema: aggregate delta counts only (0 repository file paths in Slack). Unseal diff on 127.0.0.1.",
+          btn1: "Inspect Decrypted Diff (127.0.0.1) →",
+          btn2: "Open Draft Review PR",
+          btn3: "Enroll @company.com Seat ($0) · +75 Credits →"
+        },
+        blocked: {
+          rank: "30",
+          rankLabel: "Rank 30 · Halted at 2-Strike / WP-08 Gate",
+          hl1: '⚠️ <strong><code>emunlabs/chinwag</code> · Build #1842 paused for <code>@brian</code> on <code>feat/ENG-412-auth-token</code> (<code>4e91c08</code>)</strong>',
+          hl2: '<strong>Reason:</strong> <code>2-Strike Auto-Repair Breaker Armed</code> (or <code>WP-08 Protected Workflow Policy Floor Gate</code>). Further retries halted at <code>0 credits</code>.',
+          receipt:
+            "receipt  │ rcpt_01J9F4K8…7Q · Spend before halt: 2 credits ($0.0128)\n" +
+            "gate     │ ExactActionGrant / WP-08 requires local Touch ID Ed25519 signature\n" +
+            "ceiling  │ RelayedSlackAdvisory cannot weaken OrgPolicyFloorV1 (INV-SLACK-FLOOR-01)\n" +
+            "status   │ OriginSigV1 + CloudRelayBlobSigV1 verified ✓ed25519",
+          context: "High-privilege ratification steps up to 127.0.0.1 for hardware-backed Touch ID Ed25519 signing.",
+          btn1: "Sign ExactActionGrant on 127.0.0.1 →",
+          btn2: "Send Safe-Point Steer…",
+          btn3: "Kill & Tombstone on 127.0.0.1 →"
+        }
+      };
+
+      function applySlackState(key) {
+        var s = SLACK_STATES[key] || SLACK_STATES.woken;
+        document.getElementById("slack-card-container").setAttribute("data-slack-rank", s.rank);
+        document.getElementById("slack-rank-pill").textContent = s.rankLabel;
+        document.getElementById("slack-hl-1").innerHTML = s.hl1;
+        document.getElementById("slack-hl-2").innerHTML = s.hl2;
+        document.getElementById("slack-receipt-block").textContent = s.receipt;
+        document.getElementById("slack-context-line").textContent = s.context;
+        document.getElementById("slack-primary-inspect-btn").textContent = s.btn1;
+        document.getElementById("slack-secondary-btn").textContent = s.btn2;
+        document.getElementById("slack-tertiary-btn").textContent = s.btn3;
+
+        document.querySelectorAll("[data-state-tab]").forEach(function (b) {
+          b.setAttribute("aria-selected", b.getAttribute("data-state-tab") === key ? "true" : "false");
+        });
+        document.querySelectorAll("[data-rail-state]").forEach(function (b) {
+          b.classList.toggle("is-active", b.getAttribute("data-rail-state") === key);
+        });
+        document.querySelectorAll("[data-mob-state]").forEach(function (b) {
+          b.classList.toggle("is-emerald", b.getAttribute("data-mob-state") === key);
+        });
+      }
+
+      document.querySelectorAll("[data-state-tab], [data-rail-state], [data-mob-state]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var k = btn.getAttribute("data-state-tab") || btn.getAttribute("data-rail-state") || btn.getAttribute("data-mob-state");
+          applySlackState(k);
+        });
+      });
+
+      /* 4. Interactive 320ms 3-Step Local Unseal Handshake (EMUN-09) */
+      function run320msUnsealHandshake() {
+        toggleInspector(true);
+        var s1 = document.getElementById("hs-step-1");
+        var s2 = document.getElementById("hs-step-2");
+        var s3 = document.getElementById("hs-step-3");
+        var badge = document.getElementById("unseal-timer-badge");
+
+        [s1, s2, s3].forEach(function (el) {
+          el.classList.remove("is-done-step", "is-active-step");
+        });
+
+        // 0..90ms: Step 1 Arrival
+        s1.classList.add("is-active-step");
+        badge.textContent = "Step 1/3 (0..90ms)…";
+
+        setTimeout(function () {
+          s1.classList.remove("is-active-step");
+          s1.classList.add("is-done-step");
+          s2.classList.add("is-active-step");
+          badge.textContent = "Step 2/3 (90..190ms)…";
+        }, 90);
+
+        setTimeout(function () {
+          s2.classList.remove("is-active-step");
+          s2.classList.add("is-done-step");
+          s3.classList.add("is-active-step");
+          badge.textContent = "Step 3/3 (190..320ms)…";
+        }, 190);
+
+        setTimeout(function () {
+          s3.classList.remove("is-active-step");
+          s3.classList.add("is-done-step");
+          badge.textContent = "✓ Unsealed in 0.35ms (320ms UI register)";
+        }, 320);
+      }
+
+      document.querySelectorAll("#slack-primary-inspect-btn, #top-trigger-unseal-btn, #mob-unseal-btn").forEach(function (btn) {
+        btn.addEventListener("click", run320msUnsealHandshake);
+      });
+
+      /* 5. Zero-Knowledge Bounce Mode Switcher (chinwag.sh/open#... · SLK-03) */
+      var BOUNCE_MODES = {
+        desktop_awake: {
+          pill: "Desktop · 127.0.0.1 Awake",
+          desc: "Because the #fragment is never transmitted in HTTP requests, chinwag.sh/open sees zero incident metadata. Static JS probes http://127.0.0.1:44331/api/bus/ping (250ms timeout) and redirects immediately to the local Wiretap UI.",
+          code:
+            "Bounce URL : https://chinwag.sh/open?org=emunlabs#port=44331&incident=T_coalesce_1842&rcpt=9f8a3c1d\n" +
+            "Step 1     : Browser keeps #port=44331&incident=T_coalesce_1842 strictly client-side (0B sent to chinwag.sh)\n" +
+            "Step 2     : GET http://127.0.0.1:44331/api/bus/ping (CORS allowlisted) -> 200 OK { ok: true, version: \"0.20.0\" }\n" +
+            "Step 3     : window.location.replace(\"http://127.0.0.1:44331/workbench-v5/bus-wiretap.html?incident=T_coalesce_1842\")"
+        },
+        desktop_stopped: {
+          pill: "Desktop · Daemon Stopped -> LaunchAgent Wake",
+          desc: "When chinwag ui is stopped on desktop, the 250ms ping times out cleanly and invokes chinwag://open to wake the local io.emunlabs.chinwag.ui LaunchAgent (zero ERR_CONNECTION_REFUSED crash).",
+          code:
+            "Bounce URL : https://chinwag.sh/open?org=emunlabs#port=44331&incident=T_coalesce_1842\n" +
+            "Step 1     : GET http://127.0.0.1:44331/api/bus/ping -> timeout after 250ms\n" +
+            "Step 2     : Invokes macOS URL scheme chinwag://open?incident=T_coalesce_1842 (wakes LaunchAgent)\n" +
+            "Fallback   : 1-click copyable CLI command -> chinwag bus open T_coalesce_1842"
+        },
+        mobile_zk: {
+          pill: "Mobile (iOS / Android) · Zero-Knowledge Receipt Card",
+          desc: "On Slack iOS/Android, chinwag.sh/open detects mobile immediately without probing 127.0.0.1 and renders the signed Zero-Knowledge Receipt Card with 1-click Cloud Remote Agent wake.",
+          code:
+            "Mobile ZK Receipt Card (0 probes to phone's 127.0.0.1):\n" +
+            "  Commit   : 4e91c08 · 1 file changed (+2 / -1 lines)\n" +
+            "  Review   : Driver GPT-6.1-SOL Ultra × Reviewer Gemini 4 Argon High (✓ed25519)\n" +
+            "  Notice   : Encrypted SignedHpkeBlobV1 unseals strictly on your workstation.\n" +
+            "  Actions  : [Wake Cloud Remote Agent (1 Credit)] · [Queue Steering Note (#seq_42)]"
+        }
+      };
+
+      document.querySelectorAll("[data-bounce-mode]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var m = btn.getAttribute("data-bounce-mode");
+          var d = BOUNCE_MODES[m] || BOUNCE_MODES.desktop_awake;
+          document.querySelectorAll("[data-bounce-mode]").forEach(function (b) {
+            b.classList.toggle("is-active", b === btn);
+          });
+          document.getElementById("bounce-mode-pill").textContent = d.pill;
+          document.getElementById("bounce-desc").textContent = d.desc;
+          document.getElementById("bounce-code").textContent = d.code;
+        });
+      });
+
+      /* 6. /chinwag Slash Commands & Simultaneous CAS Click Simulator */
+      var SLASH_PREVS = {
+        status:
+          "/chinwag status (Ephemeral · 0 Credits):\n" +
+          "  Active Workers : 4 standing (■ RUST#7be266, ■ WORKHORSE#AaFG0N, ■ TYPE#34bd11, ■ ALISTAIR#81c490) + 3 CF Ephemeral\n" +
+          "  OrgWallet      : 6,975 paid_365d + 840 promo_90d = 7,815 ◈ (360 dev mins saved)\n" +
+          "  3-Node Roster  : 31 standing entries · 0 Anthropic seats · Grok 4.7 High confined to #s-and-m",
+        wake:
+          "/chinwag wake @RUST ENG-412 (Per-(Seat, TaskRef) Collision Check):\n" +
+          "  Guard B Intercept: ■ RUST#7be266fc09a411e8b30c4f8395d102a4 is already active on ENG-412.\n" +
+          "  Routed message as <untrusted_slack_steering> hint to #7be266…02a4 (0 duplicate workers spawned).",
+        invite:
+          "/chinwag invite (Loop A $0/Seat Teammate Join Card in #engineering):\n" +
+          "  Join @emunlabs on Chinwag ($0/seat local Glass-Box Wiretap viewer) -> Unlocks +75 Free Org Credits (175 -> 250 ◈).\n" +
+          "  Enforces INV-SLACK-ENROLLED-MEMBER-01 (rejects restricted Slack guests unless enrolled @emunlabs.com).",
+        digest:
+          "◈ 28 broken builds intercepted in 1.4s · 540 failing matrix shards coalesced into 28 credits ($0.18 total)\n" +
+          "◆ Est. 8.4 developer hours saved this week · 4 cross-model race conditions caught before PR\n" +
+          "■ OrgWallet: 6,975 paid_365d + 840 promo_90d = 7,815 credits remaining (WAVE1_RESERVED +25%)\n" +
+          "Actions: [Instant $50 Growth / Auto-Top-Up (Stripe)] · [Request $280 Scale / $1,000 Volume B2B ACH Invoice ($0 Fee)] · [Gift a Peer Org +250 Credits (Get +250 / +500)]"
+      };
+
+      document.querySelectorAll("[data-slash-cmd]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var c = btn.getAttribute("data-slash-cmd");
+          document.getElementById("digest-code").textContent = SLASH_PREVS[c] || SLASH_PREVS.digest;
+        });
+      });
+
+      document.getElementById("sim-cas-doubleclick-btn").addEventListener("click", function () {
+        document.getElementById("digest-code").textContent =
+          "Atomic CAS Deduplication in IncidentCoordinatorDO (SLK-04 / Cassandra SLK-06):\n" +
+          "  t = 0.00s (@brian clicks [Wake Cloud Remote Agent])  : CAS STATE_2_ASLEEP -> STATE_1_CLOUD_WOKEN (1 credit reserved)\n" +
+          "  t = 0.05s (@nicola clicks [Wake Cloud Remote Agent]) : CAS NO-OP -> Ephemeral Slack toast returned:\n" +
+          "  \"✓ Already woken by @brian 0.1s ago — 0 extra credits charged.\"";
+      });
+
+      document.addEventListener("keydown", function (ev) {
+        if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "b") {
+          ev.preventDefault();
+          toggleInspector();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,2683 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="midnight">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="chinwag-csrf-token" content="dev-loopback-csrf-9f8a7c12e4019b2c3d19b2104e91c080" />
+  <title>Chinwag v0.20.0 — Workbench v5 · Human Bus Composer &amp; Glass-Box Wiretap Console (CHWG-HUMAN-BUS-UI-PRD-01 v2.0)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Martian+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    /* =========================================================================
+       Emun Labs, Inc. (1401 Lavaca St STE 81335, Austin, TX 78701)
+       SPDX-License-Identifier: Apache-2.0
+       CHWG-HUMAN-BUS-UI-PRD-01 v2.0 — Zero-Dioxus Native HTML5/CSS3/ES2024
+       3 Breakpoints: 1440x900 (3-Pane), 1024x768 (2-Pane + ⌘B Drawer), 390x844 (1-Col)
+       Zero OS Color Emojis (INV-NO-OS-EMOJI-CHROME-01) · Tabular Numerics
+       ========================================================================= */
+    :root,
+    [data-theme="midnight"] {
+      color-scheme: dark;
+      --bg-window: #070A0F;
+      --bg-sidebar: #0B1017;
+      --bg-surface: #0E131B;
+      --bg-panel: #111823;
+      --bg-elevated: #161F2E;
+      --bg-receipt: #0C0E0D;
+      --bg-receipt-surface: #141716;
+      --bg-code: #05080D;
+
+      --fg-primary: #F8FAFC;
+      --fg-bone: #ECEBE4;
+      --fg-secondary: #A9B6C8;
+      --fg-muted: #8B9BB4;
+      --receipt-dt-muted: #99A3B3;
+
+      --border-hairline: #1E293B;
+      --border-subtle: #26354D;
+      --border-receipt: #33382F;
+      --border-receipt-dash: #262A27;
+      --border-strong: rgba(56, 242, 175, 0.44);
+
+      --accent-primary: #38F2AF;
+      --accent-primary-ink: #04130D;
+      --accent-dim: rgba(56, 242, 175, 0.11);
+      --receipt-emerald: #38F2AF;
+
+      --enum-amber-fg: #FFB000;
+      --enum-amber-fill: #FFB000;
+      --enum-amber-ink: #0C0E0D;
+      --enum-amber-dim: rgba(255, 176, 0, 0.13);
+
+      --accent-blue: #58A6FF;
+      --accent-blue-dim: rgba(88, 166, 255, 0.12);
+      --accent-danger: #FF3B30;
+      --accent-danger-dim: rgba(255, 59, 48, 0.14);
+      --accent-magenta: #FF2E93;
+    }
+
+    [data-theme="daylight"] {
+      color-scheme: light;
+      --bg-window: #FAF9F6;
+      --bg-sidebar: #F3F1EC;
+      --bg-surface: #FFFFFF;
+      --bg-panel: #F6F4EE;
+      --bg-elevated: #EFECE6;
+      --bg-receipt: #FBF9F4;
+      --bg-receipt-surface: #FBF9F4;
+      --bg-code: #F1EFEA;
+
+      --fg-primary: #0F172A;
+      --fg-bone: #16181B;
+      --fg-secondary: #334155;
+      --fg-muted: #475569;
+      --receipt-dt-muted: #57544E;
+
+      --border-hairline: #D8D4CC;
+      --border-subtle: #CBD5E1;
+      --border-receipt: #D5CFC2;
+      --border-receipt-dash: #DCD7CB;
+      --border-strong: rgba(15, 118, 110, 0.42);
+
+      --accent-primary: #0F766E;
+      --accent-primary-ink: #FFFFFF;
+      --accent-dim: rgba(15, 118, 110, 0.09);
+      --receipt-emerald: #0F766E;
+
+      --enum-amber-fg: #9A5B00;
+      --enum-amber-fill: #B45309;
+      --enum-amber-ink: #FFFFFF;
+      --enum-amber-dim: rgba(180, 83, 9, 0.11);
+
+      --accent-blue: #1D4ED8;
+      --accent-blue-dim: rgba(29, 78, 216, 0.09);
+      --accent-danger: #BE123C;
+      --accent-danger-dim: rgba(190, 18, 60, 0.10);
+      --accent-magenta: #BE185D;
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: var(--bg-window);
+      color: var(--fg-primary);
+      font-family: 'Hanken Grotesk', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 12.5px;
+      line-height: 1.4;
+      overflow-x: hidden;
+      cursor: default;
+    }
+
+    button, a, select, summary, [role="button"], [role="tab"], [role="radio"], [role="treeitem"] {
+      cursor: default;
+      font-family: inherit;
+    }
+
+    input[type="text"], input[type="search"], input[type="email"], textarea {
+      cursor: text;
+      font-family: inherit;
+    }
+
+    .mono, code, pre, .tnum {
+      font-family: 'Martian Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-variant-numeric: tabular-nums slashed-zero;
+      font-feature-settings: "tnum" 1, "zero" 1;
+    }
+
+    .svg-ic {
+      width: 13px;
+      height: 13px;
+      stroke: currentColor;
+      stroke-width: 1.5;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex-shrink: 0;
+    }
+
+    /* Blinking Emun Labs Direction 1 "Enum" Cursor (the record being written) */
+    @keyframes emunBlink {
+      50% { opacity: 0; }
+    }
+    @keyframes doubleBeatAmber {
+      0%, 100% { box-shadow: 0 0 0 0 transparent; }
+      6% { box-shadow: 0 0 0 2px var(--enum-amber-fg); }
+      12% { box-shadow: 0 0 0 0 transparent; }
+      18% { box-shadow: 0 0 0 2px var(--enum-amber-fg); }
+      26% { box-shadow: 0 0 0 0 transparent; }
+    }
+    @keyframes steerSweep {
+      0% { background: rgba(56, 242, 175, 0.28); }
+      100% { background: transparent; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation: none !important;
+        transition-duration: 0ms !important;
+      }
+    }
+
+    .emun-cur-rect {
+      animation: emunBlink 1.1s steps(1) infinite;
+    }
+
+    .wb-app-window {
+      width: 100%;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-window);
+      overflow: hidden;
+    }
+
+    /* =========================================================================
+       1. TOPBAR (Strict 36px Desktop Height Contract · Zero Overlap)
+       ========================================================================= */
+    .wb-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      height: 36px;
+      min-height: 36px;
+      max-height: 36px;
+      padding: 0 10px;
+      background: var(--bg-sidebar);
+      border-bottom: 1px solid var(--border-hairline);
+      flex-shrink: 0;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .wb-topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+    }
+
+    .traffic-lights {
+      display: inline-flex;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+    .traffic-lights span {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+    .traffic-lights span:nth-child(1) { background: #FF5F56; }
+    .traffic-lights span:nth-child(2) { background: #FFBD2E; }
+    .traffic-lights span:nth-child(3) { background: #27C93F; }
+
+    .wb-crumb {
+      font-family: 'Martian Mono', monospace;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--fg-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+
+    .wb-topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .top-ledger-btn {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      height: 24px;
+      padding: 0 7px;
+      border-radius: 4px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-subtle);
+      color: var(--fg-primary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums slashed-zero;
+      white-space: nowrap;
+    }
+    .top-ledger-btn:hover {
+      border-color: var(--accent-primary);
+    }
+    .top-ledger-btn.is-emerald {
+      background: var(--accent-dim);
+      border-color: var(--border-strong);
+      color: var(--accent-primary);
+    }
+    .top-ledger-btn.is-amber {
+      background: var(--enum-amber-dim);
+      border-color: var(--enum-amber-fg);
+      color: var(--enum-amber-fg);
+    }
+
+    .wb-theme-group {
+      display: inline-flex;
+      gap: 2px;
+      padding: 2px;
+      border-radius: 5px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-hairline);
+    }
+    .wb-theme-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--fg-secondary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .wb-theme-btn[aria-pressed="true"] {
+      background: var(--accent-primary);
+      color: var(--accent-primary-ink);
+      font-weight: 700;
+    }
+
+    /* Mobile Touch-Scrollable Room & Node Strip (Hidden on Desktop/Tablet) */
+    .mobile-room-strip {
+      display: none;
+      align-items: center;
+      gap: 6px;
+      height: 36px;
+      min-height: 36px;
+      padding: 0 10px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-hairline);
+      overflow-x: auto;
+      scrollbar-width: none;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .mobile-room-strip::-webkit-scrollbar { display: none; }
+
+    /* =========================================================================
+       2. 3-PANE WORKBENCH GRID (1440x900: 248px minmax(540px,1fr) 364px)
+       ========================================================================= */
+    .wb-body-grid {
+      flex: 1;
+      min-height: 0;
+      min-width: 0;
+      display: grid;
+      grid-template-columns: 248px minmax(540px, 1fr) 364px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* =========================================================================
+       3. LEFT RAIL (248px · Attention-First 3-Tier Roster · INV-ROSTER-TRIAGE-01)
+       ========================================================================= */
+    .wb-left-rail {
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border-hairline);
+      padding: 8px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      min-width: 0;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    .rail-sec-title {
+      font-family: 'Martian Mono', monospace;
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--fg-muted);
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+    }
+
+    .rail-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .rail-row-btn {
+      appearance: none;
+      width: 100%;
+      min-height: 26px;
+      padding: 4px 7px;
+      border-radius: 5px;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--fg-secondary);
+      font-size: 11.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      text-align: left;
+      text-decoration: none;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .rail-row-btn:hover {
+      background: var(--bg-surface);
+      color: var(--fg-primary);
+    }
+    .rail-row-btn.is-active {
+      background: var(--accent-dim);
+      border-color: var(--border-strong);
+      color: var(--fg-primary);
+    }
+    .rail-row-btn.is-blocked {
+      background: var(--enum-amber-dim);
+      border-color: var(--enum-amber-fg);
+      color: var(--fg-primary);
+      animation: doubleBeatAmber 2s infinite;
+    }
+
+    .rail-row-left {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .sigil-seat { color: var(--accent-primary); font-family: 'Martian Mono', monospace; font-weight: 700; }
+    .sigil-wake { color: var(--enum-amber-fg); font-family: 'Martian Mono', monospace; font-weight: 700; }
+    .sigil-human { color: var(--fg-primary); font-family: 'Martian Mono', monospace; font-weight: 700; }
+    .sigil-grant { color: var(--enum-amber-fg); font-family: 'Martian Mono', monospace; font-weight: 700; }
+
+    .instance-suffix {
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 400;
+      color: var(--fg-muted);
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .rail-badge {
+      font-family: 'Martian Mono', monospace;
+      font-size: 9.5px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border-hairline);
+      color: var(--fg-secondary);
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums slashed-zero;
+    }
+    .rail-badge.amber {
+      background: var(--enum-amber-dim);
+      border-color: var(--enum-amber-fg);
+      color: var(--enum-amber-fg);
+    }
+    .rail-badge.emerald {
+      background: var(--accent-dim);
+      border-color: var(--border-strong);
+      color: var(--accent-primary);
+    }
+
+    .node-group-box {
+      border: 1px solid var(--border-hairline);
+      border-radius: 5px;
+      background: var(--bg-surface);
+      padding: 5px 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      margin-bottom: 4px;
+    }
+
+    .node-group-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--fg-primary);
+    }
+
+    .idle-drawer-details summary {
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      color: var(--fg-muted);
+      padding: 3px 4px;
+      list-style: none;
+      border-radius: 4px;
+    }
+    .idle-drawer-details summary::-webkit-details-marker { display: none; }
+    .idle-drawer-details summary:hover {
+      background: var(--bg-panel);
+      color: var(--fg-primary);
+    }
+
+    /* =========================================================================
+       4. CENTER STAGE (Sub-Header + Pinned Action Tray + Wiretap Log + Composer)
+       ========================================================================= */
+    .wb-center-stage {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      background: var(--bg-window);
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* 36px Lens Sub-Header */
+    .center-subheader {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      height: 36px;
+      min-height: 36px;
+      padding: 0 12px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-hairline);
+      flex-shrink: 0;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .lens-tabs {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      background: var(--bg-panel);
+      padding: 2px;
+      border-radius: 5px;
+      border: 1px solid var(--border-hairline);
+      min-width: 0;
+    }
+
+    .lens-tab-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--fg-secondary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 3px 7px;
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+    .lens-tab-btn[aria-selected="true"] {
+      background: var(--accent-primary);
+      color: var(--accent-primary-ink);
+      font-weight: 700;
+    }
+
+    /* Missing H1 Hook Warning Banner (Derived Consistently) */
+    .h1-missing-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 12px;
+      background: var(--enum-amber-dim);
+      border-bottom: 1px solid var(--enum-amber-fg);
+      color: var(--enum-amber-fg);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    body[data-missing-h1="true"] .h1-missing-banner {
+      display: flex;
+    }
+
+    /* Sticky Pinned Action Tray (max-height: 112px · HB-03) */
+    .pinned-action-tray {
+      max-height: 112px;
+      padding: 7px 12px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--enum-amber-fg);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .pinned-action-tray.is-resolved {
+      border-bottom-color: var(--border-strong);
+      background: var(--accent-dim);
+    }
+
+    .tray-left {
+      min-width: 0;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .tray-headline {
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--enum-amber-fg);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .pinned-action-tray.is-resolved .tray-headline {
+      color: var(--accent-primary);
+    }
+    .tray-sub {
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      color: var(--fg-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tray-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+
+    .act-btn {
+      appearance: none;
+      height: 25px;
+      padding: 0 8px;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface);
+      color: var(--fg-primary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .act-btn.primary-emerald {
+      background: var(--accent-primary);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary-ink);
+    }
+    .act-btn.primary-amber {
+      background: var(--enum-amber-fill);
+      border-color: var(--enum-amber-fill);
+      color: var(--enum-amber-ink);
+    }
+    .act-btn.danger {
+      background: var(--accent-danger-dim);
+      border-color: var(--accent-danger);
+      color: var(--accent-danger);
+    }
+
+    /* Scrollable Wiretap Log (INV-UI-SCROLL >= +240px) */
+    .wiretap-stream-log {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 10px 12px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+
+    /* Square-Shouldered Emun Labs "Enum" Contribution Receipt Card (2px radius) */
+    .wiretap-card {
+      background: var(--bg-receipt);
+      border: 1px solid var(--border-receipt);
+      border-left: 3px solid var(--receipt-emerald);
+      border-radius: 2px;
+      padding: 9px 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 0;
+      flex-shrink: 0;
+    }
+    .wiretap-card[data-card-state="working"] {
+      border-left-color: var(--enum-amber-fg);
+    }
+    .wiretap-card[data-card-state="review"] {
+      border-left-color: var(--enum-amber-fg);
+      animation: doubleBeatAmber 2s infinite;
+    }
+    .wiretap-card[data-card-state="quarantined"] {
+      border-left-color: var(--accent-danger);
+      background: var(--accent-danger-dim);
+    }
+    .wiretap-card.is-focused {
+      outline: 1px solid var(--accent-primary);
+    }
+    .wiretap-card.just-steered {
+      animation: steerSweep 400ms ease-out 1;
+    }
+
+    .wt-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+    }
+    .wt-head-left {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+    .wt-head-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .wt-summary {
+      font-size: 12.5px;
+      color: var(--fg-bone);
+      line-height: 1.42;
+      overflow-wrap: anywhere;
+    }
+
+    .arc-coalesce-bar {
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      color: var(--fg-secondary);
+      background: var(--bg-receipt-surface);
+      border: 1px dashed var(--border-receipt-dash);
+      padding: 4px 8px;
+      border-radius: 2px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    /* Canonical 7-Row Dashed <dl class="emun-receipt-dl"> */
+    .emun-receipt-figure {
+      border: 1px solid var(--border-receipt);
+      background: var(--bg-receipt-surface);
+      padding: 7px 10px;
+      border-radius: 2px;
+    }
+
+    .emun-receipt-dl {
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+      line-height: 1.42;
+      font-variant-numeric: tabular-nums slashed-zero;
+    }
+    .emun-receipt-dl > div {
+      display: grid;
+      grid-template-columns: 6.7em minmax(0, 1fr);
+      gap: 8px;
+      padding: 3.5px 0;
+      border-bottom: 1px dashed var(--border-receipt-dash);
+    }
+    .emun-receipt-dl > div:last-child {
+      border-bottom: none;
+    }
+    .emun-receipt-dl dt {
+      color: var(--receipt-dt-muted);
+      font-weight: 500;
+    }
+    .emun-receipt-dl dd {
+      color: var(--fg-bone);
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .emun-receipt-dl dd b {
+      color: var(--receipt-emerald);
+    }
+
+    .wt-card-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      flex-wrap: wrap;
+      padding-top: 2px;
+    }
+
+    /* Scroll-Freeze Guard Pill (INV-STREAM-MOTION-01) */
+    .scroll-freeze-pill {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 0 12px 6px;
+      padding: 5px 10px;
+      border-radius: 4px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--enum-amber-fg);
+      color: var(--fg-primary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+    .scroll-freeze-pill.is-visible {
+      display: flex;
+    }
+
+    /* =========================================================================
+       5. FOOLPROOF 2-MODE HUMAN BUS COMPOSER (HB-05 · INV-THREAD-ID-01)
+       ========================================================================= */
+    .human-composer-dock {
+      background: var(--bg-surface);
+      border-top: 2px solid var(--accent-primary);
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex-shrink: 0;
+      min-height: 92px;
+      max-height: 224px;
+    }
+    .human-composer-dock[data-composer-mode="wake"] {
+      border-top-color: var(--enum-amber-fg);
+      background: var(--bg-receipt);
+    }
+
+    .mobile-composer-expand-bar {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--fg-primary);
+    }
+
+    .composer-top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .composer-radiogroup {
+      display: inline-flex;
+      gap: 4px;
+      background: var(--bg-panel);
+      padding: 2px;
+      border-radius: 5px;
+      border: 1px solid var(--border-subtle);
+    }
+
+    .mode-radio-btn {
+      appearance: none;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--fg-secondary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .mode-radio-btn[aria-checked="true"][data-mode="reply"] {
+      background: var(--accent-dim);
+      border-color: var(--border-strong);
+      color: var(--accent-primary);
+    }
+    .mode-radio-btn[aria-checked="true"][data-mode="wake"] {
+      background: var(--enum-amber-dim);
+      border-color: var(--enum-amber-fg);
+      color: var(--enum-amber-fg);
+    }
+
+    .composer-controls-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+    }
+
+    .composer-select, .composer-input-sm {
+      height: 23px;
+      padding: 0 6px;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-panel);
+      color: var(--fg-primary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+    }
+
+    /* Pre-Flight Spawn / Addressing Strip */
+    .composer-preflight-strip {
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      padding: 4px 8px;
+      border-radius: 3px;
+      background: var(--accent-dim);
+      border: 1px solid var(--border-strong);
+      color: var(--accent-primary);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    #composer-preflight-text {
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #composer-idem-preview {
+      flex-shrink: 0;
+    }
+    .human-composer-dock[data-composer-mode="wake"] .composer-preflight-strip {
+      background: var(--enum-amber-dim);
+      border-color: var(--enum-amber-fg);
+      color: var(--enum-amber-fg);
+    }
+
+    /* Guard A / Guard B Inline Collision & Auto-Snap Banner */
+    .composer-guard-banner {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 8px;
+      border-radius: 3px;
+      background: var(--enum-amber-dim);
+      border: 1px solid var(--enum-amber-fg);
+      color: var(--enum-amber-fg);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .composer-guard-banner.is-visible {
+      display: flex;
+    }
+
+    .composer-input-row {
+      display: flex;
+      align-items: stretch;
+      gap: 8px;
+    }
+
+    .composer-textarea {
+      flex: 1;
+      min-height: 40px;
+      max-height: 76px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-window);
+      color: var(--fg-primary);
+      font-size: 12px;
+      line-height: 1.38;
+      resize: none;
+    }
+    .composer-textarea:focus {
+      outline: none;
+      border-color: var(--accent-primary);
+    }
+    .human-composer-dock[data-composer-mode="wake"] .composer-textarea:focus {
+      border-color: var(--enum-amber-fg);
+    }
+
+    /* =========================================================================
+       6. RIGHT INSPECTOR RAIL (364px · Receipt + Grant + Steer + Kill)
+       ========================================================================= */
+    .wb-right-rail {
+      background: var(--bg-sidebar);
+      border-left: 1px solid var(--border-hairline);
+      padding: 9px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      min-width: 0;
+      min-height: 0;
+      overflow-y: auto;
+    }
+
+    .insp-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: 5px;
+      padding: 8px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .insp-card.ratification-card {
+      border-color: var(--enum-amber-fg);
+      background: var(--bg-receipt);
+    }
+
+    .insp-input {
+      width: 100%;
+      padding: 5px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-window);
+      color: var(--fg-primary);
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+    }
+
+    /* =========================================================================
+       7. MODALS & DRAWERS (Export Receipt, Loop A Invite, OrgWallet, Kill/Search)
+       ========================================================================= */
+    .modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      background: rgba(5, 8, 13, 0.76);
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .modal-backdrop.is-open {
+      display: flex;
+    }
+
+    .modal-dialog {
+      width: 100%;
+      max-width: 680px;
+      max-height: 88vh;
+      overflow-y: auto;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      color: var(--fg-primary);
+    }
+
+    .modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border-hairline);
+      font-family: 'Martian Mono', monospace;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .code-snippet-box {
+      background: var(--bg-code);
+      color: var(--fg-primary);
+      border: 1px solid var(--border-hairline);
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-family: 'Martian Mono', monospace;
+      font-size: 10.5px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      max-height: 210px;
+      overflow-y: auto;
+    }
+
+    .wallet-grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    /* =========================================================================
+       8. 3-BREAKPOINT RESPONSIVE RULES (HB-02 · WP-13 Chinwag UI-Gate)
+       ========================================================================= */
+    /* Tablet: 768px..1199px (1024x768) -> 2-Pane (Left Rail 212px + Center) + Slide-Over Inspector */
+    @media (max-width: 1199px) and (min-width: 768px) {
+      .wb-body-grid {
+        grid-template-columns: 212px minmax(0, 1fr);
+      }
+      .wb-right-rail {
+        position: fixed;
+        top: 36px;
+        right: 0;
+        bottom: 0;
+        width: 364px;
+        z-index: 45;
+        transform: translateX(100%);
+        transition: transform 150ms cubic-bezier(0.22, 1, 0.36, 1);
+        box-shadow: -12px 0 32px rgba(0, 0, 0, 0.45);
+      }
+      body[data-inspector-open="true"] .wb-right-rail {
+        transform: translateX(0);
+      }
+      .hide-tablet {
+        display: none !important;
+      }
+    }
+
+    /* Mobile: <= 767px (390x844) -> 1-Column + Touch Strip + Sticky Bottom Sheet */
+    @media (max-width: 767px) {
+      .wb-topbar {
+        height: 40px;
+        min-height: 40px;
+        max-height: 40px;
+        padding: 0 8px;
+      }
+      .hide-mobile {
+        display: none !important;
+      }
+      .mobile-room-strip {
+        display: flex;
+      }
+      .wb-body-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .wb-left-rail {
+        display: none;
+      }
+      .wb-right-rail {
+        position: fixed;
+        top: 40px;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        max-width: 390px;
+        z-index: 45;
+        transform: translateX(100%);
+        transition: transform 150ms ease;
+      }
+      body[data-inspector-open="true"] .wb-right-rail {
+        transform: translateX(0);
+      }
+      .center-subheader {
+        height: auto;
+        min-height: 36px;
+        flex-wrap: wrap;
+        padding: 5px 8px;
+        gap: 6px;
+      }
+      .lens-tabs {
+        max-width: 100%;
+        overflow-x: auto;
+      }
+      .pinned-action-tray {
+        flex-direction: column;
+        align-items: flex-start;
+        max-height: none;
+        padding: 6px 8px;
+        gap: 6px;
+      }
+      .tray-actions {
+        flex-wrap: wrap;
+        width: 100%;
+      }
+      .wt-head-right {
+        flex-wrap: wrap;
+        max-width: 100%;
+      }
+      .wt-head-right .rail-badge {
+        white-space: normal;
+      }
+      .emun-receipt-dl > div {
+        grid-template-columns: 5.5em minmax(0, 1fr);
+      }
+      .human-composer-dock {
+        min-height: 52px;
+        padding: 6px 8px;
+      }
+      .human-composer-dock:not(.is-mobile-expanded) .composer-top-row,
+      .human-composer-dock:not(.is-mobile-expanded) .composer-preflight-strip,
+      .human-composer-dock:not(.is-mobile-expanded) .composer-input-row {
+        display: none;
+      }
+      .human-composer-dock:not(.is-mobile-expanded) .mobile-composer-expand-bar {
+        display: flex;
+      }
+      .human-composer-dock.is-mobile-expanded {
+        max-height: 78vh;
+      }
+      .wallet-grid-2 {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+  </style>
+</head>
+<body data-inspector-open="false" data-missing-h1="false">
+  <div class="wb-app-window">
+
+    <!-- ====================================================================
+         1. NATIVE 36PX TOPBAR (Dry Monospace Ledger Pills · Zero OS Emojis)
+         ==================================================================== -->
+    <header class="wb-topbar" role="banner">
+      <div class="wb-topbar-left">
+        <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
+        <span class="wb-crumb">chinwag ui · Human Bus &amp; Glass-Box Wiretap (127.0.0.1 · Scenario Preview)</span>
+      </div>
+
+      <div class="wb-topbar-right">
+        <button type="button" class="top-ledger-btn hide-mobile" id="top-search-btn" title="Universal Search across Bus, TASKS.md &amp; LEANN Memory (⌘K)">
+          <svg class="svg-ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <span>Search ⌘K</span>
+        </button>
+
+        <button type="button" class="top-ledger-btn hide-tablet hide-mobile" id="top-invite-btn" title="Loop A $0/Seat Intra-Org Spectator Invite (+75 Free Org Credits)">
+          <span>Seats: 2/5 ($0/seat) [+ Invite → +75 ◈]</span>
+        </button>
+
+        <button type="button" class="top-ledger-btn is-emerald hide-mobile" id="top-wallet-btn" title="Open Dual-Rail OrgWallet (Stripe Auto-Top-Up + $0-Fee Mercury B2B ACH)">
+          <span id="top-wallet-label">OrgWallet: 7,815 ◈ (0.640¢/msg) · 360m saved</span>
+        </button>
+
+        <button type="button" class="top-ledger-btn" id="top-h1-btn" aria-pressed="false" title="Simulate Missing Hook H1 (git ls-remote verifier)">
+          <span>[H1]</span>
+        </button>
+
+        <div class="wb-theme-group" role="group" aria-label="Theme Switcher">
+          <button type="button" class="wb-theme-btn" data-set-theme="midnight" aria-pressed="true">Midnight</button>
+          <button type="button" class="wb-theme-btn" data-set-theme="daylight" aria-pressed="false">Daylight</button>
+        </div>
+
+        <button type="button" class="top-ledger-btn" id="top-inspector-btn" aria-expanded="false" title="Toggle Right Inspector Drawer (⌘B)">
+          <span>⌘B</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Mobile Horizontal Touch-Scrollable Room & Action Strip (<= 767px) -->
+    <nav class="mobile-room-strip" aria-label="Mobile Room and Action Strip">
+      <button type="button" class="top-ledger-btn is-emerald" data-room-pill="#all">#all (24)</button>
+      <button type="button" class="top-ledger-btn" data-room-pill="#eng">#eng (8)</button>
+      <button type="button" class="top-ledger-btn" data-room-pill="#mgmt">#mgmt (2)</button>
+      <button type="button" class="top-ledger-btn" data-room-pill="#design">#design (7)</button>
+      <button type="button" class="top-ledger-btn" data-room-pill="#s-and-m">#s-and-m (2)</button>
+      <button type="button" class="top-ledger-btn" data-room-pill="#ci-builds">#ci-builds (1)</button>
+      <button type="button" class="top-ledger-btn" id="mob-invite-btn">+Invite (+75 ◈)</button>
+      <button type="button" class="top-ledger-btn" id="mob-wallet-btn">7,815 ◈ Wallet</button>
+    </nav>
+
+    <!-- ====================================================================
+         2. 3-COLUMN WORKBENCH BODY GRID
+         ==================================================================== -->
+    <div class="wb-body-grid">
+
+      <!-- ==================================================================
+           LEFT RAIL: Surfaces, Rooms, Pinned TaskRefs & 3-Tier Roster
+           ================================================================== -->
+      <aside class="wb-left-rail" aria-label="Rooms, Tasks, and 3-Node Fleet Roster">
+        <div>
+          <div class="rail-sec-title"><span>Workbench Surfaces</span><span>v5.4</span></div>
+          <div class="rail-list">
+            <a href="bus-wiretap.html" class="rail-row-btn is-active">
+              <span class="rail-row-left"><span class="sigil-seat">■</span><span>03 · Bus &amp; Wiretap</span></span>
+              <span class="rail-badge emerald">LIVE</span>
+            </a>
+            <a href="ci-cd.html" class="rail-row-btn">
+              <span class="rail-row-left"><span class="sigil-seat">■</span><span>14 · Runners · CI Policy</span></span>
+              <span class="rail-badge">WP-13</span>
+            </a>
+            <a href="slack-bridge.html" class="rail-row-btn">
+              <span class="rail-row-left"><span class="sigil-wake">◈</span><span>15 · Slack #ci-builds</span></span>
+              <span class="rail-badge">ZK-01</span>
+            </a>
+          </div>
+        </div>
+
+        <div>
+          <div class="rail-sec-title"><span>Rooms &amp; Channels</span><span class="mono">0 Cr Observe</span></div>
+          <div class="rail-list" id="left-room-list">
+            <button type="button" class="rail-row-btn is-active" data-room-btn="#all">
+              <span class="rail-row-left"><span class="mono">#all</span><span>All Signed Bus</span></span>
+              <span class="rail-badge">24</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-room-btn="#eng">
+              <span class="rail-row-left"><span class="mono">#eng</span><span>Engineering</span></span>
+              <span class="rail-badge">8</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-room-btn="#mgmt">
+              <span class="rail-row-left"><span class="mono">#mgmt</span><span>Management</span></span>
+              <span class="rail-badge">2</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-room-btn="#design">
+              <span class="rail-row-left"><span class="mono">#design</span><span>Design Tribunal</span></span>
+              <span class="rail-badge">7</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-room-btn="#s-and-m">
+              <span class="rail-row-left"><span class="mono">#s-and-m</span><span>Outbound Only</span></span>
+              <span class="rail-badge">2</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-room-btn="#ci-builds">
+              <span class="rail-row-left"><span class="mono">#ci-builds</span><span>CI Coalescer</span></span>
+              <span class="rail-badge amber">1 GATE</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- TIER A: ACTIVE & BLOCKED (Pinned at Top · INV-ROSTER-TRIAGE-01) -->
+        <div>
+          <div class="rail-sec-title"><span>Tier A · Active &amp; Blocked</span><span class="rail-badge amber">4 LIVE</span></div>
+          <ul class="rail-list" role="tree" aria-label="3-Node Fleet Roster and Active Instances">
+            <li role="treeitem" aria-expanded="true">
+              <button type="button" class="rail-row-btn is-blocked" data-actor="RUST#7be266fc09a411e8b30c4f8395d102a4" data-select-actor="RUST#7be266fc09a411e8b30c4f8395d102a4" data-task="CHWG-HUMAN-BUS-UI-PRD-01" title="Full instance: RUST#7be266fc09a411e8b30c4f8395d102a4 (GPT-6.1-SOL Ultra)">
+                <span class="rail-row-left">
+                  <span class="sigil-seat">■</span>
+                  <span>RUST</span>
+                  <span class="instance-suffix">#7be266…02a4</span>
+                </span>
+                <span class="rail-badge amber">GRANT · 00:38.4s</span>
+              </button>
+            </li>
+            <li role="treeitem" aria-expanded="true">
+              <button type="button" class="rail-row-btn" data-actor="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA" data-select-actor="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA" data-task="P0-06" title="Full instance: WORKHORSE#AaFG0NdpegKhpXXEB_-qPA (GPT-6.1-SOL Max · Node 2)">
+                <span class="rail-row-left">
+                  <span class="sigil-seat">■</span>
+                  <span>WORKHORSE</span>
+                  <span class="instance-suffix">#AaFG0N…qPA</span>
+                </span>
+                <span class="rail-badge emerald">01:42.8s</span>
+              </button>
+            </li>
+            <li role="treeitem" aria-expanded="true">
+              <button type="button" class="rail-row-btn" data-actor="TYPE#34bd117510284deba318b6f5f9af967d" data-select-actor="TYPE#34bd117510284deba318b6f5f9af967d" data-task="CHWG-HUMAN-BUS-UI-PRD-01" title="Full instance: TYPE#34bd117510284deba318b6f5f9af967d (GPT-6.1-SOL High)">
+                <span class="rail-row-left">
+                  <span class="sigil-seat">■</span>
+                  <span>TYPE</span>
+                  <span class="instance-suffix">#34bd11…967d</span>
+                </span>
+                <span class="rail-badge emerald">00:24.6s</span>
+              </button>
+            </li>
+            <li role="treeitem" aria-expanded="true">
+              <button type="button" class="rail-row-btn" data-actor="ALISTAIR#81c490e219f04b77a31209c8e11044b2" data-select-actor="ALISTAIR#81c490e219f04b77a31209c8e11044b2" data-task="ENG-412" title="Full instance: ALISTAIR#81c490e219f04b77a31209c8e11044b2 (Gemini 4 Argon High)">
+                <span class="rail-row-left">
+                  <span class="sigil-seat">■</span>
+                  <span>ALISTAIR</span>
+                  <span class="instance-suffix">#81c490…44b2</span>
+                </span>
+                <span class="rail-badge emerald">00:14.2s</span>
+              </button>
+            </li>
+          </ul>
+        </div>
+
+        <!-- TIER B: 3-NODE STANDING ROSTER (31 Standing · 0 Anthropic) -->
+        <div>
+          <div class="rail-sec-title">
+            <span>Tier B · 3-Node Roster (31)</span>
+            <span class="mono" style="color:var(--accent-primary);">0 Claude</span>
+          </div>
+
+          <!-- Node 1: Mac Studio (26 Standing Principals) -->
+          <div class="node-group-box">
+            <div class="node-group-head">
+              <span>● Node 1 · Mac Studio</span>
+              <span>26 seats</span>
+            </div>
+            <div class="mono" style="font-size:9.5px;color:var(--fg-muted);">
+              17 Gemini 4 Argon · 7 GPT-6.1-SOL · 2 Grok 4.7 (#s-and-m)
+            </div>
+            <details class="idle-drawer-details">
+              <summary>+ 22 idle seats on Mac Studio [▸]</summary>
+              <div class="rail-list" style="margin-top:4px;">
+                <button type="button" class="rail-row-btn" data-wake-bare="ARCHITECT"><span class="rail-row-left"><span class="sigil-seat">■</span><span>ARCHITECT</span></span><span class="rail-badge">SOL Ultra</span></button>
+                <button type="button" class="rail-row-btn" data-wake-bare="EAGLE-EYE"><span class="rail-row-left"><span class="sigil-seat">■</span><span>EAGLE-EYE</span></span><span class="rail-badge">Gemini 4</span></button>
+                <button type="button" class="rail-row-btn" data-wake-bare="DELIVERY"><span class="rail-row-left"><span class="sigil-seat">■</span><span>DELIVERY</span></span><span class="rail-badge">Gemini 4</span></button>
+                <button type="button" class="rail-row-btn" data-wake-bare="INDEX"><span class="rail-row-left"><span class="sigil-seat">■</span><span>INDEX</span></span><span class="rail-badge">SOL High</span></button>
+                <button type="button" class="rail-row-btn" data-wake-bare="CLOUDFLARE"><span class="rail-row-left"><span class="sigil-seat">■</span><span>CLOUDFLARE</span></span><span class="rail-badge">SOL High</span></button>
+                <button type="button" class="rail-row-btn" data-wake-bare="DECLARATION"><span class="rail-row-left"><span class="sigil-seat">■</span><span>DECLARATION</span></span><span class="rail-badge">SOL High</span></button>
+                <button type="button" class="rail-row-btn" data-wake-bare="GAMEDEV"><span class="rail-row-left"><span class="sigil-seat">■</span><span>GAMEDEV</span></span><span class="rail-badge">SOL Ultra</span></button>
+                <button type="button" class="rail-row-btn" data-wake-bare="QA"><span class="rail-row-left"><span class="sigil-seat">■</span><span>QA · SPARK · MO · VENTURE +11</span></span><span class="rail-badge">Gemini 4</span></button>
+                <button type="button" class="rail-row-btn" data-wake-bare="GROWTH"><span class="rail-row-left"><span class="sigil-seat">■</span><span>GROWTH · SALES (#s-and-m)</span></span><span class="rail-badge">Grok 4.7</span></button>
+              </div>
+            </details>
+          </div>
+
+          <!-- Node 2: Brian's MacBook Pro (2 Standing Principals) -->
+          <div class="node-group-box">
+            <div class="node-group-head">
+              <span>● Node 2 · Brian MBP</span>
+              <span>2 seats</span>
+            </div>
+            <button type="button" class="rail-row-btn" data-actor="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA" data-select-actor="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA" data-task="P0-06">
+              <span class="rail-row-left"><span class="sigil-seat">■</span><span>WORKHORSE</span><span class="instance-suffix">#AaFG0N…qPA</span></span>
+              <span class="rail-badge emerald">SOL Max</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-wake-bare="FLINT">
+              <span class="rail-row-left"><span class="sigil-seat">■</span><span>FLINT</span></span>
+              <span class="rail-badge">Flint 262k</span>
+            </button>
+          </div>
+
+          <!-- Node 3: Nicola's MacBook Pro (2 Standing Principals + 1 Swarm) -->
+          <div class="node-group-box">
+            <div class="node-group-head">
+              <span>● Node 3 · Nicola MBP</span>
+              <span>2 + 1 swarm</span>
+            </div>
+            <button type="button" class="rail-row-btn" data-wake-bare="H">
+              <span class="rail-row-left"><span class="sigil-seat">■</span><span>H (Lead Agent)</span></span>
+              <span class="rail-badge">SOL Ultra</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-wake-bare="AUSDRA">
+              <span class="rail-row-left"><span class="sigil-seat">■</span><span>AUSDRA (Legal/Biz)</span></span>
+              <span class="rail-badge">SOL Ultra</span>
+            </button>
+            <button type="button" class="rail-row-btn" data-wake-bare="H-SWARM">
+              <span class="rail-row-left"><span class="sigil-wake">◈</span><span>H-SWARM</span></span>
+              <span class="rail-badge">SOL High</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- TIER C: ON-DEMAND DEEPSEEK 4.1 CF EPHEMERAL POOLS -->
+        <div>
+          <div class="rail-sec-title"><span>Tier C · On-Demand Pools</span><span>CF AI</span></div>
+          <div class="node-group-box">
+            <details class="idle-drawer-details">
+              <summary>◈ DeepSeek 4.1 CF · 2/10 Dev · 1/10 QA [▸]</summary>
+              <div class="rail-list" style="margin-top:4px;">
+                <button type="button" class="rail-row-btn" data-actor="EPHEMERAL-DEV-1#88a1c04f92e11034b7729c01a442d810" data-select-actor="EPHEMERAL-DEV-1#88a1c04f92e11034b7729c01a442d810" data-task="P0-06">
+                  <span class="rail-row-left"><span class="sigil-wake">◈</span><span>DEV-1</span><span class="instance-suffix">#88a1c0…d810</span></span>
+                  <span class="rail-badge emerald">18.2s</span>
+                </button>
+                <button type="button" class="rail-row-btn" data-actor="EPHEMERAL-DEV-2#31b9e012c4487a109f3201d8e441a902" data-select-actor="EPHEMERAL-DEV-2#31b9e012c4487a109f3201d8e441a902" data-task="CHWG-HUMAN-BUS-UI-PRD-01">
+                  <span class="rail-row-left"><span class="sigil-wake">◈</span><span>DEV-2</span><span class="instance-suffix">#31b9e0…a902</span></span>
+                  <span class="rail-badge emerald">11.6s</span>
+                </button>
+                <button type="button" class="rail-row-btn" data-actor="EPHEMERAL-QA-1#64d091a8e2014c99b31208f7a114c209" data-select-actor="EPHEMERAL-QA-1#64d091a8e2014c99b31208f7a114c209" data-task="ENG-412">
+                  <span class="rail-row-left"><span class="sigil-wake">◈</span><span>QA-1</span><span class="instance-suffix">#64d091…c209</span></span>
+                  <span class="rail-badge emerald">09.4s</span>
+                </button>
+              </div>
+            </details>
+          </div>
+        </div>
+      </aside>
+
+      <!-- ==================================================================
+           CENTER STAGE: 3-Mode Lens, Pinned Action Tray, Wiretap & Composer
+           ================================================================== -->
+      <main class="wb-center-stage">
+
+        <!-- 36px Sub-Header with 3-Mode Lens Switcher -->
+        <div class="center-subheader">
+          <div style="display:flex;align-items:center;gap:8px;min-width:0;">
+            <span class="mono" style="font-weight:700;font-size:11px;" id="active-room-indicator">#all</span>
+            <div class="lens-tabs" role="tablist" aria-label="Wiretap Stream Lens">
+              <button type="button" class="lens-tab-btn" role="tab" aria-selected="true" data-lens="arcs">
+                Grouped by TaskRef (Arcs)
+              </button>
+              <button type="button" class="lens-tab-btn" role="tab" aria-selected="false" data-lens="raw">
+                Raw Forensic
+              </button>
+              <button type="button" class="lens-tab-btn" role="tab" aria-selected="false" data-lens="queue">
+                My Action Queue (2)
+              </button>
+            </div>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+            <button type="button" class="act-btn hide-mobile" id="sim-sse-burst-btn" title="Simulate +3 incoming SSE receipts while scrolled or inspecting">
+              <span>+ Sim SSE Arrival</span>
+            </button>
+            <button type="button" class="act-btn" id="open-export-top-btn" title="Export Constructively Redacted Glass-Box Receipt (INV-RECEIPT-REDACTION-GATE-01)">
+              <span>◆ Export Redacted Receipt</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Missing H1 Hook Warning Banner -->
+        <div class="h1-missing-banner" id="h1-missing-banner" role="status">
+          <span>[! H1 UNAVAILABLE] Hook H1 (git ls-remote verifier) is not installed in this repo. Local checkpoint 80c1012d is recorded, but dependent workflow compliance is refused.</span>
+          <span class="mono">0 False Compliance Claims</span>
+        </div>
+
+        <!-- Sticky Pinned Action Tray for Pending ApprovalGrantV1 (HB-03 / HB-07) -->
+        <section class="pinned-action-tray" id="pinned-grant-tray" aria-label="Pinned Pending Approval Grants">
+          <div class="tray-left">
+            <div class="tray-headline" id="tray-grant-headline">
+              [§ HUMAN RATIFICATION REQUIRED · CTL-04] ■ RUST#7be266fc09a411e8b30c4f8395d102a4 requests ExactActionGrant on crates/chinwag-cli/src/ui_server.rs
+            </div>
+            <div class="tray-sub" id="tray-grant-sub">
+              Digest: blake3:9f8a…c41e · Tree OID: 7a11c08f · Max Ops: 1 commit · Expires: 15m (Roughtime 2/2) · Policy Pin: d4e891a (Epoch #4)
+            </div>
+          </div>
+          <div class="tray-actions">
+            <button type="button" class="act-btn primary-emerald" id="tray-approve-btn" title="Sign ExactActionGrant with local Touch ID Ed25519 key (Alt+A)">
+              <span>✓ Sign Grant (Touch ID · Ed25519 · Alt+A)</span>
+            </button>
+            <button type="button" class="act-btn danger" id="tray-reject-btn" title="Reject grant and write spector-fleet tombstone (Alt+R)">
+              <span>✕ Reject &amp; Tombstone (Alt+R)</span>
+            </button>
+          </div>
+        </section>
+
+        <!-- Scrollable Wiretap Stream Log (role="log" aria-live="polite") -->
+        <section class="wiretap-stream-log" id="wiretap-log" role="log" aria-label="Glass-Box Signed Bus Wiretap" aria-live="polite" aria-atomic="false" tabindex="0">
+
+          <!-- CARD 1: WAITING_FOR_REVIEW (ExactActionGrant CTL-04 · Task CHWG-HUMAN-BUS-UI-PRD-01) -->
+          <article class="wiretap-card is-focused" tabindex="0" data-card-id="msg-4815" data-card-state="review" data-room="#eng" data-task="CHWG-HUMAN-BUS-UI-PRD-01" data-for-human="true" data-actor="RUST#7be266fc09a411e8b30c4f8395d102a4">
+            <div class="wt-card-head">
+              <div class="wt-head-left">
+                <!-- 16x16 Emun Labs Direction 1 "Enum" mark_enum SVG (Blinking Amber Block) -->
+                <svg viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">
+                  <rect x="5" y="5" width="22" height="5" fill="currentColor"/>
+                  <rect x="5" y="13.5" width="13" height="5" fill="currentColor"/>
+                  <rect class="emun-cur-rect" x="20.5" y="13.5" width="5" height="5" fill="#FFB000"/>
+                  <rect x="5" y="22" width="22" height="5" fill="currentColor"/>
+                </svg>
+                <span class="mono">#4815 · 10:31:18.305Z</span>
+                <span class="rail-badge">#eng</span>
+                <span class="rail-badge amber">Task: CHWG-HUMAN-BUS-UI-PRD-01</span>
+                <span data-actor="RUST#7be266fc09a411e8b30c4f8395d102a4" title="RUST#7be266fc09a411e8b30c4f8395d102a4">
+                  <strong class="sigil-seat">■ RUST</strong><span class="instance-suffix">#7be266…02a4</span>
+                </span>
+                <span>→</span>
+                <span class="sigil-human">● Brian#ui-9f8a…9b2c</span>
+              </div>
+              <div class="wt-head-right">
+                <span class="rail-badge amber">[§ CTL-04 GRANT PENDING]</span>
+                <span class="rail-badge emerald">✓ ed25519 (0.12ms) · HPKE 127.0.0.1 (0.23ms)</span>
+              </div>
+            </div>
+
+            <p class="wt-summary">
+              Staged 5-layer loopback defense (<code>ui_auth.rs</code>, <code>ui_sse.rs</code>, <code>ui_grant.rs</code>) with single-use 30s SSE stream ticket and <code>verify_strict</code> check. Requesting <code>ExactActionGrant</code> ratification to commit <code>crates/chinwag-cli/src/ui_server.rs</code> (+148 / -19 lines).
+            </p>
+
+            <div class="arc-coalesce-bar">
+              <span>[▸ Coalesced Causal Arc: DISPATCH → ACK → 6 intermediate tool calls · 2 workers (■ RUST, ■ TYPE) · 38.4s elapsed]</span>
+              <span class="mono">0 Local Observe Cr</span>
+            </div>
+
+            <figure class="emun-receipt-figure">
+              <dl class="emun-receipt-dl">
+                <div><dt>receipt</dt><dd>rcpt_01J9F4K8M2X9Q7 · seq #4815 · C_checkpoint: blake3:9f8a…c41e</dd></div>
+                <div><dt>thread</dt><dd>#eng · task CHWG-HUMAN-BUS-UI-PRD-01 · parent GEMINI-PM#f824838f</dd></div>
+                <div><dt>actor</dt><dd>■ RUST#7be266fc09a411e8b30c4f8395d102a4 (Node 1 Mac Studio · GPT-6.1-SOL Ultra)</dd></div>
+                <div><dt>engine</dt><dd>Codex · GPT-6.1-SOL Ultra (effort: ultra) × Reviewer: ■ TYPE (GPT-6.1-SOL High)</dd></div>
+                <div><dt>scope</dt><dd>ExactActionGrant (CTL-04) · Tree OID: 7a11c08f · +148 / -19 across 4 files (127.0.0.1 unsealed)</dd></div>
+                <div><dt>proof</dt><dd class="h1-dependent-proof">H1 git ls-remote ✓ · H2 20/20 shards → 1 Cr (0.640¢) · WP-13 UiGate 64ms ✓</dd></div>
+                <div><dt>status</dt><dd class="h1-dependent-status">OriginSigV1 + CloudRelayBlobSigV1 verified <b>✓ed25519</b> · Awaiting Human Grant (WP-06)</dd></div>
+              </dl>
+            </figure>
+
+            <div class="wt-card-footer">
+              <div style="display:inline-flex;gap:5px;flex-wrap:wrap;">
+                <button type="button" class="act-btn" data-reply-instance="RUST#7be266fc09a411e8b30c4f8395d102a4" data-reply-task="CHWG-HUMAN-BUS-UI-PRD-01" data-reply-room="#eng">
+                  <span>↩ Reply to #7be266…02a4 (--wake: OFF)</span>
+                </button>
+                <button type="button" class="act-btn" data-focus-steer="RUST#7be266fc09a411e8b30c4f8395d102a4">
+                  <span>Steer Worker (S)</span>
+                </button>
+              </div>
+              <button type="button" class="act-btn" data-export-card="rcpt_01J9F4K8M2X9Q7" data-export-task="CHWG-HUMAN-BUS-UI-PRD-01">
+                <span>◆ Export Redacted Receipt</span>
+              </button>
+            </div>
+          </article>
+
+          <!-- CARD 2: WORKING (WORKHORSE#AaFG0NdpegKhpXXEB_-qPA on Node 2 · Task P0-06) -->
+          <article class="wiretap-card" tabindex="0" data-card-id="msg-4814" data-card-state="working" data-room="#eng" data-task="P0-06" data-for-human="false" data-actor="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA">
+            <div class="wt-card-head">
+              <div class="wt-head-left">
+                <svg viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">
+                  <rect x="5" y="5" width="22" height="5" fill="currentColor"/>
+                  <rect x="5" y="13.5" width="13" height="5" fill="currentColor"/>
+                  <rect class="emun-cur-rect" x="20.5" y="13.5" width="5" height="5" fill="#FFB000"/>
+                  <rect x="5" y="22" width="22" height="5" fill="currentColor"/>
+                </svg>
+                <span class="mono">#4814 · 10:30:44.112Z</span>
+                <span class="rail-badge">#eng</span>
+                <span class="rail-badge">Task: P0-06</span>
+                <span data-actor="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA" title="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA">
+                  <strong class="sigil-seat">■ WORKHORSE</strong><span class="instance-suffix">#AaFG0N…qPA</span>
+                </span>
+                <span>→</span>
+                <span class="sigil-seat">■ GEMINI-PM#f82483…28c0</span>
+              </div>
+              <div class="wt-head-right">
+                <span class="rail-badge amber" id="workhorse-steer-badge">WORKING · 01:42.8s</span>
+                <span class="rail-badge emerald">✓ ed25519 · 0.11ms</span>
+              </div>
+            </div>
+
+            <p class="wt-summary">
+              Coordinating P0-06 independent review acceptance schemas and 12-Pillar v0.20 Rust module split across Node 2 (<code>100.108.108.25</code>) and leased <code>◈ EPHEMERAL-DEV-1#88a1c0…d810</code>. Purged legacy <code>GROKBOT_MGMT_ROSTER</code> and <code>Triple-B</code> strings per <code>ARCH-01</code>.
+            </p>
+
+            <figure class="emun-receipt-figure">
+              <dl class="emun-receipt-dl">
+                <div><dt>receipt</dt><dd>rcpt_01J9F4J2B8K1N4 · seq #4814 · JJ change yyxwplov (4cf3fd59)</dd></div>
+                <div><dt>thread</dt><dd>#eng · task P0-06 · 12 intermediate handoffs coalesced</dd></div>
+                <div><dt>actor</dt><dd>■ WORKHORSE#AaFG0NdpegKhpXXEB_-qPA (Node 2 MacBook Pro · GPT-6.1-SOL Max)</dd></div>
+                <div><dt>engine</dt><dd>Codex · GPT-6.1-SOL Max (effort: max) × Adversarial: ■ FLINT (Recursive Flint MLX 262k)</dd></div>
+                <div><dt>scope</dt><dd>BoundedBriefGrant · 2 files (+84 / -12 lines) · 64KiB record / 16MiB zstd cap enforced</dd></div>
+                <div><dt>proof</dt><dd class="h1-dependent-proof">H1 git ls-remote ✓ · Roughtime quorum 2/2 ✓ · K1 != Author verified ✓</dd></div>
+                <div><dt>status</dt><dd class="h1-dependent-status">OriginSigV1 + CloudRelayBlobSigV1 verified <b>✓ed25519</b> · Active stream writing</dd></div>
+              </dl>
+            </figure>
+
+            <div class="wt-card-footer">
+              <div style="display:inline-flex;gap:5px;flex-wrap:wrap;">
+                <button type="button" class="act-btn" data-reply-instance="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA" data-reply-task="P0-06" data-reply-room="#eng">
+                  <span>↩ Reply to #AaFG0N…qPA (--wake: OFF)</span>
+                </button>
+                <button type="button" class="act-btn" data-focus-steer="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA">
+                  <span>Steer Worker (S)</span>
+                </button>
+              </div>
+              <button type="button" class="act-btn" data-export-card="rcpt_01J9F4J2B8K1N4" data-export-task="P0-06">
+                <span>◆ Export Redacted Receipt</span>
+              </button>
+            </div>
+          </article>
+
+          <!-- CARD 3: COMPLETED & CROSS-MODEL VERIFIED (TYPE#34bd117510284deba318b6f5f9af967d · #design) -->
+          <article class="wiretap-card" tabindex="0" data-card-id="msg-4813" data-card-state="completed" data-room="#design" data-task="CHWG-HUMAN-BUS-UI-PRD-01" data-for-human="true" data-actor="TYPE#34bd117510284deba318b6f5f9af967d">
+            <div class="wt-card-head">
+              <div class="wt-head-left">
+                <svg viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">
+                  <rect x="5" y="5" width="22" height="5" fill="currentColor"/>
+                  <rect x="5" y="13.5" width="13" height="5" fill="currentColor"/>
+                  <rect x="20.5" y="13.5" width="5" height="5" fill="#38F2AF"/>
+                  <rect x="5" y="22" width="22" height="5" fill="currentColor"/>
+                </svg>
+                <span class="mono">#4813 · 10:29:51.804Z</span>
+                <span class="rail-badge">#design</span>
+                <span class="rail-badge">Task: CHWG-HUMAN-BUS-UI-PRD-01</span>
+                <span data-actor="TYPE#34bd117510284deba318b6f5f9af967d" title="TYPE#34bd117510284deba318b6f5f9af967d">
+                  <strong class="sigil-seat">■ TYPE</strong><span class="instance-suffix">#34bd11…967d</span>
+                </span>
+                <span>→</span>
+                <span class="sigil-human">● Nic#ui-3d19…c080</span>
+              </div>
+              <div class="wt-head-right">
+                <span class="rail-badge emerald">COMPLETED · WP-13 PASS</span>
+                <span class="rail-badge emerald">✓ ed25519 · 0.35ms</span>
+              </div>
+            </div>
+
+            <p class="wt-summary">
+              Verified 3-breakpoint responsive geometry (<code>1440×900</code>, <code>1024×768</code> slide-over inspector, <code>390×844</code> 1-col) and Daylight AA contrast tokens (<code>--enum-amber-fg: #9A5B00</code> 5.42:1, <code>--receipt-emerald: #0F766E</code> 5.61:1) with No-Ego Agency bench (Ula, Lucy, Donny, Serif, Glyph, Cassandra).
+            </p>
+
+            <figure class="emun-receipt-figure">
+              <dl class="emun-receipt-dl">
+                <div><dt>receipt</dt><dd>rcpt_01J9F4H9A0M3P2 · seq #4813 · C_uigate: blake3:3d19…b210</dd></div>
+                <div><dt>thread</dt><dd>#design · task CHWG-HUMAN-BUS-UI-PRD-01 · 2/3 Visual Tribunal</dd></div>
+                <div><dt>actor</dt><dd>■ TYPE#34bd117510284deba318b6f5f9af967d (Node 1 Mac Studio · GPT-6.1-SOL High)</dd></div>
+                <div><dt>engine</dt><dd>Codex · GPT-6.1-SOL High × Prosecutors: ■ SPARK (Gemini 4) &amp; ■ FLINT (Flint 262k)</dd></div>
+                <div><dt>scope</dt><dd>INV-UI-BLEED = 0.0px · INV-UI-OVERLAP = 0.0px² · min ρ = 0.82 · ΔscrollTop = +240px</dd></div>
+                <div><dt>proof</dt><dd class="h1-dependent-proof">H1 git ls-remote ✓ · Zero OS emojis in native chrome (INV-NO-OS-EMOJI-CHROME-01) ✓</dd></div>
+                <div><dt>status</dt><dd class="h1-dependent-status">OriginSigV1 + CloudRelayBlobSigV1 verified <b>✓ed25519</b> · Ready for human review</dd></div>
+              </dl>
+            </figure>
+
+            <div class="wt-card-footer">
+              <div style="display:inline-flex;gap:5px;flex-wrap:wrap;">
+                <button type="button" class="act-btn" data-reply-instance="TYPE#34bd117510284deba318b6f5f9af967d" data-reply-task="CHWG-HUMAN-BUS-UI-PRD-01" data-reply-room="#design">
+                  <span>↩ Reply to #34bd11…967d (--wake: OFF)</span>
+                </button>
+              </div>
+              <button type="button" class="act-btn" data-export-card="rcpt_01J9F4H9A0M3P2" data-export-task="CHWG-HUMAN-BUS-UI-PRD-01">
+                <span>◆ Export Redacted Receipt</span>
+              </button>
+            </div>
+          </article>
+
+          <!-- CARD 4: QUARANTINED CRYPTOGRAPHIC NEGATIVE VECTOR (INV-VERIFY-BEFORE-DECRYPT-01) -->
+          <article class="wiretap-card" tabindex="0" data-card-id="msg-4812" data-card-state="quarantined" data-room="#ci-builds" data-task="ENG-412" data-for-human="true" data-actor="ALISTAIR#81c490e219f04b77a31209c8e11044b2">
+            <div class="wt-card-head">
+              <div class="wt-head-left">
+                <svg viewBox="0 0 32 32" width="15" height="15" aria-hidden="true">
+                  <rect x="5" y="5" width="22" height="5" fill="currentColor"/>
+                  <rect x="5" y="13.5" width="13" height="5" fill="currentColor"/>
+                  <rect x="20.5" y="13.5" width="5" height="5" fill="#FF3B30"/>
+                  <rect x="5" y="22" width="22" height="5" fill="currentColor"/>
+                </svg>
+                <span class="mono">#4812 · 10:28:12.009Z</span>
+                <span class="rail-badge">#ci-builds</span>
+                <span class="rail-badge">Task: ENG-412</span>
+                <span data-actor="ALISTAIR#81c490e219f04b77a31209c8e11044b2">
+                  <strong class="sigil-seat">■ ALISTAIR</strong><span class="instance-suffix">#81c490…44b2</span>
+                </span>
+              </div>
+              <div class="wt-head-right">
+                <span class="rail-badge" style="color:var(--accent-danger);border-color:var(--accent-danger);">[✕ QUARANTINED · GATE 2]</span>
+              </div>
+            </div>
+
+            <p class="wt-summary">
+              <strong>[✕ QUARANTINED · INV-VERIFY-BEFORE-DECRYPT-01]</strong> Adversarial test vector <code>neg_03_ed25519_malleability_non_canonical_s</code> rejected by <code>ed25519_dalek::VerifyingKey::verify_strict</code> at Gate 2. <code>X25519MLKEM768</code> decapsulation and <code>zstd</code> decompression aborted with <code>0 bytes</code> touched.
+            </p>
+          </article>
+
+        </section>
+
+        <!-- Floating Scroll-Freeze Guard Pill (INV-STREAM-MOTION-01) -->
+        <div class="scroll-freeze-pill" id="scroll-freeze-pill" role="status">
+          <span id="scroll-freeze-text">[II Wiretap Paused · +3 new signed receipts in #eng (latest: ■ RUST#7be266…02a4 · 0.35ms)]</span>
+          <button type="button" class="act-btn primary-emerald" id="jump-live-btn">↓ Jump to Live (Esc)</button>
+        </div>
+
+        <!-- ================================================================
+             FOOLPROOF 2-MODE HUMAN BUS COMPOSER DOCK (HB-05 · INV-THREAD-ID-01)
+             ================================================================ -->
+        <section class="human-composer-dock" id="composer-dock" data-composer-mode="reply" aria-label="Human Bus Composer">
+
+          <!-- Mobile Compact Expand Bar -->
+          <div class="mobile-composer-expand-bar">
+            <span id="mob-composer-summary">● Reply to @WORKHORSE#AaFG0N…qPA (--wake: OFF)</span>
+            <button type="button" class="act-btn primary-emerald" id="mob-expand-composer-btn">Compose ↑</button>
+          </div>
+
+          <div class="composer-top-row">
+            <!-- Physical 2-Mode Radio Fork (role="radiogroup") -->
+            <div class="composer-radiogroup" role="radiogroup" aria-label="Recipient Dispatch Mode (INV-THREAD-ID-01)">
+              <button type="button" class="mode-radio-btn" role="radio" aria-checked="true" data-mode="reply" id="radio-mode-reply">
+                <span>● Reply to Active Thread</span>
+                <span class="mono">[--wake: OFF Locked]</span>
+              </button>
+              <button type="button" class="mode-radio-btn" role="radio" aria-checked="false" data-mode="wake" id="radio-mode-wake">
+                <span>◈ Wake Bare Seat (Spawn Worker)</span>
+                <span class="mono">[--wake: ON]</span>
+              </button>
+            </div>
+
+            <div class="composer-controls-right">
+              <label for="composer-sender-select">From:</label>
+              <select class="composer-select" id="composer-sender-select" aria-label="Human Principal Sender">
+                <option value="Brian#ui-9f8a7c12e4019b2c">● Brian#ui-9f8a…9b2c</option>
+                <option value="Nicola#ui-3d19b2104e91c080">● Nicola (Nic#ui-3d19…c080)</option>
+              </select>
+
+              <label for="composer-target-input">To:</label>
+              <input type="text" class="composer-input-sm" id="composer-target-input" value="WORKHORSE#AaFG0NdpegKhpXXEB_-qPA" style="width:195px;" aria-label="Target Actor Address" />
+
+              <label for="composer-task-input">TaskRef:</label>
+              <input type="text" class="composer-input-sm" id="composer-task-input" value="P0-06" style="width:140px;" aria-label="TaskRef Binding" />
+            </div>
+          </div>
+
+          <!-- Pre-Flight Addressing / Spawn Strip -->
+          <div class="composer-preflight-strip" id="composer-preflight-strip">
+            <span id="composer-preflight-text">
+              Addressing live instance @WORKHORSE#AaFG0NdpegKhpXXEB_-qPA on Node 2 (MacBook Pro · GPT-6.1-SOL Max). Context preserved · --wake: OFF (Locked) · 0 spawn credits.
+            </span>
+            <span class="mono" id="composer-idem-preview">idempotency: blake3:60s</span>
+          </div>
+
+          <!-- Guard A (Auto-Snap) & Guard B (Active-Instance Collision) Banner -->
+          <div class="composer-guard-banner" id="composer-guard-banner" role="alert">
+            <span id="composer-guard-text"></span>
+            <div style="display:inline-flex;gap:5px;flex-shrink:0;" id="composer-guard-actions">
+              <button type="button" class="act-btn primary-emerald" id="guard-switch-reply-btn">↩ Switch to Reply (Recommended)</button>
+              <button type="button" class="act-btn" id="guard-force-parallel-btn">◈ Spawn Parallel Anyway</button>
+            </div>
+          </div>
+
+          <div class="composer-input-row">
+            <textarea class="composer-textarea" id="composer-textarea" placeholder="Send a signed instruction to @WORKHORSE#AaFG0NdpegKhpXXEB_-qPA… (⌘Enter to sign &amp; send, S to inject mid-flight steer)"></textarea>
+            <div style="display:flex;flex-direction:column;gap:4px;justify-content:space-between;">
+              <button type="button" class="act-btn primary-emerald" id="composer-send-btn" style="height:100%;min-height:40px;padding:0 12px;">
+                <span id="composer-send-label">✓ Sign &amp; Send (Ed25519 · ⌘Enter)</span>
+              </button>
+            </div>
+          </div>
+        </section>
+
+      </main>
+
+      <!-- ==================================================================
+           RIGHT INSPECTOR RAIL (364px · Receipt, ApprovalGrant, Steer, Kill)
+           ================================================================== -->
+      <aside class="wb-right-rail" id="right-inspector-rail" aria-label="Selected Instance Forensic Inspector">
+
+        <div class="rail-sec-title">
+          <span>1. Emun Contribution Receipt</span>
+          <span class="mono" id="insp-actor-pill">■ RUST#7be266…02a4</span>
+        </div>
+
+        <div class="insp-card">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
+            <span class="mono" style="font-size:10.5px;font-weight:700;color:var(--fg-primary);" id="insp-full-actor" data-actor="RUST#7be266fc09a411e8b30c4f8395d102a4">
+              RUST#7be266fc09a411e8b30c4f8395d102a4
+            </span>
+            <button type="button" class="act-btn" id="copy-actor-btn" title="Copy full untruncated 1..=128 byte ActorAddress (INV-THREAD-ID-01)">
+              <span>Copy ID</span>
+            </button>
+          </div>
+          <dl class="emun-receipt-dl" id="insp-receipt-dl">
+            <div><dt>receipt</dt><dd id="insp-dl-rcpt">rcpt_01J9F4K8M2X9Q7 · seq #4815</dd></div>
+            <div><dt>thread</dt><dd id="insp-dl-thread">#eng / task:CHWG-HUMAN-BUS-UI-PRD-01</dd></div>
+            <div><dt>actor</dt><dd id="insp-dl-actor">■ RUST#7be266fc09a411e8b30c4f8395d102a4</dd></div>
+            <div><dt>engine</dt><dd id="insp-dl-engine">GPT-6.1-SOL Ultra (Node 1 Mac Studio)</dd></div>
+            <div><dt>scope</dt><dd id="insp-dl-scope">ExactActionGrant · +148/-19 in 4 files</dd></div>
+            <div><dt>proof</dt><dd id="insp-dl-proof" class="h1-dependent-proof">H1 git ls-remote ✓ · WP-13 UiGate 64ms ✓</dd></div>
+            <div><dt>status</dt><dd id="insp-dl-status" class="h1-dependent-status">OriginSigV1 + CloudRelayBlobSigV1 <b>✓ed25519</b></dd></div>
+          </dl>
+        </div>
+
+        <!-- 2. Human Ratification Card (ApprovalGrantV1 + TOCTOU Preimage Guard · HB-07) -->
+        <div class="rail-sec-title">
+          <span>2. Human Ratification (ApprovalGrantV1)</span>
+          <span class="mono" style="color:var(--enum-amber-fg);">CTL-04</span>
+        </div>
+
+        <div class="insp-card ratification-card" id="insp-grant-card">
+          <div class="mono" style="font-size:10.5px;font-weight:700;color:var(--enum-amber-fg);" id="insp-grant-status">
+            [§ HUMAN RATIFICATION REQUIRED · CTL-04]
+          </div>
+          <div class="mono" style="font-size:10px;color:var(--fg-secondary);">
+            Domain: <code>chinwag-approval-grant-v1\0</code> · Acceptor != Author (<code>WP-06</code>)
+          </div>
+          <div class="code-snippet-box" id="insp-grant-preimage" style="max-height:95px;">expected_worktree_tree_oid : 7a11c08f
+expected_task_spec_digest  : blake3:9f8a7c12e4019b2c
+roughtime_quorum           : 2/2 servers (radius 1.8ms &lt;= 10s)
+k2_audit_log               : .chinwag/control-audit.log</div>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
+            <label class="mono" style="font-size:9.5px;color:var(--fg-secondary);display:inline-flex;align-items:center;gap:4px;">
+              <input type="checkbox" id="sim-toctou-drift-chk" />
+              <span>Simulate TOCTOU Tree OID Drift (409)</span>
+            </label>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;">
+            <button type="button" class="act-btn primary-emerald" id="insp-approve-grant-btn">
+              <span>✓ Sign Grant (Alt+A)</span>
+            </button>
+            <button type="button" class="act-btn danger" id="insp-reject-grant-btn">
+              <span>✕ Reject &amp; Tombstone</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 3. Mid-Flight Safe-Point Steering (CHWG-PAT-05 & PRD #13 · HB-06) -->
+        <div class="rail-sec-title">
+          <span>3. Mid-Flight Steer (CHWG-PAT-05)</span>
+          <span class="mono" style="color:var(--accent-primary);">+0.4s GRAFT</span>
+        </div>
+
+        <div class="insp-card">
+          <div class="mono" style="font-size:9.5px;color:var(--accent-primary);font-weight:700;">
+            SAFE-POINT GRAFT (+0.4s) · Injects at next tool boundary without dropping context
+          </div>
+          <input type="text" class="insp-input" id="steer-input" placeholder="Steer active worker at next tool boundary… (S)" value="Pin expected_worktree_tree_oid before signing K2 control log" />
+          <div style="display:flex;justify-content:space-between;gap:5px;">
+            <button type="button" class="act-btn primary-emerald" id="steer-submit-btn" style="flex:1;">
+              <span>✓ Inject Safe-Point Steer (SIGUSR1)</span>
+            </button>
+          </div>
+          <div class="mono" style="font-size:9.5px;color:var(--fg-muted);" id="steer-receipt-status">
+            Target: <span id="steer-target-label">WORKHORSE#AaFG0NdpegKhpXXEB_-qPA</span> · 0 context tokens dropped
+          </div>
+        </div>
+
+        <!-- 4. Emergency Kill + Tombstone Switch -->
+        <div class="rail-sec-title">
+          <span>4. Emergency Process Group Kill</span>
+          <span class="mono" style="color:var(--accent-danger);">SIGTERM→KILL</span>
+        </div>
+
+        <div class="insp-card">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
+            <span class="mono" style="font-size:10px;color:var(--fg-secondary);">Revokes active leases &amp; records tombstone</span>
+            <button type="button" class="act-btn danger" id="open-kill-modal-btn">
+              <span>✕ Kill &amp; Tombstone…</span>
+            </button>
+          </div>
+        </div>
+
+      </aside>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL 1: [◆ Export Redacted Receipt] 3-Format Exporter (HB-08 / GS-01 / EE-04)
+       ====================================================================== -->
+  <div class="modal-backdrop" id="export-receipt-modal" role="dialog" aria-modal="true" aria-labelledby="export-modal-title">
+    <div class="modal-dialog">
+      <div class="modal-head">
+        <span id="export-modal-title">◆ Export Constructively Redacted Glass-Box Receipt (ExportedGlassBoxReceiptV1)</span>
+        <button type="button" class="act-btn" data-close-modal="export-receipt-modal">✕ Close (Esc)</button>
+      </div>
+
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button type="button" class="act-btn primary-emerald" data-export-fmt="markdown">1. GitHub / GitLab PR Markdown</button>
+        <button type="button" class="act-btn" data-export-fmt="svg_midnight">2. 1200×630 SVG Card (Midnight)</button>
+        <button type="button" class="act-btn" data-export-fmt="svg_daylight">3. 1200×630 SVG Card (Daylight)</button>
+      </div>
+
+      <div class="rail-badge emerald" style="padding:5px 8px;white-space:normal;">
+        ✓ 4-Stage Pre-Export Gate (INV-RECEIPT-REDACTION-GATE-01): (1) ISO-30 Secret/PII Scanner PASS · (2) Aho-Corasick Repo Path Disjointness (0 file paths) PASS · (3) Script-Free Static SVG PASS · (4) INV-B2B-REBATE-01 Corporate Rebate Footer PASS
+      </div>
+
+      <pre class="code-snippet-box" id="export-output-box"></pre>
+
+      <div class="insp-card">
+        <div class="mono" style="font-size:10.5px;font-weight:700;color:var(--enum-amber-fg);">
+          Loop B Cross-Company Peer Org Grant Preview (chinwag.sh/r/@emunlabs)
+        </div>
+        <div style="font-size:11.5px;color:var(--fg-secondary);">
+          • <strong>Tier-1 Mutual Grant:</strong> Give <code>+250 ◈</code> / Get <code>+250 ◈</code> on <code>$280 Scale Pack</code> (or Get <code>+500 ◈</code> on <code>$1,000 Org Volume Pack</code>).<br/>
+          • <strong>Tier-2 Network Dividend:</strong> Uncapped <code>10%</code> credit override (<code>+25 ◈</code> / <code>+50 ◈</code>) when a referred org refers another paying org.<br/>
+          • <strong>Corporate Rebate Safe Harbor (<code>INV-B2B-REBATE-01</code>):</strong> Referral credits accrue 100% to the corporate <code>OrgWallet</code> (<code>promo_90d</code>) as a B2B software rebate · <code>$0.00</code> cash value, zero W-9 / 1099-MISC.
+        </div>
+      </div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span class="mono" style="font-size:10px;color:var(--accent-primary);" id="export-copy-toast">Signature: ed25519:9f8a7c12e4019b2c</span>
+        <button type="button" class="act-btn primary-emerald" id="copy-export-btn">✓ Copy Redacted Receipt</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL 2: Persona-Targeted Loop A $0/Seat Spectator Invite (+75 ◈ · HB-09)
+       ====================================================================== -->
+  <div class="modal-backdrop" id="invite-modal" role="dialog" aria-modal="true" aria-labelledby="invite-modal-title">
+    <div class="modal-dialog">
+      <div class="modal-head">
+        <span id="invite-modal-title">● Loop A Intra-Org Spectator Invite ($0/Seat · Unlock +75 Free Org Credits)</span>
+        <button type="button" class="act-btn" data-close-modal="invite-modal">✕ Close (Esc)</button>
+      </div>
+
+      <div style="font-size:12px;color:var(--fg-secondary);">
+        Founding Pack Lock: <code>100 Base + 75 Pack Lock = 175 ◈</code> → <strong><code>250 Free Founding Credits</code></strong> when 1 verified <code>@emunlabs.com</code> colleague enrolls at <code>$0/seat</code> (local SSE observation &amp; <code>.hpke</code> unsealing cost <code>0 credits</code>).
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <button type="button" class="act-btn primary-emerald" data-invite-preset="em" style="height:auto;padding:7px 10px;justify-content:space-between;">
+          <span>Preset 1 · Engineering Manager / VP Eng (#mgmt &amp; #ci-builds Spectator)</span>
+          <span class="mono">$0/seat · +75 ◈</span>
+        </button>
+        <button type="button" class="act-btn" data-invite-preset="designer" style="height:auto;padding:7px 10px;justify-content:space-between;">
+          <span>Preset 2 · Product Designer (#design &amp; WP-13 Visual Tribunal Spectator)</span>
+          <span class="mono">$0/seat · +75 ◈</span>
+        </button>
+        <button type="button" class="act-btn" data-invite-preset="ciso" style="height:auto;padding:7px 10px;justify-content:space-between;">
+          <span>Preset 3 · CISO / SecOps Lead (OrgPolicyFloorV1 &amp; X25519MLKEM768 Auditor)</span>
+          <span class="mono">$0/seat · +75 ◈</span>
+        </button>
+      </div>
+
+      <pre class="code-snippet-box" id="invite-preview-box">Subject: Join emunlabs/chinwag on local Glass-Box Wiretap ($0/seat · +75 Org Credits)
+Watch real-time agent handoffs, 20-shard -> 1-credit CI repairs, and 2-strike circuit breakers live on 127.0.0.1 at $0/seat:
+  chinwag enroll --org emunlabs --role eng-mgmt --token inv_loopA_01J9F4K8</pre>
+
+      <div class="insp-card">
+        <div class="mono" style="font-size:10px;font-weight:700;color:var(--accent-primary);">
+          Deterministic In-Product Velocity &amp; Upgrade Triggers (GS-04)
+        </div>
+        <div class="mono" style="font-size:10px;color:var(--fg-secondary);">
+          • Trigger A (High-Velocity Proof): 5 resolved CI builds in 24h (84 shards → 5 credits, ~90m saved)<br/>
+          • Trigger B (Low Paid Balance Guard): Fires when paid_365d &lt; 1,000 ◈ (promo_90d excluded)<br/>
+          • Trigger C (2-Strike / Cross-Model Pair): Prompts Driver != Reviewer orthogonal pair review
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL 3: Dual-Rail OrgWallet Drawer (Stripe + $0-Fee Mercury B2B ACH · HB-10)
+       ====================================================================== -->
+  <div class="modal-backdrop" id="wallet-modal" role="dialog" aria-modal="true" aria-labelledby="wallet-modal-title">
+    <div class="modal-dialog">
+      <div class="modal-head">
+        <span id="wallet-modal-title">◈ OrgWallet Dual-Rail Billing &amp; 0-Credit Local Observation Contract (HB-10)</span>
+        <button type="button" class="act-btn" data-close-modal="wallet-modal">✕ Close (Esc)</button>
+      </div>
+
+      <div class="wallet-grid-2">
+        <div class="insp-card">
+          <div class="mono" style="font-size:10px;color:var(--fg-muted);">PAID LOTS (12-MO FIFO · AUTO-TOP-UP TRIGGER)</div>
+          <div class="mono" style="font-size:16px;font-weight:700;color:var(--accent-primary);">paid_365d: 6,975 ◈</div>
+          <div class="mono" style="font-size:10px;color:var(--fg-secondary);">Wave-1 Cohort: WAVE1_RESERVED (+25% · 0.512¢/msg)</div>
+        </div>
+        <div class="insp-card">
+          <div class="mono" style="font-size:10px;color:var(--fg-muted);">PROMO LOTS (90-DAY TTL · 50/50 CO-BURN)</div>
+          <div class="mono" style="font-size:16px;font-weight:700;color:var(--enum-amber-fg);">promo_90d: 840 ◈</div>
+          <div class="mono" style="font-size:10px;color:var(--fg-secondary);">Excluded from paid_365d &lt; 1,000 reload trigger</div>
+        </div>
+      </div>
+
+      <div class="wallet-grid-2">
+        <!-- Rail 1: Stripe Instant & Auto-Top-Up -->
+        <div class="insp-card">
+          <div class="mono" style="font-size:10.5px;font-weight:700;color:var(--accent-primary);">
+            Rail 1 · Stripe Instant Card / Apple Pay &amp; Option A Auto-Top-Up
+          </div>
+          <div style="font-size:11.5px;color:var(--fg-secondary);">
+            • <strong>$10 Starter Pack:</strong> <code>1,563 ◈</code> Wave-1 credits<br/>
+            • <strong>$50 Growth Pack:</strong> <code>7,813 ◈</code> Wave-1 credits (<code>0.512¢/credit</code>)<br/>
+            • <strong>Option A Auto-Top-Up:</strong> Reloads <code>$50 Growth</code> when <code>paid_365d &lt; 1,000 ◈</code> (Hard cap: <code>$250/mo</code>)
+          </div>
+          <button type="button" class="act-btn primary-emerald" id="stripe-topup-btn">✓ Enable $50 Auto-Top-Up (Cap: $250/mo)</button>
+        </div>
+
+        <!-- Rail 2: Mercury $0-Fee B2B ACH / Wire Invoicing -->
+        <div class="insp-card">
+          <div class="mono" style="font-size:10.5px;font-weight:700;color:var(--enum-amber-fg);">
+            Rail 2 · Mercury Invoicing ($0.00 / 0.0% Fee B2B ACH &amp; Wire)
+          </div>
+          <div style="font-size:11.5px;color:var(--fg-secondary);">
+            • <strong>$280 Scale Pack:</strong> <code>43,750 ◈</code> Wave-1 credits (~8,750 CI incidents)<br/>
+            • <strong>$1,000 Org Volume Pack:</strong> <code>195,313 ◈</code> Wave-1 credits (~39,000 CI incidents)<br/>
+            • <strong>Invoice ID:</strong> <code>cw_inv_emunlabs_lot20261106</code> (<code>0.0% ACH/Wire Fee</code>)
+          </div>
+          <button type="button" class="act-btn primary-amber" id="mercury-invoice-btn">◆ Generate $280 / $1,000 B2B ACH Invoice ($0 Fee)</button>
+        </div>
+      </div>
+
+      <div class="insp-card">
+        <div class="mono" style="font-size:10px;font-weight:700;">
+          0-Credit Local Observation Invariant (INV-ZERO-CREDIT-OBSERVE-01 · 95.6%–96.5% Gross Margin)
+        </div>
+        <div class="mono" style="font-size:10px;color:var(--fg-secondary);">
+          Local SSE stream (<code>GET /api/bus/stream</code>), <code>⌘K</code> search, local <code>.hpke</code> unsealing, and LAN <code>iroh</code> bus messages cost <strong>0 credits ($0.00 COGS)</strong>. 1 credit (0.640¢ base / 0.512¢ Wave-1) is debited strictly upon verified <code>✓ed25519 ReceiverAcceptedV1</code> for 20-shard coalesced cloud incidents.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL 4: Emergency Kill + Tombstone AlertDialog & ⌘K Search
+       ====================================================================== -->
+  <div class="modal-backdrop" id="kill-modal" role="alertdialog" aria-modal="true" aria-labelledby="kill-modal-title">
+    <div class="modal-dialog" style="max-width:540px;">
+      <div class="modal-head">
+        <span id="kill-modal-title" style="color:var(--accent-danger);">✕ Kill Worker Instance &amp; Record Tombstone</span>
+        <button type="button" class="act-btn" data-close-modal="kill-modal">Cancel (Esc)</button>
+      </div>
+      <div style="font-size:12px;color:var(--fg-secondary);" id="kill-modal-desc">
+        Kill worker <code>@RUST#7be266fc09a411e8b30c4f8395d102a4</code> (PID 48219 on Node 1 Mac Studio · <code>SIGTERM → 2s → SIGKILL</code>), revoke active <code>ApprovalGrantV1</code> leases, and record a <code>spector-fleet</code> tombstone so no future agent repeats this approach?
+      </div>
+      <input type="text" class="insp-input" id="kill-tombstone-reason" value="Rejected unpinned worktree preimage mutation; always verify expected_worktree_tree_oid first." aria-label="Tombstone Reason" />
+      <div style="display:flex;justify-content:flex-end;gap:6px;">
+        <button type="button" class="act-btn" data-close-modal="kill-modal">Cancel</button>
+        <button type="button" class="act-btn danger" id="confirm-kill-btn">✕ Confirm SIGTERM + Write Tombstone</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="live-bus-bridge.js"></script>
+  <script>
+    (function () {
+      "use strict";
+      var Bridge = window.ChinwagLiveBusBridge;
+
+      /* =====================================================================
+         1. Theme Switcher (Midnight | Daylight)
+         ===================================================================== */
+      var THEME_KEY = "chinwag_ui_theme_v2";
+      function applyTheme(raw) {
+        var t = raw && String(raw).toLowerCase() === "daylight" ? "daylight" : "midnight";
+        document.documentElement.setAttribute("data-theme", t);
+        try { localStorage.setItem(THEME_KEY, t); } catch (_) {}
+        document.querySelectorAll("[data-set-theme]").forEach(function (btn) {
+          btn.setAttribute("aria-pressed", btn.getAttribute("data-set-theme") === t ? "true" : "false");
+        });
+      }
+      var params = new URLSearchParams(window.location.search);
+      applyTheme(params.get("theme") || (function () { try { return localStorage.getItem(THEME_KEY); } catch (_) { return null; } })() || "midnight");
+      document.querySelectorAll("[data-set-theme]").forEach(function (btn) {
+        btn.addEventListener("click", function () { applyTheme(btn.getAttribute("data-set-theme")); });
+      });
+
+      /* =====================================================================
+         2. Missing H1 Hook Simulation (Consistent Across Banner, Cards & Inspector)
+         ===================================================================== */
+      var missingH1 = false;
+      var topH1Btn = document.getElementById("top-h1-btn");
+      function syncH1State() {
+        document.body.setAttribute("data-missing-h1", missingH1 ? "true" : "false");
+        if (topH1Btn) topH1Btn.setAttribute("aria-pressed", missingH1 ? "true" : "false");
+        document.querySelectorAll(".h1-dependent-proof").forEach(function (el) {
+          el.textContent = missingH1
+            ? "H1 git ls-remote: UNAVAILABLE (No RemoteReceiptV1) · Local checkpoint recorded"
+            : "H1 git ls-remote ✓ · H2 20/20 shards → 1 Cr (0.640¢) · WP-13 UiGate 64ms ✓";
+        });
+        document.querySelectorAll(".h1-dependent-status").forEach(function (el) {
+          el.innerHTML = missingH1
+            ? "OriginSigV1 + CloudRelayBlobSigV1 verified <b>✓ed25519</b> · Dependent compliance REFUSED (Missing H1)"
+            : "OriginSigV1 + CloudRelayBlobSigV1 verified <b>✓ed25519</b> · Ready for human review";
+        });
+        if (typeof syncSendBtnDisabled === "function") syncSendBtnDisabled();
+      }
+      if (topH1Btn) {
+        topH1Btn.addEventListener("click", function () {
+          missingH1 = !missingH1;
+          syncH1State();
+        });
+      }
+
+      /* =====================================================================
+         3. Tablet / Mobile Slide-Over Right Inspector Toggle (⌘B)
+         ===================================================================== */
+      var topInspBtn = document.getElementById("top-inspector-btn");
+      function toggleInspector(forceState) {
+        var cur = document.body.getAttribute("data-inspector-open") === "true";
+        var next = typeof forceState === "boolean" ? forceState : !cur;
+        document.body.setAttribute("data-inspector-open", next ? "true" : "false");
+        if (topInspBtn) topInspBtn.setAttribute("aria-expanded", next ? "true" : "false");
+      }
+      if (topInspBtn) {
+        topInspBtn.addEventListener("click", function () { toggleInspector(); });
+      }
+
+      /* =====================================================================
+         4. Room & 3-Mode Stream Lens Filtering
+         ===================================================================== */
+      var currentRoom = "#all";
+      var currentLens = "arcs";
+
+      function filterStreamCards() {
+        var cards = document.querySelectorAll("#wiretap-log .wiretap-card");
+        cards.forEach(function (card) {
+          var roomMatch = currentRoom === "#all" || card.getAttribute("data-room") === currentRoom;
+          var lensMatch = true;
+          if (currentLens === "queue") {
+            lensMatch = card.getAttribute("data-for-human") === "true";
+          }
+          card.style.display = roomMatch && lensMatch ? "flex" : "none";
+        });
+        document.querySelectorAll(".arc-coalesce-bar").forEach(function (bar) {
+          bar.style.display = currentLens === "raw" ? "none" : "flex";
+        });
+      }
+
+      document.querySelectorAll("[data-room-btn], [data-room-pill]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          currentRoom = btn.getAttribute("data-room-btn") || btn.getAttribute("data-room-pill") || "#all";
+          document.getElementById("active-room-indicator").textContent = currentRoom;
+          document.querySelectorAll("[data-room-btn]").forEach(function (b) {
+            b.classList.toggle("is-active", b.getAttribute("data-room-btn") === currentRoom);
+          });
+          document.querySelectorAll("[data-room-pill]").forEach(function (b) {
+            b.classList.toggle("is-emerald", b.getAttribute("data-room-pill") === currentRoom);
+          });
+          filterStreamCards();
+        });
+      });
+
+      document.querySelectorAll("[data-lens]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          currentLens = btn.getAttribute("data-lens");
+          document.querySelectorAll("[data-lens]").forEach(function (b) {
+            b.setAttribute("aria-selected", b === btn ? "true" : "false");
+          });
+          filterStreamCards();
+        });
+      });
+
+      /* =====================================================================
+         5. Scroll-Freeze Guard (INV-STREAM-MOTION-01)
+         ===================================================================== */
+      var wiretapLog = document.getElementById("wiretap-log");
+      var freezePill = document.getElementById("scroll-freeze-pill");
+      var jumpLiveBtn = document.getElementById("jump-live-btn");
+      var simSseBtn = document.getElementById("sim-sse-burst-btn");
+      var unseenCount = 0;
+
+      function isScrolledUp() {
+        if (!wiretapLog) return false;
+        return wiretapLog.scrollTop > 16;
+      }
+
+      if (wiretapLog) {
+        wiretapLog.addEventListener("scroll", function () {
+          if (isScrolledUp()) {
+            freezePill.classList.add("is-visible");
+          } else if (unseenCount === 0) {
+            freezePill.classList.remove("is-visible");
+          }
+        });
+      }
+
+      if (jumpLiveBtn) {
+        jumpLiveBtn.addEventListener("click", function () {
+          unseenCount = 0;
+          if (wiretapLog) wiretapLog.scrollTop = 0;
+          freezePill.classList.remove("is-visible");
+        });
+      }
+
+      if (simSseBtn) {
+        simSseBtn.addEventListener("click", function () {
+          unseenCount += 3;
+          document.getElementById("scroll-freeze-text").textContent =
+            "[II Wiretap Paused · +" + unseenCount + " new signed receipts in #eng (latest: ■ RUST#7be266…02a4 · 0.35ms)]";
+          freezePill.classList.add("is-visible");
+        });
+      }
+
+      /* =====================================================================
+         6. Physical 2-Mode Composer Fork, Auto-Snap (Guard A) & Collision (Guard B)
+         ===================================================================== */
+      var composerDock = document.getElementById("composer-dock");
+      var radioReply = document.getElementById("radio-mode-reply");
+      var radioWake = document.getElementById("radio-mode-wake");
+      var senderSelect = document.getElementById("composer-sender-select");
+      var targetInput = document.getElementById("composer-target-input");
+      var taskInput = document.getElementById("composer-task-input");
+      var preflightText = document.getElementById("composer-preflight-text");
+      var guardBanner = document.getElementById("composer-guard-banner");
+      var guardText = document.getElementById("composer-guard-text");
+      var guardActions = document.getElementById("composer-guard-actions");
+      var textarea = document.getElementById("composer-textarea");
+      var sendBtn = document.getElementById("composer-send-btn");
+      var sendLabel = document.getElementById("composer-send-label");
+
+      var composerMode = "reply"; // "reply" (wake: false) | "wake" (wake: true)
+      var pendingCollisionInstance = null;
+      var collisionBlocked = false;
+
+      function syncSendBtnDisabled() {
+        if (sendBtn) {
+          sendBtn.disabled = Boolean(missingH1 || collisionBlocked);
+        }
+      }
+
+      function lookupSeatMeta(seatName) {
+        var s = String(seatName || "").trim().toUpperCase();
+        if (Bridge && Bridge.CURATED_ROSTER_FIXTURE && Array.isArray(Bridge.CURATED_ROSTER_FIXTURE.nodes)) {
+          var nodes = Bridge.CURATED_ROSTER_FIXTURE.nodes;
+          for (var n = 0; n < nodes.length; n++) {
+            var seats = nodes[n].seats || [];
+            for (var i = 0; i < seats.length; i++) {
+              if (seats[i].seat === s) {
+                return { nodeLabel: nodes[n].name + " (" + seats[i].model };
+              }
+            }
+          }
+        }
+        return { nodeLabel: "Node 1 · Mac Studio (Gemini 4 Argon High" };
+      }
+
+      function setComposerMode(mode, targetVal, taskVal, autoSnapReason) {
+        composerMode = mode === "wake" ? "wake" : "reply";
+        composerDock.setAttribute("data-composer-mode", composerMode);
+        radioReply.setAttribute("aria-checked", composerMode === "reply" ? "true" : "false");
+        radioWake.setAttribute("aria-checked", composerMode === "wake" ? "true" : "false");
+
+        if (targetVal) targetInput.value = targetVal;
+        if (taskVal) taskInput.value = taskVal;
+
+        var rawTarget = targetInput.value.trim();
+
+        // Guard A: If in Mode 2 (wake) and target contains #<instance>, auto-snap to Mode 1!
+        if (composerMode === "wake" && rawTarget.indexOf("#") !== -1) {
+          composerMode = "reply";
+          composerDock.setAttribute("data-composer-mode", "reply");
+          radioReply.setAttribute("aria-checked", "true");
+          radioWake.setAttribute("aria-checked", "false");
+          autoSnapReason =
+            "Guard A (INV-THREAD-ID-01 Auto-Snap): Switched to Thread Reply (--wake: OFF). @" +
+            rawTarget +
+            " is an active instance—passing --wake to an existing instance is forbidden.";
+        }
+
+        if (composerMode === "reply") {
+          preflightText.textContent =
+            "Addressing live instance @" +
+            rawTarget +
+            " · Context preserved · --wake: OFF (Locked) · 0 spawn credits.";
+          textarea.placeholder =
+            "Send a signed instruction to @" + rawTarget + "… (⌘Enter to sign & send, S to inject mid-flight steer)";
+          sendBtn.className = "act-btn primary-emerald";
+          sendLabel.textContent = "✓ Sign & Send (Ed25519 · ⌘Enter)";
+        } else {
+          var bareSeat = rawTarget.replace(/^@/, "").split("#")[0] || "EAGLE-EYE";
+          targetInput.value = bareSeat;
+          var meta = lookupSeatMeta(bareSeat);
+          preflightText.textContent =
+            "Spawning new child worker @" +
+            bareSeat +
+            "#<csprng-128> on " +
+            meta.nodeLabel +
+            "). Replies route to " +
+            senderSelect.value +
+            " · --wake: ON · Est. 0 Local / 1 Cloud Cr (0.640¢).";
+          textarea.placeholder =
+            "Write a bounded task brief to wake @" + bareSeat + "… (Allocates a new 128-bit #instance and binds --task)";
+          sendBtn.className = "act-btn primary-amber";
+          sendLabel.textContent = "◈ Sign & Wake @" + bareSeat + " (Ed25519 · ⌘⇧Enter)";
+        }
+
+        // Check Guard B (Active-Instance Collision Guard) when in Wake Mode
+        collisionBlocked = false;
+        if (autoSnapReason) {
+          guardBanner.classList.add("is-visible");
+          guardText.textContent = autoSnapReason;
+          guardActions.style.display = "none";
+        } else if (composerMode === "wake" && Bridge) {
+          var collision = Bridge.checkActiveInstanceCollision(targetInput.value, taskInput.value);
+          if (collision) {
+            pendingCollisionInstance = collision;
+            collisionBlocked = true;
+            guardBanner.classList.add("is-visible");
+            guardText.textContent =
+              "[!] Guard B (Active-Instance Collision): ■ " +
+              collision.actor +
+              " is already " +
+              collision.state +
+              " on [" +
+              collision.task +
+              "] (heartbeat " +
+              collision.heartbeatAgeSec +
+              "s ago). Reply to that thread instead of spawning a duplicate worker?";
+            guardActions.style.display = "inline-flex";
+          } else {
+            guardBanner.classList.remove("is-visible");
+          }
+        } else {
+          guardBanner.classList.remove("is-visible");
+        }
+        syncSendBtnDisabled();
+
+        // Restore draft from sessionStorage
+        if (Bridge) {
+          var saved = Bridge.loadComposerDraft(currentRoom, targetInput.value);
+          if (saved && !textarea.value) textarea.value = saved;
+        }
+      }
+
+      radioReply.addEventListener("click", function () {
+        var cur = targetInput.value.trim();
+        if (cur.indexOf("#") === -1) cur = "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA";
+        setComposerMode("reply", cur, taskInput.value);
+      });
+
+      radioWake.addEventListener("click", function () {
+        var bare = targetInput.value.trim().split("#")[0] || "EAGLE-EYE";
+        setComposerMode("wake", bare, taskInput.value);
+      });
+
+      targetInput.addEventListener("input", function () {
+        setComposerMode(composerMode, targetInput.value, taskInput.value);
+      });
+      taskInput.addEventListener("input", function () {
+        setComposerMode(composerMode, targetInput.value, taskInput.value);
+      });
+      textarea.addEventListener("input", function () {
+        if (Bridge) Bridge.saveComposerDraft(currentRoom, targetInput.value, textarea.value);
+      });
+
+      document.getElementById("guard-switch-reply-btn").addEventListener("click", function () {
+        if (pendingCollisionInstance) {
+          setComposerMode("reply", pendingCollisionInstance.actor, pendingCollisionInstance.task);
+        }
+      });
+      document.getElementById("guard-force-parallel-btn").addEventListener("click", function () {
+        collisionBlocked = false;
+        syncSendBtnDisabled();
+        guardBanner.classList.remove("is-visible");
+      });
+
+      // Wire reply & wake buttons across cards and left rail
+      document.querySelectorAll("[data-reply-instance]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          setComposerMode(
+            "reply",
+            btn.getAttribute("data-reply-instance"),
+            btn.getAttribute("data-reply-task")
+          );
+          textarea.focus();
+        });
+      });
+
+      document.querySelectorAll("[data-wake-bare]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          setComposerMode("wake", btn.getAttribute("data-wake-bare"), taskInput.value || "CHWG-HUMAN-BUS-UI-PRD-01");
+          textarea.focus();
+        });
+      });
+
+      // Dispatch Human Bus Message
+      async function handleSend() {
+        var bodyText = textarea.value.trim() || "Verified preimage and H1..H5 hooks; proceed with next step.";
+        try {
+          var receipt = await Bridge.sendBusMessage({
+            from: senderSelect.value,
+            to: targetInput.value.trim(),
+            room: currentRoom === "#all" ? "#eng" : currentRoom,
+            task: taskInput.value.trim() || "CHWG-HUMAN-BUS-UI-PRD-01",
+            wake: composerMode === "wake",
+            body: bodyText
+          });
+          preflightText.textContent =
+            "✓ Dispatched " +
+            receipt.msgId +
+            " (" +
+            receipt.signatureScheme +
+            ") → @" +
+            receipt.to +
+            (receipt.deduplicated ? " [60s Idempotency Deduplicated]" : "");
+          Bridge.saveComposerDraft(currentRoom, targetInput.value, "");
+          textarea.value = "";
+        } catch (err) {
+          guardBanner.classList.add("is-visible");
+          guardText.textContent = err.message;
+          guardActions.style.display = "none";
+        }
+      }
+      sendBtn.addEventListener("click", handleSend);
+
+      // Mobile Composer Expand
+      var mobExpandBtn = document.getElementById("mob-expand-composer-btn");
+      if (mobExpandBtn) {
+        mobExpandBtn.addEventListener("click", function () {
+          composerDock.classList.toggle("is-mobile-expanded");
+        });
+      }
+
+      /* =====================================================================
+         7. Right Inspector Selection, ApprovalGrantV1 & Safe-Point Steer
+         ===================================================================== */
+      function selectActorInInspector(fullActor, taskRef) {
+        var fmt = Bridge ? Bridge.formatInstanceMiddleEllipsis(fullActor) : { seat: fullActor, shortInstance: "", full: fullActor };
+        document.getElementById("insp-actor-pill").textContent = "■ " + fmt.seat + fmt.shortInstance;
+        var fullEl = document.getElementById("insp-full-actor");
+        fullEl.textContent = fmt.full;
+        fullEl.setAttribute("data-actor", fmt.full);
+        document.getElementById("insp-dl-actor").textContent = "■ " + fmt.full;
+        if (taskRef) {
+          document.getElementById("insp-dl-thread").textContent = currentRoom + " / task:" + taskRef;
+        }
+        document.getElementById("steer-target-label").textContent = fmt.full;
+      }
+
+      document.querySelectorAll("[data-select-actor]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var act = btn.getAttribute("data-select-actor");
+          var tsk = btn.getAttribute("data-task");
+          selectActorInInspector(act, tsk);
+          setComposerMode("reply", act, tsk);
+        });
+      });
+
+      document.getElementById("copy-actor-btn").addEventListener("click", function () {
+        var full = document.getElementById("insp-full-actor").getAttribute("data-actor");
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(full).catch(function () {});
+        }
+        document.getElementById("copy-actor-btn").textContent = "✓ Copied";
+      });
+
+      // ApprovalGrantV1 Ratification (with TOCTOU Preimage Verification · HB-07)
+      async function ratifyGrant(decision) {
+        var simDrift = document.getElementById("sim-toctou-drift-chk").checked;
+        var res = await Bridge.submitApprovalGrant({
+          grant_class: "ExactActionGrant",
+          task_ref: "CHWG-HUMAN-BUS-UI-PRD-01",
+          grantee_actor: "RUST#7be266fc09a411e8b30c4f8395d102a4",
+          expected_task_spec_digest: "blake3:9f8a7c12e4019b2c",
+          expected_worktree_tree_oid: "7a11c08f",
+          live_worktree_tree_oid: simDrift ? "e904b11c" : "7a11c08f",
+          decision: decision
+        });
+
+        var preimageBox = document.getElementById("insp-grant-preimage");
+        var statusEl = document.getElementById("insp-grant-status");
+        var tray = document.getElementById("pinned-grant-tray");
+
+        if (res.stalePreimage) {
+          statusEl.textContent = "[! 409 STALE_PREIMAGE · TOCTOU WORKTREE DRIFT DETECTED]";
+          statusEl.style.color = "var(--enum-amber-fg)";
+          preimageBox.style.borderColor = "var(--enum-amber-fg)";
+          preimageBox.textContent =
+            "ERROR 409 Conflict (STALE_PREIMAGE):\n" +
+            "expected_worktree_tree_oid : 7a11c08f\n" +
+            "live_worktree_tree_oid     : e904b11c [DRIFTED · #FFB000]\n" +
+            "Uncheck drift simulation or re-verify diff to sign.";
+          toggleInspector(true);
+          return;
+        }
+
+        statusEl.textContent =
+          decision === "approve"
+            ? "✓ ExactActionGrant Signed (" + res.sig.slice(0, 18) + " · K2 Appended)"
+            : "✕ Grant Rejected & Tombstone Written to spector-fleet";
+        statusEl.style.color = decision === "approve" ? "var(--accent-primary)" : "var(--accent-danger)";
+        tray.classList.add("is-resolved");
+        document.getElementById("tray-grant-headline").textContent =
+          decision === "approve"
+            ? "✓ ExactActionGrant Ratified by ● Brian#ui-9f8a…9b2c (Touch ID · Ed25519 · K2 Audit Log Appended)"
+            : "✕ ExactActionGrant Rejected & Tombstoned by ● Brian#ui-9f8a…9b2c";
+      }
+
+      document.getElementById("tray-approve-btn").addEventListener("click", function () { ratifyGrant("approve"); });
+      document.getElementById("insp-approve-grant-btn").addEventListener("click", function () { ratifyGrant("approve"); });
+      document.getElementById("tray-reject-btn").addEventListener("click", function () { ratifyGrant("reject_and_tombstone"); });
+      document.getElementById("insp-reject-grant-btn").addEventListener("click", function () { ratifyGrant("reject_and_tombstone"); });
+
+      // Mid-Flight Safe-Point Steer (CHWG-PAT-05)
+      document.querySelectorAll("[data-focus-steer]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var target = btn.getAttribute("data-focus-steer");
+          selectActorInInspector(target, "P0-06");
+          toggleInspector(true);
+          document.getElementById("steer-input").focus();
+        });
+      });
+
+      document.getElementById("steer-submit-btn").addEventListener("click", async function () {
+        var target = document.getElementById("steer-target-label").textContent;
+        var res = await Bridge.steerWorker({
+          target_instance: target,
+          task: "P0-06",
+          mode: "safe_point_graft",
+          body: document.getElementById("steer-input").value
+        });
+        document.getElementById("steer-receipt-status").textContent =
+          "✓ " + res.deltaLabel + " → " + target + " (" + res.status + ")";
+        var badge = document.getElementById("workhorse-steer-badge");
+        if (badge) {
+          badge.textContent = "+0.4s GRAFTED";
+          badge.className = "rail-badge emerald";
+        }
+        var card = document.querySelector('[data-card-id="msg-4814"]');
+        if (card) {
+          card.classList.remove("just-steered");
+          void card.offsetWidth;
+          card.classList.add("just-steered");
+        }
+      });
+
+      /* =====================================================================
+         8. Modals (Export Redacted Receipt, Loop A Invite, OrgWallet, Kill)
+         ===================================================================== */
+      function openModal(id) {
+        var m = document.getElementById(id);
+        if (m) m.classList.add("is-open");
+      }
+      function closeModal(id) {
+        var m = document.getElementById(id);
+        if (m) m.classList.remove("is-open");
+      }
+      document.querySelectorAll("[data-close-modal]").forEach(function (btn) {
+        btn.addEventListener("click", function () { closeModal(btn.getAttribute("data-close-modal")); });
+      });
+
+      var currentExportSpec = { receiptId: "rcpt_01J9F4K8M2X9Q7", taskRef: "CHWG-HUMAN-BUS-UI-PRD-01", theme: "midnight" };
+      async function renderExportModal(fmt) {
+        currentExportSpec.theme = fmt === "svg_daylight" ? "daylight" : "midnight";
+        var res = await Bridge.exportRedactedReceipt(currentExportSpec);
+        var box = document.getElementById("export-output-box");
+        box.textContent = fmt === "markdown" ? res.markdown : res.svg;
+        document.getElementById("export-copy-toast").textContent =
+          "Signature: " + res.receiptEd25519Sig + " · 0 repo paths leaked";
+      }
+
+      document.querySelectorAll("[data-export-card], #open-export-top-btn").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          currentExportSpec.receiptId = btn.getAttribute("data-export-card") || "rcpt_01J9F4K8M2X9Q7";
+          currentExportSpec.taskRef = btn.getAttribute("data-export-task") || "CHWG-HUMAN-BUS-UI-PRD-01";
+          renderExportModal("markdown");
+          openModal("export-receipt-modal");
+        });
+      });
+
+      document.querySelectorAll("[data-export-fmt]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          document.querySelectorAll("[data-export-fmt]").forEach(function (b) {
+            b.classList.toggle("primary-emerald", b === btn);
+          });
+          renderExportModal(btn.getAttribute("data-export-fmt"));
+        });
+      });
+
+      document.getElementById("copy-export-btn").addEventListener("click", function () {
+        var txt = document.getElementById("export-output-box").textContent;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(txt).catch(function () {});
+        }
+        document.getElementById("export-copy-toast").textContent =
+          "✓ Copied signed Contribution Receipt (0 source lines, H1..H5 verified · chinwag.sh/r/@emunlabs)";
+      });
+
+      // Invite Modal
+      var INVITE_PRESETS = {
+        em: "Subject: Join emunlabs/chinwag on local Glass-Box Wiretap ($0/seat · +75 Org Credits)\nWatch real-time agent handoffs, 20-shard -> 1-credit CI repairs, and 2-strike circuit breakers live on 127.0.0.1 at $0/seat:\n  chinwag enroll --org emunlabs --role eng-mgmt --token inv_loopA_01J9F4K8",
+        designer: "Subject: Inspect Midnight & Daylight WP-13 Visual Tribunal Receipts ($0/seat · +75 Org Credits)\nInspect DOM bounding-box receipts (INV-UI-BLEED = 0.0px) and 2/3 Design Tribunal verdicts locally at $0/seat:\n  chinwag enroll --org emunlabs --role product-design --token inv_loopA_01J9F4K8",
+        ciso: "Subject: Audit OrgPolicyFloorV1 & X25519MLKEM768 Zero-Knowledge E2EE ($0/seat · +75 Org Credits)\nVerify 0B cloud plaintext (SignedHpkeBlobV1) and sign OrgPolicyFloorV1 Epoch #4 rules locally at $0/seat:\n  chinwag enroll --org emunlabs --role ciso-secops --token inv_loopA_01J9F4K8"
+      };
+      document.querySelectorAll("#top-invite-btn, #mob-invite-btn").forEach(function (b) {
+        b.addEventListener("click", function () { openModal("invite-modal"); });
+      });
+      document.querySelectorAll("[data-invite-preset]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var p = btn.getAttribute("data-invite-preset");
+          document.getElementById("invite-preview-box").textContent = INVITE_PRESETS[p] || INVITE_PRESETS.em;
+        });
+      });
+
+      // Wallet Modal
+      document.querySelectorAll("#top-wallet-btn, #mob-wallet-btn, #top-search-btn").forEach(function (b) {
+        b.addEventListener("click", function () { openModal("wallet-modal"); });
+      });
+
+      // Kill Modal
+      document.getElementById("open-kill-modal-btn").addEventListener("click", function () {
+        openModal("kill-modal");
+      });
+      document.getElementById("confirm-kill-btn").addEventListener("click", async function () {
+        await Bridge.killWorker({
+          target_instance: "RUST#7be266fc09a411e8b30c4f8395d102a4",
+          signal: "SIGTERM",
+          tombstone: {
+            id: "tombstone-unpinned-preimage-v1",
+            file_scope: "crates/chinwag-cli/src/**",
+            reason: document.getElementById("kill-tombstone-reason").value,
+            alternative: "Verify expected_worktree_tree_oid before signing."
+          }
+        });
+        closeModal("kill-modal");
+      });
+
+      /* =====================================================================
+         9. Global Keyboard Shortcuts (⌘K, ⌘B, R, W, S, Alt+A, Alt+R, Esc)
+         ===================================================================== */
+      document.addEventListener("keydown", function (ev) {
+        var tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
+        var inInput = tag === "input" || tag === "textarea" || tag === "select";
+
+        if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "b") {
+          ev.preventDefault();
+          toggleInspector();
+          return;
+        }
+        if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
+          ev.preventDefault();
+          openModal("wallet-modal");
+          return;
+        }
+        if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") {
+          ev.preventDefault();
+          handleSend();
+          return;
+        }
+        if (ev.altKey && ev.key.toLowerCase() === "a") {
+          ev.preventDefault();
+          ratifyGrant("approve");
+          return;
+        }
+        if (ev.altKey && ev.key.toLowerCase() === "r") {
+          ev.preventDefault();
+          ratifyGrant("reject_and_tombstone");
+          return;
+        }
+        if (ev.key === "Escape") {
+          ["export-receipt-modal", "invite-modal", "wallet-modal", "kill-modal"].forEach(closeModal);
+          if (freezePill.classList.contains("is-visible")) {
+            unseenCount = 0;
+            if (wiretapLog) wiretapLog.scrollTop = 0;
+            freezePill.classList.remove("is-visible");
+          }
+          return;
+        }
+        if (!inInput) {
+          if (ev.key.toLowerCase() === "r") {
+            ev.preventDefault();
+            setComposerMode("reply", "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA", "P0-06");
+            textarea.focus();
+          } else if (ev.key.toLowerCase() === "w") {
+            ev.preventDefault();
+            setComposerMode("wake", "EAGLE-EYE", "CHWG-HUMAN-BUS-UI-PRD-01");
+            textarea.focus();
+          } else if (ev.key.toLowerCase() === "s") {
+            ev.preventDefault();
+            toggleInspector(true);
+            document.getElementById("steer-input").focus();
+          }
+        }
+      });
+
+      if (Bridge) {
+        Bridge.pollChinwagBus();
+        Bridge.connectBusStream({});
+      }
+    })();
+  </script>
+</body>
+</html>
