@@ -1903,7 +1903,11 @@ mod tests {
                 store.reject(&f.fixture.provider, &rejection).unwrap();
             } else {
                 store
-                    .reserve(&f.fixture.provider, std::slice::from_ref(&approved), request())
+                    .reserve(
+                        &f.fixture.provider,
+                        std::slice::from_ref(&approved),
+                        request(),
+                    )
                     .unwrap();
             }
             let path = f.namespace.join(REVIEW_STATE_FILE_NAME);
