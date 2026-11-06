@@ -150,6 +150,7 @@ fn validate_record(record: &[u8]) -> Result<(), SchedulerJournalError> {
 
 #[derive(Debug)]
 pub(crate) struct SchedulerJournal {
+    filename: &'static str,
     directory: File,
     file: File,
     uid: u32,
@@ -165,6 +166,23 @@ pub(crate) struct SchedulerJournal {
 
 impl SchedulerJournal {
     pub(crate) fn open(directory: &File, expected_uid: u32) -> Result<Self, SchedulerJournalError> {
+        Self::open_named(directory, expected_uid, SCHEDULER_JOURNAL_FILE_NAME)
+    }
+    pub(crate) fn open_resource_leases(
+        directory: &File,
+        expected_uid: u32,
+    ) -> Result<Self, SchedulerJournalError> {
+        Self::open_named(
+            directory,
+            expected_uid,
+            "repository-resource-leases-v1.ndjson",
+        )
+    }
+    fn open_named(
+        directory: &File,
+        expected_uid: u32,
+        filename: &'static str,
+    ) -> Result<Self, SchedulerJournalError> {
         if expected_uid != rustix::process::geteuid().as_raw() {
             return Err(SchedulerJournalError::UnsafeMetadata);
         }
@@ -189,7 +207,7 @@ impl SchedulerJournal {
         let file = File::from(
             openat(
                 &retained,
-                SCHEDULER_JOURNAL_FILE_NAME,
+                filename,
                 OFlags::RDWR
                     | OFlags::CREATE
                     | OFlags::APPEND
@@ -207,18 +225,14 @@ impl SchedulerJournal {
             return Err(SchedulerJournalError::FileLimit);
         }
         let entry = regular_snapshot(
-            &statat(
-                &retained,
-                SCHEDULER_JOURNAL_FILE_NAME,
-                AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(fs_error)?,
+            &statat(&retained, filename, AtFlags::SYMLINK_NOFOLLOW).map_err(fs_error)?,
             expected_uid,
         )?;
         if snapshot != entry {
             return Err(SchedulerJournalError::IdentityChanged);
         }
         let mut journal = Self {
+            filename,
             directory: retained,
             file,
             uid: expected_uid,
@@ -284,12 +298,7 @@ impl SchedulerJournal {
         let parent = directory_snapshot(&self.directory, self.uid)?;
         let opened = regular_snapshot(&fstat(&self.file).map_err(fs_error)?, self.uid)?;
         let entry = regular_snapshot(
-            &statat(
-                &self.directory,
-                SCHEDULER_JOURNAL_FILE_NAME,
-                AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(fs_error)?,
+            &statat(&self.directory, self.filename, AtFlags::SYMLINK_NOFOLLOW).map_err(fs_error)?,
             self.uid,
         )?;
         if (parent.dev, parent.ino) != self.directory_identity

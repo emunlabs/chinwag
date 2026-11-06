@@ -53,6 +53,7 @@ pub enum SchedulerError {
     ReplayConflict,
     AlreadyActive,
     Journal(String),
+    ResourceLeaseHeld(String),
 }
 impl std::fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -218,6 +219,35 @@ pub struct ClaimedAssignment {
     id: String,
     digest: Sha256Digest,
     message: Box<VerifiedTaskMessage>,
+}
+/// Only this module can qualify a currently durable once-only claim. Public
+/// execution DTOs and string claim IDs cannot construct this capability.
+pub struct QualifiedLeaseAssignment {
+    binding: QualifiedLeaseBinding,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct QualifiedLeaseBinding {
+    pub scheduler_store: (u64, u64),
+    pub workspace: String,
+    pub repo: String,
+    pub authority_epoch: u64,
+    pub owner: String,
+    pub assignment: String,
+    pub operation: String,
+    pub write_scope_claim: String,
+    pub original_deadline: u64,
+    pub assignment_digest: [u8; 32],
+    #[serde(with = "crate::task_acceptance::TaskRefJson")]
+    pub task_ref: TaskRefV1,
+}
+impl QualifiedLeaseAssignment {
+    pub(crate) fn binding(&self) -> &QualifiedLeaseBinding {
+        &self.binding
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(binding: QualifiedLeaseBinding) -> Self {
+        Self { binding }
+    }
 }
 pub enum AdmissionDisposition {
     Claimed(ClaimedAssignment),
@@ -1089,11 +1119,73 @@ impl WorkspaceScheduler {
         })?;
         Ok(status)
     }
-    pub fn invoke(
+    #[cfg(test)]
+    fn invoke(
         &mut self,
         claim: ClaimedAssignment,
         a: &CurrentAuthority<'_>,
         executor: &mut impl ControlledExecutor,
+    ) -> Result<AdmissionStatus> {
+        self.invoke_checked(claim, a, |admission| Ok(executor.invoke(admission)))
+    }
+    pub fn qualify_for_lease(
+        &mut self,
+        claim: &ClaimedAssignment,
+        a: &CurrentAuthority<'_>,
+    ) -> Result<QualifiedLeaseAssignment> {
+        self.trusted_store(a)?;
+        self.journal
+            .verify()
+            .map_err(|e| SchedulerError::Journal(e.to_string()))?;
+        let row = self
+            .assignments
+            .get(&claim.id)
+            .cloned()
+            .ok_or(SchedulerError::Invalid)?;
+        self.synchronize_sources(a.registry)?;
+        if row.status != AdmissionStatus::Claimed || row.digest.0 != claim.digest.0 {
+            return Err(SchedulerError::ReplayConflict);
+        }
+        self.eligible(&claim.message, row.trigger, a)?;
+        Ok(QualifiedLeaseAssignment {
+            binding: QualifiedLeaseBinding {
+                scheduler_store: self.store_identity,
+                workspace: self.policy.workspace.clone(),
+                repo: self.policy.repo.clone(),
+                authority_epoch: self.policy.epoch,
+                owner: row.request.executor_actor.clone(),
+                assignment: row.id.clone(),
+                operation: row.operation.clone(),
+                write_scope_claim: row.request.write_scope_claim_id.clone(),
+                original_deadline: row.deadline,
+                assignment_digest: row.digest.0,
+                task_ref: row.reference.clone(),
+            },
+        })
+    }
+    pub fn invoke_with_lease(
+        &mut self,
+        claim: ClaimedAssignment,
+        a: &CurrentAuthority<'_>,
+        leases: &mut crate::task_resource_lease::ResourceLeaseStore,
+        capability: crate::task_resource_lease::CommittedWriteLease,
+        lease_authority: &crate::task_resource_lease::CurrentLeaseAuthority<'_>,
+        executor: &mut impl crate::task_resource_lease::LeasedExecutor,
+    ) -> Result<AdmissionStatus> {
+        let qualified = self.qualify_for_lease(&claim, a)?;
+        self.invoke_checked(claim, a, |admission| {
+            leases
+                .invoke(capability, &qualified, lease_authority, |writer| {
+                    executor.invoke(admission, writer)
+                })
+                .map_err(|error| SchedulerError::ResourceLeaseHeld(error.to_string()))
+        })
+    }
+    fn invoke_checked(
+        &mut self,
+        claim: ClaimedAssignment,
+        a: &CurrentAuthority<'_>,
+        invoke: impl FnOnce(&ExecutionAdmissionV1) -> Result<InvocationOutcome>,
     ) -> Result<AdmissionStatus> {
         self.trusted_store(a)?;
         self.journal
@@ -1129,7 +1221,19 @@ impl WorkspaceScheduler {
             })?;
             return Err(SchedulerError::Grant);
         }
-        let outcome = executor.invoke(&row.execution());
+        let outcome = match invoke(&row.execution()) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let mut rejected = row;
+                rejected.status = AdmissionStatus::RejectedBeforeInvocation;
+                rejected.outcome = Some("resource lease refused before callback".into());
+                self.append(Data::Assignment {
+                    assignment: Box::new(rejected),
+                    observed_at: self.now(a)?,
+                })?;
+                return Err(error);
+            }
+        };
         self.finish(&claim.id, outcome, self.now(a)?)
     }
     pub fn resolve_original(
@@ -1950,6 +2054,134 @@ mod tests {
             );
         }
         assert_eq!(s.dependency_blocked_reasons().len(), 2);
+    }
+    #[test]
+    fn p008_real_scheduler_claim_requires_committed_lease_before_protected_write() {
+        use crate::task_resource_lease::{
+            LeaseRequest, LeaseStatus, LeasedExecutor, ProtectedWriter, ResourceScope,
+        };
+        struct Writer {
+            calls: usize,
+        }
+        impl LeasedExecutor for Writer {
+            fn invoke(
+                &mut self,
+                admission: &ExecutionAdmissionV1,
+                writer: &mut ProtectedWriter<'_>,
+            ) -> InvocationOutcome {
+                self.calls += 1;
+                writer.write_file(0, b"guarded actual bytes").unwrap();
+                InvocationOutcome::ConfirmedRetired {
+                    original_operation_id: admission.original_operation_id.clone(),
+                    receipt_id: "controlled-original-retired".into(),
+                }
+            }
+        }
+        let f = Fixture::new(vec![vec![entry("A1")]]);
+        let mut s = f.open();
+        let task = s.select_next(&f.authority(150)).unwrap();
+        let message = message(&s, &f, &task.task_ref.task_key(), "leased-real", |_| {});
+        let claim = claim(&mut s, &message, &f, AdmissionTrigger::Manual);
+        let qualified = s.qualify_for_lease(&claim, &f.authority(150)).unwrap();
+        let fixture = crate::task_resource_lease::tests::Fixture::new(s.store_identity);
+        fs::write(fixture.root.path().join("code.rs"), b"before").unwrap();
+        let mut leases = fixture.open();
+        let cap = fixture.acquire(
+            &mut leases,
+            &qualified,
+            LeaseRequest {
+                scopes: vec![ResourceScope::File {
+                    path: "code.rs".into(),
+                }],
+                ttl_seconds: 120,
+            },
+        );
+        let mut writer = Writer { calls: 0 };
+        assert_eq!(
+            s.invoke_with_lease(
+                claim,
+                &f.authority(150),
+                &mut leases,
+                cap,
+                &fixture.authority(),
+                &mut writer
+            )
+            .unwrap(),
+            AdmissionStatus::Completed
+        );
+        assert_eq!(writer.calls, 1);
+        assert_eq!(
+            fs::read(fixture.root.path().join("code.rs")).unwrap(),
+            b"guarded actual bytes"
+        );
+        assert_eq!(leases.status("leased-real"), Some(LeaseStatus::Unknown));
+        assert!(matches!(
+            s.admit(&message, AdmissionTrigger::Event, &f.authority(150))
+                .unwrap(),
+            AdmissionDisposition::Existing(AdmissionStatus::Completed)
+        ));
+    }
+    #[test]
+    fn p008_expired_lease_is_proved_precallback_refusal_not_unknown_invocation() {
+        use crate::task_resource_lease::{
+            LeaseRequest, LeasedExecutor, ProtectedWriter, ResourceScope,
+        };
+        struct Never {
+            calls: usize,
+        }
+        impl LeasedExecutor for Never {
+            fn invoke(
+                &mut self,
+                _: &ExecutionAdmissionV1,
+                _: &mut ProtectedWriter<'_>,
+            ) -> InvocationOutcome {
+                self.calls += 1;
+                panic!("expired lease must never invoke")
+            }
+        }
+        let f = Fixture::new(vec![vec![entry("A1")]]);
+        let mut s = f.open();
+        let task = s.select_next(&f.authority(150)).unwrap();
+        let message = message(&s, &f, &task.task_ref.task_key(), "lease-expired", |_| {});
+        let claim = claim(&mut s, &message, &f, AdmissionTrigger::Manual);
+        let qualified = s.qualify_for_lease(&claim, &f.authority(150)).unwrap();
+        let fixture = crate::task_resource_lease::tests::Fixture::new(s.store_identity);
+        fs::write(fixture.root.path().join("code.rs"), b"unchanged").unwrap();
+        let mut leases = fixture.open();
+        let cap = fixture.acquire(
+            &mut leases,
+            &qualified,
+            LeaseRequest {
+                scopes: vec![ResourceScope::File {
+                    path: "code.rs".into(),
+                }],
+                ttl_seconds: 120,
+            },
+        );
+        fixture
+            .clock
+            .set(HostClockState::Verified { now_unix: 200 });
+        let mut never = Never { calls: 0 };
+        assert!(matches!(
+            s.invoke_with_lease(
+                claim,
+                &f.authority(150),
+                &mut leases,
+                cap,
+                &fixture.authority(),
+                &mut never
+            ),
+            Err(SchedulerError::ResourceLeaseHeld(_))
+        ));
+        assert_eq!(never.calls, 0);
+        assert_eq!(
+            s.status("lease-expired"),
+            Some(AdmissionStatus::RejectedBeforeInvocation)
+        );
+        assert_eq!(
+            fs::read(fixture.root.path().join("code.rs")).unwrap(),
+            b"unchanged"
+        );
     }
     #[test]
     fn p007_original_outcome_for_another_operation_cannot_release_unknown_claim() {
