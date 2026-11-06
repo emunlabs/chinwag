@@ -581,7 +581,7 @@
         <button type="button" class="sim-hook-btn" id="sim-h1-top-btn" aria-pressed="false" style="width:auto;padding:2px 8px;">
           [H1] Toggle Missing H1 Hook
         </button>
-        <span class="wb-pill">Decrypted Locally · X25519MLKEM768 · 0B Cloud Plaintext</span>
+        <span class="wb-pill">Verify-Before-Decrypt · OriginSigV1 + CloudRelaySigV1 (✓ed25519) · X25519MLKEM768</span>
         <div class="wb-theme-group" role="group" aria-label="Theme Switcher">
           <button type="button" class="wb-theme-btn" data-set-theme="midnight" aria-pressed="true">Midnight</button>
           <button type="button" class="wb-theme-btn" data-set-theme="daylight" aria-pressed="false">Daylight</button>
@@ -625,6 +625,8 @@
             <div>✓ WP-06 Accept Separate</div>
             <div>✓ WP-08 2-Seat Policy</div>
             <div>✓ WP-13 UiGateReceiptV1</div>
+            <div>✓ WP-14 Dual-Sig .hpke</div>
+            <div>✓ WP-15 CloudSignedMsgV1</div>
           </div>
         </div>
       </aside>
