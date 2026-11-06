@@ -24,11 +24,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RATCHET_WORKHORSE_COMBINED_FLOOR: "288"
-  RATCHET_CHINWAG_CLI_LIB_FLOOR: "284"
+  RATCHET_WORKHORSE_COMBINED_FLOOR: "320"
+  RATCHET_CHINWAG_CLI_LIB_FLOOR: "298"
   RATCHET_CHINWAG_CLI_P0_ADV_FLOOR: "22"
-  RATCHET_CHINWAG_CLI_TOTAL_FLOOR: "392"
-  RATCHET_WORKSPACE_TOTAL_FLOOR: "750"
+  RATCHET_CHINWAG_CLI_TOTAL_FLOOR: "408"
+  RATCHET_WORKSPACE_TOTAL_FLOOR: "766"
 
 jobs:
   stage1-h2-cleanroom-rust-gate:
@@ -42,9 +42,30 @@ jobs:
           fetch-depth: 0
 
       - name: Verify WORKHORSE Test Suite, Clippy, Formatting & Monotonic Ratchet (288+ Floor)
+        id: h2_gate
         run: |
           chmod +x ./scripts/verify-workhorse-test-suite.sh
           ./scripts/verify-workhorse-test-suite.sh --sync-node2
+
+      - name: "Execute Autonomous CI Board & Direct-to-Agent Report (INV-CI-BOARD-MUTATION-01 / INV-DIRECT-CI-AGENT-ROUTING-01)"
+        if: always()
+        env:
+          H2_OUTCOME: ${{ steps.h2_gate.outcome }}
+        run: |
+          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+          CHINWAG_BIN="./target/release/chinwag"
+          if [[ ! -x "$CHINWAG_BIN" ]] && command -v chinwag >/dev/null 2>&1; then
+            CHINWAG_BIN="$(command -v chinwag)"
+          fi
+          if [[ -x "$CHINWAG_BIN" ]]; then
+            CI_TASKS_DIR="${RUNNER_TEMP:-/tmp}/chinwag-ci-tasks-${GITHUB_RUN_ID:-local}"
+            "$CHINWAG_BIN" tasks init --tasks-dir "$CI_TASKS_DIR" --id "CHWG-BOARD-CORE-01" --title "CI Runner Board Sync Verification" --tier "M" --json
+            if [[ "$H2_OUTCOME" == "success" ]]; then
+              "$CHINWAG_BIN" ci-report --issue "CHWG-BOARD-CORE-01" --status pass --gate "H2-Cleanroom-CI" --push-boards --tasks-dir "$CI_TASKS_DIR"
+            else
+              "$CHINWAG_BIN" ci-report --issue "CHWG-BOARD-CORE-01" --status fail --gate "H2-Cleanroom-CI" --diagnostic "Stage 1 H2 Cleanroom gate failed on ${GITHUB_REF_NAME:-branch}" --push-boards --tasks-dir "$CI_TASKS_DIR"
+            fi
+          fi
 
   stage2-h-board-security-sentinel:
     name: "Stage 2 — H_board & Security Sentinel (INV-ZERO-ANTHROPIC-01 / INV-BOARD-ZERO-LEAK-01)"
