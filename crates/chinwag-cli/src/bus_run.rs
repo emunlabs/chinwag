@@ -40,7 +40,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 pub const BUS_ALPN: &[u8] = b"chinwag/bus/1";
@@ -520,6 +520,23 @@ fn read_all_messages(repo_root: &Path) -> Vec<BusMessage> {
     // This legacy query is observational. It must not create/chmod a lock or
     // silently acquire mutation authority merely to render a history view.
     read_all_messages_unlocked(repo_root)
+}
+
+/// Diagnostic row count only: the history reader counts every parseable message
+/// even when verification fails. Avoid discarded signature checks on the room
+/// owner task; actual message queries and publication still verify signatures.
+fn count_parseable_journal_messages(repo_root: &Path) -> usize {
+    let Ok(file) = File::open(messages_jsonl_path(repo_root)) else {
+        return 0;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && serde_json::from_str::<BusMessage>(trimmed).is_ok()
+        })
+        .count()
 }
 
 /// The journal is the original durable publication store. Existing SQLite
@@ -1194,11 +1211,11 @@ impl NativePublication {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RoomOwnerFailure {
     PresenceExpired,
-    RenewalUnknown,
-    SessionEnded,
+    RenewalUnknown(String),
+    ReceiveFailed(String),
 }
 
 type RoomOwnerFuture<'a> =
@@ -1219,16 +1236,18 @@ async fn drive_daemon_room(
         };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {
-                if client.renew_daemon_presence(identity, session).await.is_err() {
-                    return RoomOwnerFailure::RenewalUnknown;
+                if let Err(error) = client.renew_daemon_presence(identity, session).await {
+                    return RoomOwnerFailure::RenewalUnknown(error.to_string());
                 }
                 // Only a bounded diagnostic notification; gate state, not this
                 // notification, remains authoritative for every publication.
                 let _ = renewed.try_send(());
             }
             update = session.receive_daemon_peer() => {
-                if update.is_err() {
-                    return RoomOwnerFailure::SessionEnded;
+                if let Err(error) = update {
+                    // Room errors expose fixed, sanitized Display messages.
+                    // Keep that reason without logging Debug/source chains.
+                    return RoomOwnerFailure::ReceiveFailed(error.to_string());
                 }
             }
         }
@@ -1430,7 +1449,7 @@ async fn run_daemon_loop_inner(
         .to_string_lossy()
         .to_string();
 
-    let initial_count = read_all_messages(&repo_root).len() as u64;
+    let initial_count = count_parseable_journal_messages(&repo_root) as u64;
     let state = Arc::new(Mutex::new(DaemonState {
         ok: true,
         pid: std::process::id(),
@@ -1522,12 +1541,12 @@ async fn run_daemon_loop_inner(
             }
             failure = &mut room_driver => {
                 let message = match failure {
-                    RoomOwnerFailure::PresenceExpired => "chinwag bus network HELD: transport presence expired",
-                    RoomOwnerFailure::RenewalUnknown => "chinwag bus network HELD: transport presence renewal unknown or refused; no retry",
-                    RoomOwnerFailure::SessionEnded => "chinwag bus network HELD: original room session ended",
+                    RoomOwnerFailure::PresenceExpired => "chinwag bus network HELD: transport presence expired".to_owned(),
+                    RoomOwnerFailure::RenewalUnknown(reason) => format!("chinwag bus network HELD: transport presence renewal unknown or refused: {reason}; no retry"),
+                    RoomOwnerFailure::ReceiveFailed(reason) => format!("chinwag bus network HELD: original room receive failed: {reason}; no retry"),
                 };
                 let _ = writeln!(stdout, "{message}");
-                if failure != RoomOwnerFailure::SessionEnded { exit_code = 1; }
+                exit_code = 1;
                 break;
             }
             Some(()) = renewed_rx.recv() => {
@@ -1577,13 +1596,23 @@ async fn run_daemon_loop_inner(
                     let _ = writeln!(stdout, "{record}"); let _ = stdout.flush();
                 }
             }
-            _ = heartbeat.tick() => {
-                let count = read_all_messages(&repo_root).len() as u64;
+            scheduled = heartbeat.tick() => {
+                let tick_late_ms = scheduled.elapsed().as_millis();
+                let scan_started = Instant::now();
+                let count = count_parseable_journal_messages(&repo_root) as u64;
+                let journal_scan_ms = scan_started.elapsed().as_millis();
+                let state_started = Instant::now();
                 let update = state.lock().map_err(|_| ()).and_then(|mut guard| {
                     guard.last_heartbeat = unix_now();
                     guard.total_messages = count;
                     write_daemon_state(&repo_root, &guard)
                 });
+                let record = json!({"event":"native_bus_heartbeat_timing",
+                    "tick_late_ms":tick_late_ms,"journal_scan_ms":journal_scan_ms,
+                    "state_replace_ms":state_started.elapsed().as_millis(),
+                    "state_update_ok":update.is_ok(),"scope":"DIAGNOSTIC_NOT_TASK_AUTHORITY"});
+                let _ = writeln!(stdout, "{record}");
+                let _ = stdout.flush();
                 if update.is_err() {
                     let _ = writeln!(stdout, "chinwag bus HELD: diagnostic state update failed");
                     exit_code = 1;
@@ -2669,6 +2698,68 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diagnostic_count_fixture_row() -> serde_json::Value {
+        json!({
+            "id": "diagnostic-only", "seq": 1, "ts_unix": 1, "ts_iso": "",
+            "room": "#test", "sender": "unregistered actor", "sender_cast": "",
+            "sender_endpoint_id": "invalid endpoint", "to": null, "task_id": null,
+            "body": "controlled fixture", "digest_sha256": "invalid digest"
+        })
+    }
+
+    #[test]
+    fn diagnostic_journal_count_matches_history_parse_eligibility_not_verification() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = messages_jsonl_path(repo.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let unsigned = diagnostic_count_fixture_row();
+        let mut invalid_signature = unsigned.clone();
+        invalid_signature["pubkey_ed25519"] = json!("not a key");
+        invalid_signature["signature_ed25519"] = json!("not a signature");
+        let mut forged_verified = invalid_signature.clone();
+        forged_verified["sig_verified"] = json!(true);
+        forged_verified["to"] = json!("invalid recipient");
+        let mut wrong_type = unsigned.clone();
+        wrong_type["seq"] = json!("one");
+        // CRLF, whitespace, rejected shapes, and a final row without newline.
+        fs::write(
+            &path,
+            format!(
+                " \r\n{unsigned}\r\nnot-json\n{{}}\n{wrong_type}\n  {invalid_signature}  \n{forged_verified}"
+            ),
+        )
+        .unwrap();
+        let history = read_all_messages(repo.path());
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().all(|message| !message.sig_verified));
+        assert_eq!(count_parseable_journal_messages(repo.path()), history.len());
+    }
+
+    #[test]
+    fn diagnostic_journal_count_stops_at_first_invalid_utf8_line() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = messages_jsonl_path(repo.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let row = diagnostic_count_fixture_row().to_string();
+        let mut bytes = format!("{row}\n").into_bytes();
+        bytes.extend_from_slice(b"\xff\n");
+        bytes.extend_from_slice(row.as_bytes());
+        fs::write(path, bytes).unwrap();
+        assert_eq!(count_parseable_journal_messages(repo.path()), 1);
+        assert_eq!(read_all_messages(repo.path()).len(), 1);
+    }
+
+    #[test]
+    fn diagnostic_journal_count_open_failure_matches_empty_history() {
+        let repo = tempfile::tempdir().unwrap();
+        assert_eq!(count_parseable_journal_messages(repo.path()), 0);
+        assert!(read_all_messages(repo.path()).is_empty());
+        // Deterministic open failure, independent of the test user's privileges.
+        fs::write(repo.path().join(".chinwag"), b"not a directory").unwrap();
+        assert_eq!(count_parseable_journal_messages(repo.path()), 0);
+        assert!(read_all_messages(repo.path()).is_empty());
+    }
 
     #[test]
     fn consumer01_receipt_transcript_matches_existing_bus_signature_and_wire() {

@@ -232,6 +232,70 @@ async fn pending_room_owner_does_not_starve_local_publication_or_observation() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn room_receive_failure_exits_unsuccessfully() {
+    use chinwag_swarm::room::Error;
+    for (error, expected) in [
+        (Error::Malformed, "the room response is malformed"),
+        (
+            Error::WebSocket("protocol"),
+            "the room WebSocket operation failed (protocol)",
+        ),
+        (
+            Error::WebSocketClosed(1000),
+            "the room WebSocket closed with code 1000",
+        ),
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temporary.path()).unwrap();
+        let _original = super::tests::native_publication_fixture(&root);
+        let mut output = Vec::new();
+        let exit = run_daemon_loop_inner(
+            root,
+            0,
+            None,
+            true,
+            &mut output,
+            std::future::pending(),
+            Some(Box::pin(async move {
+                RoomOwnerFailure::ReceiveFailed(error.to_string())
+            })),
+        )
+        .await;
+        assert_eq!(exit, 1, "unexpected room failure must not report success");
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(&format!(
+            "original room receive failed: {expected}; no retry"
+        )));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn room_renewal_failure_exits_unsuccessfully_and_preserves_reason() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temporary.path()).unwrap();
+    let _original = super::tests::native_publication_fixture(&root);
+    let mut output = Vec::new();
+    let exit = run_daemon_loop_inner(
+        root,
+        0,
+        None,
+        true,
+        &mut output,
+        std::future::pending(),
+        Some(Box::pin(async {
+            RoomOwnerFailure::RenewalUnknown(
+                chinwag_swarm::room::Error::Http("timeout").to_string(),
+            )
+        })),
+    )
+    .await;
+    assert_eq!(exit, 1);
+    assert!(String::from_utf8(output).unwrap().contains(
+        "transport presence renewal unknown or refused: the room HTTP request failed (timeout); no retry"
+    ));
+}
+
 async fn wait_for_owned_daemon(root: &Path) -> Result<DaemonState, String> {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
