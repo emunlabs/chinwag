@@ -54,6 +54,7 @@ pub enum SchedulerError {
     AlreadyActive,
     Journal(String),
     ResourceLeaseHeld(String),
+    ExecutionBindingHeld(String),
 }
 impl std::fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1012,7 +1013,7 @@ impl WorkspaceScheduler {
             now,
         })
     }
-    pub fn admit(
+    fn admit_inner(
         &mut self,
         m: &VerifiedTaskMessage,
         trigger: AdmissionTrigger,
@@ -1082,6 +1083,54 @@ impl WorkspaceScheduler {
             message: Box::new(m.clone()),
         }))
     }
+
+    #[cfg(test)]
+    fn admit(
+        &mut self,
+        message: &VerifiedTaskMessage,
+        trigger: AdmissionTrigger,
+        authority: &CurrentAuthority<'_>,
+    ) -> Result<AdmissionDisposition> {
+        self.admit_inner(message, trigger, authority)
+    }
+
+    /// Current execution enrollment is checked before a fresh claim can be
+    /// consumed. A message's binding ID is a correlation field, not authority.
+    pub fn admit_bound(
+        &mut self,
+        message: &VerifiedTaskMessage,
+        trigger: AdmissionTrigger,
+        authority: &CurrentAuthority<'_>,
+        binding: &crate::execution_binding::WorkspaceExecutionBinding,
+        execution_authority: &crate::execution_binding::ExecutionAuthority<'_>,
+    ) -> Result<AdmissionDisposition> {
+        binding
+            .revalidate(execution_authority)
+            .map_err(|error| SchedulerError::ExecutionBindingHeld(error.to_string()))?;
+        binding
+            .validate_task_ref(&message.authenticated().transcript().task_ref)
+            .map_err(|error| SchedulerError::ExecutionBindingHeld(error.to_string()))?;
+        let source_root = authority.registry.root_pin();
+        let profile = authority
+            .profile
+            .as_ref()
+            .ok_or(SchedulerError::UnsupportedAdapters)?;
+        if binding.workspace_id() != self.policy.workspace
+            || binding.repo_id() != self.policy.repo
+            || binding.commitment_id() != profile.execution_binding
+            || binding.source_root() != source_root.path
+            || binding.source_root_identity() != (source_root.dev, source_root.ino)
+            || binding.source_root_generation() != source_root.generation
+        {
+            return Err(SchedulerError::ExecutionBindingHeld(
+                "current enrollment differs".into(),
+            ));
+        }
+        source_root
+            .verify()
+            .map_err(|error| SchedulerError::ExecutionBindingHeld(format!("{error:?}")))?;
+        self.admit_inner(message, trigger, authority)
+    }
     fn finish(
         &mut self,
         id: &str,
@@ -1128,7 +1177,7 @@ impl WorkspaceScheduler {
     ) -> Result<AdmissionStatus> {
         self.invoke_checked(claim, a, |admission| Ok(executor.invoke(admission)))
     }
-    pub fn qualify_for_lease(
+    fn qualify_for_lease_inner(
         &mut self,
         claim: &ClaimedAssignment,
         a: &CurrentAuthority<'_>,
@@ -1163,7 +1212,94 @@ impl WorkspaceScheduler {
             },
         })
     }
-    pub fn invoke_with_lease(
+    #[cfg(test)]
+    pub(crate) fn qualify_for_lease(
+        &mut self,
+        claim: &ClaimedAssignment,
+        a: &CurrentAuthority<'_>,
+    ) -> Result<QualifiedLeaseAssignment> {
+        self.qualify_for_lease_inner(claim, a)
+    }
+
+    fn validate_execution_binding(
+        &self,
+        claim: &ClaimedAssignment,
+        a: &CurrentAuthority<'_>,
+        binding: &crate::execution_binding::WorkspaceExecutionBinding,
+        execution_authority: &crate::execution_binding::ExecutionAuthority<'_>,
+    ) -> Result<()> {
+        binding
+            .revalidate(execution_authority)
+            .map_err(|error| SchedulerError::ExecutionBindingHeld(error.to_string()))?;
+        let row = self
+            .assignments
+            .get(&claim.id)
+            .ok_or(SchedulerError::Invalid)?;
+        let root = a.registry.root_pin();
+        if binding.workspace_id() != self.policy.workspace
+            || binding.repo_id() != self.policy.repo
+            || row.request.execution_binding_id != binding.commitment_id()
+            || binding.source_root() != root.path
+            || binding.source_root_identity() != (root.dev, root.ino)
+            || binding.source_root_generation() != root.generation
+        {
+            return Err(SchedulerError::ExecutionBindingHeld(
+                "current enrollment differs".into(),
+            ));
+        }
+        root.verify()
+            .map_err(|error| SchedulerError::ExecutionBindingHeld(format!("{error:?}")))?;
+        binding
+            .validate_task_ref(&row.reference)
+            .map_err(|error| SchedulerError::ExecutionBindingHeld(error.to_string()))
+    }
+
+    /// Qualification remains observational until the independently committed
+    /// resource lease and the same current execution binding are both checked.
+    pub fn qualify_for_bound_lease(
+        &mut self,
+        claim: &ClaimedAssignment,
+        a: &CurrentAuthority<'_>,
+        binding: &crate::execution_binding::WorkspaceExecutionBinding,
+        execution_authority: &crate::execution_binding::ExecutionAuthority<'_>,
+    ) -> Result<QualifiedLeaseAssignment> {
+        self.validate_execution_binding(claim, a, binding, execution_authority)?;
+        self.qualify_for_lease_inner(claim, a)
+    }
+
+    // These independent capabilities are deliberately not reconstructed from
+    // a caller-provided aggregate DTO or matching commitment string.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_with_bound_lease(
+        &mut self,
+        claim: ClaimedAssignment,
+        a: &CurrentAuthority<'_>,
+        leases: &mut crate::task_resource_lease::ResourceLeaseStore,
+        capability: crate::task_resource_lease::CommittedWriteLease,
+        lease_authority: &crate::task_resource_lease::CurrentLeaseAuthority<'_>,
+        binding: &crate::execution_binding::WorkspaceExecutionBinding,
+        execution_authority: &crate::execution_binding::ExecutionAuthority<'_>,
+        executor: &mut impl crate::task_resource_lease::LeasedExecutor,
+    ) -> Result<AdmissionStatus> {
+        self.validate_execution_binding(&claim, a, binding, execution_authority)?;
+        leases
+            .validate_execution_binding(binding, lease_authority)
+            .map_err(|error| SchedulerError::ResourceLeaseHeld(error.to_string()))?;
+        let qualified = self.qualify_for_bound_lease(&claim, a, binding, execution_authority)?;
+        self.invoke_checked(claim, a, |admission| {
+            binding
+                .revalidate(execution_authority)
+                .map_err(|error| SchedulerError::ExecutionBindingHeld(error.to_string()))?;
+            leases
+                .invoke(capability, &qualified, lease_authority, |writer| {
+                    executor.invoke(admission, writer)
+                })
+                .map_err(|error| SchedulerError::ResourceLeaseHeld(error.to_string()))
+        })
+    }
+
+    #[cfg(test)]
+    fn invoke_with_lease(
         &mut self,
         claim: ClaimedAssignment,
         a: &CurrentAuthority<'_>,
@@ -1172,7 +1308,7 @@ impl WorkspaceScheduler {
         lease_authority: &crate::task_resource_lease::CurrentLeaseAuthority<'_>,
         executor: &mut impl crate::task_resource_lease::LeasedExecutor,
     ) -> Result<AdmissionStatus> {
-        let qualified = self.qualify_for_lease(&claim, a)?;
+        let qualified = self.qualify_for_lease_inner(&claim, a)?;
         self.invoke_checked(claim, a, |admission| {
             leases
                 .invoke(capability, &qualified, lease_authority, |writer| {
@@ -1266,7 +1402,7 @@ impl WorkspaceScheduler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::task_dependency::DependencyCommitment;
     use crate::task_ref::GitOid;
@@ -1297,6 +1433,136 @@ mod tests {
             execution_flags: vec![],
             dependencies: vec![],
         }
+    }
+
+    /// Exercises the real bus admitted-worker adapter using the caller's same
+    /// nondefault binding. Only fixture grants, journals and workers are used.
+    pub(crate) fn probe_bound_bus_route(
+        binding: &crate::execution_binding::WorkspaceExecutionBinding,
+        execution_authority: &crate::execution_binding::ExecutionAuthority<'_>,
+        mut effect: impl FnMut(&crate::execution_binding::WorkspaceExecutionBinding) -> String,
+    ) -> String {
+        use crate::task_resource_lease::{LeaseRequest, ResourceScope};
+        let mut item = entry("A1");
+        item.baseline_commit = binding.baseline();
+        let mut fixture = Fixture::new(vec![vec![item]]);
+        let sources: Vec<_> = fixture.registry.sources().cloned().collect();
+        let bytes = fs::read(fixture._root.path().join("source-1.md")).unwrap();
+        let path = binding.source_root().join("source-1.md");
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        fixture.registry = WorkspaceSourceRegistry::new(
+            fixture.registry.policy().clone(),
+            WorkspaceRootPin {
+                path: binding.source_root().into(),
+                dev: binding.source_root_identity().0,
+                ino: binding.source_root_identity().1,
+                uid: fs::metadata(binding.source_root()).unwrap().uid(),
+                generation: binding.source_root_generation(),
+            },
+        )
+        .unwrap();
+        for mut source in sources {
+            source.state = TaskSourceState::Proposed;
+            fixture.registry.enroll(source).unwrap();
+        }
+        fixture.profile.execution_binding = binding.commitment_id();
+        let mut scheduler = fixture.open();
+        let selected = scheduler.select_next(&fixture.authority(150)).unwrap();
+        let message = message(
+            &scheduler,
+            &fixture,
+            &selected.task_ref.task_key(),
+            "bound-bus",
+            |_| {},
+        );
+        let claim = match scheduler
+            .admit_bound(
+                &message,
+                AdmissionTrigger::Manual,
+                &fixture.authority(150),
+                binding,
+                execution_authority,
+            )
+            .unwrap()
+        {
+            AdmissionDisposition::Claimed(claim) => claim,
+            _ => panic!("fresh controlled admission required"),
+        };
+        let qualified = scheduler
+            .qualify_for_bound_lease(
+                &claim,
+                &fixture.authority(150),
+                binding,
+                execution_authority,
+            )
+            .unwrap();
+        let mut resources =
+            crate::task_resource_lease::tests::Fixture::new(scheduler.store_identity);
+        // All protected descriptors address the actual same executor fixture.
+        resources.root_fd = File::open(binding.execution_root()).unwrap();
+        resources.gitdir_fd = File::open(binding.execution_root().join(".git")).unwrap();
+        resources.common_fd = resources.gitdir_fd.try_clone().unwrap();
+        resources.policy.common_git_identity = binding.common_git_identity();
+        resources
+            .clock
+            .set(HostClockState::Verified { now_unix: 150 });
+        let mut leases = resources.open();
+        let capability = resources.acquire(
+            &mut leases,
+            &qualified,
+            LeaseRequest {
+                scopes: vec![ResourceScope::IntegrationTarget],
+                ttl_seconds: 120,
+            },
+        );
+        struct Worker<'a, F> {
+            effect: &'a mut F,
+            output: Option<String>,
+            calls: usize,
+        }
+        impl<F: FnMut(&crate::execution_binding::WorkspaceExecutionBinding) -> String>
+            crate::bus_run::BoundBusExecutor for Worker<'_, F>
+        {
+            fn invoke(
+                &mut self,
+                binding: &crate::execution_binding::WorkspaceExecutionBinding,
+                _: &ExecutionAdmissionV1,
+                _: &mut crate::task_resource_lease::ProtectedWriter<'_>,
+            ) -> InvocationOutcome {
+                self.calls += 1;
+                self.output = Some((self.effect)(binding));
+                InvocationOutcome::Unknown {
+                    reason: "controlled-worker-retirement-unproved".into(),
+                }
+            }
+        }
+        let mut worker = Worker {
+            effect: &mut effect,
+            output: None,
+            calls: 0,
+        };
+        assert_eq!(
+            crate::bus_run::invoke_admitted_bus_task(
+                &mut scheduler,
+                claim,
+                &fixture.authority(150),
+                &mut leases,
+                capability,
+                &resources.authority(),
+                binding,
+                execution_authority,
+                &mut worker,
+            )
+            .unwrap(),
+            AdmissionStatus::Unknown
+        );
+        assert_eq!(worker.calls, 1);
+        assert_eq!(
+            leases.status("bound-bus"),
+            Some(crate::task_resource_lease::LeaseStatus::Unknown)
+        );
+        worker.output.unwrap()
     }
     struct Fixture {
         _root: TempDir,
@@ -1521,6 +1787,41 @@ mod tests {
                 receipt_id: "original-retirement-receipt".into(),
             }
         }
+    }
+
+    #[test]
+    fn p009_changed_binding_refuses_before_scheduler_claim_consumption() {
+        let mut fixture = Fixture::new(vec![vec![entry("A1")]]);
+        let execution = crate::execution_binding::test_support::BindingFixture::new();
+        let binding = execution.bind();
+        fixture.profile.execution_binding = binding.commitment_id();
+        let mut scheduler = fixture.open();
+        let selected = scheduler.select_next(&fixture.authority(150)).unwrap();
+        let message = message(
+            &scheduler,
+            &fixture,
+            &selected.task_ref.task_key(),
+            "no-bound-claim",
+            |_| {},
+        );
+        let path = fixture
+            .store
+            .path()
+            .join(crate::task_scheduler_journal::SCHEDULER_JOURNAL_FILE_NAME);
+        let before = fs::read(&path).unwrap();
+        execution.bump_epoch();
+        assert!(matches!(
+            scheduler.admit_bound(
+                &message,
+                AdmissionTrigger::Manual,
+                &fixture.authority(150),
+                &binding,
+                &execution.authority(),
+            ),
+            Err(SchedulerError::ExecutionBindingHeld(_))
+        ));
+        assert_eq!(scheduler.status("no-bound-claim"), None);
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[test]

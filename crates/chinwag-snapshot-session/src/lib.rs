@@ -79,41 +79,7 @@ impl SessionReceipt {
 }
 impl SnapshotSession {
     pub fn from_owner(owner: ReadOwner) -> SessionResult<Self> {
-        check_header(owner.image()).map_err(SessionError::Header)?;
-        let expected = template_schema().map_err(SessionError::Native)?;
-        let (connection, bootstrap) =
-            Connection::open_image_for_probe(owner.image(), false).map_err(SessionError::Native)?;
-        let connection = connection.ok_or(SessionError::Contract("No imported native owner"))?;
-        let validation = (|| {
-            check_engine(&connection)?;
-            if connection.query(c"PRAGMA application_id", &[])?
-                != vec![vec![Value::Integer(i64::from(schema::APPLICATION_ID))]]
-                || connection.query(c"PRAGMA user_version", &[])?
-                    != vec![vec![Value::Integer(i64::from(schema::SCHEMA_VERSION))]]
-                || schema_objects(&connection)? != expected
-            {
-                return Err(Error::Contract(
-                    "Snapshot header/schema fingerprint differs from pinned template",
-                ));
-            }
-            if site_id(&connection)? != metadata_site(&connection)? {
-                return Err(Error::Contract("Snapshot cached and metadata site differ"));
-            }
-            if bootstrap.calls != 1
-                || bootstrap.deserialize_code != Some(0)
-                || bootstrap.extension_code != Some(0)
-                || bootstrap.open_code != 0
-                || bootstrap.cancelled_temporary != 1
-                || bootstrap.restored_original != 0
-                || bootstrap.failed_open_checked_closed
-            {
-                return Err(Error::Contract("Unexpected bootstrap lifecycle receipt"));
-            }
-            Ok(())
-        })();
-        if let Err(error) = validation {
-            return finish(connection, Err(error)).map_err(SessionError::Native);
-        }
+        let (connection, bootstrap) = open_validated_private_image(owner.image())?;
         Ok(Self {
             native: Some(connection),
             owner: Some(owner),
@@ -195,6 +161,86 @@ impl SnapshotSession {
         })
     }
 }
+/// Evidence for the exact controlled private image, never store enrollment.
+#[derive(Debug)]
+pub struct DetachedImageReceipt {
+    sha256: [u8; 32],
+    bytes: usize,
+    site_id: [u8; 16],
+}
+impl DetachedImageReceipt {
+    pub fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+    pub fn site_id(&self) -> [u8; 16] {
+        self.site_id
+    }
+    pub fn application_id(&self) -> i64 {
+        i64::from(schema::APPLICATION_ID)
+    }
+    pub fn schema_version(&self) -> i64 {
+        i64::from(schema::SCHEMA_VERSION)
+    }
+}
+/// Validates ROOT-generated controlled private bytes in isolated mutable memory.
+/// No filesystem owner or marker is acquired. Not an arbitrary hostile-image
+/// parser, live-file snapshot, workspace/store mapping, or execution authority.
+/// A receipt is returned only after this original native owner's checked close.
+pub fn validate_detached_private_image(image: &[u8]) -> SessionResult<DetachedImageReceipt> {
+    use sha2::{Digest, Sha256};
+    let (connection, _) = open_validated_private_image(image)?;
+    let outcome = site_id(&connection).map(|site_id| DetachedImageReceipt {
+        sha256: Sha256::digest(image).into(),
+        bytes: image.len(),
+        site_id,
+    });
+    finish(connection, outcome).map_err(SessionError::Native)
+}
+
+fn open_validated_private_image(
+    image: &[u8],
+) -> SessionResult<(Connection, native::BootstrapReceipt)> {
+    check_header(image).map_err(SessionError::Header)?;
+    let expected = template_schema().map_err(SessionError::Native)?;
+    let (connection, bootstrap) =
+        Connection::open_image_for_probe(image, false).map_err(SessionError::Native)?;
+    let connection = connection.ok_or(SessionError::Contract("No imported native owner"))?;
+    let validation = (|| {
+        check_engine(&connection)?;
+        if connection.query(c"PRAGMA application_id", &[])?
+            != vec![vec![Value::Integer(i64::from(schema::APPLICATION_ID))]]
+            || connection.query(c"PRAGMA user_version", &[])?
+                != vec![vec![Value::Integer(i64::from(schema::SCHEMA_VERSION))]]
+            || schema_objects(&connection)? != expected
+        {
+            return Err(Error::Contract(
+                "Snapshot header/schema fingerprint differs from pinned template",
+            ));
+        }
+        if site_id(&connection)? != metadata_site(&connection)? {
+            return Err(Error::Contract("Snapshot cached and metadata site differ"));
+        }
+        if bootstrap.calls != 1
+            || bootstrap.deserialize_code != Some(0)
+            || bootstrap.extension_code != Some(0)
+            || bootstrap.open_code != 0
+            || bootstrap.cancelled_temporary != 1
+            || bootstrap.restored_original != 0
+            || bootstrap.failed_open_checked_closed
+        {
+            return Err(Error::Contract("Unexpected bootstrap lifecycle receipt"));
+        }
+        Ok(())
+    })();
+    if let Err(error) = validation {
+        return finish(connection, Err(error)).map_err(SessionError::Native);
+    }
+    Ok((connection, bootstrap))
+}
+
 fn check_header(image: &[u8]) -> std::result::Result<(), &'static str> {
     if image.len() < 100 || image.len() > MAX_IMAGE_BYTES {
         return Err("Snapshot header size");
@@ -349,5 +395,43 @@ impl Drop for Rollback<'_> {
         if self.pending {
             let _ = self.connection.query(c"ROLLBACK", &[]);
         }
+    }
+}
+
+#[cfg(test)]
+mod detached_validation_tests {
+    use super::*;
+    fn controlled_image() -> Vec<u8> {
+        let connection = Connection::open_template_memory().unwrap();
+        let result = (|| {
+            initialize_schema(&connection)?;
+            connection.export_empty_image_for_factory()
+        })();
+        finish(connection, result).unwrap()
+    }
+    #[test]
+    fn detached_private_image_receipt_binds_bytes_site_and_checked_close_path() {
+        use sha2::{Digest, Sha256};
+        let image = controlled_image();
+        let receipt = validate_detached_private_image(&image).unwrap();
+        assert_eq!(receipt.sha256(), <[u8; 32]>::from(Sha256::digest(&image)));
+        assert_eq!(receipt.bytes(), image.len());
+        assert_eq!(receipt.application_id(), i64::from(schema::APPLICATION_ID));
+        assert_eq!(receipt.schema_version(), i64::from(schema::SCHEMA_VERSION));
+        assert_eq!(
+            validate_detached_private_image(&image).unwrap().site_id(),
+            receipt.site_id()
+        );
+    }
+    #[test]
+    fn detached_private_image_rejects_size_application_and_schema_without_owner() {
+        assert!(validate_detached_private_image(b"bad header").is_err());
+        let image = controlled_image();
+        for offset in [60, 68] {
+            let mut changed = image.clone();
+            changed[offset..offset + 4].copy_from_slice(&0_u32.to_be_bytes());
+            assert!(validate_detached_private_image(&changed).is_err());
+        }
+        assert!(validate_detached_private_image(&vec![0; MAX_IMAGE_BYTES + 1]).is_err());
     }
 }

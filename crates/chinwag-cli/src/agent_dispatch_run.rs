@@ -16,26 +16,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::AgentDispatchRequest;
+use crate::execution_binding::{
+    ExecutionAuthority, RepoSelectors, StoreSelector, WorkspaceExecutionBinding, bind_execution,
+    select_repository,
+};
 use crate::seat_signing;
+use chinwag_snapshot_read_owner_private::ReadOwner;
 use chinwag_snapshot_session_private::replacement::{
     AgentDispatchRecord, WriteOwner, WriteSession,
 };
+use chinwag_snapshot_session_private::{SnapshotSession, Value};
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_CRDB_TEXT_BYTES: usize = 60_000;
 
 fn user_home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned())
-}
-
-fn default_repo_root() -> PathBuf {
-    PathBuf::from(user_home()).join("WORKSPACE/chinwag")
 }
 
 fn fleet_skills_agents_dir() -> PathBuf {
@@ -66,6 +68,8 @@ struct StdinDispatchPayload {
     #[serde(default)]
     crdb: Option<String>,
     #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
     history: Vec<HistoryEntry>,
     #[serde(default, rename = "customAgent")]
     custom_agent: Option<CustomAgentMeta>,
@@ -91,19 +95,6 @@ struct CustomAgentMeta {
     engine: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
-}
-
-fn grokbot_dept(agent_upper: &str) -> &'static str {
-    match agent_upper {
-        "ALISTAIR" | "HOUSEKEEPING" | "INFRA BOT (GROK)" | "INFRAJR" | "QA" | "FLINT" | "DOCS"
-        | "MGMT-INFRA" | "INFRA" | "EPHEMERAL-QA" => "infra",
-        "ARCHITECT" | "RUST" | "INDEX" | "DEV-1" | "DEV-2" | "DEV-3" | "ENG" | "MGMT-ENG"
-        | "EPHEMERAL-DEV" => "eng",
-        "VENTURE" | "MO" | "EAGLE-EYE" | "BIZFIN" | "INVESTIGATIONS" | "RECORD" | "DEX"
-        | "MGMT-BIZFIN" => "bizfin",
-        "DECLARATION" | "GROWTH" | "SOCIAL" | "S-AND-M" | "SALES" | "MGMT-S-AND-M" => "s-and-m",
-        _ => "product",
-    }
 }
 
 fn truncate_utf8(text: &str, max_bytes: usize) -> String {
@@ -211,85 +202,57 @@ fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
     load_persona_from_root(agent_upper, custom, &fleet_skills_agents_dir())
 }
 
-fn recall_native_memory(agent_lower: &str, query: &str, repo_root: &Path) -> String {
-    crate::memory_run::recall_for_agent_prompt(agent_lower, query, repo_root)
+fn check_binding(
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority,
+) -> Result<(), String> {
+    binding
+        .revalidate(authority)
+        .map_err(|error| error.to_string())
 }
 
-fn retain_native_memory(
-    repo_root: &Path,
-    agent_upper: &str,
-    engine: &str,
-    sender: &str,
-    item_key: &str,
-    message: &str,
-    reply: &str,
-) {
-    crate::memory_run::retain_from_agent_dispatch(
-        repo_root,
-        agent_upper,
-        engine,
-        sender,
-        item_key,
-        message,
-        reply,
-    );
+fn native_store_root(binding: &WorkspaceExecutionBinding) -> Result<&Path, String> {
+    if binding.store_path() != binding.execution_root().join(".chinwag/state.crdb") {
+        return Err("execution_store_adapter_unsupported".into());
+    }
+    Ok(binding.execution_root())
 }
 
-fn notify_grokbot_department_relay(
-    agent_upper: &str,
-    sender: &str,
-    item_key: &str,
-    message: &str,
-    reply: &str,
-) {
-    let dept = grokbot_dept(agent_upper);
-    let home = user_home();
-    let env_path = Path::new(&home)
-        .join(".paperclip-pilot/secrets/relay-webhooks")
-        .join(format!("{dept}.env"));
-    let Ok(raw) = fs::read_to_string(&env_path) else {
-        return;
-    };
-    let mut url = String::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = trimmed.split_once('=')
-            && k.trim() == "RELAY_SLACK_WEBHOOK_URL"
-        {
-            url = v.trim().trim_matches('"').trim_matches('\'').to_owned();
-        }
+fn recall_native_memory(binding: &WorkspaceExecutionBinding) -> Result<String, String> {
+    let root = native_store_root(binding)?;
+    let owner = ReadOwner::acquire_existing_private_fixture(root)
+        .map_err(|error| format!("memory_read_owner: {}", error.reason))?;
+    let session = SnapshotSession::from_owner(owner).map_err(|error| error.to_string())?;
+    let read = (|| {
+        let mut rows = session.tombstones().map_err(|error| error.to_string())?;
+        rows.extend(
+            session
+                .verified_invariants()
+                .map_err(|error| error.to_string())?,
+        );
+        Ok::<_, String>(
+            rows.into_iter()
+                .take(8)
+                .map(|row| {
+                    let text = row
+                        .into_iter()
+                        .filter_map(|value| match value {
+                            Value::Text(text) => Some(text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    format!("- {}", truncate_utf8(&text, 360))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    })();
+    let closed = session.finish().map_err(|error| error.to_string());
+    match (read, closed) {
+        (Ok(memory), Ok(_)) => Ok(memory),
+        (Err(error), _) | (_, Err(error)) => Err(error),
     }
-    if !url.starts_with("https://") {
-        return;
-    }
-    let tag = dept.to_ascii_uppercase();
-    let text = format!(
-        "[CHINWAG MISSION CONTROL][{tag}] ■ {agent_upper} | {item_key} (from {sender})\nPrompt: {}\nReply Summary: {}\nMission Control: https://brians-mac-studio-468.tail23ad5.ts.net:5487/",
-        truncate_utf8(message, 280),
-        truncate_utf8(reply, 420)
-    );
-    let Ok(payload) = serde_json::to_string(&json!({ "text": text })) else {
-        return;
-    };
-    let _ = Command::new("/usr/bin/curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "5",
-            "-H",
-            "Content-Type: application/json",
-            "-X",
-            "POST",
-            &url,
-            "-d",
-            &payload,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 fn strip_flint_banner(raw: &str) -> String {
@@ -310,54 +273,192 @@ fn codex_effort_arg(agent_upper: &str) -> &'static str {
     }
 }
 
+fn run_bound_local_command(
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority,
+    command: &mut Command,
+) -> Result<String, String> {
+    check_binding(binding, authority)?;
+    command
+        .current_dir(binding.execution_root())
+        .env("PWD", binding.execution_root())
+        .env("CHINWAG_REPO_ROOT", binding.execution_root())
+        .env("CHINWAG_STORE_PATH", binding.store_path())
+        .env("CHINWAG_STORE_ID", binding.store_id())
+        .env("CHINWAG_EXECUTION_BINDING", binding.commitment_id());
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+    ] {
+        command.env_remove(name);
+    }
+    check_binding(binding, authority)?;
+    let output = command
+        .output()
+        .map_err(|error| format!("engine_outcome_unknown: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "engine_failed_without_replacement: {:?}",
+            output.status.code()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if text.is_empty() {
+        return Err("engine_empty_reply_without_replacement".into());
+    }
+    Ok(text)
+}
+
+struct BoundHostedTransport<'a> {
+    binding: &'a WorkspaceExecutionBinding,
+    authority: &'a ExecutionAuthority<'a>,
+    inner: crate::hosted_agent::CurlTransport,
+}
+impl crate::hosted_agent::HostedTransport for BoundHostedTransport<'_> {
+    fn send(
+        &mut self,
+        request: &crate::hosted_agent::HttpRequest,
+    ) -> Result<crate::hosted_agent::HttpResponse, crate::hosted_agent::HostedAgentError> {
+        check_binding(self.binding, self.authority)
+            .map_err(crate::hosted_agent::HostedAgentError::ConfigError)?;
+        crate::hosted_agent::HostedTransport::send(&mut self.inner, request)
+    }
+}
+
+struct BoundHostedExecutor<'a> {
+    binding: &'a WorkspaceExecutionBinding,
+    authority: &'a ExecutionAuthority<'a>,
+    inner: crate::hosted_agent::StandardToolExecutor,
+}
+impl crate::hosted_agent::ToolExecutor for BoundHostedExecutor<'_> {
+    fn execute(
+        &mut self,
+        call: &crate::hosted_agent::ToolCall,
+        policy: &crate::hosted_agent::ToolPolicy,
+        transport: &mut dyn crate::hosted_agent::HostedTransport,
+    ) -> serde_json::Value {
+        if let Err(error) = check_binding(self.binding, self.authority) {
+            return json!({"ok": false, "error": error, "authority": "HELD"});
+        }
+        crate::hosted_agent::ToolExecutor::execute(&mut self.inner, call, policy, transport)
+    }
+}
+
+struct EngineRequest<'a> {
+    agent: &'a str,
+    prompt: &'a str,
+    custom: Option<&'a CustomAgentMeta>,
+    environment: &'a [(String, String)],
+    identity: &'a crate::agent_instance::DispatchIdentity,
+}
+
+fn require_local_route(agent: &str, custom: Option<&CustomAgentMeta>) -> Result<(), String> {
+    let hint = custom
+        .and_then(|meta| meta.engine.as_deref().or(meta.dept.as_deref()))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if agent == "WORKHORSE" || hint.contains("workhorse") {
+        return Err("remote_execution_binding_unsupported".into());
+    }
+    Ok(())
+}
+
 fn dispatch_to_engine(
-    agent_upper: &str,
-    full_prompt: &str,
-    custom: Option<&CustomAgentMeta>,
-    signing_env: &[(String, String)],
-    identity: &crate::agent_instance::DispatchIdentity,
-) -> (String, &'static str) {
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority,
+    request: &EngineRequest<'_>,
+) -> Result<(String, &'static str), String> {
+    check_binding(binding, authority)?;
+    let EngineRequest {
+        agent,
+        prompt,
+        custom,
+        environment,
+        identity,
+    } = request;
+    require_local_route(agent, *custom)?;
+    let engine_hint = custom
+        .and_then(|meta| meta.engine.as_deref().or(meta.dept.as_deref()))
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if let Ok(mock) = std::env::var("CHINWAG_AGENT_MOCK_REPLY")
         && !mock.trim().is_empty()
     {
-        return (mock, "mock-engine");
+        return Ok((mock, "mock-engine"));
     }
-
-    // 0. Ephemeral seats DEV-1..5 and QA-1..5 (plus legacy EPHEMERAL-DEV /
-    //    EPHEMERAL-QA) use Cloudflare Workers AI DeepSeek v4.1 Flash once the
-    //    credential file exists. Plain QA is NOT routed here. Off-switch:
-    //    EPHEMERAL_DEEPSEEK_DISABLE=1. The kill switch, 10-slot concurrency cap
-    //    and spend ledger live in deepseek_pool. Once active there is no
-    //    fallback to another engine.
-    if let Some(pool) = crate::deepseek_pool::pool_for_agent(agent_upper)
+    if let Some(pool) = crate::deepseek_pool::pool_for_agent(agent)
         && crate::deepseek_pool::enabled()
     {
-        return crate::deepseek_pool::run(pool, agent_upper, full_prompt, identity);
+        check_binding(binding, authority)?;
+        return Ok(crate::deepseek_pool::run(pool, agent, prompt, identity));
     }
 
     let home = user_home();
-    let local_bin = format!("{home}/.local/bin");
-    let path_env = format!("{local_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
-    let repo_dir = default_repo_root();
-    let default_cwd: PathBuf = if repo_dir.exists() {
-        repo_dir.clone()
-    } else {
-        PathBuf::from(&home)
-    };
+    let local_bin = Path::new(&home).join(".local/bin");
+    let path_env = format!(
+        "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        local_bin.display()
+    );
+    let rich_prompt = truncate_utf8(prompt, MAX_PROMPT_BYTES);
+    let explicit_cfg_path = std::env::var("CHINWAG_PROVIDERS_CONFIG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let default_cfg_path = Path::new(&home).join(".chinwag/providers.json");
+    let default_gemini =
+        *agent == "FREQUENCY" && Path::new(&home).join(".chinwag/gemini.env").is_file();
+    if explicit_cfg_path.is_some() || default_cfg_path.symlink_metadata().is_ok() || default_gemini
+    {
+        check_binding(binding, authority)?;
+        let config = crate::hosted_agent::ProvidersConfig::load_or_default(
+            explicit_cfg_path.as_deref(),
+            Path::new(&home),
+            binding.execution_root(),
+        )
+        .map_err(|error| error.to_string())?;
+        if config.agents.contains_key(*agent) {
+            let mut exec_env = vec![("PATH".to_owned(), path_env.clone())];
+            exec_env.extend(environment.iter().cloned());
+            let mut transport = BoundHostedTransport {
+                binding,
+                authority,
+                inner: crate::hosted_agent::CurlTransport::system_default(Path::new(&home)),
+            };
+            let mut executor = BoundHostedExecutor {
+                binding,
+                authority,
+                inner: crate::hosted_agent::StandardToolExecutor::new(
+                    binding.execution_root().to_owned(),
+                    exec_env,
+                ),
+            };
+            check_binding(binding, authority)?;
+            let system = format!(
+                "You are {agent} ({}), executing in the approved Chinwag workspace.",
+                identity.child()
+            );
+            let reply = crate::hosted_agent::run_hosted_seat(
+                &config,
+                agent,
+                &system,
+                &rich_prompt,
+                &mut transport,
+                &mut executor,
+            )
+            .map_err(|error| format!("hosted_outcome_without_replacement: {error}"))?;
+            return Ok((reply.text, "hosted-agent-api"));
+        }
+    }
 
-    let engine_hint = custom
-        .and_then(|c| c.engine.as_deref())
-        .or_else(|| custom.and_then(|c| c.dept.as_deref()))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    let is_flint = agent_upper == "FLINT" || engine_hint.contains("flint");
-    let is_deepseek = agent_upper.starts_with("DEV-")
-        || agent_upper.starts_with("EPHEMERAL-DEV-")
-        || agent_upper.starts_with("QA-")
-        || agent_upper.starts_with("EPHEMERAL-QA-")
+    let is_flint = *agent == "FLINT" || engine_hint.contains("flint");
+    let is_deepseek = agent.starts_with("DEV-")
+        || agent.starts_with("EPHEMERAL-DEV-")
+        || agent.starts_with("QA-")
+        || agent.starts_with("EPHEMERAL-QA-")
         || matches!(
-            agent_upper,
+            *agent,
             "SKILL"
                 | "MANNY"
                 | "SUMMARIZER"
@@ -368,9 +469,8 @@ fn dispatch_to_engine(
                 | "EPHEMERAL-SUPPORT"
         )
         || engine_hint.contains("deepseek");
-    let is_workhorse = agent_upper == "WORKHORSE" || engine_hint.contains("workhorse");
     let is_codex = matches!(
-        agent_upper,
+        *agent,
         "ARCHITECT"
             | "RUST"
             | "GAMEDEV"
@@ -384,145 +484,41 @@ fn dispatch_to_engine(
             | "CLOUDFLARE"
     ) || engine_hint.contains("codex")
         || engine_hint.contains("gpt-6.1-sol");
-    let is_grok = matches!(agent_upper, "GROWTH" | "SALES") || engine_hint.contains("grok");
+    let is_grok = matches!(*agent, "GROWTH" | "SALES") || engine_hint.contains("grok");
 
-    // Pass full prompt context up to MAX_PROMPT_BYTES (256 KiB) so complete 5-doc personas
-    // and the trailing message/identity/signing instructions are never clipped at 48 KB.
-    let rich_prompt = truncate_utf8(full_prompt, MAX_PROMPT_BYTES);
-
-    // 0b. Configurable Hosted-Model / AI-Service Agent Runner (`crates/chinwag-cli/src/hosted_agent.rs`).
-    //     Routes seats bound in `~/.chinwag/providers.json` (or `CHINWAG_PROVIDERS_CONFIG`, plus the
-    //     default `FREQUENCY` Gemini REST API binding when `~/.chinwag/gemini.env` is present) through
-    //     the native multi-turn tool loop without requiring Antigravity or external CLI wrappers.
-    let explicit_cfg_path = std::env::var("CHINWAG_PROVIDERS_CONFIG")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from);
-    let default_cfg_path = Path::new(&home).join(".chinwag/providers.json");
-    let has_explicit_providers_file =
-        explicit_cfg_path.is_some() || default_cfg_path.symlink_metadata().is_ok();
-    let default_gemini_env_ready =
-        agent_upper == "FREQUENCY" && Path::new(&home).join(".chinwag/gemini.env").is_file();
-
-    if has_explicit_providers_file || default_gemini_env_ready {
-        let workspace_dir = Path::new(&home).join("WORKSPACE");
-        match crate::hosted_agent::ProvidersConfig::load_or_default(
-            explicit_cfg_path.as_deref(),
-            Path::new(&home),
-            &workspace_dir,
-        ) {
-            Ok(providers_cfg) if providers_cfg.agents.contains_key(agent_upper) => {
-                let mut exec_env = vec![("PATH".to_owned(), path_env.clone())];
-                exec_env.extend(signing_env.iter().cloned());
-                let mut transport =
-                    crate::hosted_agent::CurlTransport::system_default(Path::new(&home));
-                let mut executor =
-                    crate::hosted_agent::StandardToolExecutor::new(default_cwd.clone(), exec_env);
-                let sys_instruction = format!(
-                    "You are ■ {agent_upper} ({}), executing over Chinwag's native hosted-agent library. Follow the canonical SOUL.md, AGENT.md, TOOL.md, SKILLS.md, and MEMORY.md instructions embedded in the prompt strictly.",
-                    identity.child()
-                );
-                match crate::hosted_agent::run_hosted_seat(
-                    &providers_cfg,
-                    agent_upper,
-                    &sys_instruction,
-                    &rich_prompt,
-                    &mut transport,
-                    &mut executor,
-                ) {
-                    Ok(hosted_reply) => {
-                        return (hosted_reply.text, "hosted-agent-api");
-                    }
-                    Err(err) => {
-                        return (
-                            format!("[{agent_upper} error]: {err}"),
-                            "hosted-agent-error",
-                        );
-                    }
-                }
+    for (enabled, name, engine) in [
+        (is_flint, "flint-agent", "flint-agent"),
+        (is_deepseek, "deepseek-agent", "deepseek-workers-ai"),
+    ] {
+        let binary = local_bin.join(name);
+        if enabled && binary.exists() {
+            let mut command = Command::new(binary);
+            command
+                .args(["run", &rich_prompt, "--cwd"])
+                .arg(binding.execution_root())
+                .env("PATH", &path_env)
+                .envs(environment.iter().cloned());
+            let text = run_bound_local_command(binding, authority, &mut command)?;
+            let text = if engine == "flint-agent" {
+                strip_flint_banner(&text)
+            } else {
+                text
+            };
+            if text.is_empty() {
+                return Err("engine_empty_reply_without_replacement".into());
             }
-            Ok(_) => {}
-            Err(err) => {
-                return (
-                    format!("[{agent_upper} error]: {err}"),
-                    "hosted-agent-error",
-                );
-            }
+            return Ok((text, engine));
         }
     }
-
-    // 1. Recursive Flint (Local MLX 262k on Node 2 MacBook Pro 100.108.108.25:11500)
-    let flint_bin = Path::new(&local_bin).join("flint-agent");
-    if is_flint
-        && flint_bin.exists()
-        && let Ok(out) = Command::new(&flint_bin)
-            .args(["run", &rich_prompt, "--cwd", &repo_dir.to_string_lossy()])
-            .current_dir(&default_cwd)
-            .env("PATH", &path_env)
-            .envs(signing_env.iter().cloned())
-            .output()
-    {
-        let text = strip_flint_banner(&String::from_utf8_lossy(&out.stdout));
-        if out.status.success() && !text.is_empty() {
-            return (text, "flint-agent");
-        }
-    }
-
-    // 2. DeepSeek 4.1 on Cloudflare Workers AI (@cf/deepseek-ai/deepseek-v4.1-flash-1017)
-    let deepseek_bin = Path::new(&local_bin).join("deepseek-agent");
-    if is_deepseek
-        && deepseek_bin.exists()
-        && let Ok(out) = Command::new(&deepseek_bin)
-            .args(["run", &rich_prompt, "--cwd", &repo_dir.to_string_lossy()])
-            .current_dir(&default_cwd)
-            .env("PATH", &path_env)
-            .envs(signing_env.iter().cloned())
-            .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if out.status.success() && !text.is_empty() {
-            return (text, "deepseek-workers-ai");
-        }
-    }
-
-    // 3. Node 2 MacBook Pro (100.108.108.25) Remote Dispatch for ■ WORKHORSE (Codex - GPT-6.1-SOL Max)
-    let remote_command = workhorse_remote_command(identity);
-    if is_workhorse
-        && let Ok(mut child) = Command::new("/usr/bin/ssh")
-            .args([
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=5",
-                "brianspector@100.108.108.25",
-                &remote_command,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-    {
-        if let Some(mut stdin_pipe) = child.stdin.take() {
-            let _ = stdin_pipe.write_all(rich_prompt.as_bytes());
-        }
-        if let Ok(out) = child.wait_with_output() {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            if out.status.success() && !text.is_empty() {
-                return (text, "codex-gpt-6.1-sol-max-node2");
-            }
-        }
-    }
-
-    // 4. OpenAI Codex (GPT-6.1-SOL Ultra / Max / High) Engine
-    let local_codex = Path::new(&local_bin).join("codex");
-    let codex_bin: PathBuf = if local_codex.exists() {
+    let local_codex = local_bin.join("codex");
+    let codex = if local_codex.exists() {
         local_codex
     } else {
         PathBuf::from("/opt/homebrew/bin/codex")
     };
-    if is_codex && codex_bin.exists() {
-        let effort = codex_effort_arg(agent_upper);
-        if let Ok(out) = Command::new(&codex_bin)
+    if is_codex && codex.exists() {
+        let mut command = Command::new(&codex);
+        command
             .args([
                 "exec",
                 "--skip-git-repo-check",
@@ -530,58 +526,38 @@ fn dispatch_to_engine(
                 "-m",
                 "gpt-6.1-sol",
                 "-c",
-                effort,
+                codex_effort_arg(agent),
                 "-c",
                 "service_tier=\"priority\"",
                 &rich_prompt,
             ])
-            .current_dir(&default_cwd)
             .env("PATH", &path_env)
-            .envs(signing_env.iter().cloned())
-            .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            if out.status.success() && !text.is_empty() {
-                return (text, "codex-gpt-6.1-sol");
-            }
-        }
+            .envs(environment.iter().cloned());
+        return run_bound_local_command(binding, authority, &mut command)
+            .map(|text| (text, "codex-gpt-6.1-sol"));
     }
-
-    // 5. Grok 4.7 High CLI Engine (Strictly #s-and-m Outbound Execution: GROWTH, SALES)
-    let grok_bin = Path::new(&local_bin).join("grok");
-    if is_grok
-        && grok_bin.exists()
-        && let Ok(out) = Command::new(&grok_bin)
+    let grok = local_bin.join("grok");
+    if is_grok && grok.exists() {
+        let mut command = Command::new(grok);
+        command
             .args(["agent", "--always-approve", &rich_prompt])
-            .current_dir(&default_cwd)
             .env("PATH", &path_env)
-            .envs(signing_env.iter().cloned())
-            .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if out.status.success() && !text.is_empty() {
-            return (text, "grok-4.7-high");
-        }
+            .envs(environment.iter().cloned());
+        return run_bound_local_command(binding, authority, &mut command)
+            .map(|text| (text, "grok-4.7-high"));
     }
-
-    // 6. Official Gemini 4 Argon High CLI Engine (Primary for GEMINI-PM, DELIVERY, QA, INFRAJR, HOUSEKEEPING, SPARK, PATENT, EAGLE-EYE, ALISTAIR, MO, VENTURE, SCRIBE, FREQUENCY, MOTION, DEX, DOCS, SOCIAL & Fleet Default — Zero Anthropic Seats)
-    if Path::new("/opt/homebrew/bin/gemini").exists()
-        && let Ok(out) = Command::new("/opt/homebrew/bin/node")
+    if Path::new("/opt/homebrew/bin/gemini").exists() {
+        let mut command = Command::new("/opt/homebrew/bin/node");
+        command
             .args(["/opt/homebrew/bin/gemini", "-p", &rich_prompt, "--yolo"])
-            .current_dir(&default_cwd)
             .env("PATH", &path_env)
-            .envs(signing_env.iter().cloned())
-            .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if out.status.success() && !text.is_empty() {
-            return (text, "gemini-4-argon-high");
-        }
+            .envs(environment.iter().cloned());
+        return run_bound_local_command(binding, authority, &mut command)
+            .map(|text| (text, "gemini-4-argon-high"));
     }
-
-    // 7. Secondary Fallback to Codex GPT-6.1-SOL if Gemini CLI is unavailable
-    if codex_bin.exists()
-        && let Ok(out) = Command::new(&codex_bin)
+    if codex.exists() {
+        let mut command = Command::new(codex);
+        command
             .args([
                 "exec",
                 "--skip-git-repo-check",
@@ -592,40 +568,12 @@ fn dispatch_to_engine(
                 "model_reasoning_effort=\"high\"",
                 &rich_prompt,
             ])
-            .current_dir(&default_cwd)
             .env("PATH", &path_env)
-            .envs(signing_env.iter().cloned())
-            .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        if !text.is_empty() {
-            return (text, "codex-gpt-6.1-sol");
-        }
+            .envs(environment.iter().cloned());
+        return run_bound_local_command(binding, authority, &mut command)
+            .map(|text| (text, "codex-gpt-6.1-sol"));
     }
-
-    (
-        format!("[{agent_upper} note]: Unable to invoke local agent engine."),
-        "unavailable",
-    )
-}
-
-fn resolve_repo_root(crdb_path: Option<&Path>) -> PathBuf {
-    let Some(path) = crdb_path else {
-        return default_repo_root();
-    };
-    if path.file_name().is_some_and(|n| n == "state.crdb")
-        && let Some(chinwag_dir) = path.parent()
-        && chinwag_dir.file_name().is_some_and(|n| n == ".chinwag")
-        && let Some(repo) = chinwag_dir.parent()
-    {
-        return repo.to_path_buf();
-    }
-    if path.file_name().is_some_and(|n| n == ".chinwag")
-        && let Some(repo) = path.parent()
-    {
-        return repo.to_path_buf();
-    }
-    path.to_path_buf()
+    Err("engine_unavailable_without_replacement".into())
 }
 
 /// One inbound/outbound dispatch exchange to persist into the CRDB store.
@@ -639,6 +587,7 @@ struct DispatchExchange<'a> {
     now_ms: i64,
 }
 
+#[cfg(test)]
 fn workhorse_remote_command(identity: &crate::agent_instance::DispatchIdentity) -> String {
     format!(
         "PATH=/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin {} /Users/brianspector/.local/bin/codex exec --skip-git-repo-check --ephemeral -m gpt-6.1-sol -c 'model_reasoning_effort=\"max\"' -c 'service_tier=\"priority\"' -",
@@ -673,7 +622,13 @@ fn prepare_dispatch_identity(
     DispatchIdentity::new(child, parent)
 }
 
-fn persist_to_crdb_once(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<(), String> {
+fn persist_to_crdb(
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority,
+    exchange: &DispatchExchange<'_>,
+) -> Result<(), String> {
+    check_binding(binding, authority)?;
+    let repo_root = native_store_root(binding)?;
     let DispatchExchange {
         identity,
         item_key,
@@ -684,15 +639,17 @@ fn persist_to_crdb_once(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Re
         now_ms,
     } = *exchange;
     let thread_id = identity.child().to_string();
-    crate::memory_run::clear_stale_crdb_operation_artifacts(repo_root);
-    let owner = WriteOwner::acquire_existing_private_fixture(repo_root)
+    let mut owner = WriteOwner::acquire_existing_private_fixture(repo_root)
         .map_err(|e| format!("acquire_write_owner: {}", e.reason))?;
-    let session =
+    binding
+        .revalidate_for_store_owner(authority, &mut owner)
+        .map_err(|error| error.to_string())?;
+    let mut session =
         WriteSession::from_owner(owner).map_err(|e| format!("write_session: {}", e.reason))?;
     let record = AgentDispatchRecord::try_new(
         thread_id.clone(),
-        "emunlabs/chinwag".to_owned(),
-        "refs/heads/feat/v0.1.1-invariants-and-memory".to_owned(),
+        binding.repo_id().to_owned(),
+        binding.branch_metadata(),
         format!("Chinwag Agent Comms · {thread_id} · {item_key}"),
         inbound_id.to_owned(),
         identity.parent().record_author(),
@@ -705,9 +662,15 @@ fn persist_to_crdb_once(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Re
         now_ms,
     )
     .map_err(|e| e.to_owned())?;
-    let prepared = session
+    binding
+        .revalidate_for_store_owner(authority, &mut session)
+        .map_err(|error| error.to_string())?;
+    let mut prepared = session
         .prepare_agent_dispatch(record, || false)
         .map_err(|e| format!("prepare_agent_dispatch: {}", e.reason))?;
+    binding
+        .revalidate_for_store_owner(authority, &mut prepared)
+        .map_err(|error| error.to_string())?;
     let completion = prepared
         .commit(false)
         .map_err(|e| format!("commit_agent_dispatch: {}", e.reason))?;
@@ -717,21 +680,241 @@ fn persist_to_crdb_once(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Re
     Ok(())
 }
 
-fn persist_to_crdb(repo_root: &Path, exchange: &DispatchExchange<'_>) -> Result<(), String> {
-    let backoff_ms = [50_u64, 100, 150, 200, 250];
-    let mut last_err = String::new();
-    for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
-        match persist_to_crdb_once(repo_root, exchange) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = format!("attempt_{}:{e}", attempt + 1);
-                if attempt + 1 < backoff_ms.len() {
-                    std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
-                }
-            }
+trait AgentRouteEffects {
+    fn persona(&mut self, agent: &str, custom: Option<&CustomAgentMeta>) -> Result<String, String>;
+    fn memory(&mut self, binding: &WorkspaceExecutionBinding) -> Result<String, String>;
+    fn signing(
+        &mut self,
+        agent: &str,
+        binding: &WorkspaceExecutionBinding,
+    ) -> seat_signing::SeatSigning;
+    fn engine(
+        &mut self,
+        binding: &WorkspaceExecutionBinding,
+        authority: &ExecutionAuthority,
+        request: &EngineRequest<'_>,
+    ) -> Result<(String, &'static str), String>;
+    fn persist(
+        &mut self,
+        binding: &WorkspaceExecutionBinding,
+        authority: &ExecutionAuthority,
+        exchange: &DispatchExchange<'_>,
+    ) -> Result<(), String>;
+}
+
+struct NativeRouteEffects;
+impl AgentRouteEffects for NativeRouteEffects {
+    fn persona(&mut self, agent: &str, custom: Option<&CustomAgentMeta>) -> Result<String, String> {
+        Ok(load_persona(agent, custom))
+    }
+    fn memory(&mut self, binding: &WorkspaceExecutionBinding) -> Result<String, String> {
+        recall_native_memory(binding)
+    }
+    fn signing(
+        &mut self,
+        agent: &str,
+        binding: &WorkspaceExecutionBinding,
+    ) -> seat_signing::SeatSigning {
+        seat_signing::resolve(agent, Path::new(&user_home()), binding.execution_root())
+    }
+    fn engine(
+        &mut self,
+        binding: &WorkspaceExecutionBinding,
+        authority: &ExecutionAuthority,
+        request: &EngineRequest<'_>,
+    ) -> Result<(String, &'static str), String> {
+        dispatch_to_engine(binding, authority, request)
+    }
+    fn persist(
+        &mut self,
+        binding: &WorkspaceExecutionBinding,
+        authority: &ExecutionAuthority,
+        exchange: &DispatchExchange<'_>,
+    ) -> Result<(), String> {
+        persist_to_crdb(binding, authority, exchange)
+    }
+}
+
+struct BoundDispatchInput<'a> {
+    identity: &'a crate::agent_instance::DispatchIdentity,
+    item: &'a str,
+    body: &'a str,
+    history: &'a [HistoryEntry],
+    custom: Option<&'a CustomAgentMeta>,
+}
+
+#[cfg(test)]
+pub(crate) struct AgentRouteProbe {
+    pub stdout: String,
+    pub effects: Vec<&'static str>,
+}
+
+/// Controlled route-composition probe, not native-persistence evidence. A
+/// separate regression exercises the original native replacement and reopen.
+#[cfg(test)]
+pub(crate) fn probe_bound_route(
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority,
+    command: &mut Command,
+) -> Result<AgentRouteProbe, String> {
+    struct Probe<'a> {
+        command: &'a mut Command,
+        effects: Vec<&'static str>,
+    }
+    impl AgentRouteEffects for Probe<'_> {
+        fn persona(&mut self, _: &str, _: Option<&CustomAgentMeta>) -> Result<String, String> {
+            self.effects.push("persona");
+            Ok("Controlled route probe".into())
+        }
+        fn memory(&mut self, _: &WorkspaceExecutionBinding) -> Result<String, String> {
+            self.effects.push("memory");
+            Ok(String::new())
+        }
+        fn signing(&mut self, _: &str, _: &WorkspaceExecutionBinding) -> seat_signing::SeatSigning {
+            self.effects.push("signing");
+            seat_signing::SeatSigning::default()
+        }
+        fn engine(
+            &mut self,
+            binding: &WorkspaceExecutionBinding,
+            authority: &ExecutionAuthority,
+            _: &EngineRequest<'_>,
+        ) -> Result<(String, &'static str), String> {
+            self.effects.push("engine");
+            run_bound_local_command(binding, authority, self.command)
+                .map(|text| (text, "controlled-route-probe"))
+        }
+        fn persist(
+            &mut self,
+            _: &WorkspaceExecutionBinding,
+            _: &ExecutionAuthority,
+            _: &DispatchExchange<'_>,
+        ) -> Result<(), String> {
+            self.effects.push("mock-persistence");
+            Ok(())
         }
     }
-    Err(format!("crdb_persist_failed_after_5_attempts ({last_err})"))
+    let identity = crate::agent_instance::DispatchIdentity::new(
+        crate::agent_instance::ActorAddress::parse("RUST#p009-route-probe")
+            .map_err(|error| error.to_string())?,
+        crate::agent_instance::ActorAddress::parse("WORKHORSE#p009-route-parent")
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut probe = Probe {
+        command,
+        effects: Vec::new(),
+    };
+    let response = run_bound_exchange(
+        binding,
+        authority,
+        &BoundDispatchInput {
+            identity: &identity,
+            item: "controlled-route-probe",
+            body: "controlled route probe",
+            history: &[],
+            custom: None,
+        },
+        &mut probe,
+        &mut std::io::sink(),
+    )?;
+    Ok(AgentRouteProbe {
+        stdout: response["reply"]
+            .as_str()
+            .ok_or("probe_reply_missing")?
+            .to_owned(),
+        effects: probe.effects,
+    })
+}
+
+/// Both production and controlled route tests enter this exact ordered boundary.
+/// A binding supplies context, never a scheduler grant or resource lease.
+fn run_bound_exchange(
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority,
+    input: &BoundDispatchInput<'_>,
+    effects: &mut impl AgentRouteEffects,
+    err: &mut dyn Write,
+) -> Result<serde_json::Value, String> {
+    check_binding(binding, authority)?;
+    let agent = input.identity.child().seat();
+    require_local_route(agent, input.custom)?;
+    let persona = effects.persona(agent, input.custom)?;
+    check_binding(binding, authority)?;
+    let memory = effects.memory(binding)?;
+    check_binding(binding, authority)?;
+    let signing = effects.signing(agent, binding);
+    if let Some(warning) = &signing.warning {
+        let _ = writeln!(err, "chinwag: warning: {warning}");
+    }
+    let signing_note = signing.is_active().then(|| seat_signing::brief_note(agent));
+    let child = input.identity.child().to_string();
+    let sender = input.identity.parent().to_string();
+    let prompt = assemble_dispatch_prompt(
+        agent,
+        &persona,
+        &memory,
+        input.item,
+        &child,
+        &sender,
+        input.history,
+        signing_note.as_deref(),
+        input.body,
+        MAX_PROMPT_BYTES,
+    )?;
+    let mut environment = signing.env;
+    environment.extend(input.identity.environment());
+    check_binding(binding, authority)?;
+    let (reply, engine) = effects.engine(
+        binding,
+        authority,
+        &EngineRequest {
+            agent,
+            prompt: &prompt,
+            custom: input.custom,
+            environment: &environment,
+            identity: input.identity,
+        },
+    )?;
+    if matches!(engine, "unavailable" | "hosted-agent-error") {
+        return Err("engine_outcome_held_without_replacement".into());
+    }
+    let suffix = crate::agent_instance::new_instance_id().map_err(|error| error.to_string())?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "dispatch_clock_unavailable")?
+        .as_millis();
+    let now_ms = i64::try_from(now_ms).map_err(|_| "dispatch_clock_range")?;
+    let inbound_id = format!("msg-in-{now_ms}-{suffix}");
+    let outbound_id = format!("msg-out-{now_ms}-{suffix}");
+    check_binding(binding, authority)?;
+    effects
+        .persist(
+            binding,
+            authority,
+            &DispatchExchange {
+                identity: input.identity,
+                item_key: input.item,
+                inbound_id: &inbound_id,
+                inbound_body: input.body,
+                outbound_id: &outbound_id,
+                outbound_body: &reply,
+                now_ms,
+            },
+        )
+        .map_err(|error| format!("dispatch_persistence_unknown_no_retry: {error}"))?;
+    // The original native replacement may have changed the store inode. Stop
+    // here: no unrelated retention/relay or implicit adoption of that new file.
+    Ok(json!({
+        "ok": true, "agent": agent, "agent_instance": child, "sender_instance": sender,
+        "engine": engine, "reply": reply, "item_key": input.item,
+        "crdb_message_id": outbound_id, "crdb_inbound_id": inbound_id, "crdb_thread_id": child,
+        "crdb_persisted": true, "crdb_status": "stored",
+        "workspace_id": binding.workspace_id(), "repo_id": binding.repo_id(),
+        "worktree_id": binding.worktree_id(), "execution_root": binding.execution_root(),
+        "store_id": binding.store_id(), "store_path": binding.store_path(),
+        "execution_binding": binding.commitment_id(),
+    }))
 }
 
 pub fn run_agent_dispatch(
@@ -740,7 +923,25 @@ pub fn run_agent_dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let mut stdin_payload = StdinDispatchPayload::default();
+    run_agent_dispatch_with_effects(
+        request,
+        input,
+        out,
+        err,
+        &ExecutionAuthority::unsupported(),
+        &mut NativeRouteEffects,
+    )
+}
+
+fn run_agent_dispatch_with_effects(
+    request: AgentDispatchRequest,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    authority: &ExecutionAuthority,
+    effects: &mut impl AgentRouteEffects,
+) -> u8 {
+    let mut payload = StdinDispatchPayload::default();
     if request.stdin_json {
         let mut raw = String::new();
         if input.read_to_string(&mut raw).is_err() {
@@ -748,8 +949,8 @@ pub fn run_agent_dispatch(
             return 2;
         }
         if !raw.trim().is_empty() {
-            match serde_json::from_str::<StdinDispatchPayload>(&raw) {
-                Ok(parsed) => stdin_payload = parsed,
+            match serde_json::from_str(&raw) {
+                Ok(parsed) => payload = parsed,
                 Err(_) => {
                     let _ = writeln!(err, "chinwag: invalid_arguments");
                     return 2;
@@ -757,157 +958,87 @@ pub fn run_agent_dispatch(
             }
         }
     }
-
     let ambient_actor = std::env::var("CHINWAG_ACTOR").ok();
-    let identity =
-        match prepare_dispatch_identity(&request, &stdin_payload, ambient_actor.as_deref()) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = writeln!(err, "chinwag: {error}");
-                return 2;
-            }
-        };
-    let agent_upper = identity.child().seat().to_owned();
-    let Some(body) = request
-        .body
-        .or(stdin_payload.body)
-        .or(stdin_payload.message)
-    else {
-        let _ = writeln!(err, "chinwag: invalid_arguments");
-        return 2;
-    };
-    if agent_upper.is_empty() || body.trim().is_empty() {
-        let _ = writeln!(err, "chinwag: invalid_arguments");
-        return 2;
-    }
-
-    let sender = identity.parent().to_string();
-    let item_key = request
-        .item
-        .or(stdin_payload.item_key)
-        .or(stdin_payload.item)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "chinwag-v0.1.1-sprint".to_owned());
-    let crdb_path = request.crdb.or_else(|| {
-        stdin_payload
-            .crdb
-            .filter(|s| !s.trim().is_empty())
-            .map(PathBuf::from)
-    });
-
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let hash_suffix = match crate::agent_instance::new_instance_id() {
-        Ok(value) => value,
+    let identity = match prepare_dispatch_identity(&request, &payload, ambient_actor.as_deref()) {
+        Ok(identity) => identity,
         Err(error) => {
             let _ = writeln!(err, "chinwag: {error}");
             return 2;
         }
     };
-    let agent_instance = identity.child().to_string();
-
-    let repo_root = resolve_repo_root(crdb_path.as_deref());
-    let persona = load_persona(&agent_upper, stdin_payload.custom_agent.as_ref());
-    let memories = recall_native_memory(&agent_upper.to_ascii_lowercase(), &body, &repo_root);
-
-    // Per-seat commit signing for the engine process. Fails safe: with no key
-    // pair for the seat nothing is injected and only a warning is logged.
-    let signing =
-        seat_signing::resolve(&agent_upper, Path::new(&user_home()), &default_repo_root());
-    if let Some(warning) = &signing.warning {
-        let _ = writeln!(err, "chinwag: warning: {warning}");
+    let Some(body) = request.body.or(payload.body).or(payload.message) else {
+        let _ = writeln!(err, "chinwag: invalid_arguments");
+        return 2;
+    };
+    if body.trim().is_empty() {
+        let _ = writeln!(err, "chinwag: invalid_arguments");
+        return 2;
     }
-    let signing_note = signing
-        .is_active()
-        .then(|| seat_signing::brief_note(&agent_upper));
-
-    let full_prompt = match assemble_dispatch_prompt(
-        &agent_upper,
-        &persona,
-        &memories,
-        &item_key,
-        &agent_instance,
-        &sender,
-        &stdin_payload.history,
-        signing_note.as_deref(),
-        &body,
-        MAX_PROMPT_BYTES,
-    ) {
-        Ok(prompt) => prompt,
-        Err(reason) => {
-            let _ = writeln!(err, "chinwag: {reason}");
+    let item = request
+        .item
+        .or(payload.item_key)
+        .or(payload.item)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "chinwag-v0.1.1-sprint".into());
+    let repo = request.repo.or_else(|| payload.repo.map(PathBuf::from));
+    let store = request.crdb.or_else(|| payload.crdb.map(PathBuf::from));
+    let environment_repo = std::env::var_os("CHINWAG_REPO_ROOT");
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => {
+            let _ = writeln!(err, "chinwag: execution_cwd_unavailable");
             return 2;
         }
     };
-
-    let mut engine_env = signing.env.clone();
-    engine_env.extend(identity.environment());
-
-    let (reply, engine_used) = dispatch_to_engine(
-        &agent_upper,
-        &full_prompt,
-        stdin_payload.custom_agent.as_ref(),
-        &engine_env,
-        &identity,
-    );
-    let dispatch_ok = !matches!(engine_used, "unavailable" | "hosted-agent-error");
-
-    let inbound_id = format!("msg-in-{now_ms}-{hash_suffix}");
-    let outbound_id = format!("msg-out-{now_ms}-{hash_suffix}");
-
-    let (crdb_status, crdb_persisted) = match persist_to_crdb(
-        &repo_root,
-        &DispatchExchange {
-            identity: &identity,
-            item_key: &item_key,
-            inbound_id: &inbound_id,
-            inbound_body: &body,
-            outbound_id: &outbound_id,
-            outbound_body: &reply,
-            now_ms,
-        },
-    ) {
-        Ok(()) => ("stored".to_owned(), true),
-        Err(reason) => {
-            let _ = writeln!(err, "chinwag: crdb_error: {reason}");
-            (format!("error:{reason}"), false)
+    let selected = select_repository(RepoSelectors {
+        explicit_repo: repo.as_deref(),
+        environment_repo: environment_repo.as_deref(),
+        cwd: &cwd,
+    })
+    .and_then(|selection| {
+        bind_execution(
+            &selection,
+            StoreSelector {
+                explicit_crdb: store.as_deref(),
+            },
+            authority,
+        )
+    });
+    let binding = match selected {
+        Ok(binding) => binding,
+        Err(error) => {
+            let _ = writeln!(err, "chinwag: execution_binding_held: {error}");
+            return 2;
         }
     };
-
-    notify_grokbot_department_relay(&agent_upper, &sender, &item_key, &body, &reply);
-    retain_native_memory(
-        &repo_root,
-        &agent_upper,
-        engine_used,
-        &sender,
-        &item_key,
-        &body,
-        &reply,
+    let result = run_bound_exchange(
+        &binding,
+        authority,
+        &BoundDispatchInput {
+            identity: &identity,
+            item: &item,
+            body: &body,
+            history: &payload.history,
+            custom: payload.custom_agent.as_ref(),
+        },
+        effects,
+        err,
     );
-
-    let output = json!({
-        "ok": dispatch_ok,
-        "agent": agent_upper,
-        "agent_instance": agent_instance,
-        "sender_instance": sender,
-        "engine": engine_used,
-        "reply": reply,
-        "crdb_message_id": outbound_id,
-        "crdb_inbound_id": inbound_id,
-        "crdb_thread_id": agent_instance,
-        "item_key": item_key,
-        "crdb_persisted": crdb_persisted,
-        "crdb_status": crdb_status
-    });
-    if serde_json::to_writer(&mut *out, &output).is_err()
-        || out.write_all(b"\n").is_err()
-        || out.flush().is_err()
-    {
-        return 1;
+    match result {
+        Ok(response) => {
+            if serde_json::to_writer(&mut *out, &response).is_err()
+                || out.write_all(b"\n").is_err()
+                || out.flush().is_err()
+            {
+                return 1;
+            }
+            0
+        }
+        Err(error) => {
+            let _ = writeln!(err, "chinwag: dispatch_held: {error}");
+            1
+        }
     }
-    if dispatch_ok { 0 } else { 1 }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -973,6 +1104,10 @@ fn assemble_dispatch_prompt(
 
     Ok(required_only)
 }
+
+#[cfg(test)]
+#[path = "agent_dispatch_route_tests.rs"]
+mod execution_binding_route_tests;
 
 #[cfg(test)]
 mod codex_effort_tests {

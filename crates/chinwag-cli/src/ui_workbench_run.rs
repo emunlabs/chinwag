@@ -12,12 +12,17 @@
 
 use crate::{bus_run, feature_cli_run};
 use chinwag_cli::agent_instance::{ActorAddress, InstanceError};
+use chinwag_cli::execution_binding::{
+    ExecutionAuthority, RepositorySelection, StoreSelector, WorkspaceExecutionBinding,
+    bind_execution,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_WORKBENCH_PORT: u16 = 44331;
@@ -41,32 +46,27 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn resolve_repo_root(explicit: Option<&str>) -> PathBuf {
-    if let Some(p) = explicit {
-        return PathBuf::from(p);
-    }
-    if let Ok(env_root) = std::env::var("CHINWAG_REPO_ROOT")
-        && !env_root.trim().is_empty()
-    {
-        return PathBuf::from(env_root);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/brianspector".to_string());
-    let home_path = PathBuf::from(&home);
-    if let Ok(cwd) = std::env::current_dir() {
-        for ancestor in cwd.ancestors() {
-            if ancestor != home_path.as_path()
-                && ancestor.join(".chinwag").is_dir()
-                && (ancestor.join(".git").exists() || ancestor.join("TASKS.md").exists())
-            {
-                return ancestor.to_path_buf();
-            }
-        }
-    }
-    let real_ws = PathBuf::from("/Users/brianspector/WORKSPACE/chinwag");
-    if real_ws.join(".chinwag").is_dir() {
-        return real_ws;
-    }
-    home_path.join("WORKSPACE/chinwag")
+/// A protected UI action enters this same boundary before publication or dispatch.
+pub(crate) fn with_ui_task_effect<T>(
+    selection: &RepositorySelection,
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority<'_>,
+    effect: impl FnOnce(&WorkspaceExecutionBinding) -> T,
+) -> Result<T, String> {
+    feature_cli_run::with_feature_task_effect(selection, binding, authority, effect)
+}
+
+fn preflight_ui_task_effect(selection: &RepositorySelection) -> Result<(), String> {
+    let authority = ExecutionAuthority::unsupported();
+    let binding = bind_execution(
+        selection,
+        StoreSelector {
+            explicit_crdb: None,
+        },
+        &authority,
+    )
+    .map_err(|e| e.to_string())?;
+    with_ui_task_effect(selection, &binding, &authority, |_| ())
 }
 
 fn resolve_workbench_dir(repo_root: &Path) -> PathBuf {
@@ -77,11 +77,6 @@ fn resolve_workbench_dir(repo_root: &Path) -> PathBuf {
         if p.is_dir() {
             return p;
         }
-    }
-    let backup_v5 =
-        PathBuf::from("/Users/brianspector/WORKSPACE/backups/type-style-20261028/workbench-v5");
-    if backup_v5.is_dir() {
-        return backup_v5;
     }
     repo_root.join("workbench-v5")
 }
@@ -360,9 +355,10 @@ fn write_http_response(
 
 pub fn handle_workbench_http_connection(
     mut stream: std::net::TcpStream,
-    repo_root: &Path,
+    selection: &RepositorySelection,
     workbench_dir: &Path,
 ) {
+    let repo_root = selection.root();
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let mut buf = Vec::with_capacity(8192);
     let mut temp = [0u8; 4096];
@@ -451,6 +447,20 @@ pub fn handle_workbench_http_connection(
             "403 Forbidden",
             "application/json; charset=utf-8",
             &err_json,
+        );
+        return;
+    }
+
+    if let Err(error) = selection.revalidate() {
+        let body = serde_json::to_vec(
+            &json!({"ok": false, "disposition": "HELD", "error": error.to_string()}),
+        )
+        .unwrap_or_default();
+        write_http_response(
+            &mut stream,
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &body,
         );
         return;
     }
@@ -619,6 +629,34 @@ pub fn handle_workbench_http_connection(
                 );
                 return;
             }
+            let wake = parsed
+                .get("wake")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if wake && let Err(error) = preflight_ui_task_effect(selection) {
+                let body = serde_json::to_vec(&json!({
+                    "ok": false, "disposition": "HELD", "published": false,
+                    "work_started": "UNKNOWN", "error": error,
+                }))
+                .unwrap_or_default();
+                write_http_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &body,
+                );
+                return;
+            }
+            if let Err(error) = selection.revalidate() {
+                let body = serde_json::to_vec(&json!({"ok": false, "disposition": "HELD", "published": false, "error": error.to_string()})).unwrap_or_default();
+                write_http_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &body,
+                );
+                return;
+            }
             let result = bus_run::send_bus_message_sync(
                 repo_root,
                 &sender.to_string(),
@@ -644,27 +682,12 @@ pub fn handle_workbench_http_connection(
                     return;
                 }
             };
-            if parsed
-                .get("wake")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                let repo_clone = repo_root.to_path_buf();
-                std::thread::spawn(move || {
-                    let wake_args = vec![
-                        "wake".to_string(),
-                        "--repo".to_string(),
-                        repo_clone.to_string_lossy().to_string(),
-                    ];
-                    let mut out = Vec::new();
-                    let mut err = Vec::new();
-                    let _ = bus_run::run_bus_cli(&wake_args, &mut out, &mut err);
-                });
-            }
             let resp = serde_json::to_vec_pretty(&json!({
                 "ok": true,
                 "message": msg,
-                "ack": ack
+                "ack": ack,
+                "delivery": "PUBLISH_ONLY",
+                "work_started": "UNKNOWN"
             }))
             .unwrap_or_default();
             write_http_response(
@@ -701,8 +724,9 @@ pub fn handle_workbench_http_connection(
         }
         ("GET", "/api/a509") => {
             let args = vec!["verify".to_string(), "--json".to_string()];
-            let payload =
-                run_cli_to_json_bytes(|out, err| feature_cli_run::run_a509_cli(&args, out, err));
+            let payload = run_cli_to_json_bytes(|out, err| {
+                feature_cli_run::run_a509_cli_with_selection(selection, &args, out, err)
+            });
             write_http_response(
                 &mut stream,
                 "200 OK",
@@ -712,8 +736,9 @@ pub fn handle_workbench_http_connection(
         }
         ("GET", "/api/bonds") => {
             let args = vec!["status".to_string(), "--json".to_string()];
-            let payload =
-                run_cli_to_json_bytes(|out, err| feature_cli_run::run_bond_cli(&args, out, err));
+            let payload = run_cli_to_json_bytes(|out, err| {
+                feature_cli_run::run_bond_cli_with_selection(selection, &args, out, err)
+            });
             write_http_response(
                 &mut stream,
                 "200 OK",
@@ -723,8 +748,9 @@ pub fn handle_workbench_http_connection(
         }
         ("GET", "/api/plugins") => {
             let args = vec!["verify".to_string(), "--json".to_string()];
-            let payload =
-                run_cli_to_json_bytes(|out, err| feature_cli_run::run_plugin_cli(&args, out, err));
+            let payload = run_cli_to_json_bytes(|out, err| {
+                feature_cli_run::run_plugin_cli_with_selection(selection, &args, out, err)
+            });
             write_http_response(
                 &mut stream,
                 "200 OK",
@@ -734,8 +760,9 @@ pub fn handle_workbench_http_connection(
         }
         ("GET", "/api/cwcards") => {
             let args = vec!["verify".to_string(), "--json".to_string()];
-            let payload =
-                run_cli_to_json_bytes(|out, err| feature_cli_run::run_cwcard_cli(&args, out, err));
+            let payload = run_cli_to_json_bytes(|out, err| {
+                feature_cli_run::run_cwcard_cli_with_selection(selection, &args, out, err)
+            });
             write_http_response(
                 &mut stream,
                 "200 OK",
@@ -864,7 +891,6 @@ pub fn run_ui_workbench_cli(args: &[String], stdout: &mut dyn Write, stderr: &mu
     }
 
     let mut port = DEFAULT_WORKBENCH_PORT;
-    let mut repo_arg: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -873,18 +899,24 @@ pub fn run_ui_workbench_cli(args: &[String], stdout: &mut dyn Write, stderr: &mu
                 i += 2;
             }
             "--repo" if i + 1 < args.len() => {
-                repo_arg = Some(args[i + 1].clone());
                 i += 2;
             }
             _ => i += 1,
         }
     }
 
-    let repo_root = resolve_repo_root(repo_arg.as_deref());
-    let workbench_dir = resolve_workbench_dir(&repo_root);
+    let selection = match feature_cli_run::select_cli_repository(args) {
+        Ok(selection) => Arc::new(selection),
+        Err(error) => {
+            let _ = writeln!(stderr, "chinwag ui repository held: {error}");
+            return 2;
+        }
+    };
+    let repo_root = selection.root();
+    let workbench_dir = resolve_workbench_dir(repo_root);
 
     if sub == "status" || args.iter().any(|a| a == "--status") {
-        let state_path = ui_daemon_state_path(&repo_root);
+        let state_path = ui_daemon_state_path(repo_root);
         let state: Option<UiDaemonState> = fs::read_to_string(&state_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok());
@@ -916,7 +948,7 @@ pub fn run_ui_workbench_cli(args: &[String], stdout: &mut dyn Write, stderr: &mu
     }
 
     if sub == "snapshot" {
-        let out = parse_all_tasks_json(&repo_root);
+        let out = parse_all_tasks_json(repo_root);
         let _ = writeln!(
             stdout,
             "{}",
@@ -945,7 +977,7 @@ pub fn run_ui_workbench_cli(args: &[String], stdout: &mut dyn Write, stderr: &mu
             .to_string(),
         started_at_unix: unix_now(),
     };
-    let state_path = ui_daemon_state_path(&repo_root);
+    let state_path = ui_daemon_state_path(repo_root);
     if let Some(parent) = state_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -960,7 +992,7 @@ pub fn run_ui_workbench_cli(args: &[String], stdout: &mut dyn Write, stderr: &mu
     );
 
     for stream in listener.incoming().flatten() {
-        let repo_c = repo_root.clone();
+        let repo_c = Arc::clone(&selection);
         let wb_c = workbench_dir.clone();
         std::thread::spawn(move || {
             handle_workbench_http_connection(stream, &repo_c, &wb_c);
@@ -974,6 +1006,50 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpStream;
+
+    fn init_test_repo(repo: &Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@chinwag.test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let mut command = std::process::Command::new("git");
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("GIT_") {
+                    command.env_remove(name);
+                }
+            }
+            let status = command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "core.fsmonitor=false",
+                ])
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
 
     #[test]
     fn ui_sender_admission_preserves_allowed_seat_and_exact_instance() {
@@ -1025,12 +1101,23 @@ mod tests {
 
     #[test]
     fn workbench_http_server_serves_live_api_and_injects_bus_bridge() {
-        let repo_root = resolve_repo_root(None);
-        let wb_dir = resolve_workbench_dir(&repo_root);
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let selection = Arc::new(
+            feature_cli_run::select_cli_repository(&[
+                "--repo".into(),
+                fs::canonicalize(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ])
+            .unwrap(),
+        );
+        let wb_dir = resolve_workbench_dir(selection.root());
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         let addr = listener.local_addr().expect("local_addr");
 
-        let repo_c = repo_root.clone();
+        let repo_c = Arc::clone(&selection);
         let wb_c = wb_dir.clone();
         std::thread::spawn(move || {
             for s in listener.incoming().take(5).flatten() {
@@ -1099,5 +1186,149 @@ mod tests {
         let mut r5 = String::new();
         s5.read_to_string(&mut r5).unwrap();
         assert!(r5.contains("403 Forbidden"), "{r5}");
+    }
+    fn selected_fixture() -> (tempfile::TempDir, Arc<RepositorySelection>) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        init_test_repo(&root);
+        let selected = feature_cli_run::select_cli_repository(&[
+            "--repo".into(),
+            root.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        (temp, Arc::new(selected))
+    }
+
+    fn selected_http_request(selection: Arc<RepositorySelection>, request: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let wb = selection.root().join("workbench-v5");
+            handle_workbench_http_connection(stream, &selection, &wb);
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    #[test]
+    fn p009_ui_feature_views_keep_the_same_nondefault_repository_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        init_test_repo(&root);
+        fs::create_dir(root.join(".chinwag")).unwrap();
+        fs::write(
+            root.join(".chinwag/allowed_signers"),
+            "# selected fixture\n",
+        )
+        .unwrap();
+        let selection = Arc::new(
+            feature_cli_run::select_cli_repository(&[
+                "--repo".into(),
+                root.to_string_lossy().into_owned(),
+            ])
+            .unwrap(),
+        );
+        for (route, field) in [
+            ("a509", "allowed_signers"),
+            ("bonds", "bond_path"),
+            ("plugins", "manifest_path"),
+            ("cwcards", "cwcard_path"),
+        ] {
+            let request = format!("GET /api/{route} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let response = selected_http_request(Arc::clone(&selection), request.as_bytes());
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            let value: Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert!(
+                value[field]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(selection.root().to_str().unwrap()),
+                "{route}: {value}"
+            );
+            if route == "a509" {
+                assert_eq!(value["private_keys_read"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn p009_ui_send_and_wake_holds_before_publication_or_worker_creation() {
+        let (_temp, selection) = selected_fixture();
+        let body =
+            br##"{"sender":"Brian","room":"#test","body":"controlled refusal","wake":true}"##;
+        let mut request = format!("POST /api/bus/send HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Chinwag-UI-Intent: 1\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        request.extend_from_slice(body);
+        let response = selected_http_request(Arc::clone(&selection), &request);
+        assert!(response.starts_with("HTTP/1.1 409 Conflict"), "{response}");
+        let value: Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(value["disposition"], "HELD");
+        assert_eq!(value["published"], false);
+        assert_eq!(value["work_started"], "UNKNOWN");
+        assert!(!selection.root().join(".chinwag").exists());
+    }
+
+    #[test]
+    fn p009_ui_refuses_replaced_repository_before_feature_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = fs::canonicalize(temp.path()).unwrap();
+        let root = parent.join("repo");
+        fs::create_dir(&root).unwrap();
+        init_test_repo(&root);
+        let selection = Arc::new(
+            feature_cli_run::select_cli_repository(&[
+                "--repo".into(),
+                root.to_string_lossy().into_owned(),
+            ])
+            .unwrap(),
+        );
+        fs::rename(&root, parent.join("old")).unwrap();
+        fs::create_dir(&root).unwrap();
+        init_test_repo(&root);
+        let response = selected_http_request(
+            selection,
+            b"GET /api/a509 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 409 Conflict"), "{response}");
+        let value: Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(value["disposition"], "HELD");
+    }
+
+    #[test]
+    fn p009_ui_duplicate_repo_selector_refuses_without_starting_server() {
+        let (_temp, selection) = selected_fixture();
+        let root = selection.root().to_string_lossy().into_owned();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            run_ui_workbench_cli(
+                &[
+                    "serve".into(),
+                    "--repo".into(),
+                    root.clone(),
+                    "--repo".into(),
+                    root
+                ],
+                &mut out,
+                &mut err
+            ),
+            2
+        );
+        assert!(
+            !selection
+                .root()
+                .join(".chinwag/bus/ui-daemon.json")
+                .exists()
+        );
     }
 }

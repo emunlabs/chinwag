@@ -1026,6 +1026,24 @@ impl ResourceLeaseStore {
     pub fn status(&self, id: &str) -> Option<LeaseStatus> {
         self.rows.get(id).map(|r| r.status)
     }
+
+    pub(crate) fn validate_execution_binding(
+        &self,
+        binding: &crate::execution_binding::WorkspaceExecutionBinding,
+        authority: &CurrentLeaseAuthority<'_>,
+    ) -> Result<()> {
+        let (current, _) = self.current(authority)?;
+        let tuple = |file: &File| identity(file).map(|id| (id.dev, id.ino));
+        if binding.repo_id() != self.policy.repo_id
+            || binding.root_identity() != tuple(current.root)?
+            || binding.gitdir_identity() != tuple(current.gitdir)?
+            || binding.common_git_identity() != tuple(current.common)?
+            || binding.integration_target() != current.target
+        {
+            return Err(LeaseError::Authority);
+        }
+        Ok(())
+    }
 }
 
 /// This object exposes operations, never writable descriptors or raw paths.

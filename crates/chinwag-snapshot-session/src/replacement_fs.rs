@@ -137,6 +137,9 @@ impl Stamp {
     }
 }
 impl FileId {
+    pub(super) fn identity(self) -> (u64, u64) {
+        (self.0.dev as u64, self.0.ino)
+    }
     pub fn observation(self) -> (i32, u64, u64, [i128; 4]) {
         (self.0.dev, self.0.ino, self.0.nlink, self.0.times)
     }
@@ -188,6 +191,19 @@ fn bytes(file: &mut File, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 impl Anchor {
+    pub(super) fn bound_directory_identities(&self) -> Result<((u64, u64), (u64, u64))> {
+        self.check()?;
+        let repository = self
+            .links
+            .get(self.repository_index)
+            .ok_or("repository_binding_missing")?
+            .child;
+        Ok((
+            (repository.dev as u64, repository.ino),
+            (self.captured.dev as u64, self.captured.ino),
+        ))
+    }
+
     pub fn open_fixture(repo: &Path) -> Result<Self> {
         let mut components = repo.components();
         if components.next() != Some(Component::RootDir) {

@@ -89,6 +89,34 @@ impl WriteOwner {
     pub(super) fn image(&self) -> &[u8] {
         &self.original.bytes
     }
+
+    /// Compare the original held image with a previously validated execution
+    /// binding. Expected values are data, never an owner or cleanup permit.
+    /// This verifies only this owner's exact lock; all other artifacts hold.
+    pub fn verify_bound_source(
+        &mut self,
+        repository: (u64, u64),
+        parent: (u64, u64),
+        file: (u64, u64),
+        sha256: [u8; 32],
+    ) -> Result<()> {
+        self.verify_unchanged()?;
+        let anchor = self
+            .anchor
+            .as_ref()
+            .ok_or_else(|| retained("write_anchor_missing", false, false))?;
+        let identities = anchor
+            .bound_directory_identities()
+            .map_err(|reason| retained(reason, false, false))?;
+        if identities != (repository, parent)
+            || self.original.id.identity() != file
+            || <[u8; 32]>::from(Sha256::digest(&self.original.bytes)) != sha256
+        {
+            return Err(retained("write_bound_source_mismatch", false, false));
+        }
+        self.verify_original()
+    }
+
     fn verify_original(&mut self) -> Result<()> {
         let anchor = self
             .anchor

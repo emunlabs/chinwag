@@ -118,23 +118,18 @@ fn iso_now() -> String {
     format!("{}", unix_now())
 }
 
-fn resolve_repo_root(explicit: Option<&str>) -> PathBuf {
-    if let Some(p) = explicit {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let home_path = PathBuf::from(&home);
-    if let Ok(cwd) = std::env::current_dir() {
-        for ancestor in cwd.ancestors() {
-            if ancestor != home_path
-                && ancestor.join(".chinwag").is_dir()
-                && (ancestor.join(".git").exists() || ancestor.join("TASKS.md").exists())
-            {
-                return ancestor.to_path_buf();
-            }
-        }
-    }
-    PathBuf::from(format!("{home}/WORKSPACE/chinwag"))
+fn resolve_repo_root(
+    explicit: Option<&str>,
+) -> Result<chinwag_cli::execution_binding::RepositorySelection, String> {
+    use chinwag_cli::execution_binding::{RepoSelectors, select_repository};
+    let environment = std::env::var_os("CHINWAG_REPO_ROOT");
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    select_repository(RepoSelectors {
+        explicit_repo: explicit.map(Path::new),
+        environment_repo: environment.as_deref(),
+        cwd: &cwd,
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn bus_dir(repo_root: &Path) -> PathBuf {
@@ -1231,6 +1226,56 @@ Existing-conversation scheduling has no supported adapter in this binary and rep
     0
 }
 
+/// Cooperative admitted-worker seam. Legacy prose/wake commands cannot supply
+/// these sealed capabilities. A future host adapter still needs its own proof.
+#[allow(dead_code)]
+pub(crate) trait BoundBusExecutor {
+    fn invoke(
+        &mut self,
+        binding: &chinwag_cli::execution_binding::WorkspaceExecutionBinding,
+        admission: &chinwag_cli::task_writer::ExecutionAdmissionV1,
+        writer: &mut chinwag_cli::task_resource_lease::ProtectedWriter<'_>,
+    ) -> chinwag_cli::task_scheduler::InvocationOutcome;
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn invoke_admitted_bus_task(
+    scheduler: &mut chinwag_cli::task_scheduler::WorkspaceScheduler,
+    claim: chinwag_cli::task_scheduler::ClaimedAssignment,
+    scheduler_authority: &chinwag_cli::task_scheduler::CurrentAuthority<'_>,
+    leases: &mut chinwag_cli::task_resource_lease::ResourceLeaseStore,
+    capability: chinwag_cli::task_resource_lease::CommittedWriteLease,
+    lease_authority: &chinwag_cli::task_resource_lease::CurrentLeaseAuthority<'_>,
+    binding: &chinwag_cli::execution_binding::WorkspaceExecutionBinding,
+    execution_authority: &chinwag_cli::execution_binding::ExecutionAuthority<'_>,
+    executor: &mut impl BoundBusExecutor,
+) -> Result<chinwag_cli::task_scheduler::AdmissionStatus, chinwag_cli::task_scheduler::SchedulerError>
+{
+    struct Bound<'a, E> {
+        binding: &'a chinwag_cli::execution_binding::WorkspaceExecutionBinding,
+        executor: &'a mut E,
+    }
+    impl<E: BoundBusExecutor> chinwag_cli::task_resource_lease::LeasedExecutor for Bound<'_, E> {
+        fn invoke(
+            &mut self,
+            admission: &chinwag_cli::task_writer::ExecutionAdmissionV1,
+            writer: &mut chinwag_cli::task_resource_lease::ProtectedWriter<'_>,
+        ) -> chinwag_cli::task_scheduler::InvocationOutcome {
+            self.executor.invoke(self.binding, admission, writer)
+        }
+    }
+    scheduler.invoke_with_bound_lease(
+        claim,
+        scheduler_authority,
+        leases,
+        capability,
+        lease_authority,
+        binding,
+        execution_authority,
+        &mut Bound { binding, executor },
+    )
+}
+
 pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     if sub == "--help" || sub == "-h" || sub == "help" {
@@ -1263,7 +1308,10 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 break;
             }
             "--repo" if i + 1 < args.len() => {
-                repo_arg = Some(args[i + 1].clone());
+                if repo_arg.replace(args[i + 1].clone()).is_some() {
+                    let _ = writeln!(stderr, "chinwag bus: duplicate_repository_selector");
+                    return 2;
+                }
                 i += 2;
             }
             "--from" | "-s" | "--sender" if i + 1 < args.len() => {
@@ -1342,10 +1390,9 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
         }
     }
 
-    let repo_root = resolve_repo_root(repo_arg.as_deref());
-
-    match sub {
-        "instance" | "new-instance" => match agent_instance::new_instance_id() {
+    // Identity allocation is independent of repository/task authority.
+    if matches!(sub, "instance" | "new-instance") {
+        return match agent_instance::new_instance_id() {
             Ok(instance) => {
                 let _ = writeln!(stdout, "{instance}");
                 0
@@ -1354,7 +1401,41 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 let _ = writeln!(stderr, "chinwag bus: {error}");
                 2
             }
-        },
+        };
+    }
+    // No legacy command can manufacture a current scheduler/binding/lease.
+    // Refuse the combined task effect before ordinary publication as well.
+    if wake_on_send {
+        let Some(targets) = to_arg.as_deref() else {
+            let _ = writeln!(stderr, "chinwag bus: wake_target_required");
+            return 2;
+        };
+        let Ok(targets) = agent_instance::parse_recipients(targets) else {
+            let _ = writeln!(stderr, "chinwag bus: invalid_actor_instance");
+            return 2;
+        };
+        if targets.iter().any(|target| target.instance().is_some()) {
+            let _ = writeln!(stderr, "chinwag bus: existing_instance_wake_unsupported");
+            return 2;
+        }
+    }
+    if matches!(sub, "worker" | "wake" | "route") || wake_on_send {
+        return scheduler_admission_required(stderr);
+    }
+    let selected = match resolve_repo_root(repo_arg.as_deref()) {
+        Ok(selected) => selected,
+        Err(error) => {
+            let _ = writeln!(stderr, "chinwag bus: repository selection refused: {error}");
+            return 2;
+        }
+    };
+    if let Err(error) = selected.revalidate() {
+        let _ = writeln!(stderr, "chinwag bus: repository selection refused: {error}");
+        return 2;
+    }
+    let repo_root = selected.execution_root().to_path_buf();
+
+    match sub {
         "worker" => scheduler_admission_required(stderr),
         "daemon" => {
             let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
@@ -1392,23 +1473,6 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     return 2;
                 }
             };
-            if wake_on_send {
-                let Some(targets) = to_arg.as_deref() else {
-                    let _ = writeln!(stderr, "chinwag bus: wake_target_required");
-                    return 2;
-                };
-                let Ok(targets) = agent_instance::parse_recipients(targets) else {
-                    let _ = writeln!(stderr, "chinwag bus: invalid_actor_instance");
-                    return 2;
-                };
-                if targets.iter().any(|target| target.instance().is_some()) {
-                    let _ = writeln!(stderr, "chinwag bus: existing_instance_wake_unsupported");
-                    return 2;
-                }
-            }
-            if wake_on_send {
-                return scheduler_admission_required(stderr);
-            }
             let room = room_arg.unwrap_or_else(|| "#mgmt".to_string());
             let result = send_bus_message_sync(
                 &repo_root,
@@ -2135,6 +2199,19 @@ mod tests {
         sign_bus_message(&mut wrong_seat, &secret);
         assert!(!verify_detached_bus_signature(temp.path(), &mut wrong_seat));
 
+        // Ordinary CLI reads still require an actual repository selection.
+        assert!(
+            Command::new("/usr/bin/git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["init", "--quiet", "--template="])
+                .arg(temp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         // Read the actual CLI inbox from an isolated signed fixture journal.
         let mut journal = Vec::new();
         for (seq, to, body) in [

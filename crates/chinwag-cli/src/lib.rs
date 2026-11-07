@@ -3,11 +3,27 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
+// Compile the actual binary route adapters in the library's private test
+// profile, so controlled enrollment can exercise their positive paths without
+// publishing a production constructor for fixture execution authority.
+#[cfg(all(test, target_os = "macos"))]
+extern crate self as chinwag_cli;
+#[cfg(all(test, target_os = "macos"))]
+mod bus_run;
+#[cfg(all(test, target_os = "macos"))]
+mod execution_route_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod feature_cli_run;
+#[cfg(all(test, target_os = "macos"))]
+mod ui_workbench_run;
+
 pub mod agent_instance;
 #[cfg(target_os = "macos")]
 pub mod board;
 #[cfg(target_os = "macos")]
 pub mod bus_delivery;
+#[cfg(target_os = "macos")]
+pub mod execution_binding;
 #[cfg(target_os = "macos")]
 pub mod task_acceptance;
 #[cfg(target_os = "macos")]
@@ -249,6 +265,7 @@ pub struct AgentDispatchRequest {
     pub(crate) sender: Option<String>,
     pub(crate) instance: Option<String>,
     pub(crate) body: Option<String>,
+    pub(crate) repo: Option<PathBuf>,
     pub(crate) crdb: Option<PathBuf>,
     pub(crate) stdin_json: bool,
 }
@@ -604,19 +621,19 @@ impl Invocation {
     fn agent_dispatch_help(self) -> &'static str {
         match self {
             Self::Chinwag => {
-                "Usage: chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
+                "Usage: chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--repo <ABSOLUTE_PATH>] [--crdb <ABSOLUTE_PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
             }
             Self::GitChinwag => {
-                "Usage: git chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
+                "Usage: git chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--repo <ABSOLUTE_PATH>] [--crdb <ABSOLUTE_PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
             }
             Self::GitEmun => {
-                "Usage: git emun agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
+                "Usage: git emun agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--repo <ABSOLUTE_PATH>] [--crdb <ABSOLUTE_PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
             }
             Self::GhChinwag => {
-                "Usage: gh chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
+                "Usage: gh chinwag agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--repo <ABSOLUTE_PATH>] [--crdb <ABSOLUTE_PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
             }
             Self::GhEmun => {
-                "Usage: gh emun agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--crdb <PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
+                "Usage: gh emun agent-dispatch --agent <HANDLE> [--item <ITEM_KEY>] [--sender <SEAT#INSTANCE>] [--instance <ID>] --body <BODY> [--repo <ABSOLUTE_PATH>] [--crdb <ABSOLUTE_PATH>] [--stdin]\n\nNative Rust multi-engine agent comms & dispatch backed by .chinwag/state.crdb.\nAgent callers require an explicit or inherited caller address with a complete instance ID.\n"
             }
         }
     }
@@ -632,6 +649,7 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
     let mut item = None;
     let mut sender = None;
     let mut body = None;
+    let mut repo = None;
     let mut crdb = None;
     let mut stdin_json = false;
     let mut instance = None;
@@ -665,7 +683,18 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
             "--item" | "--item-key" | "--task" | "--ticket" | "-k" => item = Some(val),
             "--sender" | "--from" | "-s" => sender = Some(val),
             "--body" | "--message" | "--prompt" | "--content" | "-m" => body = Some(val),
-            "--crdb" | "--repo" => crdb = Some(PathBuf::from(val)),
+            "--repo" => {
+                let path = PathBuf::from(val);
+                if !path.is_absolute() || repo.replace(path).is_some() {
+                    return None;
+                }
+            }
+            "--crdb" => {
+                let path = PathBuf::from(val);
+                if !path.is_absolute() || crdb.replace(path).is_some() {
+                    return None;
+                }
+            }
             "--instance" | "--thread" | "--thread-id" => {
                 if instance.replace(val).is_some() {
                     return None;
@@ -697,6 +726,7 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
         sender,
         instance,
         body,
+        repo,
         crdb,
         stdin_json,
     })
@@ -1029,6 +1059,58 @@ mod instance_dispatch_parser_tests {
             vec!["--instance", "bad/tag"],
             vec!["--instance", "one", "--instance", "two"],
             vec!["--sender", "WORKHORSE#one", "--instance", "two"],
+        ] {
+            let mut args = vec!["--agent", "RUST", "--body", "fixture"];
+            args.extend(flags);
+            assert!(parse(&args).is_none());
+        }
+    }
+
+    #[test]
+    fn p009_repository_and_store_are_independent_explicit_selectors() {
+        let request = parse(&[
+            "--agent",
+            "RUST",
+            "--body",
+            "fixture",
+            "--repo",
+            "/nondefault/executor",
+            "--crdb",
+            "/authority/store.crdb",
+        ])
+        .unwrap();
+        assert_eq!(
+            request.repo.as_deref(),
+            Some(Path::new("/nondefault/executor"))
+        );
+        assert_eq!(
+            request.crdb.as_deref(),
+            Some(Path::new("/authority/store.crdb"))
+        );
+        let request = parse(&[
+            "--agent",
+            "RUST",
+            "--body",
+            "fixture",
+            "--repo=/nondefault/executor",
+        ])
+        .unwrap();
+        assert_eq!(
+            request.repo.as_deref(),
+            Some(Path::new("/nondefault/executor"))
+        );
+        assert!(request.crdb.is_none());
+    }
+
+    #[test]
+    fn p009_invalid_or_duplicate_repo_and_store_selectors_never_fall_back() {
+        for flags in [
+            vec!["--repo", "relative"],
+            vec!["--repo="],
+            vec!["--crdb", "relative"],
+            vec!["--crdb="],
+            vec!["--repo", "/one", "--repo", "/two"],
+            vec!["--crdb", "/one", "--crdb", "/two"],
         ] {
             let mut args = vec!["--agent", "RUST", "--body", "fixture"];
             args.extend(flags);

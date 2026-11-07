@@ -403,6 +403,10 @@ impl WorkspaceSourceRegistry {
         &self.policy
     }
 
+    pub(crate) fn root_pin(&self) -> &WorkspaceRootPin {
+        &self.root
+    }
+
     pub fn source(&self, source_id: &str) -> Option<&TaskSourceRecord> {
         self.sources
             .iter()

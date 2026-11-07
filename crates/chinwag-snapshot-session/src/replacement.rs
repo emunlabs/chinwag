@@ -15,6 +15,35 @@ pub use owner::WriteOwner;
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
 
+mod original_store_owner_seal {
+    pub trait Sealed {}
+}
+
+/// Only the original retained native owner states implement this verifier.
+/// Data supplied for comparison cannot construct an owner or waive its checks.
+pub trait OriginalStoreOwner: original_store_owner_seal::Sealed {
+    fn verify_bound_source(
+        &mut self,
+        repository: (u64, u64),
+        parent: (u64, u64),
+        file: (u64, u64),
+        sha256: [u8; 32],
+    ) -> Result<()>;
+}
+
+impl original_store_owner_seal::Sealed for WriteOwner {}
+impl OriginalStoreOwner for WriteOwner {
+    fn verify_bound_source(
+        &mut self,
+        repository: (u64, u64),
+        parent: (u64, u64),
+        file: (u64, u64),
+        sha256: [u8; 32],
+    ) -> Result<()> {
+        WriteOwner::verify_bound_source(self, repository, parent, file, sha256)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Failure {
     pub reason: &'static str,
@@ -223,6 +252,35 @@ pub struct PreparedOutcome {
     owner: WriteOwner,
     candidate: Option<Candidate>,
     pending: Pending,
+}
+
+impl original_store_owner_seal::Sealed for WriteSession {}
+impl OriginalStoreOwner for WriteSession {
+    fn verify_bound_source(
+        &mut self,
+        repository: (u64, u64),
+        parent: (u64, u64),
+        file: (u64, u64),
+        sha256: [u8; 32],
+    ) -> Result<()> {
+        self.owner
+            .as_mut()
+            .ok_or_else(|| retained("write_owner_missing", false, false))?
+            .verify_bound_source(repository, parent, file, sha256)
+    }
+}
+impl original_store_owner_seal::Sealed for PreparedOutcome {}
+impl OriginalStoreOwner for PreparedOutcome {
+    fn verify_bound_source(
+        &mut self,
+        repository: (u64, u64),
+        parent: (u64, u64),
+        file: (u64, u64),
+        sha256: [u8; 32],
+    ) -> Result<()> {
+        self.owner
+            .verify_bound_source(repository, parent, file, sha256)
+    }
 }
 
 impl WriteSession {

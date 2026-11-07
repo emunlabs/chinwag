@@ -5,6 +5,10 @@
 //! verification against `.chinwag/allowed_signers`), and `TASK-14` (`chinwag a509`).
 
 use crate::bus_run;
+use chinwag_cli::execution_binding::{
+    ExecutionAuthority, RepoSelectors, RepositorySelection, StoreSelector,
+    WorkspaceExecutionBinding, bind_execution, select_repository,
+};
 use iroh::{EndpointId, SecretKey, Signature};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -12,27 +16,133 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-fn resolve_repo_root(args: &[String]) -> PathBuf {
+/// Resolve one ordinary repository selection; it does not grant task authority.
+fn explicit_repo_selector(args: &[String]) -> Result<Option<PathBuf>, String> {
+    let mut explicit = None;
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--repo" && i + 1 < args.len() {
-            return PathBuf::from(&args[i + 1]);
+        let value = if args[i] == "--repo" {
+            i += 1;
+            Some(
+                args.get(i)
+                    .ok_or("--repo requires an absolute path")?
+                    .as_str(),
+            )
+        } else {
+            args[i].strip_prefix("--repo=")
+        };
+        if let Some(value) = value {
+            if value.is_empty()
+                || value.starts_with("--")
+                || explicit.replace(PathBuf::from(value)).is_some()
+            {
+                return Err("missing or duplicate --repo selector".into());
+            }
         }
         i += 1;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let home_path = PathBuf::from(&home);
-    if let Ok(cwd) = std::env::current_dir() {
-        for ancestor in cwd.ancestors() {
-            if ancestor != home_path
-                && ancestor.join(".chinwag").is_dir()
-                && (ancestor.join(".git").exists() || ancestor.join("TASKS.md").exists())
-            {
-                return ancestor.to_path_buf();
-            }
+    Ok(explicit)
+}
+
+pub(crate) fn select_cli_repository(args: &[String]) -> Result<RepositorySelection, String> {
+    let explicit = explicit_repo_selector(args)?;
+    let environment = std::env::var_os("CHINWAG_REPO_ROOT");
+    // A higher-priority selector does not depend on a still-readable process cwd.
+    // This placeholder is ignored by the resolver when either selector is present.
+    let cwd = std::env::current_dir()
+        .or_else(|error| {
+            explicit
+                .clone()
+                .or_else(|| environment.as_ref().map(PathBuf::from))
+                .ok_or(error)
+        })
+        .map_err(|e| e.to_string())?;
+    select_repository(RepoSelectors {
+        explicit_repo: explicit.as_deref(),
+        environment_repo: environment.as_deref(),
+        cwd: &cwd,
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn validate_selected_args(selection: &RepositorySelection, args: &[String]) -> Result<(), String> {
+    selection.revalidate().map_err(|e| e.to_string())?;
+    if let Some(explicit) = explicit_repo_selector(args)?
+        && explicit != selection.root()
+    {
+        return Err("request selector differs from the retained repository selection".into());
+    }
+    Ok(())
+}
+
+fn report_binding_refusal(
+    args: &[String],
+    message: &str,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    if has_json_flag(args) {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            json!({"ok": false, "disposition": "HELD", "error": message})
+        );
+    } else {
+        let _ = writeln!(stderr, "repository binding held: {message}");
+    }
+    2
+}
+
+fn selected_cli(
+    args: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    run: fn(&RepositorySelection, &[String], &mut dyn Write, &mut dyn Write) -> u8,
+) -> u8 {
+    match select_cli_repository(args) {
+        Ok(selection) => run(&selection, args, stdout, stderr),
+        Err(error) => report_binding_refusal(args, &error, stdout, stderr),
+    }
+}
+
+/// The same pre-effect boundary is used by production commands and private tests.
+/// A selection, matching pathname or request flag cannot supply this capability.
+pub(crate) fn with_feature_task_effect<T>(
+    selection: &RepositorySelection,
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority<'_>,
+    effect: impl FnOnce(&WorkspaceExecutionBinding) -> T,
+) -> Result<T, String> {
+    selection.revalidate().map_err(|e| e.to_string())?;
+    binding.revalidate(authority).map_err(|e| e.to_string())?;
+    if selection.root() != binding.execution_root() {
+        return Err("feature selection differs from the approved execution root".into());
+    }
+    Ok(effect(binding))
+}
+
+fn admit_feature_effect(
+    selection: &RepositorySelection,
+    context: Option<(&WorkspaceExecutionBinding, &ExecutionAuthority<'_>)>,
+) -> Result<(), String> {
+    match context {
+        Some((binding, authority)) => {
+            with_feature_task_effect(selection, binding, authority, |_| ())
+        }
+        None => {
+            // No production enrollment adapter exists. Refuse before keys or writes.
+            let authority = ExecutionAuthority::unsupported();
+            bind_execution(
+                selection,
+                StoreSelector {
+                    explicit_crdb: None,
+                },
+                &authority,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         }
     }
-    PathBuf::from(format!("{home}/WORKSPACE/chinwag"))
 }
 
 fn has_json_flag(args: &[String]) -> bool {
@@ -61,9 +171,48 @@ fn hex_to_64_bytes(hex_str: &str) -> Option<[u8; 64]> {
 }
 
 /// `TASK-12` (`CHWG-OPENSPEC-CLI-01`): `chinwag openspec status | validate | archive`
-pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn Write) -> u8 {
+pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    selected_cli(args, stdout, stderr, run_openspec_cli_with_selection)
+}
+
+pub(crate) fn run_openspec_cli_with_selection(
+    selection: &RepositorySelection,
+    args: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_openspec_cli_in_context(selection, args, None, stdout, stderr)
+}
+
+#[allow(dead_code)] // Private admitted-adapter seam; public authority is Unsupported.
+pub(crate) fn run_openspec_cli_with_binding(
+    selection: &RepositorySelection,
+    args: &[String],
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_openspec_cli_in_context(selection, args, Some((binding, authority)), stdout, stderr)
+}
+
+fn run_openspec_cli_in_context(
+    selection: &RepositorySelection,
+    args: &[String],
+    context: Option<(&WorkspaceExecutionBinding, &ExecutionAuthority<'_>)>,
+    stdout: &mut dyn Write,
+    _stderr: &mut dyn Write,
+) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
-    let repo_root = resolve_repo_root(args);
+    if let Err(error) = validate_selected_args(selection, args) {
+        return report_binding_refusal(args, &error, stdout, _stderr);
+    }
+    let repo_root = selection.root();
+    if sub == "archive"
+        && let Err(error) = admit_feature_effect(selection, context)
+    {
+        return report_binding_refusal(args, &error, stdout, _stderr);
+    }
     let is_json = has_json_flag(args);
     let docs_dir = repo_root.join("docs");
     let tasks_md = repo_root.join("TASKS.md");
@@ -91,7 +240,8 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
             .cmp(&b.get("spec").and_then(|v| v.as_str()))
     });
 
-    let tasks_present = tasks_md.is_file();
+    let tasks_present =
+        fs::symlink_metadata(&tasks_md).is_ok_and(|metadata| metadata.file_type().is_file());
     match sub {
         "validate" | "check" => {
             let ok = tasks_present && !specs.is_empty();
@@ -99,6 +249,8 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
                 let payload = json!({
                     "ok": ok,
                     "command": "chinwag openspec validate",
+                    "source_qualification": "LegacyUnqualified",
+                    "task_authority": false,
                     "repo_root": repo_root.to_string_lossy(),
                     "tasks_md_valid": tasks_present,
                     "spec_count": specs.len(),
@@ -121,16 +273,38 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
             if ok { 0 } else { 1 }
         }
         "archive" => {
+            if let Err(error) = admit_feature_effect(selection, context) {
+                return report_binding_refusal(args, &error, stdout, _stderr);
+            }
             let archive_dir = repo_root.join(".chinwag").join("openspec-archive");
-            let _ = fs::create_dir_all(&archive_dir);
             let snapshot_path = archive_dir.join("tasks-snapshot.md");
-            if tasks_present {
-                let _ = fs::copy(&tasks_md, &snapshot_path);
+            let copied = if !tasks_present {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "selected legacy document is absent",
+                ))
+            } else {
+                fs::create_dir_all(&archive_dir)
+                    .and_then(|_| fs::copy(&tasks_md, &snapshot_path).map(|_| ()))
+            };
+            if let Err(error) = copied {
+                if is_json {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        json!({"ok": false, "command": "chinwag openspec archive", "disposition": "UNKNOWN", "task_authority": false, "error": error.to_string()})
+                    );
+                } else {
+                    let _ = writeln!(_stderr, "archive outcome unknown: {error}");
+                }
+                return 1;
             }
             if is_json {
                 let payload = json!({
                     "ok": true,
                     "command": "chinwag openspec archive",
+                    "source_qualification": "LegacyUnqualified",
+                    "task_authority": false,
                     "snapshot_path": snapshot_path.to_string_lossy(),
                     "spec_count": specs.len()
                 });
@@ -153,6 +327,8 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
                 let payload = json!({
                     "ok": true,
                     "command": "chinwag openspec status",
+                    "source_qualification": "LegacyUnqualified",
+                    "task_authority": false,
                     "repo_root": repo_root.to_string_lossy(),
                     "tasks_md": tasks_md.to_string_lossy(),
                     "tasks_md_present": tasks_present,
@@ -167,7 +343,7 @@ pub fn run_openspec_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut d
             } else {
                 let _ = writeln!(
                     stdout,
-                    "📐 Chinwag OpenSpec Status ({} active specs in {}):\n  • Canonical Board: {} (present={})",
+                    "📐 Chinwag OpenSpec Status ({} active specs in {}):\n  • Legacy document: {} (present={})",
                     specs.len(),
                     docs_dir.display(),
                     tasks_md.display(),
@@ -220,7 +396,7 @@ fn canonical_plugin_manifest_payload(v: &Value) -> Option<String> {
     Some(format!("chinwag-plugin-manifest-sig-v2|{jcs}"))
 }
 
-pub fn build_signed_breakroom_manifest(signer_seat: &str) -> Result<Value, String> {
+fn build_signed_breakroom_manifest(signer_seat: &str) -> Result<Value, String> {
     let secret = bus_run::actor_signing_secret(signer_seat).map_err(|e| e.to_string())?;
     Ok(sign_breakroom_manifest(signer_seat, &secret))
 }
@@ -335,8 +511,47 @@ pub fn verify_plugin_manifest_json(repo_root: &Path, raw_json: &str) -> Result<V
 /// `TASK-13` & `TASK-17` (`CHWG-PLUGIN-HOST-01` + `CHWG-PLUGIN-CRYPTO-01`):
 /// `chinwag plugin list | verify | inspect`
 pub fn run_plugin_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    selected_cli(args, stdout, stderr, run_plugin_cli_with_selection)
+}
+
+pub(crate) fn run_plugin_cli_with_selection(
+    selection: &RepositorySelection,
+    args: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_plugin_cli_in_context(selection, args, None, stdout, stderr)
+}
+
+#[allow(dead_code)] // Private admitted-adapter seam; public authority is Unsupported.
+pub(crate) fn run_plugin_cli_with_binding(
+    selection: &RepositorySelection,
+    args: &[String],
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_plugin_cli_in_context(selection, args, Some((binding, authority)), stdout, stderr)
+}
+
+fn run_plugin_cli_in_context(
+    selection: &RepositorySelection,
+    args: &[String],
+    context: Option<(&WorkspaceExecutionBinding, &ExecutionAuthority<'_>)>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
-    let repo_root = resolve_repo_root(args);
+    if let Err(error) = validate_selected_args(selection, args) {
+        return report_binding_refusal(args, &error, stdout, stderr);
+    }
+    let repo_root = selection.root();
+    if sub == "init"
+        && let Err(error) = admit_feature_effect(selection, context)
+    {
+        return report_binding_refusal(args, &error, stdout, stderr);
+    }
     let is_json = has_json_flag(args);
 
     let repo_plugin_dir = repo_root
@@ -387,7 +602,7 @@ pub fn run_plugin_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
             return 1;
         }
     };
-    let verification = verify_plugin_manifest_json(&repo_root, &raw_manifest);
+    let verification = verify_plugin_manifest_json(repo_root, &raw_manifest);
 
     let enterprise_policy = Path::new("/etc/chinwag/enterprise-policy.toml");
     let airgap_locked = if enterprise_policy.is_file() {
@@ -524,15 +739,28 @@ pub fn run_plugin_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
 }
 
 /// `TASK-14` (`CHWG-A509-CLI-01`): `chinwag a509 inspect | verify [--seat <SEAT>]`
-pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn Write) -> u8 {
+pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    selected_cli(args, stdout, stderr, run_a509_cli_with_selection)
+}
+
+pub(crate) fn run_a509_cli_with_selection(
+    selection: &RepositorySelection,
+    args: &[String],
+    stdout: &mut dyn Write,
+    _stderr: &mut dyn Write,
+) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("verify");
-    let repo_root = resolve_repo_root(args);
+    if let Err(error) = validate_selected_args(selection, args) {
+        return report_binding_refusal(args, &error, stdout, _stderr);
+    }
+    let repo_root = selection.root();
     let is_json = has_json_flag(args);
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let signing_dir = PathBuf::from(format!("{home}/.chinwag/signing"));
     let allowed_signers_path = repo_root.join(".chinwag").join("allowed_signers");
     let allowed_raw = fs::read_to_string(&allowed_signers_path).unwrap_or_default();
-
+    let public_entries = allowed_raw
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .count();
     let seats = [
         "rust",
         "architect",
@@ -545,35 +773,20 @@ pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn W
         "delivery",
         "brian",
     ];
-
-    let mut seat_records = Vec::new();
-    let mut all_verified = true;
-    for seat in seats {
-        let priv_path = signing_dir.join(format!("{seat}_ed25519"));
-        let pub_path = signing_dir.join(format!("{seat}_ed25519.pub"));
-        let resolved_priv = fs::canonicalize(&priv_path).unwrap_or(priv_path.clone());
-        let endpoint_id = chinwag_swarm::identity::Identity::from_ssh_signing_file(&resolved_priv)
-            .ok()
-            .map(|id| id.endpoint_id().to_string());
-        let pub_line = fs::read_to_string(&pub_path)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let pub_key_token = pub_line.split_whitespace().nth(1).unwrap_or("");
-        let in_allowed_signers = !pub_key_token.is_empty() && allowed_raw.contains(pub_key_token);
-        let ok = endpoint_id.is_some() && in_allowed_signers;
-        if !ok {
-            all_verified = false;
-        }
-        seat_records.push(json!({
-            "seat": seat.to_uppercase(),
-            "did": format!("did:chinwag:a509:{seat}"),
-            "iroh_endpoint_id": endpoint_id,
-            "ssh_key_present": pub_path.is_file(),
-            "in_allowed_signers": in_allowed_signers,
-            "verified": ok
-        }));
-    }
+    let seat_records: Vec<_> = seats
+        .iter()
+        .map(|seat| {
+            json!({
+                "seat": seat.to_uppercase(),
+                "did": format!("did:chinwag:a509:{seat}"),
+                "iroh_endpoint_id": null,
+                "verified": false,
+                "disposition": "UNSUPPORTED",
+                "private_keys_read": false
+            })
+        })
+        .collect();
+    let all_verified = false;
 
     if is_json {
         let payload = json!({
@@ -581,6 +794,10 @@ pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn W
             "command": format!("chinwag a509 {sub}"),
             "allowed_signers": allowed_signers_path.to_string_lossy(),
             "seat_count": seat_records.len(),
+            "public_signer_entries": public_entries,
+            "private_keys_read": false,
+            "disposition": "UNSUPPORTED",
+            "reason": "Public metadata only; private signing identity validation requires a supported admitted adapter",
             "seats": seat_records
         });
         let _ = writeln!(
@@ -591,12 +808,8 @@ pub fn run_a509_cli(args: &[String], stdout: &mut dyn Write, _stderr: &mut dyn W
     } else {
         let _ = writeln!(
             stdout,
-            "🪪 Chinwag RFC-0509 (A.509) Seat Identity & allowed_signers Audit ({}):",
-            if all_verified {
-                "ALL 10 SEATS VERIFIED"
-            } else {
-                "PARTIAL"
-            }
+            "🪪 Chinwag A.509 public signer metadata: {public_entries} entry(s) in {}. Private identity validation is UNSUPPORTED; no private keys were read.",
+            allowed_signers_path.display()
         );
         for rec in &seat_records {
             let seat = rec.get("seat").and_then(|v| v.as_str()).unwrap_or("?");
@@ -643,7 +856,7 @@ fn canonical_cwcard_payload(v: &Value) -> Option<String> {
     Some(format!("chinwag-cwcard-envelope-sig-v1|{jcs}"))
 }
 
-pub fn build_signed_cwcard_envelope(signer_seat: &str) -> Result<Value, String> {
+fn build_signed_cwcard_envelope(signer_seat: &str) -> Result<Value, String> {
     let secret = bus_run::actor_signing_secret(signer_seat).map_err(|e| e.to_string())?;
     Ok(sign_cwcard_envelope(signer_seat, &secret))
 }
@@ -742,8 +955,47 @@ pub fn verify_cwcard_json(repo_root: &Path, raw_json: &str) -> Result<Value, Str
 
 /// `TASK-24` (`CHWG-CWCard-CLI-01`): `chinwag cwcard inspect | verify [--json]`
 pub fn run_cwcard_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    selected_cli(args, stdout, stderr, run_cwcard_cli_with_selection)
+}
+
+pub(crate) fn run_cwcard_cli_with_selection(
+    selection: &RepositorySelection,
+    args: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_cwcard_cli_in_context(selection, args, None, stdout, stderr)
+}
+
+#[allow(dead_code)] // Private admitted-adapter seam; public authority is Unsupported.
+pub(crate) fn run_cwcard_cli_with_binding(
+    selection: &RepositorySelection,
+    args: &[String],
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_cwcard_cli_in_context(selection, args, Some((binding, authority)), stdout, stderr)
+}
+
+fn run_cwcard_cli_in_context(
+    selection: &RepositorySelection,
+    args: &[String],
+    context: Option<(&WorkspaceExecutionBinding, &ExecutionAuthority<'_>)>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("verify");
-    let repo_root = resolve_repo_root(args);
+    if let Err(error) = validate_selected_args(selection, args) {
+        return report_binding_refusal(args, &error, stdout, stderr);
+    }
+    let repo_root = selection.root();
+    if sub == "init"
+        && let Err(error) = admit_feature_effect(selection, context)
+    {
+        return report_binding_refusal(args, &error, stdout, stderr);
+    }
     let is_json = has_json_flag(args);
     let cwcard_path = repo_root
         .join(".chinwag")
@@ -794,7 +1046,7 @@ pub fn run_cwcard_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
         }
     };
 
-    match verify_cwcard_json(&repo_root, &raw) {
+    match verify_cwcard_json(repo_root, &raw) {
         Ok(val) => {
             let payload = json!({
                 "ok": true,
@@ -875,7 +1127,7 @@ fn canonical_bond_payload(v: &Value) -> Option<String> {
     Some(format!("chinwag-triple-b-bond-sig-v2|{jcs}"))
 }
 
-pub fn build_signed_bond_envelope(
+fn build_signed_bond_envelope(
     bond_id: &str,
     agent_handle: &str,
     chincred_score: u64,
@@ -991,8 +1243,47 @@ pub fn verify_bond_json(repo_root: &Path, raw_json: &str) -> Result<Value, Strin
 
 /// `TASK-26` (`CHWG-TRIPLE-B-CLI-01`): `chinwag bond status | verify | inspect | init [--json]`
 pub fn run_bond_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    selected_cli(args, stdout, stderr, run_bond_cli_with_selection)
+}
+
+pub(crate) fn run_bond_cli_with_selection(
+    selection: &RepositorySelection,
+    args: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_bond_cli_in_context(selection, args, None, stdout, stderr)
+}
+
+#[allow(dead_code)] // Private admitted-adapter seam; public authority is Unsupported.
+pub(crate) fn run_bond_cli_with_binding(
+    selection: &RepositorySelection,
+    args: &[String],
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority<'_>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    run_bond_cli_in_context(selection, args, Some((binding, authority)), stdout, stderr)
+}
+
+fn run_bond_cli_in_context(
+    selection: &RepositorySelection,
+    args: &[String],
+    context: Option<(&WorkspaceExecutionBinding, &ExecutionAuthority<'_>)>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("verify");
-    let repo_root = resolve_repo_root(args);
+    if let Err(error) = validate_selected_args(selection, args) {
+        return report_binding_refusal(args, &error, stdout, stderr);
+    }
+    let repo_root = selection.root();
+    if sub == "init"
+        && let Err(error) = admit_feature_effect(selection, context)
+    {
+        return report_binding_refusal(args, &error, stdout, stderr);
+    }
     let is_json = has_json_flag(args);
     let bonds_dir = repo_root.join(".chinwag").join("bonds");
     let axel_path = bonds_dir.join("axel-0001.cwbond.json");
@@ -1064,7 +1355,7 @@ pub fn run_bond_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
                 return 1;
             }
         };
-        match verify_bond_json(&repo_root, &raw) {
+        match verify_bond_json(repo_root, &raw) {
             Ok(val) => verified_bonds.push(val),
             Err(err_msg) => {
                 if is_json {
@@ -1127,12 +1418,93 @@ pub fn run_bond_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
 mod tests {
     use super::*;
 
+    fn init_test_repo(repo: &Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@chinwag.test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let mut command = std::process::Command::new("git");
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("GIT_") {
+                    command.env_remove(name);
+                }
+            }
+            let status = command
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "core.fsmonitor=false",
+                ])
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
+    fn write_test_plugin(repo: &Path, manifest: &Value) {
+        let endpoint: EndpointId = manifest["signer_pubkey_ed25519"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let public =
+            ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(*endpoint.as_bytes()))
+                .to_openssh()
+                .unwrap();
+        let plugin_dir = repo.join(".chinwag/plugins/com.emunlabs.breakroom.cwplugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            repo.join(".chinwag/allowed_signers"),
+            format!("alistair-agent@chinwag.sh namespaces=\"git\" {public} chinwag ALISTAIR\n"),
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_vec(manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn openspec_and_plugin_cli_produce_valid_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(temp.path()).unwrap();
+        init_test_repo(&repo);
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(repo.join("docs/spec.md"), "fixture spec").unwrap();
+        fs::write(repo.join("TASKS.md"), "# fixture tasks").unwrap();
+        let manifest = sign_breakroom_manifest("ALISTAIR", &SecretKey::from_bytes(&[37; 32]));
+        write_test_plugin(&repo, &manifest);
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_openspec_cli(
-            &["status".to_string(), "--json".to_string()],
+            &[
+                "status".to_string(),
+                "--repo".into(),
+                repo.to_string_lossy().into_owned(),
+                "--json".to_string(),
+            ],
             &mut out,
             &mut err,
         );
@@ -1142,7 +1514,12 @@ mod tests {
 
         let mut out_p = Vec::new();
         let code_p = run_plugin_cli(
-            &["verify".to_string(), "--json".to_string()],
+            &[
+                "verify".to_string(),
+                "--repo".into(),
+                repo.to_string_lossy().into_owned(),
+                "--json".to_string(),
+            ],
             &mut out_p,
             &mut err,
         );
@@ -1155,6 +1532,7 @@ mod tests {
     #[test]
     fn plugin_verify_checks_real_ed25519_signature_and_rejects_tampered_manifest() {
         let temp = tempfile::tempdir().unwrap();
+        init_test_repo(temp.path());
         let manifest = sign_breakroom_manifest("ALISTAIR", &SecretKey::from_bytes(&[37; 32]));
         let raw = serde_json::to_string_pretty(&manifest).unwrap();
 
@@ -1209,7 +1587,10 @@ mod tests {
             &[
                 "verify".to_string(),
                 "--repo".to_string(),
-                temp.path().to_string_lossy().to_string(),
+                fs::canonicalize(temp.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
                 "--json".to_string(),
             ],
             &mut out,
@@ -1292,5 +1673,148 @@ mod tests {
         tampered["chincred_score"] = json!(999);
         let raw_tampered = serde_json::to_string(&tampered).unwrap();
         assert!(verify_bond_json(temp.path(), &raw_tampered).is_err());
+    }
+    #[test]
+    fn p009_feature_explicit_invalid_and_duplicate_selectors_do_not_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        init_test_repo(&root);
+        let runners: [fn(&[String], &mut dyn Write, &mut dyn Write) -> u8; 5] = [
+            run_openspec_cli,
+            run_plugin_cli,
+            run_a509_cli,
+            run_cwcard_cli,
+            run_bond_cli,
+        ];
+        for run in runners {
+            for selectors in [
+                vec![
+                    "--repo".into(),
+                    root.join("absent").to_string_lossy().into_owned(),
+                ],
+                vec!["--repo".into(), "relative-repo".into()],
+                vec!["--repo=".into()],
+                vec![
+                    "--repo".into(),
+                    root.to_string_lossy().into_owned(),
+                    "--repo".into(),
+                    root.to_string_lossy().into_owned(),
+                ],
+            ] {
+                let mut args = vec!["status".into(), "--json".into()];
+                args.extend(selectors);
+                let mut out = Vec::new();
+                assert_eq!(run(&args, &mut out, &mut Vec::new()), 2);
+                let value: Value = serde_json::from_slice(&out).unwrap();
+                assert_eq!(value["disposition"], "HELD");
+            }
+        }
+        assert!(!root.join(".chinwag").exists());
+    }
+
+    #[test]
+    fn p009_feature_mutations_hold_before_signing_or_archive_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        init_test_repo(&root);
+        fs::write(root.join("TASKS.md"), "# explicitly selected fixture").unwrap();
+        let commands: [(fn(&[String], &mut dyn Write, &mut dyn Write) -> u8, &str); 4] = [
+            (run_openspec_cli, "archive"),
+            (run_plugin_cli, "init"),
+            (run_cwcard_cli, "init"),
+            (run_bond_cli, "init"),
+        ];
+        for (run, command) in commands {
+            let args = vec![
+                command.into(),
+                "--json".into(),
+                "--repo".into(),
+                root.to_string_lossy().into_owned(),
+            ];
+            let mut out = Vec::new();
+            assert_eq!(run(&args, &mut out, &mut Vec::new()), 2);
+            let value: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(value["disposition"], "HELD");
+            assert!(
+                !root.join(".chinwag").exists(),
+                "{command} wrote before binding"
+            );
+        }
+    }
+
+    #[test]
+    fn p009_retained_feature_selection_rejects_conflicting_request_selectors() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(a.path()).unwrap();
+        let other = fs::canonicalize(b.path()).unwrap();
+        init_test_repo(&root);
+        init_test_repo(&other);
+        let selected =
+            select_cli_repository(&["--repo".into(), root.to_string_lossy().into_owned()]).unwrap();
+        let mut out = Vec::new();
+        let code = run_openspec_cli_with_selection(
+            &selected,
+            &[
+                "status".into(),
+                "--json".into(),
+                "--repo".into(),
+                other.to_string_lossy().into_owned(),
+            ],
+            &mut out,
+            &mut Vec::new(),
+        );
+        assert_eq!(code, 2);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap()["disposition"],
+            "HELD"
+        );
+        out.clear();
+        assert_eq!(
+            run_openspec_cli_with_selection(
+                &selected,
+                &["status".into(), "--json".into()],
+                &mut out,
+                &mut Vec::new()
+            ),
+            0
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap()["repo_root"],
+            root.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn p009_a509_observation_uses_selected_public_metadata_without_private_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        init_test_repo(&root);
+        fs::create_dir(root.join(".chinwag")).unwrap();
+        fs::write(root.join(".chinwag/allowed_signers"), "# public fixture only\nfixture@chinwag.test namespaces=\"git\" ssh-ed25519 PUBLIC_ONLY\n").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            run_a509_cli(
+                &[
+                    "inspect".into(),
+                    "--json".into(),
+                    "--repo".into(),
+                    root.to_string_lossy().into_owned()
+                ],
+                &mut out,
+                &mut Vec::new()
+            ),
+            1
+        );
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            value["allowed_signers"],
+            root.join(".chinwag/allowed_signers")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(value["public_signer_entries"], 1);
+        assert_eq!(value["private_keys_read"], false);
+        assert_eq!(value["disposition"], "UNSUPPORTED");
     }
 }

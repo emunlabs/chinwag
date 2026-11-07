@@ -47,6 +47,7 @@ impl Dispatcher for LocalDispatcher {
                 sender: None,
                 instance: None,
                 body: None,
+                repo: Some(self.repo.clone()),
                 crdb: Some(self.repo.join(".chinwag/state.crdb")),
                 stdin_json: true,
             },
