@@ -40,6 +40,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 pub const BUS_ALPN: &[u8] = b"chinwag/bus/1";
+// Iroh's underlying connection window is ten seconds. This startup bound is
+// before any room challenge or message original exists; it never renews one.
+const RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BUS_PORT: u16 = 44330;
 const MAX_FRAME_BYTES: usize = 128 * 1024;
 
@@ -1140,18 +1143,34 @@ async fn run_daemon_loop(
             .get()
             .iter()
             .any(|status| status.url() == expected_relay && status.is_connected());
-        let ready = tokio::time::timeout(
-            Duration::from_secs(iroh::NET_REPORT_TIMEOUT),
-            endpoint.online(),
-        )
-        .await
-        .is_ok()
+        let ready = tokio::time::timeout(RELAY_REGISTRATION_TIMEOUT, endpoint.online())
+            .await
+            .is_ok()
             && endpoint
                 .home_relay_status()
                 .get()
                 .iter()
                 .any(|status| status.url() == expected_relay && status.is_connected());
         if !ready {
+            let statuses = endpoint.home_relay_status().get();
+            let selected = statuses
+                .iter()
+                .find(|status| status.url() == expected_relay);
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_relay_registration_held",
+                    "endpoint_id": endpoint.id().to_string(),
+                    "relay_origin": expected_relay.as_str(),
+                    "selected_expected_relay": selected.is_some(),
+                    "connected": selected.is_some_and(|status| status.is_connected()),
+                    "connection_error_observed": selected.is_some_and(|status| status.last_error().is_some()),
+                    "authentication_denied": selected.is_some_and(|status| status.auth_denied_reason().is_some()),
+                    "registration_wait_ms": registration_started.elapsed().as_millis()
+                })
+            );
+            let _ = stdout.flush();
             endpoint.close().await;
             let _ = writeln!(
                 stdout,
@@ -1164,6 +1183,7 @@ async fn run_daemon_loop(
             "{}",
             json!({
                 "event": "native_relay_registered",
+                "endpoint_id": endpoint.id().to_string(),
                 "relay_origin": expected_relay.as_str(),
                 "initially_registered": initially_registered,
                 "registration_wait_ms": registration_started.elapsed().as_millis(),
