@@ -297,8 +297,12 @@ impl GitPins {
         if let Some(f) = &self.gitfile {
             f.verify()?
         }
-        if let Some(f) = &self.commonfile {
-            f.verify()?
+        match &self.commonfile {
+            Some(f) => f.verify()?,
+            None => match statat(&self.gitdir.file, "commondir", AtFlags::SYMLINK_NOFOLLOW) {
+                Err(error) if error == rustix::io::Errno::NOENT => {}
+                _ => return Err(BindingError::NamespaceChanged),
+            },
         }
         Ok(())
     }

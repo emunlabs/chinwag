@@ -599,3 +599,65 @@ fn p009_private_store_custody_mode_is_checked_before_native_import() {
         assert!(!f.root().join(".chinwag/state.crdb.lock").exists());
     }
 }
+
+#[test]
+fn p009_commondir_absent_to_present_redirect_refuses_retained_contexts() {
+    fn copy_owned_git_metadata(from: &Path, to: &Path) {
+        fs::create_dir(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            let kind = entry.file_type().unwrap();
+            assert!(
+                !kind.is_symlink(),
+                "fixture metadata must be ordinary owned data"
+            );
+            if kind.is_dir() {
+                copy_owned_git_metadata(&entry.path(), &target)
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let f = BindingFixture::new();
+    let selected = f.selection();
+    let binding = f.bind();
+    assert!(selected.git.commonfile.is_none());
+    let before = safe_git(f.root(), &["rev-parse", "--git-common-dir"]).unwrap();
+    let foreign = f.source_root().join("owned-foreign-common");
+    copy_owned_git_metadata(&f.root().join(".git"), &foreign);
+    fs::write(
+        f.root().join(".git/commondir"),
+        format!("{}\n", foreign.display()),
+    )
+    .unwrap();
+    let actual_common = safe_git(f.root(), &["rev-parse", "--git-common-dir"]).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&actual_common).unwrap().trim(),
+        foreign.to_str().unwrap()
+    );
+    assert_ne!(actual_common, before);
+    let head = safe_git(f.root(), &["rev-parse", "--verify", "HEAD^{commit}"]).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&head).unwrap().trim(),
+        f.baseline().to_string()
+    );
+    println!(
+        "owned common-dir redirect proved; old={}, new={}, unchanged HEAD={}",
+        String::from_utf8_lossy(&before).trim(),
+        String::from_utf8_lossy(&actual_common).trim(),
+        String::from_utf8_lossy(&head).trim()
+    );
+    let selection_result = selected.revalidate();
+    let effects = Cell::new(0);
+    let binding_result = (|| -> BindingResult<()> {
+        binding.revalidate(&f.authority())?;
+        effects.set(1);
+        Ok(())
+    })();
+    assert!(
+        selection_result.is_err() && binding_result.is_err() && effects.get() == 0,
+        "retained metadata must refuse redirection: selection={selection_result:?}, binding={binding_result:?}, effects={}",
+        effects.get()
+    );
+}
