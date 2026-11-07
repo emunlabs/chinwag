@@ -19,6 +19,8 @@ mod ui_workbench_run;
 
 pub mod agent_instance;
 #[cfg(target_os = "macos")]
+pub mod bus_federation;
+#[cfg(target_os = "macos")]
 pub mod board;
 #[cfg(target_os = "macos")]
 pub mod bus_delivery;

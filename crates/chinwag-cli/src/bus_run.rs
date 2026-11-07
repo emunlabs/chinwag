@@ -14,6 +14,7 @@
 //!   dynamically parses `[IN_PROGRESS]` and `[READY]` items from `TASKS.md`.
 
 use chinwag_cli::agent_instance::{self, ActorAddress, InstanceError};
+pub use chinwag_cli::bus_federation::BusMessage;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Signature, TransportAddr,
     address_lookup::memory::MemoryLookup, endpoint::presets,
@@ -37,28 +38,6 @@ use tokio::sync::broadcast;
 pub const BUS_ALPN: &[u8] = b"chinwag/bus/1";
 const DEFAULT_BUS_PORT: u16 = 44330;
 const MAX_FRAME_BYTES: usize = 128 * 1024;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BusMessage {
-    pub id: String,
-    pub seq: u64,
-    pub ts_unix: u64,
-    pub ts_iso: String,
-    pub room: String,
-    pub sender: String,
-    pub sender_cast: String,
-    pub sender_endpoint_id: String,
-    pub to: Option<String>,
-    pub task_id: Option<String>,
-    pub body: String,
-    pub digest_sha256: String,
-    #[serde(default)]
-    pub pubkey_ed25519: Option<String>,
-    #[serde(default)]
-    pub signature_ed25519: Option<String>,
-    #[serde(default)]
-    pub sig_verified: bool,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
