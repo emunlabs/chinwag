@@ -46,6 +46,24 @@ fn advertisement(identity: &Identity, session: u8, revision: u64, expiry: u64) -
     )
     .unwrap()
 }
+fn renewed_own(fixture: &Fixture, revision: u64, expiry: u64, nonce: u8) -> Advertisement {
+    let challenge = Challenge {
+        room: "genesis".into(),
+        actor_id: fixture.local.endpoint_id().to_string(),
+        operation: "advertise".into(),
+        session_id: "01".repeat(32),
+        nonce: format!("{nonce:02x}").repeat(32),
+        expiry_unix: expiry,
+    };
+    sign_advertisement(
+        &fixture.local,
+        &challenge,
+        revision,
+        vec!["127.0.0.1:44330".parse().unwrap()],
+        fixture.clock.wall.load(Ordering::SeqCst),
+    )
+    .unwrap()
+}
 struct Fixture {
     local: Identity,
     peer: Identity,
@@ -110,6 +128,120 @@ fn selected_pins_and_own_receipt_alone_do_not_admit_a_peer() {
     let fixture = Fixture::new();
     assert!(fixture.gate.current_peer().is_err());
     assert!(fixture.gate.check_peer(fixture.peer.endpoint_id()).is_err());
+}
+#[test]
+fn fresh_owned_renewal_invalidates_snapshots_without_extending_peer_presence() {
+    let mut fixture = Fixture::new();
+    fixture.bind_peer(3, 1);
+    let old_snapshot = fixture.gate.current_peer().unwrap();
+    fixture.clock.wall.store(1030, Ordering::SeqCst);
+    fixture.clock.millis.store(30_000, Ordering::SeqCst);
+    let ticket = fixture.owner.prepare_renewal().unwrap();
+    assert_eq!(ticket.next_revision().unwrap(), 2);
+    let ad = renewed_own(&fixture, 2, 1090, 11);
+    let receipt = storage_receipt_for_private_test(&fixture.coordinator, &ad);
+    fixture.owner.commit_renewal(ticket, ad, receipt).unwrap();
+    assert!(old_snapshot.local_session_id().is_err());
+    assert!(
+        old_snapshot
+            .revalidate_for(fixture.peer.endpoint_id())
+            .is_err()
+    );
+    assert_eq!(
+        fixture.owner.remaining_validity().unwrap(),
+        Duration::from_secs(60)
+    );
+    assert!(fixture.gate.current_peer().is_ok());
+    fixture.clock.wall.store(1060, Ordering::SeqCst);
+    fixture.clock.millis.store(60_000, Ordering::SeqCst);
+    assert!(fixture.owner.remaining_validity().is_ok());
+    assert!(
+        fixture.gate.current_peer().is_err(),
+        "peer retains its original expiry"
+    );
+}
+#[test]
+fn renewal_cannot_resurrect_an_expired_revoked_or_stale_owner() {
+    for failure in 0..4 {
+        let mut fixture = Fixture::new();
+        fixture.clock.wall.store(1030, Ordering::SeqCst);
+        fixture.clock.millis.store(30_000, Ordering::SeqCst);
+        let ticket = fixture.owner.prepare_renewal().unwrap();
+        let ad = renewed_own(&fixture, 2, 1090, 11);
+        let receipt = storage_receipt_for_private_test(&fixture.coordinator, &ad);
+        match failure {
+            0 => fixture.clock.wall.store(1060, Ordering::SeqCst),
+            1 => fixture.clock.millis.store(60_000, Ordering::SeqCst),
+            2 => fixture.gate.revoke().unwrap(),
+            3 => {
+                let other = fixture.owner.prepare_renewal().unwrap();
+                fixture
+                    .owner
+                    .commit_renewal(other, ad.clone(), receipt.clone())
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            fixture.owner.commit_renewal(ticket, ad, receipt).is_err(),
+            "case {failure}"
+        );
+    }
+}
+#[test]
+fn renewal_requires_fresh_receipt_nonce_next_revision_and_later_expiry() {
+    for failure in 0..6 {
+        let mut fixture = Fixture::new();
+        fixture.clock.wall.store(1030, Ordering::SeqCst);
+        fixture.clock.millis.store(30_000, Ordering::SeqCst);
+        let ticket = fixture.owner.prepare_renewal().unwrap();
+        let mut ad = renewed_own(
+            &fixture,
+            if failure == 0 { 1 } else { 2 },
+            if failure == 1 { 1060 } else { 1090 },
+            if failure == 2 { 2 } else { 11 },
+        );
+        if failure == 3 {
+            ad = advertisement(&fixture.local, 5, 2, 1090);
+        }
+        let mut receipt = storage_receipt_for_private_test(&fixture.coordinator, &ad);
+        if failure == 4 {
+            receipt.revision = 7;
+        }
+        if failure == 5 {
+            receipt = storage_receipt_for_private_test(&identity(), &ad);
+        }
+        assert!(
+            fixture.owner.commit_renewal(ticket, ad, receipt).is_err(),
+            "case {failure}"
+        );
+        assert_eq!(
+            fixture.owner.remaining_validity().unwrap(),
+            Duration::from_secs(30)
+        );
+    }
+}
+#[test]
+fn refresh_cadence_is_fixed_per_verified_lease_not_reset_by_reads_or_tickets() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.owner.renewal_wait().unwrap(),
+        Duration::from_secs(30)
+    );
+    fixture.clock.wall.store(1020, Ordering::SeqCst);
+    fixture.clock.millis.store(20_000, Ordering::SeqCst);
+    let _ticket = fixture.owner.prepare_renewal().unwrap();
+    assert_eq!(
+        fixture.owner.renewal_wait().unwrap(),
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        fixture.owner.remaining_validity().unwrap(),
+        Duration::from_secs(40)
+    );
+    fixture.clock.wall.store(1030, Ordering::SeqCst);
+    fixture.clock.millis.store(30_000, Ordering::SeqCst);
+    assert_eq!(fixture.owner.renewal_wait().unwrap(), Duration::ZERO);
 }
 #[test]
 fn verified_remote_join_retains_exact_ordinary_records_and_selected_route() {

@@ -164,6 +164,25 @@ struct OwnJoin {
     session: String,
     origin: String,
     deadline: Instant,
+    refresh_at: Instant,
+}
+/// A single renewal of the exact current own transport advertisement. Merely
+/// preparing or retaining this ticket grants no additional time or authority.
+pub(crate) struct OwnRenewal {
+    previous: Arc<OwnJoin>,
+}
+impl OwnRenewal {
+    pub(crate) fn advertisement(&self) -> &Advertisement {
+        &self.previous.advertisement
+    }
+    pub(crate) fn next_revision(&self) -> Result<u64, BindingError> {
+        self.previous
+            .advertisement
+            .revision
+            .checked_add(1)
+            .filter(|revision| *revision <= 9_007_199_254_740_991)
+            .ok_or(BindingError::Replay)
+    }
 }
 struct PeerJoin {
     advertisement: Advertisement,
@@ -234,6 +253,7 @@ impl DaemonPeerGate {
             .clone();
         Ok(VerifiedDaemonPeer {
             shared: Arc::downgrade(&self.shared),
+            own: state.own.as_ref().ok_or(BindingError::Unavailable)?.clone(),
             peer,
         })
     }
@@ -325,6 +345,7 @@ fn deadline(expiry: u64, now: u64, instant: Instant) -> Result<Instant, BindingE
 #[derive(Clone)]
 pub struct VerifiedDaemonPeer {
     shared: Weak<Shared>,
+    own: Arc<OwnJoin>,
     peer: Arc<PeerJoin>,
 }
 impl VerifiedDaemonPeer {
@@ -357,6 +378,9 @@ impl VerifiedDaemonPeer {
             return Err(BindingError::Revoked);
         }
         let own = state.own.as_ref().ok_or(BindingError::Unavailable)?;
+        if !Arc::ptr_eq(own, &self.own) {
+            return Err(BindingError::Revoked);
+        }
         Ok(read(&shared, own, &self.peer))
     }
     pub fn local_session_id(&self) -> Result<String, BindingError> {
@@ -420,6 +444,97 @@ pub(crate) struct DaemonRoomOwner {
     origin: String,
 }
 impl DaemonRoomOwner {
+    pub(crate) fn origin(&self) -> &str {
+        &self.origin
+    }
+    pub(crate) fn renewal_wait(&self) -> Result<Duration, BindingError> {
+        let ticket = self.prepare_renewal()?;
+        let (_, instant) = self.gate.shared.clock.now()?;
+        Ok(ticket
+            .previous
+            .refresh_at
+            .saturating_duration_since(instant))
+    }
+    pub(crate) fn prepare_renewal(&self) -> Result<OwnRenewal, BindingError> {
+        let state = self
+            .gate
+            .shared
+            .state
+            .lock()
+            .map_err(|_| BindingError::Revoked)?;
+        let (now, instant) = self.gate.shared.clock.now()?;
+        if state.closed {
+            return Err(BindingError::Revoked);
+        }
+        let own = state.own.as_ref().ok_or(BindingError::Unavailable)?;
+        check_time(own.advertisement.expiry_unix, own.deadline, now, instant)?;
+        let ticket = OwnRenewal {
+            previous: own.clone(),
+        };
+        ticket.next_revision()?;
+        Ok(ticket)
+    }
+    pub(crate) fn commit_renewal(
+        &mut self,
+        ticket: OwnRenewal,
+        advertisement: Advertisement,
+        receipt: Receipt,
+    ) -> Result<(), BindingError> {
+        let config = &self.gate.shared.config;
+        let (now, instant) = self.gate.shared.clock.now()?;
+        room_wire::verify_daemon_advertisement(&advertisement, config.local, now, &config.policy)
+            .map_err(|_| BindingError::Receipt)?;
+        room_wire::verify_receipt(&receipt, config.coordinator, &advertisement)
+            .map_err(|_| BindingError::Receipt)?;
+        let old = ticket.advertisement();
+        if advertisement.revision != ticket.next_revision()?
+            || advertisement.actor_id != old.actor_id
+            || advertisement.node_id != old.node_id
+            || advertisement.session_id != old.session_id
+            || advertisement.direct_addresses != old.direct_addresses
+            || advertisement.expiry_unix <= old.expiry_unix
+            || bool::from(
+                advertisement
+                    .challenge_nonce
+                    .as_bytes()
+                    .ct_eq(old.challenge_nonce.as_bytes()),
+            )
+        {
+            return Err(BindingError::Replay);
+        }
+        let expires = deadline(advertisement.expiry_unix, now, instant)?;
+        let refresh_at = instant
+            .checked_add(expires.saturating_duration_since(instant) / 2)
+            .ok_or(BindingError::Time)?;
+        let mut state = self
+            .gate
+            .shared
+            .state
+            .lock()
+            .map_err(|_| BindingError::Revoked)?;
+        let (now, instant) = self.gate.shared.clock.now()?;
+        if state.closed
+            || !state
+                .own
+                .as_ref()
+                .is_some_and(|own| Arc::ptr_eq(own, &ticket.previous))
+        {
+            return Err(BindingError::Revoked);
+        }
+        // The old authorization must still be live when its successor commits.
+        // A valid new signature cannot resurrect a timed out or revoked owner.
+        check_time(old.expiry_unix, ticket.previous.deadline, now, instant)?;
+        check_time(advertisement.expiry_unix, expires, now, instant)?;
+        state.own = Some(Arc::new(OwnJoin {
+            advertisement,
+            receipt,
+            session: ticket.previous.session.clone(),
+            origin: ticket.previous.origin.clone(),
+            deadline: expires,
+            refresh_at,
+        }));
+        Ok(())
+    }
     pub(crate) fn remaining_validity(&self) -> Result<Duration, BindingError> {
         let state = self
             .gate
@@ -455,6 +570,9 @@ impl DaemonRoomOwner {
             return Err(BindingError::Receipt);
         }
         let expires = deadline(advertisement.expiry_unix, now, instant)?;
+        let refresh_at = instant
+            .checked_add(expires.saturating_duration_since(instant) / 2)
+            .ok_or(BindingError::Time)?;
         let mut state = self
             .gate
             .shared
@@ -472,6 +590,7 @@ impl DaemonRoomOwner {
             session: session.into(),
             origin: self.origin.clone(),
             deadline: expires,
+            refresh_at,
         }));
         Ok(())
     }

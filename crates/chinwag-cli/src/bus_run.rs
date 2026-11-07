@@ -1177,6 +1177,7 @@ async fn run_daemon_loop(
         );
         let _ = stdout.flush();
     }
+    let mut room_credentials = None;
     let mut room_session = if let Some((selection, gate)) = &network {
         let identity = match DaemonRoomIdentity::for_endpoint(secret, &endpoint) {
             Ok(identity) => identity,
@@ -1217,6 +1218,7 @@ async fn run_daemon_loop(
                     );
                     return 1;
                 }
+                room_credentials = Some((client, identity));
                 Some(session)
             }
             Err(error) => {
@@ -1329,6 +1331,23 @@ async fn run_daemon_loop(
     governor_tick.tick().await;
 
     loop {
+        // Re-arm receive after renewal in this one owner loop. A concurrent
+        // renewal task would leave the previous receive expiry timer armed.
+        let renewal_wait = match room_session
+            .as_ref()
+            .map(|session| session.daemon_renewal_wait())
+        {
+            Some(Ok(wait)) => Some(wait),
+            Some(Err(_)) => {
+                let _ = writeln!(
+                    stdout,
+                    "chinwag bus network HELD: transport presence expired"
+                );
+                exit_code = 1;
+                break;
+            }
+            None => None,
+        };
         tokio::select! {
             _ = &mut shutdown => {
                 break;
@@ -1337,6 +1356,23 @@ async fn run_daemon_loop(
                 let _ = writeln!(stdout, "chinwag bus HELD: diagnostic state update failed");
                 exit_code = 1;
                 break;
+            }
+            _ = async {
+                match renewal_wait {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let (Some(session), Some((client, identity))) = (&mut room_session, &room_credentials) {
+                    if client.renew_daemon_presence(identity, session).await.is_err() {
+                        let _ = writeln!(stdout, "chinwag bus network HELD: transport presence renewal unknown or refused; no retry");
+                        exit_code = 1;
+                        break;
+                    }
+                    let _ = writeln!(stdout, "{}", json!({"event":"native_transport_presence_renewed",
+                        "scope":"TRANSPORT_ONLY_NOT_TASK_AUTHORITY", "original_message_replay":false}));
+                    let _ = stdout.flush();
+                }
             }
             original = forward_rx.recv(), if network.is_some() && forwards.is_empty() => {
                 if let (Some(message), Some((selection, gate))) = (original, &network) {

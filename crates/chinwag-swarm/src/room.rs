@@ -38,6 +38,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = "chinwag-seed/0.0.1 (+https://github.com/emunlabs/chinwag)";
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+// Dropping a renewal future after the coordinator may have stored its new
+// revision must not leave the old gate usable with an unknown successor.
+struct PresenceRenewalGuard {
+    gate: DaemonPeerGate,
+    committed: bool,
+}
+impl Drop for PresenceRenewalGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.gate.revoke();
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -491,6 +505,100 @@ impl RoomClient {
             .await
     }
 
+    /// Refresh only this live daemon's transport presence on its existing
+    /// WebSocket. No reconnect, original-message retry or task lease renewal.
+    /// The caller must cancel its pending receive before invoking this method.
+    pub async fn renew_daemon_presence(
+        &self,
+        identity: &DaemonRoomIdentity,
+        session: &mut RoomSession,
+    ) -> Result<(), Error> {
+        let result = self.renew_daemon_presence_inner(identity, session).await;
+        if result.is_err() {
+            // Unknown storage/receipt outcomes fail closed, with no nonce replay.
+            session.close().await;
+        }
+        result
+    }
+
+    async fn renew_daemon_presence_inner(
+        &self,
+        identity: &DaemonRoomIdentity,
+        session: &mut RoomSession,
+    ) -> Result<(), Error> {
+        let owner = session
+            .daemon_owner
+            .as_ref()
+            .ok_or(BindingError::Unavailable)?;
+        let config = owner.gate().configuration();
+        if !bool::from(
+            identity
+                .endpoint_id()
+                .as_bytes()
+                .ct_eq(config.local_endpoint_id().as_bytes()),
+        ) || !bool::from(
+            self.coordinator
+                .as_bytes()
+                .ct_eq(config.coordinator_endpoint_id().as_bytes()),
+        ) || self.policy.as_ref() != config.relay_policy()
+            || self.base.as_str() != owner.origin()
+        {
+            return Err(BindingError::Configuration.into());
+        }
+        let wait = owner.remaining_validity()?.min(REQUEST_TIMEOUT * 2);
+        let ticket = owner.prepare_renewal()?;
+        let mut cancellation = PresenceRenewalGuard {
+            gate: owner.gate().clone(),
+            committed: false,
+        };
+        let old = ticket.advertisement();
+        let addresses = old
+            .direct_addresses
+            .iter()
+            .map(|address| address.parse::<SocketAddr>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| Error::Malformed)?;
+        let revision = ticket.next_revision()?;
+        let attached_session = session.attached_session_id()?;
+        if attached_session != old.session_id {
+            return Err(BindingError::Receipt.into());
+        }
+        let result = timeout(wait, async {
+            let (challenge, _) = self
+                .challenge(identity.endpoint_id(), "advertise", Some(attached_session))
+                .await?;
+            let wire = room_wire::sign_daemon_advertisement(
+                identity,
+                &challenge,
+                revision,
+                addresses,
+                now_unix()?,
+                &self.policy,
+            )?;
+            let (stored, _): (Stored, String) = self
+                .post(
+                    "/room/genesis/peer",
+                    serde_json::to_vec(&wire).map_err(|_| Error::Malformed)?,
+                    room_wire::auth_headers(identity, &challenge)?,
+                )
+                .await?;
+            if !stored.stored {
+                return Err(Error::Malformed);
+            }
+            Ok((wire, stored.receipt))
+        })
+        .await
+        .map_err(|_| Error::PhaseTimeout("transport_presence_renewal"))??;
+        session
+            .daemon_owner
+            .as_mut()
+            .ok_or(BindingError::Unavailable)?
+            .commit_renewal(ticket, result.0, result.1)?;
+        cancellation.committed = true;
+        tracing::info!(room_phase = "own_transport_presence_renewed");
+        Ok(())
+    }
+
     async fn open_inner<S: RoomSigner + ?Sized>(
         &self,
         identity: &S,
@@ -665,6 +773,15 @@ pub struct RoomSession {
     daemon_owner: Option<DaemonRoomOwner>,
 }
 impl RoomSession {
+    /// Fixed once per verified own advertisement, using the original clock.
+    /// Observing this duration does not extend it or assert socket liveness.
+    pub fn daemon_renewal_wait(&self) -> Result<Duration, Error> {
+        self.daemon_owner
+            .as_ref()
+            .ok_or(BindingError::Unavailable)?
+            .renewal_wait()
+            .map_err(Error::from)
+    }
     /// The configured other identity. This metadata is not freshness or authority.
     pub fn pinned_peer_id(&self) -> EndpointId {
         self.other
@@ -805,6 +922,43 @@ mod tests {
     use super::*;
     use crate::relay_policy::RelayPolicy;
     use std::sync::Arc;
+    #[test]
+    fn cancelled_presence_renewal_revokes_gate_but_committed_guard_does_not() {
+        use futures_util::FutureExt;
+        for committed in [false, true] {
+            let local = Identity::test_identity(rand::random()).endpoint_id();
+            let peer = Identity::test_identity(rand::random()).endpoint_id();
+            let coordinator = Identity::test_identity(rand::random()).endpoint_id();
+            let policy = Arc::new(RelayPolicy::from_local_manifest(None, None).unwrap());
+            let config = crate::room_binding::DaemonPairConfig::try_new(
+                "cancel-test".into(),
+                1,
+                local,
+                peer,
+                coordinator,
+                policy.clone(),
+            )
+            .unwrap();
+            let gate = DaemonPeerGate::pending(config);
+            let owner = gate
+                .begin_owner(local, coordinator, &policy, "https://room.invalid/")
+                .unwrap();
+            let future = async {
+                let _guard = PresenceRenewalGuard {
+                    gate: gate.clone(),
+                    committed,
+                };
+                std::future::pending::<()>().await;
+            };
+            assert!(future.now_or_never().is_none());
+            let expected = if committed {
+                BindingError::Unavailable
+            } else {
+                BindingError::Revoked
+            };
+            assert!(matches!(owner.prepare_renewal(), Err(error) if error == expected));
+        }
+    }
     #[test]
     fn peer_receipt_is_optional_observational_wire_data_until_verified() {
         let advertisement = serde_json::json!({"v":1,"room":"genesis","actor_id":"11".repeat(32),"session_id":"22".repeat(32),
