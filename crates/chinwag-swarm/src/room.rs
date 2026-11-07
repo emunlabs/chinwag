@@ -177,6 +177,13 @@ fn http_error(error: reqwest::Error) -> Error {
     })
 }
 
+fn startup_http_phase(phase: &'static str, error: Error) -> Error {
+    match error {
+        Error::Http("timeout") => Error::PhaseTimeout(phase),
+        other => other,
+    }
+}
+
 fn websocket_error(error: tokio_websockets::Error) -> Error {
     use tokio_websockets::{Error as Ws, upgrade::Error as Upgrade};
     match error {
@@ -500,7 +507,8 @@ impl RoomClient {
         }
         let (attach, attach_ray) = self
             .challenge(identity.endpoint_id(), "attach", None)
-            .await?;
+            .await
+            .map_err(|error| startup_http_phase("attach_challenge_http", error))?;
         tracing::info!(room_phase = "attach_challenge_verified");
         let mut ws_url = self.base.join("/room/genesis/ws").map_err(|_| Error::Url)?;
         ws_url.set_scheme("wss").map_err(|_| Error::Url)?;
@@ -547,7 +555,8 @@ impl RoomClient {
                     "advertise",
                     Some(&attach.session_id),
                 )
-                .await?;
+                .await
+                .map_err(|error| startup_http_phase("advertise_challenge_http", error))?;
             let wire = if session.daemon_owner.is_some() {
                 room_wire::sign_daemon_advertisement(
                     identity,
@@ -566,7 +575,8 @@ impl RoomClient {
                     serde_json::to_vec(&wire).map_err(|_| Error::Malformed)?,
                     room_wire::auth_headers(identity, &challenge)?,
                 )
-                .await?;
+                .await
+                .map_err(|error| startup_http_phase("advertisement_store_http", error))?;
             if !stored.stored {
                 return Err(Error::Malformed);
             }
