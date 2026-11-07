@@ -20,7 +20,7 @@ use chinwag_cli::bus_network::{
 };
 use chinwag_swarm::room_binding::{DaemonPeerGate, DaemonRoomIdentity};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Signature, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Signature, TransportAddr, Watcher,
     address_lookup::memory::MemoryLookup, endpoint::presets,
 };
 use serde::{Deserialize, Serialize};
@@ -1128,6 +1128,50 @@ async fn run_daemon_loop(
                 return 1;
             }
         };
+    // Binding a socket does not register it with the configured relay. Wait
+    // before issuing the room's short-lived challenge, so ONLINE cannot race
+    // the relay handshake. Local/disabled-relay publishers never wait here.
+    if let Some((selection, _)) = &network
+        && let Some(expected_relay) = selection.policy().relay_url()
+    {
+        let registration_started = std::time::Instant::now();
+        let initially_registered = endpoint
+            .home_relay_status()
+            .get()
+            .iter()
+            .any(|status| status.url() == expected_relay && status.is_connected());
+        let ready = tokio::time::timeout(
+            Duration::from_secs(iroh::NET_REPORT_TIMEOUT),
+            endpoint.online(),
+        )
+        .await
+        .is_ok()
+            && endpoint
+                .home_relay_status()
+                .get()
+                .iter()
+                .any(|status| status.url() == expected_relay && status.is_connected());
+        if !ready {
+            endpoint.close().await;
+            let _ = writeln!(
+                stdout,
+                "chinwag bus network HELD: owned relay registration unavailable"
+            );
+            return 1;
+        }
+        let _ = writeln!(
+            stdout,
+            "{}",
+            json!({
+                "event": "native_relay_registered",
+                "relay_origin": expected_relay.as_str(),
+                "initially_registered": initially_registered,
+                "registration_wait_ms": registration_started.elapsed().as_millis(),
+                "scope": "TRANSPORT_REGISTRATION_ONLY_NOT_DELIVERY"
+            })
+        );
+        let _ = stdout.flush();
+    }
     let mut room_session = if let Some((selection, gate)) = &network {
         let identity = match DaemonRoomIdentity::for_endpoint(secret, &endpoint) {
             Ok(identity) => identity,
