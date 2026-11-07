@@ -2,6 +2,8 @@
 
 The native bus can forward an unchanged signed original from one Chinwag daemon to its configured peer. The local publisher, journal, bounded forwarding queue and remote Iroh connection belong to the same daemon. There is no separate walkie-talkie bridge.
 
+For inter-node operations, follow the [Cloudflare-native messaging SOP](cloudflare-native-messaging-sop.md): publish locally through the selected CF-enabled daemon, correlate remote evidence, and have each original operator verify its deployment transition. The SOP does not imply automatic session renewal or continuous availability.
+
 This implementation does not by itself establish that a Cloudflare relay is deployed or that two hosts occupy separate networks. Those require actual deployment and transport evidence. A WebSocket signaling service or TURN-credential endpoint is not an Iroh relay.
 
 ## Select an ordinary peer and an owned relay
