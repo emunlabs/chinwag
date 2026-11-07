@@ -33,6 +33,8 @@ pub mod task_legacy;
 #[cfg(target_os = "macos")]
 pub mod task_normalization;
 #[cfg(target_os = "macos")]
+pub mod task_projection;
+#[cfg(target_os = "macos")]
 pub mod task_ref;
 #[cfg(target_os = "macos")]
 pub mod task_resource_lease;
@@ -48,6 +50,10 @@ pub(crate) mod task_scheduler_journal;
 pub mod task_source;
 #[cfg(target_os = "macos")]
 pub mod task_source_path;
+#[cfg(target_os = "macos")]
+pub mod task_store;
+#[cfg(all(test, target_os = "macos"))]
+mod task_store_tests;
 #[cfg(target_os = "macos")]
 pub mod task_wire;
 #[cfg(target_os = "macos")]

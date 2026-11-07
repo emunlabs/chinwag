@@ -658,6 +658,12 @@ impl Journal {
         self.operations.values().map(|index| &self.records[*index])
     }
 
+    /// Recheck the original retained snapshot even when it contains no rows.
+    /// This supplies read evidence only, never a reservation or writer grant.
+    pub(crate) fn revalidate_snapshot(&self) -> Result<(), JournalError> {
+        self.verify_binding(self.file_bytes).map(|_| ())
+    }
+
     pub fn lookup_request(
         &self,
         request: &JournalRequestV1,
