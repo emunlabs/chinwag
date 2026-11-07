@@ -23,6 +23,8 @@ pub mod bus_federation;
 #[cfg(target_os = "macos")]
 pub mod bus_identity;
 #[cfg(target_os = "macos")]
+pub mod bus_journal;
+#[cfg(target_os = "macos")]
 pub mod board;
 #[cfg(target_os = "macos")]
 pub mod bus_delivery;
