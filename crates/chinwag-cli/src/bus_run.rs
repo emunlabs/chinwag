@@ -568,11 +568,18 @@ fn read_daemon_state(repo_root: &Path) -> Option<DaemonState> {
     if status.success() { Some(state) } else { None }
 }
 
-fn write_daemon_state(repo_root: &Path, state: &DaemonState) {
-    let path = daemon_json_path(repo_root);
-    if let Ok(text) = serde_json::to_string_pretty(state) {
-        let _ = fs::write(&path, text);
-    }
+fn write_daemon_state(repo_root: &Path, state: &DaemonState) -> Result<(), ()> {
+    let bytes = serde_json::to_vec_pretty(state).map_err(|_| ())?;
+    chinwag_cli::bus_state::write_daemon_state_bytes(repo_root, &bytes).map_err(|_| ())
+}
+
+/// A stored row is retained even if authority expired during persistence. It
+/// cannot authorize a positive ACK after that loss, nor a rollback or retry.
+fn confirm_publication_current(
+    result: Result<(u64, usize), ()>,
+    current: impl FnOnce() -> bool,
+) -> Result<(u64, usize), ()> {
+    result.and_then(|stored| if current() { Ok(stored) } else { Err(()) })
 }
 
 /// Dynamically discovers active (`UP` + `RUNNING`) non-loopback IPv4 addresses on this host via `/sbin/ifconfig` (`BUS-HARDEN-05`).
@@ -759,8 +766,18 @@ async fn publish_over_iroh_quic(
 }
 
 fn format_local_wall_clock(ts_iso: &str) -> String {
-    if ts_iso.len() >= 19 {
-        let hms = &ts_iso[11..19];
+    if let Some(hms) = ts_iso.get(11..19).filter(|hms| {
+        let bytes = hms.as_bytes();
+        bytes.iter().enumerate().all(|(i, b)| {
+            if i == 2 || i == 5 {
+                *b == b':'
+            } else {
+                b.is_ascii_digit()
+            }
+        }) && &hms[..2] < "24"
+            && &hms[3..5] < "60"
+            && &hms[6..8] < "60"
+    }) {
         if ts_iso.ends_with('Z')
             && let Ok(utc_hr) = hms[0..2].parse::<u32>()
         {
@@ -776,7 +793,7 @@ fn format_local_wall_clock(ts_iso: &str) -> String {
 }
 
 fn format_bus_line(m: &BusMessage) -> String {
-    let short_ep = if m.sender_endpoint_id.len() >= 12 {
+    let short_ep = if m.sender_endpoint_id.is_ascii() && m.sender_endpoint_id.len() >= 12 {
         format!(
             "{}..{}",
             &m.sender_endpoint_id[..6],
@@ -1220,8 +1237,20 @@ async fn run_daemon_loop(
         .to_string(),
         delivery_router: chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED.to_owned(),
     }));
-    if let Ok(guard) = state.lock() {
-        write_daemon_state(&repo_root, &guard);
+    let initial_state = state
+        .lock()
+        .map_err(|_| ())
+        .and_then(|guard| write_daemon_state(&repo_root, &guard));
+    if initial_state.is_err() {
+        if let Some(session) = &mut room_session {
+            session.close().await;
+        }
+        endpoint.close().await;
+        let _ = writeln!(
+            stdout,
+            "chinwag bus HELD: diagnostic state unsafe or persistence unknown"
+        );
+        return 1;
     }
 
     let _ = writeln!(
@@ -1244,6 +1273,8 @@ async fn run_daemon_loop(
     let incoming_slots = Arc::new(tokio::sync::Semaphore::new(32));
     let mut handlers = tokio::task::JoinSet::new();
     let mut forwards = tokio::task::JoinSet::new();
+    let (state_error_tx, mut state_error_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut exit_code = 0;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut governor_tick = tokio::time::interval(Duration::from_secs(45));
     governor_tick.tick().await;
@@ -1251,6 +1282,11 @@ async fn run_daemon_loop(
     loop {
         tokio::select! {
             _ = &mut shutdown => {
+                break;
+            }
+            Some(()) = state_error_rx.recv() => {
+                let _ = writeln!(stdout, "chinwag bus HELD: diagnostic state update failed");
+                exit_code = 1;
                 break;
             }
             original = forward_rx.recv(), if network.is_some() && forwards.is_empty() => {
@@ -1287,19 +1323,29 @@ async fn run_daemon_loop(
             }
             _ = heartbeat.tick() => {
                 let count = read_all_messages(&repo_root).len() as u64;
-                if let Ok(mut guard) = state.lock() {
+                let update = state.lock().map_err(|_| ()).and_then(|mut guard| {
                     guard.last_heartbeat = unix_now();
                     guard.total_messages = count;
-                    write_daemon_state(&repo_root, &guard);
+                    write_daemon_state(&repo_root, &guard)
+                });
+                if update.is_err() {
+                    let _ = writeln!(stdout, "chinwag bus HELD: diagnostic state update failed");
+                    exit_code = 1;
+                    break;
                 }
             }
             _ = governor_tick.tick(), if !no_governors => {
                 // Reconciliation is a trigger, not authority to create a new task invocation.
                 // This legacy bus has no verified qualified-assignment/lease adapter.
-                if let Ok(mut guard) = state.lock() {
+                let update = state.lock().map_err(|_| ()).and_then(|mut guard| {
                     guard.product_governor = format!("RECONCILIATION_ONLY ({})", chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED);
                     guard.delivery_router = chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED.to_owned();
-                    write_daemon_state(&repo_root, &guard);
+                    write_daemon_state(&repo_root, &guard)
+                });
+                if update.is_err() {
+                    let _ = writeln!(stdout, "chinwag bus HELD: diagnostic state update failed");
+                    exit_code = 1;
+                    break;
                 }
             }
             _ = handlers.join_next(), if !handlers.is_empty() => {}
@@ -1313,6 +1359,7 @@ async fn run_daemon_loop(
                 let tx_clone = tx.clone();
                 let publications = publications.clone();
                 let daemon_ep = endpoint_id.clone();
+                let state_error = state_error_tx.clone();
                 handlers.spawn(async move {
                     let _slot = slot;
                     let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), incoming).await else {
@@ -1358,21 +1405,27 @@ async fn run_daemon_loop(
                                 ingress.publish(&message, &tx_clone, peer).map_err(|_| ())
                             })
                     } else { Err(()) };
-                    let ack = match result {
-                        Ok((seq, subscribers)) => {
-                            if let Ok(mut guard) = state_clone.lock() {
+                    let result = result.and_then(|(seq, subscribers)| {
+                            let update = state_clone.lock().map_err(|_| ()).and_then(|mut guard| {
                                 guard.last_heartbeat = unix_now(); guard.total_messages = seq;
-                                write_daemon_state(&repo_clone, &guard);
-                            }
-                            if let Some(path) = path {
+                                write_daemon_state(&repo_clone, &guard)
+                            });
+                            if update.is_err() { let _ = state_error.try_send(()); return Err(()); }
+                            if let Some(path) = &path {
                                 eprintln!("{}", json!({"event":"native_original_journaled", "original_id":message.id,
                                     "original_digest_sha256":message.digest_sha256, "path":path,
                                     "scope":"JOURNAL_PUBLICATION_ONLY", "processing":"UNKNOWN", "work_started":"UNKNOWN"}));
                             }
-                            BusAck { ok:true, seq, message_id:message.id.clone(), daemon_endpoint_id:daemon_ep,
+                            Ok((seq, subscribers))
+                    });
+                    // This is after ALL synchronous persistence/state writes,
+                    // immediately before constructing the positive ACK.
+                    let result = confirm_publication_current(result, || !federated ||
+                        network.as_ref().is_some_and(|(selection, gate)| selection.remote_path(conn, gate).is_ok()));
+                    let ack = match result {
+                        Ok((seq, subscribers)) => BusAck { ok:true, seq, message_id:message.id.clone(), daemon_endpoint_id:daemon_ep,
                                 transport:"iroh-quic/chinwag-bus-1".into(), room:message.room.clone(),
-                                subscribers_notified:subscribers, sig_verified:signature }
-                        }
+                                subscribers_notified:subscribers, sig_verified:signature },
                         Err(()) => BusAck { ok:false, seq:0, message_id:message.id.clone(), daemon_endpoint_id:daemon_ep,
                             transport:"iroh-quic/chinwag-bus-1 (refused or persistence unknown)".into(),
                             room:message.room.clone(), subscribers_notified:0, sig_verified:signature },
@@ -1400,7 +1453,41 @@ async fn run_daemon_loop(
     // Abort at their await points and await every original task handle.
     handlers.shutdown().await;
     forwards.shutdown().await;
-    0
+    exit_code
+}
+
+/// Fallback is possible only when no selected-daemon exchange was attempted.
+/// Every attempted exchange returns here, including missing/lost/invalid ACKs.
+fn complete_publication(
+    mut message: BusMessage,
+    daemon: Option<&DaemonState>,
+    explicit_route: bool,
+    exchange: impl FnOnce(&DaemonState, &BusMessage) -> Result<BusAck, String>,
+    local: impl FnOnce(&mut BusMessage) -> Result<BusAck, InstanceError>,
+) -> Result<(BusMessage, BusAck), InstanceError> {
+    let ack = if let Some(daemon) = daemon {
+        let ack = exchange(daemon, &message).map_err(|_| {
+            eprintln!(
+                "{}",
+                json!({"event":"bus_publication_outcome_unknown",
+                "original_id":message.id, "original_digest_sha256":message.digest_sha256,
+                "automatic_retry":false, "reconciliation_required":true})
+            );
+            InstanceError::PublicationRejected
+        })?;
+        if !valid_publication_ack(daemon, &message, &ack) {
+            return Err(InstanceError::PublicationRejected);
+        }
+        ack
+    } else {
+        if explicit_route {
+            return Err(InstanceError::PublicationRejected);
+        }
+        local(&mut message)?
+    };
+    message.seq = ack.seq;
+    message.sig_verified = ack.sig_verified;
+    Ok((message, ack))
 }
 
 pub fn send_bus_message_sync(
@@ -1463,44 +1550,40 @@ pub fn send_bus_message_sync(
         return Err(InstanceError::SigningIdentityUnavailable);
     }
 
-    if let Some(daemon) = read_daemon_state(repo_root)
-        && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        && let Ok(ack) = rt.block_on(publish_over_iroh_quic(&daemon, transport_secret, &msg))
-    {
-        if !valid_publication_ack(&daemon, &msg, &ack) {
-            return Err(InstanceError::PublicationRejected);
-        }
-        msg.seq = ack.seq;
-        msg.sig_verified = ack.sig_verified;
-        return Ok((msg, ack));
-    }
-
-    if std::env::var_os("CHINWAG_BUS_ADDR").is_some()
-        || std::env::var_os("CHINWAG_BUS_ENDPOINT_ID").is_some()
-    {
-        return Err(InstanceError::PublicationRejected);
-    }
-
-    let fallback_daemon_endpoint_id = load_or_create_daemon_secret(repo_root)
-        .map_err(|_| InstanceError::SigningIdentityUnavailable)?
-        .public()
-        .to_string();
-    let seq = persist_local_publication(repo_root, &msg)
-        .map_err(|_| InstanceError::PublicationRejected)?;
-    msg.seq = seq;
-    let ack = BusAck {
-        ok: true,
-        seq,
-        message_id: msg_id,
-        daemon_endpoint_id: fallback_daemon_endpoint_id,
-        transport: "local-jsonl (daemon unavailable; publish only)".to_string(),
-        room: room_norm,
-        subscribers_notified: 0,
-        sig_verified: msg.sig_verified,
-    };
-    Ok((msg, ack))
+    let daemon = read_daemon_state(repo_root);
+    let explicit_route = std::env::var_os("CHINWAG_BUS_ADDR").is_some()
+        || std::env::var_os("CHINWAG_BUS_ENDPOINT_ID").is_some();
+    complete_publication(
+        msg,
+        daemon.as_ref(),
+        explicit_route,
+        |daemon, msg| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "local transport runtime unavailable".to_owned())?;
+            rt.block_on(publish_over_iroh_quic(daemon, transport_secret, msg))
+        },
+        |msg| {
+            let fallback_daemon_endpoint_id = load_or_create_daemon_secret(repo_root)
+                .map_err(|_| InstanceError::SigningIdentityUnavailable)?
+                .public()
+                .to_string();
+            let seq = persist_local_publication(repo_root, msg)
+                .map_err(|_| InstanceError::PublicationRejected)?;
+            let ack = BusAck {
+                ok: true,
+                seq,
+                message_id: msg_id,
+                daemon_endpoint_id: fallback_daemon_endpoint_id,
+                transport: "local-jsonl (daemon unavailable; publish only)".to_string(),
+                room: room_norm,
+                subscribers_notified: 0,
+                sig_verified: msg.sig_verified,
+            };
+            Ok(ack)
+        },
+    )
 }
 
 fn print_bus_help(stdout: &mut dyn Write) -> u8 {
@@ -2428,6 +2511,135 @@ mod tests {
         assert_eq!(
             format_local_wall_clock("2026-10-29T18:06:12-0500 CDT"),
             "18:06:12 CDT"
+        );
+    }
+
+    #[test]
+    fn unsigned_unicode_display_metadata_persists_and_renders_without_panicking() {
+        for timestamp in [
+            "éééééééééé",
+            "0123456789🙂12:34:56Z",
+            "🙂",
+            "2026-10-29T99:88:77Z",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            let mut original = native_publication_fixture(&root);
+            original.ts_iso = timestamp.into();
+            assert!(valid_federation_original(&root, &mut original));
+            assert_eq!(persist_local_publication(&root, &original).unwrap(), 1);
+            let stored = read_all_messages(&root);
+            assert_eq!(stored.len(), 1);
+            assert_eq!(format_local_wall_clock(timestamp), timestamp);
+            assert!(format_bus_line(&stored[0]).contains(timestamp));
+        }
+        // Legacy local endpoint labels are display data too. Never slice a
+        // UTF-8 label by unchecked byte offsets, even when it is long enough.
+        let temp = tempfile::tempdir().unwrap();
+        let mut original = native_publication_fixture(temp.path());
+        original.sender_endpoint_id = "🙂🙂🙂🙂".into();
+        assert!(format_bus_line(&original).contains("🙂🙂🙂🙂"));
+    }
+
+    #[test]
+    fn attempted_uncertain_daemon_publication_never_reopens_local_sink() {
+        use std::cell::Cell;
+        for already_written in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            let original = native_publication_fixture(&root);
+            let daemon = explicit_daemon_route(
+                &root,
+                Some("127.0.0.1:44330"),
+                Some(&SecretKey::generate().public().to_string()),
+            )
+            .unwrap();
+            // A complete row plus a missing response models both a lost ACK
+            // and complete-but-unconfirmed storage. This cut does not claim
+            // an actual OS fsync fault or network packet loss was injected.
+            if already_written {
+                persist_local_publication(&root, &original).unwrap();
+            }
+            let before = fs::read(messages_jsonl_path(&root)).ok();
+            let signed_before = serde_json::to_vec(&original).unwrap();
+            let fallback_called = Cell::new(false);
+            let result = complete_publication(
+                original.clone(),
+                Some(&daemon),
+                false,
+                |_, message| {
+                    assert_eq!(serde_json::to_vec(message).unwrap(), signed_before);
+                    Err("controlled missing response after attempt".into())
+                },
+                |message| {
+                    fallback_called.set(true);
+                    persist_local_publication(&root, message).unwrap();
+                    Err(InstanceError::PublicationRejected)
+                },
+            );
+            assert!(matches!(result, Err(InstanceError::PublicationRejected)));
+            assert!(!fallback_called.get());
+            assert_eq!(fs::read(messages_jsonl_path(&root)).ok(), before);
+            assert_eq!(serde_json::to_vec(&original).unwrap(), signed_before);
+        }
+    }
+
+    #[test]
+    fn unattempted_local_publication_remains_available_but_explicit_missing_route_refuses() {
+        use std::cell::Cell;
+        for explicit in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let original = native_publication_fixture(temp.path());
+            let local_called = Cell::new(false);
+            let result = complete_publication(
+                original,
+                None,
+                explicit,
+                |_, _| panic!("no selected daemon may be contacted"),
+                |message| {
+                    local_called.set(true);
+                    let seq = persist_local_publication(temp.path(), message).unwrap();
+                    Ok(BusAck {
+                        ok: true,
+                        seq,
+                        message_id: message.id.clone(),
+                        daemon_endpoint_id: "fixture".into(),
+                        transport: "local publication".into(),
+                        room: message.room.clone(),
+                        subscribers_notified: 0,
+                        sig_verified: true,
+                    })
+                },
+            );
+            assert_eq!(result.is_ok(), !explicit);
+            assert_eq!(local_called.get(), !explicit);
+            assert_eq!(read_all_messages(temp.path()).len(), usize::from(!explicit));
+        }
+    }
+
+    #[test]
+    fn gate_lost_after_storage_refuses_positive_ack_retains_row_and_never_repeats_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let original = native_publication_fixture(&root);
+        let mut ingress = NativePublication::open(&root).unwrap();
+        let (tx, mut rx) = broadcast::channel(8);
+        let stored = ingress.publish(&original, &tx, None).map_err(|_| ());
+        assert_eq!(stored, Ok((1, 1)));
+        let before = fs::read(messages_jsonl_path(&root)).unwrap();
+        // Production invokes remote_path here, after persistence and state
+        // updates. This controlled cut models revocation/deadline crossing.
+        assert_eq!(confirm_publication_current(stored, || false), Err(()));
+        assert_eq!(rx.try_recv().unwrap().id, original.id);
+        assert!(rx.try_recv().is_err());
+        let replay = ingress.publish(&original, &tx, None).map_err(|_| ());
+        assert_eq!(confirm_publication_current(replay, || false), Err(()));
+        assert_eq!(fs::read(messages_jsonl_path(&root)).unwrap(), before);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(confirm_publication_current(Ok((1, 0)), || true), Ok((1, 0)));
+        assert_eq!(
+            confirm_publication_current(Err(()), || panic!("failed storage cannot become success")),
+            Err(())
         );
     }
 

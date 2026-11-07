@@ -23,7 +23,9 @@ These values are selected configuration data. Matching relay strings, a generati
 
 The owned relay policy permits exactly its configured clean HTTPS origin. Public default Iroh relay services, custom peer-supplied transports, incomplete selections and different expected origins are refused. There is no automatic fallback from a requested network route to an unrelated local append.
 
-New daemon keys use OS randomness and private exclusive creation with file and directory synchronization. Existing key bytes are preserved. Malformed or unsafe key files are refused without rotation or permission repair. A recognized old predictable daemon identity cannot start the network-enabled profile. A remote endpoint pin alone does not prove how its key was generated.
+New daemon keys use OS randomness and private exclusive creation with file and directory synchronization. Existing key bytes are preserved. Wrong-length or unsafe key files are refused without rotation or permission repair. Every structurally acceptable 32-byte file is a valid raw seed: this format cannot detect same-length corruption or prove the entropy or enrollment of an existing key. A recognized old predictable daemon identity cannot start the network-enabled profile; a negative legacy check or remote endpoint pin does not prove how a key was generated.
+
+Diagnostic `daemon.json` is replaced through a retained-directory, no-follow writer using a fresh private file, synchronization and exact readback. Existing symlinks, hardlinks and unsafe files are refused, including a dangling state symlink created before the identity key exists. Startup and later state-write errors stop this daemon's owned runtime. A failure after journal publication may still leave stored bytes and notifications; a negative ACK does not assert rollback.
 
 ## Relay-only path
 
@@ -52,7 +54,11 @@ The existing `chinwag/bus/1` ALPN carries the original message. Federation re-ve
 - The same message ID with conflicting immutable content is refused.
 - An uncertain or partial write retains its bytes and cannot produce a success ACK or automatic retry.
 
-The journal uses retained directory and file descriptors, exclusive cooperative locking and private regular single-link files. Missing or replaced namespaces are refused; an existing unsafe journal/lock is not silently chmodded or repaired. Advisory locks and retained descriptors do not provide containment against an adversarial process with the same OS identity. A fresh sink cannot prove history that was already lost before it opened.
+Once a selected daemon exchange is attempted, a missing or unusable response returns refusal with the original ID/digest available for explicit reconciliation. It never opens a fresh local sink automatically. The local publication path remains available when no daemon exchange was attempted and no explicit remote route was requested.
+
+Inbound federation rechecks its current gate and selected connection path after persistence and diagnostic-state updates, immediately before constructing a positive ACK. If the gate expired or was revoked during storage, the row and any completed effects remain; refusal does not retry or undo them. As with other admission checks, this does not promise atomic authority throughout subsequent asynchronous ACK transmission.
+
+The journal uses retained directory and file descriptors, exclusive cooperative locking and private regular single-link files. Missing or replaced namespaces are refused; an existing unsafe journal/lock is not silently chmodded or repaired. Advisory locks and retained descriptors do not provide containment against an adversarial process with the same OS identity. There is no durable prefix commitment to detect every same-inode historical rewrite or rollback. A fresh sink cannot prove history that was already lost before it opened. Complete valid history may contain non-monotonic sequence values; new allocation uses the maximum observed sequence with checked overflow.
 
 Existing SQLite mirrors remain historical observations. This path does not write an unchecked SQLite filename through an external command. Native history reads the original JSONL journal.
 
