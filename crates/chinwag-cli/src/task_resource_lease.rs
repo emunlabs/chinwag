@@ -39,7 +39,7 @@ pub enum LeaseError {
 }
 impl std::fmt::Display for LeaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "resource lease held: {self:?}")
+        write!(f, "resource lease refused: {self:?}")
     }
 }
 impl std::error::Error for LeaseError {}
