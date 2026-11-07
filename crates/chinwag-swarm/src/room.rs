@@ -52,6 +52,22 @@ impl Drop for PresenceRenewalGuard {
     }
 }
 
+/// Fixed HTTP wait stages for diagnostics; never contains request or reply data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpWaitStage {
+    ResponseHeaders,
+    ResponseBody,
+}
+
+impl std::fmt::Display for HttpWaitStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ResponseHeaders => "response headers",
+            Self::ResponseBody => "response body",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -64,6 +80,8 @@ pub enum Error {
     Network,
     #[error("the room HTTP request failed ({0})")]
     Http(&'static str),
+    #[error("the room HTTP request timed out while awaiting {0}")]
+    HttpWaitTimeout(HttpWaitStage),
     #[error("the room WebSocket operation failed ({0})")]
     WebSocket(&'static str),
     #[error("the room WebSocket upgrade returned HTTP {0}")]
@@ -74,6 +92,11 @@ pub enum Error {
     Timeout,
     #[error("the room {0} operation exceeded its deadline")]
     PhaseTimeout(&'static str),
+    #[error("the room {phase} operation exceeded its deadline while awaiting {stage}")]
+    PhaseHttpTimeout {
+        phase: &'static str,
+        stage: HttpWaitStage,
+    },
     #[error("the room refused this operation with HTTP {0}")]
     Refused(u16),
     #[error("room input exceeds its size limit")]
@@ -194,7 +217,16 @@ fn http_error(error: reqwest::Error) -> Error {
 fn startup_http_phase(phase: &'static str, error: Error) -> Error {
     match error {
         Error::Http("timeout") => Error::PhaseTimeout(phase),
+        Error::HttpWaitTimeout(stage) => Error::PhaseHttpTimeout { phase, stage },
         other => other,
+    }
+}
+
+fn http_wait_error(stage: HttpWaitStage, error: reqwest::Error) -> Error {
+    if error.is_timeout() {
+        Error::HttpWaitTimeout(stage)
+    } else {
+        http_error(error)
     }
 }
 
@@ -421,7 +453,10 @@ impl RoomClient {
         for (name, value) in headers {
             request = request.header(name, value);
         }
-        let mut response = request.send().await.map_err(http_error)?;
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| http_wait_error(HttpWaitStage::ResponseHeaders, error))?;
         tracing::info!(
             room_phase = "http_response",
             operation = path,
@@ -435,7 +470,11 @@ impl RoomClient {
             return Err(Error::Size);
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(http_error)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| http_wait_error(HttpWaitStage::ResponseBody, error))?
+        {
             if chunk.len() > LIMIT.saturating_sub(bytes.len()) {
                 return Err(Error::Size);
             }
@@ -922,6 +961,75 @@ mod tests {
     use super::*;
     use crate::relay_policy::RelayPolicy;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn http_timeout_diagnostic_distinguishes_headers_and_body_without_request_data() {
+        use std::io::{Read, Write};
+        for stage in [HttpWaitStage::ResponseHeaders, HttpWaitStage::ResponseBody] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = [0; 2048];
+                let _ = socket.read(&mut request).unwrap();
+                if stage == HttpWaitStage::ResponseBody {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(1500));
+            });
+            // This isolated plaintext loopback fixture never uses TLS. Supply
+            // an explicit local provider without changing any process default
+            // or the production client's platform trust configuration.
+            let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+            let client = reqwest::Client::builder()
+                .tls_backend_preconfigured(tls)
+                .no_proxy()
+                .http1_only()
+                .retry(reqwest::retry::never())
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap();
+            let response = client
+                .get(format!(
+                    "http://{address}/?nonce=PRIVATE_DIAGNOSTIC_SENTINEL"
+                ))
+                .send()
+                .await;
+            let error = match stage {
+                HttpWaitStage::ResponseHeaders => response.unwrap_err(),
+                HttpWaitStage::ResponseBody => response.unwrap().chunk().await.unwrap_err(),
+            };
+            let error = startup_http_phase("attach_challenge_http", http_wait_error(stage, error));
+            assert!(matches!(error, Error::PhaseHttpTimeout { stage: got, .. } if got == stage));
+            let rendered = error.to_string();
+            assert!(rendered.contains("attach_challenge_http"));
+            assert!(rendered.contains(&stage.to_string()));
+            for private in [
+                "PRIVATE_DIAGNOSTIC_SENTINEL",
+                "nonce",
+                "127.0.0.1",
+                "http://",
+            ] {
+                assert!(!rendered.contains(private));
+            }
+            assert!(std::error::Error::source(&error).is_none());
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn cancelled_presence_renewal_revokes_gate_but_committed_guard_does_not() {
         use futures_util::FutureExt;
