@@ -6,6 +6,9 @@ current directory. A present invalid selector fails; it never selects a home
 directory or a different repository. Discovery stops at the nearest Git
 repository. A nested repository is a separate identity. Linked worktrees retain
 their own Git directory and their shared common Git directory separately.
+Revalidation rejects a newly introduced common-directory mapping and verifies
+Git's effective worktree against the retained root, including repo-local
+`core.worktree` overrides that leave HEAD and branch unchanged.
 
 `--crdb` is an independent, exact storage selector. Its filename does not select
 a repository or establish a workspace identity. A missing or mismatched store
@@ -43,9 +46,15 @@ All four route adapters carry the selected context:
   execution binding and independently committed write capability together.
 - Agent dispatch binds before persona, memory, signing, engine construction or
   persistence. Local engines use the approved process directory and any engine
-  cwd argument. Every engine and permitted fallback rechecks the binding.
+  cwd argument. Worker launch removes inherited and explicitly supplied `GIT_*`
+  overrides before installing only the fixed configuration isolation and the
+  validated seat-signing configuration. Every engine and permitted fallback
+  rechecks the binding.
   An unknown started engine is not replaced by another engine. A local pathname
-  cannot authorize a remote checkout, so an unmapped remote route is held.
+  cannot authorize a remote checkout, so an unmapped remote route is held. Pool
+  dispatch and the hosted executor's `run_command` tool are also held while they
+  lack an adapter that carries this workspace binding into their worker and
+  persistence operations.
 - Feature entry points use retained selection for ordinary OpenSpec, plugin,
   card, bond and public A.509 inspection. Protected mutation/signing effects
   require the separate binding before their first effect. Legacy task exports

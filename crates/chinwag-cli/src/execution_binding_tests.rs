@@ -109,7 +109,7 @@ impl BindingFixture {
         let receipt =
             chinwag_snapshot_session_private::validate_detached_private_image(&image.bytes)
                 .unwrap();
-        let (baseline, branch) = git_state(&root, &selected.git).unwrap();
+        let (baseline, branch) = git_state(&selected.root, &selected.git).unwrap();
         let enrollment = Enrollment {
             workspace: options.workspace_id,
             repo: options.repo_id,
@@ -471,7 +471,7 @@ fn p009_git_environment_probe_child() {
         cwd: &root,
     })
     .unwrap();
-    let (baseline, branch) = git_state(&root, &selected.git).unwrap();
+    let (baseline, branch) = git_state(&selected.root, &selected.git).unwrap();
     assert_eq!(
         baseline.to_string(),
         std::env::var("P009_EXPECTED_BASELINE").unwrap()
@@ -658,6 +658,52 @@ fn p009_commondir_absent_to_present_redirect_refuses_retained_contexts() {
     assert!(
         selection_result.is_err() && binding_result.is_err() && effects.get() == 0,
         "retained metadata must refuse redirection: selection={selection_result:?}, binding={binding_result:?}, effects={}",
+        effects.get()
+    );
+}
+
+#[test]
+fn p009_local_core_worktree_redirect_refuses_before_execution_effect() {
+    use std::io::Write;
+
+    let f = BindingFixture::new();
+    let binding = f.bind();
+    let before = safe_git(f.root(), &["rev-parse", "--show-toplevel"]).unwrap();
+    let foreign = f.source_root().join("foreign-executor-root");
+    fs::create_dir(&foreign).unwrap();
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(f.root().join(".git/config"))
+        .unwrap();
+    writeln!(config, "\n[core]\n\tworktree = {}", foreign.display()).unwrap();
+    config.sync_all().unwrap();
+
+    let actual = safe_git(f.root(), &["rev-parse", "--show-toplevel"]).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&actual).unwrap().trim(),
+        foreign.to_str().unwrap()
+    );
+    assert_ne!(actual, before);
+    let head = safe_git(f.root(), &["rev-parse", "--verify", "HEAD^{commit}"]).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&head).unwrap().trim(),
+        f.baseline().to_string()
+    );
+    println!(
+        "owned core.worktree redirect proved; old={}, new={}, unchanged HEAD={}",
+        String::from_utf8_lossy(&before).trim(),
+        String::from_utf8_lossy(&actual).trim(),
+        String::from_utf8_lossy(&head).trim()
+    );
+    let effects = Cell::new(0);
+    let result = (|| -> BindingResult<()> {
+        binding.revalidate(&f.authority())?;
+        effects.set(1);
+        Ok(())
+    })();
+    assert!(
+        result.is_err() && effects.get() == 0,
+        "effective Git worktree must remain the bound root: result={result:?}, effects={}",
         effects.get()
     );
 }

@@ -119,6 +119,8 @@ fn account_id() -> String {
 }
 
 /// True when the pools should use DeepSeek: token file present and not disabled.
+// Retained legacy availability probe; bound dispatch refuses before probing it.
+#[allow(dead_code)]
 pub fn enabled() -> bool {
     std::env::var("EPHEMERAL_DEEPSEEK_DISABLE")
         .map(|v| v != "1")
@@ -416,7 +418,9 @@ fn call_workers_ai(
     result
 }
 
-/// Entry point used by `dispatch_to_engine`. Never falls back to another engine.
+/// Retained legacy runner; bound `dispatch_to_engine` cannot reach it until a
+/// workspace/store-aware adapter exists. This runner never selects a fallback.
+#[allow(dead_code)]
 pub fn run(
     pool: Pool,
     agent_upper: &str,

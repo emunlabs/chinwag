@@ -13,6 +13,22 @@ fn p009_private_fake_worker_child() {
     let Some(output) = std::env::var_os("CHINWAG_P009_PRIVATE_PROBE_OUT") else {
         return;
     };
+    if std::env::var_os("CHINWAG_P009_PRIVATE_MISSING_REPO").is_some() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = crate::bus_run::run_bus_cli(
+            &["status".into(), "--repo".into()],
+            &mut stdout,
+            &mut stderr,
+        );
+        let value = json!({
+            "exit": exit,
+            "stdout": String::from_utf8(stdout).unwrap(),
+            "stderr": String::from_utf8(stderr).unwrap(),
+        });
+        fs::write(output, serde_json::to_vec(&value).unwrap()).unwrap();
+        return;
+    }
     let value = json!({
         "cwd": std::env::current_dir().unwrap(),
         "repo": std::env::var("CHINWAG_REPO_ROOT").unwrap(),
@@ -21,6 +37,26 @@ fn p009_private_fake_worker_child() {
         "binding": std::env::var("CHINWAG_EXECUTION_BINDING").unwrap(),
     });
     fs::write(output, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[test]
+fn p009_trailing_bus_repo_refuses_before_valid_environment_or_cwd_fallback() {
+    let fixture = BindingFixture::new();
+    let files = tempfile::tempdir().unwrap();
+    let output = files.path().join("refusal.json");
+    assert!(!fixture.root().join(".chinwag/bus").exists());
+    let child = probe_command(&output)
+        .current_dir(fixture.root())
+        .env("CHINWAG_REPO_ROOT", fixture.root())
+        .env("CHINWAG_P009_PRIVATE_MISSING_REPO", "1")
+        .output()
+        .unwrap();
+    assert!(child.status.success());
+    let value: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+    assert_eq!(value["exit"], 2);
+    assert_eq!(value["stdout"], "");
+    assert!(value["stderr"].as_str().unwrap().contains("chinwag bus:"));
+    assert!(!fixture.root().join(".chinwag/bus").exists());
 }
 
 fn probe_command(output: &Path) -> Command {

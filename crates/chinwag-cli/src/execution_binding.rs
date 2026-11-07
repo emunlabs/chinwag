@@ -474,7 +474,7 @@ fn safe_git(root: &Path, args: &[&str]) -> BindingResult<Vec<u8>> {
     }
     Ok(output.stdout)
 }
-fn git_state(root: &Path, git: &GitPins) -> BindingResult<(GitOid, BranchBinding)> {
+fn git_state(root: &HeldDir, git: &GitPins) -> BindingResult<(GitOid, BranchBinding)> {
     // Reject local config includes before any subprocess can follow them,
     // including the common configuration of linked worktrees.
     for path in [
@@ -492,14 +492,29 @@ fn git_state(root: &Path, git: &GitPins) -> BindingResult<(GitOid, BranchBinding
             }
         }
     }
-    let head = safe_git(root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    // A local core.worktree override can preserve HEAD, branch and Git-directory
+    // identities while redirecting a scrubbed child to another workspace.
+    let top = safe_git(&root.path, &["rev-parse", "--show-toplevel"])?;
+    let top = std::str::from_utf8(&top)
+        .map_err(|_| BindingError::GitMetadata)?
+        .strip_suffix('\n')
+        .ok_or(BindingError::GitMetadata)?;
+    if top.contains(['\n', '\r']) {
+        return Err(BindingError::GitMetadata);
+    }
+    let effective_root = HeldDir::open(Path::new(top))?;
+    if effective_root.path != root.path || effective_root.id != root.id {
+        return Err(BindingError::NamespaceChanged);
+    }
+    root.verify()?;
+    let head = safe_git(&root.path, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     let baseline = GitOid::from_hex(
         std::str::from_utf8(&head)
             .map_err(|_| BindingError::GitMetadata)?
             .trim(),
     )
     .map_err(|_| BindingError::GitMetadata)?;
-    let symbolic = safe_git(root, &["rev-parse", "--symbolic-full-name", "HEAD"])?;
+    let symbolic = safe_git(&root.path, &["rev-parse", "--symbolic-full-name", "HEAD"])?;
     let reference = std::str::from_utf8(&symbolic)
         .map_err(|_| BindingError::GitMetadata)?
         .trim();
@@ -704,7 +719,7 @@ pub fn bind_execution(
     if source.id != e.source.identity {
         return Err(BindingError::SourceMapping);
     }
-    let (baseline, branch) = git_state(&root.path, &git)?;
+    let (baseline, branch) = git_state(&root, &git)?;
     if baseline != e.baseline {
         return Err(BindingError::BaselineChanged);
     }
@@ -813,7 +828,7 @@ impl WorkspaceExecutionBinding {
         self.git.verify()?;
         self.source.verify()?;
         self.store.verify()?;
-        let (baseline, branch) = git_state(&self.root.path, &self.git)?;
+        let (baseline, branch) = git_state(&self.root, &self.git)?;
         if baseline != self.enrollment.baseline {
             return Err(BindingError::BaselineChanged);
         }

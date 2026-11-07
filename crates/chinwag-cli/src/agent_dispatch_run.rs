@@ -273,10 +273,106 @@ fn codex_effort_arg(agent_upper: &str) -> &'static str {
     }
 }
 
+/// Only the fixed signing keys constructed for this bound seat may re-enter
+/// the child after all ambient/explicit Git controls have been removed.
+#[derive(Default)]
+struct BoundGitSigning {
+    environment: Vec<(String, String)>,
+}
+impl BoundGitSigning {
+    fn from_generated(
+        agent: &str,
+        binding: &WorkspaceExecutionBinding,
+        signing: &seat_signing::SeatSigning,
+    ) -> Result<Self, String> {
+        let actual: Vec<_> = signing
+            .env
+            .iter()
+            .filter(|(key, _)| key.starts_with("GIT_"))
+            .cloned()
+            .collect();
+        if actual.is_empty() {
+            return Ok(Self::default());
+        }
+        let slug = seat_signing::seat_slug(agent).ok_or("bound_signing_seat_invalid")?;
+        let home = PathBuf::from(user_home());
+        let entries = [
+            (
+                "user.name",
+                format!("{} (agent)", agent.to_ascii_uppercase()),
+            ),
+            ("user.email", seat_signing::SIGNING_EMAIL.to_owned()),
+            (
+                "user.signingkey",
+                home.join(".chinwag/signing")
+                    .join(format!("{slug}_ed25519.pub"))
+                    .display()
+                    .to_string(),
+            ),
+            ("gpg.format", "ssh".into()),
+            ("commit.gpgsign", "true".into()),
+            (
+                "gpg.ssh.allowedSignersFile",
+                binding
+                    .execution_root()
+                    .join(".chinwag/allowed_signers")
+                    .display()
+                    .to_string(),
+            ),
+        ];
+        let mut expected = Vec::new();
+        for (index, (key, value)) in entries.into_iter().enumerate() {
+            expected.push((format!("GIT_CONFIG_KEY_{index}"), key.to_owned()));
+            expected.push((format!("GIT_CONFIG_VALUE_{index}"), value));
+        }
+        expected.push(("GIT_CONFIG_COUNT".into(), "6".into()));
+        if actual != expected {
+            return Err("bound_signing_configuration_held".into());
+        }
+        Ok(Self {
+            environment: expected,
+        })
+    }
+}
+
+fn remove_untrusted_git_environment(command: &mut Command, signing: &BoundGitSigning) {
+    let mut names: Vec<_> = std::env::vars_os()
+        .map(|(name, _)| name)
+        .chain(command.get_envs().map(|(name, _)| name.to_os_string()))
+        .filter(|name| name.as_encoded_bytes().starts_with(b"GIT_"))
+        .collect();
+    names.sort();
+    names.dedup();
+    for name in names {
+        command.env_remove(name);
+    }
+    // These fixed exceptions align child Git's config sources with binding
+    // validation; no inherited or caller-selected config file is reintroduced.
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(signing.environment.iter().cloned());
+}
+
+#[cfg(test)]
 fn run_bound_local_command(
     binding: &WorkspaceExecutionBinding,
     authority: &ExecutionAuthority,
     command: &mut Command,
+) -> Result<String, String> {
+    run_bound_local_command_with_signing(binding, authority, command, &BoundGitSigning::default())
+}
+
+fn run_bound_local_command_with_signing(
+    binding: &WorkspaceExecutionBinding,
+    authority: &ExecutionAuthority,
+    command: &mut Command,
+    signing: &BoundGitSigning,
 ) -> Result<String, String> {
     check_binding(binding, authority)?;
     command
@@ -286,14 +382,7 @@ fn run_bound_local_command(
         .env("CHINWAG_STORE_PATH", binding.store_path())
         .env("CHINWAG_STORE_ID", binding.store_id())
         .env("CHINWAG_EXECUTION_BINDING", binding.commitment_id());
-    for name in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-    ] {
-        command.env_remove(name);
-    }
+    remove_untrusted_git_environment(command, signing);
     check_binding(binding, authority)?;
     let output = command
         .output()
@@ -342,6 +431,9 @@ impl crate::hosted_agent::ToolExecutor for BoundHostedExecutor<'_> {
         if let Err(error) = check_binding(self.binding, self.authority) {
             return json!({"ok": false, "error": error, "authority": "HELD"});
         }
+        if call.name == "run_command" {
+            return json!({"ok": false, "error": "bound_hosted_command_adapter_unsupported", "authority": "HELD"});
+        }
         crate::hosted_agent::ToolExecutor::execute(&mut self.inner, call, policy, transport)
     }
 }
@@ -351,10 +443,14 @@ struct EngineRequest<'a> {
     prompt: &'a str,
     custom: Option<&'a CustomAgentMeta>,
     environment: &'a [(String, String)],
+    git_signing: &'a BoundGitSigning,
     identity: &'a crate::agent_instance::DispatchIdentity,
 }
 
 fn require_local_route(agent: &str, custom: Option<&CustomAgentMeta>) -> Result<(), String> {
+    if crate::deepseek_pool::pool_for_agent(agent).is_some() {
+        return Err("pool_execution_binding_unsupported".into());
+    }
     let hint = custom
         .and_then(|meta| meta.engine.as_deref().or(meta.dept.as_deref()))
         .unwrap_or("")
@@ -376,6 +472,7 @@ fn dispatch_to_engine(
         prompt,
         custom,
         environment,
+        git_signing,
         identity,
     } = request;
     require_local_route(agent, *custom)?;
@@ -387,12 +484,6 @@ fn dispatch_to_engine(
         && !mock.trim().is_empty()
     {
         return Ok((mock, "mock-engine"));
-    }
-    if let Some(pool) = crate::deepseek_pool::pool_for_agent(agent)
-        && crate::deepseek_pool::enabled()
-    {
-        check_binding(binding, authority)?;
-        return Ok(crate::deepseek_pool::run(pool, agent, prompt, identity));
     }
 
     let home = user_home();
@@ -498,7 +589,12 @@ fn dispatch_to_engine(
                 .arg(binding.execution_root())
                 .env("PATH", &path_env)
                 .envs(environment.iter().cloned());
-            let text = run_bound_local_command(binding, authority, &mut command)?;
+            let text = run_bound_local_command_with_signing(
+                binding,
+                authority,
+                &mut command,
+                git_signing,
+            )?;
             let text = if engine == "flint-agent" {
                 strip_flint_banner(&text)
             } else {
@@ -533,7 +629,7 @@ fn dispatch_to_engine(
             ])
             .env("PATH", &path_env)
             .envs(environment.iter().cloned());
-        return run_bound_local_command(binding, authority, &mut command)
+        return run_bound_local_command_with_signing(binding, authority, &mut command, git_signing)
             .map(|text| (text, "codex-gpt-6.1-sol"));
     }
     let grok = local_bin.join("grok");
@@ -543,7 +639,7 @@ fn dispatch_to_engine(
             .args(["agent", "--always-approve", &rich_prompt])
             .env("PATH", &path_env)
             .envs(environment.iter().cloned());
-        return run_bound_local_command(binding, authority, &mut command)
+        return run_bound_local_command_with_signing(binding, authority, &mut command, git_signing)
             .map(|text| (text, "grok-4.7-high"));
     }
     if Path::new("/opt/homebrew/bin/gemini").exists() {
@@ -552,7 +648,7 @@ fn dispatch_to_engine(
             .args(["/opt/homebrew/bin/gemini", "-p", &rich_prompt, "--yolo"])
             .env("PATH", &path_env)
             .envs(environment.iter().cloned());
-        return run_bound_local_command(binding, authority, &mut command)
+        return run_bound_local_command_with_signing(binding, authority, &mut command, git_signing)
             .map(|text| (text, "gemini-4-argon-high"));
     }
     if codex.exists() {
@@ -570,7 +666,7 @@ fn dispatch_to_engine(
             ])
             .env("PATH", &path_env)
             .envs(environment.iter().cloned());
-        return run_bound_local_command(binding, authority, &mut command)
+        return run_bound_local_command_with_signing(binding, authority, &mut command, git_signing)
             .map(|text| (text, "codex-gpt-6.1-sol"));
     }
     Err("engine_unavailable_without_replacement".into())
@@ -715,7 +811,12 @@ impl AgentRouteEffects for NativeRouteEffects {
         agent: &str,
         binding: &WorkspaceExecutionBinding,
     ) -> seat_signing::SeatSigning {
-        seat_signing::resolve(agent, Path::new(&user_home()), binding.execution_root())
+        seat_signing::build(
+            agent,
+            Path::new(&user_home()),
+            binding.execution_root(),
+            None,
+        )
     }
     fn engine(
         &mut self,
@@ -844,10 +945,12 @@ fn run_bound_exchange(
     let memory = effects.memory(binding)?;
     check_binding(binding, authority)?;
     let signing = effects.signing(agent, binding);
+    let git_signing = BoundGitSigning::from_generated(agent, binding, &signing)?;
     if let Some(warning) = &signing.warning {
         let _ = writeln!(err, "chinwag: warning: {warning}");
     }
-    let signing_note = signing.is_active().then(|| seat_signing::brief_note(agent));
+    let signing_note =
+        (!git_signing.environment.is_empty()).then(|| seat_signing::brief_note(agent));
     let child = input.identity.child().to_string();
     let sender = input.identity.parent().to_string();
     let prompt = assemble_dispatch_prompt(
@@ -862,7 +965,11 @@ fn run_bound_exchange(
         input.body,
         MAX_PROMPT_BYTES,
     )?;
-    let mut environment = signing.env;
+    let mut environment: Vec<_> = signing
+        .env
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with("GIT_"))
+        .collect();
     environment.extend(input.identity.environment());
     check_binding(binding, authority)?;
     let (reply, engine) = effects.engine(
@@ -873,6 +980,7 @@ fn run_bound_exchange(
             prompt: &prompt,
             custom: input.custom,
             environment: &environment,
+            git_signing: &git_signing,
             identity: input.identity,
         },
     )?;

@@ -1307,8 +1307,12 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 positionals.extend_from_slice(&args[i + 1..]);
                 break;
             }
-            "--repo" if i + 1 < args.len() => {
-                if repo_arg.replace(args[i + 1].clone()).is_some() {
+            "--repo" => {
+                let Some(value) = args.get(i + 1) else {
+                    let _ = writeln!(stderr, "chinwag bus: missing_repository_selector");
+                    return 2;
+                };
+                if repo_arg.replace(value.clone()).is_some() {
                     let _ = writeln!(stderr, "chinwag bus: duplicate_repository_selector");
                     return 2;
                 }
