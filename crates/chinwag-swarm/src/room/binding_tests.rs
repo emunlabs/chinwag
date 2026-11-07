@@ -244,6 +244,21 @@ fn refresh_cadence_is_fixed_per_verified_lease_not_reset_by_reads_or_tickets() {
     assert_eq!(fixture.owner.renewal_wait().unwrap(), Duration::ZERO);
 }
 #[test]
+fn sanitized_posture_is_current_and_cannot_promote_expired_presence() {
+    let mut fixture = Fixture::new();
+    assert_eq!(fixture.gate.posture().unwrap().phase, "PENDING");
+    fixture.bind_peer(3, 1);
+    assert_eq!(fixture.gate.posture().unwrap().phase, "LIVE_AT_OBSERVATION");
+    let view = serde_json::to_string(&fixture.gate.posture().unwrap()).unwrap();
+    for private in ["session", "nonce", "signature", "origin", "address"] {
+        assert!(!view.contains(private));
+    }
+    fixture.clock.wall.store(1060, Ordering::SeqCst);
+    assert_eq!(fixture.gate.posture().unwrap().phase, "HELD");
+    fixture.gate.revoke().unwrap();
+    assert_eq!(fixture.gate.posture().unwrap().phase, "HELD");
+}
+#[test]
 fn verified_remote_join_retains_exact_ordinary_records_and_selected_route() {
     let mut fixture = Fixture::new();
     let ad = fixture.bind_peer(3, 1);

@@ -3,6 +3,144 @@
 
 use super::*;
 
+#[test]
+fn remote_storage_ack_requires_every_original_and_peer_witness() {
+    let temporary = tempfile::tempdir().unwrap();
+    let message = super::tests::native_publication_fixture(temporary.path());
+    let peer = SecretKey::generate().public();
+    for failure in 0..8 {
+        let mut ack = FederationAck {
+            publication: BusAck {
+                ok: true,
+                seq: 7,
+                message_id: message.id.clone(),
+                daemon_endpoint_id: peer.to_string(),
+                transport: "iroh".into(),
+                room: message.room.clone(),
+                subscribers_notified: 0,
+                sig_verified: true,
+            },
+            original_digest_sha256: message.digest_sha256.clone(),
+        };
+        match failure {
+            0 => {}
+            1 => ack.publication.ok = false,
+            2 => ack.publication.seq = 0,
+            3 => ack.publication.message_id.push('x'),
+            4 => ack.publication.room.push('x'),
+            5 => ack.publication.daemon_endpoint_id = SecretKey::generate().public().to_string(),
+            6 => ack.original_digest_sha256 = "00".repeat(32),
+            7 => ack.publication.sig_verified = false,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            valid_remote_publication_ack(peer, &message, &ack),
+            failure == 0
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temporary.path()).unwrap();
+    let original = super::tests::native_publication_fixture(&root);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut output = Vec::new();
+    let daemon = run_daemon_loop(root.clone(), 0, None, true, &mut output, async {
+        let _ = stopped.await;
+    });
+    let exercise = async {
+        let result = async {
+            let daemon = wait_for_owned_daemon(&root).await?;
+            let posture = query_local_daemon(&daemon, &BusFrame::NetworkPosture).await?;
+            assert_eq!(posture["network"]["mode"], "LEGACY_LOCAL_ONLY");
+            assert_eq!(posture["socket_liveness"], "UNKNOWN");
+            let frame = BusFrame::FederationReceipt {
+                original_id: original.id.clone(),
+                original_digest_sha256: original.digest_sha256.clone(),
+            };
+            let absent = query_local_daemon(&daemon, &frame).await?;
+            assert_eq!(absent["federation"]["outcome"], "UNKNOWN");
+            let first = publish_over_iroh_quic(&daemon, SecretKey::generate(), &original).await?;
+            assert!(valid_publication_ack(&daemon, &original, &first));
+            let journal = one_original_journal(&root, &original)?;
+            let before = query_local_daemon(&daemon, &frame).await?;
+            assert_eq!(before["federation"]["outcome"], "PUBLISH_ONLY");
+            let _ = publish_over_iroh_quic(&daemon, SecretKey::generate(), &original).await?;
+            let after = query_local_daemon(&daemon, &frame).await?;
+            assert_eq!(before, after);
+            assert_eq!(one_original_journal(&root, &original)?, journal);
+            let mut invalid_route = daemon.clone();
+            invalid_route.bound_sockets = vec!["192.0.2.1:44330".into()];
+            assert!(query_local_daemon(&invalid_route, &frame).await.is_err());
+            // Bypass the client helper deliberately. A real non-loopback
+            // transport peer must reach the server's refusal boundary too.
+            let local_ip = discover_non_loopback_ipv4()
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "this native transport test requires a non-loopback interface".to_owned()
+                })?;
+            let port = daemon.bound_sockets[0]
+                .parse::<SocketAddr>()
+                .unwrap()
+                .port();
+            let client = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .clear_address_lookup()
+                .bind_addr(format!("{local_ip}:0").parse::<SocketAddr>().unwrap())
+                .map_err(|_| "test bind address refused".to_owned())?
+                .bind()
+                .await
+                .map_err(|_| "test endpoint bind failed".to_owned())?;
+            for query in [frame, BusFrame::NetworkPosture] {
+                let address = EndpointAddr::from_parts(
+                    daemon.endpoint_id.parse().unwrap(),
+                    [TransportAddr::Ip(
+                        format!("{local_ip}:{port}").parse().unwrap(),
+                    )],
+                );
+                let connection =
+                    tokio::time::timeout(Duration::from_secs(5), client.connect(address, BUS_ALPN))
+                        .await
+                        .map_err(|_| "adversarial test connect timeout".to_owned())?
+                        .map_err(|_| "adversarial test must actually connect".to_owned())?;
+                let (mut send, mut recv) = connection
+                    .open_bi()
+                    .await
+                    .map_err(|_| "test stream failed".to_owned())?;
+                send.write_all(&serde_json::to_vec(&query).unwrap())
+                    .await
+                    .map_err(|_| "test frame write failed".to_owned())?;
+                send.finish()
+                    .map_err(|_| "test frame finish failed".to_owned())?;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(MAX_FRAME_BYTES))
+                        .await;
+                let close = tokio::time::timeout(Duration::from_secs(3), connection.closed())
+                    .await
+                    .map_err(|_| "server did not close refused query".to_owned())?;
+                match close {
+                    iroh::endpoint::ConnectionError::ApplicationClosed(close) => {
+                        assert_eq!(close.reason.as_ref(), b"local_query_refused");
+                    }
+                    _ => return Err("server did not explicitly refuse non-loopback query".into()),
+                }
+            }
+            client.close().await;
+            assert_eq!(one_original_journal(&root, &original)?, journal);
+            Ok::<(), String>(())
+        }
+        .await;
+        let _ = shutdown.send(());
+        result
+    };
+    let (exit, result) = tokio::join!(daemon, exercise);
+    assert_eq!(exit, 0);
+    result.unwrap();
+}
+
 async fn wait_for_owned_daemon(root: &Path) -> Result<DaemonState, String> {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

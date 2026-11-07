@@ -2,6 +2,8 @@
 
 The native bus can forward an unchanged signed original from one Chinwag daemon to its configured peer. The local publisher, journal, bounded forwarding queue and remote Iroh connection belong to the same daemon. There is no separate walkie-talkie bridge.
 
+For inter-node operations, follow the [Cloudflare-native messaging SOP](cloudflare-native-messaging-sop.md): publish locally through the selected CF-enabled daemon, correlate remote evidence, and have each original operator verify its deployment transition. The SOP does not imply automatic session renewal or continuous availability.
+
 This implementation does not by itself establish that a Cloudflare relay is deployed or that two hosts occupy separate networks. Those require actual deployment and transport evidence. A WebSocket signaling service or TURN-credential endpoint is not an Iroh relay.
 
 ## Select an ordinary peer and an owned relay
@@ -41,7 +43,7 @@ The ordinary Genesis coordinator contract uses attach/advertise challenges, acto
 
 The daemon-only relay profile additionally requires the backend to verify and receipt a canonical advertisement with zero direct addresses. Legacy nonempty advertisement APIs retain their existing behavior. A backend that does not support this variant remains unsupported for relay-only federation.
 
-The original room owner is revoked by close, drop, receive failure or expiry. Own and peer deadlines retain both their original wall-clock expiry and monotonic deadline, at most 120 seconds. An idle wait cancellation does not extend either deadline. There is no implicit session renewal or reconnect. This is a finite ordinary-room session, not a claim of permanent host continuity. Prompt remote revocation requires an actual backend event or closure; the client cannot infer an event the server never sends.
+The original room owner is revoked by close, drop, receive failure or expiry. Every own and peer advertisement has its own wall-clock expiry and monotonic deadline, at most 120 seconds. The daemon's explicit same-session transport-presence refresh requires a fresh signed next revision and coordinator receipt while the previous own lease is still live. It changes neither peer expiry nor task/model authority. Idle-wait cancellation cannot renew a lease; failed or cancelled refresh fails closed without reconnect or original-message retry. See the [operating procedure](cloudflare-native-messaging-sop.md#expiry-uncertainty-and-recovery) for the exact lifecycle and observation boundaries. This is not a claim of permanent host continuity. Prompt remote revocation requires an actual backend event or closure; the client cannot infer an event the server never sends.
 
 A peer storage receipt grants ordinary transport membership only. It is not a mesh transfer ticket, license, per-message K2 approval, task lease or processing receipt. The experimental mesh/TURN coordinator draft does not replace this ordinary-room protocol.
 

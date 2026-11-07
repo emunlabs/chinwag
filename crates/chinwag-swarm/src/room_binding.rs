@@ -18,6 +18,15 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+#[derive(serde::Serialize)]
+pub struct BindingPosture {
+    pub phase: &'static str,
+    pub own_revision: Option<u64>,
+    pub own_expiry_unix: Option<u64>,
+    pub peer_revision: Option<u64>,
+    pub peer_expiry_unix: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("ordinary daemon room binding unavailable")]
 pub enum BindingError {
@@ -234,6 +243,37 @@ impl DaemonPeerGate {
     }
     pub fn configuration(&self) -> &DaemonPairConfig {
         &self.shared.config
+    }
+    /// Sanitized observation only; no session, nonce, signature or task grant.
+    pub fn posture(&self) -> Result<BindingPosture, BindingError> {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| BindingError::Revoked)?;
+        let (now, instant) = self.shared.clock.now()?;
+        let own_expired = state.own.as_ref().is_some_and(|own| {
+            check_time(own.advertisement.expiry_unix, own.deadline, now, instant).is_err()
+        });
+        let phase = if state.closed || own_expired {
+            "HELD"
+        } else if state.own.is_none() || state.peer.is_none() {
+            "PENDING"
+        } else if check_live(&state, now, instant).is_ok() {
+            "LIVE_AT_OBSERVATION"
+        } else {
+            "HELD"
+        };
+        Ok(BindingPosture {
+            phase,
+            own_revision: state.own.as_ref().map(|own| own.advertisement.revision),
+            own_expiry_unix: state.own.as_ref().map(|own| own.advertisement.expiry_unix),
+            peer_revision: state.peer.as_ref().map(|peer| peer.advertisement.revision),
+            peer_expiry_unix: state
+                .peer
+                .as_ref()
+                .map(|peer| peer.advertisement.expiry_unix),
+        })
     }
     pub fn hooks(&self) -> DaemonPeerHooks {
         DaemonPeerHooks { gate: self.clone() }

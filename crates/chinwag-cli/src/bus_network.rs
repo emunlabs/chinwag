@@ -86,6 +86,26 @@ impl NetworkSelection {
     pub fn peer(&self) -> EndpointId {
         self.peer
     }
+    pub fn configuration_id(&self) -> &str {
+        &self.configuration
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn posture(&self, gate: &DaemonPeerGate) -> serde_json::Value {
+        serde_json::json!({
+            "mode": if self.relay_only { "SELECTED_RELAY_ONLY" } else { "SELECTED_RELAY_OR_DIRECT" },
+            "coordinator_origin": self.origin, "coordinator_pin": self.coordinator.to_string(),
+            "local_endpoint_id": gate.configuration().local_endpoint_id().to_string(),
+            "peer_endpoint_id": self.peer.to_string(), "relay_only": self.relay_only,
+            "selected_relay_origin": self.policy.relay_url().map(ToString::to_string),
+            "configuration_id": self.configuration, "configuration_generation": self.generation,
+            "binding": gate.posture().map(|posture| serde_json::to_value(posture).unwrap_or_default())
+                .unwrap_or_else(|_| serde_json::json!({"phase":"HELD"})),
+            "renewal_policy":"FRESH_SIGNED_OWN_PRESENCE_ON_SAME_SESSION_BEFORE_EXPIRY",
+            "task_deadline_renewal": false, "automatic_original_retry": false,
+        })
+    }
     pub fn policy(&self) -> &RelayPolicy {
         &self.policy
     }

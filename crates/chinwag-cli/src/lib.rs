@@ -31,6 +31,8 @@ pub mod bus_journal;
 #[cfg(target_os = "macos")]
 pub mod bus_network;
 #[cfg(target_os = "macos")]
+pub mod bus_observation;
+#[cfg(target_os = "macos")]
 pub mod bus_state;
 #[cfg(target_os = "macos")]
 pub mod bus_store;
