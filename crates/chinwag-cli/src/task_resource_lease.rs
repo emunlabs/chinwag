@@ -103,6 +103,8 @@ struct LeaseRow {
     generation: u64,
     binding: QualifiedLeaseBinding,
     keys: Vec<ResourceKey>,
+    // Public write indices refer to request order; keys remain acquisition order.
+    request_to_key: Vec<usize>,
     request: LeaseRequest,
     root_binding: FsIdentity,
     gitdir_binding: FsIdentity,
@@ -251,6 +253,95 @@ fn is_directory(s: &ScopeDescriptor) -> bool {
 fn descendant(parent: &str, path: &str) -> bool {
     path.strip_prefix(parent)
         .is_some_and(|tail| tail.starts_with('/'))
+}
+fn valid_request_mapping(row: &LeaseRow, policy: &LeaseStorePolicy) -> bool {
+    if row.request_to_key.len() != row.request.scopes.len()
+        || row.keys.len() != row.request.scopes.len()
+    {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let encoded: Vec<_> = row
+        .keys
+        .iter()
+        .map(|k| serde_json::to_vec(k).unwrap_or_default())
+        .collect();
+    if encoded.windows(2).any(|p| p[0] >= p[1]) {
+        return false;
+    }
+    for (request, index) in row.request.scopes.iter().zip(&row.request_to_key) {
+        if !seen.insert(*index) {
+            return false;
+        }
+        let Some(key) = row.keys.get(*index) else {
+            return false;
+        };
+        let common = FsIdentity {
+            dev: policy.common_git_identity.0,
+            ino: policy.common_git_identity.1,
+        };
+        let valid = match (request, key) {
+            (ResourceScope::File { path }, ResourceKey::Fs { scope, target }) => {
+                scope.path == *path
+                    && scope.kind == ScopeKind::File
+                    && scope.root == row.root_binding
+                    && target == &row.integration_target
+            }
+            (ResourceScope::Directory { path }, ResourceKey::Fs { scope, target }) => {
+                scope.path == *path
+                    && scope.kind == ScopeKind::Directory
+                    && scope.root == row.root_binding
+                    && target == &row.integration_target
+            }
+            (ResourceScope::Symbol { path, symbol }, ResourceKey::Fs { scope, target }) => {
+                scope.path == *path
+                    && scope.kind
+                        == (ScopeKind::Symbol {
+                            symbol: symbol.clone(),
+                        })
+                    && scope.root == row.root_binding
+                    && target == &row.integration_target
+            }
+            (
+                ResourceScope::GitIndex,
+                ResourceKey::Git {
+                    common: c,
+                    scope: GitScope::Index { scope },
+                },
+            ) => {
+                *c == common
+                    && scope.root == row.gitdir_binding
+                    && scope.path == "index"
+                    && scope.kind == ScopeKind::File
+            }
+            (
+                ResourceScope::GitRef { reference },
+                ResourceKey::Git {
+                    common: c,
+                    scope: GitScope::Ref { reference: r },
+                },
+            ) => *c == common && reference == r,
+            (
+                ResourceScope::IntegrationTarget,
+                ResourceKey::Git {
+                    common: c,
+                    scope: GitScope::Ref { reference },
+                },
+            ) => *c == common && reference == &row.integration_target,
+            (
+                ResourceScope::GitCommonDirectory,
+                ResourceKey::Git {
+                    common: c,
+                    scope: GitScope::CommonDirectory,
+                },
+            ) => *c == common,
+            _ => false,
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
 }
 fn conflict(a: &ResourceKey, b: &ResourceKey) -> bool {
     fn physical(key: &ResourceKey) -> Option<&ScopeDescriptor> {
@@ -431,6 +522,7 @@ impl ResourceLeaseStore {
                     || *observed < self.max_time
                     || row.keys.is_empty()
                     || row.keys.len() > MAX_SCOPES
+                    || !valid_request_mapping(row, &self.policy)
                     || row.request.scopes.is_empty()
                     || row.request.scopes.len() > MAX_SCOPES
                     || row.request.ttl_seconds == 0
@@ -569,7 +661,7 @@ impl ResourceLeaseStore {
         &self,
         request: &LeaseRequest,
         p: &ControlledAuthority<'_>,
-    ) -> Result<Vec<ResourceKey>> {
+    ) -> Result<(Vec<ResourceKey>, Vec<usize>)> {
         if request.scopes.is_empty()
             || request.scopes.len() > MAX_SCOPES
             || request.ttl_seconds == 0
@@ -637,11 +729,41 @@ impl ResourceLeaseStore {
             };
             keys.push(key);
         }
-        keys.sort_by_key(|k| serde_json::to_vec(k).unwrap_or_default());
+        let mut indexed: Vec<_> = keys.into_iter().enumerate().collect();
+        indexed.sort_by_key(|(_, k)| serde_json::to_vec(k).unwrap_or_default());
+        let mut request_to_key = vec![0; indexed.len()];
+        let keys: Vec<_> = indexed
+            .into_iter()
+            .enumerate()
+            .map(|(ordered, (request, key))| {
+                request_to_key[request] = ordered;
+                key
+            })
+            .collect();
         if keys.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(LeaseError::Invalid);
         }
-        Ok(keys)
+        Ok((keys, request_to_key))
+    }
+    fn validate_scopes(&self, row: &LeaseRow, p: &ControlledAuthority<'_>) -> Result<()> {
+        for key in &row.keys {
+            let scope = match key {
+                ResourceKey::Fs { scope, .. }
+                | ResourceKey::Git {
+                    scope: GitScope::Index { scope },
+                    ..
+                } => scope,
+                _ => continue,
+            };
+            let root = p.roots.get(&scope.root).ok_or(LeaseError::Identity)?;
+            let current = resolve_scope(root, &scope.path, scope.kind.clone())
+                .map_err(|_| LeaseError::Identity)?;
+            if current.descriptor != *scope {
+                return Err(LeaseError::Identity);
+            }
+            current.verify().map_err(|_| LeaseError::Identity)?;
+        }
+        Ok(())
     }
     fn binding_current(p: &ControlledAuthority<'_>, b: &QualifiedLeaseBinding) -> bool {
         b.scheduler_store == p.scheduler_store
@@ -722,7 +844,7 @@ impl ResourceLeaseStore {
                 Err(LeaseError::ReplayConflict)
             };
         }
-        let keys = self.keys(&request, p)?;
+        let (keys, request_to_key) = self.keys(&request, p)?;
         self.refresh_conflicts(&keys, p)?;
         let expires = now
             .checked_add(request.ttl_seconds)
@@ -736,6 +858,7 @@ impl ResourceLeaseStore {
             generation: self.next_generation + 1,
             binding: b.clone(),
             keys,
+            request_to_key,
             request,
             root_binding: identity(p.root)?,
             gitdir_binding: identity(p.gitdir)?,
@@ -787,6 +910,7 @@ impl ResourceLeaseStore {
         if now >= row.expires {
             return Err(LeaseError::Expired);
         }
+        self.validate_scopes(&row, p)?;
         row.status = LeaseStatus::Committed;
         self.append(Data::Lease {
             row: Box::new(row),
@@ -823,6 +947,7 @@ impl ResourceLeaseStore {
         if now >= row.expires || now >= binding.original_deadline {
             return Err(LeaseError::Expired);
         }
+        self.validate_scopes(row, p)?;
         Ok(now)
     }
     pub(crate) fn invoke(
@@ -920,7 +1045,12 @@ impl ProtectedWriter<'_> {
         self.store
             .validate_cap(self.cap, self.binding, self.authority)?;
         let (profile, _) = self.store.current(self.authority)?;
-        let descriptor = match self.store.rows[&self.cap.id].keys.get(scope_index) {
+        let row = &self.store.rows[&self.cap.id];
+        let descriptor = match row
+            .request_to_key
+            .get(scope_index)
+            .and_then(|index| row.keys.get(*index))
+        {
             Some(ResourceKey::Fs { scope, .. }) if !is_directory(scope) => scope.clone(),
             _ => return Err(LeaseError::Unsupported),
         };
@@ -965,7 +1095,15 @@ impl ProtectedWriter<'_> {
         file.set_len(0)
             .and_then(|()| file.write_all(bytes))
             .and_then(|()| file.sync_all())
-            .map_err(|e| LeaseError::Io(e.to_string()))
+            .map_err(|e| LeaseError::Io(e.to_string()))?;
+        // Observation after the effect reports drift; it cannot roll back the
+        // write or establish an atomic namespace/write primitive.
+        let post = resolve_scope(profile.root, &descriptor.path, descriptor.kind.clone())
+            .map_err(|_| LeaseError::Identity)?;
+        if post.descriptor != descriptor {
+            return Err(LeaseError::Identity);
+        }
+        post.verify().map_err(|_| LeaseError::Identity)
     }
 }
 

@@ -18,6 +18,8 @@ Requests and public DTOs describe desired resources. They do not grant write aut
 
 Acquire the complete scope set deterministically. A conflict cannot leave a partially usable capability or invoke a writer. Persist original preparation and commit identities through recovery. An uncertain commit or invocation retains the original reservation; a new assignment ID is not a recovery mechanism.
 
+Write indices retain the caller's original `LeaseRequest.scopes` order. Acquisition keys are sorted separately, with a persisted, replay-validated mapping between the two. Sorting a reservation must never redirect a payload to another authorized file. Observed physical descriptors are revalidated before commit and again before the executor callback; drift refuses the effect and keeps the original reservation.
+
 The existing `chinwag-claim` maximum TTL remains **120 seconds**. Expiry fences further protected writes; it does not establish that a previous executor or filesystem writer retired. Conflicting work remains held until the admitted retirement protocol proves a safe transfer. A PID observation, cancellation, status change or caller-provided quiescent label supplies no such proof.
 
 Retirement evidence also names the exact current durable lease phase. Invocation and checked-write records advance that phase. A proof made before a later effect cannot release that effect's UNKNOWN reservation, including when the old proof arrives late. The retirement record retains its witnessed predecessor phase for replay validation.
@@ -27,6 +29,8 @@ Retirement evidence also names the exact current durable lease phase. Invocation
 The supported invocation boundary requires the original scheduler capability and a committed lease capability. Before each protected effect, revalidate current authority, generation, owner, original assignment/deadline and filesystem scope. A protected writer must not expose writable handles that escape those checks. Replacement must retain the pathname reservation and old/new alias evidence through any uncertain outcome.
 
 The initial protected mutation is a bounded in-place write to an existing single-link file covered by a file or promoted symbol reservation. Directory and Git scopes can reserve conflicts, but grant no general filesystem or Git command interface. Missing filenames can be reserved, while creation and atomic replacement are unsupported write operations. A changed target or parent holds further writes and retains the original reservation; it is not permission to adopt the new inode. Shared refs and integration-target reservations serialize conservatively because packed refs and case aliases can share backing resources.
+
+The writer also rechecks the observed namespace after a write. A post-write error does not roll back bytes already written, and that observation is not an atomic fence against another same-user writer. The original reservation and retirement requirements still apply.
 
 This is a cooperative checked API boundary, not an OS sandbox. It cannot revoke arbitrary foreign descriptors, prevent unrelated same-process filesystem calls, preempt a kernel write already in progress or prove provider cancellation. Production time, host, storage and retirement adapters require their own supported authority; the controlled fixture profile does not approve them. A public boolean, matching pathname, lease ID or serialized row cannot enable an unsupported production adapter.
 

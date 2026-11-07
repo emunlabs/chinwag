@@ -166,6 +166,123 @@ fn unknown() -> InvocationOutcome {
     }
 }
 
+#[test]
+fn p008_qa_reverse_order_scope_indices_write_the_requested_files() {
+    let f = Fixture::new((11, 22));
+    f.write("z", b"original-z");
+    f.write("a", b"original-a");
+    let a = f.assignment("ordered");
+    let mut store = f.open();
+    let cap = f.acquire(&mut store, &a, request(vec![file("z"), file("a")]));
+    store
+        .invoke(cap, &a, &f.authority(), |writer| {
+            writer.write_file(0, b"bytes-for-z").unwrap();
+            writer.write_file(1, b"bytes-for-a").unwrap();
+            unknown()
+        })
+        .unwrap();
+    assert_eq!(fs::read(f.root.path().join("z")).unwrap(), b"bytes-for-z");
+    assert_eq!(fs::read(f.root.path().join("a")).unwrap(), b"bytes-for-a");
+}
+#[test]
+fn p008_qa_prepared_physical_drift_refuses_commit() {
+    let f = Fixture::new((11, 22));
+    f.write("src/x", b"before");
+    let a = f.assignment("prepare-drift");
+    f.register(&a);
+    let mut store = f.open();
+    let prepared = match store
+        .prepare(&a, request(vec![file("src/x")]), &f.authority())
+        .unwrap()
+    {
+        LeasePreparation::Prepared(p) => p,
+        _ => panic!("new preparation"),
+    };
+    fs::rename(f.root.path().join("src"), f.root.path().join("old-src")).unwrap();
+    f.write("src/x", b"replacement");
+    assert!(matches!(
+        store.commit(prepared, &f.authority()),
+        Err(LeaseError::Identity)
+    ));
+    assert_eq!(store.status("prepare-drift"), Some(LeaseStatus::Prepared));
+    assert_eq!(
+        fs::read(f.root.path().join("src/x")).unwrap(),
+        b"replacement"
+    );
+}
+#[test]
+fn p008_qa_committed_physical_drift_refuses_callback() {
+    let f = Fixture::new((11, 22));
+    f.write("src/x", b"before");
+    let a = f.assignment("commit-drift");
+    let mut store = f.open();
+    let cap = f.acquire(&mut store, &a, request(vec![file("src/x")]));
+    fs::rename(f.root.path().join("src"), f.root.path().join("old-src")).unwrap();
+    f.write("src/x", b"replacement");
+    let calls = Cell::new(0);
+    let result = store.invoke(cap, &a, &f.authority(), |_| {
+        calls.set(calls.get() + 1);
+        unknown()
+    });
+    assert!(matches!(result, Err(LeaseError::Identity)));
+    assert_eq!(calls.get(), 0);
+    assert_eq!(store.status("commit-drift"), Some(LeaseStatus::Committed));
+    assert_eq!(
+        fs::read(f.root.path().join("src/x")).unwrap(),
+        b"replacement"
+    );
+}
+
+#[test]
+fn p008_qa_request_index_mapping_is_required_and_validated_on_replay() {
+    for tamper in 0..4 {
+        let f = Fixture::new((11, 22));
+        f.write("z", b"z");
+        f.write("a", b"a");
+        let a = f.assignment("mapping");
+        f.register(&a);
+        let mut store = f.open();
+        assert!(matches!(
+            store
+                .prepare(&a, request(vec![file("z"), file("a")]), &f.authority())
+                .unwrap(),
+            LeasePreparation::Prepared(_)
+        ));
+        assert_eq!(store.rows["mapping"].request_to_key, vec![1, 0]);
+        drop(store);
+        let path = f.store.path().join("repository-resource-leases-v1.ndjson");
+        if tamper == 0 {
+            assert_eq!(f.open().rows["mapping"].request_to_key, vec![1, 0]);
+            continue;
+        }
+        let original = fs::read_to_string(&path).unwrap();
+        let mut rewritten = String::new();
+        for line in original.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(row) = value["data"]["row"].as_object_mut() {
+                match tamper {
+                    1 => {
+                        row.remove("request_to_key");
+                    }
+                    2 => {
+                        row.insert("request_to_key".into(), serde_json::json!([0, 1]));
+                    }
+                    _ => {
+                        row.insert("request_to_key".into(), serde_json::json!([0, 0]));
+                    }
+                }
+            }
+            rewritten.push_str(&serde_json::to_string(&value).unwrap());
+            rewritten.push('\n');
+        }
+        fs::write(path, rewritten).unwrap();
+        assert!(matches!(
+            ResourceLeaseStore::open(&f.store_fd, f.policy.clone()),
+            Err(LeaseError::Invalid)
+        ));
+    }
+}
+
 fn stale_retirement_must_not_release_later_effect(late_delivery: bool) {
     let f = Fixture::new((11, 22));
     f.write("x", b"original");
