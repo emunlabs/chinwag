@@ -749,10 +749,10 @@ impl QualifiedRecord {
                         return Err(QualifiedError::Mismatch("TaskRef task/key"));
                     }
                 }
-                RecordFamily::Event | RecordFamily::SourceWriteIntent => {
-                    if Some(indexed.task_source_id()) != key.source_id() {
-                        return Err(QualifiedError::Mismatch("TaskRef source/key"));
-                    }
+                RecordFamily::Event | RecordFamily::SourceWriteIntent
+                    if Some(indexed.task_source_id()) != key.source_id() =>
+                {
+                    return Err(QualifiedError::Mismatch("TaskRef source/key"));
                 }
                 _ => {}
             }
@@ -1125,6 +1125,205 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         out.push(DIGITS[(byte & 15) as usize] as char);
     }
     out
+}
+
+const LEGACY_ASSOCIATION_DOMAIN: &[u8] = b"chinwag-inferred-legacy-association-v1\0";
+/// Separate inference attached to untouched historical bytes. It can never
+/// enter an ObservationBatch or represent a signature by the old sender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferredLegacyAssociation {
+    association_id: String,
+    workspace: String,
+    legacy_thread_id: String,
+    legacy_message_id: String,
+    legacy_body_sha: [u8; 32],
+    migration_operation: String,
+    reference: TaskRefEnvelope,
+    pin_payload: Vec<u8>,
+    pin_digest: [u8; 32],
+}
+impl InferredLegacyAssociation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        association_id: String,
+        workspace_id: String,
+        legacy_thread_id: String,
+        legacy_message_id: String,
+        legacy_body_sha: [u8; 32],
+        migration_operation: String,
+        reference: TaskRefEnvelope,
+        pin_payload: Vec<u8>,
+        pin_digest: [u8; 32],
+    ) -> Result<Self> {
+        id(&association_id)?;
+        workspace(&workspace_id)?;
+        id(&legacy_thread_id)?;
+        id(&legacy_message_id)?;
+        id(&migration_operation)?;
+        if reference.indexes().workspace_id() != workspace_id {
+            return Err(QualifiedError::Mismatch("legacy reference workspace"));
+        }
+        if pin_payload.is_empty() {
+            return Err(QualifiedError::Invalid("empty legacy migration pin"));
+        }
+        if pin_payload.len() > MAX_QUALIFIED_PAYLOAD_BYTES {
+            return Err(QualifiedError::OversizeHeld);
+        }
+        if digest(&pin_payload) != pin_digest {
+            return Err(QualifiedError::Mismatch("legacy migration pin digest"));
+        }
+        let association = Self {
+            association_id,
+            workspace: workspace_id,
+            legacy_thread_id,
+            legacy_message_id,
+            legacy_body_sha,
+            migration_operation,
+            reference,
+            pin_payload,
+            pin_digest,
+        };
+        if encode_legacy_association(&association).len() > MAX_QUALIFIED_CHUNK_BYTES {
+            return Err(QualifiedError::OversizeHeld);
+        }
+        Ok(association)
+    }
+    pub fn association_id(&self) -> &str {
+        &self.association_id
+    }
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+    pub fn legacy_thread_id(&self) -> &str {
+        &self.legacy_thread_id
+    }
+    pub fn legacy_message_id(&self) -> &str {
+        &self.legacy_message_id
+    }
+    pub fn legacy_body_sha(&self) -> [u8; 32] {
+        self.legacy_body_sha
+    }
+    pub fn legacy_body_sha256(&self) -> [u8; 32] {
+        self.legacy_body_sha
+    }
+    pub fn migration_operation(&self) -> &str {
+        &self.migration_operation
+    }
+    pub fn reference(&self) -> &TaskRefEnvelope {
+        &self.reference
+    }
+    pub fn pin_payload(&self) -> &[u8] {
+        &self.pin_payload
+    }
+    pub fn pin_digest(&self) -> [u8; 32] {
+        self.pin_digest
+    }
+    pub fn inferred_legacy(&self) -> bool {
+        true
+    }
+    pub fn signed_by_original_sender(&self) -> bool {
+        false
+    }
+    pub fn canonical_digest(&self) -> [u8; 32] {
+        digest(&encode_legacy_association(self))
+    }
+}
+pub(crate) fn legacy_association_identity(association: &InferredLegacyAssociation) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_text(&mut out, association.workspace());
+    put_text(&mut out, association.legacy_thread_id());
+    put_text(&mut out, association.legacy_message_id());
+    put_text(&mut out, association.association_id());
+    out
+}
+pub(crate) fn legacy_association_key(association: &InferredLegacyAssociation) -> String {
+    let mut bytes = legacy_association_identity(association);
+    bytes.extend_from_slice(&association.canonical_digest());
+    hex(&bytes)
+}
+pub(crate) fn encode_legacy_association(a: &InferredLegacyAssociation) -> Vec<u8> {
+    let mut out = LEGACY_ASSOCIATION_DOMAIN.to_vec();
+    put_text(&mut out, &a.association_id);
+    put_text(&mut out, &a.workspace);
+    put_text(&mut out, &a.legacy_thread_id);
+    put_text(&mut out, &a.legacy_message_id);
+    out.extend_from_slice(&a.legacy_body_sha);
+    put_text(&mut out, &a.migration_operation);
+    put_bytes(&mut out, a.reference.canonical());
+    out.extend_from_slice(&a.reference.digest());
+    put_bytes(&mut out, &a.pin_payload);
+    out.extend_from_slice(&a.pin_digest);
+    out.extend_from_slice(&[1, 0]);
+    out
+}
+pub(crate) fn decode_legacy_association(bytes: &[u8]) -> Result<InferredLegacyAssociation> {
+    if bytes.len() > MAX_QUALIFIED_CHUNK_BYTES {
+        return Err(QualifiedError::OversizeHeld);
+    }
+    let mut d = Decoder::new(bytes);
+    if d.take(LEGACY_ASSOCIATION_DOMAIN.len())? != LEGACY_ASSOCIATION_DOMAIN {
+        return Err(QualifiedError::Invalid("legacy association domain"));
+    }
+    let association = d.text(MAX_ID)?;
+    let workspace = d.text(MAX_ID)?;
+    let thread = d.text(MAX_ID)?;
+    let message = d.text(MAX_ID)?;
+    let body_sha = d.hash()?;
+    let operation = d.text(MAX_ID)?;
+    let canonical = d.blob(MAX_TASK_REF_BYTES)?.to_vec();
+    let hash = d.hash()?;
+    let reference =
+        TaskRefEnvelope::try_new(canonical.clone(), hash, TaskRefIndexes::decode(&canonical)?)?;
+    let pin = d.blob(MAX_QUALIFIED_PAYLOAD_BYTES)?.to_vec();
+    let pin_digest = d.hash()?;
+    if d.take(2)? != [1, 0] {
+        return Err(QualifiedError::Invalid("legacy inference flags"));
+    }
+    d.finish()?;
+    let association = InferredLegacyAssociation::try_new(
+        association,
+        workspace,
+        thread,
+        message,
+        body_sha,
+        operation,
+        reference,
+        pin,
+        pin_digest,
+    )?;
+    if encode_legacy_association(&association) != bytes {
+        return Err(QualifiedError::NonCanonical);
+    }
+    Ok(association)
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyAssociationBatch {
+    associations: Vec<InferredLegacyAssociation>,
+    encoded_bytes: usize,
+}
+impl LegacyAssociationBatch {
+    pub fn try_new(associations: Vec<InferredLegacyAssociation>) -> Result<Self> {
+        if associations.len() > MAX_QUALIFIED_BATCH_RECORDS {
+            return Err(QualifiedError::OversizeHeld);
+        }
+        let encoded_bytes = associations
+            .iter()
+            .map(|a| encode_legacy_association(a).len())
+            .sum::<usize>();
+        if encoded_bytes > MAX_QUALIFIED_BATCH_BYTES {
+            return Err(QualifiedError::OversizeHeld);
+        }
+        Ok(Self {
+            associations,
+            encoded_bytes,
+        })
+    }
+    pub fn associations(&self) -> &[InferredLegacyAssociation] {
+        &self.associations
+    }
+    pub fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
 }
 
 #[cfg(test)]

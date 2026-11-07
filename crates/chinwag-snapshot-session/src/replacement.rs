@@ -7,11 +7,13 @@ pub use handoff::HandoffRequest;
 #[cfg(feature = "private-probe")]
 pub use probe_message::SeedMessage;
 mod owner;
+mod qualified;
 use crate::{Error, NativeCounts, Rows, Value, native::Connection};
 #[cfg(feature = "private-probe")]
 pub use domain::SeedThread;
 pub use domain::{AgentDispatchRecord, MemoryPinRecord, PinRequest, ThreadStart, TombstoneRecord};
 pub use owner::WriteOwner;
+pub use qualified::{MigrationRequest, QualifiedMigrationSession, QualifiedWriteSession};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
 
