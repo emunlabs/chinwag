@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::{Read, Write},
+    os::fd::{AsFd, BorrowedFd},
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
 };
@@ -137,14 +138,16 @@ impl Directory {
         Ok(())
     }
 }
-struct Directories {
+/// Retained physical bus-directory observations. Opening this guard does not
+/// load a key and supplies no signing, source or remote-admission authority.
+pub(crate) struct BusDirectory {
     path: PathBuf,
     root: Directory,
     chinwag: Directory,
     bus: Directory,
 }
-impl Directories {
-    fn open(path: &Path) -> Result<Self> {
+impl BusDirectory {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let root = Directory::root(path)?;
         let chinwag = Directory::private_child(&root, ".chinwag")?;
         let bus = Directory::private_child(&chinwag, "bus")?;
@@ -157,11 +160,23 @@ impl Directories {
         directories.verify()?;
         Ok(directories)
     }
-    fn verify(&self) -> Result<()> {
+    pub(crate) fn verify(&self) -> Result<()> {
         self.root.verify(&Directory::root(&self.path)?)?;
         self.chinwag
             .verify(&Directory::below(&self.root, ".chinwag")?)?;
         self.bus.verify(&Directory::below(&self.chinwag, "bus")?)
+    }
+    pub(crate) fn sync(&self) -> Result<()> {
+        self.verify()?;
+        fsync(&self.bus.file).map_err(os)?;
+        fsync(&self.chinwag.file).map_err(os)?;
+        fsync(&self.root.file).map_err(os)?;
+        self.verify()
+    }
+}
+impl AsFd for BusDirectory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.bus.file.as_fd()
     }
 }
 
@@ -209,7 +224,7 @@ impl KeyState {
     }
 }
 
-fn read_existing(directories: &Directories) -> Result<Option<(SecretKey, KeyState)>> {
+fn read_existing(directories: &BusDirectory) -> Result<Option<(SecretKey, KeyState)>> {
     directories.verify()?;
     let fd = match openat(
         &directories.bus.file,
@@ -254,7 +269,7 @@ fn read_existing(directories: &Directories) -> Result<Option<(SecretKey, KeyStat
 /// containment. A successfully loaded old key has unknown entropy provenance;
 /// this function supplies neither enrollment nor production K2 trust.
 pub fn load_or_create_daemon_secret(repo_root: &Path) -> Result<SecretKey> {
-    let directories = Directories::open(repo_root)?;
+    let directories = BusDirectory::open(repo_root)?;
     if let Some((key, _)) = read_existing(&directories)? {
         return Ok(key);
     }

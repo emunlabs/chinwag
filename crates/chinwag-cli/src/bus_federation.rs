@@ -143,6 +143,16 @@ impl Default for IngressLimits {
 pub trait FederationSink {
     type Error;
     fn persist_if_absent(&mut self, message: &BusMessage) -> Result<SinkDisposition, Self::Error>;
+    /// Confirm existing original bytes/sequence without any append or repair.
+    /// A sink without this readback capability cannot turn a cache hit into a
+    /// current persistence ACK. The default safely refuses that promotion.
+    fn verify_exact_replay(
+        &mut self,
+        _message: &BusMessage,
+        _expected_sequence: u64,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkDisposition {
@@ -328,14 +338,20 @@ impl BoundedIngress {
         }
         let content = SignedContent::from_message(message);
         if let Some(known) = self.known.get(&message.id) {
-            return if known.content == content {
-                Ok(IngressOutcome::ExactReplay {
-                    local_sequence: known.local_sequence,
-                })
-            } else {
-                Err(IngressError::ConflictingOriginal)
-            };
+            if known.content != content {
+                return Err(IngressError::ConflictingOriginal);
+            }
+            if !sink
+                .verify_exact_replay(message, known.local_sequence)
+                .map_err(IngressError::PersistenceUnknown)?
+            {
+                return Err(IngressError::InvalidPersistenceReceipt);
+            }
+            return Ok(IngressOutcome::ExactReplay {
+                local_sequence: known.local_sequence,
+            });
         }
+
         let stored = sink
             .persist_if_absent(message)
             .map_err(IngressError::PersistenceUnknown)?;
@@ -416,9 +432,17 @@ mod tests {
     struct Sink {
         calls: usize,
         outcome: Option<Result<SinkDisposition, &'static str>>,
+        replay_check: Option<Result<bool, &'static str>>,
     }
     impl FederationSink for Sink {
         type Error = &'static str;
+        fn verify_exact_replay(
+            &mut self,
+            _: &BusMessage,
+            sequence: u64,
+        ) -> Result<bool, Self::Error> {
+            self.replay_check.take().unwrap_or(Ok(sequence == 7))
+        }
         fn persist_if_absent(&mut self, _: &BusMessage) -> Result<SinkDisposition, Self::Error> {
             self.calls += 1;
             self.outcome
@@ -460,6 +484,22 @@ mod tests {
         assert_eq!(effects.sequences, vec![7]);
         assert_eq!(ingress.retained_entries(), 1);
     }
+
+    #[test]
+    fn cached_replay_requires_current_sink_readback_and_never_repeats_effects() {
+        for check in [Ok(false), Err("journal unavailable")] {
+            let mut ingress = core();
+            let mut sink = Sink::default();
+            let mut effects = Effects::default();
+            let message = message();
+            ingress.ingest(&message, &mut sink, &mut effects).unwrap();
+            sink.replay_check = Some(check);
+            assert!(ingress.ingest(&message, &mut sink, &mut effects).is_err());
+            assert_eq!(sink.calls, 1);
+            assert_eq!(effects.sequences, vec![7]);
+        }
+    }
+
     #[test]
     fn every_signed_field_or_key_witness_conflict_precedes_sink_and_fanout() {
         for field in 0..10 {
@@ -641,6 +681,7 @@ mod tests {
     fn zero_sequence_is_not_a_successful_persistence_receipt() {
         let mut ingress = core();
         let mut sink = Sink {
+            replay_check: None,
             calls: 0,
             outcome: Some(Ok(SinkDisposition::Stored { local_sequence: 0 })),
         };
@@ -656,6 +697,7 @@ mod tests {
     fn sink_failure_has_no_broadcast_or_fanout_and_never_claims_nonpersistence() {
         let mut ingress = core();
         let mut sink = Sink {
+            replay_check: None,
             calls: 0,
             outcome: Some(Err("original persistence uncertain")),
         };
@@ -674,6 +716,7 @@ mod tests {
     fn sink_conflict_after_cache_restart_never_runs_effects() {
         let mut ingress = core();
         let mut sink = Sink {
+            replay_check: None,
             calls: 0,
             outcome: Some(Ok(SinkDisposition::Conflict)),
         };
@@ -689,6 +732,7 @@ mod tests {
     fn persistent_exact_replay_after_cache_restart_never_runs_effects() {
         let mut ingress = core();
         let mut sink = Sink {
+            replay_check: None,
             calls: 0,
             outcome: Some(Ok(SinkDisposition::ExactReplay { local_sequence: 99 })),
         };
