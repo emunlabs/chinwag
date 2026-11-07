@@ -1170,11 +1170,11 @@ async fn run_daemon_loop(
                 }
                 Some(session)
             }
-            Err(_) => {
+            Err(error) => {
                 endpoint.close().await;
                 let _ = writeln!(
                     stdout,
-                    "chinwag bus network HELD: compatible coordinator unavailable"
+                    "chinwag bus network HELD: compatible coordinator unavailable ({error})"
                 );
                 return 1;
             }
