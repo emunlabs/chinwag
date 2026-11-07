@@ -253,7 +253,7 @@ impl NativeJournalSink {
             .checked_add(prepared.line().len() as u64)
             .ok_or(StoreError::Readback)?;
         #[cfg(test)]
-        if matches!(self.cut, Some(TestCut::PartialAppend)) {
+        if matches!(self.cut, Some(TestCut::Partial)) {
             self.cut = None;
             let count = prepared.line().len() / 2;
             let _ = journal.write(&prepared.line()[..count]).map_err(io)?;
@@ -342,6 +342,48 @@ impl NativeJournalSink {
             self.poisoned = true;
         }
         result
+    }
+}
+
+impl FederationSink for NativeJournalSink {
+    type Error = StoreError;
+    fn persist_if_absent(&mut self, message: &BusMessage) -> Result<SinkDisposition> {
+        if self.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        let result = self.persist_once(message);
+        self.complete(result)
+    }
+    fn verify_exact_replay(
+        &mut self,
+        message: &BusMessage,
+        expected_sequence: u64,
+    ) -> Result<bool> {
+        if self.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        let result = self.verify_replay_once(message, expected_sequence);
+        self.complete(result)
+    }
+}
+#[cfg(test)]
+enum TestCut {
+    Partial,
+    Before(Box<dyn FnOnce() + Send>),
+    After(Box<dyn FnOnce() + Send>),
+}
+#[cfg(test)]
+impl NativeJournalSink {
+    fn hook(&mut self, after: bool) {
+        if matches!(
+            (&self.cut, after),
+            (Some(TestCut::Before(_)), false) | (Some(TestCut::After(_)), true)
+        ) {
+            match self.cut.take().unwrap() {
+                TestCut::Before(hook) | TestCut::After(hook) => hook(),
+                TestCut::Partial => unreachable!(),
+            }
+        }
     }
 }
 
@@ -589,7 +631,7 @@ mod tests {
     #[test]
     fn partial_append_is_retained_poisoned_and_never_repaired_or_refanned() {
         let (_temp, root, mut sink) = fixture();
-        sink.cut = Some(TestCut::PartialAppend);
+        sink.cut = Some(TestCut::Partial);
         let mut effects = Effects::default();
         assert_eq!(
             ingress().ingest(&message("original"), &mut sink, &mut effects),
@@ -619,7 +661,7 @@ mod tests {
         let (_temp, root, mut sink) = fixture();
         let path = journal(&root);
         let changed = path.clone();
-        sink.cut = Some(TestCut::AfterAppend(Box::new(move || {
+        sink.cut = Some(TestCut::After(Box::new(move || {
             fs::set_permissions(changed, fs::Permissions::from_mode(0o400)).unwrap();
         })));
         let mut effects = Effects::default();
@@ -650,7 +692,7 @@ mod tests {
         let current = journal(&root);
         let previous = root.join(".chinwag/bus/replaced-journal");
         let (hook_current, hook_previous) = (current.clone(), previous.clone());
-        sink.cut = Some(TestCut::BeforeAppend(Box::new(move || {
+        sink.cut = Some(TestCut::Before(Box::new(move || {
             fs::rename(&hook_current, &hook_previous).unwrap();
             write_private(&hook_current, b"");
         })));
@@ -668,7 +710,7 @@ mod tests {
         let current = journal(&root);
         let previous = root.join(".chinwag/bus/replaced-journal");
         let (hook_current, hook_previous) = (current.clone(), previous.clone());
-        sink.cut = Some(TestCut::AfterAppend(Box::new(move || {
+        sink.cut = Some(TestCut::After(Box::new(move || {
             fs::rename(&hook_current, &hook_previous).unwrap();
             write_private(&hook_current, b"");
         })));
@@ -692,7 +734,7 @@ mod tests {
         let path = root.join(".chinwag/bus");
         let previous = root.join(".chinwag/previous-bus");
         let (hook_path, hook_previous) = (path.clone(), previous.clone());
-        sink.cut = Some(TestCut::BeforeAppend(Box::new(move || {
+        sink.cut = Some(TestCut::Before(Box::new(move || {
             fs::rename(&hook_path, hook_previous).unwrap();
             fs::create_dir(&hook_path).unwrap();
             fs::set_permissions(hook_path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -714,7 +756,7 @@ mod tests {
         let (_temp, root, mut sink) = fixture();
         let lock_path = root.join(".chinwag/bus/bus.lock");
         let moved_lock = root.join(".chinwag/bus/original-locked-file");
-        sink.cut = Some(TestCut::BeforeAppend(Box::new(move || {
+        sink.cut = Some(TestCut::Before(Box::new(move || {
             fs::rename(&lock_path, moved_lock).unwrap();
             write_private(&lock_path, b"");
         })));
@@ -850,46 +892,5 @@ mod tests {
                 .public(),
             public
         );
-    }
-}
-impl FederationSink for NativeJournalSink {
-    type Error = StoreError;
-    fn persist_if_absent(&mut self, message: &BusMessage) -> Result<SinkDisposition> {
-        if self.poisoned {
-            return Err(StoreError::Poisoned);
-        }
-        let result = self.persist_once(message);
-        self.complete(result)
-    }
-    fn verify_exact_replay(
-        &mut self,
-        message: &BusMessage,
-        expected_sequence: u64,
-    ) -> Result<bool> {
-        if self.poisoned {
-            return Err(StoreError::Poisoned);
-        }
-        let result = self.verify_replay_once(message, expected_sequence);
-        self.complete(result)
-    }
-}
-#[cfg(test)]
-enum TestCut {
-    PartialAppend,
-    BeforeAppend(Box<dyn FnOnce() + Send>),
-    AfterAppend(Box<dyn FnOnce() + Send>),
-}
-#[cfg(test)]
-impl NativeJournalSink {
-    fn hook(&mut self, after: bool) {
-        if matches!(
-            (&self.cut, after),
-            (Some(TestCut::BeforeAppend(_)), false) | (Some(TestCut::AfterAppend(_)), true)
-        ) {
-            match self.cut.take().unwrap() {
-                TestCut::BeforeAppend(hook) | TestCut::AfterAppend(hook) => hook(),
-                TestCut::PartialAppend => unreachable!(),
-            }
-        }
     }
 }

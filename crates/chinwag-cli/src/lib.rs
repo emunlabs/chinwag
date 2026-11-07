@@ -19,17 +19,19 @@ mod ui_workbench_run;
 
 pub mod agent_instance;
 #[cfg(target_os = "macos")]
+pub mod board;
+#[cfg(target_os = "macos")]
+pub mod bus_delivery;
+#[cfg(target_os = "macos")]
 pub mod bus_federation;
 #[cfg(target_os = "macos")]
 pub mod bus_identity;
 #[cfg(target_os = "macos")]
 pub mod bus_journal;
 #[cfg(target_os = "macos")]
+pub mod bus_network;
+#[cfg(target_os = "macos")]
 pub mod bus_store;
-#[cfg(target_os = "macos")]
-pub mod board;
-#[cfg(target_os = "macos")]
-pub mod bus_delivery;
 #[cfg(target_os = "macos")]
 pub mod execution_binding;
 #[cfg(target_os = "macos")]
