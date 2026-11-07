@@ -222,6 +222,90 @@ fn renewal_requires_fresh_receipt_nonce_next_revision_and_later_expiry() {
     }
 }
 #[test]
+fn an_earlier_own_nonce_cannot_reenter_after_an_intervening_valid_renewal() {
+    let mut fixture = Fixture::new();
+    fixture.clock.wall.store(1030, Ordering::SeqCst);
+    fixture.clock.millis.store(30_000, Ordering::SeqCst);
+    let first = fixture.owner.prepare_renewal().unwrap();
+    let ad = renewed_own(&fixture, 2, 1090, 11);
+    let receipt = storage_receipt_for_private_test(&fixture.coordinator, &ad);
+    fixture.owner.commit_renewal(first, ad, receipt).unwrap();
+    fixture.clock.wall.store(1040, Ordering::SeqCst);
+    fixture.clock.millis.store(40_000, Ordering::SeqCst);
+    let second = fixture.owner.prepare_renewal().unwrap();
+    // Reuse the INITIAL nonce, not the current predecessor's nonce. Every
+    // other witness is valid and the previous authorization is still live.
+    let replay = renewed_own(&fixture, 3, 1100, 2);
+    let receipt = storage_receipt_for_private_test(&fixture.coordinator, &replay);
+    assert!(matches!(
+        fixture.owner.commit_renewal(second, replay, receipt),
+        Err(BindingError::Replay)
+    ));
+    assert_eq!(
+        fixture.owner.remaining_validity().unwrap(),
+        Duration::from_secs(50)
+    );
+}
+#[test]
+fn own_nonce_history_exhaustion_revokes_without_eviction_or_lease_extension() {
+    let mut fixture = Fixture::new();
+    fixture.bind_peer(3, 1);
+    fixture.clock.wall.store(1030, Ordering::SeqCst);
+    fixture.clock.millis.store(30_000, Ordering::SeqCst);
+    // Private bounded-storage fixture, not live coordinator traffic.
+    fixture
+        .gate
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .own_nonces
+        .extend((1..MAX_OWN_PRESENCE_NONCES - 1).map(|index| format!("{index:064x}")));
+    let ticket = fixture.owner.prepare_renewal().unwrap();
+    let ad = renewed_own(&fixture, 2, 1090, 11);
+    let receipt = storage_receipt_for_private_test(&fixture.coordinator, &ad);
+    fixture.owner.commit_renewal(ticket, ad, receipt).unwrap();
+    assert_eq!(
+        fixture.gate.shared.state.lock().unwrap().own_nonces.len(),
+        MAX_OWN_PRESENCE_NONCES
+    );
+    assert!(fixture.gate.current_peer().is_ok());
+    fixture.clock.wall.store(1040, Ordering::SeqCst);
+    fixture.clock.millis.store(40_000, Ordering::SeqCst);
+    let ticket = fixture.owner.prepare_renewal().unwrap();
+    let ad = renewed_own(&fixture, 3, 1100, 12);
+    let receipt = storage_receipt_for_private_test(&fixture.coordinator, &ad);
+    assert!(matches!(
+        fixture.owner.commit_renewal(ticket, ad, receipt),
+        Err(BindingError::Replay)
+    ));
+    assert!(matches!(
+        fixture.owner.remaining_validity(),
+        Err(BindingError::Revoked)
+    ));
+    assert!(matches!(
+        fixture.gate.current_peer(),
+        Err(BindingError::Revoked)
+    ));
+    assert_eq!(
+        fixture.gate.shared.state.lock().unwrap().own_nonces.len(),
+        MAX_OWN_PRESENCE_NONCES
+    );
+}
+#[test]
+fn failed_receipt_does_not_consume_nonce_history_or_change_own_lease() {
+    let mut fixture = Fixture::new();
+    fixture.clock.wall.store(1030, Ordering::SeqCst);
+    fixture.clock.millis.store(30_000, Ordering::SeqCst);
+    let ticket = fixture.owner.prepare_renewal().unwrap();
+    let ad = renewed_own(&fixture, 2, 1090, 11);
+    let receipt = storage_receipt_for_private_test(&identity(), &ad);
+    assert!(fixture.owner.commit_renewal(ticket, ad, receipt).is_err());
+    let state = fixture.gate.shared.state.lock().unwrap();
+    assert_eq!(state.own_nonces, vec!["02".repeat(32)]);
+    assert_eq!(state.own.as_ref().unwrap().advertisement.revision, 1);
+}
+#[test]
 fn refresh_cadence_is_fixed_per_verified_lease_not_reset_by_reads_or_tickets() {
     let fixture = Fixture::new();
     assert_eq!(

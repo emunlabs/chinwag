@@ -18,6 +18,10 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+// Finite per-owner retention, including the initial own advertisement. Never
+// discard an old nonce while the same session can still authorize renewals.
+const MAX_OWN_PRESENCE_NONCES: usize = 4096;
+
 #[derive(serde::Serialize)]
 pub struct BindingPosture {
     pub phase: &'static str,
@@ -205,6 +209,7 @@ struct State {
     closed: bool,
     generation: u64,
     own: Option<Arc<OwnJoin>>,
+    own_nonces: Vec<String>,
     peer: Option<Arc<PeerJoin>>,
     active_peer_session: Option<String>,
     seen_peer_sessions: BTreeMap<String, u64>,
@@ -234,6 +239,7 @@ impl DaemonPeerGate {
                     closed: false,
                     generation: 0,
                     own: None,
+                    own_nonces: Vec::new(),
                     peer: None,
                     active_peer_session: None,
                     seen_peer_sessions: BTreeMap::new(),
@@ -533,12 +539,6 @@ impl DaemonRoomOwner {
             || advertisement.session_id != old.session_id
             || advertisement.direct_addresses != old.direct_addresses
             || advertisement.expiry_unix <= old.expiry_unix
-            || bool::from(
-                advertisement
-                    .challenge_nonce
-                    .as_bytes()
-                    .ct_eq(old.challenge_nonce.as_bytes()),
-            )
         {
             return Err(BindingError::Replay);
         }
@@ -565,6 +565,26 @@ impl DaemonRoomOwner {
         // A valid new signature cannot resurrect a timed out or revoked owner.
         check_time(old.expiry_unix, ticket.previous.deadline, now, instant)?;
         check_time(advertisement.expiry_unix, expires, now, instant)?;
+        if state.own_nonces.len() >= MAX_OWN_PRESENCE_NONCES {
+            // No eviction/reset/reconnect can silently re-admit an old nonce.
+            state.closed = true;
+            state.own = None;
+            state.peer = None;
+            return Err(BindingError::Replay);
+        }
+        let reused = state
+            .own_nonces
+            .iter()
+            .fold(subtle::Choice::from(0u8), |used, nonce| {
+                used | nonce
+                    .as_bytes()
+                    .ct_eq(advertisement.challenge_nonce.as_bytes())
+            });
+        if bool::from(reused) {
+            return Err(BindingError::Replay);
+        }
+        // Record only after all validation succeeds, under the same commit lock.
+        state.own_nonces.push(advertisement.challenge_nonce.clone());
         state.own = Some(Arc::new(OwnJoin {
             advertisement,
             receipt,
@@ -624,6 +644,7 @@ impl DaemonRoomOwner {
         }
         let (now, instant) = self.gate.shared.clock.now()?;
         check_time(advertisement.expiry_unix, expires, now, instant)?;
+        state.own_nonces.push(advertisement.challenge_nonce.clone());
         state.own = Some(Arc::new(OwnJoin {
             advertisement,
             receipt,
