@@ -8,6 +8,8 @@ mod create_fs;
 pub mod initial_create;
 #[allow(unsafe_code)]
 mod native;
+pub mod qualified;
+mod qualified_schema;
 pub mod replacement;
 mod replacement_fs;
 mod schema;
