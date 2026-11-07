@@ -293,17 +293,29 @@ fn own_nonce_history_exhaustion_revokes_without_eviction_or_lease_extension() {
     );
 }
 #[test]
-fn failed_receipt_does_not_consume_nonce_history_or_change_own_lease() {
+fn failed_receipt_preserves_history_for_a_valid_private_owner_commit() {
     let mut fixture = Fixture::new();
     fixture.clock.wall.store(1030, Ordering::SeqCst);
     fixture.clock.millis.store(30_000, Ordering::SeqCst);
     let ticket = fixture.owner.prepare_renewal().unwrap();
     let ad = renewed_own(&fixture, 2, 1090, 11);
     let receipt = storage_receipt_for_private_test(&identity(), &ad);
-    assert!(fixture.owner.commit_renewal(ticket, ad, receipt).is_err());
+    assert!(matches!(
+        fixture.owner.commit_renewal(ticket, ad.clone(), receipt),
+        Err(BindingError::Receipt)
+    ));
     let state = fixture.gate.shared.state.lock().unwrap();
     assert_eq!(state.own_nonces, vec!["02".repeat(32)]);
     assert_eq!(state.own.as_ref().unwrap().advertisement.revision, 1);
+    drop(state);
+    // Private commit-method coverage only: no HTTP, original-message replay,
+    // or RoomClient retry. The public client closes its owner on any error.
+    let fresh = fixture.owner.prepare_renewal().unwrap();
+    let receipt = storage_receipt_for_private_test(&fixture.coordinator, &ad);
+    fixture.owner.commit_renewal(fresh, ad, receipt).unwrap();
+    let state = fixture.gate.shared.state.lock().unwrap();
+    assert_eq!(state.own_nonces, vec!["02".repeat(32), "0b".repeat(32)]);
+    assert_eq!(state.own.as_ref().unwrap().advertisement.revision, 2);
 }
 #[test]
 fn refresh_cadence_is_fixed_per_verified_lease_not_reset_by_reads_or_tickets() {
