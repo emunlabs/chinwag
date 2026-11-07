@@ -146,6 +146,7 @@ async fn session_with(policy: Arc<RelayPolicy>) -> (RoomSession, mpsc::Sender<St
         proof: Some(proof()),
         attached_session_id: None,
         policy,
+        daemon_owner: None,
     };
     (session, tx, Sender(Some(handle)))
 }
@@ -256,6 +257,111 @@ async fn replay_and_retired_revision_leave_the_published_record() {
     assert!(matches!(error, Error::Replay));
     assert_eq!(published(&session), after_second);
     assert_eq!(session.peer_expiry, second_expiry);
+    drop(tx);
+    sender.finish().await;
+}
+
+// These loopback WebSocket cases exercise the actual receive path, not
+// RoomClient::open or a hosted coordinator/relay deployment.
+fn attach_private_daemon_owner(
+    session: &mut RoomSession,
+) -> (crate::room_binding::DaemonPeerGate, Identity) {
+    use crate::room_binding::{DaemonPairConfig, DaemonPeerGate};
+    let local = Identity::test_identity(rand::random());
+    let coordinator = Identity::test_identity(rand::random());
+    let config = DaemonPairConfig::try_new(
+        "controlled-ws-config".into(),
+        1,
+        local.endpoint_id(),
+        session.other,
+        coordinator.endpoint_id(),
+        session.policy.clone(),
+    )
+    .unwrap();
+    let gate = DaemonPeerGate::pending(config);
+    let mut owner = gate
+        .begin_owner(
+            local.endpoint_id(),
+            coordinator.endpoint_id(),
+            &session.policy,
+            "https://fixture-room.invalid/",
+        )
+        .unwrap();
+    let now = super::now_unix().unwrap();
+    let own = signed(&local, SESSION_A, NONCE_A, 1, 9, now + 60, now);
+    let receipt = room_wire::storage_receipt_for_private_test(&coordinator, &own);
+    owner.bind_own(own, receipt, SESSION_A).unwrap();
+    session.daemon_owner = Some(owner);
+    session.attached_session_id = Some(SESSION_A.into());
+    (gate, coordinator)
+}
+async fn push_with_receipt(
+    tx: &mpsc::Sender<String>,
+    advertisement: &Advertisement,
+    receipt: &room_wire::Receipt,
+) {
+    within(tx.send(serde_json::json!({"kind":"peer_advertisement","advertisement":advertisement,"receipt":receipt}).to_string())).await.unwrap();
+}
+#[tokio::test]
+async fn daemon_receive_without_remote_receipt_stays_observational_and_revokes_gate() {
+    let (mut session, tx, sender) = session_with(own_policy()).await;
+    let (gate, _coordinator) = attach_private_daemon_owner(&mut session);
+    let now = super::now_unix().unwrap();
+    let advert = signed(&identity(), SESSION_B, NONCE_B, 1, 10, now + 60, now);
+    push(&tx, &advert).await;
+    assert!(within(session.receive_daemon_peer()).await.is_err());
+    assert!(published(&session).is_some());
+    assert!(gate.check_peer(session.other).is_err());
+    assert!(session.daemon_owner.is_none());
+    drop(tx);
+    sender.finish().await;
+}
+#[tokio::test]
+async fn cancelling_idle_daemon_receive_does_not_revoke_or_renew_original_owner() {
+    let (mut session, tx, sender) = session_with(own_policy()).await;
+    let (gate, coordinator) = attach_private_daemon_owner(&mut session);
+    let now = super::now_unix().unwrap();
+    let advert = signed(&identity(), SESSION_B, NONCE_B, 1, 10, now + 60, now);
+    let receipt = room_wire::storage_receipt_for_private_test(&coordinator, &advert);
+    push_with_receipt(&tx, &advert, &receipt).await;
+    within(session.receive_daemon_peer()).await.unwrap();
+    let before = session
+        .daemon_owner
+        .as_ref()
+        .unwrap()
+        .remaining_validity()
+        .unwrap();
+    assert!(before > Duration::from_secs(12));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), session.receive_daemon_peer())
+            .await
+            .is_err()
+    );
+    gate.check_peer(session.other).unwrap();
+    let after = session
+        .daemon_owner
+        .as_ref()
+        .unwrap()
+        .remaining_validity()
+        .unwrap();
+    assert!(after <= before);
+    session.close().await;
+    assert!(gate.check_peer(session.other).is_err());
+    drop(tx);
+    sender.finish().await;
+}
+#[tokio::test]
+async fn invalid_remote_receipt_never_populates_daemon_peer_book_or_gate() {
+    let (mut session, tx, sender) = session_with(own_policy()).await;
+    let (gate, coordinator) = attach_private_daemon_owner(&mut session);
+    let now = super::now_unix().unwrap();
+    let advert = signed(&identity(), SESSION_B, NONCE_B, 1, 10, now + 60, now);
+    let mut receipt = room_wire::storage_receipt_for_private_test(&coordinator, &advert);
+    receipt.signature = "00".repeat(64);
+    push_with_receipt(&tx, &advert, &receipt).await;
+    assert!(within(session.receive_daemon_peer()).await.is_err());
+    assert!(published(&session).is_none());
+    assert!(gate.current_peer().is_err());
     drop(tx);
     sender.finish().await;
 }

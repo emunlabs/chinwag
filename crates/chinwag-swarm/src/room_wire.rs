@@ -7,7 +7,19 @@ use iroh::{EndpointId, Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use crate::identity::Identity;
+use crate::relay_policy::RelayPolicy;
+use crate::room_binding::RoomSigner;
+
+/// A room-authentication or advertisement preimage produced only after this
+/// codec's existing strict validation. No public raw-byte constructor exists.
+pub struct ValidatedRoomMessage<'a>(&'a [u8]);
+impl ValidatedRoomMessage<'_> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.0
+    }
+}
 
 const ROOM: &str = "genesis";
 const AUTH_DOMAIN: &str = "chinwag-do-auth/v1";
@@ -99,13 +111,17 @@ pub fn validate_challenge(
 }
 
 /// Format and pin only. The caller has already applied the freshness window.
-pub fn auth_headers(
-    identity: &Identity,
+pub fn auth_headers<S: RoomSigner + ?Sized>(
+    identity: &S,
     ch: &Challenge,
 ) -> Result<Vec<(&'static str, String)>, Error> {
     challenge_shape(ch, identity.endpoint_id())?;
     let message = auth_preimage(ch);
-    let signature = encode_hex(&identity.secret_key().sign(message.as_bytes()).to_bytes());
+    let signature = encode_hex(
+        &identity
+            .sign_validated_room_message(&ValidatedRoomMessage(message.as_bytes()))
+            .to_bytes(),
+    );
     Ok(vec![
         ("chinwag-room", ROOM.to_string()),
         ("chinwag-actor", ch.actor_id.clone()),
@@ -117,12 +133,38 @@ pub fn auth_headers(
     ])
 }
 
-pub fn sign_advertisement(
-    identity: &Identity,
+pub fn sign_advertisement<S: RoomSigner + ?Sized>(
+    identity: &S,
     ch: &Challenge,
     revision: u64,
     addresses: Vec<SocketAddr>,
     now: u64,
+) -> Result<Advertisement, Error> {
+    sign_advertisement_profile(identity, ch, revision, addresses, now, false)
+}
+
+/// Explicit ordinary-daemon profile. Empty direct addresses are meaningful
+/// only with a selected own relay; signing alone does not admit a peer. The
+/// backend must support and sign a matching stored receipt for this profile.
+pub fn sign_daemon_advertisement<S: RoomSigner + ?Sized>(
+    identity: &S,
+    ch: &Challenge,
+    revision: u64,
+    addresses: Vec<SocketAddr>,
+    now: u64,
+    policy: &RelayPolicy,
+) -> Result<Advertisement, Error> {
+    let allow_empty = matches!(policy, RelayPolicy::Own(_));
+    sign_advertisement_profile(identity, ch, revision, addresses, now, allow_empty)
+}
+
+fn sign_advertisement_profile<S: RoomSigner + ?Sized>(
+    identity: &S,
+    ch: &Challenge,
+    revision: u64,
+    addresses: Vec<SocketAddr>,
+    now: u64,
+    allow_empty: bool,
 ) -> Result<Advertisement, Error> {
     validate_challenge(
         ch,
@@ -134,7 +176,7 @@ pub fn sign_advertisement(
     if revision == 0 || revision > MAX_SAFE {
         return Err(Error::Malformed);
     }
-    if addresses.is_empty() || addresses.len() > MAX_ADDRESSES {
+    if (!allow_empty && addresses.is_empty()) || addresses.len() > MAX_ADDRESSES {
         return Err(Error::Malformed);
     }
     let actor = actor_hex(identity.endpoint_id());
@@ -154,8 +196,12 @@ pub fn sign_advertisement(
         direct_addresses,
         signature: String::new(),
     };
-    let (message, _) = advertisement_preimage(&wire)?;
-    wire.signature = encode_hex(&identity.secret_key().sign(message.as_bytes()).to_bytes());
+    let (message, _) = advertisement_preimage_profile(&wire, allow_empty)?;
+    wire.signature = encode_hex(
+        &identity
+            .sign_validated_room_message(&ValidatedRoomMessage(message.as_bytes()))
+            .to_bytes(),
+    );
     Ok(wire)
 }
 
@@ -164,13 +210,31 @@ pub fn verify_advertisement(
     expected: EndpointId,
     now: u64,
 ) -> Result<Vec<SocketAddr>, Error> {
+    verify_advertisement_profile(wire, expected, now, false)
+}
+
+pub fn verify_daemon_advertisement(
+    wire: &Advertisement,
+    expected: EndpointId,
+    now: u64,
+    policy: &RelayPolicy,
+) -> Result<Vec<SocketAddr>, Error> {
+    verify_advertisement_profile(wire, expected, now, matches!(policy, RelayPolicy::Own(_)))
+}
+
+fn verify_advertisement_profile(
+    wire: &Advertisement,
+    expected: EndpointId,
+    now: u64,
+    allow_empty: bool,
+) -> Result<Vec<SocketAddr>, Error> {
     if !is_id(&wire.actor_id) || !is_id(&wire.node_id) {
         return Err(Error::Malformed);
     }
     if wire.actor_id != actor_hex(expected) || wire.node_id != wire.actor_id {
         return Err(Error::Pin);
     }
-    let (message, addresses) = advertisement_preimage(wire)?;
+    let (message, addresses) = advertisement_preimage_profile(wire, allow_empty)?;
     verify_hex(expected, message.as_bytes(), &wire.signature)?;
     check_fresh(wire.expiry_unix, now)?;
     Ok(addresses)
@@ -241,7 +305,14 @@ fn auth_preimage(ch: &Challenge) -> String {
     out
 }
 
+#[cfg(test)]
 fn advertisement_preimage(wire: &Advertisement) -> Result<(String, Vec<SocketAddr>), Error> {
+    advertisement_preimage_profile(wire, false)
+}
+fn advertisement_preimage_profile(
+    wire: &Advertisement,
+    allow_empty: bool,
+) -> Result<(String, Vec<SocketAddr>), Error> {
     if wire.v != 1 || wire.room != ROOM || wire.node_id != wire.actor_id {
         return Err(Error::Malformed);
     }
@@ -259,7 +330,7 @@ fn advertisement_preimage(wire: &Advertisement) -> Result<(String, Vec<SocketAdd
     {
         return Err(Error::Malformed);
     }
-    let addresses = canonical_addresses(&wire.direct_addresses)?;
+    let addresses = canonical_addresses_profile(&wire.direct_addresses, allow_empty)?;
     let mut out = String::new();
     push_line(&mut out, AD_DOMAIN);
     push_line(&mut out, &format!("v={}", wire.v));
@@ -341,8 +412,38 @@ fn wire_hash(wire: &Advertisement) -> Result<String, Error> {
     Ok(encode_hex(&Sha256::digest(bytes)))
 }
 
-fn canonical_addresses(values: &[String]) -> Result<Vec<SocketAddr>, Error> {
-    if values.is_empty() || values.len() > MAX_ADDRESSES {
+#[cfg(test)]
+pub(crate) fn storage_receipt_for_private_test(
+    coordinator: &Identity,
+    wire: &Advertisement,
+) -> Receipt {
+    let mut receipt = Receipt {
+        v: 1,
+        domain: RECEIPT_DOMAIN.into(),
+        actor_id: wire.actor_id.clone(),
+        session_id: wire.session_id.clone(),
+        challenge_nonce: wire.challenge_nonce.clone(),
+        revision: wire.revision,
+        expiry_unix: wire.expiry_unix,
+        advertisement_sha256: wire_hash(wire).unwrap(),
+        coordinator_public_key: actor_hex(coordinator.endpoint_id()),
+        signature: String::new(),
+    };
+    let preimage = receipt_preimage(&receipt).unwrap();
+    receipt.signature = encode_hex(
+        &coordinator
+            .secret_key()
+            .sign(preimage.as_bytes())
+            .to_bytes(),
+    );
+    receipt
+}
+
+fn canonical_addresses_profile(
+    values: &[String],
+    allow_empty: bool,
+) -> Result<Vec<SocketAddr>, Error> {
+    if (!allow_empty && values.is_empty()) || values.len() > MAX_ADDRESSES {
         return Err(Error::Malformed);
     }
     values.iter().map(|value| canonical_socket(value)).collect()

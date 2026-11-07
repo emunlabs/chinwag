@@ -5,6 +5,10 @@ use crate::{
     attempt_journal::{ArmedAttempt, AttemptError, AttemptJournal, AttemptPhase},
     identity::Identity,
     relay_policy::RelayPolicy,
+    room_binding::{
+        BindingError, DaemonPeerGate, DaemonRoomIdentity, DaemonRoomOwner, RoomSigner,
+        VerifiedDaemonPeer,
+    },
     room_wire::{self, Advertisement, Challenge, Receipt},
 };
 use chinwag_claim::{
@@ -25,6 +29,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_websockets::{ClientBuilder, Connector, Limits, MaybeTlsStream, WebSocketStream};
 
@@ -35,6 +40,8 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(transparent)]
+    DaemonBinding(#[from] BindingError),
     #[error(transparent)]
     Attempt(#[from] AttemptError),
     #[error("the room endpoint must be a clean HTTPS origin")]
@@ -444,6 +451,47 @@ impl RoomClient {
         addresses: Vec<SocketAddr>,
         book: MemoryLookup,
     ) -> Result<RoomSession, Error> {
+        self.open_inner(identity, other, addresses, book, None)
+            .await
+    }
+
+    /// Explicit ordinary-daemon entrypoint. The pending gate and selected pins
+    /// alone grant nothing; genuine own and peer stored-record joins are needed.
+    pub async fn open_daemon(
+        &self,
+        identity: &DaemonRoomIdentity,
+        endpoint: &iroh::Endpoint,
+        gate: DaemonPeerGate,
+        addresses: Vec<SocketAddr>,
+        book: MemoryLookup,
+    ) -> Result<RoomSession, Error> {
+        if !bool::from(
+            identity
+                .endpoint_id()
+                .as_bytes()
+                .ct_eq(endpoint.id().as_bytes()),
+        ) {
+            return Err(BindingError::Endpoint.into());
+        }
+        let owner = gate.begin_owner(
+            endpoint.id(),
+            self.coordinator,
+            &self.policy,
+            self.base.as_str(),
+        )?;
+        let other = gate.configuration().peer_endpoint_id();
+        self.open_inner(identity, other, addresses, book, Some(owner))
+            .await
+    }
+
+    async fn open_inner<S: RoomSigner + ?Sized>(
+        &self,
+        identity: &S,
+        other: EndpointId,
+        addresses: Vec<SocketAddr>,
+        book: MemoryLookup,
+        daemon_owner: Option<DaemonRoomOwner>,
+    ) -> Result<RoomSession, Error> {
         if other == identity.endpoint_id()
             || self.coordinator == identity.endpoint_id()
             || self.coordinator == other
@@ -490,6 +538,7 @@ impl RoomClient {
             proof: None,
             attached_session_id: None,
             policy,
+            daemon_owner,
         };
         let store = async {
             let (challenge, challenge_ray) = self
@@ -499,8 +548,18 @@ impl RoomClient {
                     Some(&attach.session_id),
                 )
                 .await?;
-            let wire =
-                room_wire::sign_advertisement(identity, &challenge, 1, addresses, now_unix()?)?;
+            let wire = if session.daemon_owner.is_some() {
+                room_wire::sign_daemon_advertisement(
+                    identity,
+                    &challenge,
+                    1,
+                    addresses,
+                    now_unix()?,
+                    &self.policy,
+                )?
+            } else {
+                room_wire::sign_advertisement(identity, &challenge, 1, addresses, now_unix()?)?
+            };
             let (stored, stored_ray): (Stored, String) = self
                 .post(
                     "/room/genesis/peer",
@@ -513,17 +572,27 @@ impl RoomClient {
             }
             room_wire::verify_receipt(&stored.receipt, self.coordinator, &wire)?;
             tracing::info!(room_phase = "own_advertisement_receipt_verified");
-            Ok(RoomProof {
-                attach_challenge_ray: attach_ray,
-                websocket_ray,
-                advertise_challenge_ray: challenge_ray,
-                stored_ray,
-                coordinator_receipt_verified: true,
-            })
+            Ok((
+                RoomProof {
+                    attach_challenge_ray: attach_ray,
+                    websocket_ray,
+                    advertise_challenge_ray: challenge_ray,
+                    stored_ray,
+                    coordinator_receipt_verified: true,
+                },
+                wire,
+                stored.receipt,
+            ))
         }
         .await;
         match store {
-            Ok(proof) => {
+            Ok((proof, wire, receipt)) => {
+                if let Some(owner) = session.daemon_owner.as_mut()
+                    && let Err(error) = owner.bind_own(wire, receipt, &attach.session_id)
+                {
+                    session.close().await;
+                    return Err(error.into());
+                }
                 session.proof = Some(proof);
                 session.attached_session_id = Some(attach.session_id);
                 Ok(session)
@@ -547,7 +616,11 @@ struct Stored {
 #[serde(tag = "kind", deny_unknown_fields)]
 enum ServerMessage {
     #[serde(rename = "peer_advertisement")]
-    PeerAdvertisement { advertisement: Advertisement },
+    PeerAdvertisement {
+        advertisement: Advertisement,
+        #[serde(default)]
+        receipt: Option<Receipt>,
+    },
 }
 
 #[derive(Default)]
@@ -579,6 +652,7 @@ pub struct RoomSession {
     proof: Option<RoomProof>,
     attached_session_id: Option<String>,
     policy: Arc<RelayPolicy>,
+    daemon_owner: Option<DaemonRoomOwner>,
 }
 impl RoomSession {
     /// The configured other identity. This metadata is not freshness or authority.
@@ -599,14 +673,34 @@ impl RoomSession {
     /// The diagnostic caller keeps this socket alive while using the record,
     /// and closes the session before the advertisement expires.
     pub async fn receive_peer(&mut self) -> Result<(), Error> {
+        let result = self.receive_peer_inner(Duration::from_secs(12)).await;
+        if result.is_err() {
+            drop(self.daemon_owner.take());
+        }
+        result
+    }
+
+    async fn receive_peer_inner(&mut self, wait: Duration) -> Result<(), Error> {
         self.proof()?;
-        let next = timeout(Duration::from_secs(12), self.socket.next())
+        let next = timeout(wait, self.socket.next())
             .await
             .map_err(|_| Error::PhaseTimeout("peer_advertisement"))?;
         let message = next.ok_or(Error::Network)?.map_err(websocket_error)?;
         let text = message.as_text().ok_or(Error::Malformed)?;
-        let ServerMessage::PeerAdvertisement { advertisement } = parse(text.as_bytes())?;
-        let addresses = room_wire::verify_advertisement(&advertisement, self.other, now_unix()?)?;
+        let ServerMessage::PeerAdvertisement {
+            advertisement,
+            receipt,
+        } = parse(text.as_bytes())?;
+        let addresses = if self.daemon_owner.is_some() {
+            room_wire::verify_daemon_advertisement(
+                &advertisement,
+                self.other,
+                now_unix()?,
+                &self.policy,
+            )?
+        } else {
+            room_wire::verify_advertisement(&advertisement, self.other, now_unix()?)?
+        };
         self.revisions
             .accept(&advertisement.session_id, advertisement.revision)?;
         let info = addresses
@@ -615,9 +709,45 @@ impl RoomSession {
                 addr.with_ip_addr(ip)
             });
         let info = self.policy.attach_verified_peer(info, self.other)?;
+        if let Some(owner) = self.daemon_owner.as_mut() {
+            match receipt {
+                Some(receipt) => owner.bind_peer(&advertisement, &receipt)?,
+                None => owner.clear_peer()?,
+            }
+        }
         self.book.set_endpoint_info(info);
         self.peer_expiry = Some(advertisement.expiry_unix);
         Ok(())
+    }
+    pub async fn receive_daemon_peer(&mut self) -> Result<VerifiedDaemonPeer, Error> {
+        let wait = match self
+            .daemon_owner
+            .as_ref()
+            .ok_or(BindingError::Unavailable)
+            .and_then(DaemonRoomOwner::remaining_validity)
+        {
+            Ok(wait) => wait,
+            Err(error) => {
+                drop(self.daemon_owner.take());
+                return Err(error.into());
+            }
+        };
+        let result = match self.receive_peer_inner(wait).await {
+            Ok(()) => self.verified_daemon_peer(),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            drop(self.daemon_owner.take());
+        }
+        result
+    }
+    pub fn verified_daemon_peer(&self) -> Result<VerifiedDaemonPeer, Error> {
+        self.daemon_owner
+            .as_ref()
+            .ok_or(BindingError::Unavailable)?
+            .gate()
+            .current_peer()
+            .map_err(Error::from)
     }
     pub fn require_fresh_peer(&self) -> Result<(), Error> {
         self.proof()?;
@@ -638,6 +768,7 @@ impl RoomSession {
         }
     }
     pub async fn close(&mut self) {
+        drop(self.daemon_owner.take());
         self.proof = None;
         self.attached_session_id = None;
         self.peer_expiry = None;
@@ -654,6 +785,7 @@ mod claim_tests;
 mod policy_tests;
 impl Drop for RoomSession {
     fn drop(&mut self) {
+        drop(self.daemon_owner.take());
         self.book.remove_endpoint_info(self.other);
     }
 }
@@ -663,6 +795,17 @@ mod tests {
     use super::*;
     use crate::relay_policy::RelayPolicy;
     use std::sync::Arc;
+    #[test]
+    fn peer_receipt_is_optional_observational_wire_data_until_verified() {
+        let advertisement = serde_json::json!({"v":1,"room":"genesis","actor_id":"11".repeat(32),"session_id":"22".repeat(32),
+            "challenge_nonce":"33".repeat(32),"revision":1,"expiry_unix":1060,"node_id":"11".repeat(32),"direct_addresses":["127.0.0.1:1234"],"signature":"00".repeat(64)});
+        let body = serde_json::to_vec(
+            &serde_json::json!({"kind":"peer_advertisement","advertisement":advertisement}),
+        )
+        .unwrap();
+        let ServerMessage::PeerAdvertisement { receipt, .. } = parse(&body).unwrap();
+        assert!(receipt.is_none());
+    }
     #[test]
     fn room_clients_initialize_with_explicit_tls_without_a_global_provider() {
         let coordinator: EndpointId =

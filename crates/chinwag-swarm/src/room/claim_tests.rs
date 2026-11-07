@@ -644,6 +644,7 @@ async fn session_id_needs_a_proof_and_close_clears_it() {
         book: MemoryLookup::new(),
         revisions: Revisions::default(),
         policy: Arc::new(RelayPolicy::Disabled),
+        daemon_owner: None,
         peer_expiry: None,
         proof: None,
         attached_session_id: Some("fixture-session".into()),

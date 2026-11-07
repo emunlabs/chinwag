@@ -642,6 +642,7 @@ async fn attach_peer_fixture(service: &mut ClaimService) -> (Endpoint, tokio::ne
         book,
         revisions: super::super::Revisions::default(),
         policy: Arc::new(RelayPolicy::Disabled),
+        daemon_owner: None,
         peer_expiry: None,
         attached_session_id: Some(SESSION.into()),
         proof: Some(super::super::RoomProof {

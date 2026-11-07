@@ -10,6 +10,7 @@ pub mod lan;
 pub mod relay_policy;
 pub mod review;
 pub mod room;
+pub mod room_binding;
 pub mod room_wire;
 pub mod transport;
 
