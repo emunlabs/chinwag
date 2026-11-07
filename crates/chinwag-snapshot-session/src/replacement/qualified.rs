@@ -16,6 +16,7 @@ use crate::{
     },
     qualified_read, qualified_schema,
 };
+use sha2::{Digest, Sha256};
 use std::ffi::CStr;
 
 const MIGRATION_DOMAIN: &[u8] = b"chinwag-qualified-migration-v1\0";
@@ -164,7 +165,7 @@ impl QualifiedMigrationSession {
             .native
             .take()
             .ok_or_else(|| retained("migration_native_missing", false, false))?;
-        let before = legacy_rows(&native);
+        let before = legacy_fingerprints(&native);
         let outcome = (|| {
             let before = before?;
             let decision = run_transaction(
@@ -177,18 +178,17 @@ impl QualifiedMigrationSession {
                         .iter()
                         .chain(request.mirrors.records())
                         .collect();
-                    let ingress = ingest(native, &records)?;
-                    let legacy_count = ingest_legacy(native, request.legacy.associations())?;
+                    let ingress = ingest(native, &records, request.legacy.associations())?;
                     native.query(c"INSERT INTO qualified_migrations(id,workspace_id,operation_id,request_sha256,from_version,to_version,outcome) VALUES(?1,?2,?3,?4,?5,?6,?7)",&[
                     Value::Text(migration_key(&request.workspace,&request.operation)),Value::Text(request.workspace.clone()),Value::Text(request.operation.clone()),
                     Value::Blob(request.digest.to_vec()),Value::Integer(1),Value::Integer(2),Value::Text(MIGRATION_OUTCOME.into()),
                 ])?;
-                    if legacy_rows(native)? != before {
+                    if legacy_fingerprints(native)? != before {
                         return Err(Error::Contract("Migration changed original legacy rows"));
                     }
                     Ok(Decision {
                         dirty: true,
-                        response: serde_json::json!({"classification":MIGRATION_OUTCOME,"observations":ingress.response,"authority":"NONE","legacy":"LegacyUnqualified","legacy_associations":legacy_count}),
+                        response: serde_json::json!({"classification":MIGRATION_OUTCOME,"observations":ingress.response,"authority":"NONE","legacy":"LegacyUnqualified"}),
                         outcome: MIGRATION_OUTCOME,
                         is_error: false,
                     })
@@ -292,15 +292,7 @@ impl QualifiedWriteSession {
         let outcome = (|| {
             let decision = run_transaction(
                 &native,
-                |native| {
-                    let inserted = ingest_legacy(native, batch.associations())?;
-                    Ok(Decision {
-                        dirty: inserted > 0,
-                        response: serde_json::json!({"classification":"LegacyUnqualified","inserted":inserted,"authority":"NONE"}),
-                        outcome: "LEGACY_UNQUALIFIED_ASSOCIATIONS",
-                        is_error: false,
-                    })
-                },
+                |native| ingest(native, &[], batch.associations()),
                 cancelled,
             )?;
             finalize_native(&native, &decision, self.site, self.version, None)
@@ -338,7 +330,8 @@ impl QualifiedWriteSession {
             .ok_or_else(|| retained("qualified_native_missing", false, false))?;
         let outcome = (|| {
             let records: Vec<_> = records.iter().collect();
-            let decision = run_transaction(&native, |native| ingest(native, &records), cancelled)?;
+            let decision =
+                run_transaction(&native, |native| ingest(native, &records, &[]), cancelled)?;
             finalize_native(&native, &decision, self.site, self.version, None)
                 .map(|(version, candidate)| (decision, version, candidate))
         })();
@@ -444,21 +437,74 @@ fn finalize_native(
     Ok((version, candidate))
 }
 
-fn legacy_rows(native: &Connection) -> crate::Result<Vec<Rows>> {
+fn legacy_fingerprints(native: &Connection) -> crate::Result<Vec<([u8; 32], u64)>> {
     const READS: [&CStr; 8] = [
-        c"SELECT * FROM threads ORDER BY id",
-        c"SELECT * FROM messages ORDER BY id",
-        c"SELECT * FROM context_pins ORDER BY id",
-        c"SELECT * FROM agent_claims ORDER BY id",
-        c"SELECT * FROM leases ORDER BY id",
-        c"SELECT * FROM flight_checkpoints ORDER BY id",
-        c"SELECT * FROM tombstones ORDER BY id",
-        c"SELECT * FROM verified_invariants ORDER BY id",
+        c"SELECT rowid,* FROM threads WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1",
+        c"SELECT rowid,* FROM messages WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1",
+        c"SELECT rowid,* FROM context_pins WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1",
+        c"SELECT rowid,* FROM agent_claims WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1",
+        c"SELECT rowid,* FROM leases WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1",
+        c"SELECT rowid,* FROM flight_checkpoints WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1",
+        c"SELECT rowid,* FROM tombstones WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1",
+        c"SELECT rowid,* FROM verified_invariants WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1",
     ];
-    READS
-        .into_iter()
-        .map(|sql| native.query(sql, &[]))
-        .collect()
+    // A valid16MiB image can contain more than the native1MiB query result
+    // allowance. Scan one fixed-schema row at a time with its original rowid,
+    // retaining a typed length-framed fingerprint rather than the whole table.
+    let mut result = Vec::new();
+    for sql in READS {
+        let mut hash = Sha256::new();
+        hash.update(b"chinwag-preserved-legacy-table-v1\0");
+        let mut cursor = None;
+        let mut count = 0_u64;
+        loop {
+            let rows = native.query(sql, &[cursor.map_or(Value::Null, Value::Integer)])?;
+            let row = match rows.as_slice() {
+                [] => break,
+                [row] => row,
+                _ => return Err(Error::Contract("Legacy preservation page count")),
+            };
+            let Some(Value::Integer(rowid)) = row.first() else {
+                return Err(Error::Contract("Legacy preservation rowid type"));
+            };
+            if cursor.is_some_and(|previous| *rowid <= previous) {
+                return Err(Error::Contract(
+                    "Legacy preservation cursor did not advance",
+                ));
+            }
+            count = count
+                .checked_add(1)
+                .filter(|count| *count <= crate::MAX_IMAGE_BYTES as u64)
+                .ok_or(Error::Contract("Legacy preservation row count"))?;
+            hash.update((row.len() as u64).to_be_bytes());
+            for value in row {
+                match value {
+                    Value::Null => hash.update([0]),
+                    Value::Integer(value) => {
+                        hash.update([1]);
+                        hash.update(value.to_be_bytes());
+                    }
+                    Value::Real(value) => {
+                        hash.update([2]);
+                        hash.update(value.get().to_bits().to_be_bytes());
+                    }
+                    Value::Text(value) => {
+                        hash.update([3]);
+                        hash.update((value.len() as u64).to_be_bytes());
+                        hash.update(value.as_bytes());
+                    }
+                    Value::Blob(value) => {
+                        hash.update([4]);
+                        hash.update((value.len() as u64).to_be_bytes());
+                        hash.update(value);
+                    }
+                }
+            }
+            cursor = Some(*rowid);
+        }
+        result.push((hash.finalize().into(), count));
+    }
+    Ok(result)
 }
 fn migration_key(workspace: &str, operation: &str) -> String {
     let mut bytes = Vec::new();
@@ -510,7 +556,11 @@ fn accepted_original(
     Ok(Some(record))
 }
 
-fn ingest(native: &Connection, records: &[&QualifiedRecord]) -> crate::Result<Decision> {
+fn ingest(
+    native: &Connection,
+    records: &[&QualifiedRecord],
+    legacy: &[qualified::InferredLegacyAssociation],
+) -> crate::Result<Decision> {
     let mut conflicts = vec![false; records.len()];
     let mut replay = vec![false; records.len()];
     for (i, record) in records.iter().enumerate() {
@@ -567,7 +617,45 @@ fn ingest(native: &Connection, records: &[&QualifiedRecord]) -> crate::Result<De
             conflicts[i] = true;
         }
     }
-    if conflicts.iter().any(|flag| *flag) {
+    // Preflight every family in the complete request before writing any normal
+    // row. A legacy conflict must also fence normal task observations, and a
+    // task conflict must fence unrelated inferred legacy associations.
+    let mut legacy_conflicts = vec![false; legacy.len()];
+    for (i, association) in legacy.iter().enumerate() {
+        validate_legacy_original(native, association)?;
+        let existing=native.query(c"SELECT association FROM qualified_legacy_associations WHERE workspace_id=?1 AND legacy_thread_id=?2 AND legacy_message_id=?3 AND association_id=?4 ORDER BY id LIMIT 2",&[
+            Value::Text(association.workspace().into()),Value::Text(association.legacy_thread_id().into()),Value::Text(association.legacy_message_id().into()),Value::Text(association.association_id().into()),
+        ])?;
+        for row in &existing {
+            let [Value::Blob(bytes)] = row.as_slice() else {
+                return Err(Error::Contract("Legacy preflight association type"));
+            };
+            let accepted = qualified::decode_legacy_association(bytes)
+                .map_err(|_| Error::Contract("Legacy preflight association bytes"))?;
+            if qualified::legacy_association_identity(&accepted)
+                != qualified::legacy_association_identity(association)
+            {
+                return Err(Error::Contract("Legacy preflight context differs"));
+            }
+            if bytes != &qualified::encode_legacy_association(association) {
+                legacy_conflicts[i] = true;
+            }
+        }
+        if existing.len() > 1 {
+            legacy_conflicts[i] = true;
+        }
+        for j in 0..i {
+            if qualified::legacy_association_identity(&legacy[j])
+                == qualified::legacy_association_identity(association)
+                && qualified::encode_legacy_association(&legacy[j])
+                    != qualified::encode_legacy_association(association)
+            {
+                legacy_conflicts[i] = true;
+                legacy_conflicts[j] = true;
+            }
+        }
+    }
+    if conflicts.iter().any(|flag| *flag) || legacy_conflicts.iter().any(|flag| *flag) {
         let mut dirty = false;
         let mut count = 0;
         for (record, conflict) in records.iter().zip(conflicts) {
@@ -576,9 +664,17 @@ fn ingest(native: &Connection, records: &[&QualifiedRecord]) -> crate::Result<De
                 count += 1;
             }
         }
+        let retained: Vec<_> = legacy
+            .iter()
+            .zip(legacy_conflicts)
+            .filter(|(_, conflict)| *conflict)
+            .map(|(association, _)| association.clone())
+            .collect();
+        let legacy_inserted = ingest_legacy(native, &retained)?;
+        dirty |= legacy_inserted > 0;
         return Ok(Decision {
             dirty,
-            response: serde_json::json!({"classification":"Quarantined","retained_conflicts":count,"normal_insertions":0,"authority":"NONE"}),
+            response: serde_json::json!({"classification":"Quarantined","retained_conflicts":count,"retained_legacy_conflicts":retained.len(),"normal_insertions":0,"authority":"NONE"}),
             outcome: "QUALIFIED_QUARANTINED",
             is_error: false,
         });
@@ -595,10 +691,11 @@ fn ingest(native: &Connection, records: &[&QualifiedRecord]) -> crate::Result<De
         insert_record(native, record)?;
         inserted += 1;
     }
+    let legacy_inserted = ingest_legacy(native, legacy)?;
     Ok(Decision {
-        dirty: inserted > 0,
-        response: serde_json::json!({"classification":if inserted==0 {"ExactReplay"}else {"ObservationsStored"},"inserted":inserted,"authority":"NONE"}),
-        outcome: if inserted == 0 {
+        dirty: inserted + legacy_inserted > 0,
+        response: serde_json::json!({"classification":if inserted+legacy_inserted==0 {"ExactReplay"}else if records.is_empty() {"LegacyUnqualified"}else {"ObservationsStored"},"inserted":inserted,"legacy_inserted":legacy_inserted,"authority":"NONE"}),
+        outcome: if inserted + legacy_inserted == 0 {
             "QUALIFIED_EXACT_REPLAY"
         } else {
             "QUALIFIED_OBSERVATIONS_STORED"
@@ -730,24 +827,7 @@ fn ingest_legacy(
     // This local, explicitly inferred view cannot alter the raw original row
     // or enter the replicated task message/signature family.
     for association in associations {
-        let rows = native.query(
-            c"SELECT body FROM messages WHERE id=?1 AND thread_id=?2",
-            &[
-                Value::Text(association.legacy_message_id().into()),
-                Value::Text(association.legacy_thread_id().into()),
-            ],
-        )?;
-        let [row] = rows.as_slice() else {
-            return Err(Error::Contract(
-                "Legacy association original context missing",
-            ));
-        };
-        let [Value::Text(body)] = row.as_slice() else {
-            return Err(Error::Contract("Legacy association body type"));
-        };
-        if qualified::digest(body.as_bytes()) != association.legacy_body_sha() {
-            return Err(Error::Contract("Legacy association original bytes changed"));
-        }
+        validate_legacy_original(native, association)?;
     }
     let mut inserted = 0;
     for association in associations {
@@ -777,6 +857,30 @@ fn ingest_legacy(
         inserted += 1;
     }
     Ok(inserted)
+}
+fn validate_legacy_original(
+    native: &Connection,
+    association: &qualified::InferredLegacyAssociation,
+) -> crate::Result<()> {
+    let rows = native.query(
+        c"SELECT body FROM messages WHERE id=?1 AND thread_id=?2",
+        &[
+            Value::Text(association.legacy_message_id().into()),
+            Value::Text(association.legacy_thread_id().into()),
+        ],
+    )?;
+    let [row] = rows.as_slice() else {
+        return Err(Error::Contract(
+            "Legacy association original context missing",
+        ));
+    };
+    let [Value::Text(body)] = row.as_slice() else {
+        return Err(Error::Contract("Legacy association body type"));
+    };
+    if qualified::digest(body.as_bytes()) != association.legacy_body_sha() {
+        return Err(Error::Contract("Legacy association original bytes changed"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

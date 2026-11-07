@@ -80,6 +80,9 @@ fn initial() -> ObservationBatch {
     ObservationBatch::try_new(vec![source_record(), projection("projection-observation")]).unwrap()
 }
 fn fixture() -> (PathBuf, Vec<u8>) {
+    fixture_with_bulk_messages(0)
+}
+fn fixture_with_bulk_messages(bulk_messages: usize) -> (PathBuf, Vec<u8>) {
     let root = std::env::current_dir()
         .unwrap()
         .join("target")
@@ -97,6 +100,12 @@ fn fixture() -> (PathBuf, Vec<u8>) {
         crate::transaction(&native,|| {
             native.query(c"INSERT INTO threads(id,repo_id,branch_ref,title,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",&[Value::Text("legacy-thread".into()),Value::Text("legacy-repo".into()),Value::Text("refs/heads/legacy".into()),Value::Text("legacy preserved".into()),Value::Integer(17),Value::Integer(18)])?;
             native.query(c"INSERT INTO messages(id,thread_id,author_key_id,role,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",&[Value::Text("legacy-message".into()),Value::Text("legacy-thread".into()),Value::Text("legacy-author".into()),Value::Text("agent".into()),Value::Text("raw legacy \0 bytes and [DONE] stay unqualified".into()),Value::Integer(19)])?;
+            for index in 0..bulk_messages {
+                native.query(c"INSERT INTO messages(id,thread_id,author_key_id,role,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",&[
+                    Value::Text(format!("bulk-{index:03}")),Value::Text("legacy-thread".into()),Value::Text("legacy-author".into()),Value::Text("agent".into()),
+                    Value::Text(char::from(b'a'+(index%26) as u8).to_string().repeat(65536)),Value::Integer(20+index as i64),
+                ])?;
+            }
             Ok(())
         })?;
         native.export_image_for_original_writer()
@@ -148,6 +157,229 @@ fn append_batch(root: &std::path::Path, records: Vec<QualifiedRecord>) -> super:
     .unwrap()
     .commit(false)
     .unwrap()
+}
+fn association(id: &str, pin: &[u8]) -> qualified::InferredLegacyAssociation {
+    qualified::InferredLegacyAssociation::try_new(
+        id.into(),
+        "workspace".into(),
+        "legacy-thread".into(),
+        "legacy-message".into(),
+        qualified::digest(b"raw legacy \0 bytes and [DONE] stay unqualified"),
+        "original-migration-operation".into(),
+        reference(),
+        pin.to_vec(),
+        qualified::digest(pin),
+    )
+    .unwrap()
+}
+fn request_with_legacy(
+    preimage: &[u8],
+    records: Vec<QualifiedRecord>,
+    legacy: Vec<qualified::InferredLegacyAssociation>,
+) -> MigrationRequest {
+    MigrationRequest::try_new_with_legacy(
+        "workspace".into(),
+        "original-migration-operation".into(),
+        qualified::digest(preimage),
+        ObservationBatch::try_new(records).unwrap(),
+        mirrors(),
+        LegacyAssociationBatch::try_new(legacy).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn p010_audit_large_valid_legacy_image_migrates_without_whole_table_result_cap() {
+    let (root, v1) = fixture_with_bulk_messages(20);
+    assert!(v1.len() > crate::MAX_QUERY_BYTES);
+    assert!(v1.len() < crate::MAX_IMAGE_BYTES);
+    migrate(&root, request(&v1, initial()));
+    let image = fs::read(root.join(".chinwag/state.crdb")).unwrap();
+    let (native, _) = qualified_schema::open_v2_image(&image).unwrap();
+    let result = (|| -> crate::Result<()> {
+        for index in 0..20 {
+            let rows = native.query(
+                c"SELECT body FROM messages WHERE id=?1 AND thread_id=?2",
+                &[
+                    Value::Text(format!("bulk-{index:03}")),
+                    Value::Text("legacy-thread".into()),
+                ],
+            )?;
+            assert_eq!(
+                rows,
+                vec![vec![Value::Text(
+                    char::from(b'a' + (index % 26) as u8)
+                        .to_string()
+                        .repeat(65536)
+                )]]
+            );
+        }
+        Ok(())
+    })();
+    crate::finish(native, result).unwrap();
+}
+
+#[test]
+fn p010_audit_observation_conflict_skips_unrelated_legacy_association_in_same_migration() {
+    let (root, v1) = fixture();
+    let one = message("conflict-one", b"first immutable".to_vec(), b"phase");
+    let two = message("conflict-two", b"changed immutable".to_vec(), b"phase");
+    migrate(
+        &root,
+        request_with_legacy(
+            &v1,
+            vec![one, two],
+            vec![association("unrelated-legacy", b"valid pin")],
+        ),
+    );
+    let session = read(&root);
+    assert_eq!(
+        session
+            .legacy_association(
+                "workspace",
+                "legacy-thread",
+                "legacy-message",
+                "unrelated-legacy"
+            )
+            .unwrap()
+            .classification(),
+        RecordClassification::Missing
+    );
+    session.finish().unwrap();
+}
+
+#[test]
+fn p010_audit_legacy_conflict_skips_normal_observations_in_same_migration() {
+    let (root, v1) = fixture();
+    migrate(
+        &root,
+        request_with_legacy(
+            &v1,
+            initial().records().to_vec(),
+            vec![
+                association("same-legacy", b"first pin"),
+                association("same-legacy", b"changed pin"),
+            ],
+        ),
+    );
+    let session = read(&root);
+    assert_eq!(
+        session
+            .record(
+                RecordFamily::Projection,
+                "workspace",
+                "projection-observation"
+            )
+            .unwrap()
+            .classification(),
+        RecordClassification::Missing
+    );
+    assert_eq!(
+        session
+            .legacy_association(
+                "workspace",
+                "legacy-thread",
+                "legacy-message",
+                "same-legacy"
+            )
+            .unwrap()
+            .classification(),
+        RecordClassification::Quarantined
+    );
+    session.finish().unwrap();
+}
+
+#[test]
+fn p010_audit_existing_legacy_conflict_skips_unrelated_association_in_one_batch() {
+    let (root, v1) = fixture();
+    migrate(
+        &root,
+        request_with_legacy(
+            &v1,
+            initial().records().to_vec(),
+            vec![association("same-legacy", b"first pin")],
+        ),
+    );
+    let result = QualifiedWriteSession::from_v2_owner(
+        WriteOwner::acquire_existing_private_fixture(&root).unwrap(),
+    )
+    .unwrap()
+    .prepare_legacy_associations(
+        LegacyAssociationBatch::try_new(vec![
+            association("same-legacy", b"changed pin"),
+            association("unrelated", b"other pin"),
+        ])
+        .unwrap(),
+        || false,
+    )
+    .unwrap()
+    .commit(false)
+    .unwrap();
+    assert_eq!(result.response()["classification"], "Quarantined");
+    let session = read(&root);
+    assert_eq!(
+        session
+            .legacy_association("workspace", "legacy-thread", "legacy-message", "unrelated")
+            .unwrap()
+            .classification(),
+        RecordClassification::Missing
+    );
+    assert_eq!(
+        session
+            .legacy_association(
+                "workspace",
+                "legacy-thread",
+                "legacy-message",
+                "same-legacy"
+            )
+            .unwrap()
+            .classification(),
+        RecordClassification::Quarantined
+    );
+    session.finish().unwrap();
+}
+
+#[test]
+fn p010_audit_batch_internal_legacy_conflict_skips_unrelated_association() {
+    let (root, v1) = fixture();
+    migrate(&root, request(&v1, initial()));
+    QualifiedWriteSession::from_v2_owner(
+        WriteOwner::acquire_existing_private_fixture(&root).unwrap(),
+    )
+    .unwrap()
+    .prepare_legacy_associations(
+        LegacyAssociationBatch::try_new(vec![
+            association("same-legacy", b"first pin"),
+            association("same-legacy", b"changed pin"),
+            association("unrelated", b"other pin"),
+        ])
+        .unwrap(),
+        || false,
+    )
+    .unwrap()
+    .commit(false)
+    .unwrap();
+    let session = read(&root);
+    assert_eq!(
+        session
+            .legacy_association("workspace", "legacy-thread", "legacy-message", "unrelated")
+            .unwrap()
+            .classification(),
+        RecordClassification::Missing
+    );
+    assert_eq!(
+        session
+            .legacy_association(
+                "workspace",
+                "legacy-thread",
+                "legacy-message",
+                "same-legacy"
+            )
+            .unwrap()
+            .classification(),
+        RecordClassification::Quarantined
+    );
+    session.finish().unwrap();
 }
 
 #[test]

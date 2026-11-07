@@ -18,6 +18,9 @@ The existing original host journals retain authority. Before calling a
 projection current, the CLI checks the enrolled source, exact canonical file,
 complete reference and original writer journal. Neither a cached status nor
 the largest timestamp or database revision substitutes for those checks.
+Public CLI authority constructors return Unsupported. Positive migration and
+current-projection paths are confined to private controlled test fixtures;
+their results cannot authorize production effects.
 
 ## Complete records and conflicts
 
@@ -58,6 +61,12 @@ changes the isolated native image in one transaction, preserves the site and
 legacy content, checks the exact V2 schema, and checked-closes native ownership
 before the existing staging, intent, rename and fsync path. Schema version,
 source revision and CRSQL database version are distinct counters.
+Legacy preservation scans bounded rows, so a valid table larger than one
+native query result remains migratable. Conflict preflight covers the whole
+request, including inferred legacy associations: a conflicting variant cannot
+carry unrelated normal observations into the same transaction.
+An exact historical migration receipt can be looked up in an already-held V2
+read snapshot without another write owner, migration transaction or DDL.
 
 Interrupted operations retain their original artifacts. A refused reopen is a
 held outcome, not evidence of successful recovery. No caller may clear markers,
