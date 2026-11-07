@@ -303,6 +303,23 @@ mod tests {
         assert!(no_temp(&root));
     }
     #[test]
+    fn still_dangling_state_symlink_refuses_without_creating_target_or_temp() {
+        let (_temp, root) = fixture();
+        symlink("daemon_secret.key", state(&root)).unwrap();
+        assert_eq!(
+            write_daemon_state_bytes(&root, b"diagnostic state"),
+            Err(StateError::UnsafeState)
+        );
+        assert!(!key(&root).exists());
+        assert!(
+            fs::symlink_metadata(state(&root))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(no_temp(&root));
+    }
+    #[test]
     fn dangling_state_link_created_before_key_creation_never_clobbers_owned_key() {
         let (_temp, root) = fixture();
         symlink("daemon_secret.key", state(&root)).unwrap();
