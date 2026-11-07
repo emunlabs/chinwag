@@ -1194,11 +1194,11 @@ impl NativePublication {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RoomOwnerFailure {
     PresenceExpired,
-    RenewalUnknown,
-    SessionEnded,
+    RenewalUnknown(String),
+    ReceiveFailed(String),
 }
 
 type RoomOwnerFuture<'a> =
@@ -1219,16 +1219,18 @@ async fn drive_daemon_room(
         };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {
-                if client.renew_daemon_presence(identity, session).await.is_err() {
-                    return RoomOwnerFailure::RenewalUnknown;
+                if let Err(error) = client.renew_daemon_presence(identity, session).await {
+                    return RoomOwnerFailure::RenewalUnknown(error.to_string());
                 }
                 // Only a bounded diagnostic notification; gate state, not this
                 // notification, remains authoritative for every publication.
                 let _ = renewed.try_send(());
             }
             update = session.receive_daemon_peer() => {
-                if update.is_err() {
-                    return RoomOwnerFailure::SessionEnded;
+                if let Err(error) = update {
+                    // Room errors expose fixed, sanitized Display messages.
+                    // Keep that reason without logging Debug/source chains.
+                    return RoomOwnerFailure::ReceiveFailed(error.to_string());
                 }
             }
         }
@@ -1522,12 +1524,12 @@ async fn run_daemon_loop_inner(
             }
             failure = &mut room_driver => {
                 let message = match failure {
-                    RoomOwnerFailure::PresenceExpired => "chinwag bus network HELD: transport presence expired",
-                    RoomOwnerFailure::RenewalUnknown => "chinwag bus network HELD: transport presence renewal unknown or refused; no retry",
-                    RoomOwnerFailure::SessionEnded => "chinwag bus network HELD: original room session ended",
+                    RoomOwnerFailure::PresenceExpired => "chinwag bus network HELD: transport presence expired".to_owned(),
+                    RoomOwnerFailure::RenewalUnknown(reason) => format!("chinwag bus network HELD: transport presence renewal unknown or refused: {reason}; no retry"),
+                    RoomOwnerFailure::ReceiveFailed(reason) => format!("chinwag bus network HELD: original room receive failed: {reason}; no retry"),
                 };
                 let _ = writeln!(stdout, "{message}");
-                if failure != RoomOwnerFailure::SessionEnded { exit_code = 1; }
+                exit_code = 1;
                 break;
             }
             Some(()) = renewed_rx.recv() => {

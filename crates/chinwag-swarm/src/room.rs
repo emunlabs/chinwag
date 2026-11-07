@@ -66,6 +66,8 @@ pub enum Error {
     Http(&'static str),
     #[error("the room WebSocket operation failed ({0})")]
     WebSocket(&'static str),
+    #[error("the room WebSocket closed with code {0}")]
+    WebSocketClosed(u16),
     #[error("the room WebSocket upgrade returned HTTP {0}")]
     Upgrade(u16),
     #[error("the room TLS configuration could not be initialized")]
@@ -135,6 +137,27 @@ pub fn now_unix() -> Result<u64, Error> {
         .duration_since(UNIX_EPOCH)
         .map(|x| x.as_secs())
         .map_err(|_| Error::Malformed)
+}
+
+fn peer_message_text(message: &tokio_websockets::Message) -> Result<&str, Error> {
+    if let Some(text) = message.as_text() {
+        return Ok(text);
+    }
+    if message.is_close() {
+        return Err(match message.as_close() {
+            Some((code, _)) if code != tokio_websockets::CloseCode::NO_STATUS_RECEIVED => {
+                Error::WebSocketClosed(code.into())
+            }
+            _ => Error::WebSocket("peer_close_without_status"),
+        });
+    }
+    Err(Error::WebSocket(if message.is_ping() {
+        "peer_ping_frame"
+    } else if message.is_pong() {
+        "peer_pong_frame"
+    } else {
+        "peer_non_text_frame"
+    }))
 }
 
 fn clean_origin(value: &str) -> Result<Url, Error> {
@@ -813,7 +836,7 @@ impl RoomSession {
             .await
             .map_err(|_| Error::PhaseTimeout("peer_advertisement"))?;
         let message = next.ok_or(Error::Network)?.map_err(websocket_error)?;
-        let text = message.as_text().ok_or(Error::Malformed)?;
+        let text = peer_message_text(&message)?;
         let ServerMessage::PeerAdvertisement {
             advertisement,
             receipt,
@@ -922,6 +945,41 @@ mod tests {
     use super::*;
     use crate::relay_policy::RelayPolicy;
     use std::sync::Arc;
+
+    #[test]
+    fn peer_frame_diagnostics_exclude_payload_and_close_reason() {
+        use tokio_websockets::{CloseCode, Message};
+        let private = "PRIVATE_FRAME_TEST_MARKER";
+        for (message, expected) in [
+            (
+                Message::close(Some(CloseCode::NORMAL_CLOSURE), private),
+                "the room WebSocket closed with code 1000",
+            ),
+            (
+                Message::close(None, ""),
+                "the room WebSocket operation failed (peer_close_without_status)",
+            ),
+            (
+                Message::ping(private.as_bytes().to_vec()),
+                "the room WebSocket operation failed (peer_ping_frame)",
+            ),
+            (
+                Message::pong(private.as_bytes().to_vec()),
+                "the room WebSocket operation failed (peer_pong_frame)",
+            ),
+            (
+                Message::binary(private.as_bytes().to_vec()),
+                "the room WebSocket operation failed (peer_non_text_frame)",
+            ),
+        ] {
+            let diagnostic = peer_message_text(&message).unwrap_err().to_string();
+            assert_eq!(diagnostic, expected);
+            assert!(!diagnostic.contains(private));
+        }
+        let text = Message::text(private);
+        assert_eq!(peer_message_text(&text).unwrap(), private);
+    }
+
     #[test]
     fn cancelled_presence_renewal_revokes_gate_but_committed_guard_does_not() {
         use futures_util::FutureExt;
