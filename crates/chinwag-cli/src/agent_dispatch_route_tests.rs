@@ -48,13 +48,14 @@ impl AgentRouteEffects for Effects<'_> {
         &mut self,
         binding: &WorkspaceExecutionBinding,
         authority: &ExecutionAuthority,
-        _: &EngineRequest<'_>,
+        request: &EngineRequest<'_>,
     ) -> Result<(String, &'static str), String> {
         self.events.push("engine");
         let reply = match self.child {
             Some(child) => run_bound_local_command(
                 binding,
                 authority,
+                request.identity,
                 Command::new(child)
                     .arg("--cwd")
                     .arg(binding.execution_root()),
@@ -109,6 +110,13 @@ fn fake_child() -> (TempDir, PathBuf) {
         println!("git_ok={}\ngit_root={}", git.status.success(), String::from_utf8_lossy(&git.stdout).trim());
         let name = std::process::Command::new("/usr/bin/git").args(["config", "--get", "user.name"]).output().unwrap();
         println!("git_user_name={}\ngit_count={}", String::from_utf8_lossy(&name.stdout).trim(), std::env::var("GIT_CONFIG_COUNT").unwrap_or_default());
+        let mut names: Vec<_> = std::env::vars_os().filter_map(|(name, _)|
+            name.as_encoded_bytes().starts_with(b"CHINWAG_").then(|| name.to_string_lossy().into_owned())).collect();
+        names.sort();
+        println!("chinwag_names={}", names.join(","));
+        for name in ["CHINWAG_ACTOR", "CHINWAG_INSTANCE_ID", "CHINWAG_CALLER", "CHINWAG_PARENT_INSTANCE", "CHINWAG_AGENT", "CHINWAG_REPO_ROOT", "CHINWAG_STORE_PATH", "CHINWAG_STORE_ID", "CHINWAG_EXECUTION_BINDING"] {
+            println!("{}={}", name, std::env::var(name).unwrap_or_default());
+        }
     }"#).unwrap();
     let output = Command::new(chinwag_test_fixtures::rustc())
         .arg(&source)
@@ -378,7 +386,7 @@ fn p009_another_sealed_native_owner_cannot_waive_this_bindings_marker_gate() {
     );
 }
 
-const BOUND_ENV_CHILD: &str = "CHINWAG_P009_BOUND_ENV_CHILD";
+const BOUND_ENV_CHILD: &str = "P009_PRIVATE_BOUND_ENV_CHILD";
 const BOUND_ENV_CHILD_TEST: &str = "agent_dispatch_run::execution_binding_route_tests::p009_agent_bound_environment_subprocess_child";
 
 fn hostile_git_environment(root: &Path) -> Vec<(String, String)> {
@@ -424,6 +432,77 @@ fn hostile_git_environment(root: &Path) -> Vec<(String, String)> {
             "must not inherit unknown Git controls".into(),
         ),
     ]
+}
+
+fn hostile_chinwag_environment(root: &Path) -> Vec<(String, String)> {
+    vec![
+        (
+            "CHINWAG_PROVIDERS_CONFIG".into(),
+            root.join("untrusted-provider.json").display().to_string(),
+        ),
+        (
+            "CHINWAG_FLEET_AGENTS_DIR".into(),
+            root.join("untrusted-personas").display().to_string(),
+        ),
+        (
+            "CHINWAG_FUTURE_CONTROL".into(),
+            "untrusted future control".into(),
+        ),
+        ("CHINWAG_AGENT".into(), "FORGED-SEAT".into()),
+        ("CHINWAG_ACTOR".into(), "OTHER#forged-child".into()),
+        ("CHINWAG_INSTANCE_ID".into(), "forged-child".into()),
+        ("CHINWAG_CALLER".into(), "OTHER#forged-parent".into()),
+        (
+            "CHINWAG_PARENT_INSTANCE".into(),
+            "OTHER#forged-parent".into(),
+        ),
+        ("CHINWAG_REPO_ROOT".into(), root.display().to_string()),
+        (
+            "CHINWAG_STORE_PATH".into(),
+            root.join("wrong-store").display().to_string(),
+        ),
+        ("CHINWAG_STORE_ID".into(), "forged-store".into()),
+        ("CHINWAG_EXECUTION_BINDING".into(), "forged-binding".into()),
+    ]
+}
+
+#[test]
+fn p009_agent_launch_rebuilds_application_context_with_and_without_signing() {
+    let foreign = BindingFixture::new();
+    let hostile: Vec<_> = hostile_git_environment(foreign.root())
+        .into_iter()
+        .chain(hostile_chinwag_environment(foreign.root()))
+        .collect();
+    let mut failures = Vec::new();
+    for signing in ["active", "inactive"] {
+        let home = TempDir::new().unwrap();
+        if signing == "active" {
+            let keys = home.path().join(".chinwag/signing");
+            fs::create_dir_all(&keys).unwrap();
+            fs::write(keys.join("rust_ed25519.pub"), b"fixture public placeholder").unwrap();
+            fs::write(keys.join("rust_ed25519"), b"fixture private placeholder").unwrap();
+        }
+        for source in ["inherited", "explicit"] {
+            let mode = format!("app-{source}-{signing}");
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", BOUND_ENV_CHILD_TEST, "--nocapture"])
+                .env(BOUND_ENV_CHILD, &mode)
+                .env("HOME", home.path());
+            if source == "inherited" {
+                child.envs(hostile.iter().cloned());
+            }
+            let output = child.output().unwrap();
+            if !output.status.success() {
+                failures.push(format!(
+                    "{mode}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -585,18 +664,25 @@ fn p009_agent_bound_environment_subprocess_child() {
     let authority = fixture.authority();
     let foreign = BindingFixture::new();
     let mut command = Command::new(worker);
+    let who = identity("RUST");
     command.arg("--cwd").arg(binding.execution_root());
-    if mode == "explicit" || mode == "trusted" {
+    if mode == "explicit" || mode == "trusted" || mode.starts_with("app-explicit-") {
         command.envs(hostile_git_environment(foreign.root()));
+        if mode.starts_with("app-") {
+            command.envs(hostile_chinwag_environment(foreign.root()));
+        }
     }
-    let reply = if mode == "trusted" {
+    let reply = if mode == "trusted" || mode.starts_with("app-") {
         let signing = seat_signing::build(
             "RUST",
             &PathBuf::from(user_home()),
             binding.execution_root(),
             None,
         );
-        assert!(signing.is_active());
+        assert_eq!(
+            signing.is_active(),
+            mode == "trusted" || mode.ends_with("-active")
+        );
         let trusted = BoundGitSigning::from_generated("RUST", &binding, &signing).unwrap();
         let mut changed = seat_signing::SeatSigning {
             env: signing.env.clone(),
@@ -607,9 +693,10 @@ fn p009_agent_bound_environment_subprocess_child() {
             "'core.worktree=untrusted'".into(),
         ));
         assert!(BoundGitSigning::from_generated("RUST", &binding, &changed).is_err());
-        run_bound_local_command_with_signing(&binding, &authority, &mut command, &trusted).unwrap()
+        run_bound_local_command_with_signing(&binding, &authority, &who, &mut command, &trusted)
+            .unwrap()
     } else {
-        run_bound_local_command(&binding, &authority, &mut command).unwrap()
+        run_bound_local_command(&binding, &authority, &who, &mut command).unwrap()
     };
     assert!(reply.contains("git_ok=true"), "{reply}");
     assert!(
@@ -624,7 +711,7 @@ fn p009_agent_bound_environment_subprocess_child() {
         .split(',')
         .filter(|name| {
             !name.is_empty()
-                && !(mode == "trusted"
+                && !((mode == "trusted" || mode.ends_with("-active"))
                     && (*name == "GIT_CONFIG_COUNT"
                         || name
                             .strip_prefix("GIT_CONFIG_KEY_")
@@ -647,8 +734,74 @@ fn p009_agent_bound_environment_subprocess_child() {
         unexpected.is_empty(),
         "untrusted Git controls reached actual worker: {unexpected:?}"
     );
-    if mode == "trusted" {
+    if mode == "trusted" || mode.ends_with("-active") {
         assert!(reply.contains("git_count=6"), "{reply}");
         assert!(reply.contains("git_user_name=RUST (agent)"), "{reply}");
+    }
+    if mode.starts_with("app-") {
+        let names = reply
+            .lines()
+            .find_map(|line| line.strip_prefix("chinwag_names="))
+            .unwrap();
+        let unexpected: Vec<_> = names
+            .split(',')
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "CHINWAG_ACTOR"
+                        | "CHINWAG_INSTANCE_ID"
+                        | "CHINWAG_CALLER"
+                        | "CHINWAG_PARENT_INSTANCE"
+                        | "CHINWAG_AGENT"
+                        | "CHINWAG_REPO_ROOT"
+                        | "CHINWAG_STORE_PATH"
+                        | "CHINWAG_STORE_ID"
+                        | "CHINWAG_EXECUTION_BINDING"
+                )
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "untrusted application controls reached actual worker: {unexpected:?}"
+        );
+        for (name, expected) in [
+            ("CHINWAG_ACTOR", "RUST#p009-child"),
+            ("CHINWAG_INSTANCE_ID", "p009-child"),
+            ("CHINWAG_CALLER", "WORKHORSE#p009-parent"),
+            ("CHINWAG_PARENT_INSTANCE", "WORKHORSE#p009-parent"),
+            ("CHINWAG_AGENT", "RUST"),
+        ] {
+            assert!(
+                reply
+                    .lines()
+                    .any(|line| line == format!("{name}={expected}")),
+                "{reply}"
+            );
+        }
+        assert!(
+            reply.contains(&format!(
+                "CHINWAG_REPO_ROOT={}",
+                binding.execution_root().display()
+            )),
+            "{reply}"
+        );
+        assert!(
+            reply.contains(&format!(
+                "CHINWAG_STORE_PATH={}",
+                binding.store_path().display()
+            )),
+            "{reply}"
+        );
+        assert!(
+            reply.contains(&format!("CHINWAG_STORE_ID={}", binding.store_id())),
+            "{reply}"
+        );
+        assert!(
+            reply.contains(&format!(
+                "CHINWAG_EXECUTION_BINDING={}",
+                binding.commitment_id()
+            )),
+            "{reply}"
+        );
     }
 }

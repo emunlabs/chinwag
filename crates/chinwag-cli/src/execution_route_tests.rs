@@ -10,10 +10,10 @@ use std::{fs, path::Path, process::Command};
 #[test]
 #[ignore = "Owned Rust fake child; invoked only by its controlled parent test"]
 fn p009_private_fake_worker_child() {
-    let Some(output) = std::env::var_os("CHINWAG_P009_PRIVATE_PROBE_OUT") else {
+    let Some(output) = std::env::var_os("P009_PRIVATE_PROBE_OUT") else {
         return;
     };
-    if std::env::var_os("CHINWAG_P009_PRIVATE_MISSING_REPO").is_some() {
+    if std::env::var_os("P009_PRIVATE_MISSING_REPO").is_some() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit = crate::bus_run::run_bus_cli(
@@ -48,7 +48,7 @@ fn p009_trailing_bus_repo_refuses_before_valid_environment_or_cwd_fallback() {
     let child = probe_command(&output)
         .current_dir(fixture.root())
         .env("CHINWAG_REPO_ROOT", fixture.root())
-        .env("CHINWAG_P009_PRIVATE_MISSING_REPO", "1")
+        .env("P009_PRIVATE_MISSING_REPO", "1")
         .output()
         .unwrap();
     assert!(child.status.success());
@@ -68,7 +68,7 @@ fn probe_command(output: &Path) -> Command {
             "--ignored",
             "--nocapture",
         ])
-        .env("CHINWAG_P009_PRIVATE_PROBE_OUT", output);
+        .env("P009_PRIVATE_PROBE_OUT", output);
     command
 }
 

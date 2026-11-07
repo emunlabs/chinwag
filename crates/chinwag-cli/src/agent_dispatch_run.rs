@@ -335,11 +335,19 @@ impl BoundGitSigning {
     }
 }
 
-fn remove_untrusted_git_environment(command: &mut Command, signing: &BoundGitSigning) {
+fn install_bound_launch_environment(
+    command: &mut Command,
+    binding: &WorkspaceExecutionBinding,
+    identity: &crate::agent_instance::DispatchIdentity,
+    signing: &BoundGitSigning,
+) {
     let mut names: Vec<_> = std::env::vars_os()
         .map(|(name, _)| name)
         .chain(command.get_envs().map(|(name, _)| name.to_os_string()))
-        .filter(|name| name.as_encoded_bytes().starts_with(b"GIT_"))
+        .filter(|name| {
+            let name = name.as_encoded_bytes();
+            name.starts_with(b"GIT_") || name.starts_with(b"CHINWAG_")
+        })
         .collect();
     names.sort();
     names.dedup();
@@ -356,33 +364,43 @@ fn remove_untrusted_git_environment(command: &mut Command, signing: &BoundGitSig
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .envs(signing.environment.iter().cloned());
+        .envs(signing.environment.iter().cloned())
+        .env("CHINWAG_REPO_ROOT", binding.execution_root())
+        .env("CHINWAG_STORE_PATH", binding.store_path())
+        .env("CHINWAG_STORE_ID", binding.store_id())
+        .env("CHINWAG_EXECUTION_BINDING", binding.commitment_id())
+        .envs(identity.environment())
+        .env("CHINWAG_AGENT", identity.child().seat());
 }
 
 #[cfg(test)]
 fn run_bound_local_command(
     binding: &WorkspaceExecutionBinding,
     authority: &ExecutionAuthority,
+    identity: &crate::agent_instance::DispatchIdentity,
     command: &mut Command,
 ) -> Result<String, String> {
-    run_bound_local_command_with_signing(binding, authority, command, &BoundGitSigning::default())
+    run_bound_local_command_with_signing(
+        binding,
+        authority,
+        identity,
+        command,
+        &BoundGitSigning::default(),
+    )
 }
 
 fn run_bound_local_command_with_signing(
     binding: &WorkspaceExecutionBinding,
     authority: &ExecutionAuthority,
+    identity: &crate::agent_instance::DispatchIdentity,
     command: &mut Command,
     signing: &BoundGitSigning,
 ) -> Result<String, String> {
     check_binding(binding, authority)?;
     command
         .current_dir(binding.execution_root())
-        .env("PWD", binding.execution_root())
-        .env("CHINWAG_REPO_ROOT", binding.execution_root())
-        .env("CHINWAG_STORE_PATH", binding.store_path())
-        .env("CHINWAG_STORE_ID", binding.store_id())
-        .env("CHINWAG_EXECUTION_BINDING", binding.commitment_id());
-    remove_untrusted_git_environment(command, signing);
+        .env("PWD", binding.execution_root());
+    install_bound_launch_environment(command, binding, identity, signing);
     check_binding(binding, authority)?;
     let output = command
         .output()
@@ -592,6 +610,7 @@ fn dispatch_to_engine(
             let text = run_bound_local_command_with_signing(
                 binding,
                 authority,
+                identity,
                 &mut command,
                 git_signing,
             )?;
@@ -629,8 +648,14 @@ fn dispatch_to_engine(
             ])
             .env("PATH", &path_env)
             .envs(environment.iter().cloned());
-        return run_bound_local_command_with_signing(binding, authority, &mut command, git_signing)
-            .map(|text| (text, "codex-gpt-6.1-sol"));
+        return run_bound_local_command_with_signing(
+            binding,
+            authority,
+            identity,
+            &mut command,
+            git_signing,
+        )
+        .map(|text| (text, "codex-gpt-6.1-sol"));
     }
     let grok = local_bin.join("grok");
     if is_grok && grok.exists() {
@@ -639,8 +664,14 @@ fn dispatch_to_engine(
             .args(["agent", "--always-approve", &rich_prompt])
             .env("PATH", &path_env)
             .envs(environment.iter().cloned());
-        return run_bound_local_command_with_signing(binding, authority, &mut command, git_signing)
-            .map(|text| (text, "grok-4.7-high"));
+        return run_bound_local_command_with_signing(
+            binding,
+            authority,
+            identity,
+            &mut command,
+            git_signing,
+        )
+        .map(|text| (text, "grok-4.7-high"));
     }
     if Path::new("/opt/homebrew/bin/gemini").exists() {
         let mut command = Command::new("/opt/homebrew/bin/node");
@@ -648,8 +679,14 @@ fn dispatch_to_engine(
             .args(["/opt/homebrew/bin/gemini", "-p", &rich_prompt, "--yolo"])
             .env("PATH", &path_env)
             .envs(environment.iter().cloned());
-        return run_bound_local_command_with_signing(binding, authority, &mut command, git_signing)
-            .map(|text| (text, "gemini-4-argon-high"));
+        return run_bound_local_command_with_signing(
+            binding,
+            authority,
+            identity,
+            &mut command,
+            git_signing,
+        )
+        .map(|text| (text, "gemini-4-argon-high"));
     }
     if codex.exists() {
         let mut command = Command::new(codex);
@@ -666,8 +703,14 @@ fn dispatch_to_engine(
             ])
             .env("PATH", &path_env)
             .envs(environment.iter().cloned());
-        return run_bound_local_command_with_signing(binding, authority, &mut command, git_signing)
-            .map(|text| (text, "codex-gpt-6.1-sol"));
+        return run_bound_local_command_with_signing(
+            binding,
+            authority,
+            identity,
+            &mut command,
+            git_signing,
+        )
+        .map(|text| (text, "codex-gpt-6.1-sol"));
     }
     Err("engine_unavailable_without_replacement".into())
 }
@@ -879,10 +922,10 @@ pub(crate) fn probe_bound_route(
             &mut self,
             binding: &WorkspaceExecutionBinding,
             authority: &ExecutionAuthority,
-            _: &EngineRequest<'_>,
+            request: &EngineRequest<'_>,
         ) -> Result<(String, &'static str), String> {
             self.effects.push("engine");
-            run_bound_local_command(binding, authority, self.command)
+            run_bound_local_command(binding, authority, request.identity, self.command)
                 .map(|text| (text, "controlled-route-probe"))
         }
         fn persist(

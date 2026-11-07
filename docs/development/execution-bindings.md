@@ -47,9 +47,11 @@ All four route adapters carry the selected context:
 - Agent dispatch binds before persona, memory, signing, engine construction or
   persistence. Local engines use the approved process directory and any engine
   cwd argument. Worker launch removes inherited and explicitly supplied `GIT_*`
-  overrides before installing only the fixed configuration isolation and the
-  validated seat-signing configuration. Every engine and permitted fallback
-  rechecks the binding.
+  and `CHINWAG_*` controls before installing only fixed Git configuration
+  isolation, validated seat-signing options, the approved workspace context,
+  typed dispatch lineage and the executing seat. Ambient provider, persona and
+  application selectors cannot leak into this context. Every engine and
+  permitted fallback rechecks the binding.
   An unknown started engine is not replaced by another engine. A local pathname
   cannot authorize a remote checkout, so an unmapped remote route is held. Pool
   dispatch and the hosted executor's `run_command` tool are also held while they
