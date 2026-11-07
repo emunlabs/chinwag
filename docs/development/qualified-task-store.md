@@ -47,6 +47,9 @@ Missing dependencies remain held observations. Later arrivals can make a
 relationship resolvable within a snapshot, but cannot supply authentication,
 current enrollment or execution permission. Local journal mirrors cannot enter
 a replica-observation batch.
+Relationship lookup advances through paginated history. If the fixed shared
+work bound prevents a complete lookup, the read fails explicitly rather than
+labelling an unexamined reference absent.
 The API accepts typed, bounded batches; CRR registration does not expose an
 arbitrary raw replica-change import endpoint.
 

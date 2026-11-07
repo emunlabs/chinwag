@@ -31,6 +31,21 @@ pub struct RecordView {
 }
 pub type OriginalView = RecordView;
 
+// Fixed work bound for one classification, shared by nested source/projection
+// lookups. Exhaustion cannot be reported as evidence that a target is absent.
+const MAX_RELATIONSHIP_RECORD_READS: usize = 4096;
+struct RelationshipBudget {
+    remaining: usize,
+}
+impl RelationshipBudget {
+    fn consume(&mut self) -> Result<()> {
+        self.remaining = self.remaining.checked_sub(1).ok_or(Error::Contract(
+            "Qualified relationship lookup work bound exhausted; held",
+        ))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct LegacyAssociationView {
     classification: RecordClassification,
@@ -429,6 +444,24 @@ pub(crate) fn load_record(
     workspace: &str,
     observation_id: &str,
 ) -> Result<RecordView> {
+    load_record_with_budget(
+        native,
+        family,
+        workspace,
+        observation_id,
+        &mut RelationshipBudget {
+            remaining: MAX_RELATIONSHIP_RECORD_READS,
+        },
+    )
+}
+
+fn load_record_with_budget(
+    native: &Connection,
+    family: RecordFamily,
+    workspace: &str,
+    observation_id: &str,
+    budget: &mut RelationshipBudget,
+) -> Result<RecordView> {
     identifier(workspace, false)?;
     identifier(observation_id, false)?;
     // A conflict-only batch deliberately creates no normal observation header.
@@ -484,7 +517,7 @@ pub(crate) fn load_record(
             "Immutable qualified identity is quarantined",
         ));
     }
-    let classification = if references_present(native, &record)? {
+    let classification = if references_present(native, &record, budget)? {
         RecordClassification::LinkedObservation
     } else {
         RecordClassification::Dangling
@@ -531,19 +564,44 @@ fn has_reference(
     native: &Connection,
     key: &LogicalKey,
     reference: Option<&TaskRefEnvelope>,
+    budget: &mut RelationshipBudget,
 ) -> Result<bool> {
-    for id in observation_ids(native, key, "", 64)? {
-        let view = load_record(native, key.family(), key.workspace(), &id)?;
-        if view.classification() == RecordClassification::LinkedObservation
-            && let Some(record) = view.record()
-            && reference.is_none_or(|expected| record.references().contains(expected))
-        {
-            return Ok(true);
+    let mut after_id = String::new();
+    loop {
+        let page_limit = budget.remaining.min(64);
+        if page_limit == 0 {
+            return Err(Error::Contract(
+                "Qualified relationship lookup work bound exhausted; held",
+            ));
+        }
+        let ids = observation_ids(native, key, &after_id, page_limit)?;
+        let count = ids.len();
+        for id in ids {
+            if id <= after_id {
+                return Err(Error::Contract(
+                    "Qualified relationship cursor did not advance; held",
+                ));
+            }
+            budget.consume()?;
+            let view = load_record_with_budget(native, key.family(), key.workspace(), &id, budget)?;
+            after_id = id;
+            if view.classification() == RecordClassification::LinkedObservation
+                && let Some(record) = view.record()
+                && reference.is_none_or(|expected| record.references().contains(expected))
+            {
+                return Ok(true);
+            }
+        }
+        if count < page_limit {
+            return Ok(false);
         }
     }
-    Ok(false)
 }
-fn references_present(native: &Connection, record: &QualifiedRecord) -> Result<bool> {
+fn references_present(
+    native: &Connection,
+    record: &QualifiedRecord,
+    budget: &mut RelationshipBudget,
+) -> Result<bool> {
     for reference in record.references() {
         let i = reference.indexes();
         let source = LogicalKey::source(
@@ -552,7 +610,7 @@ fn references_present(native: &Connection, record: &QualifiedRecord) -> Result<b
             i.source_generation(),
         )
         .map_err(contract)?;
-        if !has_reference(native, &source, None)? {
+        if !has_reference(native, &source, None, budget)? {
             return Ok(false);
         }
         if record.family() != RecordFamily::Projection {
@@ -562,7 +620,7 @@ fn references_present(native: &Connection, record: &QualifiedRecord) -> Result<b
                 i.task_id().into(),
             )
             .map_err(contract)?;
-            if !has_reference(native, &task, Some(reference))? {
+            if !has_reference(native, &task, Some(reference), budget)? {
                 return Ok(false);
             }
         }
@@ -926,6 +984,178 @@ mod tests {
             native.query(schema::INSERT_REF, &values)?;
         }
         Ok(())
+    }
+
+    fn history_reference(revision: u64) -> TaskRefEnvelope {
+        let indexes = TaskRefIndexes::try_new(
+            WORKSPACE.into(),
+            "read-repository".into(),
+            SOURCE.into(),
+            1,
+            "source/tasks.md".into(),
+            "same-task-label".into(),
+            [1; 32],
+            0,
+            revision,
+            StoredGitOid::Sha1([2; 20]),
+        )
+        .unwrap();
+        let canonical = indexes.canonical_bytes();
+        TaskRefEnvelope::try_new(canonical.clone(), digest(&canonical), indexes).unwrap()
+    }
+
+    fn public_history_classification(target_revision: u64) -> RecordClassification {
+        use crate::{
+            qualified::{ImmutableOriginal, LocalJournalMirrorBatch, ObservationBatch},
+            replacement::{MigrationRequest, QualifiedMigrationSession, WriteOwner},
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "p010-reader-history-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let store_parent = root.join(".chinwag");
+        std::fs::create_dir(&store_parent).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&store_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::initial_create::fresh_empty_store_image_for_private_fixture()
+            .unwrap()
+            .begin_private_fixture(&root)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let preimage = std::fs::read(root.join(".chinwag/state.crdb")).unwrap();
+        let key = LogicalKey::projection(WORKSPACE.into(), SOURCE.into(), "same-task-label".into())
+            .unwrap();
+        let mut records = vec![source()];
+        for revision in 0..65 {
+            records.push(record(
+                &format!("projection-{revision:03}"),
+                key.clone(),
+                vec![history_reference(revision)],
+                b"observed-history".to_vec(),
+            ));
+        }
+        let message_key = LogicalKey::message(
+            WORKSPACE.into(),
+            "fixture-principal".into(),
+            "history-message".into(),
+        )
+        .unwrap();
+        let binding = b"controlled immutable binding; no task authority".to_vec();
+        let original =
+            ImmutableOriginal::try_new(message_key.clone(), binding.clone(), digest(&binding))
+                .unwrap();
+        let payload = b"message phase".to_vec();
+        records.push(
+            QualifiedRecord::try_new(
+                "message-needing-projection".into(),
+                message_key,
+                vec![history_reference(target_revision)],
+                Some(original),
+                payload.clone(),
+                digest(&payload),
+            )
+            .unwrap(),
+        );
+        assert_eq!(records.len(), 67);
+        let request = MigrationRequest::try_new(
+            WORKSPACE.into(),
+            "reader-history-migration".into(),
+            digest(&preimage),
+            ObservationBatch::try_new(records).unwrap(),
+            LocalJournalMirrorBatch::try_new(vec![]).unwrap(),
+        )
+        .unwrap();
+        QualifiedMigrationSession::from_v1_owner(
+            WriteOwner::acquire_existing_private_fixture(&root).unwrap(),
+        )
+        .unwrap()
+        .prepare(request, || false)
+        .unwrap()
+        .commit(false)
+        .unwrap();
+        let session = QualifiedSnapshotSession::from_v2_owner(
+            ReadOwner::acquire_existing_private_fixture(&root).unwrap(),
+        )
+        .unwrap();
+        let view = session
+            .record(
+                RecordFamily::Message,
+                WORKSPACE,
+                "message-needing-projection",
+            )
+            .unwrap();
+        let classification = view.classification();
+        assert!(view.record().is_some());
+        assert!(
+            session
+                .finish()
+                .unwrap()
+                .owner_verified_after_native_close()
+        );
+        classification
+    }
+
+    #[test]
+    fn p010_read_reference_match_on_second_page_resolves_actual_public_snapshot() {
+        assert_eq!(
+            public_history_classification(64),
+            RecordClassification::LinkedObservation
+        );
+    }
+
+    #[test]
+    fn p010_read_reference_truly_absent_after_second_page_remains_dangling() {
+        assert_eq!(
+            public_history_classification(65),
+            RecordClassification::Dangling
+        );
+    }
+
+    #[test]
+    fn p010_read_reference_shared_work_exhaustion_is_held_not_false_absence() {
+        native_test(|native| {
+            seed(native, &source())?;
+            let key =
+                LogicalKey::projection(WORKSPACE.into(), SOURCE.into(), "same-task-label".into())
+                    .unwrap();
+            for revision in 0..2 {
+                seed(
+                    native,
+                    &record(
+                        &format!("projection-{revision:03}"),
+                        key.clone(),
+                        vec![history_reference(revision)],
+                        b"history".to_vec(),
+                    ),
+                )?;
+            }
+            let target = history_reference(1);
+            // The first nonmatching projection and its nested source lookup
+            // consume the same private budget. The still-unread match cannot
+            // be turned into a negative relationship assertion.
+            let mut limited = RelationshipBudget { remaining: 2 };
+            assert!(matches!(
+                has_reference(native, &key, Some(&target), &mut limited),
+                Err(Error::Contract(
+                    "Qualified relationship lookup work bound exhausted; held"
+                ))
+            ));
+            assert_eq!(limited.remaining, 0);
+            let mut normal = RelationshipBudget {
+                remaining: MAX_RELATIONSHIP_RECORD_READS,
+            };
+            assert!(has_reference(native, &key, Some(&target), &mut normal)?);
+            Ok(())
+        });
     }
 
     #[test]
