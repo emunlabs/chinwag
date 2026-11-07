@@ -522,6 +522,23 @@ fn read_all_messages(repo_root: &Path) -> Vec<BusMessage> {
     read_all_messages_unlocked(repo_root)
 }
 
+/// Diagnostic row count only: the history reader counts every parseable message
+/// even when verification fails. Avoid discarded signature checks on the room
+/// owner task; actual message queries and publication still verify signatures.
+fn count_parseable_journal_messages(repo_root: &Path) -> usize {
+    let Ok(file) = File::open(messages_jsonl_path(repo_root)) else {
+        return 0;
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && serde_json::from_str::<BusMessage>(trimmed).is_ok()
+        })
+        .count()
+}
+
 /// The journal is the original durable publication store. Existing SQLite
 /// mirrors remain historical observations and are not written through an
 /// unchecked external path. Storage never grants processing or work start.
@@ -1432,7 +1449,7 @@ async fn run_daemon_loop_inner(
         .to_string_lossy()
         .to_string();
 
-    let initial_count = read_all_messages(&repo_root).len() as u64;
+    let initial_count = count_parseable_journal_messages(&repo_root) as u64;
     let state = Arc::new(Mutex::new(DaemonState {
         ok: true,
         pid: std::process::id(),
@@ -1582,7 +1599,7 @@ async fn run_daemon_loop_inner(
             scheduled = heartbeat.tick() => {
                 let tick_late_ms = scheduled.elapsed().as_millis();
                 let scan_started = Instant::now();
-                let count = read_all_messages(&repo_root).len() as u64;
+                let count = count_parseable_journal_messages(&repo_root) as u64;
                 let journal_scan_ms = scan_started.elapsed().as_millis();
                 let state_started = Instant::now();
                 let update = state.lock().map_err(|_| ()).and_then(|mut guard| {
@@ -2681,6 +2698,68 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diagnostic_count_fixture_row() -> serde_json::Value {
+        json!({
+            "id": "diagnostic-only", "seq": 1, "ts_unix": 1, "ts_iso": "",
+            "room": "#test", "sender": "unregistered actor", "sender_cast": "",
+            "sender_endpoint_id": "invalid endpoint", "to": null, "task_id": null,
+            "body": "controlled fixture", "digest_sha256": "invalid digest"
+        })
+    }
+
+    #[test]
+    fn diagnostic_journal_count_matches_history_parse_eligibility_not_verification() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = messages_jsonl_path(repo.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let unsigned = diagnostic_count_fixture_row();
+        let mut invalid_signature = unsigned.clone();
+        invalid_signature["pubkey_ed25519"] = json!("not a key");
+        invalid_signature["signature_ed25519"] = json!("not a signature");
+        let mut forged_verified = invalid_signature.clone();
+        forged_verified["sig_verified"] = json!(true);
+        forged_verified["to"] = json!("invalid recipient");
+        let mut wrong_type = unsigned.clone();
+        wrong_type["seq"] = json!("one");
+        // CRLF, whitespace, rejected shapes, and a final row without newline.
+        fs::write(
+            &path,
+            format!(
+                " \r\n{unsigned}\r\nnot-json\n{{}}\n{wrong_type}\n  {invalid_signature}  \n{forged_verified}"
+            ),
+        )
+        .unwrap();
+        let history = read_all_messages(repo.path());
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().all(|message| !message.sig_verified));
+        assert_eq!(count_parseable_journal_messages(repo.path()), history.len());
+    }
+
+    #[test]
+    fn diagnostic_journal_count_stops_at_first_invalid_utf8_line() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = messages_jsonl_path(repo.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let row = diagnostic_count_fixture_row().to_string();
+        let mut bytes = format!("{row}\n").into_bytes();
+        bytes.extend_from_slice(b"\xff\n");
+        bytes.extend_from_slice(row.as_bytes());
+        fs::write(path, bytes).unwrap();
+        assert_eq!(count_parseable_journal_messages(repo.path()), 1);
+        assert_eq!(read_all_messages(repo.path()).len(), 1);
+    }
+
+    #[test]
+    fn diagnostic_journal_count_open_failure_matches_empty_history() {
+        let repo = tempfile::tempdir().unwrap();
+        assert_eq!(count_parseable_journal_messages(repo.path()), 0);
+        assert!(read_all_messages(repo.path()).is_empty());
+        // Deterministic open failure, independent of the test user's privileges.
+        fs::write(repo.path().join(".chinwag"), b"not a directory").unwrap();
+        assert_eq!(count_parseable_journal_messages(repo.path()), 0);
+        assert!(read_all_messages(repo.path()).is_empty());
+    }
 
     #[test]
     fn consumer01_receipt_transcript_matches_existing_bus_signature_and_wire() {
