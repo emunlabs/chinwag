@@ -21,6 +21,7 @@ use chinwag_cli::bus_network::{
 use chinwag_cli::bus_observation::{
     FederationObservation, ReceiptCache, RemotePublication, valid_receipt_query,
 };
+use chinwag_swarm::room::{RoomClient, RoomSession};
 use chinwag_swarm::room_binding::{DaemonPeerGate, DaemonRoomIdentity};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Signature, TransportAddr, Watcher,
@@ -1193,6 +1194,47 @@ impl NativePublication {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomOwnerFailure {
+    PresenceExpired,
+    RenewalUnknown,
+    SessionEnded,
+}
+
+type RoomOwnerFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = RoomOwnerFailure> + 'a>>;
+
+// One persistent owner future: selecting another daemon event must not drop an
+// in-flight renewal. After renewal, recreate receive with the new lease timer.
+async fn drive_daemon_room(
+    session: &mut RoomSession,
+    client: &RoomClient,
+    identity: &DaemonRoomIdentity,
+    renewed: tokio::sync::mpsc::Sender<()>,
+) -> RoomOwnerFailure {
+    loop {
+        let wait = match session.daemon_renewal_wait() {
+            Ok(wait) => wait,
+            Err(_) => return RoomOwnerFailure::PresenceExpired,
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {
+                if client.renew_daemon_presence(identity, session).await.is_err() {
+                    return RoomOwnerFailure::RenewalUnknown;
+                }
+                // Only a bounded diagnostic notification; gate state, not this
+                // notification, remains authoritative for every publication.
+                let _ = renewed.try_send(());
+            }
+            update = session.receive_daemon_peer() => {
+                if update.is_err() {
+                    return RoomOwnerFailure::SessionEnded;
+                }
+            }
+        }
+    }
+}
+
 async fn run_daemon_loop(
     repo_root: PathBuf,
     port: u16,
@@ -1201,6 +1243,32 @@ async fn run_daemon_loop(
     stdout: &mut dyn Write,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> u8 {
+    run_daemon_loop_inner(
+        repo_root,
+        port,
+        network_selection,
+        no_governors,
+        stdout,
+        shutdown,
+        None,
+    )
+    .await
+}
+
+async fn run_daemon_loop_inner(
+    repo_root: PathBuf,
+    port: u16,
+    network_selection: Option<NetworkSelection>,
+    no_governors: bool,
+    stdout: &mut dyn Write,
+    shutdown: impl std::future::Future<Output = ()>,
+    controlled_local_driver: Option<RoomOwnerFuture<'static>>,
+) -> u8 {
+    // This private seam exercises responsiveness under a pending owner. It
+    // cannot replace the real owner or create authority on a networked daemon.
+    if controlled_local_driver.is_some() && network_selection.is_some() {
+        return 1;
+    }
     tokio::pin!(shutdown);
     let secret = match load_or_create_daemon_secret(&repo_root) {
         Ok(secret) => secret,
@@ -1429,24 +1497,20 @@ async fn run_daemon_loop(
     let mut governor_tick = tokio::time::interval(Duration::from_secs(45));
     governor_tick.tick().await;
 
-    loop {
-        // Re-arm receive after renewal in this one owner loop. A concurrent
-        // renewal task would leave the previous receive expiry timer armed.
-        let renewal_wait = match room_session
-            .as_ref()
-            .map(|session| session.daemon_renewal_wait())
-        {
-            Some(Ok(wait)) => Some(wait),
-            Some(Err(_)) => {
-                let _ = writeln!(
-                    stdout,
-                    "chinwag bus network HELD: transport presence expired"
-                );
-                exit_code = 1;
-                break;
+    let (renewed_tx, mut renewed_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut room_driver: RoomOwnerFuture<'_> = match controlled_local_driver {
+        Some(driver) => driver,
+        None => Box::pin(async {
+            match (&mut room_session, &room_credentials) {
+                (Some(session), Some((client, identity))) => {
+                    drive_daemon_room(session, client, identity, renewed_tx).await
+                }
+                (None, None) => std::future::pending().await,
+                _ => RoomOwnerFailure::PresenceExpired,
             }
-            None => None,
-        };
+        }),
+    };
+    loop {
         tokio::select! {
             _ = &mut shutdown => {
                 break;
@@ -1456,22 +1520,20 @@ async fn run_daemon_loop(
                 exit_code = 1;
                 break;
             }
-            _ = async {
-                match renewal_wait {
-                    Some(wait) => tokio::time::sleep(wait).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let (Some(session), Some((client, identity))) = (&mut room_session, &room_credentials) {
-                    if client.renew_daemon_presence(identity, session).await.is_err() {
-                        let _ = writeln!(stdout, "chinwag bus network HELD: transport presence renewal unknown or refused; no retry");
-                        exit_code = 1;
-                        break;
-                    }
-                    let _ = writeln!(stdout, "{}", json!({"event":"native_transport_presence_renewed",
-                        "scope":"TRANSPORT_ONLY_NOT_TASK_AUTHORITY", "original_message_replay":false}));
-                    let _ = stdout.flush();
-                }
+            failure = &mut room_driver => {
+                let message = match failure {
+                    RoomOwnerFailure::PresenceExpired => "chinwag bus network HELD: transport presence expired",
+                    RoomOwnerFailure::RenewalUnknown => "chinwag bus network HELD: transport presence renewal unknown or refused; no retry",
+                    RoomOwnerFailure::SessionEnded => "chinwag bus network HELD: original room session ended",
+                };
+                let _ = writeln!(stdout, "{message}");
+                if failure != RoomOwnerFailure::SessionEnded { exit_code = 1; }
+                break;
+            }
+            Some(()) = renewed_rx.recv() => {
+                let _ = writeln!(stdout, "{}", json!({"event":"native_transport_presence_renewed",
+                    "scope":"TRANSPORT_ONLY_NOT_TASK_AUTHORITY", "original_message_replay":false}));
+                let _ = stdout.flush();
             }
             original = forward_rx.recv(), if network.is_some() && forwards.is_empty() => {
                 if let (Some(message), Some((selection, gate))) = (original, &network) {
@@ -1513,17 +1575,6 @@ async fn run_daemon_loop(
                             "original_digest_sha256":digest, "phase":failure.category(), "automatic_retry":false}),
                     };
                     let _ = writeln!(stdout, "{record}"); let _ = stdout.flush();
-                }
-            }
-            update = async {
-                match &mut room_session {
-                    Some(session) => session.receive_daemon_peer().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if update.is_err() {
-                    let _ = writeln!(stdout, "chinwag bus network HELD: original room session ended");
-                    break;
                 }
             }
             _ = heartbeat.tick() => {
@@ -1673,7 +1724,8 @@ async fn run_daemon_loop(
             }
         }
     }
-
+    // Cancel the one driver (and its renewal guard) before explicit close.
+    drop(room_driver);
     if let Some(session) = &mut room_session {
         session.close().await;
     }

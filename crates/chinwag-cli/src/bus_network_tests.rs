@@ -82,19 +82,26 @@ async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
                 .ok_or_else(|| {
                     "this native transport test requires a non-loopback interface".to_owned()
                 })?;
-            let port = daemon.bound_sockets[0]
-                .parse::<SocketAddr>()
-                .unwrap()
+            let port = daemon
+                .bound_sockets
+                .iter()
+                .filter_map(|raw| raw.parse::<SocketAddr>().ok())
+                .find(|socket| socket.is_ipv4() && socket.ip().is_unspecified())
+                .ok_or("controlled daemon did not report an actual wildcard IPv4 socket")?
                 .port();
             let client = Endpoint::builder(presets::Minimal)
                 .relay_mode(RelayMode::Disabled)
                 .clear_address_lookup()
+                .clear_ip_transports()
                 .bind_addr(format!("{local_ip}:0").parse::<SocketAddr>().unwrap())
                 .map_err(|_| "test bind address refused".to_owned())?
                 .bind()
                 .await
                 .map_err(|_| "test endpoint bind failed".to_owned())?;
-            for query in [frame, BusFrame::NetworkPosture] {
+            let client_sockets = client.bound_sockets();
+            assert_eq!(client_sockets.len(), 1);
+            assert_eq!(client_sockets[0].ip().to_string(), local_ip);
+            for (query_index, query) in [frame, BusFrame::NetworkPosture].into_iter().enumerate() {
                 let address = EndpointAddr::from_parts(
                     daemon.endpoint_id.parse().unwrap(),
                     [TransportAddr::Ip(
@@ -104,7 +111,10 @@ async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
                 let connection =
                     tokio::time::timeout(Duration::from_secs(5), client.connect(address, BUS_ALPN))
                         .await
-                        .map_err(|_| "adversarial test connect timeout".to_owned())?
+                        .map_err(|_| format!(
+                            "adversarial test connect timeout: query={query_index} target={local_ip}:{port} client={client_sockets:?} daemon={:?}",
+                            daemon.bound_sockets
+                        ))?
                         .map_err(|_| "adversarial test must actually connect".to_owned())?;
                 let (mut send, mut recv) = connection
                     .open_bi()
@@ -141,11 +151,102 @@ async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
     result.unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn pending_room_owner_does_not_starve_local_publication_or_observation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let temporary = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temporary.path()).unwrap();
+    let original = super::tests::native_publication_fixture(&root);
+    let entered = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    struct DriverDrop(Arc<AtomicBool>);
+    impl Drop for DriverDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let driver_entered = entered.clone();
+    let driver_dropped = dropped.clone();
+    let driver = Box::pin(async move {
+        let _guard = DriverDrop(driver_dropped);
+        driver_entered.store(true, Ordering::SeqCst);
+        std::future::pending::<RoomOwnerFailure>().await
+    });
+    let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut output = Vec::new();
+    let daemon = run_daemon_loop_inner(
+        root.clone(),
+        0,
+        None,
+        true,
+        &mut output,
+        async {
+            let _ = stopped.await;
+        },
+        Some(driver),
+    );
+    let exercise = async {
+        let result = async {
+            let daemon = wait_for_owned_daemon(&root).await?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !entered.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| "controlled room owner was not polled")?;
+            let posture = tokio::time::timeout(
+                Duration::from_secs(5),
+                query_local_daemon(&daemon, &BusFrame::NetworkPosture),
+            )
+            .await
+            .map_err(|_| "pending owner starved posture query")??;
+            assert_eq!(posture["network"]["mode"], "LEGACY_LOCAL_ONLY");
+            let ack = tokio::time::timeout(
+                Duration::from_secs(5),
+                publish_over_iroh_quic(&daemon, SecretKey::generate(), &original),
+            )
+            .await
+            .map_err(|_| "pending owner starved local publication")??;
+            assert!(valid_publication_ack(&daemon, &original, &ack));
+            let receipt = tokio::time::timeout(
+                Duration::from_secs(5),
+                query_local_daemon(
+                    &daemon,
+                    &BusFrame::FederationReceipt {
+                        original_id: original.id.clone(),
+                        original_digest_sha256: original.digest_sha256.clone(),
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| "pending owner starved receipt query")??;
+            assert_eq!(receipt["federation"]["outcome"], "PUBLISH_ONLY");
+            let _ = one_original_journal(&root, &original)?;
+            assert!(
+                !dropped.load(Ordering::SeqCst),
+                "owner future was cancelled by unrelated I/O"
+            );
+            Ok::<(), String>(())
+        }
+        .await;
+        let _ = shutdown.send(());
+        result
+    };
+    let (exit, result) = tokio::join!(daemon, exercise);
+    assert_eq!(exit, 0);
+    result.unwrap();
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "shutdown did not retire the original owner future"
+    );
+}
+
 async fn wait_for_owned_daemon(root: &Path) -> Result<DaemonState, String> {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(bytes) = fs::read(daemon_json_path(root))
-                && let Ok(mut daemon) = serde_json::from_slice::<DaemonState>(&bytes)
+                && let Ok(daemon) = serde_json::from_slice::<DaemonState>(&bytes)
             {
                 if daemon.pid != std::process::id()
                     || daemon.product_governor != "DISABLED_CONTROLLED_INSTANCE"
@@ -154,13 +255,12 @@ async fn wait_for_owned_daemon(root: &Path) -> Result<DaemonState, String> {
                 }
                 // Use only an actual reported local socket. Do not consult or
                 // mutate global CHINWAG_BUS_* routing environment in this test.
-                let local = daemon
+                let _local = daemon
                     .bound_sockets
                     .iter()
                     .filter_map(|raw| raw.parse::<SocketAddr>().ok())
                     .find(|socket| socket.ip().is_loopback() && socket.port() != 0)
                     .ok_or("daemon did not report a bound loopback socket")?;
-                daemon.bound_sockets = vec![local.to_string()];
                 return Ok(daemon);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
