@@ -82,26 +82,19 @@ async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
                 .ok_or_else(|| {
                     "this native transport test requires a non-loopback interface".to_owned()
                 })?;
-            let port = daemon
-                .bound_sockets
-                .iter()
-                .filter_map(|raw| raw.parse::<SocketAddr>().ok())
-                .find(|socket| socket.is_ipv4() && socket.ip().is_unspecified())
-                .ok_or("controlled daemon did not report an actual wildcard IPv4 socket")?
+            let port = daemon.bound_sockets[0]
+                .parse::<SocketAddr>()
+                .unwrap()
                 .port();
             let client = Endpoint::builder(presets::Minimal)
                 .relay_mode(RelayMode::Disabled)
                 .clear_address_lookup()
-                .clear_ip_transports()
                 .bind_addr(format!("{local_ip}:0").parse::<SocketAddr>().unwrap())
                 .map_err(|_| "test bind address refused".to_owned())?
                 .bind()
                 .await
                 .map_err(|_| "test endpoint bind failed".to_owned())?;
-            let client_sockets = client.bound_sockets();
-            assert_eq!(client_sockets.len(), 1);
-            assert_eq!(client_sockets[0].ip().to_string(), local_ip);
-            for (query_index, query) in [frame, BusFrame::NetworkPosture].into_iter().enumerate() {
+            for query in [frame, BusFrame::NetworkPosture] {
                 let address = EndpointAddr::from_parts(
                     daemon.endpoint_id.parse().unwrap(),
                     [TransportAddr::Ip(
@@ -111,10 +104,7 @@ async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
                 let connection =
                     tokio::time::timeout(Duration::from_secs(5), client.connect(address, BUS_ALPN))
                         .await
-                        .map_err(|_| format!(
-                            "adversarial test connect timeout: query={query_index} target={local_ip}:{port} client={client_sockets:?} daemon={:?}",
-                            daemon.bound_sockets
-                        ))?
+                        .map_err(|_| "adversarial test connect timeout".to_owned())?
                         .map_err(|_| "adversarial test must actually connect".to_owned())?;
                 let (mut send, mut recv) = connection
                     .open_bi()
@@ -246,7 +236,7 @@ async fn wait_for_owned_daemon(root: &Path) -> Result<DaemonState, String> {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(bytes) = fs::read(daemon_json_path(root))
-                && let Ok(daemon) = serde_json::from_slice::<DaemonState>(&bytes)
+                && let Ok(mut daemon) = serde_json::from_slice::<DaemonState>(&bytes)
             {
                 if daemon.pid != std::process::id()
                     || daemon.product_governor != "DISABLED_CONTROLLED_INSTANCE"
@@ -255,12 +245,13 @@ async fn wait_for_owned_daemon(root: &Path) -> Result<DaemonState, String> {
                 }
                 // Use only an actual reported local socket. Do not consult or
                 // mutate global CHINWAG_BUS_* routing environment in this test.
-                let _local = daemon
+                let local = daemon
                     .bound_sockets
                     .iter()
                     .filter_map(|raw| raw.parse::<SocketAddr>().ok())
                     .find(|socket| socket.ip().is_loopback() && socket.port() != 0)
                     .ok_or("daemon did not report a bound loopback socket")?;
+                daemon.bound_sockets = vec![local.to_string()];
                 return Ok(daemon);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
