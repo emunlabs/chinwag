@@ -40,7 +40,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 pub const BUS_ALPN: &[u8] = b"chinwag/bus/1";
@@ -1579,13 +1579,23 @@ async fn run_daemon_loop_inner(
                     let _ = writeln!(stdout, "{record}"); let _ = stdout.flush();
                 }
             }
-            _ = heartbeat.tick() => {
+            scheduled = heartbeat.tick() => {
+                let tick_late_ms = scheduled.elapsed().as_millis();
+                let scan_started = Instant::now();
                 let count = read_all_messages(&repo_root).len() as u64;
+                let journal_scan_ms = scan_started.elapsed().as_millis();
+                let state_started = Instant::now();
                 let update = state.lock().map_err(|_| ()).and_then(|mut guard| {
                     guard.last_heartbeat = unix_now();
                     guard.total_messages = count;
                     write_daemon_state(&repo_root, &guard)
                 });
+                let record = json!({"event":"native_bus_heartbeat_timing",
+                    "tick_late_ms":tick_late_ms,"journal_scan_ms":journal_scan_ms,
+                    "state_replace_ms":state_started.elapsed().as_millis(),
+                    "state_update_ok":update.is_ok(),"scope":"DIAGNOSTIC_NOT_TASK_AUTHORITY"});
+                let _ = writeln!(stdout, "{record}");
+                let _ = stdout.flush();
                 if update.is_err() {
                     let _ = writeln!(stdout, "chinwag bus HELD: diagnostic state update failed");
                     exit_code = 1;

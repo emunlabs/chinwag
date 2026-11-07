@@ -27,7 +27,7 @@ use std::{
     collections::BTreeMap,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 use tokio::{net::TcpStream, time::timeout};
@@ -64,6 +64,12 @@ pub enum Error {
     Network,
     #[error("the room HTTP request failed ({0})")]
     Http(&'static str),
+    #[error("the room HTTP {phase} failed ({category}, elapsed_ms={elapsed_ms})")]
+    HttpResponse {
+        phase: &'static str,
+        category: &'static str,
+        elapsed_ms: u128,
+    },
     #[error("the room WebSocket operation failed ({0})")]
     WebSocket(&'static str),
     #[error("the room WebSocket closed with code {0}")]
@@ -202,8 +208,8 @@ fn parse<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
 
 // Retain diagnostic categories without serializing request headers, signed
 // challenges, response bodies, URLs, or an upstream error's arbitrary text.
-fn http_error(error: reqwest::Error) -> Error {
-    Error::Http(if error.is_timeout() {
+fn http_category(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
         "timeout"
     } else if error.is_connect() {
         "connect"
@@ -211,12 +217,39 @@ fn http_error(error: reqwest::Error) -> Error {
         "body"
     } else {
         "request"
-    })
+    }
+}
+
+fn http_response_error(
+    path: &str,
+    reading_body: bool,
+    started: Instant,
+    error: reqwest::Error,
+) -> Error {
+    // Map only known operations to fixed labels. Never format the path or the
+    // upstream error, which can carry URLs, headers or response contents.
+    let phase = match (path, reading_body) {
+        ("/room/genesis/challenge", false) => "challenge_response_headers",
+        ("/room/genesis/challenge", true) => "challenge_response_body",
+        ("/room/genesis/peer", false) => "peer_store_response_headers",
+        ("/room/genesis/peer", true) => "peer_store_response_body",
+        (_, false) => "other_response_headers",
+        (_, true) => "other_response_body",
+    };
+    Error::HttpResponse {
+        phase,
+        category: http_category(&error),
+        elapsed_ms: started.elapsed().as_millis(),
+    }
 }
 
 fn startup_http_phase(phase: &'static str, error: Error) -> Error {
     match error {
-        Error::Http("timeout") => Error::PhaseTimeout(phase),
+        Error::Http("timeout")
+        | Error::HttpResponse {
+            category: "timeout",
+            ..
+        } => Error::PhaseTimeout(phase),
         other => other,
     }
 }
@@ -444,7 +477,11 @@ impl RoomClient {
         for (name, value) in headers {
             request = request.header(name, value);
         }
-        let mut response = request.send().await.map_err(http_error)?;
+        let headers_started = Instant::now();
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| http_response_error(path, false, headers_started, error))?;
         tracing::info!(
             room_phase = "http_response",
             operation = path,
@@ -458,7 +495,12 @@ impl RoomClient {
             return Err(Error::Size);
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(http_error)? {
+        let body_started = Instant::now();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| http_response_error(path, true, body_started, error))?
+        {
             if chunk.len() > LIMIT.saturating_sub(bytes.len()) {
                 return Err(Error::Size);
             }
@@ -945,6 +987,49 @@ mod tests {
     use super::*;
     use crate::relay_policy::RelayPolicy;
     use std::sync::Arc;
+
+    #[test]
+    fn http_response_diagnostics_distinguish_stages_without_upstream_text() {
+        let coordinator = Identity::test_identity(rand::random()).endpoint_id();
+        let policy = Arc::new(RelayPolicy::from_local_manifest(None, None).unwrap());
+        let client = RoomClient::new("https://room.invalid", coordinator, policy).unwrap();
+        for (path, body, phase) in [
+            (
+                "/room/genesis/challenge",
+                false,
+                "challenge_response_headers",
+            ),
+            ("/room/genesis/challenge", true, "challenge_response_body"),
+            ("/room/genesis/peer", false, "peer_store_response_headers"),
+            ("/room/genesis/peer", true, "peer_store_response_body"),
+            ("PRIVATE_PATH_MARKER", false, "other_response_headers"),
+            ("PRIVATE_PATH_MARKER", true, "other_response_body"),
+        ] {
+            let error = client
+                .http
+                .get("https://room.invalid/PRIVATE_URL_MARKER")
+                .header("invalid\nheader", "PRIVATE_HEADER_MARKER")
+                .build()
+                .unwrap_err();
+            let diagnostic = http_response_error(path, body, Instant::now(), error).to_string();
+            assert!(diagnostic.starts_with(&format!(
+                "the room HTTP {phase} failed (request, elapsed_ms="
+            )));
+            assert!(!diagnostic.contains("PRIVATE_"));
+            assert!(!diagnostic.contains("room.invalid"));
+        }
+        assert!(matches!(
+            startup_http_phase(
+                "attach_challenge",
+                Error::HttpResponse {
+                    phase: "challenge_response_body",
+                    category: "timeout",
+                    elapsed_ms: 5000,
+                }
+            ),
+            Error::PhaseTimeout("attach_challenge")
+        ));
+    }
 
     #[test]
     fn peer_frame_diagnostics_exclude_payload_and_close_reason() {
