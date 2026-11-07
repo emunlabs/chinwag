@@ -40,9 +40,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 pub const BUS_ALPN: &[u8] = b"chinwag/bus/1";
-// Iroh's underlying connection window is ten seconds. This startup bound is
-// before any room challenge or message original exists; it never renews one.
-const RELAY_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+// Preserve Iroh's normal connection window for an explicitly pinned relay.
+// Each original is attempted once; gate freshness is checked before and after.
+const FEDERATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BUS_PORT: u16 = 44330;
 const MAX_FRAME_BYTES: usize = 128 * 1024;
 
@@ -103,19 +103,43 @@ impl Drop for OwnedBusConnection {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FederationFailure {
+    PeerUnavailable,
+    ConnectDeadline,
+    ConnectFailed,
+    TransferDeadline,
+    TransferOrAckRefused,
+}
+impl FederationFailure {
+    fn category(self) -> &'static str {
+        match self {
+            Self::PeerUnavailable => "peer_unavailable",
+            Self::ConnectDeadline => "connect_deadline",
+            Self::ConnectFailed => "connect_failed",
+            Self::TransferDeadline => "transfer_deadline",
+            Self::TransferOrAckRefused => "transfer_or_ack_refused",
+        }
+    }
+}
+
 async fn forward_original(
     endpoint: &Endpoint,
     selection: &NetworkSelection,
     gate: &DaemonPeerGate,
     message: &BusMessage,
-) -> Result<PathObservation, ()> {
+) -> Result<PathObservation, FederationFailure> {
     use subtle::ConstantTimeEq;
-    let address = selection.current_address(gate).map_err(|_| ())?;
-    let connection =
-        tokio::time::timeout(Duration::from_secs(3), endpoint.connect(address, BUS_ALPN))
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+    let address = selection
+        .current_address(gate)
+        .map_err(|_| FederationFailure::PeerUnavailable)?;
+    let connection = tokio::time::timeout(
+        FEDERATION_CONNECT_TIMEOUT,
+        endpoint.connect(address, BUS_ALPN),
+    )
+    .await
+    .map_err(|_| FederationFailure::ConnectDeadline)?
+    .map_err(|_| FederationFailure::ConnectFailed)?;
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         selection.remote_path(&connection, gate).map_err(|_| ())?;
         let (mut send, mut recv) = connection.open_bi().await.map_err(|_| ())?;
@@ -154,8 +178,8 @@ async fn forward_original(
         selection.remote_path(&connection, gate).map_err(|_| ())
     })
     .await
-    .map_err(|_| ())
-    .and_then(|result| result);
+    .map_err(|_| FederationFailure::TransferDeadline)
+    .and_then(|result| result.map_err(|_| FederationFailure::TransferOrAckRefused));
     connection.close(0u32.into(), b"native_original_finished");
     result
 }
@@ -1131,63 +1155,24 @@ async fn run_daemon_loop(
                 return 1;
             }
         };
-    // Binding a socket does not register it with the configured relay. Wait
-    // before issuing the room's short-lived challenge, so ONLINE cannot race
-    // the relay handshake. Local/disabled-relay publishers never wait here.
+    // Home-relay selection is diagnostic only. Explicit peer relay addresses
+    // can lazily dial a non-home relay, so no HOME selection may gate them.
     if let Some((selection, _)) = &network
         && let Some(expected_relay) = selection.policy().relay_url()
     {
-        let registration_started = std::time::Instant::now();
-        let initially_registered = endpoint
-            .home_relay_status()
-            .get()
+        let statuses = endpoint.home_relay_status().get();
+        let selected = statuses
             .iter()
-            .any(|status| status.url() == expected_relay && status.is_connected());
-        let ready = tokio::time::timeout(RELAY_REGISTRATION_TIMEOUT, endpoint.online())
-            .await
-            .is_ok()
-            && endpoint
-                .home_relay_status()
-                .get()
-                .iter()
-                .any(|status| status.url() == expected_relay && status.is_connected());
-        if !ready {
-            let statuses = endpoint.home_relay_status().get();
-            let selected = statuses
-                .iter()
-                .find(|status| status.url() == expected_relay);
-            let _ = writeln!(
-                stdout,
-                "{}",
-                json!({
-                    "event": "native_relay_registration_held",
-                    "endpoint_id": endpoint.id().to_string(),
-                    "relay_origin": expected_relay.as_str(),
-                    "selected_expected_relay": selected.is_some(),
-                    "connected": selected.is_some_and(|status| status.is_connected()),
-                    "connection_error_observed": selected.is_some_and(|status| status.last_error().is_some()),
-                    "authentication_denied": selected.is_some_and(|status| status.auth_denied_reason().is_some()),
-                    "registration_wait_ms": registration_started.elapsed().as_millis()
-                })
-            );
-            let _ = stdout.flush();
-            endpoint.close().await;
-            let _ = writeln!(
-                stdout,
-                "chinwag bus network HELD: owned relay registration unavailable"
-            );
-            return 1;
-        }
+            .find(|status| status.url() == expected_relay);
         let _ = writeln!(
             stdout,
             "{}",
             json!({
-                "event": "native_relay_registered",
+                "event": "native_home_relay_observation",
                 "endpoint_id": endpoint.id().to_string(),
-                "relay_origin": expected_relay.as_str(),
-                "initially_registered": initially_registered,
-                "registration_wait_ms": registration_started.elapsed().as_millis(),
-                "scope": "TRANSPORT_REGISTRATION_ONLY_NOT_DELIVERY"
+                "selected_expected_home_relay": selected.is_some(),
+                "home_relay_connected": selected.is_some_and(|status| status.is_connected()),
+                "scope": "HOME_SELECTION_DIAGNOSTIC_ONLY_NOT_CONNECTIVITY_OR_DELIVERY"
             })
         );
         let _ = stdout.flush();
@@ -1368,8 +1353,8 @@ async fn run_daemon_loop(
                         Ok(path) => json!({"event":"native_federation_ack", "original_id":id,
                             "original_digest_sha256":digest, "scope":"REMOTE_JOURNAL_PUBLICATION_ONLY",
                             "path":path, "processing":"UNKNOWN", "work_started":"UNKNOWN"}),
-                        Err(()) => json!({"event":"native_federation_unknown", "original_id":id,
-                            "original_digest_sha256":digest, "automatic_retry":false}),
+                        Err(failure) => json!({"event":"native_federation_unknown", "original_id":id,
+                            "original_digest_sha256":digest, "phase":failure.category(), "automatic_retry":false}),
                     };
                     let _ = writeln!(stdout, "{record}"); let _ = stdout.flush();
                 }
