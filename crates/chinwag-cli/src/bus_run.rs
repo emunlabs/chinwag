@@ -373,6 +373,7 @@ pub fn sign_bus_message(msg: &mut BusMessage, secret: &SecretKey) {
 /// (b) that `pubkey_ed25519` is registered for `msg.sender` in `<repo_root>/.chinwag/allowed_signers` (`BUS-HARDEN-04`).
 /// Fails closed if `.chinwag/allowed_signers` is missing, unreadable, empty, or does not map `pubkey` to `msg.sender`.
 pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> bool {
+    use subtle::ConstantTimeEq;
     if ActorAddress::parse(&msg.sender).is_err()
         || msg
             .to
@@ -416,7 +417,7 @@ pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> 
     }
     let sender_norm = base_seat_str(&msg.sender).trim().to_uppercase();
     let in_allowed = signers.iter().any(|(seat_opt, bytes)| {
-        bytes == pubkey.as_bytes()
+        bool::from(bytes.ct_eq(pubkey.as_bytes()))
             && seat_opt
                 .as_deref()
                 .is_some_and(|s| s.eq_ignore_ascii_case(&sender_norm))

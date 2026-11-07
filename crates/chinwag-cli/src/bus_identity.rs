@@ -12,6 +12,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
 };
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 const KEY_NAME: &str = "daemon_secret.key";
@@ -315,7 +316,10 @@ pub fn load_or_create_daemon_secret(repo_root: &Path) -> Result<SecretKey> {
     let expected_public = SecretKey::from_bytes(&seed).public();
     let (loaded, observed) = read_existing(&directories)?.ok_or(IdentityError::Changed)?;
     // Only public IDs are compared; temporary seed material is zeroized.
-    if observed != written || observed.id != empty.id || loaded.public() != expected_public {
+    if observed != written
+        || observed.id != empty.id
+        || !bool::from(loaded.public().as_bytes().ct_eq(expected_public.as_bytes()))
+    {
         return Err(IdentityError::Changed);
     }
     Ok(loaded)
@@ -336,7 +340,11 @@ fn legacy_public_id(repo_root: &Path) -> Result<EndpointId> {
 /// OS randomness: a moved legacy identity or an unrelated weak key is unbound
 /// until separately enrolled. This predicate can only support remote refusal.
 pub fn is_known_legacy_public_id(repo_root: &Path, public: &EndpointId) -> Result<bool> {
-    Ok(legacy_public_id(repo_root)? == *public)
+    Ok(bool::from(
+        legacy_public_id(repo_root)?
+            .as_bytes()
+            .ct_eq(public.as_bytes()),
+    ))
 }
 
 #[cfg(test)]
