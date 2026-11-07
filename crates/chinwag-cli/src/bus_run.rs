@@ -2248,7 +2248,10 @@ mod tests {
                     &[
                         "inbox".into(),
                         "--repo".into(),
-                        temp.path().to_string_lossy().into_owned(),
+                        fs::canonicalize(temp.path())
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
                         "--for".into(),
                         query.into(),
                         "--json".into()
@@ -2256,7 +2259,9 @@ mod tests {
                     &mut out,
                     &mut err
                 ),
-                0
+                0,
+                "{}",
+                String::from_utf8_lossy(&err)
             );
             let rows: Vec<BusMessage> = serde_json::from_slice(&out).unwrap();
             assert_eq!(rows.iter().map(|row| row.seq).collect::<Vec<_>>(), expected);

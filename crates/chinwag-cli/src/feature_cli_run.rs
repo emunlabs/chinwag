@@ -31,13 +31,12 @@ fn explicit_repo_selector(args: &[String]) -> Result<Option<PathBuf>, String> {
         } else {
             args[i].strip_prefix("--repo=")
         };
-        if let Some(value) = value {
-            if value.is_empty()
+        if let Some(value) = value
+            && (value.is_empty()
                 || value.starts_with("--")
-                || explicit.replace(PathBuf::from(value)).is_some()
-            {
-                return Err("missing or duplicate --repo selector".into());
-            }
+                || explicit.replace(PathBuf::from(value)).is_some())
+        {
+            return Err("missing or duplicate --repo selector".into());
         }
         i += 1;
     }
@@ -1418,6 +1417,8 @@ fn run_bond_cli_in_context(
 mod tests {
     use super::*;
 
+    type CliRunner = fn(&[String], &mut dyn Write, &mut dyn Write) -> u8;
+
     fn init_test_repo(repo: &Path) {
         for args in [
             vec!["init", "-q"],
@@ -1679,7 +1680,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         init_test_repo(&root);
-        let runners: [fn(&[String], &mut dyn Write, &mut dyn Write) -> u8; 5] = [
+        let runners: [CliRunner; 5] = [
             run_openspec_cli,
             run_plugin_cli,
             run_a509_cli,
@@ -1718,7 +1719,7 @@ mod tests {
         let root = fs::canonicalize(temp.path()).unwrap();
         init_test_repo(&root);
         fs::write(root.join("TASKS.md"), "# explicitly selected fixture").unwrap();
-        let commands: [(fn(&[String], &mut dyn Write, &mut dyn Write) -> u8, &str); 4] = [
+        let commands: [(CliRunner, &str); 4] = [
             (run_openspec_cli, "archive"),
             (run_plugin_cli, "init"),
             (run_cwcard_cli, "init"),
