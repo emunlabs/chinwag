@@ -89,10 +89,13 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("bus") {
+            // The daemon's async handlers also write diagnostics. Holding a
+            // process-wide stdio lock across its runtime blocks those workers
+            // before they can acknowledge a persisted remote original.
             let code = bus_run::run_bus_cli(
                 &raw_args[2..],
-                &mut std::io::stdout().lock(),
-                &mut std::io::stderr().lock(),
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
             );
             return ExitCode::from(code);
         }
