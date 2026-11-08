@@ -170,7 +170,7 @@ impl CommandProfile {
             .current_dir("/");
         c.args(["run","--rm","--pull","never","--platform","linux/amd64","--entrypoint","/bin/sh","--name"]).arg(self.container_name())
             .arg("--cidfile").arg(root.join("container-id"))
-            .args(["--label",&format!("io.chinwag.ci.execution={}",hex::encode(self.spec.execution_id)),"--network","none","--cap-drop","ALL","--security-opt","no-new-privileges","--user","65532:65532","--read-only","--pids-limit","128","--memory","512m","--cpus","2","--tmpfs","/tmp:rw,noexec,nosuid,size=64m","--tmpfs","/build:rw,nosuid,size=128m","--mount"])
+            .args(["--label",&format!("io.chinwag.ci.execution={}",hex::encode(self.spec.execution_id)),"--network","none","--cap-drop","ALL","--security-opt","no-new-privileges","--user","65532:65532","--read-only","--pids-limit","128","--memory","512m","--cpus","2","--tmpfs","/tmp:rw,noexec,nosuid,size=64m","--tmpfs","/build:rw,exec,nosuid,size=128m","--mount"])
             .arg(format!("type=bind,source={},target=/src,readonly",fixture.display()))
             .args(["--workdir","/src","--env","HOME=/tmp","--env","LC_ALL=C"])
             .arg(&self.spec.rust_image)
@@ -511,6 +511,11 @@ mod tests {
             ["--pull", "never"],
             ["--security-opt", "no-new-privileges"],
             ["--entrypoint", "/bin/sh"],
+            // Docker prepends noexec to tmpfs mounts. Only the bounded build
+            // scratch space may execute the binary that the admitted command
+            // compiles; general temporary data remains non-executable.
+            ["--tmpfs", "/build:rw,exec,nosuid,size=128m"],
+            ["--tmpfs", "/tmp:rw,noexec,nosuid,size=64m"],
         ] {
             assert!(args.windows(2).any(|w| w == pair));
         }
