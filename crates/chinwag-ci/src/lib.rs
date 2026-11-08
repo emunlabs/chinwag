@@ -22,6 +22,8 @@ use zeroize::Zeroizing;
 #[cfg(unix)]
 pub mod admission;
 #[cfg(unix)]
+pub mod authorization;
+#[cfg(unix)]
 pub mod custody;
 pub mod envelope;
 pub mod github;

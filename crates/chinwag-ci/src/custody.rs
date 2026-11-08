@@ -378,6 +378,18 @@ fn enrolled_store_binding(
     }
 }
 impl OwnerCustody {
+    /// Only a record actually committed by AdmissionLedger can be certified;
+    /// this owner exposes no arbitrary-signing or raw-key operation.
+    pub fn certify_admission(
+        &self,
+        admission: &crate::admission::CommittedAdmission,
+    ) -> Result<Vec<u8>, CustodyError> {
+        self.guard.check()?;
+        let Keys::Admission { signer } = &self.keys else {
+            return Err(CustodyError::Role);
+        };
+        crate::authorization::certify(admission, signer).map_err(|_| CustodyError::Held)
+    }
     fn assemble(
         guard: Arc<Guard>,
         material: Material,

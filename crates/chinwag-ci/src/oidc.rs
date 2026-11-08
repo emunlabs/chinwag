@@ -957,6 +957,130 @@ mod tests {
             .unwrap()
         }
         #[test]
+        fn owner_certificate_binds_exact_committed_record_and_canonical_signature() {
+            use crate::{
+                authorization,
+                custody::{OwnerCustody, OwnerRole, PublicEnrollment},
+            };
+            let d = directory();
+            let vault = directory();
+            let mut ledger = AdmissionLedger::open(&d.path().canonicalize().unwrap()).unwrap();
+            let challenge = ledger
+                .issue(&dispatch_intent("cd"), runner_keys(), 100, 1, 1001, 1090)
+                .unwrap();
+            let proof = binding("cd", &challenge, "certificate-token", 1000);
+            let admission = match ledger.consume(&proof, challenge.nonce, 1002).unwrap() {
+                AdmissionOutcome::NewlyCommitted(record) => record,
+                _ => panic!("new fixture admission required"),
+            };
+            let owner = OwnerCustody::create_new(
+                &vault.path().canonicalize().unwrap(),
+                OwnerRole::Admission,
+                [12; 32],
+                None,
+            )
+            .unwrap();
+            let PublicEnrollment::Admission { signer } = owner.public_enrollment().unwrap() else {
+                panic!("role")
+            };
+            let certificate = owner.certify_admission(&admission).unwrap();
+            let verified = authorization::verify_historical_certificate(&certificate, signer)
+                .unwrap()
+                .require_current(1002)
+                .unwrap();
+            assert_eq!(verified.digest(), admission.digest());
+            assert!(verified.record() == admission.record());
+            let claims = verified.expected_provenance([13; 32], 1).unwrap();
+            assert_eq!(claims.run_id, 100);
+            assert_eq!(claims.command_profile_sha256, [0xde; 32]);
+            assert_eq!(claims.delivery_profile_sha256, [0xcd; 32]);
+            assert!(verified.expected_provenance([0; 32], 1).is_err());
+            assert!(authorization::verify_historical_certificate(&certificate, [14; 32]).is_err());
+            for field in ["signer", "admission_sha256", "record"] {
+                let mut changed: serde_json::Value = serde_json::from_slice(&certificate).unwrap();
+                if field == "record" {
+                    changed["statement"][field]["run_id"] = json!(101);
+                } else {
+                    changed["statement"][field][0] = json!(42);
+                }
+                assert!(
+                    authorization::verify_historical_certificate(
+                        &serde_json::to_vec(&changed).unwrap(),
+                        signer
+                    )
+                    .is_err()
+                );
+            }
+            let mut padded = certificate.clone();
+            padded.push(b' ');
+            assert!(authorization::verify_historical_certificate(&padded, signer).is_err());
+            let mut extended: serde_json::Value = serde_json::from_slice(&certificate).unwrap();
+            extended["unrecognized"] = json!(true);
+            assert!(
+                authorization::verify_historical_certificate(
+                    &serde_json::to_vec(&extended).unwrap(),
+                    signer
+                )
+                .is_err()
+            );
+        }
+        #[test]
+        fn historical_reconciliation_cannot_renew_a_certificate_or_publication_authority() {
+            use crate::{
+                authorization::{self, AuthorizationError},
+                custody::{OwnerCustody, OwnerRole, PublicEnrollment},
+            };
+            let d = directory();
+            let vault = directory();
+            let path = d.path().canonicalize().unwrap();
+            let vp = vault.path().canonicalize().unwrap();
+            let mut ledger = AdmissionLedger::open(&path).unwrap();
+            let challenge = ledger
+                .issue(&dispatch_intent("cd"), runner_keys(), 100, 1, 1001, 1090)
+                .unwrap();
+            let proof = binding("cd", &challenge, "historical-token", 1000);
+            let AdmissionOutcome::NewlyCommitted(admission) =
+                ledger.consume(&proof, challenge.nonce, 1002).unwrap()
+            else {
+                panic!("new")
+            };
+            let owner =
+                OwnerCustody::create_new(&vp, OwnerRole::Admission, [15; 32], None).unwrap();
+            let enrollment = owner.public_enrollment().unwrap();
+            let PublicEnrollment::Admission { signer } = enrollment else {
+                panic!("role")
+            };
+            let certificate = owner.certify_admission(&admission).unwrap();
+            drop(owner);
+            drop(ledger);
+            let owner =
+                OwnerCustody::open_enrolled(&vp, OwnerRole::Admission, [15; 32], None, &enrollment)
+                    .unwrap();
+            let mut ledger = AdmissionLedger::open(&path).unwrap();
+            let AdmissionOutcome::ReconciledOriginal(original) =
+                ledger.consume(&proof, challenge.nonce, 5000).unwrap()
+            else {
+                panic!("reconcile")
+            };
+            assert_eq!(certificate, owner.certify_admission(&original).unwrap());
+            for now in [1000, 1090, 5000] {
+                assert!(matches!(
+                    authorization::verify_historical_certificate(&certificate, signer)
+                        .unwrap()
+                        .require_current(now),
+                    Err(AuthorizationError::Lifetime)
+                ));
+            }
+            assert!(
+                authorization::verify_historical_certificate(&certificate, signer)
+                    .unwrap()
+                    .require_current(1089)
+                    .is_ok()
+            );
+            let wrong = OwnerCustody::create_new(&vp, OwnerRole::Acu, [15; 32], None).unwrap();
+            assert!(wrong.certify_admission(&admission).is_err());
+        }
+        #[test]
         fn one_durable_admission_survives_reopen_and_exact_reconciliation_never_renews_it() {
             let d = directory();
             let path = d.path().canonicalize().unwrap();
