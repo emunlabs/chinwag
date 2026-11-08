@@ -85,6 +85,7 @@ fn expected(now_unix: u64) -> IntentVerification<'static> {
     IntentVerification {
         initiator_instance: INITIATOR,
         initiator_public_key: key().verifying_key().to_bytes(),
+        admission_addressee: "GEMINI-PM#test-instance-5678",
         task_id: "CHWG-CI-TEST",
         room: "#eng",
         now_unix,
@@ -102,6 +103,25 @@ fn verifies_exact_native_original_and_utf8_byte_lengths() {
         hex::encode(verified.original_digest()),
         value["digest_sha256"]
     );
+}
+
+#[test]
+fn a_valid_signature_for_another_admission_recipient_does_not_grant_scope() {
+    let bytes = serde_json::to_vec(&original(&body().to_string())).unwrap();
+    for destination in [
+        "OTHER#test-instance-5678",
+        "GEMINI-PM",
+        "ALL#test-instance-5678",
+        "GEMINI-PM#test-instance-5678,OTHER#test-instance-1234",
+        "",
+    ] {
+        let mut other = expected(1001);
+        other.admission_addressee = destination;
+        assert!(matches!(
+            verify_original(&bytes, other),
+            Err(IntentError::Scope)
+        ));
+    }
 }
 
 #[test]

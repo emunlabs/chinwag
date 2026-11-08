@@ -646,6 +646,7 @@ mod tests {
             crate::intent::IntentVerification {
                 initiator_instance: sender,
                 initiator_public_key: signer.verifying_key().to_bytes(),
+                admission_addressee: to,
                 task_id: "CHWG-CI-TEST",
                 room: "#eng",
                 now_unix: 1001,

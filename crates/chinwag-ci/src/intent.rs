@@ -53,6 +53,10 @@ pub struct IntentSpec {
 pub struct IntentVerification<'a> {
     pub initiator_instance: &'a str,
     pub initiator_public_key: [u8; 32],
+    /// Exact, qualified admission recipient from trusted local policy. A
+    /// different signed destination (including broadcasts/lists) grants this
+    /// coordinator no right to admit the intent.
+    pub admission_addressee: &'a str,
     pub task_id: &'a str,
     pub room: &'a str,
     pub now_unix: u64,
@@ -192,6 +196,7 @@ pub fn verify_original(
     }
     let original: NativeOriginal = serde_json::from_slice(json).map_err(|_| IntentError::Format)?;
     if !qualified_instance(expected.initiator_instance)
+        || !qualified_instance(expected.admission_addressee)
         || original.sender != expected.initiator_instance
         || original.task_id != expected.task_id
         || original.room != expected.room
@@ -244,6 +249,9 @@ pub fn verify_original(
     let digest: [u8; 32] = Sha256::digest(digest_input.as_bytes()).into();
     if hex::encode(digest) != original.digest_sha256 {
         return Err(IntentError::Authentication);
+    }
+    if original.to != expected.admission_addressee {
+        return Err(IntentError::Scope);
     }
     let spec: IntentSpec = serde_json::from_str(&original.body).map_err(|_| IntentError::Format)?;
     if !valid_spec(&spec) || spec.recipient_instance != original.sender {
