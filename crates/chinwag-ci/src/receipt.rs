@@ -104,6 +104,31 @@ fn signed_bytes(v: &Statement) -> Result<Vec<u8>, ReceiptError> {
     Ok(input)
 }
 impl ReceiptSigner {
+    pub(crate) fn from_owner_seed(
+        role: Destination,
+        store_id: [u8; 32],
+        store: CiphertextStore,
+        seed: &[u8; 32],
+    ) -> Result<Self, ReceiptError> {
+        if store_id == [0; 32] {
+            return Err(ReceiptError::Rejected);
+        }
+        Ok(Self {
+            secret: iroh::SecretKey::from_bytes(seed),
+            role,
+            store_id,
+            store,
+        })
+    }
+    pub(crate) fn read_complete_object(
+        &self,
+        receipt: &VerifiedStorageReceipt,
+    ) -> Result<Vec<u8>, ReceiptError> {
+        if receipt.role != self.role || receipt.store_id != self.store_id {
+            return Err(ReceiptError::Rejected);
+        }
+        Ok(self.store.read_existing(receipt.object_claim())?)
+    }
     /// Owner enrolls the returned public key together with this store ID and
     /// capability. The signer can never be redirected to an arbitrary store.
     pub fn generate(

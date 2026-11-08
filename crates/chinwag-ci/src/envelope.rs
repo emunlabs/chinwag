@@ -550,6 +550,13 @@ pub struct GateSecret {
     envelope: [u8; 32],
 }
 impl AcuGateKey {
+    pub(crate) fn from_owner_seed(seed: &[u8; 32]) -> Self {
+        let (secret, public) = Kem::derive_keypair(seed);
+        Self {
+            secret,
+            public: public.to_bytes().into(),
+        }
+    }
     pub fn generate() -> Result<Self, EnvelopeError> {
         let (secret, public) = generate_kem()?;
         Ok(Self { secret, public })
@@ -580,6 +587,14 @@ impl AcuGateKey {
     }
 }
 impl DestinationKey {
+    pub(crate) fn from_owner_seed(role: Destination, seed: &[u8; 32]) -> Self {
+        let (secret, public) = Kem::derive_keypair(seed);
+        Self {
+            secret,
+            public: public.to_bytes().into(),
+            role,
+        }
+    }
     pub fn generate(role: Destination) -> Result<Self, EnvelopeError> {
         let (secret, public) = generate_kem()?;
         Ok(Self {
@@ -669,6 +684,14 @@ impl GateSecret {
     }
 }
 impl ResponseKey {
+    pub(crate) fn from_owner_seed(role: Destination, seed: &[u8; 32]) -> Self {
+        let (secret, public) = Kem::derive_keypair(seed);
+        Self {
+            secret,
+            public: public.to_bytes().into(),
+            role,
+        }
+    }
     pub fn generate(role: Destination) -> Result<Self, EnvelopeError> {
         let (secret, public) = generate_kem()?;
         Ok(Self {

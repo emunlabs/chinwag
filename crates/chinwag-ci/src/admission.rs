@@ -126,6 +126,11 @@ pub struct AdmissionLedger {
     poisoned: bool,
     initializing: bool,
 }
+impl Drop for AdmissionLedger {
+    fn drop(&mut self) {
+        let _ = fs::flock(&self.lock, FlockOperation::NonBlockingUnlock);
+    }
+}
 fn canonical<T: Serialize>(v: &T) -> Result<Vec<u8>, AdmissionError> {
     serde_json::to_vec(v).map_err(|_| AdmissionError::Store)
 }
@@ -491,6 +496,16 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         d
+    }
+    #[test]
+    fn final_ledger_owner_releases_lock_even_with_a_transient_inherited_fd() {
+        let d = directory();
+        let p = d.path().canonicalize().unwrap();
+        let ledger = AdmissionLedger::open(&p).unwrap();
+        let inherited = rustix::io::dup(&ledger.lock).unwrap();
+        drop(ledger);
+        AdmissionLedger::open(&p).unwrap();
+        drop(inherited);
     }
     #[test]
     fn initialized_state_disappearance_and_mismatched_initialization_never_reset_replay_memory() {

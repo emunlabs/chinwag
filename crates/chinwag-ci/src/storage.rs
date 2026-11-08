@@ -106,6 +106,23 @@ impl CiphertextStore {
         use rustix::fd::AsFd;
         self.directory.as_fd()
     }
+    /// Public owner enrollment binding to this anchored local directory, not a
+    /// portable host identity or a hash of any private key/file contents.
+    pub(crate) fn directory_binding(&self) -> Result<[u8; 32], StorageError> {
+        self.check()?;
+        let s = fs::fstat(&self.directory).map_err(|_| StorageError::Directory)?;
+        let mut h = Sha256::new();
+        h.update(b"chinwag-ci-owner-directory-binding-v1\0");
+        for value in [
+            std::env::consts::OS.as_bytes(),
+            &s.st_dev.to_be_bytes(),
+            &s.st_ino.to_be_bytes(),
+        ] {
+            h.update((value.len() as u64).to_be_bytes());
+            h.update(value);
+        }
+        Ok(h.finalize().into())
+    }
     /// Open the explicitly owned store, refusing symlinks in every component.
     /// The capability remains anchored if the directory is subsequently renamed.
     /// No existing permission, parent, or service is changed by this method.
