@@ -733,6 +733,8 @@ name = "chinwag-ci"
 version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
+ "ed25519-dalek 2.2.0",
+ "hex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

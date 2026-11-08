@@ -23,3 +23,13 @@ artifact, write it into an inbox, or echo it into a public runner log.
 The tests re-execute a Rust fixture as a real child. They exercise a failure with
 output larger than a pipe, binary stderr, explicit output overflow, deadline
 cleanup, invalid context refusal and a real successful process exit.
+
+The `intent` module verifies an initiating agent's original native bus signature
+against a caller-pinned seat key, exact qualified sender, task and room. It also
+verifies the native digest, typed dispatch context and finite intent lifetime.
+Its tests include the published RFC 8032 section 7.1 Ed25519 known-answer vector
+and application tampering cases. The seat key authenticates a signed routing
+assertion; it does not establish an independently keyed chat/process identity.
+`VerifiedIntent` deliberately does not grant OIDC admission, replay consumption,
+K2 attestation, addressed delivery, or permission to execute a repair. Those
+checks must bind the actual GitHub run and trusted current instance separately.

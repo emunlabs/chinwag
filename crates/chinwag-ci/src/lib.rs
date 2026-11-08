@@ -15,6 +15,8 @@ use std::{io, process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 use zeroize::Zeroizing;
 
+pub mod intent;
+
 pub const MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
 
 /// These fields are supplied claims. A separate admission verifier must bind
