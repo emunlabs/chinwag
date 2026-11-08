@@ -8,7 +8,7 @@ use crate::{
     authorization::AdmissionBoundEnvelope, profile::CommandProfile, runtime::RuntimeError,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 #[derive(Deserialize)]
@@ -134,11 +134,53 @@ struct Isolated<'a> {
     completed_unix: Option<u64>,
     completed_within_admission: bool,
 }
+
+/// Created only after the authenticated, authorized capture has passed every
+/// context, command, lifecycle and complete-stream check below. This is evidence
+/// of an observed result, never an agent binding or permission to run a repair.
+pub(crate) struct VerifiedCapture {
+    outcome: CompletedOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CompletedOutcome {
+    Exited { code: i32 },
+    Signaled { signal: i32 },
+}
+
+impl VerifiedCapture {
+    pub(crate) fn outcome(&self) -> CompletedOutcome {
+        self.outcome
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        !matches!(self.outcome, CompletedOutcome::Exited { code: 0 })
+    }
+}
+
+fn completed_outcome(outcome: &Outcome, exit: Option<&Exit>) -> Option<CompletedOutcome> {
+    let exit = exit.filter(|exit| exit.observed_before_capture_failure)?;
+    match outcome {
+        Outcome::Exited { code }
+            if exit.code == Some(*code) && exit.signal.is_none() && *code >= 0 =>
+        {
+            Some(CompletedOutcome::Exited { code: *code })
+        }
+        Outcome::Signaled {
+            signal: Some(signal),
+        } if exit.signal == Some(*signal) && exit.code.is_none() && *signal > 0 => {
+            Some(CompletedOutcome::Signaled { signal: *signal })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn validate(
     bytes: &[u8],
     e: &AdmissionBoundEnvelope,
     profile: &CommandProfile,
-) -> Result<(), RuntimeError> {
+) -> Result<VerifiedCapture, RuntimeError> {
     let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError)?;
     let c = &v.captured;
     let r = e.admission_record();
@@ -150,32 +192,22 @@ pub(crate) fn validate(
     wanted.observed_parent_working_directory_base64 =
         c.command.observed_parent_working_directory_base64;
     // Actual parent cwd is an observed field, not a source of execution authority.
-    let valid_outcome = match (&c.outcome, &c.observed_child_exit) {
-        (Outcome::Exited { code }, Some(exit)) => {
-            exit.code == Some(*code)
-                && exit.signal.is_none()
-                && exit.observed_before_capture_failure
-        }
-        (Outcome::Signaled { signal }, Some(exit)) => {
-            *signal == exit.signal && exit.code.is_none() && exit.observed_before_capture_failure
-        }
-        (Outcome::DeadlineExceeded { child_reaped }, _) => {
+    let outcome = completed_outcome(&c.outcome, c.observed_child_exit.as_ref());
+    // Preserve parsing of incomplete outcomes while refusing to promote them
+    // into a completed failure suitable for a later independently admitted wake.
+    match &c.outcome {
+        Outcome::DeadlineExceeded { child_reaped } => {
             let _ = child_reaped;
-            false
         }
-        (
-            Outcome::CaptureIoFailed {
-                child_reaped,
-                operation,
-                io_error_kind,
-            },
-            _,
-        ) => {
+        Outcome::CaptureIoFailed {
+            child_reaped,
+            operation,
+            io_error_kind,
+        } => {
             let _ = (child_reaped, operation, io_error_kind);
-            false
         }
-        _ => false,
-    };
+        _ => {}
+    }
     let timing = c
         .timing
         .started_unix_ms
@@ -216,7 +248,7 @@ pub(crate) fn validate(
         || c.context.job != "chinwag-ci-proof"
         || c.context.initiating_intent_sha256 != hex::encode(r.intent_digest)
         || c.command != wanted
-        || !valid_outcome
+        || outcome.is_none()
         || !timing
         || !closed
         || !c.stdout.complete()
@@ -224,7 +256,9 @@ pub(crate) fn validate(
     {
         return Err(RuntimeError);
     }
-    Ok(())
+    Ok(VerifiedCapture {
+        outcome: outcome.ok_or(RuntimeError)?,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -259,5 +293,44 @@ mod tests {
         ] {
             assert!(serde_json::from_slice::<Isolated<'_>>(b).is_err())
         }
+    }
+
+    #[test]
+    fn completed_failures_require_matching_observed_os_exit_not_failure_text() {
+        let mut exit = Exit {
+            code: Some(0),
+            signal: None,
+            observed_before_capture_failure: true,
+        };
+        let green = VerifiedCapture {
+            outcome: completed_outcome(&Outcome::Exited { code: 0 }, Some(&exit)).unwrap(),
+        };
+        assert!(!green.failed());
+        assert_eq!(green.outcome(), CompletedOutcome::Exited { code: 0 });
+        exit.code = Some(101);
+        let red = VerifiedCapture {
+            outcome: completed_outcome(&Outcome::Exited { code: 101 }, Some(&exit)).unwrap(),
+        };
+        assert!(red.failed());
+        assert!(completed_outcome(&Outcome::Exited { code: 0 }, Some(&exit)).is_none());
+        assert!(completed_outcome(&Outcome::Exited { code: 101 }, None).is_none());
+        exit.observed_before_capture_failure = false;
+        assert!(completed_outcome(&Outcome::Exited { code: 101 }, Some(&exit)).is_none());
+        exit.observed_before_capture_failure = true;
+        exit.code = None;
+        exit.signal = Some(15);
+        let signaled = VerifiedCapture {
+            outcome: completed_outcome(&Outcome::Signaled { signal: Some(15) }, Some(&exit))
+                .unwrap(),
+        };
+        assert!(signaled.failed());
+        assert!(completed_outcome(&Outcome::Signaled { signal: None }, Some(&exit)).is_none());
+        assert!(
+            completed_outcome(
+                &Outcome::DeadlineExceeded { child_reaped: true },
+                Some(&exit)
+            )
+            .is_none()
+        );
     }
 }

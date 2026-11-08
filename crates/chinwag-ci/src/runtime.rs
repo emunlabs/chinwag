@@ -630,7 +630,7 @@ fn qualified_output(
     let plaintext = checked(owner.open_payload_from_grant(envelope, &grant, policy, now()?))?;
     // Parse and traverse the complete sealed capture before recording qualified
     // read. Content is untrusted evidence, never instructions or repair authority.
-    crate::capture_read::validate(&plaintext, envelope, profile)?;
+    let verified = crate::capture_read::validate(&plaintext, envelope, profile)?;
     obs.plaintext_sha256 = Sha256::digest(&plaintext).into();
     obs.plaintext_bytes = plaintext.len() as u64;
     obs.fully_read = true;
@@ -640,6 +640,14 @@ fn qualified_output(
     write_new(
         &outputs.join("qualified-read-observation.json"),
         &json(&obs)?,
+    )?;
+    write_new(
+        &outputs.join("qualified-command-outcome.json"),
+        &json(&serde_json::json!({
+            "classification": "AUTHORIZED_CAPTURE_OUTCOME_NOT_WAKE_OR_REPAIR_AUTHORITY",
+            "outcome": verified.outcome(),
+            "failed": verified.failed(),
+        }))?,
     )?;
     Ok(obs)
 }
