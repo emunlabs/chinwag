@@ -86,7 +86,7 @@ registration do not prove that the runner finished bootstrap, prepared its image
 reached its readiness loop or delivered a payload. Diagnostic records add no
 retries or authority and do not relax trust.
 
-Owner POSTs now use a 30-second response budget: the existing 25-second server
+Runner owner POSTs now use a 30-second response budget: the existing 25-second server
 handler bound plus five seconds for transport and response delivery. This aligns
 the earlier 10-second caller deadline with server evidence reads
 that may themselves take ten seconds. GitHub/OIDC evidence requests retain their
