@@ -5,7 +5,7 @@
 // Public calculation fixture for the real red/read/fix/green demonstration.
 // The CI transport implementation does not inspect or fix it.
 fn invoice_total(subtotal: i64, adjustment: i64) -> i64 {
-    subtotal - adjustment
+    subtotal + adjustment
 }
 
 #[test]
