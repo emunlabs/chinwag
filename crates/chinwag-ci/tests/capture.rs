@@ -32,6 +32,15 @@ fn process_fixture() {
             std::process::exit(17);
         }
         Ok("deadline") => std::thread::sleep(Duration::from_secs(30)),
+        Ok("pipe-holder") => std::thread::sleep(Duration::from_millis(600)),
+        Ok("failed-with-held-pipe") => {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process_fixture", "--nocapture", "--quiet"])
+                .env("CHINWAG_CI_CAPTURE_FIXTURE", "pipe-holder")
+                .spawn()
+                .unwrap();
+            std::process::exit(17);
+        }
         Ok("green") => std::process::exit(0),
         _ => {}
     }
@@ -144,4 +153,31 @@ async fn invalid_provenance_is_refused_before_spawn() {
         capture(&mut child("green"), invalid, CaptureLimits::default()).await,
         Err(chinwag_ci::CaptureError::InvalidInput)
     ));
+}
+
+#[tokio::test]
+async fn preserves_exit_when_a_descendant_keeps_the_pipe_open() {
+    let evidence = capture(
+        &mut child("failed-with-held-pipe"),
+        context(),
+        CaptureLimits {
+            deadline: Duration::from_millis(200),
+            ..CaptureLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        evidence.outcome(),
+        ProcessOutcome::DeadlineExceeded { child_reaped: true }
+    ));
+    let exit = evidence
+        .observed_child_exit()
+        .expect("direct child exit was observed");
+    assert_eq!(exit.code, Some(17));
+    assert!(exit.observed_before_capture_failure);
+    assert!(!evidence.output_is_complete());
+    // This controlled descendant is finite. Give it time to close its inherited
+    // pipes; production descendants belong to the runner's job sandbox.
+    tokio::time::sleep(Duration::from_millis(700)).await;
 }

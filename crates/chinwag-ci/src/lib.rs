@@ -56,10 +56,65 @@ impl Default for CaptureLimits {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProcessOutcome {
-    Exited { code: i32 },
-    Signaled { signal: Option<i32> },
-    DeadlineExceeded { child_reaped: bool },
-    CaptureIoFailed { child_reaped: bool },
+    Exited {
+        code: i32,
+    },
+    Signaled {
+        signal: Option<i32>,
+    },
+    DeadlineExceeded {
+        child_reaped: bool,
+    },
+    CaptureIoFailed {
+        child_reaped: bool,
+        operation: CaptureOperation,
+        io_error_kind: String,
+    },
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureOperation {
+    Stdout,
+    Stderr,
+    WaitForChild,
+}
+
+/// The child status and the pipe capture result are independent observations.
+#[derive(Serialize)]
+pub struct ObservedChildExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub observed_before_capture_failure: bool,
+}
+
+impl ObservedChildExit {
+    fn new(status: std::process::ExitStatus, before_failure: bool) -> Self {
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        Self {
+            code: status.code(),
+            signal,
+            observed_before_capture_failure: before_failure,
+        }
+    }
+}
+
+struct CaptureIoError {
+    operation: CaptureOperation,
+    kind: io::ErrorKind,
+}
+
+fn classify_io(operation: CaptureOperation, error: io::Error) -> CaptureIoError {
+    CaptureIoError {
+        operation,
+        kind: error.kind(),
+    }
 }
 
 /// No Debug implementation: accidentally logging this value must not print
@@ -71,6 +126,7 @@ pub struct CapturedRun {
     provenance: &'static str,
     context: UnverifiedRunContext,
     outcome: ProcessOutcome,
+    observed_child_exit: Option<ObservedChildExit>,
     stdout: StreamEvidence,
     stderr: StreamEvidence,
 }
@@ -143,6 +199,10 @@ impl CapturedRun {
         self.stdout.is_complete() && self.stderr.is_complete()
     }
 
+    pub fn observed_child_exit(&self) -> Option<&ObservedChildExit> {
+        self.observed_child_exit.as_ref()
+    }
+
     /// Sensitive plaintext serialization, intended only as input to sealing.
     /// It must not be written to stdout, an inbox, or a GitHub Actions artifact.
     pub fn plaintext_for_sealing(&self) -> Result<Zeroizing<Vec<u8>>, serde_json::Error> {
@@ -209,11 +269,29 @@ pub async fn capture(
     let stderr_pipe = child.stderr.take().expect("piped stderr");
     let mut stdout = StreamEvidence::new();
     let mut stderr = StreamEvidence::new();
+    let mut observed_child_exit = None;
     let result = timeout(limits.deadline, async {
         tokio::try_join!(
-            stdout.drain(stdout_pipe, limits.bytes_per_stream),
-            stderr.drain(stderr_pipe, limits.bytes_per_stream),
-            child.wait()
+            async {
+                stdout
+                    .drain(stdout_pipe, limits.bytes_per_stream)
+                    .await
+                    .map_err(|e| classify_io(CaptureOperation::Stdout, e))
+            },
+            async {
+                stderr
+                    .drain(stderr_pipe, limits.bytes_per_stream)
+                    .await
+                    .map_err(|e| classify_io(CaptureOperation::Stderr, e))
+            },
+            async {
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|e| classify_io(CaptureOperation::WaitForChild, e))?;
+                observed_child_exit = Some(ObservedChildExit::new(status, true));
+                Ok::<_, CaptureIoError>(status)
+            }
         )
     })
     .await;
@@ -235,14 +313,26 @@ pub async fn capture(
             // start_kill is safe even when wait already reaped the child but a
             // descendant retained a pipe. Never extend the process deadline.
             let _ = child.start_kill();
-            let child_reaped = matches!(
-                timeout(Duration::from_secs(2), child.wait()).await,
-                Ok(Ok(_))
-            );
-            if failure.is_err() {
-                ProcessOutcome::DeadlineExceeded { child_reaped }
+            let child_reaped = if observed_child_exit.is_some() {
+                true
             } else {
-                ProcessOutcome::CaptureIoFailed { child_reaped }
+                match timeout(Duration::from_secs(2), child.wait()).await {
+                    Ok(Ok(status)) => {
+                        observed_child_exit = Some(ObservedChildExit::new(status, false));
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            match failure {
+                Err(_) => ProcessOutcome::DeadlineExceeded { child_reaped },
+                Ok(Err(error)) => ProcessOutcome::CaptureIoFailed {
+                    child_reaped,
+                    operation: error.operation,
+                    // Only the stdlib enum name; never raw OS/upstream text.
+                    io_error_kind: format!("{:?}", error.kind),
+                },
+                Ok(Ok(_)) => unreachable!(),
             }
         }
     };
@@ -254,6 +344,7 @@ pub async fn capture(
         provenance: "UNVERIFIED_REQUIRES_SIGNED_INTENT_AND_WORKLOAD_ADMISSION",
         context,
         outcome,
+        observed_child_exit,
         stdout,
         stderr,
     })
