@@ -608,12 +608,19 @@ mod tests {
     }
 
     fn dispatch_intent(profile: &str) -> crate::intent::VerifiedIntent {
+        dispatch_intent_with_workflow(profile, &"bc".repeat(20))
+    }
+
+    fn dispatch_intent_with_workflow(
+        profile: &str,
+        workflow_commit: &str,
+    ) -> crate::intent::VerifiedIntent {
         use ed25519_dalek::{Signer, SigningKey};
         let signer = SigningKey::from_bytes(&[0x31; 32]); // ephemeral test-only identity
         let public = hex::encode(signer.verifying_key().to_bytes());
         let sender = "WORKHORSE#test-instance-1234";
         let body=json!({"schema":"chinwag.ci-dispatch-intent.v1","repository":"example/ci-test","repository_id":42,
-            "source_commit":"ab".repeat(20),"workflow_ref":expected().workflow_ref,"workflow_commit":"bc".repeat(20),
+            "source_commit":"ab".repeat(20),"workflow_ref":expected().workflow_ref,"workflow_commit":workflow_commit,
             "recipient_instance":sender,"delivery_profile_sha256":profile.repeat(32),"command_sha256":"de".repeat(32),
             "nonce":"ef".repeat(32),"expires_unix":1100}).to_string();
         let to = "GEMINI-PM#test-instance-5678";
@@ -1040,5 +1047,68 @@ mod tests {
                 Ok(AdmissionOutcome::NewlyCommitted(_))
             ));
         }
+    }
+
+    #[test]
+    fn trusted_public_run_metadata_binds_the_oidc_verifier_to_the_exact_signed_dispatch() {
+        use crate::github::{self, EvidenceError, TrustedDispatch};
+        let intent = dispatch_intent_with_workflow("cd", &"ab".repeat(20));
+        let trusted = TrustedDispatch {
+            run_id: 100,
+            run_attempt: 1,
+            repository_owner_id: 7,
+            actor_id: 9,
+            workflow_id: 99,
+        };
+        let repository = json!({"id":42,"full_name":"example/ci-test","owner":{"id":7}});
+        let raw = json!({"id":100,"run_attempt":1,"workflow_id":99,"event":"workflow_dispatch","status":"in_progress","conclusion":null,
+            "head_sha":"ab".repeat(20),"head_branch":"test","path":".github/workflows/ci.yml","actor":{"id":9},"repository":repository,"head_repository":repository});
+        let run = github::verify_run(&serde_json::to_vec(&raw).unwrap(), &intent, trusted).unwrap();
+        let mut c = claims();
+        c["workflow_sha"] = json!("ab".repeat(20));
+        verify_token(&issue(&c), &keys(), run.expected_oidc(AUD, 1001)).unwrap();
+        for (path, value) in [
+            ("/id", json!(101)),
+            ("/run_attempt", json!(2)),
+            ("/workflow_id", json!(98)),
+            ("/event", json!("push")),
+            ("/head_sha", json!("cd".repeat(20))),
+            ("/head_branch", json!("main")),
+            ("/path", json!(".github/workflows/other.yml")),
+            ("/actor/id", json!(10)),
+            ("/repository/id", json!(43)),
+            ("/repository/owner/id", json!(8)),
+            ("/head_repository/id", json!(43)),
+            ("/repository/full_name", json!("other/ci-test")),
+            ("/head_repository/full_name", json!("other/ci-test")),
+            ("/status", json!("completed")),
+            ("/conclusion", json!("failure")),
+        ] {
+            let mut changed = raw.clone();
+            *changed.pointer_mut(path).unwrap() = value;
+            assert!(
+                matches!(
+                    github::verify_run(&serde_json::to_vec(&changed).unwrap(), &intent, trusted),
+                    Err(EvidenceError::Scope)
+                ),
+                "{path}"
+            );
+        }
+        let text = raw.to_string();
+        let duplicated = format!("{{\"id\":100,{}", &text[1..]);
+        assert!(matches!(
+            github::verify_run(duplicated.as_bytes(), &intent, trusted),
+            Err(EvidenceError::Response)
+        ));
+        // A valid signed intent for a differently sourced workflow remains
+        // rejected by this same-commit MVP; no invented reusable-workflow proof.
+        assert!(matches!(
+            github::verify_run(
+                &serde_json::to_vec(&raw).unwrap(),
+                &dispatch_intent("cd"),
+                trusted
+            ),
+            Err(EvidenceError::Scope)
+        ));
     }
 }

@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 #[cfg(unix)]
 pub mod admission;
 pub mod envelope;
+pub mod github;
 pub mod intent;
 pub mod oidc;
 #[cfg(unix)]
