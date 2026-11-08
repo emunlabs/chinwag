@@ -42,6 +42,9 @@ pub struct IntentSpec {
     pub workflow_commit: String,
     pub recipient_instance: String,
     pub delivery_profile_sha256: String,
+    /// SHA-256 of the canonical immutable command PROFILE, including pinned
+    /// image, fixture bytes, isolation policy and finite bounds. The observed
+    /// program/argv digest in CommandEvidence is a distinct commitment.
     pub command_sha256: String,
     pub nonce: String,
     pub expires_unix: u64,

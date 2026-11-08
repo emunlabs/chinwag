@@ -294,7 +294,12 @@ fn validate_pre(pre: &PreHeader) -> Result<(), EnvelopeError> {
             return Err(EnvelopeError::Rejected);
         }
     }
-    let k = &pre.keys;
+    validate_key_pins(&pre.keys, &[pre.runner_signer])
+}
+pub(crate) fn validate_key_pins(
+    k: &KeyPins,
+    additional_signers: &[[u8; 32]],
+) -> Result<(), EnvelopeError> {
     let kem = [
         k.acu_gate_base,
         k.recipient_psk,
@@ -302,12 +307,12 @@ fn validate_pre(pre: &PreHeader) -> Result<(), EnvelopeError> {
         k.recipient_response_base,
         k.archive_response_base,
     ];
-    let ed = [
-        pre.runner_signer,
+    let mut ed = vec![
         k.acu_signer,
         k.recipient_receipt_signer,
         k.archive_receipt_signer,
     ];
+    ed.extend_from_slice(additional_signers);
     let mut rng = StdRng::try_from_os_rng().map_err(|_| EnvelopeError::Entropy)?;
     for (i, key) in kem.iter().enumerate() {
         if *key == [0; 32] || kem[..i].contains(key) || ed.contains(key) {
