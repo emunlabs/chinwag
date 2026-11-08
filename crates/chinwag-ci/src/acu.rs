@@ -391,6 +391,9 @@ pub fn verify_grant(
     })
 }
 impl VerifiedGrant {
+    pub(crate) fn expires_unix(&self) -> u64 {
+        self.statement.request.expires_unix
+    }
     pub(crate) fn open(
         &self,
         owner: &OwnerCustody,
@@ -734,6 +737,131 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn scoped_tool_read_refuses_expiry_revocation_new_epoch_and_changed_policy_without_reopening() {
+        let f = Fixture::new();
+        let scope = crate::agent_read::ReadAuthorization::qualified(1200, &f.policy);
+        let raw = f.acu.sign_release_policy(&f.spec).unwrap();
+        assert!(scope.verify_current(&raw, 1100).is_ok());
+        assert!(scope.verify_current(&raw, 1200).is_err());
+        for change in 0..4 {
+            let mut p = f.spec.clone();
+            match change {
+                0 => p.active = false,
+                1 => p.allow_recipient = false,
+                2 => p.epoch += 1,
+                _ => p.issued_unix += 1,
+            }
+            let raw = f.acu.sign_release_policy(&p).unwrap();
+            assert!(scope.verify_current(&raw, 1100).is_err());
+        }
+        let mut raw = raw;
+        let n = raw.len() - 4;
+        raw[n] ^= 1;
+        assert!(scope.verify_current(&raw, 1100).is_err());
+    }
+    #[test]
+    fn dual_custody_barrier_requires_both_complete_three_layer_signatures_same_object_and_selected_paths()
+     {
+        use crate::{
+            delivery_barrier::{DualDeliveryRequest, fixture_verify_pair},
+            transport::{CI_ALPN, SelectedRelayWitness, fixture_observed_claim},
+        };
+        let f = Fixture::new_at(crate::runtime::now().unwrap() - 3);
+        let e = &f.envelope;
+        let relay = "https://relay-fixture.trycloudflare.com/";
+        let body = e.complete_storage_blob().unwrap();
+        let rpeer = e.admission_record().agent_transport_key;
+        let apeer = e.admission_record().archive_transport_key;
+        let r = f
+            .root
+            .persist_native_admitted(
+                e,
+                &fixture_observed_claim(e.certificate(), &body, rpeer, relay),
+                relay,
+            )
+            .unwrap();
+        let a = f
+            .archive
+            .persist_native_admitted(
+                e,
+                &fixture_observed_claim(e.certificate(), &body, apeer, relay),
+                relay,
+            )
+            .unwrap();
+        let object = crate::storage::CiphertextClaim {
+            sha256: sha2::Sha256::digest(e.complete_admitted_blob().unwrap()).into(),
+            bytes: e.complete_admitted_blob().unwrap().len() as u64,
+        };
+        let path = |p| SelectedRelayWitness {
+            peer_endpoint_id: hex::encode(p),
+            alpn: String::from_utf8(CI_ALPN.to_vec()).unwrap(),
+            selected_transport: "relay".into(),
+            relay_origin: relay.into(),
+        };
+        let q = DualDeliveryRequest {
+            version: 1,
+            run_id: 100,
+            run_attempt: 1,
+            envelope_digest: *e.digest(),
+            object,
+            recipient_receipt_hex: hex::encode(r),
+            archive_receipt_hex: hex::encode(a),
+            recipient_path: path(rpeer),
+            archive_path: path(apeer),
+        };
+        assert!(fixture_verify_pair(&q, e, rpeer, apeer, relay));
+        let serialized = serde_json::to_vec(&q).unwrap();
+        for field in ["recipient_receipt_hex", "archive_receipt_hex"] {
+            for depth in 0..3 {
+                let mut q: DualDeliveryRequest = serde_json::from_slice(&serialized).unwrap();
+                let encoded = if field == "recipient_receipt_hex" {
+                    &mut q.recipient_receipt_hex
+                } else {
+                    &mut q.archive_receipt_hex
+                };
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&hex::decode(&*encoded).unwrap()).unwrap();
+                fn flip(v: &mut serde_json::Value) {
+                    let s = v.as_str().unwrap();
+                    let mut s = s.to_owned();
+                    s.replace_range(..1, if &s[..1] == "0" { "1" } else { "0" });
+                    *v = s.into();
+                }
+                if depth == 0 {
+                    flip(&mut value["signature_hex"]);
+                } else {
+                    let wire =
+                        hex::decode(value["statement"]["durable_receipt_hex"].as_str().unwrap())
+                            .unwrap();
+                    let mut inner: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+                    if depth == 1 {
+                        flip(&mut inner["signature_hex"]);
+                    } else {
+                        flip(&mut inner["statement"]["storage_receipt"]["signature_hex"]);
+                    }
+                    value["statement"]["durable_receipt_hex"] =
+                        hex::encode(serde_json::to_vec(&inner).unwrap()).into();
+                }
+                *encoded = hex::encode(serde_json::to_vec(&value).unwrap());
+                assert!(!fixture_verify_pair(&q, e, rpeer, apeer, relay));
+            }
+        }
+
+        for change in 0..7 {
+            let mut q: DualDeliveryRequest = serde_json::from_slice(&serialized).unwrap();
+            match change {
+                0 => q.archive_receipt_hex.clear(),
+                1 => q.archive_receipt_hex = q.recipient_receipt_hex.clone(),
+                2 => q.run_id += 1,
+                3 => q.run_attempt += 1,
+                4 => q.object.sha256[0] ^= 1,
+                5 => q.recipient_path.selected_transport = "direct".into(),
+                _ => q.archive_path.relay_origin = "https://wrong.trycloudflare.com/".into(),
+            }
+            assert!(!fixture_verify_pair(&q, e, rpeer, apeer, relay));
+        }
     }
     #[test]
     fn both_destinations_need_their_own_signed_request_and_verified_encrypted_grant() {

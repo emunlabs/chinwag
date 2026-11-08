@@ -59,7 +59,8 @@ fn route_matches(peer: EndpointId, relay: &RelayUrl, remote: &EndpointAddr, alpn
             .all(|address| matches!(address,TransportAddr::Relay(url) if url==relay))
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectedRelayWitness {
     pub(crate) peer_endpoint_id: String,
     pub(crate) alpn: String,

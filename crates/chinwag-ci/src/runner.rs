@@ -302,6 +302,31 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
     archive.close().await;
     agent.close().await;
     let (a, r) = transfer?;
+    // Receipt-only completion: the complete encrypted failure has already gone
+    // directly over native Iroh/Cloudflare to BOTH stores. This POST carries no
+    // payload and confers no read, agent-start or repair authority.
+    let completion = crate::delivery_barrier::DualDeliveryRequest {
+        version: 1,
+        run_id: job.run_id,
+        run_attempt: job.run_attempt,
+        envelope_digest: *bound.digest(),
+        object: crate::storage::CiphertextClaim {
+            sha256: Sha256::digest(&blob).into(),
+            bytes: blob.len() as u64,
+        },
+        recipient_receipt_hex: hex::encode(&r.unverified_receipt),
+        archive_receipt_hex: hex::encode(&a.unverified_receipt),
+        recipient_path: r.path_after.clone(),
+        archive_path: a.path_after.clone(),
+    };
+    // Exactly one POST; a lost reply stays held and never replays the original.
+    let _ = post(
+        &client,
+        &config.admission_origin,
+        "v1/delivery-complete",
+        &completion,
+    )
+    .await?;
     Ok((
         RunnerObservation {
             classification: "SAME_SIGNED_ADMITTED_ENCRYPTED_ORIGINAL_VERIFIED_DURABLE_AT_BOTH_SELECTED_CF_DESTINATIONS",

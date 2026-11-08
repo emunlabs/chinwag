@@ -132,7 +132,7 @@ impl PreparedFixture {
         Ok(())
     }
 }
-async fn git_output(
+pub(crate) async fn git_output(
     checkout: &Path,
     args: &[String],
     limit: usize,
@@ -194,7 +194,10 @@ async fn git_output(
         }
     }
 }
-async fn pinned_bytes(checkout: &Path, source: &str) -> Result<Vec<u8>, PreparationError> {
+pub(crate) async fn pinned_bytes(
+    checkout: &Path,
+    source: &str,
+) -> Result<Vec<u8>, PreparationError> {
     if source.len() != 40
         || !source
             .bytes()

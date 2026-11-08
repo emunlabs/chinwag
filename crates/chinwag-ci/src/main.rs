@@ -31,6 +31,17 @@ async fn main() {
             )
             .await
         }
+        [_, action, config] if action == "agent-init" => {
+            chinwag_ci::idle_agent::enroll(config.as_ref())
+                .await
+                .map_err(|_| ())
+        }
+        [_, action, socket, scope] if action == "agent-read" => match scope.to_str() {
+            Some(scope) => chinwag_ci::agent_read::read_capture(socket.as_ref(), scope)
+                .await
+                .map_err(|_| ()),
+            None => Err(()),
+        },
         [_, action, config] if action == "serve-studio" => {
             chinwag_ci::owner_supervisor::run(
                 chinwag_ci::owner_supervisor::OwnerKind::Studio,
@@ -71,7 +82,7 @@ async fn main() {
         }
         _ => {
             eprintln!(
-                "usage: chinwag-ci owner-init|owner-verify CONFIG PUBLIC; policy-sign CONFIG PUBLIC SPEC OUTPUT; serve-root|serve-studio|runner CONFIG"
+                "usage: chinwag-ci owner-init|owner-verify CONFIG PUBLIC; policy-sign CONFIG PUBLIC SPEC OUTPUT; serve-root|serve-studio|runner|agent-init CONFIG; agent-read PIPE_DIRECTORY SCOPE_SHA256"
             );
             std::process::exit(2)
         }

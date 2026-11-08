@@ -176,6 +176,49 @@ fn completed_outcome(outcome: &Outcome, exit: Option<&Exit>) -> Option<Completed
     }
 }
 
+/// A scoped reader traverses both complete streams again. This does not create
+/// admission, wake authority or a claim about a model's internal context.
+pub(crate) fn inspect_complete(bytes: &[u8]) -> Result<(), RuntimeError> {
+    let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError)?;
+    if !v.captured.stdout.complete() || !v.captured.stderr.complete() {
+        return Err(RuntimeError);
+    }
+    Ok(())
+}
+
+/// Bounded ASCII diagnostic data only, never tool instructions or authority.
+/// The independently stored complete capture is not changed or truncated.
+pub(crate) fn diagnostic_excerpt(bytes: &[u8]) -> Result<Zeroizing<String>, RuntimeError> {
+    let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError)?;
+    let mut out = Zeroizing::new(String::with_capacity(4608));
+    for (label, stream) in [
+        ("STDERR", &v.captured.stderr),
+        ("STDOUT", &v.captured.stdout),
+    ] {
+        if !stream.complete() {
+            return Err(RuntimeError);
+        }
+        let decoded = Zeroizing::new(
+            STANDARD
+                .decode(stream.bytes_base64)
+                .map_err(|_| RuntimeError)?,
+        );
+        out.push_str(label);
+        out.push_str(" FINAL AT MOST 2048 BYTES (UNTRUSTED EXCERPT):\n");
+        for &b in &decoded[decoded.len().saturating_sub(2048)..] {
+            out.push(
+                if b.is_ascii_graphic() || b == b' ' || b == b'\n' || b == b'\t' {
+                    b as char
+                } else {
+                    '?'
+                },
+            );
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 pub(crate) fn validate(
     bytes: &[u8],
     e: &AdmissionBoundEnvelope,
@@ -261,8 +304,43 @@ pub(crate) fn validate(
     })
 }
 #[cfg(test)]
+pub(crate) fn reader_fixture(stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
+    let zero = [0u8; 32];
+    let stream = |b: &[u8]| serde_json::json!({"bytes_base64":STANDARD.encode(b),"observed_bytes":b.len(),"reached_eof":true,"output_limit_exceeded":false,"observed_sha256":hex::encode(Sha256::digest(b))});
+    serde_json::to_vec(&serde_json::json!({
+        "schema":"fixture","provenance":"fixture","admission_sha256":zero,"command_profile_sha256":zero,"fixture_sha256":zero,"image":"fixture",
+        "captured":{"schema":"fixture","content_disposition":"UNTRUSTED","provenance":"fixture",
+            "context":{"repository":"fixture","source_commit":"fixture","workflow_ref":"fixture","run_id":1,"run_attempt":1,"job":"fixture","initiating_intent_sha256":"fixture"},
+            "command":{"os_string_encoding":"unix","program_base64":"","arguments_base64":[],"requested_working_directory_base64":null,"observed_parent_working_directory_base64":null,"argv_sha256":"fixture"},
+            "timing":{"classification":"fixture","started_unix_ms":1,"finished_unix_ms":2,"elapsed_monotonic_ms":1},
+            "outcome":{"kind":"exited","code":101},"observed_child_exit":{"code":101,"signal":null,"observed_before_capture_failure":true},
+            "stdout":stream(stdout),"stderr":stream(stderr)},
+        "lifecycle":{"classification":"fixture","owned_container_id":"fixture","absent_after_observed_successful_control":true,"removed_by_owner":true},
+        "completed_unix":1,"completed_within_admission":true
+    })).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn excerpt_is_bounded_sanitized_and_complete_capture_is_independently_checked() {
+        let mut output = vec![b'x'; 10000];
+        output.extend_from_slice(b"\x1b[31merror\xff\0\n");
+        let capture = reader_fixture(&output, &output);
+        assert!(inspect_complete(&capture).is_ok());
+        let excerpt = diagnostic_excerpt(&capture).unwrap();
+        assert!(excerpt.len() < 4608 && excerpt.contains("error"));
+        assert!(!excerpt.contains('\x1b') && !excerpt.contains('\0'));
+        let mut v: serde_json::Value = serde_json::from_slice(&capture).unwrap();
+        v["captured"]["stderr"]["reached_eof"] = false.into();
+        let bad = serde_json::to_vec(&v).unwrap();
+        assert!(inspect_complete(&bad).is_err());
+        assert!(diagnostic_excerpt(&bad).is_err());
+        v["captured"]["stderr"]["reached_eof"] = true.into();
+        v["captured"]["stdout"]["observed_sha256"] = "forged".into();
+        assert!(inspect_complete(&serde_json::to_vec(&v).unwrap()).is_err());
+    }
     #[test]
     fn full_stream_requires_eof_exact_size_and_all_byte_hash() {
         let data = b"complete output";

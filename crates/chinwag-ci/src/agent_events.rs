@@ -7,6 +7,7 @@
 //! thread/turn/item events. Never retain reasoning, command output or messages
 //! in a public observation. OS closure and actual source checks remain separate.
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroize;
 
@@ -34,6 +35,45 @@ struct Item {
     status: Option<String>,
     exit_code: Option<i64>,
     changes: Option<Vec<Change>>,
+    command: Option<String>,
+}
+impl Drop for Item {
+    fn drop(&mut self) {
+        if let Some(v) = &mut self.command {
+            v.zeroize();
+        }
+    }
+}
+pub(crate) fn command_digest(command: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"chinwag-ci-exact-tool-command-v1\0");
+    h.update(command.as_bytes());
+    h.finalize().into()
+}
+/// Exact Codex0.162.1 display commitments, using its pinned shlex version.
+/// Permit only the fixed reader argv, directly or in a known system shell;
+/// no stripping, substring matching, command suffixes or arbitrary wrappers.
+pub(crate) fn read_command_commitments(
+    argv: [&str; 4],
+) -> Result<(String, Vec<[u8; 32]>), AgentEventError> {
+    let script = shlex::try_join(argv).map_err(|_| AgentEventError)?;
+    let mut hashes = vec![command_digest(&script)];
+    for shell in ["/bin/zsh", "/bin/bash", "/bin/sh"] {
+        for flag in ["-lc", "-c"] {
+            hashes.push(command_digest(
+                &shlex::try_join([shell, flag, script.as_str()]).map_err(|_| AgentEventError)?,
+            ));
+        }
+    }
+    Ok((script, hashes))
+}
+#[derive(Clone, Serialize)]
+pub struct ToolCommandObservation {
+    pub item_id_sha256: [u8; 32],
+    pub started_command_sha256: Option<[u8; 32]>,
+    pub completed_command_sha256: Option<[u8; 32]>,
+    pub exit_code: i64,
+    pub completed: bool,
 }
 #[derive(Deserialize)]
 struct Change {
@@ -56,6 +96,7 @@ pub struct AgentTurnObservation {
     pub failed_file_changes: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub commands: Vec<ToolCommandObservation>,
 }
 
 /// Incremental decoder. A record bound can refuse evidence, but its caller must
@@ -69,6 +110,8 @@ pub struct CodexEvents {
     completed: bool,
     poisoned: bool,
     active: BTreeMap<String, String>,
+    command_starts: BTreeMap<String, [u8; 32]>,
+    command_observations: Vec<ToolCommandObservation>,
     seen: BTreeSet<String>,
     commands: u64,
     failed_commands: u64,
@@ -104,6 +147,8 @@ impl CodexEvents {
             completed: false,
             poisoned: false,
             active: BTreeMap::new(),
+            command_starts: BTreeMap::new(),
+            command_observations: Vec::new(),
             seen: BTreeSet::new(),
             commands: 0,
             failed_commands: 0,
@@ -185,6 +230,11 @@ impl CodexEvents {
             if self.seen.contains(id) || self.active.insert(id.into(), kind.into()).is_some() {
                 return Err(AgentEventError);
             }
+            if kind == "command_execution"
+                && let Some(c) = &item.command
+            {
+                self.command_starts.insert(id.into(), command_digest(c));
+            }
             return Ok(());
         }
         if event == "item.updated" {
@@ -211,6 +261,13 @@ impl CodexEvents {
                 let code = item.exit_code.ok_or(AgentEventError)?;
                 self.commands += 1;
                 self.failed_commands += u64::from(code != 0);
+                self.command_observations.push(ToolCommandObservation {
+                    item_id_sha256: Sha256::digest(id.as_bytes()).into(),
+                    started_command_sha256: self.command_starts.remove(id),
+                    completed_command_sha256: item.command.as_deref().map(command_digest),
+                    exit_code: code,
+                    completed: item.status.as_deref() == Some("completed"),
+                });
             }
             "file_change" => {
                 if !matches!(item.status.as_deref(), Some("completed" | "failed")) {
@@ -254,6 +311,7 @@ impl CodexEvents {
             failed_file_changes: self.failed_changes,
             input_tokens: self.usage.as_ref().and_then(|u| u.input_tokens),
             output_tokens: self.usage.as_ref().and_then(|u| u.output_tokens),
+            commands: std::mem::take(&mut self.command_observations),
         })
     }
 }
@@ -272,6 +330,50 @@ mod tests {
         format!(
             "{{\"type\":\"thread.started\",\"thread_id\":\"{ID}\"}}\n{{\"type\":\"turn.started\"}}\n{items}{{\"type\":\"turn.completed\",\"usage\":{{}}}}\n"
         )
+    }
+    #[test]
+    fn reader_commitment_binds_exact_started_completed_command_and_rejects_shell_additions() {
+        let (script, expected) =
+            read_command_commitments(["/owned/chinwag-ci", "agent-read", "/owned/c.sock", "abcd"])
+                .unwrap();
+        let wrapped = shlex::try_join(["/bin/zsh", "-lc", script.as_str()]).unwrap();
+        assert!(expected.contains(&command_digest(&wrapped)));
+        for command in [
+            format!("echo {script}"),
+            format!("{script}; touch other"),
+            format!("{script} > /tmp/copy"),
+            script.replace("abcd", "different"),
+        ] {
+            assert!(!expected.contains(&command_digest(&command)));
+        }
+        for changed in [false, true] {
+            let mut items = String::new();
+            for (kind, cmd) in [
+                ("item.started", wrapped.clone()),
+                (
+                    "item.completed",
+                    if changed {
+                        format!("echo {script}")
+                    } else {
+                        wrapped.clone()
+                    },
+                ),
+            ] {
+                let v = serde_json::json!({"type":kind,"item":{"id":"read1","type":"command_execution","command":cmd,"status":"completed","exit_code":0,"aggregated_output":"PRIVATE_COMPLETE_FAILURE"}});
+                items.push_str(&serde_json::to_string(&v).unwrap());
+                items.push('\n');
+            }
+            let mut p = CodexEvents::new(ID).unwrap();
+            p.push(stream(&items).as_bytes()).unwrap();
+            let result = p.finish().unwrap();
+            let cmd = &result.commands[0];
+            assert_eq!(
+                cmd.started_command_sha256 == cmd.completed_command_sha256,
+                !changed
+            );
+            let public = serde_json::to_string(&result).unwrap();
+            assert!(!public.contains("PRIVATE") && !public.contains("/owned"));
+        }
     }
     #[test]
     fn fragmented_exact_session_stream_observes_real_tool_events_without_retaining_payloads() {

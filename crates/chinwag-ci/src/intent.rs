@@ -106,14 +106,14 @@ pub enum IntentError {
     Lifetime,
 }
 
-fn canonical_hex(value: &str, bytes: usize) -> bool {
+pub(crate) fn canonical_hex(value: &str, bytes: usize) -> bool {
     value.len() == bytes * 2
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn qualified_instance(value: &str) -> bool {
+pub(crate) fn qualified_instance(value: &str) -> bool {
     value.split_once('#').is_some_and(|(seat, instance)| {
         !seat.is_empty()
             && seat.len() <= 64

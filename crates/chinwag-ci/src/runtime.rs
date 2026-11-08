@@ -41,7 +41,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 #[derive(Debug, thiserror::Error)]
 #[error("CI runtime refused or ended with unconfirmed evidence; preserve its original operation")]
 pub struct RuntimeError;
@@ -121,7 +121,7 @@ impl Plan {
             now()?,
         ))
     }
-    fn delivery(&self) -> Result<DeliveryProfile> {
+    pub(crate) fn delivery(&self) -> Result<DeliveryProfile> {
         checked(DeliveryProfile::parse(self.delivery_profile.as_bytes()))
     }
 }
@@ -184,6 +184,8 @@ pub struct RootConfiguration {
     pub admission: OwnerFiles,
     pub ledger: PathBuf,
     pub output_directory: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_agent: Option<PathBuf>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -253,7 +255,7 @@ pub struct ArtifactObservation {
 
 /// Own exclusive private file, anchored to an already admitted directory. This
 /// helper never overwrites or creates parent namespaces and never logs content.
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     use rustix::fs::{self, AtFlags, Mode, OFlags};
     let dir = checked(CiphertextStore::open(path.parent().ok_or(RuntimeError)?))?;
     let name = path.file_name().ok_or(RuntimeError)?;
@@ -341,6 +343,73 @@ struct RootState {
     admission: OwnerCustody,
     ledger: Mutex<AdmissionLedger>,
     recipient_online: AtomicBool,
+    recipient: Arc<Mutex<OwnerCustody>>,
+    dual_delivery: Mutex<Option<crate::delivery_barrier::VerifiedDualDelivery>>,
+    dual_changed: tokio::sync::Notify,
+}
+
+async fn delivery_complete(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoResponse {
+    let result = async {
+        let request: crate::delivery_barrier::DualDeliveryRequest = decode(&body)?;
+        let plan: Plan = read(&s.config.plan)?;
+        let profiles = plan.profiles()?;
+        let job: Job = read(&s.config.registered_job)?;
+        let owner = s.recipient.lock().await;
+        let e = recover(
+            &owner,
+            profiles.delivery(),
+            Destination::Recipient,
+            request.object,
+        )?;
+        let proof = checked(crate::delivery_barrier::verify(
+            &request,
+            &e,
+            &profiles,
+            &job.registered(),
+            now()?,
+        ))?;
+        drop(owner);
+        let mut slot = s.dual_delivery.lock().await;
+        if let Some(prior) = slot.as_ref() {
+            if prior.receipt_set_digest() != proof.receipt_set_digest() {
+                return Err(RuntimeError);
+            }
+        } else {
+            write_new(
+                &s.config
+                    .output_directory
+                    .join("verified-dual-delivery-v1.json"),
+                &json(&proof)?,
+            )?;
+            write_new(
+                &s.config
+                    .output_directory
+                    .join("dual-delivery-receipts-v1.json"),
+                &json(&request)?,
+            )?;
+            *slot = Some(proof.clone());
+            s.dual_changed.notify_one();
+        }
+        json(&proof)
+    }
+    .await;
+    http_result(result)
+}
+
+async fn wait_dual(
+    s: &RootState,
+    obs: &ArtifactObservation,
+    budget: &OwnerBudget,
+) -> Result<crate::delivery_barrier::VerifiedDualDelivery> {
+    loop {
+        if let Some(proof) = s.dual_delivery.lock().await.clone() {
+            if !proof.matches(obs.run_id, obs.run_attempt, obs.envelope_digest, obs.object) {
+                return Err(RuntimeError);
+            }
+            return Ok(proof);
+        }
+        tokio::select! { _=s.dual_changed.notified()=>{}, _=budget.work_stopped()=>return Err(RuntimeError) }
+    }
 }
 async fn bootstrap(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoResponse {
     let result = async {
@@ -615,6 +684,13 @@ fn recover(
     ))
     .map(|(e, _)| e)
 }
+struct QualifiedCapture {
+    observation: ArtifactObservation,
+    verified: crate::capture_read::VerifiedCapture,
+    plaintext: Zeroizing<Vec<u8>>,
+    read_authorization: crate::agent_read::ReadAuthorization,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qualified_output(
     owner: &OwnerCustody,
@@ -625,7 +701,7 @@ fn qualified_output(
     grant: &[u8],
     mut obs: ArtifactObservation,
     outputs: &Path,
-) -> Result<ArtifactObservation> {
+) -> Result<QualifiedCapture> {
     let grant = checked(acu::verify_grant(grant, request, envelope, policy, now()?))?;
     let plaintext = checked(owner.open_payload_from_grant(envelope, &grant, policy, now()?))?;
     // Parse and traverse the complete sealed capture before recording qualified
@@ -649,14 +725,22 @@ fn qualified_output(
             "failed": verified.failed(),
         }))?,
     )?;
-    Ok(obs)
+    Ok(QualifiedCapture {
+        observation: obs,
+        verified,
+        plaintext,
+        read_authorization: crate::agent_read::ReadAuthorization::qualified(
+            grant.expires_unix(),
+            policy,
+        ),
+    })
 }
 async fn recipient_read(
     owner: &OwnerCustody,
     plan: &Plan,
     obs: ArtifactObservation,
     outputs: &Path,
-) -> Result<ArtifactObservation> {
+) -> Result<QualifiedCapture> {
     let delivery = plan.delivery()?;
     let e = recover(owner, &delivery, Destination::Recipient, obs.object)?;
     let client = checked(crate::github::normal_https_client())?;
@@ -732,7 +816,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
     )?;
     let stop = Arc::new(AtomicBool::new(false));
     let budget = OwnerBudget::new(Duration::from_secs(config.lifetime_seconds), stop.clone());
-    let mut recipient = config.recipient.open()?;
+    let recipient = config.recipient.open()?;
     let admission = config.admission.open()?;
     let plan: Plan = read(&config.plan)?;
     let d = plan.delivery()?;
@@ -751,12 +835,16 @@ pub async fn serve_root(path: &Path) -> Result<()> {
         config,
         admission,
         recipient_online: AtomicBool::new(false),
+        recipient: Arc::new(Mutex::new(recipient)),
+        dual_delivery: Mutex::new(None),
+        dual_changed: tokio::sync::Notify::new(),
     });
     let app = Router::new()
         .route("/v1/bootstrap", post(bootstrap))
         .route("/v1/ready", get(readiness))
         .route("/v1/challenge", post(challenge))
         .route("/v1/admit", post(admit))
+        .route("/v1/delivery-complete", post(delivery_complete))
         .layer(DefaultBodyLimit::max(128 * 1024))
         .layer(middleware::from_fn(request_deadline))
         .with_state(state.clone());
@@ -774,21 +862,59 @@ pub async fn serve_root(path: &Path) -> Result<()> {
         };
         let plan: Plan = read(&s.config.plan)?;
         // Readiness is set only after the exact owner bind actually completes.
-        let obs = receive(
-            &mut recipient,
-            &plan,
-            &job,
-            Destination::Recipient,
-            &receiver_budget,
-            &s.config.output_directory,
-            Some(&s.recipient_online),
-        )
-        .await?;
+        let obs = {
+            let mut owner = s.recipient.lock().await;
+            receive(
+                &mut owner,
+                &plan,
+                &job,
+                Destination::Recipient,
+                &receiver_budget,
+                &s.config.output_directory,
+                Some(&s.recipient_online),
+            )
+            .await?
+        };
         s.recipient_online.store(false, Ordering::Release);
-        tokio::select! {
-            result = recipient_read(&recipient, &plan, obs, &s.config.output_directory) => result.map(|_| ()),
+        // Both signed native storage proofs precede the CURRENT ACU request.
+        // Release the owner mutex while waiting so the receipt-only HTTP
+        // handler can independently reopen this already-native stored object.
+        let dual = wait_dual(&s, &obs, &receiver_budget).await?;
+        let recipient = s.recipient.lock().await;
+        let qualified = tokio::select! {
+            result = recipient_read(&recipient, &plan, obs, &s.config.output_directory) => result,
             _ = receiver_budget.work_stopped() => Err(RuntimeError),
+        }?;
+        if let Some(agent) = &s.config.idle_agent {
+            let envelope = recover(
+                &recipient,
+                &plan.delivery()?,
+                Destination::Recipient,
+                qualified.observation.object,
+            )?;
+            let command = checked(crate::profile::CommandProfile::parse(
+                plan.command_profile.as_bytes(),
+            ))?;
+            drop(recipient);
+            checked(
+                crate::idle_agent::wake(
+                    agent,
+                    crate::idle_agent::QualifiedWake {
+                        plan: &plan,
+                        envelope: &envelope,
+                        verified: &qualified.verified,
+                        plaintext: &qualified.plaintext,
+                        observation: &qualified.observation,
+                        command_profile: &command,
+                        budget: &receiver_budget,
+                        dual: &dual,
+                        read_authorization: &qualified.read_authorization,
+                    },
+                )
+                .await,
+            )?;
         }
+        Ok(())
     };
     run_owner(listener, app, budget, receiver).await
 }

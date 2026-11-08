@@ -522,6 +522,8 @@ pub async fn run<F: FnOnce(u32) -> Result<(), ()>, S: Future<Output = ()>>(
     }
     command.args([
         "exec",
+        "--model",
+        "gpt-6.1-sol",
         "--sandbox",
         "workspace-write",
         "-c",

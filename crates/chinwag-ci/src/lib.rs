@@ -60,6 +60,12 @@ pub mod runner_identity;
 pub mod runtime;
 pub mod transport;
 // Only the descriptor-bound Darwin ACL adapter needs FFI. Crypto paths deny it.
+#[cfg(unix)]
+pub mod agent_read;
+#[cfg(unix)]
+pub mod delivery_barrier;
+#[cfg(unix)]
+pub mod idle_agent;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod macos_acl;

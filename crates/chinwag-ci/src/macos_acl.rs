@@ -2,7 +2,7 @@
 // 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 
-//! The only unsafe module: descriptor-bound Darwin security attributes.
+//! Descriptor-bound Darwin adapters; no cryptographic or process authority.
 //! Mode0600/0700 cannot rule out granting ACLs. A path/proxy listing is not an
 //! ACL observation of the held inode. The allocating acl_get_fd_np wrapper can
 //! mask an allocation error as ENOENT in the examined Apple Libc source.
@@ -14,6 +14,15 @@
 //! This is the examined XNU/local filesystem contract, not universal FS support.
 
 use std::os::fd::{AsRawFd, BorrowedFd};
+
+/// Rustix does not expose Darwin mkfifoat. Create one exclusive owner FIFO at
+/// the held directory descriptor; existing names are refused by the OS.
+pub(crate) fn create_fifo_at(directory: BorrowedFd<'_>, name: &std::ffi::CStr) -> Result<(), ()> {
+    // SAFETY: the descriptor and NUL-terminated name are live for this call;
+    // mkfifoat retains neither pointer. No raw data or key material is involved.
+    let result = unsafe { libc::mkfifoat(directory.as_raw_fd(), name.as_ptr(), 0o600) };
+    if result == 0 { Ok(()) } else { Err(()) }
+}
 
 fn exact_absence(reply: &[u8; 12]) -> bool {
     reply[..4] == 12_u32.to_ne_bytes()
