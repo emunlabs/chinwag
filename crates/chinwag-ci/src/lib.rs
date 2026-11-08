@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 pub mod intent;
 pub mod oidc;
 pub mod runner_binding;
+pub mod runner_identity;
 pub mod transport;
 // Only the descriptor-bound Darwin ACL adapter needs FFI. Crypto paths deny it.
 #[cfg(target_os = "macos")]

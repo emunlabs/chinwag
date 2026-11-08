@@ -40,6 +40,8 @@ fn validate(
         || run_id == 0
         || attempt == 0
         || keys.agent_transport_ed25519 == keys.archive_transport_ed25519
+        || keys.signing_ed25519 == keys.agent_transport_ed25519
+        || keys.signing_ed25519 == keys.archive_transport_ed25519
     {
         return Err(BindingError::Input);
     }

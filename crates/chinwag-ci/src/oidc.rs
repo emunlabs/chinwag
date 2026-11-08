@@ -718,6 +718,40 @@ mod tests {
     }
 
     #[test]
+    fn opaque_iroh_job_signer_interoperates_with_strict_admission_verification() {
+        use crate::{
+            runner_binding::{BindingError, audience_for, verify_runner_proof},
+            runner_identity::RunnerIdentity,
+        };
+        let identity = RunnerIdentity::generate().unwrap();
+        let public = identity.public_keys();
+        let intent = dispatch_intent("cd");
+        let challenge = [0x88; 32];
+        let audience = audience_for(&intent, public, challenge, 100, 1).unwrap();
+        let workflow = workflow_for(&audience);
+        let signature = identity
+            .sign_admission(&intent, &workflow, challenge)
+            .unwrap();
+        // Production Iroh signing and strict Dalek verification use their real
+        // independent APIs; this is not a predeclared fixture signature.
+        let verified =
+            verify_runner_proof(intent, workflow, public, challenge, signature, 1001).unwrap();
+        assert_eq!(verified.signing_public_key(), &public.signing_ed25519);
+        assert_eq!(verified.audience(), audience);
+        let other_identity = RunnerIdentity::generate().unwrap();
+        assert!(matches!(
+            other_identity.sign_admission(
+                &dispatch_intent("cd"),
+                &workflow_for(&audience),
+                challenge
+            ),
+            Err(crate::runner_identity::IdentityError::Binding(
+                BindingError::Scope
+            ))
+        ));
+    }
+
+    #[test]
     fn valid_independent_layers_cannot_be_mixed_with_another_intent_key_or_challenge() {
         use crate::runner_binding::{BindingError, audience_for, verify_runner_proof};
         let intent = dispatch_intent("cd");
@@ -827,6 +861,14 @@ mod tests {
             audience_for(&intent, duplicate, challenge, 100, 1),
             Err(BindingError::Input)
         ));
+        for alias in [keys.agent_transport_ed25519, keys.archive_transport_ed25519] {
+            let mut duplicate_signer = keys;
+            duplicate_signer.signing_ed25519 = alias;
+            assert!(matches!(
+                audience_for(&intent, duplicate_signer, challenge, 100, 1),
+                Err(BindingError::Input)
+            ));
+        }
         assert!(matches!(
             audience_for(&intent, keys, [0; 32], 100, 1),
             Err(BindingError::Input)
