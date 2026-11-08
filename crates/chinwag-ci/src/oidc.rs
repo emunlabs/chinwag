@@ -210,6 +210,8 @@ pub struct VerifiedWorkflow {
     workflow_ref: String,
     workflow_commit: String,
     token_sha256: [u8; 32],
+    issued_unix: u64,
+    not_before_unix: u64,
 }
 impl VerifiedWorkflow {
     pub fn run_id(&self) -> u64 {
@@ -250,6 +252,12 @@ impl VerifiedWorkflow {
     }
     pub fn token_sha256(&self) -> &[u8; 32] {
         &self.token_sha256
+    }
+    pub fn issued_unix(&self) -> u64 {
+        self.issued_unix
+    }
+    pub fn not_before_unix(&self) -> u64 {
+        self.not_before_unix
     }
 }
 
@@ -349,6 +357,8 @@ pub fn verify_token(
         workflow_ref: claims.workflow_ref,
         workflow_commit: claims.workflow_sha,
         token_sha256: Sha256::digest(token.as_bytes()).into(),
+        issued_unix: claims.iat,
+        not_before_unix: claims.nbf,
     })
 }
 
@@ -594,6 +604,259 @@ mod tests {
                 &serde_json::to_vec(&json!({"keys":[private_field]})).unwrap()
             ),
             Err(OidcError::Format)
+        ));
+    }
+
+    fn dispatch_intent(profile: &str) -> crate::intent::VerifiedIntent {
+        use ed25519_dalek::{Signer, SigningKey};
+        let signer = SigningKey::from_bytes(&[0x31; 32]); // ephemeral test-only identity
+        let public = hex::encode(signer.verifying_key().to_bytes());
+        let sender = "WORKHORSE#test-instance-1234";
+        let body=json!({"schema":"chinwag.ci-dispatch-intent.v1","repository":"example/ci-test","repository_id":42,
+            "source_commit":"ab".repeat(20),"workflow_ref":expected().workflow_ref,"workflow_commit":"bc".repeat(20),
+            "recipient_instance":sender,"delivery_profile_sha256":profile.repeat(32),"command_sha256":"de".repeat(32),
+            "nonce":"ef".repeat(32),"expires_unix":1100}).to_string();
+        let to = "GEMINI-PM#test-instance-5678";
+        let digest = hex::encode(Sha256::digest(format!(
+            "chinwag-bus-v1|1000|#eng|{sender}|{public}|{to}|CHWG-CI-TEST|{body}"
+        )));
+        let id = format!("bus-1000-{}", &digest[..8]);
+        let fields = [
+            id.as_str(),
+            "1000",
+            sender,
+            to,
+            "#eng",
+            "CHWG-CI-TEST",
+            &body,
+        ];
+        let input = format!(
+            "chinwag-bus-sig-v2|{}",
+            fields
+                .iter()
+                .map(|s| format!("{}:{s}", s.len()))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        let original = json!({"id":id,"ts_unix":1000,"sender":sender,"sender_endpoint_id":public,"pubkey_ed25519":public,
+            "to":to,"room":"#eng","task_id":"CHWG-CI-TEST","body":body,"digest_sha256":digest,
+            "signature_ed25519":hex::encode(signer.sign(input.as_bytes()).to_bytes())});
+        crate::intent::verify_original(
+            &serde_json::to_vec(&original).unwrap(),
+            crate::intent::IntentVerification {
+                initiator_instance: sender,
+                initiator_public_key: signer.verifying_key().to_bytes(),
+                task_id: "CHWG-CI-TEST",
+                room: "#eng",
+                now_unix: 1001,
+            },
+        )
+        .unwrap()
+    }
+
+    fn runner_keys() -> crate::runner_binding::RunnerPublicKeys {
+        let public = |seed| {
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes()
+        };
+        crate::runner_binding::RunnerPublicKeys {
+            signing_ed25519: public(0x55),
+            agent_transport_ed25519: public(0x66),
+            archive_transport_ed25519: public(0x77),
+        }
+    }
+
+    fn workflow_for(audience: &str) -> VerifiedWorkflow {
+        let mut claims = claims();
+        claims["aud"] = json!(audience);
+        verify_token(
+            &issue(&claims),
+            &keys(),
+            ExpectedWorkflow {
+                audience,
+                ..expected()
+            },
+        )
+        .unwrap()
+    }
+
+    fn pop_signature(
+        intent: &crate::intent::VerifiedIntent,
+        workflow: &VerifiedWorkflow,
+        keys: crate::runner_binding::RunnerPublicKeys,
+        challenge: [u8; 32],
+    ) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        let payload =
+            crate::runner_binding::proof_payload(intent, workflow, keys, challenge).unwrap();
+        ed25519_dalek::SigningKey::from_bytes(&[0x55; 32])
+            .sign(&payload)
+            .to_bytes()
+    }
+
+    #[test]
+    fn runner_pop_joins_verified_native_intent_and_oidc_execution_scope() {
+        use crate::runner_binding::{audience_for, verify_runner_proof};
+        let intent = dispatch_intent("cd");
+        let keys = runner_keys();
+        let challenge = [0x88; 32];
+        let audience = audience_for(&intent, keys, challenge, 100, 1).unwrap();
+        let workflow = workflow_for(&audience);
+        let signature = pop_signature(&intent, &workflow, keys, challenge);
+        let binding =
+            verify_runner_proof(intent, workflow, keys, challenge, signature, 1001).unwrap();
+        assert_eq!(
+            binding.initiating_instance(),
+            "WORKHORSE#test-instance-1234"
+        );
+        assert_eq!(binding.run_id(), 100);
+        assert_eq!(binding.run_attempt(), 1);
+        assert_eq!(binding.expires_unix(), 1100);
+        assert_eq!(binding.signing_public_key(), &keys.signing_ed25519);
+        assert_eq!(binding.audience(), audience);
+    }
+
+    #[test]
+    fn valid_independent_layers_cannot_be_mixed_with_another_intent_key_or_challenge() {
+        use crate::runner_binding::{BindingError, audience_for, verify_runner_proof};
+        let intent = dispatch_intent("cd");
+        let keys = runner_keys();
+        let challenge = [0x88; 32];
+        let audience = audience_for(&intent, keys, challenge, 100, 1).unwrap();
+        let workflow = workflow_for(&audience);
+        let signature = pop_signature(&intent, &workflow, keys, challenge);
+        assert!(matches!(
+            verify_runner_proof(
+                dispatch_intent("ce"),
+                workflow_for(&audience),
+                keys,
+                challenge,
+                signature,
+                1001
+            ),
+            Err(BindingError::Scope)
+        ));
+        let mut other = keys;
+        other.archive_transport_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0x79; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(matches!(
+            verify_runner_proof(
+                dispatch_intent("cd"),
+                workflow_for(&audience),
+                other,
+                challenge,
+                signature,
+                1001
+            ),
+            Err(BindingError::Scope)
+        ));
+        assert!(matches!(
+            verify_runner_proof(
+                dispatch_intent("cd"),
+                workflow_for(&audience),
+                keys,
+                [0x89; 32],
+                signature,
+                1001
+            ),
+            Err(BindingError::Scope)
+        ));
+    }
+
+    #[test]
+    fn runner_pop_rejects_another_token_bad_signature_expiry_and_duplicate_transport_keys() {
+        use crate::runner_binding::{BindingError, audience_for, verify_runner_proof};
+        let intent = dispatch_intent("cd");
+        let keys = runner_keys();
+        let challenge = [0x88; 32];
+        let audience = audience_for(&intent, keys, challenge, 100, 1).unwrap();
+        let workflow = workflow_for(&audience);
+        let signature = pop_signature(&intent, &workflow, keys, challenge);
+        let mut claims = claims();
+        claims["aud"] = json!(audience);
+        claims["jti"] = json!("a-different-valid-token");
+        let other = verify_token(
+            &issue(&claims),
+            &self::keys(),
+            ExpectedWorkflow {
+                audience: &audience,
+                ..expected()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_runner_proof(
+                dispatch_intent("cd"),
+                other,
+                keys,
+                challenge,
+                signature,
+                1001
+            ),
+            Err(BindingError::Signature)
+        ));
+        let mut bad = signature;
+        bad[0] ^= 1;
+        assert!(matches!(
+            verify_runner_proof(
+                dispatch_intent("cd"),
+                workflow_for(&audience),
+                keys,
+                challenge,
+                bad,
+                1001
+            ),
+            Err(BindingError::Signature)
+        ));
+        assert!(matches!(
+            verify_runner_proof(
+                dispatch_intent("cd"),
+                workflow_for(&audience),
+                keys,
+                challenge,
+                signature,
+                1100
+            ),
+            Err(BindingError::Lifetime)
+        ));
+        let mut duplicate = keys;
+        duplicate.archive_transport_ed25519 = duplicate.agent_transport_ed25519;
+        assert!(matches!(
+            audience_for(&intent, duplicate, challenge, 100, 1),
+            Err(BindingError::Input)
+        ));
+        assert!(matches!(
+            audience_for(&intent, keys, [0; 32], 100, 1),
+            Err(BindingError::Input)
+        ));
+    }
+
+    #[test]
+    fn a_verified_workflow_cannot_be_rejoined_before_its_not_before_time() {
+        use crate::runner_binding::{BindingError, audience_for, verify_runner_proof};
+        let intent = dispatch_intent("cd");
+        let keys = runner_keys();
+        let challenge = [0x88; 32];
+        let audience = audience_for(&intent, keys, challenge, 100, 1).unwrap();
+        let mut claims = claims();
+        claims["aud"] = json!(audience);
+        claims["nbf"] = json!(1050);
+        let workflow = verify_token(
+            &issue(&claims),
+            &self::keys(),
+            ExpectedWorkflow {
+                audience: &audience,
+                now_unix: 1050,
+                ..expected()
+            },
+        )
+        .unwrap();
+        let signature = pop_signature(&intent, &workflow, keys, challenge);
+        assert!(matches!(
+            verify_runner_proof(intent, workflow, keys, challenge, signature, 1001),
+            Err(BindingError::Lifetime)
         ));
     }
 }

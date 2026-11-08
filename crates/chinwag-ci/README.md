@@ -67,3 +67,16 @@ storage. This follows examined XNU behavior and local filesystem tests and does
 not claim universal filesystem support. The adapter is the only
 module permitted to use unsafe FFI, with explicit descriptor/opaque-allocation
 ownership rationale; cryptography modules continue to deny unsafe code.
+
+`runner_binding` joins the signed intent and verified workflow with the ephemeral
+runner signing key's proof of possession. Its custom OIDC audience commits to
+the original intent, delivery/command profiles, workflow execution, signing and
+two distinct transport public keys, and server challenge. The proof signs a
+separate domain containing that audience and the exact JWT hash, so independently
+valid intents, tokens and keys cannot be spliced together. Composition rechecks
+both issuance bounds, OIDC `nbf`, and the earlier expiry.
+
+The coordinator must issue/consume challenges atomically and supply trusted
+dispatch metadata. The two transport keys are still claims until each actual
+native handshake proves possession. This layer issues neither K2 nor repair
+authority, does not implement replay storage, and does not establish task start.
