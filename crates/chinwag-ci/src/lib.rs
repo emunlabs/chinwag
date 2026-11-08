@@ -28,6 +28,8 @@ pub mod authorization;
 #[cfg(unix)]
 pub mod custody;
 pub mod envelope;
+#[cfg(unix)]
+pub mod execution;
 pub mod github;
 pub mod intent;
 pub mod oidc;

@@ -226,6 +226,9 @@ impl HistoricalAdmission {
     }
 }
 impl CurrentAdmission {
+    pub fn issuer(&self) -> [u8; 32] {
+        self.historical.statement.signer
+    }
     pub fn record(&self) -> &AdmissionRecord {
         self.historical.record()
     }

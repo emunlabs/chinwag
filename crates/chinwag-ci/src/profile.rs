@@ -321,6 +321,30 @@ impl BoundProfiles {
         )
         .map_err(|_| ProfileError)
     }
+    pub fn validate_admission(
+        &self,
+        admission: &authorization::CurrentAdmission,
+        registered: &RegisteredJob,
+        now: u64,
+    ) -> Result<(), ProfileError> {
+        self.validate_registered_job(registered)?;
+        let r = admission.record();
+        if admission.issuer() != self.delivery.spec().admission_signer
+            || r.spec != self.intent
+            || r.intent_digest != self.intent_digest
+            || r.initiating_instance != self.initiating_instance
+            || r.run_id != registered.run_id
+            || r.run_attempt != registered.run_attempt
+            || r.signing_key != registered.keys.signing_ed25519
+            || r.agent_transport_key != registered.keys.agent_transport_ed25519
+            || r.archive_transport_key != registered.keys.archive_transport_ed25519
+            || now < r.usable_from_unix
+            || now >= r.expires_unix
+        {
+            return Err(ProfileError);
+        }
+        Ok(())
+    }
     pub fn authenticate_current_artifact(
         &self,
         certificate: &[u8],
@@ -335,18 +359,7 @@ impl BoundProfiles {
                 .map_err(|_| ProfileError)?
                 .require_current(now)
                 .map_err(|_| ProfileError)?;
-        let record = admission.record();
-        if record.spec != self.intent
-            || record.intent_digest != self.intent_digest
-            || record.initiating_instance != self.initiating_instance
-            || record.run_id != registered.run_id
-            || record.run_attempt != registered.run_attempt
-            || record.signing_key != registered.keys.signing_ed25519
-            || record.agent_transport_key != registered.keys.agent_transport_ed25519
-            || record.archive_transport_key != registered.keys.archive_transport_ed25519
-        {
-            return Err(ProfileError);
-        }
+        self.validate_admission(&admission, registered, now)?;
         admission
             .authenticate_envelope(
                 envelope,
@@ -627,6 +640,32 @@ mod tests {
         bound
             .authenticate_current_artifact(&certificate, copy(), &registered, 1002)
             .unwrap();
+        let other_vault = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(other_vault.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let other_issuer = OwnerCustody::create_new(
+            &other_vault.path().canonicalize().unwrap(),
+            OwnerRole::Admission,
+            [22; 32],
+            None,
+        )
+        .unwrap();
+        let PublicEnrollment::Admission { signer: other_pin } =
+            other_issuer.public_enrollment().unwrap()
+        else {
+            panic!("other issuer")
+        };
+        let other_certificate = other_issuer.certify_admission(&admitted).unwrap();
+        let other_current =
+            authorization::verify_historical_certificate(&other_certificate, other_pin)
+                .unwrap()
+                .require_current(1001)
+                .unwrap();
+        assert!(
+            bound
+                .validate_admission(&other_current, &registered, 1002)
+                .is_err()
+        );
         let mut aliased = registered.keys;
         aliased.agent_transport_ed25519 = bound.delivery.spec().recipient.transport;
         assert!(
