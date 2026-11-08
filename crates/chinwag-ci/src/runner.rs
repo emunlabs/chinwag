@@ -221,14 +221,7 @@ async fn post<T: Serialize>(
     path: &str,
     v: &T,
 ) -> Result<Vec<u8>> {
-    runtime::request_bytes(
-        c,
-        reqwest::Method::POST,
-        &format!("{origin}{path}"),
-        Some(ser(v)?),
-        128 * 1024,
-    )
-    .await
+    runtime::request_owner_post(c, &format!("{origin}{path}"), ser(v)?, 128 * 1024).await
 }
 /// Return 1 for a fully delivered red workload, 0 only for a fully delivered
 /// eligible green workload. Any missing admission/receipt/closure stays held.

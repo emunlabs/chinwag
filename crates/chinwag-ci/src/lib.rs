@@ -38,6 +38,8 @@ pub mod envelope;
 #[cfg(unix)]
 pub mod execution;
 pub mod github;
+#[cfg(unix)]
+mod http_diagnostics;
 pub mod intent;
 pub mod oidc;
 #[cfg(unix)]

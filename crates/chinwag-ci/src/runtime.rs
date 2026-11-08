@@ -363,23 +363,55 @@ async fn verify_workflow(
     job: &Job,
     token: &str,
     audience: &str,
+    trace: Option<&crate::http_diagnostics::Request>,
 ) -> Result<oidc::VerifiedWorkflow> {
+    use crate::http_diagnostics::Phase;
     if job.run_id != dispatch.run_id || job.run_attempt != dispatch.run_attempt {
         return Err(RuntimeError::Refused);
     }
     let intent = plan.intent()?;
     let client = checked(GithubEvidenceClient::new())?;
-    let (run, keys) = tokio::join!(
-        client.verify_dispatch_run(&intent, dispatch.trusted()),
-        client.issuer_keys()
-    );
-    let run = checked(run)?;
-    let keys = checked(keys)?;
+    if let Some(t) = trace {
+        t.phase(Phase::ClientPrepared);
+    }
+    let run = async {
+        if let Some(t) = trace {
+            t.phase(Phase::RunStarted);
+        }
+        let r = client
+            .verify_dispatch_run(&intent, dispatch.trusted())
+            .await
+            .map_err(RuntimeError::Evidence);
+        if let Some(t) = trace {
+            t.result(Phase::RunCompleted, &r);
+        }
+        r
+    };
+    let keys = async {
+        if let Some(t) = trace {
+            t.phase(Phase::KeysStarted);
+        }
+        let r = client.issuer_keys().await.map_err(RuntimeError::Evidence);
+        if let Some(t) = trace {
+            t.result(Phase::KeysCompleted, &r);
+        }
+        r
+    };
+    let (run, keys) = tokio::join!(run, keys);
+    let run = run?;
+    let keys = keys?;
     let mut expected = run.expected_oidc(audience, now()?);
     // Exact subject is operator-pinned from repository OIDC configuration, never
     // decoded from the incoming JWT. All run/repository/workflow checks remain.
     expected.subject = &plan.expected_oidc_subject;
-    checked(oidc::verify_token(token, &keys, expected))
+    if let Some(t) = trace {
+        t.phase(Phase::OidcStarted);
+    }
+    let verified = checked(oidc::verify_token(token, &keys, expected));
+    if let Some(t) = trace {
+        t.result(Phase::OidcCompleted, &verified);
+    }
+    verified
 }
 fn same_enrollment(owner: &OwnerCustody, d: &PublicDestination) -> Result<()> {
     if checked(owner.public_enrollment())? != PublicEnrollment::Destination(d.clone()) {
@@ -392,6 +424,7 @@ struct RootState {
     config: RootConfiguration,
     admission: OwnerCustody,
     ledger: Mutex<AdmissionLedger>,
+    diagnostics: crate::http_diagnostics::Diagnostics,
     recipient_online: AtomicBool,
     recipient: Arc<Mutex<OwnerCustody>>,
     dual_delivery: Mutex<Option<crate::delivery_barrier::VerifiedDualDelivery>>,
@@ -467,7 +500,15 @@ async fn bootstrap(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoRes
         let plan: Plan = read(&s.config.plan)?;
         let dispatch: Dispatch = read(&s.config.dispatch)?;
         let audience = bootstrap_audience(plan.bootstrap_hint, &request.job)?;
-        verify_workflow(&plan, &dispatch, &request.job, &request.token, &audience).await?;
+        verify_workflow(
+            &plan,
+            &dispatch,
+            &request.job,
+            &request.token,
+            &audience,
+            None,
+        )
+        .await?;
         plan.profiles()?
             .validate_registered_job(&request.job.registered())
             .map_err(|_| RuntimeError::Refused)?;
@@ -496,23 +537,34 @@ async fn readiness(State(s): State<Arc<RootState>>) -> impl IntoResponse {
     }
 }
 async fn challenge(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoResponse {
+    use crate::http_diagnostics::Phase;
+    let trace = s.diagnostics.request();
+    trace.phase(Phase::Entered);
     let result = async {
         let r: BootstrapRequest = decode(&body)?;
+        trace.phase(Phase::Decoded);
         is_ready(&s, &r.job)?;
+        trace.phase(Phase::Ready);
         let plan: Plan = read(&s.config.plan)?;
         let dispatch: Dispatch = read(&s.config.dispatch)?;
+        trace.phase(Phase::ConfigurationRead);
         verify_workflow(
             &plan,
             &dispatch,
             &r.job,
             &r.token,
             &bootstrap_audience(plan.bootstrap_hint, &r.job)?,
+            Some(&trace),
         )
         .await?;
+        trace.phase(Phase::WorkflowVerified);
         let intent = plan.intent()?;
         let t = now()?;
         let exp = intent.spec().expires_unix.min(t + 300);
-        let c = checked(s.ledger.lock().await.issue(
+        trace.phase(Phase::LedgerWait);
+        let mut ledger = s.ledger.lock().await;
+        trace.phase(Phase::LedgerIssue);
+        let c = checked(ledger.issue(
             &intent,
             r.job.keys(),
             r.job.run_id,
@@ -520,6 +572,8 @@ async fn challenge(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoRes
             t,
             exp,
         ))?;
+        drop(ledger);
+        trace.phase(Phase::LedgerIssued);
         json(&ChallengeResponse {
             nonce: c.nonce,
             audience: c.audience,
@@ -527,6 +581,14 @@ async fn challenge(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoRes
         })
     }
     .await;
+    trace.result(
+        if result.is_ok() {
+            Phase::ResponseReady
+        } else {
+            Phase::Held
+        },
+        &result,
+    );
     http_result(result)
 }
 async fn admit(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoResponse {
@@ -543,7 +605,7 @@ async fn admit(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoRespons
             r.job.run_id,
             r.job.run_attempt,
         ))?;
-        let workflow = verify_workflow(&plan, &dispatch, &r.job, &r.token, &audience).await?;
+        let workflow = verify_workflow(&plan, &dispatch, &r.job, &r.token, &audience, None).await?;
         let signature: [u8; 64] = checked(checked(hex::decode(&r.signature_hex))?.try_into())?;
         let binding = checked(runner_binding::verify_runner_proof(
             intent,
@@ -584,8 +646,10 @@ fn validate_server(
     checked(CiphertextStore::open(outputs)).map(|_| ())
 }
 static INFLIGHT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+pub(crate) const OWNER_HANDLER_BOUND: Duration = Duration::from_secs(25);
+pub(crate) const OWNER_POST_BOUND: Duration = Duration::from_secs(30);
 async fn request_deadline(request: axum::extract::Request, next: Next) -> Response {
-    request_deadline_at(request, next, Duration::from_secs(25)).await
+    request_deadline_at(request, next, OWNER_HANDLER_BOUND).await
 }
 async fn request_deadline_at(
     request: axum::extract::Request,
@@ -882,6 +946,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
     let state = Arc::new(RootState {
         stop,
         ledger: Mutex::new(checked(AdmissionLedger::open(&config.ledger))?),
+        diagnostics: crate::http_diagnostics::Diagnostics::best_effort(&config.output_directory),
         config,
         admission,
         recipient_online: AtomicBool::new(false),
@@ -1206,8 +1271,40 @@ pub(crate) async fn request_bytes(
     body: Option<Vec<u8>>,
     max: usize,
 ) -> Result<Vec<u8>> {
+    request_bytes_inner(client, method, url, body, max, None).await
+}
+/// The server may spend its whole handler budget before returning a refusal.
+/// Leave a bounded network margin instead of racing that work with a shorter
+/// client deadline. This does not retry a POST or renew admission authority.
+pub(crate) async fn request_owner_post(
+    client: &reqwest::Client,
+    url: &str,
+    body: Vec<u8>,
+    max: usize,
+) -> Result<Vec<u8>> {
+    request_bytes_inner(
+        client,
+        reqwest::Method::POST,
+        url,
+        Some(body),
+        max,
+        Some(OWNER_POST_BOUND),
+    )
+    .await
+}
+async fn request_bytes_inner(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<Vec<u8>>,
+    max: usize,
+    bound: Option<Duration>,
+) -> Result<Vec<u8>> {
     let url = checked(reqwest::Url::parse(url))?;
     let mut req = client.request(method, url.clone());
+    if let Some(bound) = bound {
+        req = req.timeout(bound);
+    }
     if let Some(body) = body {
         req = req.header("Content-Type", "application/json").body(body)
     }
@@ -1257,6 +1354,44 @@ mod tests {
             .timeout(bound)
             .build()
             .unwrap()
+    }
+    #[tokio::test]
+    async fn owner_post_can_return_a_bounded_server_result_after_client_default_expires() {
+        assert!(OWNER_POST_BOUND >= OWNER_HANDLER_BOUND + Duration::from_secs(5));
+        assert!(OWNER_HANDLER_BOUND > crate::github::REQUEST_BOUND);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let client = http_fixture_client(Duration::from_millis(20));
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            request_owner_post(
+                &client,
+                &format!("http://{addr}/owned"),
+                b"{}".to_vec(),
+                4096,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        server.await.unwrap();
+        // The actual server result arrives after the shorter default; no retry.
+        assert!(matches!(
+            error,
+            RuntimeError::Http(HttpFailure::Status(403))
+        ));
     }
     #[tokio::test]
     async fn http_refusal_reports_only_numeric_status_not_response_or_url() {

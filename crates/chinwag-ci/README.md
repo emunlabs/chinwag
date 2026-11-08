@@ -83,8 +83,28 @@ headers, tokens, claims, response bodies or captured output. A phase entry prove
 only that the runner reached that phase. Cleanup entries are reported separately
 without replacing the original failure phase. Operator readiness and server-side job
 registration do not prove that the runner finished bootstrap, prepared its image,
-reached its readiness loop or delivered a payload. Diagnostics add no retries or
-authority and do not change existing trust or timeouts.
+reached its readiness loop or delivered a payload. Diagnostic records add no
+retries or authority and do not relax trust.
+
+Owner POSTs now use a 30-second response budget: the existing 25-second server
+handler bound plus five seconds for transport and response delivery. This aligns
+the earlier 10-second caller deadline with server evidence reads
+that may themselves take ten seconds. GitHub/OIDC evidence requests retain their
+existing ten-second request and five-second connection bounds. This alignment
+does not establish the earlier timeout's inner cause or guarantee delivery. No original POST
+is retried, and policy, nonce, admission and model deadlines remain independent
+and must still be current.
+
+Root also creates a private `http-operation-phases-v1.jsonl` in its declared
+output directory. Challenge records contain only a process-local request number,
+fixed phase/category and monotonic elapsed milliseconds. They record separate
+run/JWKS reads, OIDC and ledger phases; no request values or credential data enter
+the logger. At most 256 records are written, with an explicit final limit marker.
+Diagnostic setup errors disable only logging; existing files and permissions
+remain untouched. Contended writes are skipped. Diagnostic limits, write errors or missing records never authorize or stop a
+request: incomplete traces remain unknown. These best-effort records are not a
+durability, request-authentication, delivery or task-start proof. They are not
+payload output. Existing files are preserved rather than overwritten.
 
 Runner exit `0` means complete successful command capture with both verified
 durable destinations. Exit `1` preserves a delivered original that is not
