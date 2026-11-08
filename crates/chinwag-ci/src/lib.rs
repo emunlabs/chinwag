@@ -11,7 +11,11 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use std::{io, process::Stdio, time::Duration};
+use std::{
+    io,
+    process::Stdio,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 use zeroize::Zeroizing;
 
@@ -27,6 +31,104 @@ mod macos_acl;
 pub mod storage;
 
 pub const MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_COMMAND_EVIDENCE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Owned command-builder observations, never a scan of another process's argv
+/// or environment. These bytes can contain credentials: seal them with the full
+/// failure payload, never echo them. Cwd is recorded separately from argv hash.
+#[derive(Serialize)]
+pub struct CommandEvidence {
+    os_string_encoding: &'static str,
+    #[serde(serialize_with = "serialize_bytes")]
+    program_base64: Zeroizing<Vec<u8>>,
+    #[serde(serialize_with = "serialize_byte_arrays")]
+    arguments_base64: Vec<Zeroizing<Vec<u8>>>,
+    #[serde(serialize_with = "serialize_optional_bytes")]
+    requested_working_directory_base64: Option<Zeroizing<Vec<u8>>>,
+    #[serde(serialize_with = "serialize_optional_bytes")]
+    observed_parent_working_directory_base64: Option<Zeroizing<Vec<u8>>>,
+    argv_sha256: String,
+}
+
+impl CommandEvidence {
+    /// Snapshot executable argv as represented by the owned command builder.
+    /// NUL is not valid in an OS argument; structured-input callers must reject
+    /// it before constructing Command, which may replace invalid NUL strings.
+    pub fn snapshot(command: &Command) -> Result<Self, CaptureError> {
+        let source = command.as_std();
+        let parent = std::env::current_dir().ok();
+        let requested = source
+            .get_current_dir()
+            .map(|path| path.as_os_str().as_encoded_bytes());
+        let observed_parent = parent
+            .as_ref()
+            .map(|path| path.as_os_str().as_encoded_bytes());
+        let program = source.get_program().as_encoded_bytes();
+        let mut total = 0_usize;
+        for value in std::iter::once(program)
+            .chain(source.get_args().map(|value| value.as_encoded_bytes()))
+            .chain(requested)
+            .chain(observed_parent)
+        {
+            total = total
+                .checked_add(8)
+                .and_then(|size| size.checked_add(value.len()))
+                .ok_or(CaptureError::InvalidInput)?;
+            if total > MAX_COMMAND_EVIDENCE_BYTES {
+                return Err(CaptureError::InvalidInput);
+            }
+        }
+        let encoding = if cfg!(unix) {
+            "unix-os-bytes"
+        } else {
+            "rust-os-encoded-bytes-same-platform"
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"chinwag-ci-command-argv-v1\0");
+        for value in std::iter::once(encoding.as_bytes())
+            .chain(std::iter::once(program))
+            .chain(source.get_args().map(|value| value.as_encoded_bytes()))
+        {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        Ok(Self {
+            os_string_encoding: encoding,
+            program_base64: Zeroizing::new(program.to_vec()),
+            arguments_base64: source
+                .get_args()
+                .map(|value| Zeroizing::new(value.as_encoded_bytes().to_vec()))
+                .collect(),
+            requested_working_directory_base64: requested
+                .map(|value| Zeroizing::new(value.to_vec())),
+            observed_parent_working_directory_base64: observed_parent
+                .map(|value| Zeroizing::new(value.to_vec())),
+            argv_sha256: hex::encode(digest.finalize()),
+        })
+    }
+    /// Commits to program+argument boundaries and encoding, not cwd/environment
+    /// or permission to execute. Verify checkout/cwd policy independently.
+    pub fn argv_sha256(&self) -> &str {
+        &self.argv_sha256
+    }
+}
+
+#[derive(Serialize)]
+struct HostTiming {
+    classification: &'static str,
+    started_unix_ms: Option<u64>,
+    finished_unix_ms: Option<u64>,
+    elapsed_monotonic_ms: u64,
+}
+
+fn host_unix_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
 
 /// These fields are supplied claims. A separate admission verifier must bind
 /// them to a signed initiating-agent intent and the actual workflow identity.
@@ -136,6 +238,8 @@ pub struct CapturedRun {
     content_disposition: &'static str,
     provenance: &'static str,
     context: UnverifiedRunContext,
+    command: CommandEvidence,
+    timing: HostTiming,
     outcome: ProcessOutcome,
     observed_child_exit: Option<ObservedChildExit>,
     stdout: StreamEvidence,
@@ -158,6 +262,32 @@ pub struct StreamEvidence {
 fn serialize_bytes<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
     let encoded = Zeroizing::new(STANDARD.encode(value));
     serializer.serialize_str(&encoded)
+}
+
+fn serialize_byte_arrays<S: Serializer>(
+    values: &[Zeroizing<Vec<u8>>],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+    for value in values {
+        let encoded = Zeroizing::new(STANDARD.encode(value));
+        sequence.serialize_element(encoded.as_str())?;
+    }
+    sequence.end()
+}
+
+fn serialize_optional_bytes<S: Serializer>(
+    value: &Option<Zeroizing<Vec<u8>>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => {
+            let encoded = Zeroizing::new(STANDARD.encode(value));
+            serializer.serialize_some(encoded.as_str())
+        }
+        None => serializer.serialize_none(),
+    }
 }
 
 impl StreamEvidence {
@@ -269,6 +399,9 @@ pub async fn capture(
     {
         return Err(CaptureError::InvalidInput);
     }
+    let started = Instant::now();
+    let started_unix_ms = host_unix_ms();
+    let command_evidence = CommandEvidence::snapshot(command)?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -354,6 +487,13 @@ pub async fn capture(
         content_disposition: "UNTRUSTED_PROCESS_OUTPUT_DATA_ONLY",
         provenance: "UNVERIFIED_REQUIRES_SIGNED_INTENT_AND_WORKLOAD_ADMISSION",
         context,
+        command: command_evidence,
+        timing: HostTiming {
+            classification: "LOCAL_HOST_OBSERVATION_NOT_K2_TRUSTED_TIME",
+            started_unix_ms,
+            finished_unix_ms: host_unix_ms(),
+            elapsed_monotonic_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        },
         outcome,
         observed_child_exit,
         stdout,

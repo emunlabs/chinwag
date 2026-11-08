@@ -95,3 +95,12 @@ Tests cover hostile lengths/routes and a real loopback delayed-reader close
 regression. That loopback fixture is not Cloudflare or CI-runner proof. Actual
 owned CI profiles, crypto/admission integration, dual destination delivery and
 the failing/fixed GitHub workflow remain to be exercised end to end.
+
+Captured evidence also contains lossless program/argument bytes, requested cwd,
+the observed parent cwd and a domain-separated argv digest. It does not copy the
+process environment. Cwd/checkout policy remains independent of that argv hash.
+NUL is invalid in an OS argument and must be rejected before constructing a
+command from structured input. Valid non-UTF8 Unix arguments are retained.
+Wall-clock values and monotonic elapsed time are labeled local host observations;
+they do not establish K2 trusted time. Command metadata, like output, must be
+sealed rather than printed into runner logs.

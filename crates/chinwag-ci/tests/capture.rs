@@ -77,6 +77,16 @@ async fn retains_binary_output_larger_than_a_pipe_and_original_failure() {
         .decode(json["stderr"]["bytes_base64"].as_str().unwrap())
         .unwrap();
     assert_eq!(stderr, b"failure\0\xff\n");
+    assert!(
+        !STANDARD
+            .decode(json["command"]["program_base64"].as_str().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        json["timing"]["classification"],
+        "LOCAL_HOST_OBSERVATION_NOT_K2_TRUSTED_TIME"
+    );
     assert_eq!(
         json["provenance"],
         "UNVERIFIED_REQUIRES_SIGNED_INTENT_AND_WORKLOAD_ADMISSION"
@@ -180,4 +190,51 @@ async fn preserves_exit_when_a_descendant_keeps_the_pipe_open() {
     // This controlled descendant is finite. Give it time to close its inherited
     // pipes; production descendants belong to the runner's job sandbox.
     tokio::time::sleep(Duration::from_millis(700)).await;
+}
+
+#[test]
+fn command_evidence_binds_argument_boundaries_without_collecting_environment() {
+    use chinwag_ci::CommandEvidence;
+    let mut first = Command::new("test-only-program");
+    first
+        .args(["ab", "c"])
+        .env("TEST_ONLY_SECRET", "DO_NOT_SNAPSHOT_ENVIRONMENT");
+    let mut second = Command::new("test-only-program");
+    second.args(["a", "bc"]);
+    let first = CommandEvidence::snapshot(&first).unwrap();
+    let second = CommandEvidence::snapshot(&second).unwrap();
+    assert_ne!(first.argv_sha256(), second.argv_sha256());
+    let json = serde_json::to_string(&first).unwrap();
+    assert!(!json.contains("DO_NOT_SNAPSHOT_ENVIRONMENT"));
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let args = value["arguments_base64"].as_array().unwrap();
+    assert_eq!(STANDARD.decode(args[0].as_str().unwrap()).unwrap(), b"ab");
+    assert_eq!(STANDARD.decode(args[1].as_str().unwrap()).unwrap(), b"c");
+}
+
+#[cfg(unix)]
+#[test]
+fn command_evidence_preserves_non_utf8_argument_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = Command::new("never-executed");
+    command.arg(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+    let evidence = chinwag_ci::CommandEvidence::snapshot(&command).unwrap();
+    let value = serde_json::to_value(&evidence).unwrap();
+    assert_eq!(value["os_string_encoding"], "unix-os-bytes");
+    assert_eq!(
+        STANDARD
+            .decode(value["arguments_base64"][0].as_str().unwrap())
+            .unwrap(),
+        b"raw-\xff"
+    );
+}
+
+#[test]
+fn oversized_command_metadata_is_refused_without_spawning() {
+    let mut command = Command::new("never-executed");
+    command.arg("x".repeat(chinwag_ci::MAX_COMMAND_EVIDENCE_BYTES));
+    assert!(matches!(
+        chinwag_ci::CommandEvidence::snapshot(&command),
+        Err(chinwag_ci::CaptureError::InvalidInput)
+    ));
 }
