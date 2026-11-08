@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 pub mod acu;
 #[cfg(unix)]
 pub mod admission;
+pub mod agent_events;
 #[cfg(unix)]
 pub mod authorization;
 #[cfg(unix)]
