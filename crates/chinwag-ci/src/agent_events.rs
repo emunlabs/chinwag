@@ -74,6 +74,8 @@ pub struct ToolCommandObservation {
     pub completed_command_sha256: Option<[u8; 32]>,
     pub exit_code: i64,
     pub completed: bool,
+    pub started_event: Option<u64>,
+    pub completed_event: u64,
 }
 #[derive(Deserialize)]
 struct Change {
@@ -97,6 +99,39 @@ pub struct AgentTurnObservation {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub commands: Vec<ToolCommandObservation>,
+    pub command_items: u64,
+    pub file_change_items: u64,
+    pub other_tool_items: u64,
+    pub first_file_change_event: Option<u64>,
+    pub out_of_scope_file_change: bool,
+}
+
+impl AgentTurnObservation {
+    pub(crate) fn zero_tool_initial(&self) -> bool {
+        self.command_items == 0 && self.file_change_items == 0 && self.other_tool_items == 0
+    }
+    pub(crate) fn read_then_scoped_patch(&self, expected: &[[u8; 32]]) -> bool {
+        let [command] = self.commands.as_slice() else {
+            return false;
+        };
+        self.command_items == 1
+            && self.other_tool_items == 0
+            && self.file_change_items > 0
+            && self.reported_file_changes > 0
+            && !self.out_of_scope_file_change
+            && command
+                .started_command_sha256
+                .is_some_and(|d| expected.contains(&d))
+            && command.started_command_sha256 == command.completed_command_sha256
+            && command.completed
+            && command.exit_code == 0
+            && command
+                .started_event
+                .is_some_and(|n| n < command.completed_event)
+            && self
+                .first_file_change_event
+                .is_some_and(|n| n > command.completed_event)
+    }
 }
 
 /// Incremental decoder. A record bound can refuse evidence, but its caller must
@@ -110,7 +145,15 @@ pub struct CodexEvents {
     completed: bool,
     poisoned: bool,
     active: BTreeMap<String, String>,
-    command_starts: BTreeMap<String, [u8; 32]>,
+    command_starts: BTreeMap<String, ([u8; 32], u64)>,
+    observed_items: BTreeSet<String>,
+    command_items: u64,
+    file_change_items: u64,
+    other_tool_items: u64,
+    event_number: u64,
+    first_file_change_event: Option<u64>,
+    out_of_scope_file_change: bool,
+    allowed_absolute_fixture: Option<String>,
     command_observations: Vec<ToolCommandObservation>,
     seen: BTreeSet<String>,
     commands: u64,
@@ -148,6 +191,14 @@ impl CodexEvents {
             poisoned: false,
             active: BTreeMap::new(),
             command_starts: BTreeMap::new(),
+            observed_items: BTreeSet::new(),
+            command_items: 0,
+            file_change_items: 0,
+            other_tool_items: 0,
+            event_number: 0,
+            first_file_change_event: None,
+            out_of_scope_file_change: false,
+            allowed_absolute_fixture: None,
             command_observations: Vec::new(),
             seen: BTreeSet::new(),
             commands: 0,
@@ -156,6 +207,13 @@ impl CodexEvents {
             failed_changes: 0,
             usage: None,
         })
+    }
+
+    pub(crate) fn allow_workspace_fixture(&mut self, workspace: &std::path::Path) {
+        self.allowed_absolute_fixture = workspace
+            .join(crate::preparation::FIXTURE_GIT_PATH)
+            .to_str()
+            .map(str::to_owned);
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), AgentEventError> {
@@ -189,6 +247,7 @@ impl CodexEvents {
         if line.iter().all(u8::is_ascii_whitespace) {
             return Ok(());
         }
+        self.event_number = self.event_number.checked_add(1).ok_or(AgentEventError)?;
         let v: Event = serde_json::from_slice(line).map_err(|_| AgentEventError)?;
         let event = v.r#type.as_str();
         if event == "thread.started" {
@@ -226,6 +285,27 @@ impl CodexEvents {
         {
             return Err(AgentEventError);
         }
+        if self.observed_items.insert(id.into()) {
+            match kind {
+                "command_execution" => self.command_items += 1,
+                "file_change" => self.file_change_items += 1,
+                "reasoning" | "agent_message" => {}
+                _ => self.other_tool_items += 1,
+            }
+        }
+        if kind == "file_change" {
+            self.first_file_change_event
+                .get_or_insert(self.event_number);
+            if let Some(changes) = &item.changes {
+                for change in changes {
+                    if change.path != crate::preparation::FIXTURE_GIT_PATH
+                        && Some(change.path.as_str()) != self.allowed_absolute_fixture.as_deref()
+                    {
+                        self.out_of_scope_file_change = true;
+                    }
+                }
+            }
+        }
         if event == "item.started" {
             if self.seen.contains(id) || self.active.insert(id.into(), kind.into()).is_some() {
                 return Err(AgentEventError);
@@ -233,7 +313,8 @@ impl CodexEvents {
             if kind == "command_execution"
                 && let Some(c) = &item.command
             {
-                self.command_starts.insert(id.into(), command_digest(c));
+                self.command_starts
+                    .insert(id.into(), (command_digest(c), self.event_number));
             }
             return Ok(());
         }
@@ -263,7 +344,9 @@ impl CodexEvents {
                 self.failed_commands += u64::from(code != 0);
                 self.command_observations.push(ToolCommandObservation {
                     item_id_sha256: Sha256::digest(id.as_bytes()).into(),
-                    started_command_sha256: self.command_starts.remove(id),
+                    started_command_sha256: self.command_starts.get(id).map(|v| v.0),
+                    started_event: self.command_starts.remove(id).map(|v| v.1),
+                    completed_event: self.event_number,
                     completed_command_sha256: item.command.as_deref().map(command_digest),
                     exit_code: code,
                     completed: item.status.as_deref() == Some("completed"),
@@ -312,6 +395,11 @@ impl CodexEvents {
             input_tokens: self.usage.as_ref().and_then(|u| u.input_tokens),
             output_tokens: self.usage.as_ref().and_then(|u| u.output_tokens),
             commands: std::mem::take(&mut self.command_observations),
+            command_items: self.command_items,
+            file_change_items: self.file_change_items,
+            other_tool_items: self.other_tool_items,
+            first_file_change_event: self.first_file_change_event,
+            out_of_scope_file_change: self.out_of_scope_file_change,
         })
     }
 }
@@ -330,6 +418,118 @@ mod tests {
         format!(
             "{{\"type\":\"thread.started\",\"thread_id\":\"{ID}\"}}\n{{\"type\":\"turn.started\"}}\n{items}{{\"type\":\"turn.completed\",\"usage\":{{}}}}\n"
         )
+    }
+    fn observed(items: Vec<serde_json::Value>) -> AgentTurnObservation {
+        let mut text = String::new();
+        for v in items {
+            text.push_str(&serde_json::to_string(&v).unwrap());
+            text.push('\n');
+        }
+        let mut p = CodexEvents::new(ID).unwrap();
+        p.allow_workspace_fixture(std::path::Path::new("/owned/work"));
+        p.push(stream(&text).as_bytes()).unwrap();
+        p.finish().unwrap()
+    }
+    fn command(id: &str, stage: &str, text: &str, exit: i64) -> serde_json::Value {
+        serde_json::json!({"type":stage,"item":{"id":id,"type":"command_execution","command":text,"status":if exit==0{"completed"}else{"failed"},"exit_code":exit}})
+    }
+    fn patch(id: &str, stage: &str, path: &str, failed: bool) -> serde_json::Value {
+        serde_json::json!({"type":stage,"item":{"id":id,"type":"file_change","status":if failed{"failed"}else{"completed"},"changes":[{"path":path,"kind":"update"}]}})
+    }
+    #[test]
+    fn initial_turn_refuses_non_command_and_unknown_tools_even_completion_only() {
+        assert!(observed(vec![serde_json::json!({"type":"item.completed","item":{"id":"m","type":"agent_message"}})]).zero_tool_initial());
+        for kind in [
+            "mcp_tool_call",
+            "collab_tool_call",
+            "web_search",
+            "todo_list",
+            "future_unknown_tool",
+        ] {
+            for stages in [
+                vec!["item.completed"],
+                vec!["item.started", "item.completed"],
+            ] {
+                let o = observed(
+                    stages
+                        .into_iter()
+                        .map(
+                            |stage| serde_json::json!({"type":stage,"item":{"id":"x","type":kind}}),
+                        )
+                        .collect(),
+                );
+                assert_eq!(o.other_tool_items, 1);
+                assert!(!o.zero_tool_initial());
+            }
+        }
+    }
+    #[test]
+    fn singleton_reader_must_complete_before_every_patch_attempt() {
+        let (reader, expected) = read_command_commitments([
+            "/owned/chinwag-ci",
+            "agent-read",
+            "/owned/work/target/r",
+            "abcd",
+        ])
+        .unwrap();
+        let path = crate::preparation::FIXTURE_GIT_PATH;
+        let rs = command("read", "item.started", &reader, 0);
+        let rd = command("read", "item.completed", &reader, 0);
+        let ps = patch("patch", "item.started", path, false);
+        let pd = patch("patch", "item.completed", path, false);
+        assert!(
+            observed(vec![rs.clone(), rd.clone(), ps.clone(), pd.clone()])
+                .read_then_scoped_patch(&expected)
+        );
+        for events in [
+            vec![rs.clone(), ps, rd.clone(), pd.clone()],
+            vec![
+                patch("failed", "item.completed", path, true),
+                rs.clone(),
+                rd.clone(),
+                pd.clone(),
+            ],
+            vec![
+                rs.clone(),
+                rd.clone(),
+                command("extra", "item.started", "echo unrelated", 1),
+                command("extra", "item.completed", "echo unrelated", 1),
+                pd.clone(),
+            ],
+            vec![
+                rs.clone(),
+                rd.clone(),
+                serde_json::json!({"type":"item.completed","item":{"id":"tool","type":"mcp_tool_call"}}),
+                pd.clone(),
+            ],
+            vec![
+                rs.clone(),
+                rd.clone(),
+                patch("other", "item.completed", "other.rs", false),
+                patch("revert", "item.completed", "other.rs", false),
+                pd.clone(),
+            ],
+            vec![rs.clone(), rd.clone()],
+        ] {
+            assert!(!observed(events).read_then_scoped_patch(&expected));
+        }
+        let absolute = format!("/owned/work/{path}");
+        assert!(
+            observed(vec![
+                rs.clone(),
+                rd.clone(),
+                patch("patch", "item.completed", &absolute, false)
+            ])
+            .read_then_scoped_patch(&expected)
+        );
+        assert!(
+            !observed(vec![
+                rs,
+                rd,
+                patch("patch", "item.completed", &format!("/other/{path}"), false)
+            ])
+            .read_then_scoped_patch(&expected)
+        );
     }
     #[test]
     fn reader_commitment_binds_exact_started_completed_command_and_rejects_shell_additions() {

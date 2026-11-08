@@ -105,7 +105,9 @@ It requires both destinations' three-layer native storage signatures for the
 same encrypted original, a current ACU grant and complete authorized failure
 read, and the exact enrolled idle conversation. Green or incomplete captures do
 not wake it. The owner fsyncs a once-only reservation before launching the exact
-session resume; failure logs cannot select executable, flags, model, session,
+session resume. Fresh signed current ACU policy is checked again at launch;
+grant/policy expiry caps both process work and prompt delivery. Failure logs cannot
+select executable, flags, model, session,
 working directory or repair scope.
 
 The resumed turn receives a bounded sanitized diagnostic excerpt and a fixed
@@ -117,8 +119,12 @@ capture and stream hashes, writes it to its tool output, acknowledges the full
 read, and requires the parent's final durable acknowledgement and physical EOF.
 A helper's full read does not establish that every byte entered a model context.
 
-A repair counts only after that exact resumed turn reports the fixed read tool
-start/completion, the original coding-agent process exits cleanly, and the actual
+A repair counts only after that exact resumed turn reports its sole command:
+the fixed read tool completing before any direct `apply_patch` activity. Extra
+commands, unknown tools and out-of-scope reported patch paths refuse the result.
+The pinned public fixture context is supplied with the owner prompt; the host
+runs local tests after the agent applies the patch. The original coding-agent
+process must exit cleanly, and the actual
 Git diff changes only the admitted arithmetic body while preserving the entire
 test and diagnostic output. The owner then checkpoints the model-produced diff
 and submits a new authenticated CI run. Only a separately verified green run and

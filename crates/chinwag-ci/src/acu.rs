@@ -745,6 +745,13 @@ mod tests {
         let raw = f.acu.sign_release_policy(&f.spec).unwrap();
         assert!(scope.verify_current(&raw, 1100).is_ok());
         assert!(scope.verify_current(&raw, 1200).is_err());
+        let monotonic = tokio::time::Instant::now();
+        assert_eq!(
+            scope.current_until(&raw, 1100, monotonic).unwrap(),
+            monotonic + std::time::Duration::from_secs(100)
+        );
+        assert!(scope.current_until(&raw, 1200, monotonic).is_err());
+        assert!(scope.current_until(&raw, 1201, monotonic).is_err());
         for change in 0..4 {
             let mut p = f.spec.clone();
             match change {
@@ -755,6 +762,7 @@ mod tests {
             }
             let raw = f.acu.sign_release_policy(&p).unwrap();
             assert!(scope.verify_current(&raw, 1100).is_err());
+            assert!(scope.current_until(&raw, 1100, monotonic).is_err());
         }
         let mut raw = raw;
         let n = raw.len() - 4;

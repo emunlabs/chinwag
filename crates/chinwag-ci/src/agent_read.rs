@@ -187,7 +187,21 @@ impl ReadAuthorization {
         }
         Ok(())
     }
-    async fn current(&self, origin: &str) -> Result<(), ReadError> {
+    pub(crate) fn current_until(
+        &self,
+        raw: &[u8],
+        now: u64,
+        monotonic_now: Instant,
+    ) -> Result<Instant, ReadError> {
+        self.verify_current(raw, now)?;
+        let remaining = self
+            .until()
+            .checked_sub(now)
+            .filter(|n| *n > 0)
+            .ok_or(ReadError)?;
+        Ok(monotonic_now + Duration::from_secs(remaining))
+    }
+    pub(crate) async fn current(&self, origin: &str) -> Result<Instant, ReadError> {
         let client = checked(crate::github::normal_https_client())?;
         let raw = checked(
             runtime::request_bytes(
@@ -200,7 +214,7 @@ impl ReadAuthorization {
             .await,
         )?;
         let now = checked(runtime::now())?;
-        self.verify_current(&raw, now)
+        self.current_until(&raw, now, Instant::now())
     }
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]

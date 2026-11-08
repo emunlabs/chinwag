@@ -57,6 +57,8 @@ pub struct AgentProcessObservation {
     pub deadline_exceeded: bool,
     pub forced: bool,
     pub stop_requested: bool,
+    pub forced_kill_failed: bool,
+    pub reap_unconfirmed: bool,
     pub turn: Option<AgentTurnObservation>,
 }
 impl AgentProcessObservation {
@@ -69,13 +71,31 @@ impl AgentProcessObservation {
             && !self.deadline_exceeded
             && !self.forced
             && !self.stop_requested
+            && !self.forced_kill_failed
+            && !self.reap_unconfirmed
             && self.turn.is_some()
     }
 }
+/// Custody of an ORIGINAL whose terminal wait is unconfirmed. This is not a
+/// closed process or permission to retry/signal a numeric PID. Keep it with the
+/// held operation for operator reconciliation. Drop must not issue an implicit
+/// kill after a failed wait/start_kill (PID ownership may be uncertain).
+pub struct OriginalChildCustody {
+    child: Option<tokio::process::Child>,
+}
+impl Drop for OriginalChildCustody {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            std::mem::forget(child);
+        }
+    }
+}
+
 pub struct AgentRun {
     pub observation: AgentProcessObservation,
     /// Initial build request only. Never serialize an agent's free text.
     pub(crate) last_message: Zeroizing<Vec<u8>>,
+    pub original_custody: Option<OriginalChildCustody>,
 }
 impl AgentRun {
     pub fn initial_build_request(&self) -> &[u8] {
@@ -159,9 +179,16 @@ struct Output {
     eof: bool,
 }
 
-async fn read_events<R: AsyncRead + Unpin>(mut reader: R, expected: Option<String>) -> Output {
+async fn read_events<R: AsyncRead + Unpin>(
+    mut reader: R,
+    expected: Option<String>,
+    workspace: Option<PathBuf>,
+) -> Output {
     let initial = expected.is_none();
     let mut parser = expected.as_deref().and_then(|id| CodexEvents::new(id).ok());
+    if let (Some(parser), Some(workspace)) = (&mut parser, &workspace) {
+        parser.allow_workspace_fixture(workspace);
+    }
     let mut invalid = false;
     let mut count = 0u64;
     let mut eof = false;
@@ -195,6 +222,9 @@ async fn read_events<R: AsyncRead + Unpin>(mut reader: R, expected: Option<Strin
                             .and_then(|id| CodexEvents::new(id).ok());
                     }
                     if let Some(p) = parser.as_mut() {
+                        if let Some(workspace) = &workspace {
+                            p.allow_workspace_fixture(workspace);
+                        }
                         if p.push(&line).is_err() || p.push(b"\n").is_err() {
                             invalid = true;
                         }
@@ -309,6 +339,8 @@ where
         deadline_exceeded: false,
         forced: false,
         stop_requested: false,
+        forced_kill_failed: false,
+        reap_unconfirmed: false,
         turn: None,
     };
     tokio::pin!(stop);
@@ -317,13 +349,14 @@ where
         return AgentRun {
             observation,
             last_message: Zeroizing::new(Vec::new()),
+            original_custody: None,
         };
     }
     tokio::select! {
         biased;
         _ = &mut stop => {
             observation.stop_requested = true;
-            return AgentRun { observation, last_message: Zeroizing::new(Vec::new()) };
+            return AgentRun { observation, last_message: Zeroizing::new(Vec::new()), original_custody:None };
         },
         _ = std::future::ready(()) => {},
     }
@@ -332,12 +365,14 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let workspace = command.as_std().get_current_dir().map(PathBuf::from);
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(_) => {
             return AgentRun {
                 observation,
                 last_message: Zeroizing::new(Vec::new()),
+                original_custody: None,
             };
         }
     };
@@ -379,7 +414,7 @@ where
     let mut monitor = tokio::spawn(async move {
         let result = supervise(
             child,
-            expected,
+            (expected, workspace),
             prompt,
             observation,
             [work, close_at],
@@ -407,31 +442,70 @@ where
             ..fallback
         },
         last_message: Zeroizing::new(Vec::new()),
+        original_custody: None,
     })
+}
+
+struct Retirement<T> {
+    kill_failed: bool,
+    status: Option<T>,
+}
+async fn bounded_retirement<T>(
+    kill: std::io::Result<()>,
+    wait: impl Future<Output = std::io::Result<T>>,
+    close_at: Instant,
+) -> Retirement<T> {
+    let status = if Instant::now() >= close_at {
+        None
+    } else {
+        match tokio::time::timeout_at(close_at, wait).await {
+            Ok(Ok(status)) if Instant::now() < close_at => Some(status),
+            _ => None,
+        }
+    };
+    Retirement {
+        kill_failed: kill.is_err(),
+        status,
+    }
+}
+fn retirement_start(grace_start: Instant, close_at: Instant) -> Instant {
+    let reserved =
+        (close_at.saturating_duration_since(grace_start) / 2).min(Duration::from_secs(1));
+    close_at - reserved
 }
 
 async fn supervise(
     mut child: tokio::process::Child,
-    expected: Option<String>,
+    scope: (Option<String>, Option<PathBuf>),
     prompt: Zeroizing<Vec<u8>>,
     mut observation: AgentProcessObservation,
     bounds: [Instant; 2],
     deliver: bool,
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> AgentRun {
+    let (expected, workspace) = scope;
     let [work, mut close_at] = bounds;
     let pid = observation.original_child_pid.unwrap_or(0);
+    let mut force_at = retirement_start(work, close_at);
+    let mut kill_attempted = false;
     let mut stdin = child.stdin.take().expect("owned piped stdin");
     let stdout = child.stdout.take().expect("owned piped stdout");
     let stderr = child.stderr.take().expect("owned piped stderr");
     let io = async {
         tokio::join!(
             async {
-                let r = deliver && stdin.write_all(&prompt).await.is_ok();
+                let r = if deliver && Instant::now() < work {
+                    tokio::select! {biased;
+                        _=sleep_until(work)=>false,
+                        r=stdin.write_all(&prompt)=>r.is_ok()&&Instant::now()<work,
+                    }
+                } else {
+                    false
+                };
                 drop(stdin);
                 r
             },
-            read_events(stdout, expected),
+            read_events(stdout, expected, workspace),
             drain(stderr)
         )
     };
@@ -449,8 +523,9 @@ async fn supervise(
                     // A failed wait does not establish an unreaped PID. Do not
                     // send another signal or let kill_on_drop target a reused
                     // numeric PID. Preserve UNKNOWN for original reconciliation.
-                    std::mem::forget(child);
-                    return AgentRun {observation,last_message:Zeroizing::new(Vec::new())};
+                    observation.reap_unconfirmed=true;
+                    observation.classification="ORIGINAL_AGENT_WAIT_UNCONFIRMED_HELD_NO_RETRY";
+                    return AgentRun {observation,last_message:Zeroizing::new(Vec::new()),original_custody:Some(OriginalChildCustody{child:Some(child)})};
                 }
             } },
             r=&mut io,if io_result.is_none()=>io_result=Some(r),
@@ -461,13 +536,21 @@ async fn supervise(
             _=&mut stop,if !observation.stop_requested=>{
                 observation.stop_requested=true;
                 close_at=close_at.min(Instant::now()+Duration::from_secs(10));
+                force_at=force_at.min(retirement_start(Instant::now(),close_at));
                 if status.is_none() {signal_owned(pid);}
+            },
+            _=sleep_until(force_at),if status.is_none()&&!kill_attempted=>{
+                kill_attempted=true;observation.forced=true;
+                let retired=bounded_retirement(child.start_kill(),child.wait(),close_at).await;
+                observation.forced_kill_failed=retired.kill_failed;
+                status=retired.status;
+                if status.is_none(){observation.reap_unconfirmed=true;break;}
             },
             _=sleep_until(close_at)=>{
                 observation.deadline_exceeded=true;
-                if status.is_none() {
-                    observation.forced=true;let _=child.start_kill();
-                    if let Ok(s)=child.wait().await {status=Some(s);}
+                if status.is_none(){
+                    if !kill_attempted{observation.forced=true;observation.forced_kill_failed=child.start_kill().is_err();}
+                    observation.reap_unconfirmed=true;
                 }
                 break;
             },
@@ -488,11 +571,21 @@ async fn supervise(
         return AgentRun {
             observation,
             last_message: out.message,
+            original_custody: if status.is_none() {
+                Some(OriginalChildCustody { child: Some(child) })
+            } else {
+                None
+            },
         };
     }
     AgentRun {
         observation,
         last_message: Zeroizing::new(Vec::new()),
+        original_custody: if status.is_none() {
+            Some(OriginalChildCustody { child: Some(child) })
+        } else {
+            None
+        },
     }
 }
 
@@ -553,6 +646,69 @@ pub async fn run<F: FnOnce(u32) -> Result<(), ()>, S: Future<Output = ()>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn failed_termination_and_unresolved_reap_return_by_original_close_with_custody() {
+        // Inject failure/pending wait to exercise the production bound; this is
+        // not a claim that an actual OS child was made unkillable.
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let close = Instant::now() + Duration::from_millis(25);
+        let r = bounded_retirement::<ExitStatus>(
+            Err(std::io::ErrorKind::PermissionDenied.into()),
+            std::future::pending(),
+            close,
+        )
+        .await;
+        assert!(r.kill_failed && r.status.is_none());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(Instant::now() < close + Duration::from_millis(500));
+        let mut custody = OriginalChildCustody { child: Some(child) };
+        assert_eq!(custody.child.as_ref().unwrap().id(), Some(pid));
+        // Separate test cleanup of the retained ORIGINAL, not a replacement or
+        // an observation falsely attributed to the injected pending wait.
+        let mut original = custody.child.take().unwrap();
+        original.start_kill().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), original.wait())
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    }
+    #[tokio::test]
+    async fn wait_error_and_late_or_past_deadline_zero_cannot_qualify_a_reap() {
+        let bound = Instant::now() + Duration::from_millis(20);
+        let error = bounded_retirement::<u8>(
+            Ok(()),
+            async { Err(std::io::ErrorKind::Interrupted.into()) },
+            bound,
+        )
+        .await;
+        assert!(error.status.is_none());
+        let late = bounded_retirement(
+            Ok(()),
+            async {
+                tokio::time::sleep_until(bound + Duration::from_millis(20)).await;
+                Ok(0u8)
+            },
+            bound,
+        )
+        .await;
+        assert!(late.status.is_none());
+        let past = bounded_retirement(Ok(()), std::future::ready(Ok(0u8)), Instant::now()).await;
+        assert!(past.status.is_none());
+        let ready = bounded_retirement(
+            Ok(()),
+            std::future::ready(Ok(0u8)),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(ready.status, Some(0));
+    }
     const ID: &str = "0199a213-81c0-7800-8aa1-bbab2a035a53";
     #[tokio::test]
     async fn actual_owned_child_receives_complete_stdin_and_closes_before_clean_observation() {
@@ -758,7 +914,7 @@ mod tests {
         );
         wire.push_str(&serde_json::json!({"type":"item.completed","item":{"id":"reply","type":"agent_message","text":"{\"request_build\":true}"}}).to_string());
         wire.push_str("\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":10}}\n");
-        let r = read_events(wire.as_bytes(), None).await;
+        let r = read_events(wire.as_bytes(), None, None).await;
         assert!(r.eof);
         assert_eq!(r.turn.unwrap().session_id, ID);
         assert_eq!(&*r.message, b"{\"request_build\":true}");
