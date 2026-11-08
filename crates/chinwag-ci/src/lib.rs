@@ -34,6 +34,8 @@ pub mod oidc;
 #[cfg(unix)]
 pub mod owner_cli;
 #[cfg(unix)]
+pub mod preparation;
+#[cfg(unix)]
 pub mod profile;
 #[cfg(unix)]
 pub mod receipt;

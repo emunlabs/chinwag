@@ -299,6 +299,9 @@ impl BoundProfiles {
     pub fn delivery(&self) -> &DeliveryProfile {
         &self.delivery
     }
+    pub(crate) fn intended_source(&self) -> &str {
+        &self.intent.source_commit
+    }
     pub fn validate_registered_job(&self, registered: &RegisteredJob) -> Result<(), ProfileError> {
         if registered.run_id == 0 || registered.run_attempt == 0 {
             return Err(ProfileError);
