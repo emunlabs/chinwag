@@ -101,20 +101,24 @@ struct Certificate {
 }
 pub struct HistoricalAdmission {
     statement: AdmissionStatement,
+    certificate: Vec<u8>,
 }
 /// Only produced after verifying the signature and rechecking finite validity.
 /// It authorizes this exact run's evidence ingress, never repair or task start.
 pub struct CurrentAdmission {
     historical: HistoricalAdmission,
 }
-/// Current ingress authenticated against an independently pinned owner
-/// certificate. Historical signature verification cannot construct this type.
+/// An admitted artifact authenticated against an independently pinned owner
+/// certificate and either current ingress or signed durable prior ingress.
+/// Historical signature verification alone cannot construct this type.
 /// The timestamp is an ordinary explicit host-clock observation, not K2 time.
 pub struct AdmissionBoundEnvelope {
     envelope: AuthenticatedEnvelope,
     issuer: [u8; 32],
     ingress_unix: u64,
     admission: AdmissionRecord,
+    certificate: Vec<u8>,
+    current_ingress: bool,
 }
 impl std::ops::Deref for AdmissionBoundEnvelope {
     type Target = AuthenticatedEnvelope;
@@ -131,6 +135,26 @@ impl AdmissionBoundEnvelope {
     }
     pub fn admission_record(&self) -> &AdmissionRecord {
         &self.admission
+    }
+    pub fn certificate(&self) -> &[u8] {
+        &self.certificate
+    }
+    pub(crate) fn is_current_ingress(&self) -> bool {
+        self.current_ingress
+    }
+    /// Certificate + complete signed manifest + ciphertext, stored as one
+    /// bounded object. No private recipient/ACU material or raw logs appear.
+    pub fn complete_admitted_blob(&self) -> Result<Vec<u8>, AuthorizationError> {
+        let inner = self
+            .envelope
+            .complete_storage_blob()
+            .map_err(|_| AuthorizationError::Rejected)?;
+        let mut bytes = Vec::with_capacity(12 + self.certificate.len() + inner.len());
+        bytes.extend_from_slice(b"CWCIAD01");
+        bytes.extend_from_slice(&(self.certificate.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.certificate);
+        bytes.extend_from_slice(&inner);
+        Ok(bytes)
     }
 }
 pub(crate) fn certify(
@@ -184,6 +208,7 @@ pub fn verify_historical_certificate(
     )?;
     Ok(HistoricalAdmission {
         statement: certificate.statement,
+        certificate: bytes.to_vec(),
     })
 }
 impl HistoricalAdmission {
@@ -212,26 +237,11 @@ impl CurrentAdmission {
         current_policy_sha256: [u8; 32],
         current_policy_epoch: u64,
     ) -> Result<ClaimedProvenance, AuthorizationError> {
-        let r = self.record();
-        if current_policy_sha256 == [0; 32] || current_policy_epoch == 0 {
-            return Err(AuthorizationError::Rejected);
-        }
-        Ok(ClaimedProvenance {
-            admission_sha256: *self.digest(),
-            repository: r.spec.repository.clone(),
-            repository_id: r.spec.repository_id,
-            source_commit: decode_hex(&r.spec.source_commit)?,
-            workflow_ref: r.spec.workflow_ref.clone(),
-            workflow_commit: decode_hex(&r.spec.workflow_commit)?,
-            run_id: r.run_id,
-            run_attempt: r.run_attempt,
-            initiating_instance: r.initiating_instance.clone(),
-            intent_digest: r.intent_digest,
-            command_profile_sha256: decode_hex(&r.spec.command_sha256)?,
-            delivery_profile_sha256: decode_hex(&r.spec.delivery_profile_sha256)?,
-            policy_sha256: current_policy_sha256,
-            policy_epoch: current_policy_epoch,
-        })
+        provenance(
+            &self.historical,
+            current_policy_sha256,
+            current_policy_epoch,
+        )
     }
     /// Caller supplies the independently owner-enrolled profile and current
     /// policy, rather than trusting corresponding envelope claims.
@@ -259,8 +269,110 @@ impl CurrentAdmission {
             issuer: self.historical.statement.signer,
             ingress_unix: now_unix,
             admission: self.record().clone(),
+            certificate: self.historical.certificate.clone(),
+            current_ingress: true,
         })
     }
+}
+pub fn parse_admitted_blob(bytes: &[u8]) -> Result<(&[u8], SealedEnvelope), AuthorizationError> {
+    if bytes.len() < 12
+        || bytes.len() > crate::storage::MAX_CIPHERTEXT_BYTES
+        || &bytes[..8] != b"CWCIAD01"
+    {
+        return Err(AuthorizationError::Rejected);
+    }
+    let n = u32::from_be_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| AuthorizationError::Rejected)?,
+    ) as usize;
+    if n == 0 || n > MAX_AUTH_BYTES || n > bytes.len() - 12 {
+        return Err(AuthorizationError::Rejected);
+    }
+    let certificate = &bytes[12..12 + n];
+    let envelope =
+        envelope::parse_storage_blob(&bytes[12 + n..]).map_err(|_| AuthorizationError::Rejected)?;
+    Ok((certificate, envelope))
+}
+/// This accepts a signed observation of PRIOR admitted ingress, never a bare
+/// expired certificate. It creates read/release context, not current publication
+/// authority. The caller separately reads actual bytes through its own store.
+#[allow(clippy::too_many_arguments)]
+pub fn recover_stored_admitted_envelope(
+    blob: &[u8],
+    receipt: &[u8],
+    enrolled_admission_pin: [u8; 32],
+    pins: &KeyPins,
+    original_policy_sha256: [u8; 32],
+    original_policy_epoch: u64,
+    role: crate::envelope::Destination,
+    store_id: [u8; 32],
+) -> Result<
+    (
+        AdmissionBoundEnvelope,
+        crate::receipt::VerifiedStorageReceipt,
+    ),
+    AuthorizationError,
+> {
+    let (certificate, sealed) = parse_admitted_blob(blob)?;
+    let historical = verify_historical_certificate(certificate, enrolled_admission_pin)?;
+    let expected = provenance(&historical, original_policy_sha256, original_policy_epoch)?;
+    let authenticated = envelope::authenticate(
+        &sealed.manifest,
+        &sealed.ciphertext,
+        &expected,
+        pins,
+        &historical.record().signing_key,
+    )
+    .map_err(|_| AuthorizationError::Rejected)?;
+    let (verified, ingress) = crate::receipt::verify_admitted_historical(
+        receipt,
+        &authenticated,
+        certificate,
+        enrolled_admission_pin,
+        historical.record(),
+        role,
+        store_id,
+        blob,
+    )
+    .map_err(|_| AuthorizationError::Rejected)?;
+    Ok((
+        AdmissionBoundEnvelope {
+            envelope: authenticated,
+            issuer: enrolled_admission_pin,
+            ingress_unix: ingress,
+            admission: historical.record().clone(),
+            certificate: certificate.to_vec(),
+            current_ingress: false,
+        },
+        verified,
+    ))
+}
+fn provenance(
+    historical: &HistoricalAdmission,
+    policy_sha256: [u8; 32],
+    policy_epoch: u64,
+) -> Result<ClaimedProvenance, AuthorizationError> {
+    let r = historical.record();
+    if policy_sha256 == [0; 32] || policy_epoch == 0 {
+        return Err(AuthorizationError::Rejected);
+    }
+    Ok(ClaimedProvenance {
+        admission_sha256: *historical.digest(),
+        repository: r.spec.repository.clone(),
+        repository_id: r.spec.repository_id,
+        source_commit: decode_hex(&r.spec.source_commit)?,
+        workflow_ref: r.spec.workflow_ref.clone(),
+        workflow_commit: decode_hex(&r.spec.workflow_commit)?,
+        run_id: r.run_id,
+        run_attempt: r.run_attempt,
+        initiating_instance: r.initiating_instance.clone(),
+        intent_digest: r.intent_digest,
+        command_profile_sha256: decode_hex(&r.spec.command_sha256)?,
+        delivery_profile_sha256: decode_hex(&r.spec.delivery_profile_sha256)?,
+        policy_sha256,
+        policy_epoch,
+    })
 }
 #[cfg(test)]
 pub(crate) fn assert_canonical_certificate_tampering_is_refused(bytes: &[u8], pin: [u8; 32]) {

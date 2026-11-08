@@ -14,6 +14,9 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+mod admitted;
+pub use admitted::verify_admitted;
+pub(crate) use admitted::verify_admitted_historical;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiptError {
@@ -167,12 +170,12 @@ impl ReceiptSigner {
     pub fn public(&self) -> [u8; 32] {
         *self.secret.public().as_bytes()
     }
-    fn sign_observation(
+    fn observation_statement(
         &self,
         envelope: &AuthenticatedEnvelope,
         blob: &[u8],
         observation: StoredBytesObservation,
-    ) -> Result<Vec<u8>, ReceiptError> {
+    ) -> Result<Statement, ReceiptError> {
         if self.public() != *envelope.receipt_signing_pin(self.role) {
             return Err(ReceiptError::Rejected);
         }
@@ -201,6 +204,15 @@ impl ReceiptSigner {
             object: observation.object().into(),
             created_inode_confirmed: observation.created_inode_confirmed(),
         };
+        Ok(statement)
+    }
+    fn sign_observation(
+        &self,
+        envelope: &AuthenticatedEnvelope,
+        blob: &[u8],
+        observation: StoredBytesObservation,
+    ) -> Result<Vec<u8>, ReceiptError> {
+        let statement = self.observation_statement(envelope, blob, observation)?;
         let signature_hex = hex::encode(self.secret.sign(&signed_bytes(&statement)?).to_bytes());
         canonical(&SignedReceipt {
             statement,
@@ -240,6 +252,21 @@ pub fn verify(
     role: Destination,
     store_id: [u8; 32],
 ) -> Result<VerifiedStorageReceipt, ReceiptError> {
+    verify_with_object(
+        bytes,
+        envelope,
+        role,
+        store_id,
+        claim(&envelope.complete_storage_blob()?),
+    )
+}
+fn verify_with_object(
+    bytes: &[u8],
+    envelope: &AuthenticatedEnvelope,
+    role: Destination,
+    store_id: [u8; 32],
+    object: CiphertextClaim,
+) -> Result<VerifiedStorageReceipt, ReceiptError> {
     if bytes.len() > 16384 || store_id == [0; 32] {
         return Err(ReceiptError::Rejected);
     }
@@ -250,7 +277,6 @@ pub fn verify(
     }
     let s = &signed.statement;
     let c = envelope.claims();
-    let object = claim(&envelope.complete_storage_blob()?);
     if s.version != 1
         || s.classification != "DURABLE_COMPLETE_ENVELOPE_READBACK_OBSERVATION_ONLY"
         || s.role != role

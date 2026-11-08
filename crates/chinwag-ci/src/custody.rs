@@ -593,6 +593,39 @@ impl OwnerCustody {
         };
         Ok(receipt.persist(envelope)?)
     }
+    pub fn persist_admitted(
+        &self,
+        envelope: &crate::authorization::AdmissionBoundEnvelope,
+    ) -> Result<Vec<u8>, CustodyError> {
+        self.guard.check()?;
+        let Keys::Destination { receipt, .. } = &self.keys else {
+            return Err(CustodyError::Role);
+        };
+        Ok(receipt.persist_admitted(envelope)?)
+    }
+    #[cfg(test)]
+    pub(crate) fn persist_admitted_fixture(
+        &self,
+        envelope: &crate::authorization::AdmissionBoundEnvelope,
+        before: u64,
+        after: u64,
+    ) -> Result<Vec<u8>, CustodyError> {
+        self.guard.check()?;
+        let Keys::Destination { receipt, .. } = &self.keys else {
+            return Err(CustodyError::Role);
+        };
+        Ok(receipt.persist_admitted_fixture(envelope, before, after)?)
+    }
+    pub fn read_admitted_object(
+        &self,
+        object: crate::storage::CiphertextClaim,
+    ) -> Result<(Vec<u8>, Vec<u8>), CustodyError> {
+        self.guard.check()?;
+        let Keys::Destination { receipt, .. } = &self.keys else {
+            return Err(CustodyError::Role);
+        };
+        Ok(receipt.read_admitted_object(object)?)
+    }
     pub fn reconcile_existing(
         &self,
         envelope: &AuthenticatedEnvelope,

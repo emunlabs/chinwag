@@ -904,4 +904,220 @@ mod tests {
         );
         assert!(f.root.sign_release_policy(&f.spec).is_err());
     }
+    #[test]
+    fn cold_archive_recovery_uses_signed_durable_ingress_after_producer_admission_expires() {
+        use crate::{authorization, receipt};
+        let Fixture {
+            root,
+            archive,
+            acu,
+            envelope,
+            policy,
+            spec,
+            payload,
+            _directories: dirs,
+            issuer,
+        } = Fixture::new();
+        let er = root.public_enrollment().unwrap();
+        let ea = archive.public_enrollment().unwrap();
+        let pins = envelope.key_pins().clone();
+        let original_policy = policy.digest();
+        let rr = root
+            .persist_admitted_fixture(&envelope, 1003, 1003)
+            .unwrap();
+        let ra = archive
+            .persist_admitted_fixture(&envelope, 1003, 1003)
+            .unwrap();
+        let vr =
+            receipt::verify_admitted(&rr, &envelope, Destination::Recipient, [21; 32]).unwrap();
+        let va = receipt::verify_admitted(&ra, &envelope, Destination::Archive, [22; 32]).unwrap();
+        assert_eq!(
+            root.read_complete_object(&vr).unwrap(),
+            archive.read_complete_object(&va).unwrap()
+        );
+        let certificate = envelope.certificate().to_vec();
+        assert!(
+            authorization::verify_historical_certificate(&certificate, issuer)
+                .unwrap()
+                .require_current(1401)
+                .is_err()
+        );
+        drop(root);
+        drop(archive);
+        drop(envelope); // No live ingress value survives.
+        let store =
+            |i: usize| CiphertextStore::open(&dirs[i].path().canonicalize().unwrap()).unwrap();
+        let root = OwnerCustody::open_enrolled(
+            &dirs[0].path().canonicalize().unwrap(),
+            OwnerRole::Recipient,
+            [10; 32],
+            Some((store(3), [21; 32])),
+            &er,
+        )
+        .unwrap();
+        let archive = OwnerCustody::open_enrolled(
+            &dirs[1].path().canonicalize().unwrap(),
+            OwnerRole::Archive,
+            [11; 32],
+            Some((store(4), [22; 32])),
+            &ea,
+        )
+        .unwrap();
+        let mut new_spec = spec;
+        new_spec.epoch = 2;
+        new_spec.issued_unix = 1400;
+        new_spec.expires_unix = 2000;
+        new_spec.allowed_historical_envelopes.push(PolicyRevision {
+            epoch: 1,
+            sha256: original_policy,
+        });
+        let current = verify_current_policy(
+            &acu.sign_release_policy(&new_spec).unwrap(),
+            policy.signer(),
+            1401,
+        )
+        .unwrap();
+        let d = dir();
+        let mut ledger =
+            ReleaseLedger::open(&d.path().canonicalize().unwrap(), policy.signer(), issuer)
+                .unwrap();
+        for (owner, role, id, claim) in [
+            (&root, Destination::Recipient, [21; 32], vr.object_claim()),
+            (&archive, Destination::Archive, [22; 32], va.object_claim()),
+        ] {
+            let (blob, stored_receipt) = owner.read_admitted_object(claim).unwrap();
+            let (historical, verified) = authorization::recover_stored_admitted_envelope(
+                &blob,
+                &stored_receipt,
+                issuer,
+                &pins,
+                original_policy,
+                1,
+                role,
+                id,
+            )
+            .unwrap();
+            assert_eq!(verified.object_claim().sha256, claim.sha256);
+            assert_eq!(historical.ingress_unix(), 1002);
+            assert!(
+                owner
+                    .persist_admitted_fixture(&historical, 1401, 1401)
+                    .is_err()
+            ); // No publication renewal.
+            let request = owner
+                .create_release_request(&historical, &current, 1401, 1600)
+                .unwrap();
+            let response = ledger
+                .release(&acu, &historical, &current, &request, 1402)
+                .unwrap();
+            let grant = verify_grant(&response, &request, &historical, &current, 1403).unwrap();
+            assert_eq!(
+                &*owner
+                    .open_payload_from_grant(&historical, &grant, &current, 1403)
+                    .unwrap(),
+                &payload
+            );
+        }
+    }
+    #[test]
+    fn bare_ciphertext_receipts_changed_ingress_and_missing_sidecars_cannot_create_historical_authority()
+     {
+        use crate::{authorization, receipt};
+        let f = Fixture::new();
+        let legacy = f.root.persist(&f.envelope).unwrap();
+        let original = f
+            .root
+            .persist_admitted_fixture(&f.envelope, 1003, 1003)
+            .unwrap();
+        let verified =
+            receipt::verify_admitted(&original, &f.envelope, Destination::Recipient, [21; 32])
+                .unwrap();
+        let blob = f.root.read_complete_object(&verified).unwrap();
+        let pins = f.envelope.key_pins();
+        let recover = |blob: &[u8], receipt: &[u8]| {
+            authorization::recover_stored_admitted_envelope(
+                blob,
+                receipt,
+                f.issuer,
+                pins,
+                f.policy.digest(),
+                1,
+                Destination::Recipient,
+                [21; 32],
+            )
+        };
+        assert!(recover(&blob, &legacy).is_err());
+        let text = std::str::from_utf8(&original).unwrap();
+        for (from, to) in [
+            (
+                "\"authenticated_ingress_unix\":1002",
+                "\"authenticated_ingress_unix\":999",
+            ),
+            (
+                "\"storage_observed_unix\":1003",
+                "\"storage_observed_unix\":1300",
+            ),
+        ] {
+            assert!(text.contains(from));
+            assert!(recover(&blob, text.replace(from, to).as_bytes()).is_err());
+        }
+        let mut forged = original.clone();
+        let offset = text.rfind("\"signature_hex\":\"").unwrap() + "\"signature_hex\":\"".len();
+        forged[offset] = if forged[offset] == b'0' { b'1' } else { b'0' };
+        assert!(recover(&blob, &forged).is_err());
+        let mut changed = blob.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        assert!(recover(&changed, &original).is_err());
+        assert!(
+            f.root
+                .persist_admitted_fixture(&f.envelope, 1300, 1300)
+                .is_err()
+        );
+        let name = format!(
+            "{}.ingress-receipt.json",
+            hex::encode(verified.object_claim().sha256)
+        );
+        std::fs::rename(
+            f._directories[3].path().join(&name),
+            f._directories[3].path().join("preserved-ingress.json"),
+        )
+        .unwrap();
+        assert!(
+            f.root
+                .read_admitted_object(verified.object_claim())
+                .is_err()
+        );
+        assert!(
+            f.root
+                .persist_admitted_fixture(&f.envelope, 1004, 1004)
+                .is_err()
+        ); // Never recreates receipt/new expiry.
+    }
+    #[test]
+    fn persistence_completing_after_admission_expiry_preserves_object_without_a_false_timely_receipt()
+     {
+        let f = Fixture::new();
+        assert!(
+            f.root
+                .persist_admitted_fixture(&f.envelope, 1003, 1300)
+                .is_err()
+        );
+        let entries: Vec<_> = std::fs::read_dir(f._directories[3].path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].to_str().unwrap().ends_with(".cwcipher"));
+        assert!(
+            f.root
+                .persist_admitted_fixture(&f.envelope, 1004, 1004)
+                .is_err()
+        );
+        let f = Fixture::new();
+        assert!(
+            f.root
+                .persist_admitted_fixture(&f.envelope, 1003, 1002)
+                .is_err()
+        );
+    }
 }
