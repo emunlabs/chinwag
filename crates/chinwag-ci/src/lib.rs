@@ -38,6 +38,12 @@ pub mod oidc;
 #[cfg(unix)]
 pub mod owner_cli;
 #[cfg(unix)]
+mod owner_http;
+#[cfg(unix)]
+mod owner_lifecycle;
+#[cfg(unix)]
+pub mod owner_supervisor;
+#[cfg(unix)]
 pub mod preparation;
 #[cfg(unix)]
 pub mod profile;

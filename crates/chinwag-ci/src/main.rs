@@ -25,11 +25,25 @@ async fn main() {
             owner_result
         }
         [_, action, config] if action == "serve-root" => {
+            chinwag_ci::owner_supervisor::run(
+                chinwag_ci::owner_supervisor::OwnerKind::Root,
+                config.as_ref(),
+            )
+            .await
+        }
+        [_, action, config] if action == "serve-studio" => {
+            chinwag_ci::owner_supervisor::run(
+                chinwag_ci::owner_supervisor::OwnerKind::Studio,
+                config.as_ref(),
+            )
+            .await
+        }
+        [_, action, config] if action == "__ci-owned-root" => {
             chinwag_ci::runtime::serve_root(config.as_ref())
                 .await
                 .map_err(|_| ())
         }
-        [_, action, config] if action == "serve-studio" => {
+        [_, action, config] if action == "__ci-owned-studio" => {
             chinwag_ci::runtime::serve_studio(config.as_ref())
                 .await
                 .map_err(|_| ())

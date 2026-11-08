@@ -13,6 +13,7 @@ use crate::{
     github::{GithubEvidenceClient, TrustedDispatch},
     intent::{self, IntentVerification, VerifiedIntent},
     oidc, owner_cli,
+    owner_lifecycle::OwnerBudget,
     profile::{BoundProfiles, DeliveryProfile, RegisteredJob},
     runner_binding::{self, RunnerPublicKeys},
     storage::{CiphertextClaim, CiphertextStore},
@@ -44,7 +45,7 @@ use zeroize::Zeroize;
 #[derive(Debug, thiserror::Error)]
 #[error("CI runtime refused or ended with unconfirmed evidence; preserve its original operation")]
 pub struct RuntimeError;
-type Result<T> = std::result::Result<T, RuntimeError>;
+pub(crate) type Result<T> = std::result::Result<T, RuntimeError>;
 fn checked<T, E>(r: std::result::Result<T, E>) -> Result<T> {
     r.map_err(|_| RuntimeError)
 }
@@ -463,15 +464,6 @@ fn validate_server(
     }
     checked(CiphertextStore::open(outputs)).map(|_| ())
 }
-async fn wait_stop(stop: &AtomicBool) {
-    while !stop.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-async fn finite_shutdown(seconds: u64, stop: Arc<AtomicBool>) {
-    tokio::select! {_=tokio::time::sleep(Duration::from_secs(seconds))=>{},_=tokio::signal::ctrl_c()=>{}}
-    stop.store(true, Ordering::Release);
-}
 static INFLIGHT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 async fn request_deadline(request: axum::extract::Request, next: Next) -> Response {
     request_deadline_at(request, next, Duration::from_secs(25)).await
@@ -505,9 +497,8 @@ async fn receive(
     plan: &Plan,
     job: &Job,
     role: Destination,
-    seconds: u64,
+    budget: &OwnerBudget,
     outputs: &Path,
-    stop: &AtomicBool,
     online: Option<&AtomicBool>,
 ) -> Result<ArtifactObservation> {
     let profiles = plan.profiles()?;
@@ -521,21 +512,28 @@ async fn receive(
         Destination::Recipient => job.agent_transport,
         Destination::Archive => job.archive_transport,
     };
-    let pair = checked(
-        owner
-            .bind_destination_pair(
-                checked(iroh::EndpointId::from_bytes(&peer))?,
-                &d.relay_origin,
-                &d.relay_origin,
-            )
-            .await,
-    )?;
+    let bind = async {
+        checked(
+            owner
+                .bind_destination_pair(
+                    checked(iroh::EndpointId::from_bytes(&peer))?,
+                    &d.relay_origin,
+                    &d.relay_origin,
+                )
+                .await,
+        )
+    };
+    let pair = budget.bind(bind, |pair| pair.close()).await?;
     if let Some(online) = online {
         online.store(true, Ordering::Release);
     }
     let online_guard = OnlineGuard(online);
     let mut observation = None;
-    let operation = pair.receive_once(Duration::from_secs(seconds), |claim| {
+    let remaining = budget
+        .work_until
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(Duration::from_secs(1800));
+    let operation = pair.receive_once(remaining, |claim| {
         let result: Result<Vec<u8>> = (|| {
             let sealed = checked(envelope::parse_storage_blob(&claim.ciphertext))?;
             let bound = checked(profiles.authenticate_current_artifact(
@@ -558,9 +556,10 @@ async fn receive(
         })();
         async move { result.map_err(|_| TransferError::Application) }
     });
-    let transfer = tokio::select! {r=operation=>r,_=wait_stop(stop)=>Err(TransferError::Deadline)};
+    let transfer =
+        tokio::select! {r=operation=>r,_=budget.work_stopped()=>Err(TransferError::Deadline)};
     drop(online_guard);
-    pair.close().await;
+    budget.finish_close(pair.close()).await?;
     checked(transfer)?;
     let (object, envelope_digest, admission_sha256) = observation.ok_or(RuntimeError)?;
     let native = checked(owner.read_native_receipt(object))?;
@@ -713,7 +712,8 @@ async fn recipient_read(
     )
 }
 /// Finite root admission HTTP and one exact registered recipient endpoint. No
-/// process is spawned for another seat; all children are joined before return.
+/// process is spawned for another seat. Only successful closure is clean; an
+/// unconfirmed bind/close returns held and the CLI parent observes worker exit.
 pub async fn serve_root(path: &Path) -> Result<()> {
     let config: RootConfiguration = read(path)?;
     validate_server(
@@ -722,6 +722,8 @@ pub async fn serve_root(path: &Path) -> Result<()> {
         config.lifetime_seconds,
         &config.output_directory,
     )?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let budget = OwnerBudget::new(Duration::from_secs(config.lifetime_seconds), stop.clone());
     let mut recipient = config.recipient.open()?;
     let admission = config.admission.open()?;
     let plan: Plan = read(&config.plan)?;
@@ -736,7 +738,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
     same_enrollment(&recipient, &d.spec().recipient)?;
     let listener = checked(tokio::net::TcpListener::bind(config.listen).await)?;
     let state = Arc::new(RootState {
-        stop: Arc::new(AtomicBool::new(false)),
+        stop,
         ledger: Mutex::new(checked(AdmissionLedger::open(&config.ledger))?),
         config,
         admission,
@@ -751,54 +753,70 @@ pub async fn serve_root(path: &Path) -> Result<()> {
         .layer(middleware::from_fn(request_deadline))
         .with_state(state.clone());
     let s = state.clone();
+    let receiver_budget = budget.clone();
     let receiver = async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(s.config.lifetime_seconds);
         let job = loop {
             if let Ok(j) = read::<Job>(&s.config.registered_job) {
                 break j;
             }
-            if s.stop.load(Ordering::Acquire) || tokio::time::Instant::now() >= deadline {
+            if receiver_budget.stopped() {
                 return Err(RuntimeError);
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
         let plan: Plan = read(&s.config.plan)?;
-        // This readiness flag means the exact receiver owner is about to bind;
-        // selected-relay readiness still requires actual transfer witnesses.
-        let seconds = deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .as_secs()
-            .min(1800);
+        // Readiness is set only after the exact owner bind actually completes.
         let obs = receive(
             &mut recipient,
             &plan,
             &job,
             Destination::Recipient,
-            seconds,
+            &receiver_budget,
             &s.config.output_directory,
-            &s.stop,
             Some(&s.recipient_online),
         )
         .await?;
         s.recipient_online.store(false, Ordering::Release);
-        recipient_read(&recipient, &plan, obs, &s.config.output_directory)
-            .await
-            .map(|_| ())
+        tokio::select! {
+            result = recipient_read(&recipient, &plan, obs, &s.config.output_directory) => result.map(|_| ()),
+            _ = receiver_budget.work_stopped() => Err(RuntimeError),
+        }
     };
-    let server = axum::serve(listener, app).with_graceful_shutdown(finite_shutdown(
-        state.config.lifetime_seconds,
-        state.stop.clone(),
-    ));
-    let server = tokio::time::timeout(
-        Duration::from_secs(state.config.lifetime_seconds + 30),
-        std::future::IntoFuture::into_future(server),
-    );
-    let (http, receipt) = tokio::join!(server, receiver);
-    checked(checked(http)?)?;
+    run_owner(listener, app, budget, receiver).await
+}
+async fn run_owner<F: std::future::Future<Output = Result<()>>>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    budget: OwnerBudget,
+    receiver: F,
+) -> Result<()> {
+    let shutdown = async {
+        tokio::select! {
+            _ = budget.work_stopped() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
+        budget.stop();
+    };
+    let receiver = async {
+        let result = receiver.await;
+        if result.is_err() {
+            budget.stop();
+        }
+        result
+    };
+    let server = async {
+        let result = crate::owner_http::serve(listener, app, budget.clone()).await;
+        if result.is_err() {
+            budget.stop();
+        }
+        result
+    };
+    let (http, receipt, ()) = tokio::join!(server, receiver, shutdown);
+    http?;
     receipt
 }
+
 struct StudioState {
-    stop: Arc<AtomicBool>,
     config: StudioConfiguration,
     archive: Arc<Mutex<OwnerCustody>>,
     acu: OwnerCustody,
@@ -899,6 +917,8 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
     let plan: Plan = read(&config.plan)?;
     let job: Job = read(&config.registered_job)?;
     let d = plan.delivery()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let budget = OwnerBudget::new(Duration::from_secs(config.lifetime_seconds), stop.clone());
     let archive = Arc::new(Mutex::new(config.archive.open()?));
     let acu = config.acu.open()?;
     same_enrollment(&*archive.lock().await, &d.spec().archive)?;
@@ -917,7 +937,6 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
         d.spec().admission_signer,
     ))?;
     let state = Arc::new(StudioState {
-        stop: Arc::new(AtomicBool::new(false)),
         config,
         archive,
         acu,
@@ -930,15 +949,15 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
         .layer(middleware::from_fn(request_deadline))
         .with_state(state.clone());
     let s = state.clone();
+    let receiver_budget = budget.clone();
     let receiver = async move {
         let obs = receive(
             &mut *s.archive.lock().await,
             &plan,
             &job,
             Destination::Archive,
-            s.config.lifetime_seconds.min(1800),
+            &receiver_budget,
             &s.config.output_directory,
-            &s.stop,
             None,
         )
         .await?;
@@ -972,18 +991,9 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
         )
         .map(|_| ())
     };
-    let server = axum::serve(listener, app).with_graceful_shutdown(finite_shutdown(
-        state.config.lifetime_seconds,
-        state.stop.clone(),
-    ));
-    let server = tokio::time::timeout(
-        Duration::from_secs(state.config.lifetime_seconds + 30),
-        std::future::IntoFuture::into_future(server),
-    );
-    let (http, receipt) = tokio::join!(server, receiver);
-    checked(checked(http)?)?;
-    receipt
+    run_owner(listener, app, budget, receiver).await
 }
+
 pub fn sign_policy(
     owner_config: &Path,
     public: &Path,
@@ -1049,9 +1059,8 @@ mod tests {
             .layer(middleware::from_fn(|r, n| {
                 request_deadline_at(r, n, Duration::from_millis(50))
             }));
-        let server = tokio::spawn(std::future::IntoFuture::into_future(axum::serve(
-            listener, app,
-        )));
+        let budget = OwnerBudget::test(Duration::from_millis(150), Duration::from_millis(150));
+        let server = tokio::spawn(crate::owner_http::serve(listener, app, budget));
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         client
             .write_all(b"POST /body HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\r\n")
@@ -1060,8 +1069,13 @@ mod tests {
         let mut bytes = [0; 2048];
         let response = tokio::time::timeout(Duration::from_secs(2), client.read(&mut bytes)).await;
         client.shutdown().await.unwrap();
-        server.abort();
-        let _ = server.await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
         let n = response.unwrap().unwrap();
         assert!(String::from_utf8_lossy(&bytes[..n]).starts_with("HTTP/1.1 408"));
     }

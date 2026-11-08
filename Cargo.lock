@@ -740,6 +740,8 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hpke",
+ "hyper",
+ "hyper-util",
  "iroh",
  "libc",
  "rand 0.9.5",
