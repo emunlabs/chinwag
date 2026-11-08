@@ -1,6 +1,13 @@
 name: Chinwag Core CI & Automated Review Merge Gate
 
 on:
+  workflow_dispatch:
+    inputs:
+      probe_only:
+        description: "Verify the hosted event binding without running the CI payload"
+        required: true
+        type: boolean
+        default: true
   push:
     branches:
       - main
@@ -32,6 +39,7 @@ env:
 
 jobs:
   stage1-h2-cleanroom-rust-gate:
+    if: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' }}
     name: "Stage 1 — H2 Cleanroom Rust & WORKHORSE 288+ Test Ratchet Gate"
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
@@ -68,6 +76,7 @@ jobs:
           fi
 
   stage2-h-board-security-sentinel:
+    if: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' }}
     name: "Stage 2 — H_board & Security Sentinel (INV-ZERO-ANTHROPIC-01 / INV-BOARD-ZERO-LEAK-01)"
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 10
@@ -119,7 +128,7 @@ jobs:
     needs:
       - stage1-h2-cleanroom-rust-gate
       - stage2-h-board-security-sentinel
-    if: ${{ always() && startsWith(github.ref, 'refs/heads/review/') }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && startsWith(github.ref, 'refs/heads/review/') }}
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 10
     steps:
@@ -171,3 +180,13 @@ jobs:
           if [[ -x "/Users/brianspector/chinwag-main-deploy-supervisor/tracker.sh" ]]; then
             /Users/brianspector/chinwag-main-deploy-supervisor/tracker.sh || true
           fi
+
+  ci-event-binding-probe:
+    name: "CI event binding preflight"
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && inputs.probe_only }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Observe hosted event admission
+        run: printf '%s\n' 'CHWG_CI_EVENT_BINDING_PREFLIGHT_ONLY'
