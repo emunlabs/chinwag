@@ -733,8 +733,10 @@ name = "chinwag-ci"
 version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
+ "chinwag-swarm",
  "ed25519-dalek 2.2.0",
  "hex",
+ "iroh",
  "libc",
  "rsa",
  "rustix",

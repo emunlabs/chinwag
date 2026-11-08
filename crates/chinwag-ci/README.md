@@ -80,3 +80,18 @@ The coordinator must issue/consume challenges atomically and supply trusted
 dispatch metadata. The two transport keys are still claims until each actual
 native handshake proves possession. This layer issues neither K2 nor repair
 authority, does not implement replay storage, and does not establish task start.
+
+The native `transport` component uses a dedicated CI ALPN and a single pinned
+peer on one explicitly selected owned relay. It binds only loopback UDP sockets,
+disables address discovery/public relay fallback, and records the actual
+connection's selected peer/relay path around transfer. Frames have bounded
+manifest/ciphertext lengths and an independently checked ciphertext checksum.
+The receiving application must authenticate and persist the encrypted envelope
+and supply its signed receipt. Returned bytes stay unverified until the caller
+checks that receipt. The last application-data receiver owns final closure;
+a QUIC FIN ACK is not an application-read or processing proof.
+
+Tests cover hostile lengths/routes and a real loopback delayed-reader close
+regression. That loopback fixture is not Cloudflare or CI-runner proof. Actual
+owned CI profiles, crypto/admission integration, dual destination delivery and
+the failing/fixed GitHub workflow remain to be exercised end to end.
