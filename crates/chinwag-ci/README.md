@@ -33,3 +33,18 @@ assertion; it does not establish an independently keyed chat/process identity.
 `VerifiedIntent` deliberately does not grant OIDC admission, replay consumption,
 K2 attestation, addressed delivery, or permission to execute a repair. Those
 checks must bind the actual GitHub run and trusted current instance separately.
+
+The `oidc` module verifies actual RS256 signatures with the issuer's public RSA
+keys and matches the repository/owner, run/attempt, actor, source, workflow,
+subject and audience against the admitted caller's expected execution. It
+rejects duplicate top-level fields, substituted algorithms/key URLs, ambiguous
+issuer keys and invalid finite token lifetimes. Its RSA known-answer test uses
+the public RFC 7515 Appendix A.2 vector. Expired example claims are never treated
+as a GitHub admission.
+
+The caller must fetch the fixed GitHub issuer JWKS with normal HTTPS trust and
+bind expected run IDs to the trusted dispatch response. OIDC verifies a GitHub
+workflow identity; it does not prove possession of the runner key committed in
+the audience, consume a replay record, authenticate an arbitrary job/shard
+name, issue K2, or authorize remediation. These remain separate integration
+requirements. Nothing here installs an archive/ACU service or performs delivery.
