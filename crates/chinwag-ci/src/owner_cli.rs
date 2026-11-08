@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAX_PUBLIC: usize = 16 * 1024;
+const MAX_PUBLIC: usize = 128 * 1024;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerConfiguration {
@@ -60,7 +60,9 @@ fn private_file(file: &File) -> Result<rustix::fs::Stat, OwnerCliError> {
 fn canonical<T: Serialize>(v: &T) -> Result<Vec<u8>, OwnerCliError> {
     serde_json::to_vec(v).map_err(|_| OwnerCliError)
 }
-fn read_public<T: Serialize + for<'a> Deserialize<'a>>(path: &Path) -> Result<T, OwnerCliError> {
+pub(crate) fn read_public<T: Serialize + for<'a> Deserialize<'a>>(
+    path: &Path,
+) -> Result<T, OwnerCliError> {
     if !path.is_absolute() || path.extension().is_none_or(|e| e != "json") {
         return Err(OwnerCliError);
     }
@@ -101,6 +103,25 @@ fn read_public<T: Serialize + for<'a> Deserialize<'a>>(path: &Path) -> Result<T,
         return Err(OwnerCliError);
     }
     Ok(value)
+}
+/// Runtime keeps this opaque custody alive for its entire finite owner job.
+pub(crate) fn open_owner(
+    config_path: &Path,
+    public_path: &Path,
+) -> Result<OwnerCustody, OwnerCliError> {
+    let config: OwnerConfiguration = read_public(config_path)?;
+    let expected: PublicEnrollment = read_public(public_path)?;
+    if config.version != 1 || config.owner_context == [0; 32] {
+        return Err(OwnerCliError);
+    }
+    OwnerCustody::open_enrolled(
+        &config.private_directory,
+        config.role,
+        config.owner_context,
+        store(&config)?,
+        &expected,
+    )
+    .map_err(|_| OwnerCliError)
 }
 fn store(
     config: &OwnerConfiguration,

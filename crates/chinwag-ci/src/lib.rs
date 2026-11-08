@@ -26,6 +26,8 @@ pub mod admission;
 #[cfg(unix)]
 pub mod authorization;
 #[cfg(unix)]
+mod capture_read;
+#[cfg(unix)]
 pub mod custody;
 pub mod envelope;
 #[cfg(unix)]
@@ -41,8 +43,12 @@ pub mod preparation;
 pub mod profile;
 #[cfg(unix)]
 pub mod receipt;
+#[cfg(unix)]
+pub mod runner;
 pub mod runner_binding;
 pub mod runner_identity;
+#[cfg(unix)]
+pub mod runtime;
 pub mod transport;
 // Only the descriptor-bound Darwin ACL adapter needs FFI. Crypto paths deny it.
 #[cfg(target_os = "macos")]

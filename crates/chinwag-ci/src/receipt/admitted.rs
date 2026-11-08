@@ -54,13 +54,24 @@ fn private(file: &File) -> Result<Stat, ReceiptError> {
     crate::macos_acl::require_absent(file.as_fd()).map_err(|_| ReceiptError::Rejected)?;
     Ok(s)
 }
-fn sidecar_name(object: CiphertextClaim) -> String {
-    format!("{}.ingress-receipt.json", hex::encode(object.sha256))
+fn sidecar_name(object: CiphertextClaim, native: bool) -> String {
+    format!(
+        "{}.{}-receipt.json",
+        hex::encode(object.sha256),
+        if native { "native-ingress" } else { "ingress" }
+    )
 }
 impl ReceiptSigner {
     fn read_ingress_sidecar(&self, object: CiphertextClaim) -> Result<Vec<u8>, ReceiptError> {
+        self.read_receipt_sidecar(object, false)
+    }
+    pub(crate) fn read_receipt_sidecar(
+        &self,
+        object: CiphertextClaim,
+        native: bool,
+    ) -> Result<Vec<u8>, ReceiptError> {
         self.store.check()?;
-        let name = sidecar_name(object);
+        let name = sidecar_name(object, native);
         let file = File::from(
             fs::openat(
                 self.store.directory(),
@@ -99,11 +110,19 @@ impl ReceiptSigner {
         object: CiphertextClaim,
         bytes: &[u8],
     ) -> Result<(), ReceiptError> {
+        self.persist_receipt_sidecar(object, bytes, false)
+    }
+    pub(crate) fn persist_receipt_sidecar(
+        &self,
+        object: CiphertextClaim,
+        bytes: &[u8],
+        native: bool,
+    ) -> Result<(), ReceiptError> {
         self.store.check()?;
         if bytes.is_empty() || bytes.len() > MAX_RECEIPT {
             return Err(ReceiptError::Rejected);
         }
-        let name = sidecar_name(object);
+        let name = sidecar_name(object, native);
         let mode = Mode::RUSR | Mode::WUSR;
         let fd = fs::openat(
             self.store.directory(),
@@ -127,7 +146,7 @@ impl ReceiptSigner {
         let created = private(&file)?;
         fs::fsync(self.store.directory())
             .map_err(|_| ReceiptError::Storage(StorageError::CreatedButUnconfirmed))?;
-        if self.read_ingress_sidecar(object)? != bytes {
+        if self.read_receipt_sidecar(object, native)? != bytes {
             return Err(ReceiptError::Storage(StorageError::CreatedButUnconfirmed));
         }
         let named = fs::statat(self.store.directory(), &name, AtFlags::SYMLINK_NOFOLLOW)

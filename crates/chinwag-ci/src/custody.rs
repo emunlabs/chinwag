@@ -603,6 +603,18 @@ impl OwnerCustody {
         };
         Ok(receipt.persist_admitted(envelope)?)
     }
+    pub fn persist_native_admitted(
+        &self,
+        envelope: &crate::authorization::AdmissionBoundEnvelope,
+        claim: &crate::transport::ReceivedCiphertextClaim,
+        relay: &str,
+    ) -> Result<Vec<u8>, CustodyError> {
+        self.guard.check()?;
+        let Keys::Destination { receipt, .. } = &self.keys else {
+            return Err(CustodyError::Role);
+        };
+        Ok(receipt.persist_native_admitted(envelope, claim, relay)?)
+    }
     #[cfg(test)]
     pub(crate) fn persist_admitted_fixture(
         &self,
@@ -625,6 +637,18 @@ impl OwnerCustody {
             return Err(CustodyError::Role);
         };
         Ok(receipt.read_admitted_object(object)?)
+    }
+    /// Read the unchanged original native wrapper after an uncertain reply.
+    /// Caller still verifies its signature and exact original correlations.
+    pub fn read_native_receipt(
+        &self,
+        object: crate::storage::CiphertextClaim,
+    ) -> Result<Vec<u8>, CustodyError> {
+        self.guard.check()?;
+        let Keys::Destination { receipt, .. } = &self.keys else {
+            return Err(CustodyError::Role);
+        };
+        Ok(receipt.read_receipt_sidecar(object, true)?)
     }
     pub fn reconcile_existing(
         &self,

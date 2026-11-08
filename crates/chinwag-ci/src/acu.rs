@@ -484,6 +484,7 @@ mod tests {
         runner_identity::RunnerIdentity,
         storage::CiphertextStore,
     };
+    use sha2::Digest;
     use std::os::unix::fs::PermissionsExt;
     fn dir() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
@@ -503,6 +504,9 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::new_at(1000)
+        }
+        fn new_at(base: u64) -> Self {
             let dirs: Vec<_> = (0..6).map(|_| dir()).collect();
             let store =
                 |i: usize| CiphertextStore::open(&dirs[i].path().canonicalize().unwrap()).unwrap();
@@ -552,8 +556,8 @@ mod tests {
             let spec = PolicySpec {
                 version: 1,
                 epoch: 1,
-                issued_unix: 1000,
-                expires_unix: 2000,
+                issued_unix: base,
+                expires_unix: base + 1000,
                 active: true,
                 allow_recipient: true,
                 allow_archive: true,
@@ -565,7 +569,7 @@ mod tests {
                 allowed_historical_envelopes: Vec::new(),
             };
             let policy =
-                verify_current_policy(&acu.sign_release_policy(&spec).unwrap(), signer, 1001)
+                verify_current_policy(&acu.sign_release_policy(&spec).unwrap(), signer, base + 1)
                     .unwrap();
             let runner = RunnerIdentity::generate().unwrap();
             let keys = runner.public_keys();
@@ -583,7 +587,7 @@ mod tests {
                     delivery_profile_sha256: hex::encode([6; 32]),
                     command_sha256: hex::encode([5; 32]),
                     nonce: hex::encode([9; 32]),
-                    expires_unix: 2000,
+                    expires_unix: base + 1000,
                 },
                 initiating_instance: "WORKHORSE#fixture".into(),
                 intent_digest: [4; 32],
@@ -595,8 +599,8 @@ mod tests {
                 signing_key: keys.signing_ed25519,
                 agent_transport_key: keys.agent_transport_ed25519,
                 archive_transport_key: keys.archive_transport_ed25519,
-                usable_from_unix: 1000,
-                expires_unix: 1300,
+                usable_from_unix: base,
+                expires_unix: base + 300,
             });
             let issuer_owner = OwnerCustody::create_new(
                 &dirs[5].path().canonicalize().unwrap(),
@@ -615,7 +619,7 @@ mod tests {
                 issuer,
             )
             .unwrap()
-            .require_current(1001)
+            .require_current(base + 1)
             .unwrap();
             let claims = current.expected_provenance(policy.digest(), 1).unwrap();
             let payload = vec![0x69; 100000];
@@ -623,7 +627,7 @@ mod tests {
                 .seal_failure(claims.clone(), pins.clone(), &payload)
                 .unwrap();
             let envelope = current
-                .authenticate_envelope(sealed, &pins, policy.digest(), 1, 1002)
+                .authenticate_envelope(sealed, &pins, policy.digest(), 1, base + 2)
                 .unwrap();
             Self {
                 root,
@@ -645,6 +649,91 @@ mod tests {
             )
             .unwrap()
         }
+    }
+    #[test]
+    fn native_wrapper_is_exact_durable_and_rejects_other_frame_peer_or_relay() {
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3;
+        let f = Fixture::new_at(base);
+        let e = &f.envelope;
+        let relay = "https://ci-fixture.trycloudflare.com/";
+        let body = e.complete_storage_blob().unwrap();
+        let claim = crate::transport::fixture_observed_claim(
+            e.certificate(),
+            &body,
+            e.admission_record().agent_transport_key,
+            relay,
+        );
+        let bytes = f.root.persist_native_admitted(e, &claim, relay).unwrap();
+        crate::receipt::assert_canonical_native_signature_tamper_refused(
+            &bytes,
+            e,
+            Destination::Recipient,
+            [21; 32],
+            relay,
+        );
+        crate::receipt::verify_native_admitted(&bytes, e, Destination::Recipient, [21; 32], relay)
+            .unwrap();
+        let blob = e.complete_admitted_blob().unwrap();
+        let object = crate::storage::CiphertextClaim {
+            sha256: sha2::Sha256::digest(&blob).into(),
+            bytes: blob.len() as u64,
+        };
+        assert_eq!(f.root.read_native_receipt(object).unwrap(), bytes);
+        assert!(
+            crate::receipt::verify_native_admitted(
+                &bytes,
+                e,
+                Destination::Archive,
+                [22; 32],
+                relay
+            )
+            .is_err()
+        );
+        assert!(
+            crate::receipt::verify_native_admitted(
+                &bytes,
+                e,
+                Destination::Recipient,
+                [21; 32],
+                "https://other.trycloudflare.com/"
+            )
+            .is_err()
+        );
+        let wrong = crate::transport::fixture_observed_claim(
+            e.certificate(),
+            b"other complete frame",
+            e.admission_record().archive_transport_key,
+            relay,
+        );
+        assert!(f.archive.persist_native_admitted(e, &wrong, relay).is_err());
+        let bad_peer = crate::transport::fixture_observed_claim(
+            e.certificate(),
+            &body,
+            e.admission_record().agent_transport_key,
+            relay,
+        );
+        assert!(
+            f.archive
+                .persist_native_admitted(e, &bad_peer, relay)
+                .is_err()
+        );
+        let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        changed["statement"]["before"]["relay_origin"] =
+            serde_json::json!("https://forged.trycloudflare.com/");
+        assert!(
+            crate::receipt::verify_native_admitted(
+                &serde_json::to_vec(&changed).unwrap(),
+                e,
+                Destination::Recipient,
+                [21; 32],
+                relay
+            )
+            .is_err()
+        );
     }
     #[test]
     fn both_destinations_need_their_own_signed_request_and_verified_encrypted_grant() {

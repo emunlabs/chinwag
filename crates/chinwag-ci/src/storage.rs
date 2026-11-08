@@ -21,7 +21,8 @@ use std::{
 
 pub const MAX_CIPHERTEXT_BYTES: usize = 32 * 1024 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CiphertextClaim {
     pub sha256: [u8; 32],
     pub bytes: u64,

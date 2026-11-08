@@ -61,10 +61,10 @@ fn route_matches(peer: EndpointId, relay: &RelayUrl, remote: &EndpointAddr, alpn
 
 #[derive(Clone, Serialize)]
 pub struct SelectedRelayWitness {
-    pub peer_endpoint_id: String,
-    pub alpn: String,
-    pub selected_transport: &'static str,
-    pub relay_origin: String,
+    pub(crate) peer_endpoint_id: String,
+    pub(crate) alpn: String,
+    pub(crate) selected_transport: String,
+    pub(crate) relay_origin: String,
 }
 
 impl PairSelection {
@@ -83,7 +83,7 @@ impl PairSelection {
         Ok(SelectedRelayWitness {
             peer_endpoint_id: self.peer.to_string(),
             alpn: String::from_utf8_lossy(CI_ALPN).into_owned(),
-            selected_transport: "relay",
+            selected_transport: "relay".into(),
             relay_origin: self.relay.to_string(),
         })
     }
@@ -129,8 +129,29 @@ pub struct ReceivedCiphertextClaim {
     pub manifest: Zeroizing<Vec<u8>>,
     pub ciphertext: Zeroizing<Vec<u8>>,
     pub ciphertext_sha256: [u8; 32],
-    pub path_before: SelectedRelayWitness,
-    pub path_after_receive: SelectedRelayWitness,
+    pub(crate) path_before: SelectedRelayWitness,
+    pub(crate) path_after_receive: SelectedRelayWitness,
+    frame_digest: [u8; 32],
+}
+fn frame_digest(manifest: &[u8], body: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"chinwag-ci-observed-native-frame-v1\0");
+    h.update((manifest.len() as u64).to_be_bytes());
+    h.update(manifest);
+    h.update((body.len() as u64).to_be_bytes());
+    h.update(body);
+    h.finalize().into()
+}
+impl ReceivedCiphertextClaim {
+    pub fn path_before(&self) -> &SelectedRelayWitness {
+        &self.path_before
+    }
+    pub fn path_after_receive(&self) -> &SelectedRelayWitness {
+        &self.path_after_receive
+    }
+    pub(crate) fn matches_original(&self, certificate: &[u8], body: &[u8]) -> bool {
+        self.frame_digest == frame_digest(certificate, body)
+    }
 }
 
 pub struct ReturnedReceipt {
@@ -366,12 +387,14 @@ impl CiPair {
                 return Err(TransferError::Frame);
             }
             let path_after_receive = self.selection.witness(&connection.0)?;
+            let frame_digest = frame_digest(&manifest, &ciphertext);
             let receipt = handler(ReceivedCiphertextClaim {
                 manifest,
                 ciphertext,
                 ciphertext_sha256: header.sha256,
                 path_before,
                 path_after_receive,
+                frame_digest,
             })
             .await?;
             if receipt.is_empty() || receipt.len() > MAX_RECEIPT_BYTES {
@@ -411,6 +434,29 @@ async fn send_reply_and_wait_reader_close(
             Ok(())
         }
         _ => Err(TransferError::Network),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_observed_claim(
+    manifest: &[u8],
+    body: &[u8],
+    peer: [u8; 32],
+    relay: &str,
+) -> ReceivedCiphertextClaim {
+    let path = SelectedRelayWitness {
+        peer_endpoint_id: hex::encode(peer),
+        alpn: String::from_utf8_lossy(CI_ALPN).into_owned(),
+        selected_transport: "relay".into(),
+        relay_origin: relay.into(),
+    };
+    ReceivedCiphertextClaim {
+        manifest: Zeroizing::new(manifest.to_vec()),
+        ciphertext: Zeroizing::new(body.to_vec()),
+        ciphertext_sha256: Sha256::digest(body).into(),
+        path_before: path.clone(),
+        path_after_receive: path,
+        frame_digest: frame_digest(manifest, body),
     }
 }
 

@@ -15,8 +15,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 mod admitted;
+mod native;
 pub use admitted::verify_admitted;
 pub(crate) use admitted::verify_admitted_historical;
+#[cfg(test)]
+pub(crate) use native::assert_canonical_native_signature_tamper_refused;
+pub use native::verify_native_admitted;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiptError {
