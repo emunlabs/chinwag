@@ -1,106 +1,138 @@
-# Chinwag CI evidence capture
+# Chinwag CI failure loop
 
-This crate is the first part of the CI failure loop. It runs an explicit argv,
-drains stdout and stderr concurrently, preserves binary output and the real exit
-status, and returns an in-memory evidence record. It does not print captured
-output. Retained output and serialized plaintext use zeroizing buffers.
+`chinwag-ci` captures an admitted build command, seals its complete evidence in
+one signed encrypted original, and sends that same object over native Iroh
+through an explicitly selected Cloudflare relay to the initiating agent and an
+Archive owner. Public runner output contains delivery observations; captured
+stdout, stderr and command metadata stay inside the encrypted evidence.
 
-Each stream has a maximum retained size of 4 MiB. A limit does not stop draining
-the child pipes: the record counts and hashes all observed bytes and explicitly
-marks the retained prefix incomplete. A deadline covers child exit and pipe EOF;
-deadline and I/O failure outcomes cannot become a successful exit. The runner
-must also contain process descendants in its owned job sandbox.
+The checked-in demonstration is
+[`chinwag-core-ci-and-merge.yml`](../../.github/workflows/chinwag-core-ci-and-merge.yml),
+job `Native encrypted CI failure loop`, and the public
+[`fixture.rs`](../../ci/chinwag-ci-loop-fixture/fixture.rs). Its manual event is
+limited to the designated review branch. The three legacy workflow jobs and
+event-only probe are excluded from that controlled payload run.
 
-Run context is **unverified input**. Capturing a zero exit status does not mint a
-trusted workload attestation. Process output remains untrusted data and cannot
-authorize execution. Before operational use, the caller must authenticate the
-initiating-agent intent and workload identity, seal the full evidence, deliver
-the ciphertext through native transport to both intended stores, and verify
-separate storage and processing receipts. Those integrations are not implemented
-in this capture unit. Never upload `plaintext_for_sealing()` to an Actions
-artifact, write it into an inbox, or echo it into a public runner log.
+## Authenticated path
 
-The tests re-execute a Rust fixture as a real child. They exercise a failure with
-output larger than a pipe, binary stderr, explicit output overflow, deadline
-cleanup, invalid context refusal and a real successful process exit.
+1. The initiating agent signs a typed native intent binding repository, source,
+   workflow, recipient, command and delivery commitments, nonce and finite expiry.
+   Verification uses the pinned seat key, exact sender, addressee, task and room.
+2. The runner creates fresh signing and two distinct transport keys. Admission
+   binds their possession to the original intent, an atomic server challenge,
+   the exact authenticated dispatch response and GitHub OIDC. RS256 verification
+   uses the fixed issuer's public JWKS with normal HTTPS trust and checks the
+   expected repository/owner IDs, actor, run/attempt, source, workflow, subject,
+   audience and token lifetime. Incoming claims do not select these expectations.
+3. The fixed command profile runs the public Rust fixture in an unprivileged,
+   networkless container with a pinned image, read-only source/root filesystem,
+   dropped capabilities, `no-new-privileges` and CPU/memory/process limits.
+   Bounded `/build` scratch explicitly permits the compiled test to execute;
+   general `/tmp` remains `noexec`.
+4. The parent concurrently drains both output streams and captures the actual
+   exit, complete command bytes, stream hashes, EOF status and cleanup evidence.
+   Lossless argv and working-directory metadata are sealed too; the process
+   environment is not copied. Output remains untrusted data and grants no repair
+   authority. The active agent needs separate authorization to change source.
+5. The envelope implements customer **ACU AND (Recipient OR Archive)** access.
+   The native CI transport uses `chinwag/ci-ciphertext/1`, one pinned destination
+   peer and the same selected owned relay. UDP binds only loopback; address
+   discovery, direct routing and public-relay fallback are disabled. No remote
+   handset publication, journal copying or application message bridge carries
+   the CI evidence.
+6. Each destination authenticates admission and envelope bindings, persists and
+   independently reopens the exact object, and returns signed durable/native
+   receipts. The sender verifies the actual selected peer/relay path and receipt
+   bindings. Each owner separately requests its current ACU grant and validates
+   a complete decrypted capture. A storage ACK is not a qualified read, task
+   start or successful repair.
 
-The `intent` module verifies an initiating agent's original native bus signature
-against a caller-pinned seat key, exact qualified sender, task and room. It also
-verifies the native digest, typed dispatch context and finite intent lifetime.
-Its tests include the published RFC 8032 section 7.1 Ed25519 known-answer vector
-and application tampering cases. The seat key authenticates a signed routing
-assertion; it does not establish an independently keyed chat/process identity.
-`VerifiedIntent` deliberately does not grant OIDC admission, replay consumption,
-K2 attestation, addressed delivery, or permission to execute a repair. Those
-checks must bind the actual GitHub run and trusted current instance separately.
+## Owner and runner entry points
 
-The `oidc` module verifies actual RS256 signatures with the issuer's public RSA
-keys and matches the repository/owner, run/attempt, actor, source, workflow,
-subject and audience against the admitted caller's expected execution. It
-rejects duplicate top-level fields, substituted algorithms/key URLs, ambiguous
-issuer keys and invalid finite token lifetimes. Its RSA known-answer test uses
-the public RFC 7515 Appendix A.2 vector. Expired example claims are never treated
-as a GitHub admission.
+```text
+chinwag-ci owner-init CONFIG PUBLIC
+chinwag-ci owner-verify CONFIG PUBLIC
+chinwag-ci policy-sign CONFIG PUBLIC SPEC OUTPUT
+chinwag-ci serve-root CONFIG
+chinwag-ci serve-studio CONFIG
+chinwag-ci runner CONFIG
+```
 
-The caller must fetch the fixed GitHub issuer JWKS with normal HTTPS trust and
-bind expected run IDs to the trusted dispatch response. OIDC verifies a GitHub
-workflow identity; it does not prove possession of the runner key committed in
-the audience, consume a replay record, authenticate an arbitrary job/shard
-name, issue K2, or authorize remediation. These remain separate integration
-requirements. Nothing here installs an archive/ACU service or performs delivery.
+Use typed configuration structures in [`runtime.rs`](src/runtime.rs),
+[`runner.rs`](src/runner.rs) and [`owner_cli.rs`](src/owner_cli.rs). Owner files
+require compact canonical JSON in exact struct field order, no trailing newline,
+regular single-link owner-owned `0600` files and private `0700` directories.
+Create the declared output namespace before starting an owner. Symlink,
+hardlink, ACL and namespace uncertainty refuses the operation. `owner-init` is
+for genuine first enrollment; use `owner-verify` for existing custody. Preserve
+uncertain operations and reconcile them instead of reinitializing or replaying.
+Private bundles stay opaque to the supported owner API and must not be exported.
 
-On Unix, `storage` can persist an already authenticated ciphertext claim into
-an explicitly owned private directory. It uses private create-new files, refuses
-symlink components/hardlinked objects, completes file and directory sync calls,
-and independently reopens and verifies exact bytes/hash/length. Existing-object
-observation is separate and does not claim comparison against a creation inode
-it never witnessed. Partial creation failures leave evidence for reconciliation.
-These are byte-storage observations: the caller must authenticate the encrypted
-envelope first and sign a receipt that binds the destination role and original
-event. They do not establish WORM storage, archive service acceptance, policy
-authorization, or initiating-agent processing.
+Root owns admission and Recipient service; Studio owns Archive and customer ACU
+service in the demonstrated topology. Finite owner supervision includes original
+bind, receive and first close in one monotonic budget, tracks HTTP connections,
+and waits for the original worker's OS exit. Forced/deadline/unconfirmed closure
+cannot be reported as clean success. Each original operator controls its own
+processes. Public service health and a started PID are preparation observations.
 
-On macOS a small descriptor-bound adapter requests extended security attributes
-directly into a fixed buffer and accepts only the exact empty-attribute reply.
-Every ACL blob, truncated reply, inspection error and unexpected shape refuses
-storage. This follows examined XNU behavior and local filesystem tests and does
-not claim universal filesystem support. The adapter is the only
-module permitted to use unsafe FFI, with explicit descriptor/opaque-allocation
-ownership rationale; cryptography modules continue to deny unsafe code.
+Runner exit `0` means complete successful command capture with both verified
+durable destinations. Exit `1` preserves a delivered original that is not
+eligible green, including a failed command. Exit `2` holds a refused or uncertain
+operation. Neither successful delivery nor exit `0` establishes that an agent
+started work. The demonstrated repair was performed by an already active,
+explicitly authorized initiating agent; generic agent invocation or automatic
+unrestricted remediation is not implemented here.
 
-`runner_binding` joins the signed intent and verified workflow with the ephemeral
-runner signing key's proof of possession. Its custom OIDC audience commits to
-the original intent, delivery/command profiles, workflow execution, signing and
-two distinct transport public keys, and server challenge. The proof signs a
-separate domain containing that audience and the exact JWT hash, so independently
-valid intents, tokens and keys cannot be spliced together. Composition rechecks
-both issuance bounds, OIDC `nbf`, and the earlier expiry.
+## Reproducible controlled proof
 
-The coordinator must issue/consume challenges atomically and supply trusted
-dispatch metadata. The two transport keys are still claims until each actual
-native handshake proves possession. This layer issues neither K2 nor repair
-authority, does not implement replay storage, and does not establish task start.
+- [Red run 42450930951](https://github.com/emunlabs/chinwag/actions/runs/42450930951)
+  built source `983bf33769dd1a29682dac902430b9cef9885ab0` on hosted Linux. The
+  actual command exited `126`: `/build/tests` was denied execution in the tmpfs.
+  The planned invoice assertion did **not** run. The full failure reached both
+  owners as the same signed encrypted object, and both completed distinct
+  ACU-authorized full reads.
+- Source `84e00c038e8220b9d54df1ed970f6bfba77f18e8` explicitly enabled execution
+  only on bounded `/build`. Source `397497315fc9493786771137c232ec5b2eb9d8ef`
+  separately removed the deliberately added invoice `+ 1`, retaining the test
+  and all diagnostic output.
+- [Fresh green run 42452778661](https://github.com/emunlabs/chinwag/actions/runs/42452778661)
+  built and executed source `397497315fc9493786771137c232ec5b2eb9d8ef` using a new
+  intent, execution identity, authenticated dispatch and runner keys. The fixture
+  passed and the workflow succeeded. Both destinations returned verified selected
+  relay receipts for the same 35,359-byte encrypted original. The initiating
+  agent's authorized read recovered the complete 29,221-byte capture, including
+  10,039 stdout bytes and 8,978 stderr bytes: all 128 diagnostic lines per stream,
+  matching stream hashes and EOF, without clipping.
 
-The native `transport` component uses a dedicated CI ALPN and a single pinned
-peer on one explicitly selected owned relay. It binds only loopback UDP sockets,
-disables address discovery/public relay fallback, and records the actual
-connection's selected peer/relay path around transfer. Frames have bounded
-manifest/ciphertext lengths and an independently checked ciphertext checksum.
-The receiving application must authenticate and persist the encrypted envelope
-and supply its signed receipt. Returned bytes stay unverified until the caller
-checks that receipt. The last application-data receiver owns final closure;
-a QUIC FIN ACK is not an application-read or processing proof.
+These run links prove their recorded runtime revisions. A later documentation
+change does not relabel either run's source, replay its original or turn a failed
+startup into success. Full-read and clean-closure receipts remain separate from
+the workflow result. Final source/release acceptance is a separate review.
 
-Tests cover hostile lengths/routes and a real loopback delayed-reader close
-regression. That loopback fixture is not Cloudflare or CI-runner proof. Actual
-owned CI profiles, crypto/admission integration, dual destination delivery and
-the failing/fixed GitHub workflow remain to be exercised end to end.
+## Tests and limits
 
-Captured evidence also contains lossless program/argument bytes, requested cwd,
-the observed parent cwd and a domain-separated argv digest. It does not copy the
-process environment. Cwd/checkout policy remains independent of that argv hash.
-NUL is invalid in an OS argument and must be rejected before constructing a
-command from structured input. Valid non-UTF8 Unix arguments are retained.
-Wall-clock values and monotonic elapsed time are labeled local host observations;
-they do not establish K2 trusted time. Command metadata, like output, must be
-sealed rather than printed into runner logs.
+```sh
+cargo test -p chinwag-ci --locked --offline
+cargo clippy -p chinwag-ci --all-targets --locked --offline -- -D warnings
+cargo fmt --package chinwag-ci -- --check
+cargo build -p chinwag-ci --locked --offline
+```
+
+The recorded macOS package checks passed 113 tests: 79 library and 34 integration
+tests, with zero failures or ignored tests. Some filesystem cases are macOS-only.
+The hosted green run proves a Linux build and the actual isolated fixture; it is
+not a claim that all 113 package tests ran on Linux. Tests include public RFC
+8032, RFC 7515 and RFC 9180 vectors, tampering/admission/replay cases, hostile
+transport/storage inputs, binary/large output, and real owned child/HTTP lifecycle
+regressions. See [`tests`](tests) and the module tests in [`src`](src).
+
+Each stream retains at most 4 MiB. Overflow continues draining, counts and hashes
+all observed bytes, and explicitly marks the retained prefix incomplete; it
+cannot become eligible green evidence. A deadline covers child exit and pipe EOF.
+Wall clock and monotonic timings are local software observations, not K2 trusted
+time or hardware workload attestation. The demonstrated ACU and Archive share a
+customer host/UID; independent compromise resistance is not established.
+QuickTunnels are temporary endpoints, not a production availability guarantee.
+The fixed-fixture proof does not establish arbitrary build-command admission,
+durable outbox/reconnect, reboot continuity, WORM storage or general agent wakeup.
+Never print plaintext into public runner logs or upload it as an Actions artifact.
