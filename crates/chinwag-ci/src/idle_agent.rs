@@ -31,26 +31,45 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
-#[error("idle coding-agent operation held; preserve the original enrollment and wake")]
-pub struct IdleAgentError;
+pub enum IdleAgentError {
+    #[error("idle coding-agent operation held; preserve the original enrollment and wake")]
+    Refused,
+    #[error("original coding-agent handle held; reconcile without another launch")]
+    Held(Box<agent_process::HeldAgent>),
+}
+impl IdleAgentError {
+    pub fn into_held(self) -> Option<agent_process::HeldAgent> {
+        match self {
+            Self::Held(h) => Some(*h),
+            Self::Refused => None,
+        }
+    }
+}
+pub(crate) fn finish_agent_run(
+    mut run: agent_process::AgentRun,
+) -> Result<agent_process::AgentRun, IdleAgentError> {
+    if let Some(custody) = run.original_custody.take() {
+        return Err(IdleAgentError::Held(Box::new(agent_process::HeldAgent {
+            observation: run.observation,
+            custody,
+        })));
+    }
+    Ok(run)
+}
 fn checked<T, E>(r: Result<T, E>) -> Result<T, IdleAgentError> {
-    r.map_err(|_| IdleAgentError)
+    r.map_err(|_| IdleAgentError::Refused)
 }
 fn hash(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
 }
 fn authorized_until(
     expiry: u64,
-    now: u64,
-    monotonic_now: Instant,
+    sample: crate::agent_deadline::Sample,
     owner_until: Instant,
 ) -> Result<Instant, IdleAgentError> {
-    let remaining = expiry
-        .checked_sub(now)
-        .filter(|r| *r > 0)
-        .ok_or(IdleAgentError)?;
-    Ok(owner_until.min(monotonic_now + Duration::from_secs(remaining)))
+    Ok(owner_until.min(checked(sample.until(expiry))?))
 }
+
 fn json<T: Serialize>(v: &T) -> Result<Vec<u8>, IdleAgentError> {
     checked(serde_json::to_vec(v))
 }
@@ -98,12 +117,12 @@ impl AgentConfiguration {
                 "emunlabs/chinwag/.github/workflows/chinwag-core-ci-and-merge.yml@refs/heads/",
             )
         {
-            return Err(IdleAgentError);
+            return Err(IdleAgentError::Refused);
         }
         if self.state_directory.starts_with(&self.route.workspace)
             || checked(self.state_directory.canonicalize())? != self.state_directory
         {
-            return Err(IdleAgentError);
+            return Err(IdleAgentError::Refused);
         }
         verify_reader(self)?;
         checked(self.route.verify())
@@ -150,7 +169,7 @@ fn verify_reader(c: &AgentConfiguration) -> Result<(), IdleAgentError> {
         || checked(c.reader_executable.canonicalize())? != c.reader_executable
         || c.reader_executable_sha256 == [0; 32]
     {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     let fd = checked(fs::open(
         &c.reader_executable,
@@ -166,7 +185,7 @@ fn verify_reader(c: &AgentConfiguration) -> Result<(), IdleAgentError> {
         || before.st_size <= 0
         || before.st_size > 512 * 1024 * 1024
     {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     let mut f = File::from(fd);
     let mut h = Sha256::new();
@@ -186,7 +205,7 @@ fn verify_reader(c: &AgentConfiguration) -> Result<(), IdleAgentError> {
         || end.st_ino != named.st_ino
         || before.st_ino != end.st_ino
     {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     Ok(())
 }
@@ -205,7 +224,7 @@ impl AgentConfiguration {
 fn fixture_bytes(workspace: &Path) -> Result<Vec<u8>, IdleAgentError> {
     let path = workspace.join(FIXTURE_GIT_PATH);
     if checked(path.canonicalize())? != path {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     let fd = checked(fs::open(
         &path,
@@ -220,7 +239,7 @@ fn fixture_bytes(workspace: &Path) -> Result<Vec<u8>, IdleAgentError> {
         || start.st_size < 1
         || start.st_size > 1024 * 1024
     {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     let mut f = File::from(fd);
     let mut b = Vec::with_capacity(start.st_size as usize);
@@ -233,7 +252,7 @@ fn fixture_bytes(workspace: &Path) -> Result<Vec<u8>, IdleAgentError> {
         || named.st_ino != end.st_ino
         || checked(path.canonicalize())? != path
     {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     Ok(b)
 }
@@ -251,7 +270,7 @@ async fn changes(c: &AgentConfiguration) -> Result<Vec<u8>, IdleAgentError> {
         .await,
     )?;
     if !untracked.is_empty() {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     checked(
         preparation::git_output(
@@ -279,12 +298,12 @@ async fn unchanged(c: &AgentConfiguration) -> Result<Vec<u8>, IdleAgentError> {
         .await,
     )?;
     if tree != format!("{}\n", c.source_tree).as_bytes() {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     let pinned = checked(preparation::pinned_bytes(&c.route.workspace, &c.source_commit).await)?;
     let current = fixture_bytes(&c.route.workspace)?;
     if hash(&pinned) != c.fixture_sha256 || current != pinned || !changes(c).await?.is_empty() {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     Ok(current)
 }
@@ -294,7 +313,7 @@ async fn unchanged(c: &AgentConfiguration) -> Result<Vec<u8>, IdleAgentError> {
 pub async fn enroll(config: &Path) -> Result<(), IdleAgentError> {
     let c: AgentConfiguration = checked(owner_cli::read_public(config))?;
     if config.starts_with(&c.route.workspace) {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     c.validate()?;
     unchanged(&c).await?;
@@ -323,20 +342,24 @@ pub async fn enroll(config: &Path) -> Result<(), IdleAgentError> {
     };
     let until = authorized_until(
         c.expires_unix,
-        checked(runtime::now())?,
-        Instant::now(),
+        checked(crate::agent_deadline::Sample::now())?,
         Instant::now() + Duration::from_secs(c.route.turn_seconds),
     )?;
     let run = checked(agent_process::run(&c.route, None, prompt, until, |_| Ok(()), stop).await)?;
+    let run = finish_agent_run(run)?;
     let observation = json(&run.observation)?;
     checked(runtime::write_new(
         &c.state_directory.join("initial-agent-observed-v1.json"),
         &observation,
     ))?;
     if !run.observation.clean() || run.original_custody.is_some() {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
-    let turn = run.observation.turn.as_ref().ok_or(IdleAgentError)?;
+    let turn = run
+        .observation
+        .turn
+        .as_ref()
+        .ok_or(IdleAgentError::Refused)?;
     let request: BuildRequest = checked(serde_json::from_slice(run.initial_build_request()))?;
     if request != c.request()
         || turn.command_completions != 0
@@ -346,11 +369,15 @@ pub async fn enroll(config: &Path) -> Result<(), IdleAgentError> {
         || !turn.input_tokens.is_some_and(|n| n > 0)
         || !turn.output_tokens.is_some_and(|n| n > 0)
     {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     c.validate()?;
     unchanged(&c).await?;
-    let seat = c.parent_instance.split_once('#').ok_or(IdleAgentError)?.0;
+    let seat = c
+        .parent_instance
+        .split_once('#')
+        .ok_or(IdleAgentError::Refused)?
+        .0;
     let receipt = IdleReceipt {
         version: 1,
         configuration_sha256: digest,
@@ -360,14 +387,17 @@ pub async fn enroll(config: &Path) -> Result<(), IdleAgentError> {
         generation: c.generation,
         requested_build: request,
         source_tree: c.source_tree.clone(),
-        original_child_pid: run.observation.original_child_pid.ok_or(IdleAgentError)?,
-        original_os_exit_code: run.observation.exit_code.ok_or(IdleAgentError)?,
+        original_child_pid: run
+            .observation
+            .original_child_pid
+            .ok_or(IdleAgentError::Refused)?,
+        original_os_exit_code: run.observation.exit_code.ok_or(IdleAgentError::Refused)?,
         original_os_exit_observed: run.observation.os_exit_observed,
         original_turn_started: turn.turn_started,
         original_turn_completed: turn.turn_completed,
         original_zero_tool_items: turn.zero_tool_initial(),
-        actual_input_tokens: turn.input_tokens.ok_or(IdleAgentError)?,
-        actual_output_tokens: turn.output_tokens.ok_or(IdleAgentError)?,
+        actual_input_tokens: turn.input_tokens.ok_or(IdleAgentError::Refused)?,
+        actual_output_tokens: turn.output_tokens.ok_or(IdleAgentError::Refused)?,
         initial_process_observation_sha256: hash(&observation),
         idle_since_unix: checked(runtime::now())?,
         expires_unix: c.expires_unix,
@@ -395,7 +425,11 @@ fn binding(
 ) -> Result<(), IdleAgentError> {
     let r = q.envelope.admission_record();
     let o = q.observation;
-    let seat = c.parent_instance.split_once('#').ok_or(IdleAgentError)?.0;
+    let seat = c
+        .parent_instance
+        .split_once('#')
+        .ok_or(IdleAgentError::Refused)?
+        .0;
     if idle.version != 1
         || idle.configuration_sha256 != c.digest()?
         || idle.parent_instance != c.parent_instance
@@ -441,15 +475,17 @@ fn binding(
         || o.plaintext_bytes != q.plaintext.len() as u64
         || q.budget.stopped()
     {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     Ok(())
 }
 
 const FUNCTION: &str = "fn invoice_total(subtotal: i64, adjustment: i64) -> i64 {\n";
 fn body(source: &str) -> Result<(&str, &str, &str), IdleAgentError> {
-    let (prefix, remaining) = source.split_once(FUNCTION).ok_or(IdleAgentError)?;
-    let (body, suffix) = remaining.split_once("\n}\n").ok_or(IdleAgentError)?;
+    let (prefix, remaining) = source.split_once(FUNCTION).ok_or(IdleAgentError::Refused)?;
+    let (body, suffix) = remaining
+        .split_once("\n}\n")
+        .ok_or(IdleAgentError::Refused)?;
     Ok((prefix, body, suffix))
 }
 /// Validate a model-produced patch. No replacement expression is generated here.
@@ -457,15 +493,15 @@ fn body(source: &str) -> Result<(&str, &str, &str), IdleAgentError> {
 /// over both parameters, preventing constants, calls or a forced-green escape.
 pub fn validate_fixture_repair(before: &[u8], after: &[u8]) -> Result<(), IdleAgentError> {
     if before == after || after.len() > 1024 * 1024 {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     let (pre, _, tail) = body(checked(std::str::from_utf8(before))?)?;
     let (new_pre, new_body, new_tail) = body(checked(std::str::from_utf8(after))?)?;
     if pre != new_pre || tail != new_tail || new_body.len() > 4096 {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     if new_body.contains("/*") || new_body.contains("//") || new_body.contains("*/") {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     let mut grammar = Arithmetic {
         bytes: new_body.as_bytes(),
@@ -475,7 +511,7 @@ pub fn validate_fixture_repair(before: &[u8], after: &[u8]) -> Result<(), IdleAg
     grammar.expression(0)?;
     grammar.space();
     if grammar.at != grammar.bytes.len() || !grammar.used.into_iter().all(|v| v) {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
 
     Ok(())
@@ -527,7 +563,7 @@ impl Arithmetic<'_> {
     }
     fn factor(&mut self, depth: usize) -> Result<(), IdleAgentError> {
         if depth >= 64 {
-            return Err(IdleAgentError);
+            return Err(IdleAgentError::Refused);
         }
         if self.take(b'-') {
             return self.factor(depth + 1);
@@ -535,7 +571,7 @@ impl Arithmetic<'_> {
         if self.take(b'(') {
             self.expression(depth + 1)?;
             if !self.take(b')') {
-                return Err(IdleAgentError);
+                return Err(IdleAgentError::Refused);
             }
             return Ok(());
         }
@@ -551,7 +587,7 @@ impl Arithmetic<'_> {
         match &self.bytes[start..self.at] {
             b"subtotal" => self.used[0] = true,
             b"adjustment" => self.used[1] = true,
-            _ => return Err(IdleAgentError),
+            _ => return Err(IdleAgentError::Refused),
         }
         Ok(())
     }
@@ -564,7 +600,7 @@ pub(crate) async fn wake(config: &Path, q: QualifiedWake<'_>) -> Result<(), Idle
     }
     let c: AgentConfiguration = checked(owner_cli::read_public(config))?;
     if config.starts_with(&c.route.workspace) {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     c.validate()?;
     let mut store = checked(WakeStore::open(&c.state_directory, c.digest()?))?;
@@ -609,9 +645,11 @@ pub(crate) async fn wake(config: &Path, q: QualifiedWake<'_>) -> Result<(), Idle
     };
     let scope_digest = checked(scope.digest())?;
     let (read_command, expected_read) = checked(crate::agent_events::read_command_commitments([
-        c.reader_executable.to_str().ok_or(IdleAgentError)?,
+        c.reader_executable
+            .to_str()
+            .ok_or(IdleAgentError::Refused)?,
         "agent-read",
-        listener.path().to_str().ok_or(IdleAgentError)?,
+        listener.path().to_str().ok_or(IdleAgentError::Refused)?,
         &hex::encode(scope_digest),
     ]))?;
     let excerpt = checked(crate::capture_read::diagnostic_excerpt(q.plaintext))?;
@@ -624,24 +662,19 @@ pub(crate) async fn wake(config: &Path, q: QualifiedWake<'_>) -> Result<(), Idle
     let start_flag = started_flag.clone();
     let work_until = authorized_until(
         c.expires_unix,
-        checked(runtime::now())?,
-        Instant::now(),
+        checked(crate::agent_deadline::Sample::now())?,
         authority_until,
     )?;
-    // A fresh policy check cannot extend the earlier monotonic scope bound.
-    let work_until = work_until.min(checked(
-        q.read_authorization
-            .current(&delivery.spec().acu_origin)
-            .await,
-    )?);
+    let prepared = checked(agent_process::prepare(&c.route, Some(&idle.session_id)))?;
     if Instant::now() >= work_until {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     let read_until = work_until;
     let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
     let (failed_tx, mut failed_rx) = tokio::sync::watch::channel(false);
     let agent = async {
-        let r=agent_process::run(&c.route,Some(&idle.session_id),prompt,work_until,
+        let r=agent_process::run_prepared(prepared,prompt,work_until,
+            async { q.read_authorization.current(&delivery.spec().acu_origin).await.map_err(|_| agent_process::AgentRouteError) },
             |pid|{
                 store.record(WakePhase::Started,&serde_json::json!({
                     "classification":"ORIGINAL_AGENT_CHILD_STARTED_PROMPT_NOT_YET_SENT",
@@ -666,7 +699,7 @@ pub(crate) async fn wake(config: &Path, q: QualifiedWake<'_>) -> Result<(), Idle
         r
     };
     let (run, full_read) = tokio::join!(agent, reader);
-    let run = checked(run)?;
+    let run = finish_agent_run(checked(run)?)?;
     checked(runtime::write_new(
         &c.state_directory.join("wake-agent-observed-v1.json"),
         &json(&run.observation)?,
@@ -706,7 +739,7 @@ pub(crate) async fn wake(config: &Path, q: QualifiedWake<'_>) -> Result<(), Idle
         })))?;
     }
     if repaired.is_none() {
-        return Err(IdleAgentError);
+        return Err(IdleAgentError::Refused);
     }
     Ok(())
 }
@@ -719,12 +752,19 @@ mod tests {
         let now = Instant::now();
         let owner = now + Duration::from_secs(300);
         assert_eq!(
-            authorized_until(101, 100, now, owner).unwrap(),
+            authorized_until(102, crate::agent_deadline::Sample::fixture(now, 100), owner).unwrap(),
             now + Duration::from_secs(1)
         );
-        assert_eq!(authorized_until(500, 100, now, owner).unwrap(), owner);
-        assert!(authorized_until(100, 100, now, owner).is_err());
-        assert!(authorized_until(99, 100, now, owner).is_err());
+        assert_eq!(
+            authorized_until(500, crate::agent_deadline::Sample::fixture(now, 100), owner).unwrap(),
+            owner
+        );
+        assert!(
+            authorized_until(100, crate::agent_deadline::Sample::fixture(now, 100), owner).is_err()
+        );
+        assert!(
+            authorized_until(99, crate::agent_deadline::Sample::fixture(now, 100), owner).is_err()
+        );
     }
     fn fixture(expr: &str) -> Vec<u8> {
         format!("// preserved\n{FUNCTION}    {expr}\n}}\n\n#[test]\nfn check() {{ assert_eq!(invoice_total(2,3),5); }}\n").into_bytes()

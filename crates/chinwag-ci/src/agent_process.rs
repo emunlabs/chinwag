@@ -76,19 +76,97 @@ impl AgentProcessObservation {
             && self.turn.is_some()
     }
 }
-/// Custody of an ORIGINAL whose terminal wait is unconfirmed. This is not a
-/// closed process or permission to retry/signal a numeric PID. Keep it with the
-/// held operation for operator reconciliation. Drop must not issue an implicit
-/// kill after a failed wait/start_kill (PID ownership may be uncertain).
-pub struct OriginalChildCustody {
+/// Process-local owner-held originals. The registry retains the actual handle
+/// if an error or abandoned supervisor result is dropped. It runs no task,
+/// issues no signals, and is not durable across owner/runtime destruction.
+struct HeldState {
     child: Option<tokio::process::Child>,
+    terminal: Option<ExitStatus>,
 }
-impl Drop for OriginalChildCustody {
-    fn drop(&mut self) {
-        if let Some(child) = self.child.take() {
-            std::mem::forget(child);
+type HeldChild = std::sync::Arc<tokio::sync::Mutex<HeldState>>;
+static HELD: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<u64, OriginalChildCustody>>,
+> = std::sync::OnceLock::new();
+static NEXT_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn held_registry()
+-> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, OriginalChildCustody>> {
+    HELD.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+#[derive(Clone)]
+pub struct OriginalChildCustody {
+    token: u64,
+    pid: Option<u32>,
+    child: HeldChild,
+}
+impl std::fmt::Debug for OriginalChildCustody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OriginalChildCustody(held; wait-only)")
+    }
+}
+impl OriginalChildCustody {
+    pub(crate) fn hold(child: tokio::process::Child) -> Self {
+        let held = Self {
+            token: NEXT_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            pid: child.id(),
+            child: std::sync::Arc::new(tokio::sync::Mutex::new(HeldState {
+                child: Some(child),
+                terminal: None,
+            })),
+        };
+        held_registry().insert(held.token, held.clone());
+        held
+    }
+    pub fn original_pid(&self) -> Option<u32> {
+        self.pid
+    }
+    /// Bounded wait on this ORIGINAL only. Pending/error keeps the registry's
+    /// ownership; only an observed OS exit removes it. Never sends a signal.
+    pub async fn wait_until(&mut self, until: Instant) -> std::io::Result<Option<ExitStatus>> {
+        if Instant::now() >= until {
+            return Ok(None);
+        }
+        let Ok(mut guard) = tokio::time::timeout_at(until, self.child.lock()).await else {
+            return Ok(None);
+        };
+        if let Some(status) = guard.terminal {
+            return Ok(Some(status));
+        }
+        let Some(child) = guard.child.as_mut() else {
+            return Ok(None);
+        };
+        match tokio::time::timeout_at(until, child.wait()).await {
+            Ok(Ok(status)) => {
+                guard.child.take();
+                guard.terminal = Some(status);
+                held_registry().remove(&self.token);
+                Ok(Some(status))
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(None),
         }
     }
+    /// Explicit CLI reconciliation after the work already returned HELD. Each
+    /// wait is bounded; eventual retirement never promotes the failed work.
+    pub async fn retain_until_retired(mut self) {
+        eprintln!("CI_ORIGINAL_CHILD_HELD_RECONCILIATION_NO_RETRY");
+        loop {
+            if matches!(
+                self.wait_until(Instant::now() + Duration::from_secs(30))
+                    .await,
+                Ok(Some(_))
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+/// Owner-process reconciliation access, including an abandoned awaiter's held
+/// result. These capabilities permit only observation of original handles.
+pub fn retained_originals() -> Vec<OriginalChildCustody> {
+    held_registry().values().cloned().collect()
 }
 
 pub struct AgentRun {
@@ -96,6 +174,25 @@ pub struct AgentRun {
     /// Initial build request only. Never serialize an agent's free text.
     pub(crate) last_message: Zeroizing<Vec<u8>>,
     pub original_custody: Option<OriginalChildCustody>,
+}
+/// Typed owner handoff; unlike a PID/metadata record this retains the actual
+/// original Child and exposes bounded wait-only reconciliation.
+pub struct HeldAgent {
+    pub observation: AgentProcessObservation,
+    pub custody: OriginalChildCustody,
+}
+impl std::fmt::Debug for HeldAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HeldAgent(original handle retained; no retry)")
+    }
+}
+impl HeldAgent {
+    /// CLI ownership reconciliation, separate from the already failed work.
+    /// Keep the handle alive across bounded waits; even eventual exit0 remains
+    /// HELD and never creates Idle, a repair result or another launch.
+    pub async fn retain_until_retired(self) {
+        self.custody.retain_until_retired().await;
+    }
 }
 impl AgentRun {
     pub fn initial_build_request(&self) -> &[u8] {
@@ -308,8 +405,9 @@ impl Drop for CancelOnDrop {
     }
 }
 
+#[cfg(test)]
 async fn owned<F, S, C>(
-    mut command: Command,
+    command: Command,
     expected: Option<String>,
     prompt: Zeroizing<Vec<u8>>,
     bounds: [Instant; 2],
@@ -322,12 +420,40 @@ where
     S: Future<Output = ()>,
     C: FnOnce(&AgentProcessObservation) + Send + 'static,
 {
+    let digest = Sha256::digest(&prompt).into();
+    owned_input(
+        command,
+        expected,
+        (prompt, digest),
+        bounds,
+        on_spawn,
+        stop,
+        completed,
+    )
+    .await
+}
+
+async fn owned_input<F, S, C>(
+    mut command: Command,
+    expected: Option<String>,
+    input: (Zeroizing<Vec<u8>>, [u8; 32]),
+    bounds: [Instant; 2],
+    on_spawn: F,
+    stop: S,
+    completed: C,
+) -> AgentRun
+where
+    F: FnOnce(u32) -> Result<(), ()>,
+    S: Future<Output = ()>,
+    C: FnOnce(&AgentProcessObservation) + Send + 'static,
+{
+    let (prompt, input_sha256) = input;
     let [work, close] = bounds;
     let mut observation = AgentProcessObservation {
         classification: "OWNED_AGENT_PROCESS_OBSERVATION_NOT_VERIFIED_REPAIR",
         original_child_pid: None,
         started_unix_ms: None,
-        input_sha256: Sha256::digest(&prompt).into(),
+        input_sha256,
         input_bytes: prompt.len() as u64,
         stdin_complete: false,
         streams_eof: false,
@@ -525,7 +651,7 @@ async fn supervise(
                     // numeric PID. Preserve UNKNOWN for original reconciliation.
                     observation.reap_unconfirmed=true;
                     observation.classification="ORIGINAL_AGENT_WAIT_UNCONFIRMED_HELD_NO_RETRY";
-                    return AgentRun {observation,last_message:Zeroizing::new(Vec::new()),original_custody:Some(OriginalChildCustody{child:Some(child)})};
+                    return AgentRun {observation,last_message:Zeroizing::new(Vec::new()),original_custody:Some(OriginalChildCustody::hold(child))};
                 }
             } },
             r=&mut io,if io_result.is_none()=>io_result=Some(r),
@@ -572,7 +698,7 @@ async fn supervise(
             observation,
             last_message: out.message,
             original_custody: if status.is_none() {
-                Some(OriginalChildCustody { child: Some(child) })
+                Some(OriginalChildCustody::hold(child))
             } else {
                 None
             },
@@ -582,28 +708,26 @@ async fn supervise(
         observation,
         last_message: Zeroizing::new(Vec::new()),
         original_custody: if status.is_none() {
-            Some(OriginalChildCustody { child: Some(child) })
+            Some(OriginalChildCustody::hold(child))
         } else {
             None
         },
     }
 }
 
-/// Only the exact UUID may be resumed. Caller must already hold its owner wake
-/// reservation; an actual spawned child is recorded before any prompt is sent.
-pub async fn run<F: FnOnce(u32) -> Result<(), ()>, S: Future<Output = ()>>(
+/// Fixed command fully verified and constructed before any final authorization
+/// fetch. No mutable command accessor, Clone, or failure-selected route exists.
+pub(crate) struct PreparedAgentRoute {
+    command: Command,
+    expected: Option<String>,
+    turn_seconds: u64,
+}
+pub(crate) fn prepare(
     route: &CodingAgentRoute,
     session: Option<&str>,
-    prompt: Zeroizing<Vec<u8>>,
-    original_work_deadline: Instant,
-    on_spawn: F,
-    stop: S,
-) -> Result<AgentRun, AgentRouteError> {
+) -> Result<PreparedAgentRoute, AgentRouteError> {
     route.verify()?;
-    if session.is_some_and(|s| !session_uuid(s))
-        || prompt.is_empty()
-        || prompt.len() > 16 * 1024 * 1024
-    {
+    if session.is_some_and(|s| !session_uuid(s)) {
         return Err(AgentRouteError);
     }
     let mut command = Command::new(&route.executable);
@@ -627,20 +751,71 @@ pub async fn run<F: FnOnce(u32) -> Result<(), ()>, S: Future<Output = ()>>(
     } else {
         command.args(["--json", "--ignore-user-config", "-"]);
     }
-    let work = original_work_deadline.min(Instant::now() + Duration::from_secs(route.turn_seconds));
+    Ok(PreparedAgentRoute {
+        command,
+        expected: session.map(str::to_owned),
+        turn_seconds: route.turn_seconds,
+    })
+}
+
+pub(crate) async fn run_prepared<F, S, A>(
+    prepared: PreparedAgentRoute,
+    prompt: Zeroizing<Vec<u8>>,
+    original_work_deadline: Instant,
+    final_authorization: A,
+    on_spawn: F,
+    stop: S,
+) -> Result<AgentRun, AgentRouteError>
+where
+    F: FnOnce(u32) -> Result<(), ()>,
+    S: Future<Output = ()>,
+    A: Future<Output = Result<Instant, AgentRouteError>>,
+{
+    if prompt.is_empty() || prompt.len() > 16 * 1024 * 1024 {
+        return Err(AgentRouteError);
+    }
+    let input_sha256 = Sha256::digest(&prompt).into();
+    // ALL executable hashing and command construction have already completed.
+    // No further preparation or route verification follows this final gate.
+    let authorized = final_authorization.await?;
+    let work = original_work_deadline
+        .min(authorized)
+        .min(Instant::now() + Duration::from_secs(prepared.turn_seconds));
     if work <= Instant::now() {
         return Err(AgentRouteError);
     }
-    Ok(owned(
-        command,
-        session.map(str::to_owned),
-        prompt,
+    Ok(owned_input(
+        prepared.command,
+        prepared.expected,
+        (prompt, input_sha256),
         [work, work + Duration::from_secs(10)],
         on_spawn,
         stop,
         |_| {},
     )
     .await)
+}
+
+/// Initial build-request route; resumed callers use prepare + final current
+/// signed authorization through run_prepared, never another verify after it.
+pub async fn run<F: FnOnce(u32) -> Result<(), ()>, S: Future<Output = ()>>(
+    route: &CodingAgentRoute,
+    session: Option<&str>,
+    prompt: Zeroizing<Vec<u8>>,
+    original_work_deadline: Instant,
+    on_spawn: F,
+    stop: S,
+) -> Result<AgentRun, AgentRouteError> {
+    let prepared = prepare(route, session)?;
+    run_prepared(
+        prepared,
+        prompt,
+        original_work_deadline,
+        std::future::ready(Ok(original_work_deadline)),
+        on_spawn,
+        stop,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -666,17 +841,25 @@ mod tests {
         assert!(r.kill_failed && r.status.is_none());
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(Instant::now() < close + Duration::from_millis(500));
-        let mut custody = OriginalChildCustody { child: Some(child) };
-        assert_eq!(custody.child.as_ref().unwrap().id(), Some(pid));
+        let mut custody = OriginalChildCustody::hold(child);
+        assert_eq!(custody.original_pid(), Some(pid));
         // Separate test cleanup of the retained ORIGINAL, not a replacement or
         // an observation falsely attributed to the injected pending wait.
-        let mut original = custody.child.take().unwrap();
-        original.start_kill().unwrap();
+        custody
+            .child
+            .lock()
+            .await
+            .child
+            .as_mut()
+            .unwrap()
+            .start_kill()
+            .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), original.wait())
+            custody
+                .wait_until(Instant::now() + Duration::from_secs(1))
                 .await
                 .unwrap()
-                .is_ok()
+                .is_some()
         );
     }
     #[tokio::test]
@@ -708,6 +891,122 @@ mod tests {
         )
         .await;
         assert_eq!(ready.status, Some(0));
+    }
+    #[tokio::test]
+    async fn unconfirmed_supervision_survives_the_production_idle_and_runtime_handoff() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        // The already elapsed close forces an unconfirmed bounded retirement
+        // through REAL supervise/owned, not a manually constructed AgentRun.
+        let work = Instant::now() + Duration::from_secs(5);
+        let run = owned(
+            command,
+            None,
+            Zeroizing::new(b"fixture".to_vec()),
+            [work, Instant::now()],
+            |_| Ok(()),
+            std::future::pending(),
+            |_| {},
+        )
+        .await;
+        assert!(!run.observation.clean() && run.observation.reap_unconfirmed);
+        let pid = run.observation.original_child_pid.unwrap();
+        // This exact production helper is the FIRST disposition in both enroll
+        // and wake, before any fallible write/qualification can lose custody.
+        let error = crate::idle_agent::finish_agent_run(run).err().unwrap();
+        let result = crate::runtime::owner_outcome(
+            Err(crate::runtime::RuntimeError::Refused),
+            Err(crate::runtime::RuntimeError::AgentHeld(error)),
+        );
+        let held = result.err().unwrap().into_held().unwrap();
+        assert_eq!(held.custody.original_pid(), Some(pid));
+        assert!(!held.observation.clean());
+        // Dropping the typed error/token (including abandoned JoinHandle
+        // output) cannot forget the actual original handle.
+        drop(held);
+        let mut retained = retained_originals()
+            .into_iter()
+            .find(|h| h.original_pid() == Some(pid))
+            .unwrap();
+        let peer = retained.clone();
+        assert!(
+            retained
+                .wait_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut peer = peer;
+        assert!(
+            peer.wait_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !retained_originals()
+                .iter()
+                .any(|h| h.original_pid() == Some(pid))
+        );
+        // Observing forced retirement is not a repair, Idle receipt or retry.
+    }
+    #[tokio::test]
+    async fn abandoned_original_monitor_output_keeps_a_reconcilable_owner_handle() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let work = Instant::now() + Duration::from_secs(5);
+        let close = Instant::now();
+        let handle = tokio::spawn(owned(
+            command,
+            None,
+            Zeroizing::new(b"fixture".to_vec()),
+            [work, close],
+            move |pid| {
+                let _ = pid_tx.send(pid);
+                Ok(())
+            },
+            std::future::pending(),
+            move |o| {
+                let _ = done_tx.send(o.reap_unconfirmed);
+            },
+        ));
+        // No caller receives this original task's AgentRun/held output.
+        drop(handle);
+        let pid = pid_rx.await.unwrap();
+        assert!(done_rx.await.unwrap());
+        tokio::task::yield_now().await;
+        let mut held = retained_originals()
+            .into_iter()
+            .find(|h| h.original_pid() == Some(pid))
+            .unwrap();
+        assert!(
+            held.wait_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    #[tokio::test]
+    async fn custody_wait_bounds_lock_contention_and_retains_the_same_original() {
+        let mut c = Command::new("/bin/sleep");
+        c.arg("0.15").kill_on_drop(true);
+        let mut held = OriginalChildCustody::hold(c.spawn().unwrap());
+        let pid = held.original_pid();
+        let state = held.child.clone();
+        let guard = state.lock().await;
+        let until = Instant::now() + Duration::from_millis(20);
+        assert!(held.wait_until(until).await.unwrap().is_none());
+        assert_eq!(held.original_pid(), pid);
+        drop(guard);
+        assert!(
+            held.wait_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
     }
     const ID: &str = "0199a213-81c0-7800-8aa1-bbab2a035a53";
     #[tokio::test]

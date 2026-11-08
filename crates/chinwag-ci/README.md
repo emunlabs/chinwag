@@ -186,3 +186,8 @@ QuickTunnels are temporary endpoints, not a production availability guarantee.
 The fixed-fixture proof does not establish arbitrary build-command admission,
 durable outbox/reconnect, reboot continuity, WORM storage or general agent wakeup.
 Never print plaintext into public runner logs or upload it as an Actions artifact.
+
+
+Idle-wake launch prepares and hashes the fixed executable before its final signed current-policy check. Integer Unix expiry conversion anchors monotonic time first and discards the uncertain fractional second; no provable remaining lifetime means no spawn. Both the initial monotonic authority cap and prompt-delivery checks remain in force.
+
+Unconfirmed model retirement returns typed held custody through enrollment/wake, Root runtime and the CLI. A process-local owner registry retains the actual original handle even if an awaiter or error is dropped. Reconciliation exposes only bounded waits on that handle, including bounded lock acquisition, and caches terminal status for other tokens. It cannot signal a numeric PID or launch a replacement. A Root worker configured for idle wake is likewise retained at an unconfirmed parent deadline because it may own model custody. The CLI keeps held originals across explicit reconciliation intervals; later retirement never makes the original work clean or renews authority. This registry does not survive owner/runtime destruction and does not establish host continuity.

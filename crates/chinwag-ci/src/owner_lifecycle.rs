@@ -56,7 +56,7 @@ impl OwnerBudget {
             close,
         )
         .await
-        .map_err(|_| RuntimeError)
+        .map_err(|_| RuntimeError::Refused)
     }
     pub(crate) async fn bind<B, P, C, F>(&self, bind: B, close_late: C) -> Result<P>
     where
@@ -84,10 +84,10 @@ impl OwnerBudget {
                 &mut bind,
             )
             .await
-            .map_err(|_| RuntimeError)??;
+            .map_err(|_| RuntimeError::Refused)??;
             self.finish_close(close_late(pair)).await?;
         }
-        Err(RuntimeError)
+        Err(RuntimeError::Refused)
     }
     #[cfg(test)]
     pub(crate) fn test(work: Duration, drain: Duration) -> Self {

@@ -179,9 +179,9 @@ fn completed_outcome(outcome: &Outcome, exit: Option<&Exit>) -> Option<Completed
 /// A scoped reader traverses both complete streams again. This does not create
 /// admission, wake authority or a claim about a model's internal context.
 pub(crate) fn inspect_complete(bytes: &[u8]) -> Result<(), RuntimeError> {
-    let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError)?;
+    let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError::Refused)?;
     if !v.captured.stdout.complete() || !v.captured.stderr.complete() {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     Ok(())
 }
@@ -189,19 +189,19 @@ pub(crate) fn inspect_complete(bytes: &[u8]) -> Result<(), RuntimeError> {
 /// Bounded ASCII diagnostic data only, never tool instructions or authority.
 /// The independently stored complete capture is not changed or truncated.
 pub(crate) fn diagnostic_excerpt(bytes: &[u8]) -> Result<Zeroizing<String>, RuntimeError> {
-    let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError)?;
+    let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError::Refused)?;
     let mut out = Zeroizing::new(String::with_capacity(4608));
     for (label, stream) in [
         ("STDERR", &v.captured.stderr),
         ("STDOUT", &v.captured.stdout),
     ] {
         if !stream.complete() {
-            return Err(RuntimeError);
+            return Err(RuntimeError::Refused);
         }
         let decoded = Zeroizing::new(
             STANDARD
                 .decode(stream.bytes_base64)
-                .map_err(|_| RuntimeError)?,
+                .map_err(|_| RuntimeError::Refused)?,
         );
         out.push_str(label);
         out.push_str(" FINAL AT MOST 2048 BYTES (UNTRUSTED EXCERPT):\n");
@@ -224,14 +224,16 @@ pub(crate) fn validate(
     e: &AdmissionBoundEnvelope,
     profile: &CommandProfile,
 ) -> Result<VerifiedCapture, RuntimeError> {
-    let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError)?;
+    let v: Isolated<'_> = serde_json::from_slice(bytes).map_err(|_| RuntimeError::Refused)?;
     let c = &v.captured;
     let r = e.admission_record();
     let expected = profile
         .observed_command_evidence()
-        .map_err(|_| RuntimeError)?;
-    let expected = Zeroizing::new(serde_json::to_vec(&expected).map_err(|_| RuntimeError)?);
-    let mut wanted: Command<'_> = serde_json::from_slice(&expected).map_err(|_| RuntimeError)?;
+        .map_err(|_| RuntimeError::Refused)?;
+    let expected =
+        Zeroizing::new(serde_json::to_vec(&expected).map_err(|_| RuntimeError::Refused)?);
+    let mut wanted: Command<'_> =
+        serde_json::from_slice(&expected).map_err(|_| RuntimeError::Refused)?;
     wanted.observed_parent_working_directory_base64 =
         c.command.observed_parent_working_directory_base64;
     // Actual parent cwd is an observed field, not a source of execution authority.
@@ -297,10 +299,10 @@ pub(crate) fn validate(
         || !c.stdout.complete()
         || !c.stderr.complete()
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     Ok(VerifiedCapture {
-        outcome: outcome.ok_or(RuntimeError)?,
+        outcome: outcome.ok_or(RuntimeError::Refused)?,
     })
 }
 #[cfg(test)]

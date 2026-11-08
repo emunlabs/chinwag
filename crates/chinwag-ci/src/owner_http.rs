@@ -64,7 +64,7 @@ async fn serve_with_header_limit(
                             // The connection and its socket stay owned here.
                             tokio::select! {
                                 _result = &mut connection => Ok(()),
-                                _ = sleep_until(budget.close_until.min(Instant::now() + Duration::from_secs(10))) => Err(RuntimeError),
+                                _ = sleep_until(budget.close_until.min(Instant::now() + Duration::from_secs(10))) => Err(RuntimeError::Refused),
                             }
                         }
                     }
@@ -95,7 +95,11 @@ async fn serve_with_header_limit(
     while let Some(result) = connections.join_next().await {
         clean &= matches!(result, Ok(Ok(())));
     }
-    if clean { Ok(()) } else { Err(RuntimeError) }
+    if clean {
+        Ok(())
+    } else {
+        Err(RuntimeError::Refused)
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    let result: Result<(), ()> = match args.as_slice() {
+    let mut result: Result<(), ()> = match args.as_slice() {
         [_, action, config, public] if action == "owner-init" || action == "owner-verify" => {
             let result = if action == "owner-init" {
                 chinwag_ci::owner_cli::initialize(config.as_ref(), public.as_ref())
@@ -25,16 +25,17 @@ async fn main() {
             owner_result
         }
         [_, action, config] if action == "serve-root" => {
-            chinwag_ci::owner_supervisor::run(
-                chinwag_ci::owner_supervisor::OwnerKind::Root,
-                config.as_ref(),
+            owner_result(
+                chinwag_ci::owner_supervisor::run(
+                    chinwag_ci::owner_supervisor::OwnerKind::Root,
+                    config.as_ref(),
+                )
+                .await,
             )
             .await
         }
         [_, action, config] if action == "agent-init" => {
-            chinwag_ci::idle_agent::enroll(config.as_ref())
-                .await
-                .map_err(|_| ())
+            idle_result(chinwag_ci::idle_agent::enroll(config.as_ref()).await).await
         }
         [_, action, socket, scope] if action == "agent-read" => match scope.to_str() {
             Some(scope) => chinwag_ci::agent_read::read_capture(socket.as_ref(), scope)
@@ -43,16 +44,17 @@ async fn main() {
             None => Err(()),
         },
         [_, action, config] if action == "serve-studio" => {
-            chinwag_ci::owner_supervisor::run(
-                chinwag_ci::owner_supervisor::OwnerKind::Studio,
-                config.as_ref(),
+            owner_result(
+                chinwag_ci::owner_supervisor::run(
+                    chinwag_ci::owner_supervisor::OwnerKind::Studio,
+                    config.as_ref(),
+                )
+                .await,
             )
             .await
         }
         [_, action, config] if action == "__ci-owned-root" => {
-            chinwag_ci::runtime::serve_root(config.as_ref())
-                .await
-                .map_err(|_| ())
+            runtime_result(chinwag_ci::runtime::serve_root(config.as_ref()).await).await
         }
         [_, action, config] if action == "__ci-owned-studio" => {
             chinwag_ci::runtime::serve_studio(config.as_ref())
@@ -87,6 +89,18 @@ async fn main() {
             std::process::exit(2)
         }
     };
+    // Also retain abandoned awaiter results from this owner process. No
+    // background reaper, replacement process or numeric-PID signalling.
+    loop {
+        let retained = chinwag_ci::agent_process::retained_originals();
+        if retained.is_empty() {
+            break;
+        }
+        result = Err(());
+        for original in retained {
+            original.retain_until_retired().await;
+        }
+    }
     if result.is_err() {
         eprintln!("CI_OPERATION_HELD_PRESERVE_ORIGINAL_NO_RETRY");
         std::process::exit(2)
@@ -96,4 +110,43 @@ async fn main() {
 fn main() {
     eprintln!("CI runtime requires the supported Unix filesystem adapter");
     std::process::exit(2)
+}
+
+#[cfg(unix)]
+async fn idle_result(r: Result<(), chinwag_ci::idle_agent::IdleAgentError>) -> Result<(), ()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Some(h) = e.into_held() {
+                h.retain_until_retired().await;
+            }
+            Err(())
+        }
+    }
+}
+#[cfg(unix)]
+async fn runtime_result(r: Result<(), chinwag_ci::runtime::RuntimeError>) -> Result<(), ()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Some(h) = e.into_held() {
+                h.retain_until_retired().await;
+            }
+            Err(())
+        }
+    }
+}
+#[cfg(unix)]
+async fn owner_result(
+    r: Result<(), chinwag_ci::owner_supervisor::OwnerSupervisorError>,
+) -> Result<(), ()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Some(h) = e.into_held() {
+                h.retain_until_retired().await;
+            }
+            Err(())
+        }
+    }
 }

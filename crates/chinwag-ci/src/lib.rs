@@ -23,6 +23,8 @@ use zeroize::Zeroizing;
 pub mod acu;
 #[cfg(unix)]
 pub mod admission;
+#[cfg(unix)]
+mod agent_deadline;
 pub mod agent_events;
 #[cfg(unix)]
 pub mod agent_process;

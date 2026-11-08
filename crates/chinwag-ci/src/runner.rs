@@ -26,7 +26,7 @@ use std::{
 use zeroize::Zeroizing;
 type Result<T> = std::result::Result<T, RuntimeError>;
 fn ck<T, E>(r: std::result::Result<T, E>) -> Result<T> {
-    r.map_err(|_| RuntimeError)
+    r.map_err(|_| RuntimeError::Refused)
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,7 +81,7 @@ fn own_oidc_url(raw: &str, audience: &str) -> Result<reqwest::Url> {
             .is_some_and(|h| h.ends_with(".actions.githubusercontent.com") && !h.starts_with('.'))
         || url.query_pairs().any(|(k, _)| k == "audience")
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     url.query_pairs_mut().append_pair("audience", audience);
     Ok(url)
@@ -101,12 +101,12 @@ async fn own_oidc(client: &reqwest::Client, audience: &str) -> Result<Zeroizing<
         || response.status() != reqwest::StatusCode::OK
         || response.content_length().is_some_and(|n| n > 32 * 1024)
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     let mut bytes = Zeroizing::new(Vec::new());
     while let Some(b) = ck(response.chunk().await)? {
         if b.len() > 32768usize.saturating_sub(bytes.len()) {
-            return Err(RuntimeError);
+            return Err(RuntimeError::Refused);
         }
         bytes.extend_from_slice(&b)
     }
@@ -117,7 +117,7 @@ async fn own_oidc(client: &reqwest::Client, audience: &str) -> Result<Zeroizing<
     }
     let token: Token = ck(serde_json::from_slice(&bytes))?;
     if token.value.len() > 16 * 1024 || token.value.is_empty() {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     Ok(Zeroizing::new(token.value))
 }
@@ -143,14 +143,14 @@ async fn post<T: Serialize>(
 /// eligible green workload. Any missing admission/receipt/closure stays held.
 pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
     if !cfg!(target_os = "linux") {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     let config: RunnerConfiguration = ck(crate::owner_cli::read_public(path))?;
     if config.version != 1
         || !origin_ok(&config.admission_origin)
         || config.bootstrap_hint == [0; 32]
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     let mut identity = ck(RunnerIdentity::generate())?;
     let keys = identity.public_keys();
@@ -174,11 +174,11 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
         || plan.expected_oidc_subject != config.expected_oidc_subject
         || plan.bootstrap_hint != config.bootstrap_hint
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     let profiles = plan.profiles()?;
     if profiles.delivery().spec().admission_origin != config.admission_origin {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     let fixture = ck(preparation::prepare(&profiles, &config.checkout).await)?;
     let image = ck(execution::prepare_image(profiles.command(), &fixture).await)?;
@@ -193,7 +193,7 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
         }
         if response.status() != reqwest::StatusCode::TOO_EARLY || tokio::time::Instant::now() >= end
         {
-            return Err(RuntimeError);
+            return Err(RuntimeError::Refused);
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -270,7 +270,7 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
         Ok(pair) => pair,
         Err(_) => {
             archive.close().await;
-            return Err(RuntimeError);
+            return Err(RuntimeError::Refused);
         }
     };
     // Archive first, so its durable object is available to ACU when Root

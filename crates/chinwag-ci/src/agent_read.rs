@@ -190,16 +190,10 @@ impl ReadAuthorization {
     pub(crate) fn current_until(
         &self,
         raw: &[u8],
-        now: u64,
-        monotonic_now: Instant,
+        sample: crate::agent_deadline::Sample,
     ) -> Result<Instant, ReadError> {
-        self.verify_current(raw, now)?;
-        let remaining = self
-            .until()
-            .checked_sub(now)
-            .filter(|n| *n > 0)
-            .ok_or(ReadError)?;
-        Ok(monotonic_now + Duration::from_secs(remaining))
+        self.verify_current(raw, sample.unix())?;
+        checked(sample.until(self.until()))
     }
     pub(crate) async fn current(&self, origin: &str) -> Result<Instant, ReadError> {
         let client = checked(crate::github::normal_https_client())?;
@@ -213,8 +207,8 @@ impl ReadAuthorization {
             )
             .await,
         )?;
-        let now = checked(runtime::now())?;
-        self.current_until(&raw, now, Instant::now())
+        let sample = checked(crate::agent_deadline::Sample::now())?;
+        self.current_until(&raw, sample)
     }
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -43,11 +43,25 @@ use std::{
 use tokio::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
 #[derive(Debug, thiserror::Error)]
-#[error("CI runtime refused or ended with unconfirmed evidence; preserve its original operation")]
-pub struct RuntimeError;
+pub enum RuntimeError {
+    #[error(
+        "CI runtime refused or ended with unconfirmed evidence; preserve its original operation"
+    )]
+    Refused,
+    #[error("CI original coding-agent custody requires reconciliation")]
+    AgentHeld(crate::idle_agent::IdleAgentError),
+}
+impl RuntimeError {
+    pub fn into_held(self) -> Option<crate::agent_process::HeldAgent> {
+        match self {
+            Self::AgentHeld(e) => e.into_held(),
+            Self::Refused => None,
+        }
+    }
+}
 pub(crate) type Result<T> = std::result::Result<T, RuntimeError>;
 fn checked<T, E>(r: std::result::Result<T, E>) -> Result<T> {
-    r.map_err(|_| RuntimeError)
+    r.map_err(|_| RuntimeError::Refused)
 }
 pub(crate) fn now() -> Result<u64> {
     checked(SystemTime::now().duration_since(UNIX_EPOCH)).map(|d| d.as_secs())
@@ -57,7 +71,7 @@ fn json<T: Serialize>(v: &T) -> Result<Vec<u8>> {
 }
 fn decode<T: for<'a> Deserialize<'a>>(b: &[u8]) -> Result<T> {
     if b.len() > 128 * 1024 {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     checked(serde_json::from_slice(b))
 }
@@ -99,7 +113,7 @@ impl Plan {
             || self.expected_oidc_subject.is_empty()
             || self.expected_oidc_subject.len() > 1024
         {
-            return Err(RuntimeError);
+            return Err(RuntimeError::Refused);
         }
         checked(intent::verify_original(
             self.native_original.as_bytes(),
@@ -257,8 +271,10 @@ pub struct ArtifactObservation {
 /// helper never overwrites or creates parent namespaces and never logs content.
 pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     use rustix::fs::{self, AtFlags, Mode, OFlags};
-    let dir = checked(CiphertextStore::open(path.parent().ok_or(RuntimeError)?))?;
-    let name = path.file_name().ok_or(RuntimeError)?;
+    let dir = checked(CiphertextStore::open(
+        path.parent().ok_or(RuntimeError::Refused)?,
+    ))?;
+    let name = path.file_name().ok_or(RuntimeError::Refused)?;
     let fd = checked(fs::openat(
         dir.directory(),
         name,
@@ -281,7 +297,7 @@ pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         || st.st_size != bytes.len() as i64
         || st.st_nlink != 1
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     checked(fs::fsync(dir.directory()))?;
     checked(dir.check())
@@ -290,9 +306,9 @@ fn read<T: Serialize + for<'a> Deserialize<'a>>(p: &Path) -> Result<T> {
     checked(owner_cli::read_public(p))
 }
 fn register(path: &Path, job: &Job) -> Result<()> {
-    if path.try_exists().map_err(|_| RuntimeError)? {
+    if path.try_exists().map_err(|_| RuntimeError::Refused)? {
         if read::<Job>(path)? != *job {
-            return Err(RuntimeError);
+            return Err(RuntimeError::Refused);
         }
         Ok(())
     } else {
@@ -315,7 +331,7 @@ async fn verify_workflow(
     audience: &str,
 ) -> Result<oidc::VerifiedWorkflow> {
     if job.run_id != dispatch.run_id || job.run_attempt != dispatch.run_attempt {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     let intent = plan.intent()?;
     let client = checked(GithubEvidenceClient::new())?;
@@ -333,7 +349,7 @@ async fn verify_workflow(
 }
 fn same_enrollment(owner: &OwnerCustody, d: &PublicDestination) -> Result<()> {
     if checked(owner.public_enrollment())? != PublicEnrollment::Destination(d.clone()) {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     Ok(())
 }
@@ -372,7 +388,7 @@ async fn delivery_complete(State(s): State<Arc<RootState>>, body: Bytes) -> impl
         let mut slot = s.dual_delivery.lock().await;
         if let Some(prior) = slot.as_ref() {
             if prior.receipt_set_digest() != proof.receipt_set_digest() {
-                return Err(RuntimeError);
+                return Err(RuntimeError::Refused);
             }
         } else {
             write_new(
@@ -404,11 +420,11 @@ async fn wait_dual(
     loop {
         if let Some(proof) = s.dual_delivery.lock().await.clone() {
             if !proof.matches(obs.run_id, obs.run_attempt, obs.envelope_digest, obs.object) {
-                return Err(RuntimeError);
+                return Err(RuntimeError::Refused);
             }
             return Ok(proof);
         }
-        tokio::select! { _=s.dual_changed.notified()=>{}, _=budget.work_stopped()=>return Err(RuntimeError) }
+        tokio::select! { _=s.dual_changed.notified()=>{}, _=budget.work_stopped()=>return Err(RuntimeError::Refused) }
     }
 }
 async fn bootstrap(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoResponse {
@@ -420,7 +436,7 @@ async fn bootstrap(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoRes
         verify_workflow(&plan, &dispatch, &request.job, &request.token, &audience).await?;
         plan.profiles()?
             .validate_registered_job(&request.job.registered())
-            .map_err(|_| RuntimeError)?;
+            .map_err(|_| RuntimeError::Refused)?;
         register(&s.config.registered_job, &request.job)?;
         json(&plan)
     }
@@ -433,7 +449,7 @@ fn is_ready(s: &RootState, job: &Job) -> Result<()> {
         || read::<Job>(&s.config.registered_job)? != *job
         || read::<Job>(&s.config.relay_ready)? != *job
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     Ok(())
 }
@@ -529,7 +545,7 @@ fn validate_server(
         || addr.port() == 0
         || !(30..=3600).contains(&lifetime)
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     checked(CiphertextStore::open(outputs)).map(|_| ())
 }
@@ -630,7 +646,7 @@ async fn receive(
     drop(online_guard);
     budget.finish_close(pair.close()).await?;
     checked(transfer)?;
-    let (object, envelope_digest, admission_sha256) = observation.ok_or(RuntimeError)?;
+    let (object, envelope_digest, admission_sha256) = observation.ok_or(RuntimeError::Refused)?;
     let native = checked(owner.read_native_receipt(object))?;
     let stored = recover(owner, profiles.delivery(), role, object)?;
     checked(crate::receipt::verify_native_admitted(
@@ -825,7 +841,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
             signer: d.spec().admission_signer,
         })
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     same_enrollment(&recipient, &d.spec().recipient)?;
     let listener = checked(tokio::net::TcpListener::bind(config.listen).await)?;
@@ -856,7 +872,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
                 break j;
             }
             if receiver_budget.stopped() {
-                return Err(RuntimeError);
+                return Err(RuntimeError::Refused);
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
@@ -883,7 +899,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
         let recipient = s.recipient.lock().await;
         let qualified = tokio::select! {
             result = recipient_read(&recipient, &plan, obs, &s.config.output_directory) => result,
-            _ = receiver_budget.work_stopped() => Err(RuntimeError),
+            _ = receiver_budget.work_stopped() => Err(RuntimeError::Refused),
         }?;
         if let Some(agent) = &s.config.idle_agent {
             let envelope = recover(
@@ -896,23 +912,22 @@ pub async fn serve_root(path: &Path) -> Result<()> {
                 plan.command_profile.as_bytes(),
             ))?;
             drop(recipient);
-            checked(
-                crate::idle_agent::wake(
-                    agent,
-                    crate::idle_agent::QualifiedWake {
-                        plan: &plan,
-                        envelope: &envelope,
-                        verified: &qualified.verified,
-                        plaintext: &qualified.plaintext,
-                        observation: &qualified.observation,
-                        command_profile: &command,
-                        budget: &receiver_budget,
-                        dual: &dual,
-                        read_authorization: &qualified.read_authorization,
-                    },
-                )
-                .await,
-            )?;
+            crate::idle_agent::wake(
+                agent,
+                crate::idle_agent::QualifiedWake {
+                    plan: &plan,
+                    envelope: &envelope,
+                    verified: &qualified.verified,
+                    plaintext: &qualified.plaintext,
+                    observation: &qualified.observation,
+                    command_profile: &command,
+                    budget: &receiver_budget,
+                    dual: &dual,
+                    read_authorization: &qualified.read_authorization,
+                },
+            )
+            .await
+            .map_err(RuntimeError::AgentHeld)?;
         }
         Ok(())
     };
@@ -946,8 +961,17 @@ async fn run_owner<F: std::future::Future<Output = Result<()>>>(
         result
     };
     let (http, receipt, ()) = tokio::join!(server, receiver, shutdown);
-    http?;
-    receipt
+    owner_outcome(http, receipt)
+}
+pub(crate) fn owner_outcome(http: Result<()>, receipt: Result<()>) -> Result<()> {
+    // A separate HTTP error must never drop the receiver's original custody.
+    match receipt {
+        Err(e @ RuntimeError::AgentHeld(_)) => Err(e),
+        other => {
+            http?;
+            other
+        }
+    }
 }
 
 struct StudioState {
@@ -966,13 +990,15 @@ async fn policy_get(State(s): State<Arc<StudioState>>) -> impl IntoResponse {
 fn acu_pin(owner: &OwnerCustody) -> Result<[u8; 32]> {
     match checked(owner.public_enrollment())? {
         PublicEnrollment::Acu { signer, .. } => Ok(signer),
-        _ => Err(RuntimeError),
+        _ => Err(RuntimeError::Refused),
     }
 }
 fn read_raw(path: &Path, max: usize) -> Result<Vec<u8>> {
     use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
-    let dir = checked(CiphertextStore::open(path.parent().ok_or(RuntimeError)?))?;
-    let name = path.file_name().ok_or(RuntimeError)?;
+    let dir = checked(CiphertextStore::open(
+        path.parent().ok_or(RuntimeError::Refused)?,
+    ))?;
+    let name = path.file_name().ok_or(RuntimeError::Refused)?;
     let f = File::from(checked(fs::openat(
         dir.directory(),
         name,
@@ -987,7 +1013,7 @@ fn read_raw(path: &Path, max: usize) -> Result<Vec<u8>> {
         || st.st_size < 1
         || st.st_size as usize > max
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     #[cfg(target_os = "macos")]
     {
@@ -1004,7 +1030,7 @@ fn read_raw(path: &Path, max: usize) -> Result<Vec<u8>> {
         || end.st_dev != named.st_dev
         || named.st_size != end.st_size
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     checked(dir.check())?;
     Ok(bytes)
@@ -1062,7 +1088,7 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
             signer: d.spec().acu_signer,
         })
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     let listener = checked(tokio::net::TcpListener::bind(config.listen).await)?;
     let ledger = checked(acu::ReleaseLedger::open(
@@ -1156,12 +1182,12 @@ pub(crate) async fn request_bytes(
         || response.status() != reqwest::StatusCode::OK
         || response.content_length().is_some_and(|n| n > max as u64)
     {
-        return Err(RuntimeError);
+        return Err(RuntimeError::Refused);
     }
     let mut bytes = Vec::new();
     while let Some(b) = checked(response.chunk().await)? {
         if b.len() > max.saturating_sub(bytes.len()) {
-            return Err(RuntimeError);
+            return Err(RuntimeError::Refused);
         }
         bytes.extend_from_slice(&b)
     }

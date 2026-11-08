@@ -747,11 +747,30 @@ mod tests {
         assert!(scope.verify_current(&raw, 1200).is_err());
         let monotonic = tokio::time::Instant::now();
         assert_eq!(
-            scope.current_until(&raw, 1100, monotonic).unwrap(),
-            monotonic + std::time::Duration::from_secs(100)
+            scope
+                .current_until(
+                    &raw,
+                    crate::agent_deadline::Sample::fixture(monotonic, 1100)
+                )
+                .unwrap(),
+            monotonic + std::time::Duration::from_secs(99)
         );
-        assert!(scope.current_until(&raw, 1200, monotonic).is_err());
-        assert!(scope.current_until(&raw, 1201, monotonic).is_err());
+        assert!(
+            scope
+                .current_until(
+                    &raw,
+                    crate::agent_deadline::Sample::fixture(monotonic, 1200)
+                )
+                .is_err()
+        );
+        assert!(
+            scope
+                .current_until(
+                    &raw,
+                    crate::agent_deadline::Sample::fixture(monotonic, 1201)
+                )
+                .is_err()
+        );
         for change in 0..4 {
             let mut p = f.spec.clone();
             match change {
@@ -762,12 +781,138 @@ mod tests {
             }
             let raw = f.acu.sign_release_policy(&p).unwrap();
             assert!(scope.verify_current(&raw, 1100).is_err());
-            assert!(scope.current_until(&raw, 1100, monotonic).is_err());
+            assert!(
+                scope
+                    .current_until(
+                        &raw,
+                        crate::agent_deadline::Sample::fixture(monotonic, 1100)
+                    )
+                    .is_err()
+            );
         }
         let mut raw = raw;
         let n = raw.len() - 4;
         raw[n] ^= 1;
         assert!(scope.verify_current(&raw, 1100).is_err());
+    }
+    #[tokio::test]
+    async fn final_prepared_launch_rejects_revocation_and_expiry_before_spawn_or_started_record() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::time::Instant;
+        let f = Fixture::new();
+        let scope = crate::agent_read::ReadAuthorization::qualified(1200, &f.policy);
+        let active = f.acu.sign_release_policy(&f.spec).unwrap();
+        for expired in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().canonicalize().unwrap();
+            let executable = dir.join("codex");
+            let spawned = dir.join("spawned");
+            let delivered = dir.join("delivered");
+            let script = format!(
+                "#!/bin/sh\nprintf started > '{}'\ncat > '{}'\n",
+                spawned.display(),
+                delivered.display()
+            );
+            std::fs::write(&executable, script.as_bytes()).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let route = crate::agent_process::CodingAgentRoute {
+                executable,
+                executable_sha256: Sha256::digest(script.as_bytes()).into(),
+                workspace: dir.clone(),
+                turn_seconds: 15,
+            };
+            let anchor = Instant::now();
+            let first = scope
+                .current_until(
+                    &active,
+                    crate::agent_deadline::Sample::fixture(anchor, 1100),
+                )
+                .unwrap();
+            let prepared = crate::agent_process::prepare(&route, None).unwrap();
+            // Authorization changes DURING preparation after initial checks,
+            // before the production final gate. This is not a model call.
+            let mut revoked = f.spec.clone();
+            revoked.active = false;
+            let final_policy = if expired {
+                active.clone()
+            } else {
+                f.acu.sign_release_policy(&revoked).unwrap()
+            };
+            let unix = if expired { 1200 } else { 1100 };
+            if expired {
+                assert!(
+                    scope
+                        .current_until(
+                            &active,
+                            crate::agent_deadline::Sample::fixture(anchor, 1199)
+                        )
+                        .is_err()
+                );
+                assert!(
+                    scope
+                        .current_until(
+                            &active,
+                            crate::agent_deadline::Sample::fixture(
+                                anchor + std::time::Duration::from_micros(1),
+                                1199
+                            )
+                        )
+                        .is_err()
+                );
+            }
+            let store_dir = dir.join("store");
+            std::fs::create_dir(&store_dir).unwrap();
+            std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut store = crate::wake_store::WakeStore::initialize(&store_dir, [1; 32]).unwrap();
+            for phase in [
+                crate::wake_store::WakePhase::Initiating,
+                crate::wake_store::WakePhase::Idle,
+                crate::wake_store::WakePhase::Reserved,
+            ] {
+                store
+                    .record(phase, &serde_json::json!({"fixture":true}))
+                    .unwrap();
+            }
+            let result = crate::agent_process::run_prepared(
+                prepared,
+                zeroize::Zeroizing::new(b"must not deliver".to_vec()),
+                first,
+                async {
+                    scope
+                        .current_until(
+                            &final_policy,
+                            crate::agent_deadline::Sample::fixture(Instant::now(), unix),
+                        )
+                        .map_err(|_| crate::agent_process::AgentRouteError)
+                },
+                |_| {
+                    store
+                        .record(
+                            crate::wake_store::WakePhase::Started,
+                            &serde_json::json!({"started":true}),
+                        )
+                        .map_err(|_| ())
+                },
+                std::future::pending(),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(!spawned.exists() && !delivered.exists());
+            assert!(
+                store
+                    .read::<serde_json::Value>(crate::wake_store::WakePhase::Started)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .record(
+                        crate::wake_store::WakePhase::Reserved,
+                        &serde_json::json!({})
+                    )
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn dual_custody_barrier_requires_both_complete_three_layer_signatures_same_object_and_selected_paths()

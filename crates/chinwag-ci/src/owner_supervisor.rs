@@ -61,18 +61,46 @@ impl OwnerExit {
             && self.os_exit_observed
     }
 }
+#[derive(Debug, thiserror::Error)]
+pub enum OwnerSupervisorError {
+    #[error("CI owner operation refused or held")]
+    Refused,
+    #[error("original Root worker retained for possible coding-agent custody")]
+    HeldWorker(Box<crate::agent_process::OriginalChildCustody>),
+}
+impl OwnerSupervisorError {
+    pub fn into_held(self) -> Option<crate::agent_process::OriginalChildCustody> {
+        match self {
+            Self::HeldWorker(c) => Some(*c),
+            Self::Refused => None,
+        }
+    }
+}
+#[derive(Debug)]
+enum WatchError {
+    Io,
+    Held,
+}
+fn wait_error(preserve: bool) -> WatchError {
+    if preserve {
+        WatchError::Held
+    } else {
+        WatchError::Io
+    }
+}
 async fn watch_child<S: Future<Output = ()>>(
     child: &mut Child,
     hard: Instant,
     stop: S,
-) -> std::io::Result<OwnerExit> {
+    preserve: bool,
+) -> Result<OwnerExit, WatchError> {
     tokio::pin!(stop);
     let stopped = tokio::select! {
-        status = child.wait() => return Ok(OwnerExit::observed(status?, false, false, hard)),
+        status = child.wait() => return Ok(OwnerExit::observed(status.map_err(|_|wait_error(preserve))?, false, false, hard)),
         _ = &mut stop => true,
         _ = tokio::time::sleep_until(hard) => false,
     };
-    if let Some(status) = child.try_wait()? {
+    if let Some(status) = child.try_wait().map_err(|_| wait_error(preserve))? {
         return Ok(OwnerExit::observed(status, stopped, false, hard));
     }
     if stopped {
@@ -80,54 +108,69 @@ async fn watch_child<S: Future<Output = ()>>(
             .id()
             .and_then(|pid| i32::try_from(pid).ok())
             .and_then(rustix::process::Pid::from_raw)
-            .ok_or_else(|| std::io::Error::other("owned child unavailable"))?;
+            .ok_or_else(|| wait_error(preserve))?;
         // The exact owned unreaped child cannot have its PID reused.
         let _signal = rustix::process::kill_process(pid, rustix::process::Signal::INT);
         let drain = hard.min(Instant::now() + Duration::from_secs(12));
         if let Ok(status) = timeout_at(drain, child.wait()).await {
-            return Ok(OwnerExit::observed(status?, true, false, hard));
+            return Ok(OwnerExit::observed(
+                status.map_err(|_| wait_error(preserve))?,
+                true,
+                false,
+                hard,
+            ));
         }
     }
     // A late status after the hard bound is still held, even if exit code is 0.
-    if let Some(status) = child.try_wait()? {
+    if let Some(status) = child.try_wait().map_err(|_| wait_error(preserve))? {
         return Ok(OwnerExit::observed(status, stopped, false, hard));
+    }
+    // A Root worker may own an unconfirmed model child. Preserve its actual
+    // process handle at the bounded return instead of destroying that custody.
+    if preserve {
+        return Err(WatchError::Held);
     }
     let _kill_result = child.start_kill();
     // SIGKILL issuance/kill_on_drop is not OS completion. Retain the same child
     // and wait. A kernel reap error remains unknown, never a completion receipt.
     Ok(OwnerExit::observed(
-        child.wait().await?,
+        child.wait().await.map_err(|_| WatchError::Io)?,
         stopped,
         true,
         hard,
     ))
 }
-pub async fn run(kind: OwnerKind, config: &Path) -> Result<(), ()> {
+pub async fn run(kind: OwnerKind, config: &Path) -> Result<(), OwnerSupervisorError> {
     // Only this owner's declared public configuration is parsed by the parent;
     // custody, ledgers, stores and keys are opened exclusively by its worker.
-    let (seconds, worker) = match kind {
-        OwnerKind::Root => (
-            owner_cli::read_public::<RootConfiguration>(config)
-                .map_err(|_| ())?
-                .lifetime_seconds,
-            "__ci-owned-root",
-        ),
+    let (seconds, worker, preserve) = match kind {
+        OwnerKind::Root => {
+            let c = owner_cli::read_public::<RootConfiguration>(config)
+                .map_err(|_| OwnerSupervisorError::Refused)?;
+            (
+                c.lifetime_seconds,
+                "__ci-owned-root",
+                c.idle_agent.is_some(),
+            )
+        }
         OwnerKind::Studio => (
             owner_cli::read_public::<StudioConfiguration>(config)
-                .map_err(|_| ())?
+                .map_err(|_| OwnerSupervisorError::Refused)?
                 .lifetime_seconds,
             "__ci-owned-studio",
+            false,
         ),
     };
     if !(30..=3600).contains(&seconds) {
-        return Err(());
+        return Err(OwnerSupervisorError::Refused);
     }
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|_| ())?;
+        .map_err(|_| OwnerSupervisorError::Refused)?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|_| ())?;
+        .map_err(|_| OwnerSupervisorError::Refused)?;
     let hard = Instant::now() + Duration::from_secs(seconds + 2);
-    let mut command = Command::new(std::env::current_exe().map_err(|_| ())?);
+    let mut command =
+        Command::new(std::env::current_exe().map_err(|_| OwnerSupervisorError::Refused)?);
     command
         .arg(worker)
         .arg(config)
@@ -139,13 +182,28 @@ pub async fn run(kind: OwnerKind, config: &Path) -> Result<(), ()> {
         .stderr(Stdio::null())
         .process_group(0)
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| ())?;
+    let mut child = command.spawn().map_err(|_| OwnerSupervisorError::Refused)?;
     let stop = async {
         tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
     };
-    let observed = watch_child(&mut child, hard, stop).await.map_err(|_| ())?;
-    println!("{}", serde_json::to_string(&observed).map_err(|_| ())?);
-    if observed.clean() { Ok(()) } else { Err(()) }
+    let observed = match watch_child(&mut child, hard, stop, preserve).await {
+        Ok(v) => v,
+        Err(WatchError::Held) => {
+            return Err(OwnerSupervisorError::HeldWorker(Box::new(
+                crate::agent_process::OriginalChildCustody::hold(child),
+            )));
+        }
+        Err(WatchError::Io) => return Err(OwnerSupervisorError::Refused),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&observed).map_err(|_| OwnerSupervisorError::Refused)?
+    );
+    if observed.clean() {
+        Ok(())
+    } else {
+        Err(OwnerSupervisorError::Refused)
+    }
 }
 
 #[cfg(test)]
@@ -203,12 +261,46 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         };
-        let result = watch_child(&mut child, start + Duration::from_millis(180), stop)
+        let result = watch_child(&mut child, start + Duration::from_millis(180), stop, false)
             .await
             .unwrap();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(child.try_wait().unwrap().is_some());
         result
+    }
+    #[tokio::test]
+    async fn root_worker_deadline_returns_original_custody_without_destroying_model_owner() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("0.2")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let hard = Instant::now() + Duration::from_millis(20);
+        assert!(matches!(
+            watch_child(&mut child, hard, std::future::pending(), true).await,
+            Err(WatchError::Held)
+        ));
+        // Same typed owner disposition as run; no replacement or PID lookup.
+        let error = OwnerSupervisorError::HeldWorker(Box::new(
+            crate::agent_process::OriginalChildCustody::hold(child),
+        ));
+        let mut held = error.into_held().unwrap();
+        assert_eq!(held.original_pid(), pid);
+        assert!(
+            held.wait_until(Instant::now() + Duration::from_millis(20))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            held.wait_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        // The original operation's hard bound remains HELD, never clean.
     }
     #[tokio::test]
     async fn actual_clean_exit_and_failure_keep_their_original_status() {
