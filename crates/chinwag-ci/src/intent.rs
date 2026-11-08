@@ -8,7 +8,7 @@
 //! routing assertion, not proof that a separate process/chat owns another key.
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_ORIGINAL_BYTES: usize = 32 * 1024;
@@ -31,7 +31,7 @@ struct NativeOriginal {
     // None of it can replace verification of the original signed fields.
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntentSpec {
     pub schema: String,

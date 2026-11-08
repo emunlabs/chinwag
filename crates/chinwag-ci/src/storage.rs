@@ -102,6 +102,10 @@ fn private_file(stat: &Stat) -> bool {
 }
 
 impl CiphertextStore {
+    pub(crate) fn directory(&self) -> rustix::fd::BorrowedFd<'_> {
+        use rustix::fd::AsFd;
+        self.directory.as_fd()
+    }
     /// Open the explicitly owned store, refusing symlinks in every component.
     /// The capability remains anchored if the directory is subsequently renamed.
     /// No existing permission, parent, or service is changed by this method.
@@ -125,7 +129,7 @@ impl CiphertextStore {
         Ok(store)
     }
 
-    fn check(&self) -> Result<(), StorageError> {
+    pub(crate) fn check(&self) -> Result<(), StorageError> {
         if !private_directory(&fs::fstat(&self.directory).map_err(|_| StorageError::Directory)?) {
             return Err(StorageError::Directory);
         }

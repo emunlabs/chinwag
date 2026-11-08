@@ -902,4 +902,143 @@ mod tests {
             Err(BindingError::Lifetime)
         ));
     }
+
+    #[cfg(unix)]
+    mod admission_tests {
+        use super::*;
+        use crate::{
+            admission::{AdmissionError, AdmissionLedger, AdmissionOutcome, IssuedChallenge},
+            runner_binding::verify_runner_proof,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        fn directory() -> tempfile::TempDir {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            d
+        }
+        fn binding(
+            profile: &str,
+            challenge: &IssuedChallenge,
+            jti: &str,
+            nbf: u64,
+        ) -> crate::runner_binding::VerifiedRunnerBinding {
+            let intent = dispatch_intent(profile);
+            let keys = runner_keys();
+            let mut c = claims();
+            c["aud"] = json!(challenge.audience);
+            c["jti"] = json!(jti);
+            c["nbf"] = json!(nbf);
+            let workflow = verify_token(
+                &issue(&c),
+                &self::super::keys(),
+                ExpectedWorkflow {
+                    audience: &challenge.audience,
+                    now_unix: nbf.max(1001),
+                    ..expected()
+                },
+            )
+            .unwrap();
+            let signature = pop_signature(&intent, &workflow, keys, challenge.nonce);
+            verify_runner_proof(
+                intent,
+                workflow,
+                keys,
+                challenge.nonce,
+                signature,
+                nbf.max(1001),
+            )
+            .unwrap()
+        }
+        #[test]
+        fn one_durable_admission_survives_reopen_and_exact_reconciliation_never_renews_it() {
+            let d = directory();
+            let path = d.path().canonicalize().unwrap();
+            let mut ledger = AdmissionLedger::open(&path).unwrap();
+            assert!(matches!(
+                AdmissionLedger::open(&path),
+                Err(AdmissionError::Busy)
+            ));
+            let challenge = ledger
+                .issue(&dispatch_intent("cd"), runner_keys(), 100, 1, 1001, 1090)
+                .unwrap();
+            let proof = binding("cd", &challenge, "test-token-id", 1000);
+            let original = match ledger.consume(&proof, challenge.nonce, 1002).unwrap() {
+                AdmissionOutcome::NewlyCommitted(record) => record,
+                _ => panic!("first admission must be committed once"),
+            };
+            let digest = *original.digest();
+            assert_eq!(original.record().expires_unix, 1090);
+            let canonical = original.canonical_record().unwrap();
+            drop(ledger);
+            let mut reopened = AdmissionLedger::open(&path).unwrap();
+            let observed = match reopened.consume(&proof, challenge.nonce, 5000).unwrap() {
+                AdmissionOutcome::ReconciledOriginal(record) => record,
+                _ => panic!("reconciliation cannot repeat admission effects"),
+            };
+            assert_eq!(observed.digest(), &digest);
+            assert_eq!(observed.canonical_record().unwrap(), canonical);
+            assert_eq!(observed.record().expires_unix, 1090);
+            let data = std::fs::read_to_string(path.join("admission-state-v1.json")).unwrap();
+            assert!(!data.contains("test-token-id")); // JTI is persisted only as issuer-scoped hash.
+            assert!(!data.contains("eyJ")); // Raw encoded JWT is not persisted.
+        }
+        #[test]
+        fn token_and_intent_run_are_consumed_atomically_across_new_challenges_and_tokens() {
+            let d = directory();
+            let path = d.path().canonicalize().unwrap();
+            let mut ledger = AdmissionLedger::open(&path).unwrap();
+            let first = ledger
+                .issue(&dispatch_intent("cd"), runner_keys(), 100, 1, 1001, 1090)
+                .unwrap();
+            let proof = binding("cd", &first, "shared-jti", 1000);
+            assert!(matches!(
+                ledger.consume(&proof, first.nonce, 1002),
+                Ok(AdmissionOutcome::NewlyCommitted(_))
+            ));
+            let second = ledger
+                .issue(&dispatch_intent("ce"), runner_keys(), 100, 1, 1001, 1090)
+                .unwrap();
+            let reused_jti = binding("ce", &second, "shared-jti", 1000);
+            assert!(matches!(
+                ledger.consume(&reused_jti, second.nonce, 1002),
+                Err(AdmissionError::Conflict)
+            ));
+            // The failed transaction did not consume the new challenge/scope.
+            let new_jti = binding("ce", &second, "new-jti", 1000);
+            assert!(matches!(
+                ledger.consume(&new_jti, second.nonce, 1002),
+                Ok(AdmissionOutcome::NewlyCommitted(_))
+            ));
+            let third = ledger
+                .issue(&dispatch_intent("cd"), runner_keys(), 100, 1, 1001, 1090)
+                .unwrap();
+            let changed_token = binding("cd", &third, "yet-another-jti", 1000);
+            assert!(matches!(
+                ledger.consume(&changed_token, third.nonce, 1002),
+                Err(AdmissionError::Conflict)
+            ));
+        }
+        #[test]
+        fn proof_validity_and_challenge_expiry_are_rechecked_when_consuming() {
+            let d = directory();
+            let path = d.path().canonicalize().unwrap();
+            let mut ledger = AdmissionLedger::open(&path).unwrap();
+            let challenge = ledger
+                .issue(&dispatch_intent("cd"), runner_keys(), 100, 1, 1001, 1090)
+                .unwrap();
+            let proof = binding("cd", &challenge, "test-token-id", 1050);
+            assert!(matches!(
+                ledger.consume(&proof, challenge.nonce, 1002),
+                Err(AdmissionError::Lifetime)
+            ));
+            assert!(matches!(
+                ledger.consume(&proof, challenge.nonce, 1090),
+                Err(AdmissionError::Lifetime)
+            ));
+            assert!(matches!(
+                ledger.consume(&proof, challenge.nonce, 1050),
+                Ok(AdmissionOutcome::NewlyCommitted(_))
+            ));
+        }
+    }
 }

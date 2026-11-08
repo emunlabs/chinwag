@@ -146,6 +146,7 @@ pub fn proof_payload(
 }
 
 pub struct VerifiedRunnerBinding {
+    spec: crate::intent::IntentSpec,
     initiating_instance: String,
     intent_digest: [u8; 32],
     token_sha256: [u8; 32],
@@ -154,10 +155,17 @@ pub struct VerifiedRunnerBinding {
     run_id: u64,
     attempt: u32,
     expires_unix: u64,
+    usable_from_unix: u64,
     keys: RunnerPublicKeys,
 }
 
 impl VerifiedRunnerBinding {
+    pub fn intent_spec(&self) -> &crate::intent::IntentSpec {
+        &self.spec
+    }
+    pub fn usable_from_unix(&self) -> u64 {
+        self.usable_from_unix
+    }
     pub fn initiating_instance(&self) -> &str {
         &self.initiating_instance
     }
@@ -215,6 +223,7 @@ pub fn verify_runner_proof(
         .verify_strict(&payload, &Signature::from_bytes(&signature))
         .map_err(|_| BindingError::Signature)?;
     Ok(VerifiedRunnerBinding {
+        spec: intent.spec().clone(),
         initiating_instance: intent.initiating_instance().into(),
         intent_digest: *intent.original_digest(),
         token_sha256: *workflow.token_sha256(),
@@ -223,6 +232,10 @@ pub fn verify_runner_proof(
         run_id: workflow.run_id(),
         attempt: workflow.run_attempt(),
         expires_unix,
+        usable_from_unix: intent
+            .issued_unix()
+            .max(workflow.issued_unix())
+            .max(workflow.not_before_unix()),
         keys,
     })
 }
