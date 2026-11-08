@@ -149,6 +149,9 @@ pub struct AuthenticatedEnvelope {
     digest: [u8; 32],
 }
 impl AuthenticatedEnvelope {
+    pub(crate) fn key_pins(&self) -> &KeyPins {
+        &self.manifest.header.pre.keys
+    }
     pub fn digest(&self) -> &[u8; 32] {
         &self.digest
     }

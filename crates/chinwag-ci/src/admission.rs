@@ -79,19 +79,46 @@ pub struct AdmissionRecord {
 #[serde(deny_unknown_fields)]
 struct State {
     version: u16,
+    purpose: u8,
     challenges: BTreeMap<String, ChallengeRecord>,
     token_admissions: BTreeMap<String, String>,
     scope_admissions: BTreeMap<String, String>,
     admissions: BTreeMap<String, AdmissionRecord>,
+    releases: BTreeMap<String, ReleaseRecord>,
+    acu_policy: Option<PolicyRecord>,
+    release_enrollment: Option<ReleaseEnrollment>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseRecord {
+    request_sha256: [u8; 32],
+    encrypted_signed_response: Option<Vec<u8>>,
+}
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyRecord {
+    signer: [u8; 32],
+    epoch: u64,
+    sha256: [u8; 32],
+}
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseEnrollment {
+    acu: [u8; 32],
+    admission: [u8; 32],
 }
 impl Default for State {
     fn default() -> Self {
         Self {
             version: 1,
+            purpose: 1,
             challenges: BTreeMap::new(),
             token_admissions: BTreeMap::new(),
             scope_admissions: BTreeMap::new(),
             admissions: BTreeMap::new(),
+            releases: BTreeMap::new(),
+            acu_policy: None,
+            release_enrollment: None,
         }
     }
 }
@@ -106,6 +133,14 @@ pub struct CommittedAdmission {
     record: AdmissionRecord,
 }
 impl CommittedAdmission {
+    #[cfg(test)]
+    pub(crate) fn synthetic_fixture(record: AdmissionRecord) -> Self {
+        let digest = digest(
+            b"chinwag-ci-admission-record-v1\0",
+            &[&canonical(&record).unwrap()],
+        );
+        Self { digest, record }
+    }
     pub fn digest(&self) -> &[u8; 32] {
         &self.digest
     }
@@ -125,6 +160,16 @@ pub struct AdmissionLedger {
     lock: File,
     poisoned: bool,
     initializing: bool,
+    purpose: u8,
+}
+/// Consumed before any ACU gate unwrap. No public constructor or serialization.
+pub(crate) struct ReservedRelease {
+    scope: String,
+    request_sha256: [u8; 32],
+}
+pub(crate) enum ReleaseDisposition {
+    Reserved(ReservedRelease),
+    Ready(Vec<u8>),
 }
 impl Drop for AdmissionLedger {
     fn drop(&mut self) {
@@ -163,6 +208,12 @@ fn check_file(fd: impl AsFd) -> Result<Stat, AdmissionError> {
 }
 impl AdmissionLedger {
     pub fn open(path: &Path) -> Result<Self, AdmissionError> {
+        Self::open_purpose(path, 1)
+    }
+    pub(crate) fn open_release(path: &Path) -> Result<Self, AdmissionError> {
+        Self::open_purpose(path, 2)
+    }
+    fn open_purpose(path: &Path, purpose: u8) -> Result<Self, AdmissionError> {
         let directory = CiphertextStore::open(path).map_err(|_| AdmissionError::Store)?;
         let mode = Mode::RUSR | Mode::WUSR;
         let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
@@ -202,6 +253,7 @@ impl AdmissionLedger {
             lock,
             poisoned: false,
             initializing: fresh,
+            purpose,
         };
         ledger.check_lock()?;
         let (_, prior) = ledger.read()?;
@@ -212,7 +264,13 @@ impl AdmissionLedger {
             if prior.is_some() {
                 return Err(AdmissionError::Store);
             }
-            ledger.commit(&State::default(), None)?;
+            ledger.commit(
+                &State {
+                    purpose,
+                    ..State::default()
+                },
+                None,
+            )?;
             ledger
                 .lock
                 .write_all(INITIALIZED)
@@ -252,7 +310,15 @@ impl AdmissionLedger {
             Mode::empty(),
         ) {
             Ok(fd) => fd,
-            Err(Errno::NOENT) if self.initializing => return Ok((State::default(), None)),
+            Err(Errno::NOENT) if self.initializing => {
+                return Ok((
+                    State {
+                        purpose: self.purpose,
+                        ..State::default()
+                    },
+                    None,
+                ));
+            }
             Err(_) => return Err(AdmissionError::Store),
         };
         let initial = check_file(&fd)?;
@@ -278,7 +344,9 @@ impl AdmissionLedger {
         }
         let state: State = serde_json::from_slice(&bytes).map_err(|_| AdmissionError::Store)?;
         if state.version != 1
+            || state.purpose != self.purpose
             || state.challenges.len() > MAX_CHALLENGES
+            || state.releases.len() > MAX_CHALLENGES
             || canonical(&state)? != bytes
         {
             return Err(AdmissionError::Store);
@@ -357,6 +425,9 @@ impl AdmissionLedger {
         now: u64,
         expires: u64,
     ) -> Result<IssuedChallenge, AdmissionError> {
+        if self.purpose != 1 {
+            return Err(AdmissionError::Conflict);
+        }
         if self.poisoned {
             return Err(AdmissionError::CommitUnknown);
         }
@@ -406,6 +477,9 @@ impl AdmissionLedger {
         nonce: [u8; 32],
         now: u64,
     ) -> Result<AdmissionOutcome, AdmissionError> {
+        if self.purpose != 1 {
+            return Err(AdmissionError::Conflict);
+        }
         if self.poisoned {
             return Err(AdmissionError::CommitUnknown);
         }
@@ -485,6 +559,124 @@ impl AdmissionLedger {
             digest: record_digest,
             record,
         }))
+    }
+    pub(crate) fn bind_release_enrollment(
+        &mut self,
+        acu: [u8; 32],
+        admission: [u8; 32],
+    ) -> Result<(), AdmissionError> {
+        if self.purpose != 2 {
+            return Err(AdmissionError::Conflict);
+        }
+        if self.poisoned {
+            return Err(AdmissionError::CommitUnknown);
+        }
+        let (mut state, prior) = self.read()?;
+        let enrollment = ReleaseEnrollment { acu, admission };
+        if let Some(old) = &state.release_enrollment {
+            return if old == &enrollment {
+                Ok(())
+            } else {
+                Err(AdmissionError::Conflict)
+            };
+        }
+        state.release_enrollment = Some(enrollment);
+        self.commit(&state, prior)
+    }
+    pub(crate) fn observe_policy(
+        &mut self,
+        signer: [u8; 32],
+        epoch: u64,
+        sha256: [u8; 32],
+    ) -> Result<(), AdmissionError> {
+        if self.purpose != 2 {
+            return Err(AdmissionError::Conflict);
+        }
+        if self.poisoned {
+            return Err(AdmissionError::CommitUnknown);
+        }
+        let (mut state, prior) = self.read()?;
+        let policy = PolicyRecord {
+            signer,
+            epoch,
+            sha256,
+        };
+        if let Some(old) = &state.acu_policy {
+            if old == &policy {
+                return Ok(());
+            }
+            if old.signer != signer || epoch <= old.epoch {
+                return Err(AdmissionError::Conflict);
+            }
+        }
+        state.acu_policy = Some(policy);
+        self.commit(&state, prior)
+    }
+    pub(crate) fn reserve_release(
+        &mut self,
+        scope: [u8; 32],
+        request_sha256: [u8; 32],
+    ) -> Result<ReleaseDisposition, AdmissionError> {
+        if self.purpose != 2 {
+            return Err(AdmissionError::Conflict);
+        }
+        if self.poisoned {
+            return Err(AdmissionError::CommitUnknown);
+        }
+        let (mut state, prior) = self.read()?;
+        let scope = hex::encode(scope);
+        if let Some(old) = state.releases.get(&scope) {
+            if old.request_sha256 != request_sha256 {
+                return Err(AdmissionError::Conflict);
+            }
+            return match &old.encrypted_signed_response {
+                Some(bytes) => Ok(ReleaseDisposition::Ready(bytes.clone())),
+                None => Err(AdmissionError::CommitUnknown),
+            };
+        }
+        if state.releases.len() >= MAX_CHALLENGES {
+            return Err(AdmissionError::Capacity);
+        }
+        state.releases.insert(
+            scope.clone(),
+            ReleaseRecord {
+                request_sha256,
+                encrypted_signed_response: None,
+            },
+        );
+        self.commit(&state, prior)?;
+        Ok(ReleaseDisposition::Reserved(ReservedRelease {
+            scope,
+            request_sha256,
+        }))
+    }
+    pub(crate) fn finish_release(
+        &mut self,
+        reserved: ReservedRelease,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, AdmissionError> {
+        if self.purpose != 2 {
+            return Err(AdmissionError::Conflict);
+        }
+        if self.poisoned {
+            return Err(AdmissionError::CommitUnknown);
+        }
+        if bytes.is_empty() || bytes.len() > crate::authorization::MAX_AUTH_BYTES {
+            return Err(AdmissionError::Capacity);
+        }
+        let (mut state, prior) = self.read()?;
+        let entry = state
+            .releases
+            .get_mut(&reserved.scope)
+            .ok_or(AdmissionError::Conflict)?;
+        if entry.request_sha256 != reserved.request_sha256
+            || entry.encrypted_signed_response.is_some()
+        {
+            return Err(AdmissionError::Conflict);
+        }
+        entry.encrypted_signed_response = Some(bytes.clone());
+        self.commit(&state, prior)?;
+        Ok(bytes)
     }
 }
 

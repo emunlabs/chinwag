@@ -382,6 +382,85 @@ fn enrolled_store_binding(
     }
 }
 impl OwnerCustody {
+    pub fn sign_release_policy(
+        &self,
+        spec: &crate::acu::PolicySpec,
+    ) -> Result<Vec<u8>, crate::acu::AcuError> {
+        self.guard
+            .check()
+            .map_err(|_| crate::acu::AcuError::Rejected)?;
+        let Keys::Acu { signer, .. } = &self.keys else {
+            return Err(crate::acu::AcuError::Rejected);
+        };
+        crate::acu::sign_policy(spec, signer)
+    }
+    pub fn create_release_request(
+        &self,
+        envelope: &crate::authorization::AdmissionBoundEnvelope,
+        policy: &crate::acu::CurrentPolicy,
+        now: u64,
+        expires: u64,
+    ) -> Result<Vec<u8>, crate::acu::AcuError> {
+        self.guard
+            .check()
+            .map_err(|_| crate::acu::AcuError::Rejected)?;
+        let Keys::Destination {
+            role,
+            store_id,
+            receipt,
+            response,
+            ..
+        } = &self.keys
+        else {
+            return Err(crate::acu::AcuError::Rejected);
+        };
+        if response.public()
+            != match role {
+                Destination::Recipient => envelope.key_pins().recipient_response_base,
+                Destination::Archive => envelope.key_pins().archive_response_base,
+            }
+        {
+            return Err(crate::acu::AcuError::Rejected);
+        }
+        let statement =
+            crate::acu::request_statement(envelope, policy, *role, *store_id, now, expires)?;
+        let signature = receipt.sign_release_request(&statement)?;
+        crate::acu::finish_request(statement, signature)
+    }
+    pub(crate) fn create_reserved_grant(
+        &self,
+        envelope: &AuthenticatedEnvelope,
+        request: &crate::acu::VerifiedRequest,
+        now: u64,
+    ) -> Result<Vec<u8>, crate::acu::AcuError> {
+        self.guard
+            .check()
+            .map_err(|_| crate::acu::AcuError::Rejected)?;
+        let Keys::Acu { gate, signer } = &self.keys else {
+            return Err(crate::acu::AcuError::Rejected);
+        };
+        if *signer.public().as_bytes() != envelope.key_pins().acu_signer {
+            return Err(crate::acu::AcuError::Rejected);
+        }
+        let secret = gate
+            .unwrap_for_authorized_release(envelope)
+            .map_err(|_| crate::acu::AcuError::Rejected)?;
+        let wrapped = secret
+            .wrap_response(envelope, request.statement.role, request.digest)
+            .map_err(|_| crate::acu::AcuError::Rejected)?;
+        crate::acu::sign_grant(request, wrapped, signer, now)
+    }
+    pub fn open_payload_from_grant(
+        &self,
+        envelope: &crate::authorization::AdmissionBoundEnvelope,
+        grant: &crate::acu::VerifiedGrant,
+        policy: &crate::acu::CurrentPolicy,
+        now: u64,
+    ) -> Result<Zeroizing<Vec<u8>>, crate::acu::AcuError> {
+        let gate = grant.open(self, envelope, policy, now)?;
+        self.open_payload_with_gate(envelope, &gate)
+            .map_err(|_| crate::acu::AcuError::Rejected)
+    }
     /// Only a record actually committed by AdmissionLedger can be certified;
     /// this owner exposes no arbitrary-signing or raw-key operation.
     pub fn certify_admission(
@@ -539,7 +618,8 @@ impl OwnerCustody {
     }
     /// Crypto operation only: caller must first verify current policy and the
     /// signed request and durably consume release replay state.
-    pub fn gate_for_authorized_release(
+    #[cfg(test)]
+    pub(crate) fn gate_for_authorized_release(
         &self,
         envelope: &AuthenticatedEnvelope,
     ) -> Result<GateSecret, CustodyError> {
@@ -551,7 +631,7 @@ impl OwnerCustody {
     }
     /// The independently signed ACU response/current policy must be verified by
     /// the application first. HPKE-Base alone authenticates no releasing sender.
-    pub fn open_gate_from_authorized_response(
+    pub(crate) fn open_gate_from_authorized_response(
         &self,
         envelope: &AuthenticatedEnvelope,
         request: [u8; 32],
@@ -563,7 +643,7 @@ impl OwnerCustody {
         };
         Ok(response.open_gate_from_verified_grant(envelope, request, wrapped)?)
     }
-    pub fn open_payload_with_gate(
+    pub(crate) fn open_payload_with_gate(
         &self,
         envelope: &AuthenticatedEnvelope,
         gate: &GateSecret,

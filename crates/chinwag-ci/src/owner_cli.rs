@@ -256,7 +256,8 @@ mod tests {
         assert!(initialize(&cp, &pp).is_err());
         let mut other: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&pp).unwrap()).unwrap();
-        other["Acu"]["signer"][0] = serde_json::json!(42);
+        let byte = other["Acu"]["signer"][0].as_u64().unwrap();
+        other["Acu"]["signer"][0] = serde_json::json!(byte ^ 1);
         std::fs::write(&pp, canonical(&other).unwrap()).unwrap();
         assert!(verify(&cp, &pp).is_err());
     }

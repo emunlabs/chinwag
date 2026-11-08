@@ -107,6 +107,32 @@ pub struct HistoricalAdmission {
 pub struct CurrentAdmission {
     historical: HistoricalAdmission,
 }
+/// Current ingress authenticated against an independently pinned owner
+/// certificate. Historical signature verification cannot construct this type.
+/// The timestamp is an ordinary explicit host-clock observation, not K2 time.
+pub struct AdmissionBoundEnvelope {
+    envelope: AuthenticatedEnvelope,
+    issuer: [u8; 32],
+    ingress_unix: u64,
+    admission: AdmissionRecord,
+}
+impl std::ops::Deref for AdmissionBoundEnvelope {
+    type Target = AuthenticatedEnvelope;
+    fn deref(&self) -> &Self::Target {
+        &self.envelope
+    }
+}
+impl AdmissionBoundEnvelope {
+    pub fn admission_issuer(&self) -> [u8; 32] {
+        self.issuer
+    }
+    pub fn ingress_unix(&self) -> u64 {
+        self.ingress_unix
+    }
+    pub fn admission_record(&self) -> &AdmissionRecord {
+        &self.admission
+    }
+}
 pub(crate) fn certify(
     admission: &CommittedAdmission,
     signer: &iroh::SecretKey,
@@ -216,17 +242,43 @@ impl CurrentAdmission {
         current_policy_sha256: [u8; 32],
         current_policy_epoch: u64,
         now_unix: u64,
-    ) -> Result<AuthenticatedEnvelope, AuthorizationError> {
+    ) -> Result<AdmissionBoundEnvelope, AuthorizationError> {
         if now_unix < self.record().usable_from_unix || now_unix >= self.record().expires_unix {
             return Err(AuthorizationError::Lifetime);
         }
-        envelope::authenticate(
+        let authenticated = envelope::authenticate(
             &envelope.manifest,
             &envelope.ciphertext,
             &self.expected_provenance(current_policy_sha256, current_policy_epoch)?,
             pins,
             &self.record().signing_key,
         )
-        .map_err(|_| AuthorizationError::Rejected)
+        .map_err(|_| AuthorizationError::Rejected)?;
+        Ok(AdmissionBoundEnvelope {
+            envelope: authenticated,
+            issuer: self.historical.statement.signer,
+            ingress_unix: now_unix,
+            admission: self.record().clone(),
+        })
+    }
+}
+#[cfg(test)]
+pub(crate) fn assert_canonical_certificate_tampering_is_refused(bytes: &[u8], pin: [u8; 32]) {
+    for case in 0..4 {
+        let mut certificate: Certificate = parse(bytes).unwrap();
+        match case {
+            0 => certificate.statement.signer[0] ^= 1,
+            1 => certificate.statement.admission_sha256[0] ^= 1,
+            2 => certificate.statement.record.run_id += 1,
+            3 => {
+                let mut signature = hex::decode(&certificate.signature_hex).unwrap();
+                signature[0] ^= 1;
+                certificate.signature_hex = hex::encode(signature);
+            }
+            _ => unreachable!(),
+        }
+        let wire = canonical(&certificate).unwrap();
+        let _: Certificate = parse(&wire).unwrap();
+        assert!(verify_historical_certificate(&wire, pin).is_err());
     }
 }

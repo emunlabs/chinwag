@@ -20,6 +20,8 @@ use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 use zeroize::Zeroizing;
 
 #[cfg(unix)]
+pub mod acu;
+#[cfg(unix)]
 pub mod admission;
 #[cfg(unix)]
 pub mod authorization;

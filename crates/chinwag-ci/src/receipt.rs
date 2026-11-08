@@ -104,6 +104,22 @@ fn signed_bytes(v: &Statement) -> Result<Vec<u8>, ReceiptError> {
     Ok(input)
 }
 impl ReceiptSigner {
+    pub(crate) fn sign_release_request(
+        &self,
+        statement: &crate::acu::RequestStatement,
+    ) -> Result<String, crate::acu::AcuError> {
+        if statement.role != self.role
+            || statement.signer != self.public()
+            || statement.store_id != self.store_id
+        {
+            return Err(crate::acu::AcuError::Rejected);
+        }
+        Ok(hex::encode(
+            self.secret
+                .sign(&crate::acu::request_payload(statement)?)
+                .to_bytes(),
+        ))
+    }
     pub(crate) fn from_owner_seed(
         role: Destination,
         store_id: [u8; 32],

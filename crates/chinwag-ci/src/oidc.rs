@@ -996,21 +996,7 @@ mod tests {
             assert_eq!(claims.delivery_profile_sha256, [0xcd; 32]);
             assert!(verified.expected_provenance([0; 32], 1).is_err());
             assert!(authorization::verify_historical_certificate(&certificate, [14; 32]).is_err());
-            for field in ["signer", "admission_sha256", "record"] {
-                let mut changed: serde_json::Value = serde_json::from_slice(&certificate).unwrap();
-                if field == "record" {
-                    changed["statement"][field]["run_id"] = json!(101);
-                } else {
-                    changed["statement"][field][0] = json!(42);
-                }
-                assert!(
-                    authorization::verify_historical_certificate(
-                        &serde_json::to_vec(&changed).unwrap(),
-                        signer
-                    )
-                    .is_err()
-                );
-            }
+            authorization::assert_canonical_certificate_tampering_is_refused(&certificate, signer);
             let mut padded = certificate.clone();
             padded.push(b' ');
             assert!(authorization::verify_historical_certificate(&padded, signer).is_err());
