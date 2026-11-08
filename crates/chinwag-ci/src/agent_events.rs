@@ -20,6 +20,12 @@ struct Event {
     r#type: String,
     thread_id: Option<String>,
     item: Option<Item>,
+    usage: Option<Usage>,
+}
+#[derive(Deserialize)]
+struct Usage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 }
 #[derive(Deserialize)]
 struct Item {
@@ -38,7 +44,7 @@ struct Change {
 #[error("coding-agent event stream is incomplete, mismatched or failed")]
 pub struct AgentEventError;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct AgentTurnObservation {
     pub classification: &'static str,
     pub session_id: String,
@@ -48,6 +54,8 @@ pub struct AgentTurnObservation {
     pub failed_commands: u64,
     pub reported_file_changes: u64,
     pub failed_file_changes: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 /// Incremental decoder. A record bound can refuse evidence, but its caller must
@@ -66,6 +74,7 @@ pub struct CodexEvents {
     failed_commands: u64,
     changes: u64,
     failed_changes: u64,
+    usage: Option<Usage>,
 }
 
 pub fn session_uuid(id: &str) -> bool {
@@ -100,6 +109,7 @@ impl CodexEvents {
             failed_commands: 0,
             changes: 0,
             failed_changes: 0,
+            usage: None,
         })
     }
 
@@ -148,7 +158,10 @@ impl CodexEvents {
         }
         match event {
             "turn.started" if !self.started => self.started = true,
-            "turn.completed" if self.started && self.active.is_empty() => self.completed = true,
+            "turn.completed" if self.started && self.active.is_empty() => {
+                self.completed = true;
+                self.usage = v.usage;
+            }
             "item.started" | "item.updated" | "item.completed" if self.started => {
                 self.item(event, &v.item.ok_or(AgentEventError)?)?;
             }
@@ -239,6 +252,8 @@ impl CodexEvents {
             failed_commands: self.failed_commands,
             reported_file_changes: self.changes,
             failed_file_changes: self.failed_changes,
+            input_tokens: self.usage.as_ref().and_then(|u| u.input_tokens),
+            output_tokens: self.usage.as_ref().and_then(|u| u.output_tokens),
         })
     }
 }

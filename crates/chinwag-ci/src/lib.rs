@@ -25,6 +25,8 @@ pub mod acu;
 pub mod admission;
 pub mod agent_events;
 #[cfg(unix)]
+pub mod agent_process;
+#[cfg(unix)]
 pub mod authorization;
 #[cfg(unix)]
 mod capture_read;
