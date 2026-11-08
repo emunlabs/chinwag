@@ -63,6 +63,8 @@ pub mod transport;
 mod macos_acl;
 #[cfg(unix)]
 pub mod storage;
+#[cfg(unix)]
+pub mod wake_store;
 
 pub const MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_COMMAND_EVIDENCE_BYTES: usize = 4 * 1024 * 1024;
