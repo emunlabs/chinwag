@@ -73,6 +73,17 @@ impl RunnerIdentity {
         self.public
     }
 
+    /// Cryptographic sealing only. Claims must independently match the durable
+    /// coordinator admission and resolved profiles before either store accepts.
+    pub fn seal_failure(
+        &self,
+        claims: crate::envelope::ClaimedProvenance,
+        pins: crate::envelope::KeyPins,
+        plaintext: &[u8],
+    ) -> Result<crate::envelope::SealedEnvelope, crate::envelope::EnvelopeError> {
+        crate::envelope::seal(&self.signer, claims, pins, plaintext)
+    }
+
     /// Signs only the typed admission PoP domain for THIS job's public keys.
     /// This is not a coordinator K2 or permission to execute/repair a task.
     pub fn sign_admission(

@@ -19,6 +19,7 @@ use std::{
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 use zeroize::Zeroizing;
 
+pub mod envelope;
 pub mod intent;
 pub mod oidc;
 pub mod runner_binding;
