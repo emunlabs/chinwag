@@ -2,7 +2,7 @@
 // 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! CI evidence capture. A captured process result is data, not workload identity,
 //! execution authority, delivery, a K2 attestation, or permission to remediate.
@@ -17,6 +17,12 @@ use zeroize::Zeroizing;
 
 pub mod intent;
 pub mod oidc;
+// Only the descriptor-bound Darwin ACL adapter needs FFI. Crypto paths deny it.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod macos_acl;
+#[cfg(unix)]
+pub mod storage;
 
 pub const MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
 

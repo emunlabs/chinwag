@@ -48,3 +48,22 @@ workflow identity; it does not prove possession of the runner key committed in
 the audience, consume a replay record, authenticate an arbitrary job/shard
 name, issue K2, or authorize remediation. These remain separate integration
 requirements. Nothing here installs an archive/ACU service or performs delivery.
+
+On Unix, `storage` can persist an already authenticated ciphertext claim into
+an explicitly owned private directory. It uses private create-new files, refuses
+symlink components/hardlinked objects, completes file and directory sync calls,
+and independently reopens and verifies exact bytes/hash/length. Existing-object
+observation is separate and does not claim comparison against a creation inode
+it never witnessed. Partial creation failures leave evidence for reconciliation.
+These are byte-storage observations: the caller must authenticate the encrypted
+envelope first and sign a receipt that binds the destination role and original
+event. They do not establish WORM storage, archive service acceptance, policy
+authorization, or initiating-agent processing.
+
+On macOS a small descriptor-bound adapter requests extended security attributes
+directly into a fixed buffer and accepts only the exact empty-attribute reply.
+Every ACL blob, truncated reply, inspection error and unexpected shape refuses
+storage. This follows examined XNU behavior and local filesystem tests and does
+not claim universal filesystem support. The adapter is the only
+module permitted to use unsafe FFI, with explicit descriptor/opaque-allocation
+ownership rationale; cryptography modules continue to deny unsafe code.
