@@ -10,7 +10,7 @@ The checked-in demonstration is
 [`chinwag-core-ci-and-merge.yml`](../../.github/workflows/chinwag-core-ci-and-merge.yml),
 job `Native encrypted CI failure loop`, and the public
 [`fixture.rs`](../../ci/chinwag-ci-loop-fixture/fixture.rs). Its manual event is
-limited to the designated review branch. The three legacy workflow jobs and
+limited to the two explicit demonstration review branches. The three legacy workflow jobs and
 event-only probe are excluded from that controlled payload run.
 
 ## Authenticated path
@@ -79,9 +79,53 @@ Runner exit `0` means complete successful command capture with both verified
 durable destinations. Exit `1` preserves a delivered original that is not
 eligible green, including a failed command. Exit `2` holds a refused or uncertain
 operation. Neither successful delivery nor exit `0` establishes that an agent
-started work. The demonstrated repair was performed by an already active,
-explicitly authorized initiating agent; generic agent invocation or automatic
-unrestricted remediation is not implemented here.
+started work. The earlier completed demonstration below used an already active,
+explicitly authorized initiating agent. The separate enrolled-idle route requires
+the additional observations described next; delivery alone never starts it.
+
+## Enrolled idle initiating agent
+
+The owner can opt one controlled job into an exact persistent Codex conversation:
+
+```text
+chinwag-ci agent-init AGENT_CONFIG
+chinwag-ci agent-read PIPE_DIRECTORY SCOPE_SHA256
+```
+
+`agent-init` creates a new session on the fixed owner-pinned Codex0.162.1 route,
+requests the exact admitted build, and records idle only after the initial turn
+and its original OS child both complete successfully. The canonical private
+[`AgentConfiguration`](src/idle_agent.rs) binds its parent, exact source/tree,
+fixture, execution identity, nonce, generation and finite expiry. Its private
+phase store and trusted reader executable must be outside the agent's writable
+checkout. Existing sessions and uncertain reservations are never reset.
+
+The recipient's optional `idle_agent` configuration enables one automatic wake.
+It requires both destinations' three-layer native storage signatures for the
+same encrypted original, a current ACU grant and complete authorized failure
+read, and the exact enrolled idle conversation. Green or incomplete captures do
+not wake it. The owner fsyncs a once-only reservation before launching the exact
+session resume; failure logs cannot select executable, flags, model, session,
+working directory or repair scope.
+
+The resumed turn receives a bounded sanitized diagnostic excerpt and a fixed
+scoped read command. The complete capture travels through owner-created private
+FIFOs inside ignored workspace scratch, under the original grant/deadline and
+fresh signed-policy checks. This local tool read adds no model network exception
+and does not carry messages between hosts. The client verifies the complete
+capture and stream hashes, writes it to its tool output, acknowledges the full
+read, and requires the parent's final durable acknowledgement and physical EOF.
+A helper's full read does not establish that every byte entered a model context.
+
+A repair counts only after that exact resumed turn reports the fixed read tool
+start/completion, the original coding-agent process exits cleanly, and the actual
+Git diff changes only the admitted arithmetic body while preserving the entire
+test and diagnostic output. The owner then checkpoints the model-produced diff
+and submits a new authenticated CI run. Only a separately verified green run and
+both destinations' new receipts/full reads close the loop. This is a finite,
+owner-trusted fixture workflow; it is not unrestricted remediation, fleet-global
+idle detection or an assertion of production continuity. The idle-wake end-to-end
+runtime proof remains separate from source tests and the earlier run links.
 
 ## Reproducible controlled proof
 

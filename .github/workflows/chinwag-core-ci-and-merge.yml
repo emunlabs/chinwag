@@ -8,6 +8,11 @@ on:
         required: true
         type: boolean
         default: true
+      initiating_instance:
+        description: "Exact enrolled initiating instance for the controlled idle-wake branch"
+        required: false
+        type: string
+        default: "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA"
       admission_origin:
         description: "Owned finite CI admission HTTPS origin"
         required: false
@@ -47,7 +52,7 @@ env:
 
 jobs:
   stage1-h2-cleanroom-rust-gate:
-    if: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' }}
+    if: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && github.ref != 'refs/heads/workhorse/review-ci-idle-wake-20261108' }}
     name: "Stage 1 — H2 Cleanroom Rust & WORKHORSE 288+ Test Ratchet Gate"
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
@@ -84,7 +89,7 @@ jobs:
           fi
 
   stage2-h-board-security-sentinel:
-    if: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' }}
+    if: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && github.ref != 'refs/heads/workhorse/review-ci-idle-wake-20261108' }}
     name: "Stage 2 — H_board & Security Sentinel (INV-ZERO-ANTHROPIC-01 / INV-BOARD-ZERO-LEAK-01)"
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 10
@@ -136,7 +141,7 @@ jobs:
     needs:
       - stage1-h2-cleanroom-rust-gate
       - stage2-h-board-security-sentinel
-    if: ${{ always() && github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && startsWith(github.ref, 'refs/heads/review/') }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && github.ref != 'refs/heads/workhorse/review-ci-idle-wake-20261108' && startsWith(github.ref, 'refs/heads/review/') }}
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 10
     steps:
@@ -191,7 +196,7 @@ jobs:
 
   ci-event-binding-probe:
     name: "CI event binding preflight"
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && inputs.probe_only }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/workhorse/review-ci-failure-artifact-20261107' || github.ref == 'refs/heads/workhorse/review-ci-idle-wake-20261108') && inputs.probe_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}
@@ -200,7 +205,7 @@ jobs:
         run: printf '%s\n' 'CHWG_CI_EVENT_BINDING_PREFLIGHT_ONLY'
 
   ci-native-failure-loop:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && !inputs.probe_only }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/workhorse/review-ci-failure-artifact-20261107' || github.ref == 'refs/heads/workhorse/review-ci-idle-wake-20261108') && !inputs.probe_only }}
     name: "Native encrypted CI failure loop"
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -221,20 +226,36 @@ jobs:
         env:
           CI_ADMISSION_ORIGIN: ${{ inputs.admission_origin }}
           CI_BOOTSTRAP_HINT: ${{ inputs.bootstrap_hint }}
+          CI_INITIATING_INSTANCE: ${{ inputs.initiating_instance }}
         shell: bash
         run: |
           set -euo pipefail
           umask 077
           test "$GITHUB_REPOSITORY_ID" = "1431177977"
           test "$GITHUB_ACTOR_ID" = "2736922"
+          case "$GITHUB_REF" in
+            refs/heads/workhorse/review-ci-failure-artifact-20261107)
+              test "$CI_INITIATING_INSTANCE" = 'WORKHORSE#AaFG0NdpegKhpXXEB_-qPA' || exit 2
+              ci_task_id='CHWG-CI-LOOP'
+              ;;
+            refs/heads/workhorse/review-ci-idle-wake-20261108)
+              [[ "$CI_INITIATING_INSTANCE" =~ ^WORKHORSE#[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || exit 2
+              test "$CI_INITIATING_INSTANCE" != 'WORKHORSE#00000000-0000-0000-0000-000000000000' || exit 2
+              ci_task_id='CHWG-CI-IDLE-WAKE'
+              ;;
+            *) exit 2 ;;
+          esac
           config_dir="$RUNNER_TEMP/chinwag-ci-bootstrap-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -m 700 "$config_dir"
           jq -cn \
             --arg origin "$CI_ADMISSION_ORIGIN" \
             --arg hint "$CI_BOOTSTRAP_HINT" \
+            --arg instance "$CI_INITIATING_INSTANCE" \
+            --arg task "$ci_task_id" \
+            --arg ref "$GITHUB_REF" \
             --argjson run "$GITHUB_RUN_ID" \
             --argjson attempt "$GITHUB_RUN_ATTEMPT" \
             --arg checkout "$GITHUB_WORKSPACE" \
-            '{version:1,admission_origin:$origin,bootstrap_hint:($hint|[scan("..")|ascii_downcase|explode|map(if .>=48 and .<=57 then .-48 elif .>=97 and .<=102 then .-87 else error("invalid public hint") end)|.[0]*16+.[1]]),expected_scope:{instance:"WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",public_key:[58,142,175,252,163,34,25,136,98,94,83,247,1,176,189,244,11,245,229,169,115,166,36,173,88,192,255,165,221,126,70,108],addressee:"WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",task_id:"CHWG-CI-LOOP",room:"#eng"},expected_oidc_subject:"repo:emunlabs@345238620/chinwag@1431177977:ref:refs/heads/workhorse/review-ci-failure-artifact-20261107",dispatch:{run_id:$run,run_attempt:$attempt,repository_owner_id:345238620,actor_id:2736922,workflow_id:409368914},checkout:$checkout}' \
+            '{version:1,admission_origin:$origin,bootstrap_hint:($hint|[scan("..")|ascii_downcase|explode|map(if .>=48 and .<=57 then .-48 elif .>=97 and .<=102 then .-87 else error("invalid public hint") end)|.[0]*16+.[1]]),expected_scope:{instance:$instance,public_key:[58,142,175,252,163,34,25,136,98,94,83,247,1,176,189,244,11,245,229,169,115,166,36,173,88,192,255,165,221,126,70,108],addressee:"WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",task_id:$task,room:"#eng"},expected_oidc_subject:("repo:emunlabs@345238620/chinwag@1431177977:ref:"+$ref),dispatch:{run_id:$run,run_attempt:$attempt,repository_owner_id:345238620,actor_id:2736922,workflow_id:409368914},checkout:$checkout}' \
             | tr -d '\n' > "$config_dir/runner-config.json"
           ./target/debug/chinwag-ci runner "$config_dir/runner-config.json"
