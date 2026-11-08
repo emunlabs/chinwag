@@ -8,6 +8,14 @@ on:
         required: true
         type: boolean
         default: true
+      admission_origin:
+        description: "Owned finite CI admission HTTPS origin"
+        required: false
+        type: string
+      bootstrap_hint:
+        description: "Public 32-byte CI bootstrap commitment, lowercase hex"
+        required: false
+        type: string
   push:
     branches:
       - main
@@ -190,3 +198,43 @@ jobs:
     steps:
       - name: Observe hosted event admission
         run: printf '%s\n' 'CHWG_CI_EVENT_BINDING_PREFLIGHT_ONLY'
+
+  ci-native-failure-loop:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && !inputs.probe_only }}
+    name: "Native encrypted CI failure loop"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout exact admitted source without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Build the Rust CI parent on the hosted Linux runner
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          cargo +1.97.1 build --locked --package chinwag-ci
+      - name: Capture the admitted fixture and deliver one encrypted original directly to both owners
+        env:
+          CI_ADMISSION_ORIGIN: ${{ inputs.admission_origin }}
+          CI_BOOTSTRAP_HINT: ${{ inputs.bootstrap_hint }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$GITHUB_REPOSITORY_ID" = "1431177977"
+          test "$GITHUB_ACTOR_ID" = "2736922"
+          config_dir="$RUNNER_TEMP/chinwag-ci-bootstrap-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$config_dir"
+          jq -cn \
+            --arg origin "$CI_ADMISSION_ORIGIN" \
+            --arg hint "$CI_BOOTSTRAP_HINT" \
+            --argjson run "$GITHUB_RUN_ID" \
+            --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg checkout "$GITHUB_WORKSPACE" \
+            '{version:1,admission_origin:$origin,bootstrap_hint:($hint|[scan("..")|ascii_downcase|explode|map(if .>=48 and .<=57 then .-48 elif .>=97 and .<=102 then .-87 else error("invalid public hint") end)|.[0]*16+.[1]]),expected_scope:{instance:"WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",public_key:[58,142,175,252,163,34,25,136,98,94,83,247,1,176,189,244,11,245,229,169,115,166,36,173,88,192,255,165,221,126,70,108],addressee:"WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",task_id:"CHWG-CI-LOOP",room:"#eng"},expected_oidc_subject:"repo:emunlabs@345238620/chinwag@1431177977:ref:refs/heads/workhorse/review-ci-failure-artifact-20261107",dispatch:{run_id:$run,run_attempt:$attempt,repository_owner_id:345238620,actor_id:2736922,workflow_id:409368914},checkout:$checkout}' \
+            | tr -d '\n' > "$config_dir/runner-config.json"
+          ./target/debug/chinwag-ci runner "$config_dir/runner-config.json"
