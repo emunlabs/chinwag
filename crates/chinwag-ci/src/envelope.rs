@@ -161,6 +161,54 @@ impl AuthenticatedEnvelope {
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext
     }
+    pub fn receipt_signing_pin(&self, role: Destination) -> &[u8; 32] {
+        match role {
+            Destination::Recipient => &self.manifest.header.pre.keys.recipient_receipt_signer,
+            Destination::Archive => &self.manifest.header.pre.keys.archive_receipt_signer,
+        }
+    }
+    pub fn complete_storage_blob(&self) -> Result<Vec<u8>, EnvelopeError> {
+        let manifest = self.original_manifest()?;
+        let mut bytes = b"CHWGCE01".to_vec();
+        bytes.extend_from_slice(&(manifest.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&(self.ciphertext.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&manifest);
+        bytes.extend_from_slice(&self.ciphertext);
+        Ok(bytes)
+    }
+}
+
+/// Parse only, never authenticate. Length bounds precede copying; metadata,
+/// wraps and signature share the same durable object commit as the ciphertext.
+pub fn parse_storage_blob(bytes: &[u8]) -> Result<SealedEnvelope, EnvelopeError> {
+    if bytes.len() < 20 || &bytes[..8] != b"CHWGCE01" {
+        return Err(EnvelopeError::Rejected);
+    }
+    let manifest = u32::from_be_bytes(
+        bytes[8..12]
+            .try_into()
+            .map_err(|_| EnvelopeError::Rejected)?,
+    ) as usize;
+    let ciphertext = u64::from_be_bytes(
+        bytes[12..20]
+            .try_into()
+            .map_err(|_| EnvelopeError::Rejected)?,
+    );
+    if manifest == 0
+        || manifest > MAX_MANIFEST_BYTES
+        || ciphertext < 17
+        || ciphertext > (MAX_PLAINTEXT_BYTES + 16) as u64
+    {
+        return Err(EnvelopeError::Rejected);
+    }
+    let end = 20 + manifest + ciphertext as usize;
+    if bytes.len() != end {
+        return Err(EnvelopeError::Rejected);
+    }
+    Ok(SealedEnvelope {
+        manifest: bytes[20..20 + manifest].to_vec(),
+        ciphertext: bytes[20 + manifest..].to_vec(),
+    })
 }
 
 fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, EnvelopeError> {

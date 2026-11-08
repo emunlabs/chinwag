@@ -22,6 +22,8 @@ use zeroize::Zeroizing;
 pub mod envelope;
 pub mod intent;
 pub mod oidc;
+#[cfg(unix)]
+pub mod receipt;
 pub mod runner_binding;
 pub mod runner_identity;
 pub mod transport;

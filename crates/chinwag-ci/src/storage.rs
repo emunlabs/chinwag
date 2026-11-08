@@ -8,7 +8,7 @@
 
 use rustix::{
     fd::OwnedFd,
-    fs::{self, FileType, Mode, OFlags, Stat},
+    fs::{self, AtFlags, FileType, Mode, OFlags, Stat},
     io::Errno,
 };
 use serde::Serialize;
@@ -66,6 +66,9 @@ impl StoredBytesObservation {
     }
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+    pub fn created_inode_confirmed(&self) -> bool {
+        self.reopened_same_inode_as_created
     }
 }
 
@@ -135,6 +138,19 @@ impl CiphertextStore {
         Ok(())
     }
 
+    fn check_name(&self, claim: CiphertextClaim, opened: &Stat) -> Result<(), StorageError> {
+        let named = fs::statat(&self.directory, claim.filename(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| StorageError::Readback)?;
+        if !private_file(&named)
+            || named.st_dev != opened.st_dev
+            || named.st_ino != opened.st_ino
+            || named.st_size != opened.st_size
+        {
+            return Err(StorageError::Readback);
+        }
+        Ok(())
+    }
+
     pub fn persist_ciphertext_claim(
         &self,
         claim: CiphertextClaim,
@@ -186,6 +202,7 @@ impl CiphertextStore {
             return Err(confirm());
         }
         self.check().map_err(|_| confirm())?;
+        self.check_name(claim, &observed).map_err(|_| confirm())?;
         Ok(Self::observation(claim, true))
     }
 
@@ -199,9 +216,25 @@ impl CiphertextStore {
             return Err(StorageError::Claim);
         }
         self.check()?;
-        self.reopen_and_read(claim)?;
+        let (observed, _) = self.reopen_and_read(claim)?;
         fs::fsync(&self.directory).map_err(|_| StorageError::Readback)?;
+        self.check()?;
+        self.check_name(claim, &observed)?;
         Ok(Self::observation(claim, false))
+    }
+
+    /// A bounded read of this exact immutable object. Caller reauthenticates
+    /// the complete envelope before decrypting or asserting a qualified read.
+    pub fn read_existing(&self, claim: CiphertextClaim) -> Result<Vec<u8>, StorageError> {
+        if !claim.valid() {
+            return Err(StorageError::Claim);
+        }
+        self.check()?;
+        let (observed, bytes) = self.reopen_and_read(claim)?;
+        fs::fsync(&self.directory).map_err(|_| StorageError::Readback)?;
+        self.check()?;
+        self.check_name(claim, &observed)?;
+        Ok(bytes)
     }
 
     fn reopen_and_read(&self, claim: CiphertextClaim) -> Result<(Stat, Vec<u8>), StorageError> {
@@ -243,6 +276,7 @@ impl CiphertextStore {
             crate::macos_acl::require_absent(file.as_fd()).map_err(|_| StorageError::Readback)?;
         }
         self.check()?;
+        self.check_name(claim, &after)?;
         Ok((after, bytes))
     }
 
@@ -255,5 +289,47 @@ impl CiphertextStore {
             readback_hash_and_size_verified: true,
             reopened_same_inode_as_created: compared_created_inode,
         }
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn read_inode_must_still_have_the_observed_object_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let store = CiphertextStore::open(&path).unwrap();
+        let bytes = b"public synthetic ciphertext fixture";
+        let claim = CiphertextClaim {
+            sha256: Sha256::digest(bytes).into(),
+            bytes: bytes.len() as u64,
+        };
+        store.persist_ciphertext_claim(claim, bytes).unwrap();
+        let (observed, _) = store.reopen_and_read(claim).unwrap();
+        let name = path.join(claim.filename());
+        std::fs::rename(&name, path.join("moved-owned-fixture")).unwrap();
+        assert!(matches!(
+            store.check_name(claim, &observed),
+            Err(StorageError::Readback)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut replacement = options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&name)
+            .unwrap();
+        replacement.write_all(bytes).unwrap();
+        replacement.sync_all().unwrap();
+        // Same private mode, length and bytes still do not make a new inode the
+        // object whose FD was read back.
+        assert!(matches!(
+            store.check_name(claim, &observed),
+            Err(StorageError::Readback)
+        ));
     }
 }
