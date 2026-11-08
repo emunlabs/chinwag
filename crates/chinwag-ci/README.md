@@ -75,6 +75,17 @@ and waits for the original worker's OS exit. Forced/deadline/unconfirmed closure
 cannot be reported as clean success. Each original operator controls its own
 processes. Public service health and a started PID are preparation observations.
 
+The hosted runner emits fixed `CI_RUNNER_PHASE` labels and monotonic elapsed
+milliseconds to stderr. A held operation identifies its failure phase and a fixed
+refusal category; HTTP diagnostics retain only timeout/connect/body/network,
+response refusal or a numeric status. They never format request errors, URLs,
+headers, tokens, claims, response bodies or captured output. A phase entry proves
+only that the runner reached that phase. Cleanup entries are reported separately
+without replacing the original failure phase. Operator readiness and server-side job
+registration do not prove that the runner finished bootstrap, prepared its image,
+reached its readiness loop or delivered a payload. Diagnostics add no retries or
+authority and do not change existing trust or timeouts.
+
 Runner exit `0` means complete successful command capture with both verified
 durable destinations. Exit `1` preserves a delivered original that is not
 eligible green, including a failed command. Exit `2` holds a refused or uncertain

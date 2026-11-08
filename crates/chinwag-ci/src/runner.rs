@@ -13,18 +13,102 @@ use crate::{
     oidc, preparation, receipt,
     runner_identity::RunnerIdentity,
     runtime::{
-        self, AdmitRequest, BootstrapRequest, ChallengeResponse, Dispatch, Job, Plan, RuntimeError,
-        Scope,
+        self, AdmitRequest, BootstrapRequest, ChallengeResponse, Dispatch, HttpFailure, Job, Plan,
+        RuntimeError, Scope,
     },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 type Result<T> = std::result::Result<T, RuntimeError>;
+
+#[derive(Clone, Copy, Debug)]
+enum Phase {
+    Configuration,
+    BootstrapOidc,
+    BootstrapExchange,
+    PlanProfiles,
+    FixturePreparation,
+    ImagePreparation,
+    OwnerReadiness,
+    FreshChallengeOidc,
+    ChallengeExchange,
+    AdmissionOidc,
+    GithubEvidence,
+    OidcVerification,
+    AdmissionSignature,
+    AdmissionExchange,
+    CertificateValidation,
+    CaptureExecution,
+    ArtifactSealing,
+    ArchiveBinding,
+    RecipientBinding,
+    ArchiveTransfer,
+    RecipientTransfer,
+    PairClosure,
+    DeliveryCompletion,
+    FinalObservation,
+}
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Configuration => "CONFIGURATION",
+            Self::BootstrapOidc => "BOOTSTRAP_OIDC",
+            Self::BootstrapExchange => "BOOTSTRAP_EXCHANGE",
+            Self::PlanProfiles => "PLAN_PROFILES",
+            Self::FixturePreparation => "FIXTURE_PREPARATION",
+            Self::ImagePreparation => "IMAGE_PREPARATION",
+            Self::OwnerReadiness => "OWNER_READINESS",
+            Self::FreshChallengeOidc => "FRESH_CHALLENGE_OIDC",
+            Self::ChallengeExchange => "CHALLENGE_EXCHANGE",
+            Self::AdmissionOidc => "ADMISSION_OIDC",
+            Self::GithubEvidence => "GITHUB_EVIDENCE",
+            Self::OidcVerification => "OIDC_VERIFICATION",
+            Self::AdmissionSignature => "ADMISSION_SIGNATURE",
+            Self::AdmissionExchange => "ADMISSION_EXCHANGE",
+            Self::CertificateValidation => "CERTIFICATE_VALIDATION",
+            Self::CaptureExecution => "CAPTURE_EXECUTION",
+            Self::ArtifactSealing => "ARTIFACT_SEALING",
+            Self::ArchiveBinding => "ARCHIVE_BINDING",
+            Self::RecipientBinding => "RECIPIENT_BINDING",
+            Self::ArchiveTransfer => "ARCHIVE_TRANSFER",
+            Self::RecipientTransfer => "RECIPIENT_TRANSFER",
+            Self::PairClosure => "PAIR_CLOSURE",
+            Self::DeliveryCompletion => "DELIVERY_COMPLETION",
+            Self::FinalObservation => "FINAL_OBSERVATION",
+        })
+    }
+}
+struct Trace {
+    phase: Phase,
+    started: Instant,
+}
+impl Trace {
+    fn enter(&mut self, phase: Phase) {
+        self.phase = phase;
+        eprintln!(
+            "CI_RUNNER_PHASE phase={} elapsed_ms={}",
+            phase,
+            self.started.elapsed().as_millis()
+        );
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("CI_RUNNER_HELD phase={phase} elapsed_ms={elapsed_ms}: {source}")]
+pub struct RunnerError {
+    phase: Phase,
+    elapsed_ms: u128,
+    source: RuntimeError,
+}
+impl RunnerError {
+    pub fn into_runtime(self) -> RuntimeError {
+        self.source
+    }
+}
 fn ck<T, E>(r: std::result::Result<T, E>) -> Result<T> {
     r.map_err(|_| RuntimeError::Refused)
 }
@@ -92,19 +176,26 @@ async fn own_oidc(client: &reqwest::Client, audience: &str) -> Result<Zeroizing<
     let raw = Zeroizing::new(ck(std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL"))?);
     let bearer = Zeroizing::new(ck(std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN"))?);
     let url = own_oidc_url(&raw, audience)?;
-    let mut response = ck(client
+    let mut response = client
         .get(url.clone())
         .bearer_auth(bearer.as_str())
         .send()
-        .await)?;
-    if response.url() != &url
-        || response.status() != reqwest::StatusCode::OK
-        || response.content_length().is_some_and(|n| n > 32 * 1024)
-    {
-        return Err(RuntimeError::Refused);
+        .await
+        .map_err(|e| RuntimeError::Http(HttpFailure::classify(&e)))?;
+    if response.url() != &url || response.content_length().is_some_and(|n| n > 32 * 1024) {
+        return Err(RuntimeError::Http(HttpFailure::Response));
+    }
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(RuntimeError::Http(HttpFailure::Status(
+            response.status().as_u16(),
+        )));
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    while let Some(b) = ck(response.chunk().await)? {
+    while let Some(b) = response
+        .chunk()
+        .await
+        .map_err(|e| RuntimeError::Http(HttpFailure::classify(&e)))?
+    {
         if b.len() > 32768usize.saturating_sub(bytes.len()) {
             return Err(RuntimeError::Refused);
         }
@@ -141,7 +232,21 @@ async fn post<T: Serialize>(
 }
 /// Return 1 for a fully delivered red workload, 0 only for a fully delivered
 /// eligible green workload. Any missing admission/receipt/closure stays held.
-pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
+pub async fn run(path: &Path) -> std::result::Result<(RunnerObservation, bool), RunnerError> {
+    let mut trace = Trace {
+        phase: Phase::Configuration,
+        started: Instant::now(),
+    };
+    trace.enter(Phase::Configuration);
+    run_phased(path, &mut trace)
+        .await
+        .map_err(|source| RunnerError {
+            phase: trace.phase,
+            elapsed_ms: trace.started.elapsed().as_millis(),
+            source,
+        })
+}
+async fn run_phased(path: &Path, trace: &mut Trace) -> Result<(RunnerObservation, bool)> {
     if !cfg!(target_os = "linux") {
         return Err(RuntimeError::Refused);
     }
@@ -163,12 +268,15 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
     };
     let client = ck(crate::github::normal_https_client())?;
     let bootstrap_audience = runtime::bootstrap_audience(config.bootstrap_hint, &job)?;
+    trace.enter(Phase::BootstrapOidc);
     let bootstrap_token = own_oidc(&client, &bootstrap_audience).await?;
     let boot = BootstrapRequest {
         job: job.clone(),
         token: bootstrap_token.to_string(),
     };
+    trace.enter(Phase::BootstrapExchange);
     let plan_bytes = post(&client, &config.admission_origin, "v1/bootstrap", &boot).await?;
+    trace.enter(Phase::PlanProfiles);
     let plan: Plan = ck(serde_json::from_slice(&plan_bytes))?;
     if plan.scope != config.expected_scope
         || plan.expected_oidc_subject != config.expected_oidc_subject
@@ -180,19 +288,30 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
     if profiles.delivery().spec().admission_origin != config.admission_origin {
         return Err(RuntimeError::Refused);
     }
+    trace.enter(Phase::FixturePreparation);
     let fixture = ck(preparation::prepare(&profiles, &config.checkout).await)?;
+    trace.enter(Phase::ImagePreparation);
     let image = ck(execution::prepare_image(profiles.command(), &fixture).await)?;
     // Status GET is read-only; no publication/challenge/admission retry. The
     // finite preparation window lets the original operators enroll exact keys.
+    trace.enter(Phase::OwnerReadiness);
     let end = tokio::time::Instant::now() + Duration::from_secs(600);
     loop {
         let url = format!("{}v1/ready", config.admission_origin);
-        let response = ck(client.get(&url).send().await)?;
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::Http(HttpFailure::classify(&e)))?;
         if response.status() == reqwest::StatusCode::OK {
             break;
         }
-        if response.status() != reqwest::StatusCode::TOO_EARLY || tokio::time::Instant::now() >= end
-        {
+        if response.status() != reqwest::StatusCode::TOO_EARLY {
+            return Err(RuntimeError::Http(HttpFailure::Status(
+                response.status().as_u16(),
+            )));
+        }
+        if tokio::time::Instant::now() >= end {
             return Err(RuntimeError::Refused);
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -201,26 +320,32 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
     // credential. Obtain a fresh token for this new challenge operation.
     drop(boot);
     drop(bootstrap_token);
+    trace.enter(Phase::FreshChallengeOidc);
     let fresh_bootstrap = own_oidc(&client, &bootstrap_audience).await?;
     let boot = BootstrapRequest {
         job: job.clone(),
         token: fresh_bootstrap.to_string(),
     };
+    trace.enter(Phase::ChallengeExchange);
     let challenge: ChallengeResponse = ck(serde_json::from_slice(
         &post(&client, &config.admission_origin, "v1/challenge", &boot).await?,
     ))?;
+    trace.enter(Phase::AdmissionOidc);
     let token = own_oidc(&client, &challenge.audience).await?;
     let intent = plan.intent()?;
     let evidence = ck(GithubEvidenceClient::new())?;
+    trace.enter(Phase::GithubEvidence);
     let (run, jwks) = tokio::join!(
         evidence.verify_dispatch_run(&intent, config.dispatch.trusted()),
         evidence.issuer_keys()
     );
-    let run = ck(run)?;
-    let jwks = ck(jwks)?;
+    let run = run.map_err(RuntimeError::Evidence)?;
+    let jwks = jwks.map_err(RuntimeError::Evidence)?;
     let mut expected = run.expected_oidc(&challenge.audience, runtime::now()?);
     expected.subject = &config.expected_oidc_subject;
+    trace.enter(Phase::OidcVerification);
     let workflow = ck(oidc::verify_token(&token, &jwks, expected))?;
+    trace.enter(Phase::AdmissionSignature);
     let signature = ck(identity.sign_admission(&intent, &workflow, challenge.nonce))?;
     let admit = AdmitRequest {
         job: job.clone(),
@@ -228,23 +353,27 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
         nonce: challenge.nonce,
         signature_hex: hex::encode(signature),
     };
+    trace.enter(Phase::AdmissionExchange);
     let certificate = post(&client, &config.admission_origin, "v1/admit", &admit).await?;
     drop(admit);
     drop(token);
     drop(boot);
     drop(fresh_bootstrap);
     let d = profiles.delivery().spec();
+    trace.enter(Phase::CertificateValidation);
     let admission = ck(ck(authorization::verify_historical_certificate(
         &certificate,
         d.admission_signer,
     ))?
     .require_current(runtime::now()?))?;
     ck(profiles.validate_admission(&admission, &job.registered(), runtime::now()?))?;
+    trace.enter(Phase::CaptureExecution);
     let captured =
         ck(execution::execute(&profiles, fixture, &image, &admission, &job.registered()).await)?;
     let green = captured.eligible_for_green();
     let complete = captured.output_is_complete();
     let plaintext = ck(captured.plaintext_for_sealing())?;
+    trace.enter(Phase::ArtifactSealing);
     let claims =
         ck(admission.expected_provenance(d.original_policy_sha256, d.original_policy_epoch))?;
     let sealed =
@@ -260,22 +389,27 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
     let blob = ck(bound.complete_admitted_blob())?;
     let archive_peer = ck(iroh::EndpointId::from_bytes(&d.archive.transport))?;
     let agent_peer = ck(iroh::EndpointId::from_bytes(&d.recipient.transport))?;
+    trace.enter(Phase::ArchiveBinding);
     let archive = ck(identity
         .bind_archive_pair(archive_peer, &d.relay_origin, &d.relay_origin)
         .await)?;
+    trace.enter(Phase::RecipientBinding);
     let agent = match identity
         .bind_agent_pair(agent_peer, &d.relay_origin, &d.relay_origin)
         .await
     {
         Ok(pair) => pair,
         Err(_) => {
+            trace.enter(Phase::PairClosure);
             archive.close().await;
+            trace.phase = Phase::RecipientBinding;
             return Err(RuntimeError::Refused);
         }
     };
     // Archive first, so its durable object is available to ACU when Root
     // requests its independent P grant after receiving the same original.
     let transfer = async {
+        trace.enter(Phase::ArchiveTransfer);
         let a = ck(archive
             .send(&certificate, &wire, Duration::from_secs(60))
             .await)?;
@@ -286,6 +420,7 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
             d.archive.store_id,
             &d.relay_origin,
         ))?;
+        trace.enter(Phase::RecipientTransfer);
         let r = ck(agent
             .send(&certificate, &wire, Duration::from_secs(60))
             .await)?;
@@ -299,9 +434,14 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
         Ok::<_, RuntimeError>((a, r))
     }
     .await;
+    let transfer_phase = trace.phase;
+    trace.enter(Phase::PairClosure);
     archive.close().await;
     agent.close().await;
-    let (a, r) = transfer?;
+    let (a, r) = transfer.inspect_err(|_| {
+        // Cleanup must not overwrite which operation actually failed.
+        trace.phase = transfer_phase;
+    })?;
     // Receipt-only completion: the complete encrypted failure has already gone
     // directly over native Iroh/Cloudflare to BOTH stores. This POST carries no
     // payload and confers no read, agent-start or repair authority.
@@ -320,6 +460,7 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
         archive_path: a.path_after.clone(),
     };
     // Exactly one POST; a lost reply stays held and never replays the original.
+    trace.enter(Phase::DeliveryCompletion);
     let _ = post(
         &client,
         &config.admission_origin,
@@ -327,6 +468,7 @@ pub async fn run(path: &Path) -> Result<(RunnerObservation, bool)> {
         &completion,
     )
     .await?;
+    trace.enter(Phase::FinalObservation);
     Ok((
         RunnerObservation {
             classification: "SAME_SIGNED_ADMITTED_ENCRYPTED_ORIGINAL_VERIFIED_DURABLE_AT_BOTH_SELECTED_CF_DESTINATIONS",

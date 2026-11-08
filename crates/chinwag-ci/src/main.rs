@@ -79,7 +79,10 @@ async fn main() {
                     }
                     std::process::exit(if green { 0 } else { 1 });
                 }
-                Err(_) => Err(()),
+                Err(error) => {
+                    eprintln!("{error}");
+                    runtime_result(Err(error.into_runtime())).await
+                }
             }
         }
         _ => {

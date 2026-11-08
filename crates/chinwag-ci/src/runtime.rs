@@ -48,6 +48,10 @@ pub enum RuntimeError {
         "CI runtime refused or ended with unconfirmed evidence; preserve its original operation"
     )]
     Refused,
+    #[error("{0}")]
+    Http(HttpFailure),
+    #[error("{0}")]
+    Evidence(crate::github::EvidenceError),
     #[error("CI original coding-agent custody requires reconciliation")]
     AgentHeld(crate::idle_agent::IdleAgentError),
 }
@@ -55,7 +59,37 @@ impl RuntimeError {
     pub fn into_held(self) -> Option<crate::agent_process::HeldAgent> {
         match self {
             Self::AgentHeld(e) => e.into_held(),
-            Self::Refused => None,
+            Self::Refused | Self::Http(_) | Self::Evidence(_) => None,
+        }
+    }
+}
+/// Fixed categories only. Never retain or format a reqwest error, URL, body,
+/// token, header or upstream message in an operational diagnostic.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum HttpFailure {
+    #[error("HTTP request timed out")]
+    Timeout,
+    #[error("HTTP connection failed")]
+    Connect,
+    #[error("HTTP body transfer failed")]
+    Body,
+    #[error("HTTP network request failed")]
+    Network,
+    #[error("HTTP endpoint returned status {0}")]
+    Status(u16),
+    #[error("HTTP response refused")]
+    Response,
+}
+impl HttpFailure {
+    pub(crate) fn classify(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else if error.is_body() || error.is_decode() {
+            Self::Body
+        } else {
+            Self::Network
         }
     }
 }
@@ -1177,17 +1211,26 @@ pub(crate) async fn request_bytes(
     if let Some(body) = body {
         req = req.header("Content-Type", "application/json").body(body)
     }
-    let mut response = checked(req.send().await)?;
-    if response.url() != &url
-        || response.status() != reqwest::StatusCode::OK
-        || response.content_length().is_some_and(|n| n > max as u64)
-    {
-        return Err(RuntimeError::Refused);
+    let mut response = req
+        .send()
+        .await
+        .map_err(|e| RuntimeError::Http(HttpFailure::classify(&e)))?;
+    if response.url() != &url || response.content_length().is_some_and(|n| n > max as u64) {
+        return Err(RuntimeError::Http(HttpFailure::Response));
+    }
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(RuntimeError::Http(HttpFailure::Status(
+            response.status().as_u16(),
+        )));
     }
     let mut bytes = Vec::new();
-    while let Some(b) = checked(response.chunk().await)? {
+    while let Some(b) = response
+        .chunk()
+        .await
+        .map_err(|e| RuntimeError::Http(HttpFailure::classify(&e)))?
+    {
         if b.len() > max.saturating_sub(bytes.len()) {
-            return Err(RuntimeError::Refused);
+            return Err(RuntimeError::Http(HttpFailure::Response));
         }
         bytes.extend_from_slice(&b)
     }
@@ -1198,6 +1241,97 @@ pub(crate) async fn request_bytes(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    fn http_fixture_client(bound: Duration) -> reqwest::Client {
+        // The local HTTP fixture still needs an explicit provider when the
+        // dependency enables rustls-no-provider. Never mutate the global one.
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .no_proxy()
+            .timeout(bound)
+            .build()
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn http_refusal_reports_only_numeric_status_not_response_or_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 34\r\nConnection: close\r\n\r\nTOKEN_NONCE_AND_UPSTREAM_SENTINEL_42").await.unwrap();
+        });
+        let error = request_bytes(
+            &http_fixture_client(Duration::from_secs(2)),
+            reqwest::Method::GET,
+            &format!("http://{addr}/TOKEN_NONCE_AND_UPSTREAM_SENTINEL_42"),
+            None,
+            4096,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(
+            error,
+            RuntimeError::Http(HttpFailure::Status(403))
+        ));
+        assert_eq!(error.to_string(), "HTTP endpoint returned status 403");
+        assert!(!format!("{error:?}").contains("SENTINEL"));
+    }
+    #[tokio::test]
+    async fn http_timeout_discards_reqwest_url_and_keeps_fixed_category() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let client = http_fixture_client(Duration::from_millis(25));
+        let error = request_bytes(
+            &client,
+            reqwest::Method::GET,
+            &format!("http://{addr}/PRIVATE_TOKEN_SENTINEL"),
+            None,
+            4096,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, RuntimeError::Http(HttpFailure::Timeout)));
+        assert_eq!(error.to_string(), "HTTP request timed out");
+        assert!(!format!("{error:?}").contains("SENTINEL"));
+    }
+    #[tokio::test]
+    async fn truncated_http_body_has_body_category_without_retaining_content() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nBODY_TOKEN_SENTINEL").await.unwrap();
+        });
+        let error = request_bytes(
+            &http_fixture_client(Duration::from_secs(2)),
+            reqwest::Method::GET,
+            &format!("http://{addr}/PRIVATE_TOKEN_SENTINEL"),
+            None,
+            4096,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, RuntimeError::Http(HttpFailure::Body)));
+        assert_eq!(error.to_string(), "HTTP body transfer failed");
+        assert!(!format!("{error:?}").contains("SENTINEL"));
+    }
     #[test]
     fn receiver_readiness_clears_on_all_scope_exits() {
         let flag = AtomicBool::new(true);
