@@ -30,6 +30,8 @@ pub mod github;
 pub mod intent;
 pub mod oidc;
 #[cfg(unix)]
+pub mod owner_cli;
+#[cfg(unix)]
 pub mod receipt;
 pub mod runner_binding;
 pub mod runner_identity;

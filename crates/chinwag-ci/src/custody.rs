@@ -81,6 +81,10 @@ pub struct PublicDestination {
     pub psk: [u8; 32],
     pub response_base: [u8; 32],
     pub receipt_signer: [u8; 32],
+    /// Explicit dual-purpose enrollment of the same owner signing identity.
+    /// Release requests and storage receipts use distinct signature domains
+    /// and typed operations. No arbitrary signing permission is implied.
+    pub release_request_signer: [u8; 32],
     pub transport: [u8; 32],
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,6 +478,7 @@ impl OwnerCustody {
                 psk: psk.public(),
                 response_base: response.public(),
                 receipt_signer: receipt.public(),
+                release_request_signer: receipt.public(),
                 transport: *transport_public,
             }),
             Keys::Acu { gate, signer } => PublicEnrollment::Acu {
