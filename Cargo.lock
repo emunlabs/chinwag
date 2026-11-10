@@ -777,6 +777,7 @@ version = "0.1.0"
 dependencies = [
  "chinwag-confirmed-initial-private",
  "chinwag-editor-config-private",
+ "chinwag-history-archive",
  "chinwag-mcp-private-anchored",
  "chinwag-signing",
  "chinwag-snapshot-read-owner-private",
@@ -821,6 +822,15 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "toml_edit 0.25.17+spec-1.1.0",
+]
+
+[[package]]
+name = "chinwag-history-archive"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
