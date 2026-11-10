@@ -777,6 +777,7 @@ version = "0.1.0"
 dependencies = [
  "chinwag-confirmed-initial-private",
  "chinwag-editor-config-private",
+ "chinwag-host-process",
  "chinwag-mcp-private-anchored",
  "chinwag-signing",
  "chinwag-snapshot-read-owner-private",

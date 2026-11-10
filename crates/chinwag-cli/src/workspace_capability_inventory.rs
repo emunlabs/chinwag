@@ -25,15 +25,18 @@ use crate::task_ref::{GitOid, Sha256Digest, TaskRefV1, validate_id};
 use crate::task_store::StoredObservation;
 use crate::task_write_journal::strict_json_object;
 use rustix::fs::{
-    AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, Stat, flock, fstat, openat, statat,
+    AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, Stat, fcntl_getfl, fcntl_setfl, flock,
+    fstat, openat, statat,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_INVENTORY_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_INVENTORY_RECORDS: usize = 2048;
@@ -206,6 +209,288 @@ impl std::error::Error for InventoryError {}
 
 pub type InventoryResult<T> = Result<T, InventoryError>;
 
+/// Checked wall clock in milliseconds since UNIX epoch.
+pub fn current_unix_ms() -> InventoryResult<u64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| InventoryError::Io(format!("system clock precedes UNIX epoch: {err}")))?;
+    u64::try_from(elapsed.as_millis())
+        .map_err(|err| InventoryError::Io(format!("UNIX millisecond clock overflow: {err}")))
+}
+
+/// Bind this process to its kernel start timestamp, in UNIX microseconds.
+pub fn observe_current_process_birth_binding() -> InventoryResult<(u32, u64)> {
+    let pid = std::process::id();
+    match chinwag_host_process::inspect_process_birth(pid) {
+        Ok(chinwag_host_process::ProcessBirthObservation::Alive(info)) => {
+            Ok((pid, info.start_time_unix_us))
+        }
+        Ok(chinwag_host_process::ProcessBirthObservation::NotFoundOrZombie) => Err(
+            InventoryError::Io("current process birth unavailable".to_owned()),
+        ),
+        Err(err) => Err(InventoryError::Io(format!(
+            "current process birth inspection failed: {err}"
+        ))),
+    }
+}
+
+pub fn check_pid_birth_binding_live(pid: u32, expected_birth_unix_us: u64) -> Result<bool, String> {
+    match chinwag_host_process::inspect_process_birth(pid) {
+        Ok(chinwag_host_process::ProcessBirthObservation::Alive(info)) => {
+            Ok(info.start_time_unix_us == expected_birth_unix_us)
+        }
+        Ok(chinwag_host_process::ProcessBirthObservation::NotFoundOrZombie) => Ok(false),
+        Err(err) => Err(format!(
+            "indeterminate process birth inspection for pid={pid}: {err}"
+        )),
+    }
+}
+
+fn jj_binary() -> &'static str {
+    if fs::metadata("/opt/homebrew/bin/jj")
+        .is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0)
+    {
+        "/opt/homebrew/bin/jj"
+    } else {
+        "jj"
+    }
+}
+
+fn read_jj_path_file(path: &Path) -> InventoryResult<PathBuf> {
+    let mut bytes = Vec::new();
+    let mut file = File::from(
+        openat(
+            CWD,
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|err| InventoryError::Io(err.to_string()))?,
+    );
+    if FileType::from_raw_mode(fstat(&file).map_err(|err| InventoryError::Io(err.to_string()))?.st_mode) != FileType::RegularFile {
+        return Err(InventoryError::SharedGitStoreMismatch("JJ backing path must be a regular file".to_owned()));
+    }
+    (&mut file)
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|err| InventoryError::Io(err.to_string()))?;
+    if bytes.len() > 4096 {
+        return Err(InventoryError::SharedGitStoreMismatch(
+            "JJ backing path exceeds 4096 bytes".to_owned(),
+        ));
+    }
+    let raw = std::str::from_utf8(&bytes)
+        .map_err(|err| InventoryError::SharedGitStoreMismatch(err.to_string()))?
+        .trim();
+    if raw.is_empty() {
+        return Err(InventoryError::SharedGitStoreMismatch(
+            "empty JJ backing path".to_owned(),
+        ));
+    }
+    let joined = path
+        .parent()
+        .ok_or_else(|| InventoryError::InvalidPath("JJ path has no parent".to_owned()))?
+        .join(raw);
+    let mut resolved = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    Ok(resolved)
+}
+
+fn read_bounded_jj_pipe(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> InventoryResult<bool> {
+    let mut buffer = [0u8; 4096];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                if bytes.len() + count > 65_536 {
+                    return Err(InventoryError::WorkspaceIdentityDrift(
+                        "live JJ output exceeded 65536 bytes".to_owned(),
+                    ));
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(InventoryError::Io(err.to_string())),
+        }
+    }
+}
+
+fn live_jj_workspace_listing(workspace_path: &Path) -> InventoryResult<Vec<u8>> {
+    let mut child = Command::new(jj_binary())
+        .args(["--no-pager", "--ignore-working-copy", "--color=never", "-R"])
+        .arg(workspace_path)
+        .args(["workspace", "list", "-T", "name ++ \"\\t\" ++ target.current_working_copy() ++ \"\\t\" ++ target.change_id() ++ \"\\t\" ++ target.commit_id() ++ \"\\n\""])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+        .map_err(|err| InventoryError::Io(format!("live JJ spawn failed: {err}")))?;
+    let result = (|| {
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| InventoryError::Io("missing JJ stdout".to_owned()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| InventoryError::Io("missing JJ stderr".to_owned()))?;
+        for fd in [
+            &stdout as &dyn std::os::fd::AsFd,
+            &stderr as &dyn std::os::fd::AsFd,
+        ] {
+            let flags = fcntl_getfl(fd).map_err(|err| InventoryError::Io(err.to_string()))?;
+            fcntl_setfl(fd, flags | OFlags::NONBLOCK)
+                .map_err(|err| InventoryError::Io(err.to_string()))?;
+        }
+        let deadline = Instant::now() + Duration::from_millis(5_000);
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        loop {
+            let stdout_done = read_bounded_jj_pipe(&mut stdout, &mut out)?;
+            let stderr_done = read_bounded_jj_pipe(&mut stderr, &mut err_out)?;
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|err| InventoryError::Io(err.to_string()))?
+                && stdout_done
+                && stderr_done
+            {
+                return if status.success() {
+                    Ok(out)
+                } else {
+                    Err(InventoryError::WorkspaceIdentityDrift(format!(
+                        "live JJ query failed: {}",
+                        String::from_utf8_lossy(&err_out)
+                    )))
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(InventoryError::WorkspaceIdentityDrift(
+                    "live JJ query timed out".to_owned(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+/// Read pinned JJ workspace metadata without snapshotting source edits. Verify
+/// physical identities on both sides of the bounded, read-only child query.
+#[allow(clippy::too_many_arguments)]
+pub fn observe_live_jj_workspace(
+    workspace_path: &Path,
+    expected_workspace_identity: FsEntryIdentityV1,
+    expected_shared_git_store_identity: FsEntryIdentityV1,
+    operational_checkout_identity: FsEntryIdentityV1,
+    expected_workspace_name: &str,
+    expected_jj_change_id: &str,
+    expected_jj_commit_id: GitOid,
+) -> InventoryResult<()> {
+    let identity = verify_private_directory_identity(workspace_path, true)?;
+    if identity != expected_workspace_identity
+        || identity.same_inode(&operational_checkout_identity)
+        || identity.same_inode(&expected_shared_git_store_identity)
+    {
+        return Err(InventoryError::WorkspaceIdentityDrift(
+            "live workspace physical identity mismatch".to_owned(),
+        ));
+    }
+    let jj_dir = workspace_path.join(".jj");
+    let meta = fs::symlink_metadata(&jj_dir).map_err(|err| InventoryError::Io(err.to_string()))?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(InventoryError::SymlinkOrNonDirectory(
+            "workspace .jj must be a direct real directory".to_owned(),
+        ));
+    }
+    let repo_entry = jj_dir.join("repo");
+    let meta =
+        fs::symlink_metadata(&repo_entry).map_err(|err| InventoryError::Io(err.to_string()))?;
+    let repo_dir = if meta.file_type().is_symlink() {
+        return Err(InventoryError::SymlinkOrNonDirectory(
+            "workspace .jj/repo is a symlink".to_owned(),
+        ));
+    } else if meta.is_file() {
+        read_jj_path_file(&repo_entry)?
+    } else if meta.is_dir() {
+        repo_entry
+    } else {
+        return Err(InventoryError::SymlinkOrNonDirectory(
+            "invalid .jj/repo entry".to_owned(),
+        ));
+    };
+    verify_private_directory_identity(&repo_dir, false)?;
+    verify_private_directory_identity(&repo_dir.join("store"), false)?;
+    let store_root = repo_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| InventoryError::SharedGitStoreMismatch("JJ store has no root".to_owned()))?;
+    let root_id = verify_private_directory_identity(store_root, false)?;
+    if root_id.same_inode(&operational_checkout_identity) {
+        return Err(InventoryError::WorkspaceIdentityDrift(
+            "JJ store aliases operational checkout".to_owned(),
+        ));
+    }
+    let mut store_matches = root_id.same_inode(&expected_shared_git_store_identity);
+    let git_target = repo_dir.join("store/git_target");
+    match fs::symlink_metadata(&git_target) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+            let target_id =
+                verify_private_directory_identity(&read_jj_path_file(&git_target)?, false)?;
+            if target_id.same_inode(&operational_checkout_identity) {
+                return Err(InventoryError::WorkspaceIdentityDrift(
+                    "JJ Git target aliases operational checkout".to_owned(),
+                ));
+            }
+            store_matches |= target_id.same_inode(&expected_shared_git_store_identity);
+        }
+        Ok(_) => {
+            return Err(InventoryError::SharedGitStoreMismatch(
+                "JJ Git target must be a real path file".to_owned(),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(InventoryError::Io(err.to_string())),
+    }
+    if !store_matches {
+        return Err(InventoryError::SharedGitStoreMismatch(
+            "JJ backing store identity mismatch".to_owned(),
+        ));
+    }
+    let stdout = live_jj_workspace_listing(workspace_path)?;
+    let stdout = std::str::from_utf8(&stdout)
+        .map_err(|err| InventoryError::WorkspaceIdentityDrift(err.to_string()))?;
+    let mut matches = stdout.lines().filter_map(|line| {
+        let fields: Vec<_> = line.split('\t').collect();
+        (fields.len() == 4 && fields[0] == expected_workspace_name).then_some(fields)
+    });
+    let valid = matches.next().is_some_and(|fields| {
+        fields[1] == "true"
+            && fields[2] == expected_jj_change_id
+            && GitOid::from_hex(fields[3]) == Ok(expected_jj_commit_id)
+    }) && matches.next().is_none();
+    if !valid {
+        return Err(InventoryError::WorkspaceIdentityDrift(
+            "live JJ workspace name, current target, change_id or commit_id mismatch".to_owned(),
+        ));
+    }
+    if verify_private_directory_identity(workspace_path, true)? != expected_workspace_identity {
+        return Err(InventoryError::WorkspaceIdentityDrift(
+            "workspace changed during live JJ query".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FsEntryIdentityV1 {
@@ -355,6 +640,16 @@ pub struct WorkspaceOwnershipRecordV1 {
 
 impl WorkspaceOwnershipRecordV1 {
     fn same_ownership_incarnation(&self, other: &Self) -> bool {
+        self.pid_birth_binding == other.pid_birth_binding && self.same_ownership_fields(other)
+    }
+
+    fn same_ownership_incarnation_ignoring_hold(&self, other: &Self) -> bool {
+        (self.status != WorkspaceOwnershipStatusV1::Active
+            || self.pid_birth_binding == other.pid_birth_binding)
+            && self.same_ownership_fields(other)
+    }
+
+    fn same_ownership_fields(&self, other: &Self) -> bool {
         self.record_id == other.record_id
             && self.repo_id == other.repo_id
             && self.operational_checkout_path == other.operational_checkout_path
@@ -724,6 +1019,7 @@ pub fn require_stored_observation_not_authority(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[expect(clippy::large_enum_variant, reason = "The admitted checkpoint event carries TaskRefV1 inline; journal records have a strict byte ceiling")]
 pub enum InventoryPayloadV1 {
     RegisterWorkspace {
         record: Box<WorkspaceOwnershipRecordV1>,
@@ -732,6 +1028,18 @@ pub enum InventoryPayloadV1 {
         record_id: String,
         actor: String,
         released_unix_ms: u64,
+    },
+    AdvanceWorkspaceCheckpoint {
+        record_id: String,
+        actor: String,
+        #[serde(with = "task_ref_serde")]
+        task_ref: TaskRefV1,
+        expected_jj_working_copy_change_id: String,
+        #[serde(with = "git_oid_serde")]
+        expected_old_jj_working_copy_commit_id: GitOid,
+        #[serde(with = "git_oid_serde")]
+        new_jj_working_copy_commit_id: GitOid,
+        updated_unix_ms: u64,
     },
     UpsertCapability {
         record: Box<CapabilityProvenanceRecordV1>,
@@ -750,6 +1058,7 @@ pub enum InventoryPayloadV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "record_kind", rename_all = "snake_case", deny_unknown_fields)]
+#[expect(clippy::large_enum_variant, reason = "Intent carries the admitted inline checkpoint payload; all journal records are bounded before append")]
 enum JournalEntryV1 {
     Intent {
         operation_id: String,
@@ -954,6 +1263,10 @@ pub struct ContinuousInventoryRegistryV1 {
     shared_git_store_identity: FsEntryIdentityV1,
     operational_checkout_identity: FsEntryIdentityV1,
     workspaces: BTreeMap<String, WorkspaceOwnershipRecordV1>,
+    next_workspace_registration_seq: u64,
+    workspace_registration_seq: BTreeMap<String, u64>,
+    local_workspace_holds:
+        BTreeMap<String, (WorkspaceOwnershipRecordV1, u64, WorkspaceOwnershipRecordV1)>,
     capabilities: BTreeMap<String, CapabilityProvenanceRecordV1>,
     local_capability_holds:
         BTreeMap<String, (CapabilityProvenanceRecordV1, CapabilityProvenanceRecordV1)>,
@@ -982,6 +1295,9 @@ impl ContinuousInventoryRegistryV1 {
             shared_git_store_identity,
             operational_checkout_identity,
             workspaces: BTreeMap::new(),
+            next_workspace_registration_seq: 0,
+            workspace_registration_seq: BTreeMap::new(),
+            local_workspace_holds: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             local_capability_holds: BTreeMap::new(),
             committed_ops: BTreeMap::new(),
@@ -1060,7 +1376,19 @@ impl ContinuousInventoryRegistryV1 {
     ) -> InventoryResult<InventorySubmissionOutcomeV1> {
         validate_id(operation_id, "operation_id")
             .map_err(|e| InventoryError::InvalidIdentifier(e.to_string()))?;
-        let digest = Self::payload_digest(&payload)?;
+        let digest = match Self::payload_digest(&payload) {
+            Ok(digest) => digest,
+            Err(err) => {
+                let mut candidate = self.clone();
+                let _ = candidate.apply_payload(payload.clone(), false);
+                self.install_local_negative_capability_overlay(
+                    &candidate,
+                    &payload,
+                    "non-tail persistence refusal: payload serialization failed",
+                );
+                return Err(err);
+            }
+        };
         let mut journal = LockedInventoryJournal::open(journal_path, true)?
             .ok_or_else(|| InventoryError::Io("created journal is missing".to_owned()))?;
         self.verify_or_bind_journal_identity(&journal)?;
@@ -1141,54 +1469,65 @@ impl ContinuousInventoryRegistryV1 {
             self.operational_checkout_identity,
             journal,
         )?;
-        // Local reconciliation holds remain conservative across shared-journal refreshes.
+        // A local negative observation belongs to the inspected registration,
+        // including its journal generation. Release and ABA replacement win.
+        for (id, (inspected, seq, held)) in &self.local_workspace_holds {
+            if let Some(replayed) = staging.workspaces.get_mut(id)
+                && replayed.status.blocks_exclusive_claim()
+                && replayed.same_ownership_incarnation_ignoring_hold(inspected)
+                && staging.workspace_registration_seq.get(id).copied() == Some(*seq)
+            {
+                replayed.status = WorkspaceOwnershipStatusV1::HeldStaleOrUnknown;
+                replayed.hold_reason.clone_from(&held.hold_reason);
+                replayed.pid_birth_binding = None;
+                staging
+                    .local_workspace_holds
+                    .insert(id.clone(), (inspected.clone(), *seq, replayed.clone()));
+            }
+        }
         for (id, record) in &self.workspaces {
-            if record.status == WorkspaceOwnershipStatusV1::HeldStaleOrUnknown {
-                if self.corrupt_or_ambiguous_tail_reason.is_some() {
-                    staging.workspaces.insert(id.clone(), record.clone());
-                    continue;
-                }
-                if let Some(existing) = staging.workspaces.get_mut(id) {
-                    if existing.status.blocks_exclusive_claim()
-                        && existing.same_ownership_incarnation(record)
-                    {
-                        existing.status = WorkspaceOwnershipStatusV1::HeldStaleOrUnknown;
-                        existing.hold_reason.clone_from(&record.hold_reason);
-                        existing.pid_birth_binding = None;
-                    }
-                } else if id.contains("#incomplete:") {
-                    staging.workspaces.insert(id.clone(), record.clone());
-                }
+            if (id.contains("#incomplete:")
+                || record
+                    .hold_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("incomplete_journal_intent:")))
+                && !staging.workspaces.contains_key(id)
+            {
+                staging.workspaces.insert(id.clone(), record.clone());
             }
         }
         staging
             .incomplete_ops_held
             .extend(self.incomplete_ops_held.clone());
         staging.rejected_ops.extend(self.rejected_ops.clone());
-        if self.corrupt_or_ambiguous_tail_reason.is_some() {
-            for (id, record) in &self.capabilities {
-                if record.effective_classification == CapabilityClassificationV1::Held {
-                    staging.capabilities.insert(id.clone(), record.clone());
-                }
+        for (cap_id, (inspected_incarnation, held_overlay)) in &self.local_capability_holds {
+            if staging
+                .capabilities
+                .get(cap_id)
+                .is_some_and(|replayed| replayed.same_capability_incarnation(inspected_incarnation))
+                || (!staging.capabilities.contains_key(cap_id)
+                    && (cap_id.contains("#incomplete:")
+                        || held_overlay
+                            .hold_or_downgrade_reason
+                            .as_deref()
+                            .is_some_and(|reason| {
+                                reason.starts_with("incomplete_journal_intent:")
+                            })))
+            {
+                staging
+                    .capabilities
+                    .insert(cap_id.clone(), held_overlay.clone());
+                staging.local_capability_holds.insert(
+                    cap_id.clone(),
+                    (inspected_incarnation.clone(), held_overlay.clone()),
+                );
             }
-            if staging.corrupt_or_ambiguous_tail_reason.is_none() {
-                staging.corrupt_or_ambiguous_tail_reason =
-                    self.corrupt_or_ambiguous_tail_reason.clone();
-            }
-        } else {
-            for (cap_id, (inspected_incarnation, held_overlay)) in &self.local_capability_holds {
-                if let Some(replayed) = staging.capabilities.get(cap_id)
-                    && replayed.same_capability_incarnation(inspected_incarnation)
-                {
-                    staging
-                        .capabilities
-                        .insert(cap_id.clone(), held_overlay.clone());
-                    staging.local_capability_holds.insert(
-                        cap_id.clone(),
-                        (inspected_incarnation.clone(), held_overlay.clone()),
-                    );
-                }
-            }
+        }
+        if self.corrupt_or_ambiguous_tail_reason.is_some()
+            && staging.corrupt_or_ambiguous_tail_reason.is_none()
+        {
+            staging.corrupt_or_ambiguous_tail_reason =
+                self.corrupt_or_ambiguous_tail_reason.clone();
         }
         staging.bound_journal_identity = self.bound_journal_identity.clone();
         staging.journal_path = Some(journal_path.to_owned());
@@ -1208,23 +1547,37 @@ impl ContinuousInventoryRegistryV1 {
         now_unix_ms: u64,
         payload: InventoryPayloadV1,
     ) -> InventoryResult<InventorySubmissionOutcomeV1> {
-        let digest = Self::payload_digest(&payload)?;
         let mut candidate = self.clone();
         let apply_outcome = candidate.apply_payload(payload.clone(), false);
         let hold_reason = apply_outcome.as_ref().err().map(ToString::to_string);
-        let intent_line = Self::journal_line(&JournalEntryV1::Intent {
-            operation_id: operation_id.to_owned(),
-            intent_digest: digest.clone(),
-            recorded_unix_ms: now_unix_ms,
-            payload: payload.clone(),
-        })?;
-        let result_line = Self::journal_line(&JournalEntryV1::Result {
-            operation_id: operation_id.to_owned(),
-            intent_digest: digest.clone(),
-            completed_unix_ms: now_unix_ms,
-            committed: apply_outcome.is_ok(),
-            hold_reason: hold_reason.clone(),
-        })?;
+        let serialized = (|| {
+            let digest = Self::payload_digest(&payload)?;
+            let intent_line = Self::journal_line(&JournalEntryV1::Intent {
+                operation_id: operation_id.to_owned(),
+                intent_digest: digest.clone(),
+                recorded_unix_ms: now_unix_ms,
+                payload: payload.clone(),
+            })?;
+            let result_line = Self::journal_line(&JournalEntryV1::Result {
+                operation_id: operation_id.to_owned(),
+                intent_digest: digest.clone(),
+                completed_unix_ms: now_unix_ms,
+                committed: apply_outcome.is_ok(),
+                hold_reason: hold_reason.clone(),
+            })?;
+            Ok((digest, intent_line, result_line))
+        })();
+        let (digest, intent_line, result_line) = match serialized {
+            Ok(lines) => lines,
+            Err(err) => {
+                self.install_local_negative_capability_overlay(
+                    &candidate,
+                    &payload,
+                    "non-tail persistence refusal: journal serialization failed",
+                );
+                return Err(err);
+            }
+        };
         if existing_record_count
             .checked_add(2)
             .is_none_or(|count| count > MAX_INVENTORY_RECORDS)
@@ -1233,36 +1586,7 @@ impl ContinuousInventoryRegistryV1 {
                 .checked_add((intent_line.len() + result_line.len()) as u64)
                 .is_none_or(|size| size > MAX_INVENTORY_JOURNAL_BYTES)
         {
-            let held_capability_id = match &payload {
-                InventoryPayloadV1::UpsertCapability { record } if apply_outcome.is_err() => {
-                    Some(&record.capability_id)
-                }
-                InventoryPayloadV1::HoldCapability { capability_id, .. } => Some(capability_id),
-                _ => None,
-            };
-            if let Some(cap_id) = held_capability_id
-                && let (Some(inspected), Some(mut held)) = (
-                    self.capabilities.get(cap_id).cloned(),
-                    candidate.capabilities.get(cap_id).cloned(),
-                )
-                && held.effective_classification == CapabilityClassificationV1::Held
-            {
-                // Repeated refusals still refer to the original journal incarnation.
-                let inspected = self
-                    .local_capability_holds
-                    .get(cap_id)
-                    .map_or(inspected, |(incarnation, _)| incarnation.clone());
-                held.installed_binary_sha256 = None;
-                held.hold_or_downgrade_reason = Some(format!(
-                    "{}; non-tail persistence refusal: inventory journal cannot reserve both Intent and Result",
-                    held.hold_or_downgrade_reason
-                        .as_deref()
-                        .unwrap_or("capability held")
-                ));
-                self.capabilities.insert(cap_id.clone(), held.clone());
-                self.local_capability_holds
-                    .insert(cap_id.clone(), (inspected, held));
-            }
+            self.install_local_negative_capability_overlay(&candidate, &payload, "non-tail persistence refusal: inventory journal cannot reserve both Intent and Result");
             return Err(InventoryError::JournalCorruptOrBounded(
                 "inventory journal cannot reserve both Intent and Result".to_owned(),
             ));
@@ -1298,6 +1622,9 @@ impl ContinuousInventoryRegistryV1 {
             InventoryPayloadV1::HoldCapability { capability_id, .. } => {
                 candidate.local_capability_holds.remove(capability_id);
             }
+            InventoryPayloadV1::HoldWorkspace { record_id, .. } => {
+                candidate.local_workspace_holds.remove(record_id);
+            }
             _ => {}
         }
         match apply_outcome {
@@ -1315,6 +1642,39 @@ impl ContinuousInventoryRegistryV1 {
                 *self = candidate;
                 Err(err)
             }
+        }
+    }
+
+    fn install_local_negative_capability_overlay(
+        &mut self,
+        candidate: &Self,
+        payload: &InventoryPayloadV1,
+        reason_suffix: &str,
+    ) {
+        let cap_id = match payload {
+            InventoryPayloadV1::UpsertCapability { record } => &record.capability_id,
+            InventoryPayloadV1::HoldCapability { capability_id, .. } => capability_id,
+            _ => return,
+        };
+        if let (Some(inspected), Some(mut held)) = (
+            self.capabilities.get(cap_id).cloned(),
+            candidate.capabilities.get(cap_id).cloned(),
+        ) && held.effective_classification == CapabilityClassificationV1::Held
+        {
+            let inspected = self
+                .local_capability_holds
+                .get(cap_id)
+                .map_or(inspected, |(incarnation, _)| incarnation.clone());
+            held.installed_binary_sha256 = None;
+            held.hold_or_downgrade_reason = Some(format!(
+                "{}; {reason_suffix}",
+                held.hold_or_downgrade_reason
+                    .as_deref()
+                    .unwrap_or("capability held")
+            ));
+            self.capabilities.insert(cap_id.clone(), held.clone());
+            self.local_capability_holds
+                .insert(cap_id.clone(), (inspected, held));
         }
     }
 
@@ -1365,9 +1725,52 @@ impl ContinuousInventoryRegistryV1 {
         Ok(())
     }
 
+    fn matches_active_workspace_incarnation(
+        &self,
+        record_id: &str,
+        inspected_record: &WorkspaceOwnershipRecordV1,
+        inspected_seq: Option<u64>,
+    ) -> bool {
+        self.workspaces.get(record_id).is_some_and(|current| {
+            current.status == WorkspaceOwnershipStatusV1::Active
+                && current.same_ownership_incarnation(inspected_record)
+                && inspected_seq.is_none_or(|seq| {
+                    self.workspace_registration_seq.get(record_id).copied() == Some(seq)
+                })
+        })
+    }
+
+    fn apply_local_workspace_hold(
+        &mut self,
+        inspected: &WorkspaceOwnershipRecordV1,
+        inspected_seq: Option<u64>,
+        payload: InventoryPayloadV1,
+    ) -> InventoryResult<bool> {
+        if !self.matches_active_workspace_incarnation(
+            &inspected.record_id,
+            inspected,
+            inspected_seq,
+        ) {
+            return Ok(false);
+        }
+        self.apply_payload(payload, false)?;
+        if let Some(seq) = inspected_seq {
+            self.local_workspace_holds.insert(
+                inspected.record_id.clone(),
+                (
+                    inspected.clone(),
+                    seq,
+                    self.workspaces[&inspected.record_id].clone(),
+                ),
+            );
+        }
+        Ok(true)
+    }
+
     fn hold_workspace(
         &mut self,
         inspected_record: &WorkspaceOwnershipRecordV1,
+        inspected_seq: Option<u64>,
         reason: String,
         now_unix_ms: u64,
     ) -> InventoryResult<bool> {
@@ -1377,18 +1780,7 @@ impl ContinuousInventoryRegistryV1 {
             updated_unix_ms: now_unix_ms,
         };
         let Some(path) = self.journal_path.clone() else {
-            if !self
-                .workspaces
-                .get(&inspected_record.record_id)
-                .is_some_and(|current| {
-                    current.status == WorkspaceOwnershipStatusV1::Active
-                        && current.same_ownership_incarnation(inspected_record)
-                })
-            {
-                return Ok(false);
-            }
-            self.apply_payload(payload, false)?;
-            return Ok(true);
+            return self.apply_local_workspace_hold(inspected_record, inspected_seq, payload);
         };
         let opened = LockedInventoryJournal::open(&path, true).and_then(|journal| {
             journal.ok_or_else(|| InventoryError::Io("created journal is missing".to_owned()))
@@ -1396,46 +1788,47 @@ impl ContinuousInventoryRegistryV1 {
         let mut journal = match opened {
             Ok(journal) => journal,
             Err(err) => {
-                if self
-                    .workspaces
-                    .get(&inspected_record.record_id)
-                    .is_some_and(|current| current.same_ownership_incarnation(inspected_record))
-                {
-                    self.apply_payload(payload, false)?;
-                }
+                self.apply_local_workspace_hold(inspected_record, inspected_seq, payload)?;
                 return Err(err);
             }
         };
-        // A foreign journal must be rejected before even a local hold changes
-        // the state belonging to this handle's authoritative journal.
+        // A foreign journal cannot alter the read model belonging to this handle.
         self.verify_or_bind_journal_identity(&journal)?;
         let count = match self.refresh_from_journal_locked(&path, &mut journal) {
             Ok(count) => count,
             Err(err) => {
-                if self
-                    .workspaces
-                    .get(&inspected_record.record_id)
-                    .is_some_and(|current| current.same_ownership_incarnation(inspected_record))
-                {
-                    self.apply_payload(payload, false)?;
-                }
+                self.apply_local_workspace_hold(inspected_record, inspected_seq, payload)?;
                 return Err(err);
             }
         };
-        if let Some(reason) = &self.corrupt_or_ambiguous_tail_reason {
-            return Err(InventoryError::JournalCorruptOrBounded(reason.clone()));
+        if let Some(reason) = self.corrupt_or_ambiguous_tail_reason.clone() {
+            return Err(InventoryError::JournalCorruptOrBounded(reason));
         }
-        if !self
-            .workspaces
-            .get(&inspected_record.record_id)
-            .is_some_and(|current| {
-                current.status == WorkspaceOwnershipStatusV1::Active
-                    && current.same_ownership_incarnation(inspected_record)
-            })
-        {
+        if !self.matches_active_workspace_incarnation(
+            &inspected_record.record_id,
+            inspected_record,
+            inspected_seq,
+        ) {
             return Ok(false);
         }
-        self.commit_automatic_hold(&mut journal, count, now_unix_ms, payload)?;
+        if let Err(err) = self.commit_automatic_hold(&mut journal, count, now_unix_ms, payload) {
+            if let Some(seq) = inspected_seq
+                && let Some(held) = self.workspaces.get(&inspected_record.record_id)
+                && held.status == WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
+                && held.same_ownership_incarnation_ignoring_hold(inspected_record)
+                && self
+                    .workspace_registration_seq
+                    .get(&inspected_record.record_id)
+                    .copied()
+                    == Some(seq)
+            {
+                self.local_workspace_holds.insert(
+                    inspected_record.record_id.clone(),
+                    (inspected_record.clone(), seq, held.clone()),
+                );
+            }
+            return Err(err);
+        }
         Ok(true)
     }
 
@@ -1489,12 +1882,6 @@ impl ContinuousInventoryRegistryV1 {
                             record.record_id
                         )));
                     }
-                    if existing.workspace_name == record.workspace_name {
-                        return Err(InventoryError::DuplicateWorkspaceName(format!(
-                            "workspace_name {:?} already claimed by {:?}",
-                            record.workspace_name, existing.owner_actor
-                        )));
-                    }
                     if existing
                         .workspace_identity
                         .same_inode(&record.workspace_identity)
@@ -1504,6 +1891,12 @@ impl ContinuousInventoryRegistryV1 {
                             record.workspace_identity.dev,
                             record.workspace_identity.ino,
                             existing.owner_actor
+                        )));
+                    }
+                    if existing.workspace_name == record.workspace_name {
+                        return Err(InventoryError::DuplicateWorkspaceName(format!(
+                            "workspace_name {:?} already claimed by {:?}",
+                            record.workspace_name, existing.owner_actor
                         )));
                     }
                     if existing.jj_working_copy_change_id == record.jj_working_copy_change_id
@@ -1516,6 +1909,30 @@ impl ContinuousInventoryRegistryV1 {
                     }
                 }
 
+                if !is_replay {
+                    if let Some((pid, birth_us)) = record.pid_birth_binding
+                        && !matches!(check_pid_birth_binding_live(pid, birth_us), Ok(true))
+                    {
+                        return Err(InventoryError::WorkspaceHeld(format!(
+                            "bound process pid={pid} birth={birth_us} is not alive at admission"
+                        )));
+                    }
+                    observe_live_jj_workspace(
+                        Path::new(&record.workspace_path),
+                        record.workspace_identity,
+                        self.shared_git_store_identity,
+                        self.operational_checkout_identity,
+                        &record.workspace_name,
+                        &record.jj_working_copy_change_id,
+                        record.jj_working_copy_commit_id,
+                    )?;
+                }
+                self.next_workspace_registration_seq += 1;
+                self.workspace_registration_seq.insert(
+                    record.record_id.clone(),
+                    self.next_workspace_registration_seq,
+                );
+                self.local_workspace_holds.remove(&record.record_id);
                 record.status = WorkspaceOwnershipStatusV1::Active;
                 record.hold_reason = None;
                 self.workspaces.insert(record.record_id.clone(), *record);
@@ -1544,6 +1961,86 @@ impl ContinuousInventoryRegistryV1 {
                 }
                 existing.status = WorkspaceOwnershipStatusV1::Released;
                 existing.hold_reason = None;
+                self.local_workspace_holds.remove(&record_id);
+                Ok(())
+            }
+            InventoryPayloadV1::AdvanceWorkspaceCheckpoint {
+                record_id,
+                actor,
+                task_ref,
+                expected_jj_working_copy_change_id,
+                expected_old_jj_working_copy_commit_id,
+                new_jj_working_copy_commit_id,
+                updated_unix_ms,
+            } => {
+                let existing = self.workspaces.get(&record_id).ok_or_else(|| {
+                    InventoryError::UnresolvedOrMismatchedOwner(format!(
+                        "unknown workspace record_id {record_id:?}"
+                    ))
+                })?;
+                if existing.status != WorkspaceOwnershipStatusV1::Active {
+                    return Err(InventoryError::WorkspaceHeld(format!(
+                        "workspace {record_id:?} is not Active"
+                    )));
+                }
+                if existing.owner_actor != actor || existing.task_ref != task_ref {
+                    return Err(InventoryError::UnresolvedOrMismatchedOwner(format!(
+                        "checkpoint owner/task mismatch for {record_id:?}"
+                    )));
+                }
+                if updated_unix_ms < existing.issued_unix_ms
+                    || updated_unix_ms >= existing.lease_expires_unix_ms
+                {
+                    return Err(InventoryError::WorkspaceHeld(
+                        "checkpoint advance outside active lease window".to_owned(),
+                    ));
+                }
+                if existing.jj_working_copy_change_id != expected_jj_working_copy_change_id {
+                    return Err(InventoryError::SharedMutableJjChange(
+                        "checkpoint advance cannot switch mutable JJ change_id".to_owned(),
+                    ));
+                }
+                if existing.jj_working_copy_commit_id != expected_old_jj_working_copy_commit_id {
+                    return Err(InventoryError::WorkspaceIdentityDrift(
+                        "checkpoint advance expected_old_jj_working_copy_commit_id CAS mismatch"
+                            .to_owned(),
+                    ));
+                }
+                if new_jj_working_copy_commit_id == existing.base_commit_id {
+                    return Err(InventoryError::SharedMutableJjChange(
+                        "new working-copy commit cannot equal immutable base_commit_id".to_owned(),
+                    ));
+                }
+                if self.workspaces.values().any(|other| {
+                    other.record_id != record_id
+                        && other.status.blocks_exclusive_claim()
+                        && other.jj_working_copy_commit_id == new_jj_working_copy_commit_id
+                }) {
+                    return Err(InventoryError::SharedMutableJjChange(
+                        "checkpoint commit already claimed by another workspace".to_owned(),
+                    ));
+                }
+                if !is_replay {
+                    if let Some((pid, birth_us)) = existing.pid_birth_binding
+                        && !matches!(check_pid_birth_binding_live(pid, birth_us), Ok(true))
+                    {
+                        return Err(InventoryError::WorkspaceHeld(format!(
+                            "bound process pid={pid} birth={birth_us} is not alive at checkpoint advance"
+                        )));
+                    }
+                    observe_live_jj_workspace(
+                        Path::new(&existing.workspace_path),
+                        existing.workspace_identity,
+                        self.shared_git_store_identity,
+                        self.operational_checkout_identity,
+                        &existing.workspace_name,
+                        &expected_jj_working_copy_change_id,
+                        new_jj_working_copy_commit_id,
+                    )?;
+                }
+                if let Some(existing) = self.workspaces.get_mut(&record_id) {
+                    existing.jj_working_copy_commit_id = new_jj_working_copy_commit_id;
+                }
                 Ok(())
             }
             InventoryPayloadV1::UpsertCapability { mut record } => {
@@ -1568,12 +2065,27 @@ impl ContinuousInventoryRegistryV1 {
                 hold_reason,
                 ..
             } => {
+                if !is_replay
+                    && let Some(inspected) = self.workspaces.get(&record_id)
+                    && inspected.status == WorkspaceOwnershipStatusV1::Active
+                    && let Some(seq) = self.workspace_registration_seq.get(&record_id).copied()
+                {
+                    self.local_workspace_holds.insert(
+                        record_id.clone(),
+                        (inspected.clone(), seq, inspected.clone()),
+                    );
+                }
                 let record = self.workspaces.get_mut(&record_id).ok_or_else(|| {
                     InventoryError::WorkspaceHeld(format!("unknown workspace record {record_id:?}"))
                 })?;
                 record.status = WorkspaceOwnershipStatusV1::HeldStaleOrUnknown;
                 record.hold_reason = Some(hold_reason);
                 record.pid_birth_binding = None;
+                if !is_replay
+                    && let Some((_, _, held)) = self.local_workspace_holds.get_mut(&record_id)
+                {
+                    held.clone_from(record);
+                }
                 Ok(())
             }
             InventoryPayloadV1::HoldCapability {
@@ -1634,9 +2146,34 @@ impl ContinuousInventoryRegistryV1 {
                 record.lease_expires_unix_ms
             );
             Some((InventoryError::WorkspaceHeld(reason.clone()), reason))
+        } else if let Some((pid, birth_us)) = record.pid_birth_binding
+            && !matches!(check_pid_birth_binding_live(pid, birth_us), Ok(true))
+        {
+            let reason = format!(
+                "workspace {record_id:?} bound process pid={pid} birth={birth_us} is not alive"
+            );
+            Some((InventoryError::WorkspaceHeld(reason.clone()), reason))
         } else {
             match verify_private_directory_identity(Path::new(&record.workspace_path), true) {
-                Ok(current_id) if current_id == record.workspace_identity => None,
+                Ok(current_id) if current_id == record.workspace_identity => {
+                    observe_live_jj_workspace(
+                        Path::new(&record.workspace_path),
+                        record.workspace_identity,
+                        self.shared_git_store_identity,
+                        self.operational_checkout_identity,
+                        &record.workspace_name,
+                        &record.jj_working_copy_change_id,
+                        record.jj_working_copy_commit_id,
+                    )
+                    .err()
+                    .map(|err| {
+                        let reason = format!(
+                            "workspace {:?} live JJ verification failed: {err}",
+                            record.record_id
+                        );
+                        (err, reason)
+                    })
+                }
                 Ok(current_id) => {
                     let reason = format!(
                         "workspace {record_id:?} physical identity drifted from {:?} to {:?}",
@@ -1654,7 +2191,8 @@ impl ContinuousInventoryRegistryV1 {
             }
         };
         if let Some((err, reason)) = failure {
-            self.hold_workspace(&record, reason, now_unix_ms)?;
+            let seq = self.workspace_registration_seq.get(record_id).copied();
+            self.hold_workspace(&record, seq, reason, now_unix_ms)?;
             return Err(err);
         }
         Ok(&self.workspaces[record_id])
@@ -1672,7 +2210,7 @@ impl ContinuousInventoryRegistryV1 {
     where
         F: Fn(u32, u64) -> bool,
     {
-        let mut holds: Vec<(WorkspaceOwnershipRecordV1, String)> = Vec::new();
+        let mut holds: Vec<(WorkspaceOwnershipRecordV1, Option<u64>, String)> = Vec::new();
         for record in self.workspaces.values() {
             if record.status != WorkspaceOwnershipStatusV1::Active {
                 continue;
@@ -1687,33 +2225,74 @@ impl ContinuousInventoryRegistryV1 {
                 ))
             } else {
                 match verify_private_directory_identity(Path::new(&record.workspace_path), true) {
-                    Ok(actual) if actual == record.workspace_identity => None,
+                    Ok(actual) if actual == record.workspace_identity => observe_live_jj_workspace(
+                        Path::new(&record.workspace_path),
+                        record.workspace_identity,
+                        self.shared_git_store_identity,
+                        self.operational_checkout_identity,
+                        &record.workspace_name,
+                        &record.jj_working_copy_change_id,
+                        record.jj_working_copy_commit_id,
+                    )
+                    .err()
+                    .map(|err| format!("live JJ workspace verification failed: {err}")),
                     Ok(_) | Err(_) => {
                         Some("physical workspace directory missing or identity drifted".to_owned())
                     }
                 }
             };
             if let Some(reason) = reason {
-                holds.push((record.clone(), reason));
+                holds.push((
+                    record.clone(),
+                    self.workspace_registration_seq
+                        .get(&record.record_id)
+                        .copied(),
+                    reason,
+                ));
             }
         }
         let mut newly_held = Vec::new();
-        for (inspected_record, reason) in holds {
-            match self.hold_workspace(&inspected_record, reason.clone(), now_unix_ms) {
+        for (inspected_record, inspected_seq, reason) in holds {
+            match self.hold_workspace(
+                &inspected_record,
+                inspected_seq,
+                reason.clone(),
+                now_unix_ms,
+            ) {
                 Ok(true) => newly_held.push(inspected_record.record_id),
                 Ok(false) => {}
                 Err(err) => {
                     if let Some(record) = self.workspaces.get_mut(&inspected_record.record_id)
-                        && record.same_ownership_incarnation(&inspected_record)
+                        && record.same_ownership_incarnation_ignoring_hold(&inspected_record)
+                        && inspected_seq.is_none_or(|seq| {
+                            self.workspace_registration_seq
+                                .get(&inspected_record.record_id)
+                                .copied()
+                                == Some(seq)
+                        })
                         && record.status == WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
                     {
                         record.hold_reason = Some(format!("{reason}; durable hold failed: {err}"));
+                        if let Some((_, _, overlay)) = self
+                            .local_workspace_holds
+                            .get_mut(&inspected_record.record_id)
+                        {
+                            overlay.clone_from(record);
+                        }
                         newly_held.push(inspected_record.record_id);
                     }
                 }
             }
         }
         newly_held
+    }
+
+    pub fn reconcile_workspaces_live(&mut self) -> InventoryResult<Vec<String>> {
+        Ok(
+            self.reconcile_workspaces(current_unix_ms()?, |pid, birth_us| {
+                matches!(check_pid_birth_binding_live(pid, birth_us), Ok(true))
+            }),
+        )
     }
 
     /// Replay a durable journal from disk and place any intent lacking a
@@ -1741,7 +2320,7 @@ impl ContinuousInventoryRegistryV1 {
         }
         // Release the replay lock before automatic hold transactions reopen it.
         drop(journal);
-        registry.reconcile_workspaces(0, |_, _| true);
+        registry.reconcile_workspaces_live()?;
         Ok(registry)
     }
 
@@ -1756,7 +2335,7 @@ impl ContinuousInventoryRegistryV1 {
             return Ok((registry, 0));
         }
         let lines: Vec<&[u8]> = bytes.split_inclusive(|byte| *byte == b'\n').collect();
-        let mut pending_intents: BTreeMap<String, (String, InventoryPayloadV1)> = BTreeMap::new();
+        let mut pending_intents = BTreeMap::new();
         let mut count = 0usize;
         for (idx, raw_line) in lines.iter().enumerate() {
             count += 1;
@@ -1779,8 +2358,8 @@ impl ContinuousInventoryRegistryV1 {
             let entry = match parsed {
                 Ok(entry) => entry,
                 Err(_) if idx + 1 == lines.len() => {
-                    for (op_id, (digest, payload)) in pending_intents {
-                        registry.hold_incomplete(op_id, digest, payload);
+                    for (op_id, (digest, payload, inspected)) in pending_intents {
+                        registry.hold_replayed_incomplete(op_id, digest, payload, inspected);
                     }
                     let reason = format!("torn_or_corrupt_journal_tail_at_line_{}", idx + 1);
                     registry.corrupt_or_ambiguous_tail_reason = Some(reason.clone());
@@ -1788,23 +2367,29 @@ impl ContinuousInventoryRegistryV1 {
                         format!("torn-journal-tail-line-{}", idx + 1),
                         reason.clone(),
                     );
-                    for record in registry.workspaces.values_mut() {
+                    for (id, record) in &mut registry.workspaces {
                         if record.status == WorkspaceOwnershipStatusV1::Active {
+                            let inspected = record.clone();
                             record.status = WorkspaceOwnershipStatusV1::HeldStaleOrUnknown;
                             record.hold_reason = Some(format!("fenced_by_{reason}"));
                             record.pid_birth_binding = None;
+                            if let Some(seq) = registry.workspace_registration_seq.get(id).copied() {
+                                registry.local_workspace_holds.insert(id.clone(), (inspected, seq, record.clone()));
+                            }
                         }
                     }
                     // Every positive classification in this schema is evidence
                     // of readiness; none survives an untrustworthy journal tail.
-                    for record in registry.capabilities.values_mut() {
+                    for (id, record) in &mut registry.capabilities {
                         if !matches!(
                             record.effective_classification,
                             CapabilityClassificationV1::Unknown | CapabilityClassificationV1::Held
                         ) {
+                            let inspected = record.clone();
                             record.effective_classification = CapabilityClassificationV1::Held;
                             record.hold_or_downgrade_reason = Some(format!("fenced_by_{reason}"));
                             record.installed_binary_sha256 = None;
+                            registry.local_capability_holds.insert(id.clone(), (inspected, record.clone()));
                         }
                     }
                     return Ok((registry, count));
@@ -1831,7 +2416,19 @@ impl ContinuousInventoryRegistryV1 {
                             "duplicate journal intent for operation_id {operation_id}"
                         )));
                     }
-                    pending_intents.insert(operation_id, (intent_digest, payload));
+                    let inspected = match &payload {
+                        InventoryPayloadV1::ReleaseWorkspace { record_id, .. }
+                        | InventoryPayloadV1::HoldWorkspace { record_id, .. }
+                        | InventoryPayloadV1::AdvanceWorkspaceCheckpoint { record_id, .. } => {
+                            registry
+                                .workspaces
+                                .get(record_id)
+                                .zip(registry.workspace_registration_seq.get(record_id))
+                                .map(|(record, seq)| (record.clone(), *seq))
+                        }
+                        _ => None,
+                    };
+                    pending_intents.insert(operation_id, (intent_digest, payload, inspected));
                 }
                 JournalEntryV1::Result {
                     operation_id,
@@ -1840,7 +2437,7 @@ impl ContinuousInventoryRegistryV1 {
                     hold_reason,
                     ..
                 } => {
-                    let Some((expected_digest, payload)) = pending_intents.remove(&operation_id)
+                    let Some((expected_digest, payload, _)) = pending_intents.remove(&operation_id)
                     else {
                         return Err(InventoryError::JournalCorruptOrBounded(format!(
                             "result without preceding intent for operation_id {operation_id:?}"
@@ -1872,15 +2469,71 @@ impl ContinuousInventoryRegistryV1 {
         }
 
         // Any intent without a matching result is held conservatively across restart.
-        for (op_id, (digest, payload)) in pending_intents {
-            registry.hold_incomplete(op_id, digest, payload);
+        for (op_id, (digest, payload, inspected)) in pending_intents {
+            registry.hold_replayed_incomplete(op_id, digest, payload, inspected);
         }
         journal.verify_binding(journal.file_bytes)?;
         Ok((registry, count))
     }
 
+    fn hold_replayed_incomplete(
+        &mut self,
+        op_id: String,
+        digest: String,
+        payload: InventoryPayloadV1,
+        inspected: Option<(WorkspaceOwnershipRecordV1, u64)>,
+    ) {
+        // A pending intent cannot resurrect an owner released later in the
+        // valid journal, or hold a later registration with identical fields.
+        if matches!(
+            &payload,
+            InventoryPayloadV1::ReleaseWorkspace { .. }
+                | InventoryPayloadV1::HoldWorkspace { .. }
+                | InventoryPayloadV1::AdvanceWorkspaceCheckpoint { .. }
+        ) && !inspected.as_ref().is_some_and(|(record, seq)| {
+            self.workspaces
+                .get(&record.record_id)
+                .is_some_and(|current| {
+                    current.status.blocks_exclusive_claim()
+                        && current.same_ownership_incarnation_ignoring_hold(record)
+                        && self
+                            .workspace_registration_seq
+                            .get(&record.record_id)
+                            .copied()
+                            == Some(*seq)
+                })
+        }) {
+            self.incomplete_ops_held.insert(op_id, digest);
+            return;
+        }
+        self.hold_incomplete(op_id, digest, payload);
+    }
+
     fn hold_incomplete(&mut self, op_id: String, digest: String, payload: InventoryPayloadV1) {
         self.incomplete_ops_held.insert(op_id.clone(), digest);
+        let inspected_workspace = match &payload {
+            InventoryPayloadV1::ReleaseWorkspace { record_id, .. }
+            | InventoryPayloadV1::AdvanceWorkspaceCheckpoint { record_id, .. }
+            | InventoryPayloadV1::HoldWorkspace { record_id, .. } => self
+                .workspaces
+                .get(record_id)
+                .filter(|record| record.status == WorkspaceOwnershipStatusV1::Active)
+                .zip(self.workspace_registration_seq.get(record_id))
+                .map(|(record, seq)| (record.clone(), *seq)),
+            _ => None,
+        };
+        let inspected_capability = match &payload {
+            InventoryPayloadV1::UpsertCapability { record } => Some(
+                self.capabilities
+                    .get(&record.capability_id)
+                    .cloned()
+                    .unwrap_or_else(|| (**record).clone()),
+            ),
+            InventoryPayloadV1::HoldCapability { capability_id, .. } => {
+                self.capabilities.get(capability_id).cloned()
+            }
+            _ => None,
+        };
         match payload {
             InventoryPayloadV1::RegisterWorkspace { mut record } => {
                 record.status = WorkspaceOwnershipStatusV1::HeldStaleOrUnknown;
@@ -1914,6 +2567,17 @@ impl ContinuousInventoryRegistryV1 {
                     true,
                 );
             }
+            InventoryPayloadV1::AdvanceWorkspaceCheckpoint {
+                record_id,
+                updated_unix_ms,
+                ..
+            } => {
+                let _ = self.apply_payload(InventoryPayloadV1::HoldWorkspace {
+                    record_id,
+                    hold_reason: format!("incomplete_journal_intent:{op_id}:advance_workspace_checkpoint_unconfirmed"),
+                    updated_unix_ms,
+                }, true);
+            }
             InventoryPayloadV1::UpsertCapability { mut record } => {
                 let reason =
                     format!("incomplete_journal_intent:{op_id}:upsert_capability_unconfirmed");
@@ -1932,6 +2596,26 @@ impl ContinuousInventoryRegistryV1 {
             | InventoryPayloadV1::HoldCapability { .. }) => {
                 let _ = self.apply_payload(hold, true);
             }
+        }
+        if let Some((inspected, seq)) = inspected_workspace
+            && let Some(held) = self.workspaces.get(&inspected.record_id)
+        {
+            let inspected = self
+                .local_workspace_holds
+                .get(&inspected.record_id)
+                .map_or(inspected.clone(), |(original, _, _)| original.clone());
+            self.local_workspace_holds
+                .insert(inspected.record_id.clone(), (inspected, seq, held.clone()));
+        }
+        if let Some(inspected) = inspected_capability
+            && let Some(held) = self.capabilities.get(&inspected.capability_id)
+        {
+            let inspected = self
+                .local_capability_holds
+                .get(&inspected.capability_id)
+                .map_or(inspected.clone(), |(original, _)| original.clone());
+            self.local_capability_holds
+                .insert(inspected.capability_id.clone(), (inspected, held.clone()));
         }
     }
 
@@ -1977,6 +2661,86 @@ mod tests {
         tref
     }
 
+    fn test_jj(path: &Path, args: &[&str]) -> String {
+        let mut command = Command::new(jj_binary());
+        command.args([
+            "--no-pager",
+            "--color=never",
+            "--config",
+            "user.name=Inventory Test",
+            "--config",
+            "user.email=inventory@example.invalid",
+        ]);
+        if args.starts_with(&["git", "init"]) {
+            command.current_dir(path);
+        } else {
+            command.arg("-R").arg(path);
+        }
+        let output = command.args(args).stdin(Stdio::null()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "jj {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn jj_checkpoint(path: &Path) -> (String, GitOid) {
+        let output = test_jj(
+            path,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "change_id ++ \"\t\" ++ commit_id",
+            ],
+        );
+        let (change, commit) = output.trim().split_once('\t').unwrap();
+        (change.to_owned(), GitOid::from_hex(commit).unwrap())
+    }
+
+    fn jj_fixture_template() -> &'static TempDir {
+        static TEMPLATE: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+        TEMPLATE.get_or_init(|| {
+            let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+            let store = tmp.path().join("store-repo");
+            fs::create_dir(&store).unwrap();
+            fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+            test_jj(&store, &["git", "init", "--colocate"]);
+            for (dir, name) in [
+                ("ws-agent-1", "ws-chwg-jj-workspace-registry-01-s1"),
+                ("ws-agent-2", "ws-task-publish-reg-v1"),
+            ] {
+                let path = tmp.path().join(dir);
+                test_jj(
+                    &store,
+                    &["workspace", "add", "--name", name, path.to_str().unwrap()],
+                );
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                let _ = jj_checkpoint(&path);
+            }
+            tmp
+        })
+    }
+
+    fn copy_fixture_tree(from: &Path, to: &Path) {
+        fs::create_dir(to).unwrap();
+        fs::set_permissions(to, fs::metadata(from).unwrap().permissions()).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_fixture_tree(&entry.path(), &dest);
+            } else {
+                assert!(entry.file_type().unwrap().is_file());
+                fs::copy(entry.path(), dest).unwrap();
+            }
+        }
+    }
+
     struct EnvFixture {
         _tmp: TempDir,
         store_dir: std::path::PathBuf,
@@ -1988,22 +2752,39 @@ mod tests {
         op_id: FsEntryIdentityV1,
         ws1_id: FsEntryIdentityV1,
         ws2_id: FsEntryIdentityV1,
+        base_unix_ms: u64,
+        live_pid_birth: (u32, u64),
+        ws1_change_id: String,
+        ws1_commit_id: GitOid,
+        ws2_change_id: String,
+        ws2_commit_id: GitOid,
     }
 
     impl EnvFixture {
         fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
             fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let store_dir = tmp.path().join("store-repo");
             let op_dir = tmp.path().join("operational-checkout");
             let ws1_dir = tmp.path().join("ws-agent-1");
             let ws2_dir = tmp.path().join("ws-agent-2");
             let journal_dir = tmp.path().join("journal");
-            for dir in [&store_dir, &op_dir, &ws1_dir, &ws2_dir, &journal_dir] {
+            for dir in [&op_dir, &journal_dir] {
                 fs::create_dir(dir).unwrap();
                 fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
             }
+            let template = jj_fixture_template();
+            for (source, dest) in [
+                ("store-repo", &store_dir),
+                ("ws-agent-1", &ws1_dir),
+                ("ws-agent-2", &ws2_dir),
+            ] {
+                copy_fixture_tree(&template.path().join(source), dest);
+            }
+            let (ws1_change_id, ws1_commit_id) = jj_checkpoint(&ws1_dir);
+            let (ws2_change_id, ws2_commit_id) = jj_checkpoint(&ws2_dir);
             let store_id = verify_private_directory_identity(&store_dir, true).unwrap();
+
             let op_id = verify_private_directory_identity(&op_dir, true).unwrap();
             let ws1_id = verify_private_directory_identity(&ws1_dir, true).unwrap();
             let ws2_id = verify_private_directory_identity(&ws2_dir, true).unwrap();
@@ -2019,6 +2800,12 @@ mod tests {
                 op_id,
                 ws1_id,
                 ws2_id,
+                base_unix_ms: current_unix_ms().unwrap(),
+                live_pid_birth: observe_current_process_birth_binding().unwrap(),
+                ws1_change_id,
+                ws1_commit_id,
+                ws2_change_id,
+                ws2_commit_id,
             }
         }
 
@@ -2034,6 +2821,31 @@ mod tests {
             actor: &str,
             task_id: &str,
         ) -> WorkspaceOwnershipRecordV1 {
+            if (ws_path == self.ws1_dir || ws_path == self.ws2_dir) && ws_name != "ws-other-name" {
+                let listing = test_jj(
+                    ws_path,
+                    &[
+                        "--ignore-working-copy",
+                        "workspace",
+                        "list",
+                        "-T",
+                        "if(target.current_working_copy(), name)",
+                    ],
+                );
+                if listing != ws_name {
+                    test_jj(ws_path, &["workspace", "rename", ws_name]);
+                }
+            }
+            let change_id: &str = match change_id {
+                "pvonlxyolzsyqopzqrmtopulwnmmvmur" => &self.ws1_change_id,
+                "xnslnrmrotuspxtltrpqrzpzrzmtyyok" => &self.ws2_change_id,
+                other => other,
+            };
+            let commit = match commit_hex {
+                "dcbcc601da53aada5b94e766cbb3b9acc2e0851c" => self.ws1_commit_id,
+                "9e27172b5e00c9f9e95a044a2a0b4cf0b2db7ff2" => self.ws2_commit_id,
+                other => GitOid::from_hex(other).unwrap(),
+            };
             WorkspaceOwnershipRecordV1 {
                 record_id: record_id.to_owned(),
                 repo_id: "emunlabs/chinwag".to_owned(),
@@ -2045,7 +2857,7 @@ mod tests {
                 workspace_path: ws_path.to_str().unwrap().to_owned(),
                 workspace_identity: ws_id,
                 jj_working_copy_change_id: change_id.to_owned(),
-                jj_working_copy_commit_id: GitOid::from_hex(commit_hex).unwrap(),
+                jj_working_copy_commit_id: commit,
                 base_commit_id: GitOid::from_hex("d326c7129979ca43499547842daac076d80fac35")
                     .unwrap(),
                 base_tree_id: GitOid::from_hex("69c3b294b10a74190b894e2be486138c61772d83").unwrap(),
@@ -2061,8 +2873,8 @@ mod tests {
                 review_branch: "refs/heads/review/chwg-jj-workspace-registry-01-s1-20261109"
                     .to_owned(),
                 issued_unix_ms: 1_000,
-                lease_expires_unix_ms: 60_000,
-                pid_birth_binding: Some((12345, 999)),
+                lease_expires_unix_ms: self.base_unix_ms + 60_000,
+                pid_birth_binding: Some(self.live_pid_birth),
                 status: WorkspaceOwnershipStatusV1::Active,
                 hold_reason: None,
             }
@@ -2385,7 +3197,8 @@ mod tests {
         );
 
         // Reconcile dead PID / expired lease places ws1 into HeldStaleOrUnknown.
-        let newly_held = recovered.reconcile_workspaces(70_000, |_pid, _birth| false);
+        let newly_held =
+            recovered.reconcile_workspaces(f.base_unix_ms + 70_000, |_pid, _birth| false);
         assert_eq!(newly_held, vec!["rec-ws1".to_owned()]);
         assert!(matches!(
             recovered.verify_workspace_for_mutation(
@@ -2475,16 +3288,30 @@ mod tests {
             for index in 0..4 {
                 let path = if shared_change {
                     let path = racing._tmp.path().join(format!("race-workspace-{index}"));
-                    fs::create_dir(&path).unwrap();
+                    test_jj(
+                        &racing.store_dir,
+                        &[
+                            "workspace",
+                            "add",
+                            "--name",
+                            &format!("race-name-{index}"),
+                            path.to_str().unwrap(),
+                        ],
+                    );
+                    test_jj(&path, &["edit", &racing.ws1_change_id]);
                     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
                     path
                 } else {
                     racing.ws1_dir.clone()
                 };
                 let identity = verify_private_directory_identity(&path, true).unwrap();
-                let mut claim = racing.make_ws_record(
+                let claim = racing.make_ws_record(
                     &format!("race-record-{index}"),
-                    &format!("race-name-{index}"),
+                    &if shared_change {
+                        format!("race-name-{index}")
+                    } else {
+                        "ws-chwg-jj-workspace-registry-01-s1".to_owned()
+                    },
                     &path,
                     identity,
                     "pvonlxyolzsyqopzqrmtopulwnmmvmur",
@@ -2492,11 +3319,6 @@ mod tests {
                     "RUST#efffddad3cb4321cb1308b089f76c206",
                     "CHWG-JJ-WORKSPACE-REGISTRY-01",
                 );
-                if !shared_change {
-                    claim.jj_working_copy_change_id = format!("distinct-race-change-{index}");
-                }
-                claim.jj_working_copy_commit_id =
-                    GitOid::from_hex(&format!("{:040x}", index + 1)).unwrap();
                 claims.push(claim);
             }
             let barrier = std::sync::Barrier::new(4);
@@ -2688,7 +3510,7 @@ mod tests {
 
         // A local reconciliation hold must survive an authoritative replay.
         assert_eq!(
-            registry.reconcile_workspaces(70_000, |_, _| true),
+            registry.reconcile_workspaces(f.base_unix_ms + 70_000, |_, _| true),
             Vec::<String>::new()
         );
         assert_eq!(
@@ -2886,7 +3708,7 @@ mod tests {
                 },
             )
             .unwrap();
-        fs::remove_dir(&f.ws1_dir).unwrap();
+        fs::remove_dir_all(&f.ws1_dir).unwrap();
         fs::rename(&f.ws2_dir, f._tmp.path().join("moved-active")).unwrap();
         // Raw replay remains independent of both missing directories.
         let mut journal = LockedInventoryJournal::open(&f.journal_path, false)
@@ -2967,7 +3789,7 @@ mod tests {
                 )
                 .unwrap();
             let now = match failure {
-                0 => 70_000,
+                0 => f.base_unix_ms + 70_000,
                 1 => {
                     fs::rename(&f.ws1_dir, f._tmp.path().join("old-inode")).unwrap();
                     fs::create_dir(&f.ws1_dir).unwrap();
@@ -2975,7 +3797,7 @@ mod tests {
                     3_000
                 }
                 _ => {
-                    fs::remove_dir(&f.ws1_dir).unwrap();
+                    fs::remove_dir_all(&f.ws1_dir).unwrap();
                     3_000
                 }
             };
@@ -2995,7 +3817,7 @@ mod tests {
             // Restore a valid directory binding before restart: only the journal
             // can now explain the hold (especially the expired synthetic lease).
             if failure == 1 {
-                fs::remove_dir(&f.ws1_dir).unwrap();
+                fs::remove_dir_all(&f.ws1_dir).unwrap();
                 fs::rename(f._tmp.path().join("old-inode"), &f.ws1_dir).unwrap();
             }
             let recovered = ContinuousInventoryRegistryV1::load_and_reconcile(
@@ -3040,7 +3862,7 @@ mod tests {
                     &record.record_id,
                     &record.owner_actor,
                     &record.task_ref,
-                    70_000
+                    f.base_unix_ms + 70_000
                 )
                 .is_err()
         );
@@ -3375,7 +4197,7 @@ mod tests {
             let mut holding = registry.clone();
             holding.journal_path = Some(journal_b.clone());
             assert!(matches!(
-                holding.hold_workspace(&owner, "foreign hold".to_owned(), 3_000),
+                holding.hold_workspace(&owner, None, "foreign hold".to_owned(), 3_000),
                 Err(InventoryError::InvalidPath(_))
             ));
             assert_eq!(holding.inspect_discovery_snapshot(), before);
@@ -3803,7 +4625,7 @@ mod tests {
             let size = fs::metadata(&f.journal_path).unwrap().len();
             // Reconciliation would ordinarily persist a hold for this missing
             // path. Torn-tail recovery must remain a discovery-only operation.
-            fs::remove_dir(&f.ws1_dir).unwrap();
+            fs::remove_dir_all(&f.ws1_dir).unwrap();
             let mut recovered = ContinuousInventoryRegistryV1::load_and_reconcile(
                 f.store_id,
                 f.op_id,
@@ -3869,7 +4691,7 @@ mod tests {
                 ));
                 let inspected = handle.workspaces["ws-1"].clone();
                 assert!(matches!(
-                    handle.hold_workspace(&inspected, "after tail".to_owned(), 4_001),
+                    handle.hold_workspace(&inspected, None, "after tail".to_owned(), 4_001),
                     Err(InventoryError::JournalCorruptOrBounded(_))
                 ));
                 handle.refresh_from_journal(&f.journal_path).unwrap();
@@ -3996,7 +4818,7 @@ mod tests {
                 ));
                 let inspected = registry.workspaces["s2b-first"].clone();
                 assert!(matches!(
-                    registry.hold_workspace(&inspected, "blocked hold".to_owned(), 4_001),
+                    registry.hold_workspace(&inspected, None, "blocked hold".to_owned(), 4_001),
                     Err(InventoryError::JournalCorruptOrBounded(_))
                 ));
                 assert_eq!(registry.inspect_discovery_snapshot(), snapshot);
@@ -4278,11 +5100,11 @@ mod tests {
         if replacement {
             record.owner_actor = "WORKHORSE#22222222222222222222222222222222".to_owned();
             record.issued_unix_ms = 160;
-            record.lease_expires_unix_ms = 5_000;
+            record.lease_expires_unix_ms = f.base_unix_ms + 5_000;
         } else {
             record.owner_actor = "WORKHORSE#11111111111111111111111111111111".to_owned();
             record.issued_unix_ms = 100;
-            record.lease_expires_unix_ms = 200;
+            record.lease_expires_unix_ms = f.base_unix_ms + 200;
         }
         record
     }
@@ -4351,7 +5173,11 @@ mod tests {
         let bytes = fs::read(&f.journal_path).unwrap();
 
         // The expired record inspected by A predates B's release and replacement.
-        assert!(handle_a.reconcile_workspaces(300, |_, _| false).is_empty());
+        assert!(
+            handle_a
+                .reconcile_workspaces(f.base_unix_ms + 300, |_, _| false)
+                .is_empty()
+        );
         assert_eq!(handle_a.workspaces["ws-1"], incarnation_2);
         local_overlay.refresh_from_journal(&f.journal_path).unwrap();
         assert_eq!(local_overlay.workspaces["ws-1"], incarnation_2);
@@ -4452,6 +5278,941 @@ mod tests {
         ));
         assert!(handle_a.corrupt_or_ambiguous_tail_reason().is_some());
         assert_eq!(fs::read(&f.journal_path).unwrap(), torn);
+    }
+
+    fn bound_test_journal(path: &Path, by_records: bool) -> Vec<u8> {
+        let mut bytes = fs::read(path).unwrap();
+        if by_records {
+            let padding = InventoryPayloadV1::UpsertCapability {
+                record: Box::new(s2b_capability("cap-padding")),
+            };
+            let digest = ContinuousInventoryRegistryV1::payload_digest(&padding).unwrap();
+            let start = bytes.iter().filter(|b| **b == b'\n').count() / 2;
+            for sequence in start..MAX_INVENTORY_RECORDS / 2 {
+                let op = format!("padding-{sequence}");
+                for entry in [
+                    JournalEntryV1::Intent {
+                        operation_id: op.clone(),
+                        intent_digest: digest.clone(),
+                        recorded_unix_ms: 100,
+                        payload: padding.clone(),
+                    },
+                    JournalEntryV1::Result {
+                        operation_id: op,
+                        intent_digest: digest.clone(),
+                        completed_unix_ms: 100,
+                        committed: true,
+                        hold_reason: None,
+                    },
+                ] {
+                    bytes.extend(ContinuousInventoryRegistryV1::journal_line(&entry).unwrap());
+                }
+            }
+            assert_eq!(
+                bytes.iter().filter(|b| **b == b'\n').count(),
+                MAX_INVENTORY_RECORDS
+            );
+        } else {
+            assert_eq!(bytes.pop(), Some(b'\n'));
+            bytes.resize(MAX_INVENTORY_JOURNAL_BYTES as usize - 1, b' ');
+            bytes.push(b'\n');
+        }
+        fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn s2d_f3_explicit_held_upsert_and_capacity_refusal_preserve_negative_overlay() {
+        for by_records in [false, true] {
+            let f = EnvFixture::new();
+            let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+            let ready = s2b_capability("cap-1");
+            registry
+                .submit_durable(
+                    &f.journal_path,
+                    "ready",
+                    100,
+                    InventoryPayloadV1::UpsertCapability {
+                        record: Box::new(ready.clone()),
+                    },
+                )
+                .unwrap();
+            let bytes = bound_test_journal(&f.journal_path, by_records);
+            let mut negative = ready.clone();
+            negative.claimed_classification = CapabilityClassificationV1::Held;
+            negative.hold_or_downgrade_reason = Some("explicit negative observation".to_owned());
+            negative.observed_unix_ms = 200;
+            let negative = InventoryPayloadV1::UpsertCapability {
+                record: Box::new(negative),
+            };
+            for _ in 0..3 {
+                assert!(matches!(
+                    registry.submit_durable(
+                        &f.journal_path,
+                        "negative-refused",
+                        200,
+                        negative.clone()
+                    ),
+                    Err(InventoryError::JournalCorruptOrBounded(_))
+                ));
+                for op in ["negative-refused", "positive-refused"] {
+                    assert!(!registry.committed_ops.contains_key(op));
+                    assert!(!registry.rejected_ops.contains_key(op));
+                    assert!(!registry.incomplete_ops_held.contains_key(op));
+                }
+                let held = registry.capabilities["cap-1"].clone();
+                assert_eq!(
+                    held.effective_classification,
+                    CapabilityClassificationV1::Held
+                );
+                assert_eq!(held.installed_binary_sha256, None);
+                assert!(
+                    held.hold_or_downgrade_reason
+                        .as_deref()
+                        .unwrap()
+                        .contains("explicit negative observation")
+                );
+                for _ in 0..2 {
+                    registry.refresh_from_journal(&f.journal_path).unwrap();
+                    assert_eq!(registry.capabilities["cap-1"], held);
+                }
+                assert!(
+                    registry.local_capability_holds["cap-1"]
+                        .0
+                        .same_capability_incarnation(&ready)
+                );
+                assert!(matches!(
+                    registry.submit_durable(
+                        &f.journal_path,
+                        "positive-refused",
+                        300,
+                        InventoryPayloadV1::UpsertCapability {
+                            record: Box::new(ready.clone())
+                        }
+                    ),
+                    Err(InventoryError::JournalCorruptOrBounded(_))
+                ));
+                assert_eq!(
+                    registry
+                        .inspect_discovery_snapshot()
+                        .capabilities
+                        .into_iter()
+                        .find(|cap| cap.capability_id == "cap-1"),
+                    Some(held)
+                );
+                assert_eq!(fs::read(&f.journal_path).unwrap(), bytes);
+            }
+        }
+        // Serialization and line-bound refusals occur before capacity reservation.
+        for failure in 0..3 {
+            let f = EnvFixture::new();
+            let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+            let ready = s2b_capability("cap-1");
+            registry
+                .submit_durable(
+                    &f.journal_path,
+                    "ready",
+                    100,
+                    InventoryPayloadV1::UpsertCapability {
+                        record: Box::new(ready.clone()),
+                    },
+                )
+                .unwrap();
+            let bytes = fs::read(&f.journal_path).unwrap();
+            let mut negative = ready;
+            negative.claimed_classification = CapabilityClassificationV1::Held;
+            let payload = match failure {
+                0 => {
+                    negative
+                        .task_ref
+                        .as_mut()
+                        .unwrap()
+                        .canonical_task_path
+                        .clear();
+                    InventoryPayloadV1::UpsertCapability {
+                        record: Box::new(negative),
+                    }
+                }
+                1 => {
+                    negative.source_tree_clean = false;
+                    negative.claimed_classification = CapabilityClassificationV1::Operational;
+                    negative.source_module_path = "p".repeat(MAX_INVENTORY_JOURNAL_BYTES as usize);
+                    InventoryPayloadV1::UpsertCapability {
+                        record: Box::new(negative),
+                    }
+                }
+                _ => InventoryPayloadV1::HoldCapability {
+                    capability_id: "cap-1".to_owned(),
+                    hold_reason: "x".repeat(MAX_INVENTORY_JOURNAL_BYTES as usize),
+                    updated_unix_ms: 200,
+                },
+            };
+            assert!(
+                registry
+                    .submit_durable(&f.journal_path, "serialization-refused", 200, payload)
+                    .is_err()
+            );
+            assert_eq!(
+                registry.capabilities["cap-1"].effective_classification,
+                CapabilityClassificationV1::Held
+            );
+            assert_eq!(registry.capabilities["cap-1"].installed_binary_sha256, None);
+            registry.refresh_from_journal(&f.journal_path).unwrap();
+            assert_eq!(
+                registry.capabilities["cap-1"].effective_classification,
+                CapabilityClassificationV1::Held
+            );
+            assert!(!registry.committed_ops.contains_key("serialization-refused"));
+            assert!(!registry.rejected_ops.contains_key("serialization-refused"));
+            assert!(
+                !registry
+                    .incomplete_ops_held
+                    .contains_key("serialization-refused")
+            );
+            assert_eq!(fs::read(&f.journal_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn s2d_f7_pid_binding_and_aba_replacement_error_fallbacks_and_ambiguity_overlay_fence() {
+        for change_pid in [false, true] {
+            let f = EnvFixture::new();
+            let record = s2b_workspace(&f, false);
+            let mut a = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+            a.submit_durable(
+                &f.journal_path,
+                "register",
+                2_000,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(record.clone()),
+                },
+            )
+            .unwrap();
+            let old_seq = a.workspace_registration_seq[&record.record_id];
+            let mut local = a.clone();
+            local
+                .apply_local_workspace_hold(
+                    &record,
+                    Some(old_seq),
+                    InventoryPayloadV1::HoldWorkspace {
+                        record_id: record.record_id.clone(),
+                        hold_reason: "old local hold".to_owned(),
+                        updated_unix_ms: 2_001,
+                    },
+                )
+                .unwrap();
+            let mut b = ContinuousInventoryRegistryV1::load_and_reconcile(
+                f.store_id,
+                f.op_id,
+                &f.journal_path,
+            )
+            .unwrap();
+            b.submit_durable(
+                &f.journal_path,
+                "release",
+                2_002,
+                InventoryPayloadV1::ReleaseWorkspace {
+                    record_id: record.record_id.clone(),
+                    actor: record.owner_actor.clone(),
+                    released_unix_ms: 2_002,
+                },
+            )
+            .unwrap();
+            let mut replacement = record.clone();
+            let mut child = Command::new("/bin/sleep").arg("10").spawn().unwrap();
+            if change_pid {
+                let chinwag_host_process::ProcessBirthObservation::Alive(info) =
+                    chinwag_host_process::inspect_process_birth(child.id()).unwrap()
+                else {
+                    panic!("live child");
+                };
+                replacement.pid_birth_binding = Some((info.pid, info.start_time_unix_us));
+                assert!(!replacement.same_ownership_incarnation(&record));
+            }
+            b.submit_durable(
+                &f.journal_path,
+                "replacement",
+                2_003,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(replacement.clone()),
+                },
+            )
+            .unwrap();
+            let bytes = fs::read(&f.journal_path).unwrap();
+            assert!(
+                a.reconcile_workspaces(f.base_unix_ms, |_, _| false)
+                    .is_empty()
+            );
+            assert_eq!(a.workspaces[&record.record_id], replacement);
+            assert_ne!(a.workspace_registration_seq[&record.record_id], old_seq);
+            local.refresh_from_journal(&f.journal_path).unwrap();
+            assert_eq!(local.workspaces[&record.record_id], replacement);
+            assert!(!local.local_workspace_holds.contains_key(&record.record_id));
+            assert_eq!(fs::read(&f.journal_path).unwrap(), bytes);
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        for lock_open_failure in [false, true] {
+            let f = EnvFixture::new();
+            let r1 = s2b_workspace(&f, false);
+            let r2 = s2b_workspace(&f, true);
+            let mut a = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+            for (op, record) in [("register-1", &r1), ("register-2", &r2)] {
+                a.submit_durable(
+                    &f.journal_path,
+                    op,
+                    2_000,
+                    InventoryPayloadV1::RegisterWorkspace {
+                        record: Box::new(record.clone()),
+                    },
+                )
+                .unwrap();
+            }
+            let seq1 = a.workspace_registration_seq[&r1.record_id];
+            let seq2 = a.workspace_registration_seq[&r2.record_id];
+            let mut b = a.clone();
+            b.submit_durable(
+                &f.journal_path,
+                "release-2",
+                2_100,
+                InventoryPayloadV1::ReleaseWorkspace {
+                    record_id: r2.record_id.clone(),
+                    actor: r2.owner_actor.clone(),
+                    released_unix_ms: 2_100,
+                },
+            )
+            .unwrap();
+            // Dispatch the two stale observations in reconciliation order. R1's
+            // refresh observes R2's release before R2's persistence path fails.
+            assert!(
+                a.hold_workspace(&r1, Some(seq1), "R1 stale".to_owned(), 2_200)
+                    .unwrap()
+            );
+            assert_eq!(
+                a.workspaces[&r2.record_id].status,
+                WorkspaceOwnershipStatusV1::Released
+            );
+            if lock_open_failure {
+                fs::set_permissions(&f.journal_path, fs::Permissions::from_mode(0o400)).unwrap();
+            } else {
+                let mut bytes = fs::read(&f.journal_path).unwrap();
+                bytes.splice(0..0, b"{}\n".iter().copied());
+                fs::write(&f.journal_path, bytes).unwrap();
+            }
+            assert!(
+                a.hold_workspace(&r2, Some(seq2), "R2 stale".to_owned(), 2_201)
+                    .is_err()
+            );
+            assert_eq!(
+                a.workspaces[&r2.record_id].status,
+                WorkspaceOwnershipStatusV1::Released
+            );
+            assert!(!a.local_workspace_holds.contains_key(&r2.record_id));
+        }
+        for replace in [false, true] {
+            let f = EnvFixture::new();
+            let record = s2b_workspace(&f, false);
+            let mut a = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+            a.submit_durable(
+                &f.journal_path,
+                "register",
+                2_000,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(record.clone()),
+                },
+            )
+            .unwrap();
+            a.submit_durable(
+                &f.journal_path,
+                "ready",
+                2_000,
+                InventoryPayloadV1::UpsertCapability {
+                    record: Box::new(s2b_capability("cap-1")),
+                },
+            )
+            .unwrap();
+            let prefix = fs::read(&f.journal_path).unwrap();
+            a.fail_next_result_append = true;
+            assert!(
+                a.hold_workspace(
+                    &record,
+                    Some(a.workspace_registration_seq[&record.record_id]),
+                    "ambiguous hold".to_owned(),
+                    2_100
+                )
+                .is_err()
+            );
+            a.hold_incomplete(
+                "local-cap-hold".to_owned(),
+                "digest".to_owned(),
+                InventoryPayloadV1::HoldCapability {
+                    capability_id: "cap-1".to_owned(),
+                    hold_reason: "ambiguous negative".to_owned(),
+                    updated_unix_ms: 2_100,
+                },
+            );
+            assert!(a.corrupt_or_ambiguous_tail_reason().is_some());
+            // The valid journal retains the incomplete hold intent. A later
+            // durable release/re-registration supersedes that old observation.
+            assert!(fs::read(&f.journal_path).unwrap().starts_with(&prefix));
+            let mut b = ContinuousInventoryRegistryV1::load_and_reconcile(
+                f.store_id,
+                f.op_id,
+                &f.journal_path,
+            )
+            .unwrap();
+            b.submit_durable(
+                &f.journal_path,
+                "release",
+                2_200,
+                InventoryPayloadV1::ReleaseWorkspace {
+                    record_id: record.record_id.clone(),
+                    actor: record.owner_actor.clone(),
+                    released_unix_ms: 2_200,
+                },
+            )
+            .unwrap();
+            if replace {
+                b.submit_durable(
+                    &f.journal_path,
+                    "replacement",
+                    2_300,
+                    InventoryPayloadV1::RegisterWorkspace {
+                        record: Box::new(record.clone()),
+                    },
+                )
+                .unwrap();
+            }
+            let mut newer = s2b_capability("cap-1");
+            newer.observed_unix_ms = 2_300;
+            b.submit_durable(
+                &f.journal_path,
+                "newer-capability",
+                2_300,
+                InventoryPayloadV1::UpsertCapability {
+                    record: Box::new(newer),
+                },
+            )
+            .unwrap();
+            a.refresh_from_journal(&f.journal_path).unwrap();
+            assert!(a.corrupt_or_ambiguous_tail_reason().is_some());
+            assert_eq!(
+                a.workspaces[&record.record_id],
+                b.workspaces[&record.record_id]
+            );
+            assert_eq!(a.capabilities["cap-1"], b.capabilities["cap-1"]);
+            assert!(!a.local_workspace_holds.contains_key(&record.record_id));
+            assert!(!a.local_capability_holds.contains_key("cap-1"));
+        }
+    }
+
+    #[test]
+    fn s2e_live_jj_admission_and_mutation_reject_wrong_store_name_change_commit_and_symlink() {
+        for mutation in [false, true] {
+            for failure in 0..10 {
+                let f = EnvFixture::new();
+                let mut record = s2b_workspace(&f, false);
+                let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+                if mutation {
+                    registry
+                        .submit_durable(
+                            &f.journal_path,
+                            "register",
+                            2_000,
+                            InventoryPayloadV1::RegisterWorkspace {
+                                record: Box::new(record.clone()),
+                            },
+                        )
+                        .unwrap();
+                }
+                match failure {
+                    0 => {
+                        fs::write(f.ws1_dir.join("dirty-source.rs"), "uncommitted source\n")
+                            .unwrap();
+                    }
+                    1 => {
+                        let other = EnvFixture::new();
+                        fs::write(
+                            f.ws1_dir.join(".jj/repo"),
+                            other.store_dir.join(".jj/repo").to_str().unwrap(),
+                        )
+                        .unwrap();
+                        // Keep the foreign store alive until after observation.
+                        let result = if mutation {
+                            registry
+                                .verify_workspace_for_mutation(
+                                    &record.record_id,
+                                    &record.owner_actor,
+                                    &record.task_ref,
+                                    f.base_unix_ms,
+                                )
+                                .map(|_| ())
+                        } else {
+                            registry
+                                .submit_durable(
+                                    &f.journal_path,
+                                    "wrong-store",
+                                    2_000,
+                                    InventoryPayloadV1::RegisterWorkspace {
+                                        record: Box::new(record.clone()),
+                                    },
+                                )
+                                .map(|_| ())
+                        };
+                        assert!(matches!(
+                            result,
+                            Err(InventoryError::SharedGitStoreMismatch(_))
+                        ));
+                        continue;
+                    }
+                    2 => {
+                        if mutation {
+                            test_jj(&f.ws1_dir, &["workspace", "rename", "wrong-name"]);
+                        } else {
+                            record.workspace_name = "wrong-name".to_owned();
+                        }
+                    }
+                    3 => {
+                        if mutation {
+                            test_jj(&f.ws1_dir, &["new", "-m", "different change"]);
+                        } else {
+                            record.jj_working_copy_change_id = f.ws2_change_id.clone();
+                        }
+                    }
+                    4 => {
+                        if mutation {
+                            test_jj(&f.ws1_dir, &["describe", "-m", "different commit"]);
+                        } else {
+                            record.jj_working_copy_commit_id = f.ws2_commit_id;
+                        }
+                    }
+                    5 => {
+                        let real = f._tmp.path().join("real-workspace");
+                        fs::rename(&f.ws1_dir, &real).unwrap();
+                        symlink(real, &f.ws1_dir).unwrap();
+                    }
+                    6 => {
+                        let real = f.ws1_dir.join("jj-real");
+                        fs::rename(f.ws1_dir.join(".jj"), &real).unwrap();
+                        symlink(real, f.ws1_dir.join(".jj")).unwrap();
+                    }
+                    7 => {
+                        fs::remove_file(f.ws1_dir.join(".jj/repo")).unwrap();
+                        symlink(f.store_dir.join(".jj/repo"), f.ws1_dir.join(".jj/repo")).unwrap();
+                    }
+                    8 => {
+                        fs::remove_dir_all(f.ws1_dir.join(".jj")).unwrap();
+                    }
+                    _ => {
+                        fs::remove_file(f.ws1_dir.join(".jj/repo")).unwrap();
+                    }
+                }
+                let result = if mutation {
+                    registry
+                        .verify_workspace_for_mutation(
+                            &record.record_id,
+                            &record.owner_actor,
+                            &record.task_ref,
+                            f.base_unix_ms,
+                        )
+                        .map(|_| ())
+                } else {
+                    registry
+                        .submit_durable(
+                            &f.journal_path,
+                            "admission",
+                            2_000,
+                            InventoryPayloadV1::RegisterWorkspace {
+                                record: Box::new(record.clone()),
+                            },
+                        )
+                        .map(|_| ())
+                };
+                if failure == 0 {
+                    result.unwrap();
+                    let mut dirty_cap = s2b_capability("dirty-capability");
+                    dirty_cap.source_tree_clean = false;
+                    for claim in [
+                        CapabilityClassificationV1::Installed,
+                        CapabilityClassificationV1::Operational,
+                    ] {
+                        dirty_cap.claimed_classification = claim;
+                        assert!(matches!(
+                            dirty_cap.verify_and_classify(),
+                            Err(InventoryError::DirtyOrMismatchedBuildProvenance(_))
+                        ));
+                    }
+                } else {
+                    assert!(result.is_err(), "mutation={mutation} failure={failure}");
+                    if mutation {
+                        assert_eq!(
+                            registry.workspaces[&record.record_id].status,
+                            WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
+                        );
+                        assert_eq!(
+                            registry.workspaces[&record.record_id].pid_birth_binding,
+                            None
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn s2e_real_pid_birth_and_clock_startup_and_preuse_reconciliation() {
+        let (pid, birth_us) = observe_current_process_birth_binding().unwrap();
+        assert_eq!(pid, std::process::id());
+        assert_eq!(check_pid_birth_binding_live(pid, birth_us), Ok(true));
+        assert_eq!(
+            check_pid_birth_binding_live(pid, birth_us + 1_000),
+            Ok(false)
+        );
+        assert!(check_pid_birth_binding_live(0, birth_us).is_err());
+        assert!(current_unix_ms().unwrap() > 1_000);
+        for preuse in [false, true] {
+            for failure in 0..4 {
+                let f = EnvFixture::new();
+                let mut record = s2b_workspace(&f, false);
+                let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+                if failure == 1 {
+                    let mut child = Command::new("/bin/sleep").arg("0.2").spawn().unwrap();
+                    let chinwag_host_process::ProcessBirthObservation::Alive(info) =
+                        chinwag_host_process::inspect_process_birth(child.id()).unwrap()
+                    else {
+                        panic!("live child");
+                    };
+                    record.pid_birth_binding = Some((info.pid, info.start_time_unix_us));
+                    registry
+                        .submit_durable(
+                            &f.journal_path,
+                            "register",
+                            2_000,
+                            InventoryPayloadV1::RegisterWorkspace {
+                                record: Box::new(record.clone()),
+                            },
+                        )
+                        .unwrap();
+                    child.wait().unwrap();
+                    assert_eq!(
+                        check_pid_birth_binding_live(info.pid, info.start_time_unix_us),
+                        Ok(false)
+                    );
+                } else {
+                    if failure == 2 {
+                        record.pid_birth_binding = Some((pid, birth_us + 1_000));
+                    }
+                    if failure == 3 {
+                        record.lease_expires_unix_ms = f.base_unix_ms;
+                    }
+                    if failure == 2 {
+                        assert!(matches!(
+                            registry.submit_durable(
+                                &f.journal_path,
+                                "invalid-live-admission",
+                                2_000,
+                                InventoryPayloadV1::RegisterWorkspace {
+                                    record: Box::new(record.clone())
+                                }
+                            ),
+                            Err(InventoryError::WorkspaceHeld(_))
+                        ));
+                        // A historical journal can contain an owner that is no
+                        // longer alive. Replay remains pure and deterministic.
+                        let payload = InventoryPayloadV1::RegisterWorkspace {
+                            record: Box::new(record.clone()),
+                        };
+                        let digest =
+                            ContinuousInventoryRegistryV1::payload_digest(&payload).unwrap();
+                        for entry in [
+                            JournalEntryV1::Intent {
+                                operation_id: "historical-register".to_owned(),
+                                intent_digest: digest.clone(),
+                                recorded_unix_ms: 2_000,
+                                payload,
+                            },
+                            JournalEntryV1::Result {
+                                operation_id: "historical-register".to_owned(),
+                                intent_digest: digest,
+                                completed_unix_ms: 2_000,
+                                committed: true,
+                                hold_reason: None,
+                            },
+                        ] {
+                            ContinuousInventoryRegistryV1::append_journal_entry(
+                                &f.journal_path,
+                                &entry,
+                            )
+                            .unwrap();
+                        }
+                        registry.refresh_from_journal(&f.journal_path).unwrap();
+                    } else {
+                        registry
+                            .submit_durable(
+                                &f.journal_path,
+                                "register",
+                                2_000,
+                                InventoryPayloadV1::RegisterWorkspace {
+                                    record: Box::new(record.clone()),
+                                },
+                            )
+                            .unwrap();
+                    }
+                }
+                if preuse {
+                    let result = registry.verify_workspace_for_mutation(
+                        &record.record_id,
+                        &record.owner_actor,
+                        &record.task_ref,
+                        current_unix_ms().unwrap(),
+                    );
+                    assert_eq!(result.is_ok(), failure == 0);
+                    if failure != 0 {
+                        assert!(matches!(result, Err(InventoryError::WorkspaceHeld(_))));
+                    }
+                } else {
+                    registry = ContinuousInventoryRegistryV1::load_and_reconcile(
+                        f.store_id,
+                        f.op_id,
+                        &f.journal_path,
+                    )
+                    .unwrap();
+                }
+                let actual = &registry.workspaces[&record.record_id];
+                assert_eq!(
+                    actual.status,
+                    if failure == 0 {
+                        WorkspaceOwnershipStatusV1::Active
+                    } else {
+                        WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
+                    }
+                );
+                if failure != 0 {
+                    assert_eq!(actual.pid_birth_binding, None);
+                    assert!(actual.status.blocks_exclusive_claim());
+                    assert_eq!(registry.inspect_discovery_snapshot().workspaces.len(), 1);
+                    assert!(registry.reconcile_workspaces_live().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    fn checkpoint_payload(
+        record: &WorkspaceOwnershipRecordV1,
+        new_commit: GitOid,
+        now: u64,
+    ) -> InventoryPayloadV1 {
+        InventoryPayloadV1::AdvanceWorkspaceCheckpoint {
+            record_id: record.record_id.clone(),
+            actor: record.owner_actor.clone(),
+            task_ref: record.task_ref.clone(),
+            expected_jj_working_copy_change_id: record.jj_working_copy_change_id.clone(),
+            expected_old_jj_working_copy_commit_id: record.jj_working_copy_commit_id,
+            new_jj_working_copy_commit_id: new_commit,
+            updated_unix_ms: now,
+        }
+    }
+
+    #[test]
+    fn s2e_durable_checkpoint_advance_cas_updates_same_change_and_rejects_stale_or_different_change()
+     {
+        let f = EnvFixture::new();
+        let original = s2b_workspace(&f, false);
+        let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "register",
+                2_000,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(original.clone()),
+                },
+            )
+            .unwrap();
+        test_jj(&f.ws1_dir, &["describe", "-m", "checkpoint 1"]);
+        let (change, new_commit) = jj_checkpoint(&f.ws1_dir);
+        assert_eq!(change, original.jj_working_copy_change_id);
+        assert_ne!(new_commit, original.jj_working_copy_commit_id);
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "advance",
+                f.base_unix_ms,
+                checkpoint_payload(&original, new_commit, f.base_unix_ms),
+            )
+            .unwrap();
+        registry
+            .verify_workspace_for_mutation(
+                &original.record_id,
+                &original.owner_actor,
+                &original.task_ref,
+                f.base_unix_ms,
+            )
+            .unwrap();
+        let advanced = registry.workspaces[&original.record_id].clone();
+        assert_eq!(advanced.jj_working_copy_commit_id, new_commit);
+        assert_eq!(advanced.base_commit_id, original.base_commit_id);
+        assert_eq!(advanced.base_tree_id, original.base_tree_id);
+        let loaded =
+            ContinuousInventoryRegistryV1::load_and_reconcile(f.store_id, f.op_id, &f.journal_path)
+                .unwrap();
+        assert_eq!(loaded.workspaces[&original.record_id], advanced);
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "stale-cas",
+                f.base_unix_ms,
+                checkpoint_payload(&original, new_commit, f.base_unix_ms)
+            ),
+            Err(InventoryError::WorkspaceIdentityDrift(_))
+        ));
+        let mut wrong_actor = advanced.clone();
+        wrong_actor.owner_actor = "RUST#00000000000000000000000000000000".to_owned();
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "wrong-actor",
+                f.base_unix_ms,
+                checkpoint_payload(&wrong_actor, new_commit, f.base_unix_ms)
+            ),
+            Err(InventoryError::UnresolvedOrMismatchedOwner(_))
+        ));
+        let mut wrong_task = advanced.clone();
+        wrong_task.task_ref = sample_task_ref("OTHER-TASK");
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "wrong-task",
+                f.base_unix_ms,
+                checkpoint_payload(&wrong_task, new_commit, f.base_unix_ms)
+            ),
+            Err(InventoryError::UnresolvedOrMismatchedOwner(_))
+        ));
+        for (op, now) in [
+            ("before-lease", advanced.issued_unix_ms - 1),
+            ("after-lease", advanced.lease_expires_unix_ms),
+        ] {
+            assert!(matches!(
+                registry.submit_durable(
+                    &f.journal_path,
+                    op,
+                    f.base_unix_ms,
+                    checkpoint_payload(&advanced, new_commit, now)
+                ),
+                Err(InventoryError::WorkspaceHeld(_))
+            ));
+        }
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "base-commit",
+                f.base_unix_ms,
+                checkpoint_payload(&advanced, advanced.base_commit_id, f.base_unix_ms)
+            ),
+            Err(InventoryError::SharedMutableJjChange(_))
+        ));
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "release",
+                f.base_unix_ms,
+                InventoryPayloadV1::ReleaseWorkspace {
+                    record_id: advanced.record_id.clone(),
+                    actor: advanced.owner_actor.clone(),
+                    released_unix_ms: f.base_unix_ms,
+                },
+            )
+            .unwrap();
+        let mut replacement = advanced.clone();
+        replacement.owner_actor = wrong_actor.owner_actor;
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "replacement",
+                f.base_unix_ms,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(replacement.clone()),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "stale-incarnation",
+                f.base_unix_ms,
+                checkpoint_payload(&advanced, new_commit, f.base_unix_ms)
+            ),
+            Err(InventoryError::UnresolvedOrMismatchedOwner(_))
+        ));
+        test_jj(&f.ws1_dir, &["new", "-m", "different mutable change"]);
+        let (different_change, different_commit) = jj_checkpoint(&f.ws1_dir);
+        assert_ne!(different_change, replacement.jj_working_copy_change_id);
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "switch-live-change",
+                f.base_unix_ms,
+                checkpoint_payload(&replacement, different_commit, f.base_unix_ms)
+            ),
+            Err(InventoryError::WorkspaceIdentityDrift(_))
+        ));
+        let mut switched = replacement.clone();
+        switched.jj_working_copy_change_id = different_change;
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "switch-expected-change",
+                f.base_unix_ms,
+                checkpoint_payload(&switched, different_commit, f.base_unix_ms)
+            ),
+            Err(InventoryError::SharedMutableJjChange(_))
+        ));
+        assert!(matches!(
+            registry.verify_workspace_for_mutation(
+                &replacement.record_id,
+                &replacement.owner_actor,
+                &replacement.task_ref,
+                f.base_unix_ms
+            ),
+            Err(InventoryError::WorkspaceIdentityDrift(_))
+        ));
+        assert_eq!(
+            registry.workspaces[&replacement.record_id].status,
+            WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
+        );
+
+        // An incomplete checkpoint event holds its owner on crash recovery.
+        let f = EnvFixture::new();
+        let record = s2b_workspace(&f, false);
+        let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "register",
+                2_000,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(record.clone()),
+                },
+            )
+            .unwrap();
+        test_jj(&f.ws1_dir, &["describe", "-m", "incomplete checkpoint"]);
+        let (_, new_commit) = jj_checkpoint(&f.ws1_dir);
+        let payload = checkpoint_payload(&record, new_commit, f.base_unix_ms);
+        registry.fail_next_result_append = true;
+        assert!(
+            registry
+                .submit_durable(&f.journal_path, "crashed-advance", f.base_unix_ms, payload)
+                .is_err()
+        );
+        let loaded =
+            ContinuousInventoryRegistryV1::load_and_reconcile(f.store_id, f.op_id, &f.journal_path)
+                .unwrap();
+        assert_eq!(
+            loaded.workspaces[&record.record_id].status,
+            WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
+        );
+        assert_eq!(loaded.workspaces[&record.record_id].pid_birth_binding, None);
+        assert!(loaded.incomplete_ops_held.contains_key("crashed-advance"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub enum GroupState {
     Executing,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid owned group leader")]
     InvalidGroup,
@@ -29,6 +29,162 @@ pub enum Error {
     Query(Option<i32>),
     #[error("invalid Darwin group snapshot: {0}")]
     Snapshot(&'static str),
+    #[error("Darwin process birth query failed: {0}")]
+    Sysctl(#[source] std::io::Error),
+    #[error("invalid Darwin process birth snapshot: {0}")]
+    Decode(&'static str),
+    #[error("Darwin process entry size {actual} != {expected}")]
+    EntrySize { actual: usize, expected: usize },
+}
+
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::InvalidGroup, Self::InvalidGroup) => true,
+            (Self::Query(a), Self::Query(b)) => a == b,
+            (Self::Snapshot(a), Self::Snapshot(b)) | (Self::Decode(a), Self::Decode(b)) => a == b,
+            (Self::Sysctl(a), Self::Sysctl(b)) => {
+                a.raw_os_error() == b.raw_os_error() && a.to_string() == b.to_string()
+            }
+            (
+                Self::EntrySize {
+                    actual: a,
+                    expected: b,
+                },
+                Self::EntrySize {
+                    actual: c,
+                    expected: d,
+                },
+            ) => a == c && b == d,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Error {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcStatus {
+    Idle,
+    Running,
+    Sleeping,
+    Stopped,
+    Zombie,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcBirthInfo {
+    pub pid: u32,
+    pub pgid: u32,
+    pub status: ProcStatus,
+    /// Kernel process start timestamp in microseconds since UNIX epoch
+    /// (`kinfo_proc.kp_proc.p_starttime`: `tv_sec * 1_000_000 + tv_usec`).
+    pub start_time_unix_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessBirthObservation {
+    Alive(ProcBirthInfo),
+    NotFoundOrZombie,
+}
+
+/// Inspect one PID without signaling or reaping it. A birth timestamp binds
+/// ownership to a process incarnation even when the kernel reuses its PID.
+#[allow(unsafe_code)]
+pub fn inspect_process_birth(pid: u32) -> Result<ProcessBirthObservation, Error> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(Error::Decode("PID outside positive pid_t range"));
+    }
+    let mut mib = [
+        CHINWAG_CTL_KERN as libc::c_int,
+        CHINWAG_KERN_PROC as libc::c_int,
+        CHINWAG_KERN_PROC_PID as libc::c_int,
+        pid as libc::c_int,
+    ];
+    let mut buffer = [0u8; CHINWAG_KINFO_SIZE as usize];
+    let mut size = buffer.len();
+    // SAFETY: initialized MIB and writable byte buffer have the supplied lengths.
+    // Null newp/newlen=0 is read-only; sysctl retains none of these pointers.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result == -1 {
+        let err = std::io::Error::last_os_error();
+        return if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(ProcessBirthObservation::NotFoundOrZombie)
+        } else {
+            Err(Error::Sysctl(err))
+        };
+    }
+    if size == 0 {
+        return Ok(ProcessBirthObservation::NotFoundOrZombie);
+    }
+    if size != buffer.len() {
+        return Err(Error::EntrySize {
+            actual: size,
+            expected: buffer.len(),
+        });
+    }
+    decode_process_birth(&buffer, pid)
+}
+
+fn birth_scalar<const N: usize>(bytes: &[u8], offset: u32) -> Result<[u8; N], Error> {
+    bytes
+        .get(offset as usize..)
+        .and_then(|tail| tail.get(..N))
+        .and_then(|scalar| scalar.try_into().ok())
+        .ok_or(Error::Decode("SDK scalar bounds"))
+}
+
+fn decode_process_birth(bytes: &[u8], expected_pid: u32) -> Result<ProcessBirthObservation, Error> {
+    if bytes.len() != CHINWAG_KINFO_SIZE as usize {
+        return Err(Error::EntrySize {
+            actual: bytes.len(),
+            expected: CHINWAG_KINFO_SIZE as usize,
+        });
+    }
+    let pid = i32::from_ne_bytes(birth_scalar(bytes, CHINWAG_PID_OFFSET)?);
+    if pid == 0 {
+        return Ok(ProcessBirthObservation::NotFoundOrZombie);
+    }
+    if pid < 0 || pid as u32 != expected_pid {
+        return Err(Error::Decode("kernel returned a different PID"));
+    }
+    let status = u32::from(birth_scalar::<1>(bytes, CHINWAG_STATUS_OFFSET)?[0]);
+    let status = match status {
+        CHINWAG_STATUS_IDLE => ProcStatus::Idle,
+        CHINWAG_STATUS_RUN => ProcStatus::Running,
+        CHINWAG_STATUS_SLEEP => ProcStatus::Sleeping,
+        CHINWAG_STATUS_STOP => ProcStatus::Stopped,
+        CHINWAG_STATUS_ZOMBIE => return Ok(ProcessBirthObservation::NotFoundOrZombie),
+        _ => return Err(Error::Decode("unknown process status")),
+    };
+    let pgid = i32::from_ne_bytes(birth_scalar(bytes, CHINWAG_PGID_OFFSET)?);
+    if pgid <= 0 {
+        return Err(Error::Decode("invalid process group"));
+    }
+    let tv_sec = i64::from_ne_bytes(birth_scalar(bytes, CHINWAG_START_TVSEC_OFFSET)?);
+    let tv_usec = i32::from_ne_bytes(birth_scalar(bytes, CHINWAG_START_TVUSEC_OFFSET)?);
+    if tv_sec <= 0 || !(0..1_000_000).contains(&tv_usec) {
+        return Err(Error::Decode("invalid process start timeval"));
+    }
+    let start_time_unix_us = (tv_sec as u64)
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(tv_usec as u64))
+        .ok_or(Error::Decode("process start timestamp overflow"))?;
+    Ok(ProcessBirthObservation::Alive(ProcBirthInfo {
+        pid: pid as u32,
+        pgid: pgid as u32,
+        status,
+        start_time_unix_us,
+    }))
 }
 
 /// Query only the supplied group. Ownership and its unreaped lifetime are held
@@ -154,6 +310,72 @@ fn classify(bytes: &[u8], group: NonZeroI32) -> Result<GroupState, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_process_birth_matches_pid_and_has_exact_microsecond_timestamp() {
+        let pid = std::process::id();
+        let ProcessBirthObservation::Alive(info) = inspect_process_birth(pid).unwrap() else {
+            panic!("current process must be alive");
+        };
+        assert_eq!(info.pid, pid);
+        assert!(info.pgid > 0);
+        assert!(info.start_time_unix_us > 0);
+        assert_eq!(
+            inspect_process_birth(pid).unwrap(),
+            ProcessBirthObservation::Alive(info)
+        );
+    }
+
+    #[test]
+    fn exited_child_process_is_not_found_or_zombie() {
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(
+            inspect_process_birth(pid).unwrap(),
+            ProcessBirthObservation::NotFoundOrZombie
+        );
+    }
+
+    #[test]
+    fn invalid_process_birth_pids_fail_closed() {
+        for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+            assert!(matches!(inspect_process_birth(pid), Err(Error::Decode(_))));
+        }
+    }
+
+    #[test]
+    fn synthetic_process_birth_zombie_timeval_bounds_pid_and_size_fail_closed() {
+        let mut bytes = row(42, 42, CHINWAG_STATUS_ZOMBIE);
+        assert_eq!(
+            decode_process_birth(&bytes, 42).unwrap(),
+            ProcessBirthObservation::NotFoundOrZombie
+        );
+        bytes[CHINWAG_STATUS_OFFSET as usize] = CHINWAG_STATUS_RUN as u8;
+        let offset = CHINWAG_START_TVSEC_OFFSET as usize;
+        bytes[offset..offset + 8].copy_from_slice(&123i64.to_ne_bytes());
+        let offset = CHINWAG_START_TVUSEC_OFFSET as usize;
+        for usec in [-1i32, 1_000_000, i32::MAX] {
+            bytes[offset..offset + 4].copy_from_slice(&usec.to_ne_bytes());
+            assert!(matches!(
+                decode_process_birth(&bytes, 42),
+                Err(Error::Decode(_))
+            ));
+        }
+        bytes[offset..offset + 4].copy_from_slice(&456i32.to_ne_bytes());
+        let ProcessBirthObservation::Alive(info) = decode_process_birth(&bytes, 42).unwrap() else {
+            panic!("live synthetic row");
+        };
+        assert_eq!(info.start_time_unix_us, 123_000_456);
+        assert!(matches!(
+            decode_process_birth(&bytes, 43),
+            Err(Error::Decode(_))
+        ));
+        assert!(matches!(
+            decode_process_birth(&bytes[..1], 42),
+            Err(Error::EntrySize { .. })
+        ));
+    }
     fn row(pid: i32, group: i32, status: u32) -> Vec<u8> {
         let mut row = vec![0; CHINWAG_KINFO_SIZE as usize];
         let offset = CHINWAG_PID_OFFSET as usize;
