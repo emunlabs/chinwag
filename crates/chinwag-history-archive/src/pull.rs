@@ -11,7 +11,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -31,32 +31,9 @@ struct Http {
 impl Http {
     fn keychain() -> Result<Self, String> {
         use crate::pull_plan::{ACCOUNT, SERVICE};
-        let mut child = Command::new("/usr/bin/security")
-            .args(["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| "credential reference unavailable")?;
-        let mut secret = Zeroizing::new(Vec::new());
-        child
-            .stdout
-            .take()
-            .ok_or("credential stream unavailable")?
-            .take(4097)
-            .read_to_end(&mut secret)
-            .map_err(|_| "credential stream failed")?;
-        if secret.len() > 4096 {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("credential outside bound".into());
-        }
-        if !child
-            .wait()
-            .map_err(|_| "credential lookup failed")?
-            .success()
-        {
-            return Err("credential reference unavailable".into());
-        }
+        let mut command = Command::new("/usr/bin/security");
+        command.args(["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"]);
+        let secret = crate::bounded_child::run(&mut command, Duration::from_secs(5), 4096)?;
         let token = std::str::from_utf8(&secret)
             .map_err(|_| "invalid credential encoding")?
             .trim_end_matches(['\r', '\n']);

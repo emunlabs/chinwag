@@ -12,4 +12,5 @@ mod pull_plan;
 pub use pull_plan::{ObjectSpec, PullPlan};
 mod pull;
 pub use pull::pull;
+mod bounded_child;
 mod namespace;
