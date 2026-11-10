@@ -65,6 +65,7 @@ enum BusFrame {
         original_digest_sha256: String,
     },
     NetworkPosture,
+    JournalChanged { observed_len: u64, observed_inode: u64, timeout_secs: u64 },
     Ping,
 }
 
@@ -787,6 +788,10 @@ async fn query_local_daemon(daemon: &DaemonState, frame: &BusFrame) -> Result<Va
                 && value["original_digest_sha256"] == *original_digest_sha256
         }
         BusFrame::NetworkPosture => value["schema"] == "chinwag.network-posture.v1",
+        BusFrame::JournalChanged { observed_len, observed_inode, .. } => {
+            value["schema"] == "chinwag.bus.journal-change.v1"
+                && value["observed_len"] == *observed_len && value["observed_inode"] == *observed_inode
+        }
         _ => false,
     };
     if !valid {
@@ -848,7 +853,8 @@ async fn exchange_local_frame(
     lookup.set_endpoint_info(addr.clone());
 
     let client = bind_bus_endpoint(actor_secret, 0, lookup).await?;
-    let result = tokio::time::timeout(Duration::from_secs(8), async {
+    let timeout = match frame { BusFrame::JournalChanged { timeout_secs, .. } => timeout_secs.saturating_add(8).min(3608), _ => 8 };
+    let result = tokio::time::timeout(Duration::from_secs(timeout), async {
         let connection = client
             .connect(addr, BUS_ALPN)
             .await
@@ -1689,6 +1695,24 @@ async fn run_daemon_loop_inner(
                                 "processing":"UNKNOWN", "work_started":"UNKNOWN"});
                             send_local_observation(&mut send, response).await; return;
                         }
+                        Ok(BusFrame::JournalChanged { observed_len, observed_inode, timeout_secs }) => {
+                            if !local_publisher_path(conn) || !(1..=3600).contains(&timeout_secs) {
+                                conn.close(0x403u32.into(), b"local_wait_refused"); return;
+                            }
+                            // Subscribe before comparing the client's catch-up mark.
+                            // No filesystem/state lock spans the asynchronous wait.
+                            let mut arrivals = tx_clone.subscribe();
+                            let mark = fs::symlink_metadata(messages_jsonl_path(&repo_clone)).ok().map(|m| {
+                                use std::os::unix::fs::MetadataExt;
+                                (m.len(), m.ino())
+                            }).unwrap_or((0,0));
+                            let changed = mark != (observed_len, observed_inode)
+                                || tokio::time::timeout(Duration::from_secs(timeout_secs), arrivals.recv()).await.is_ok();
+                            let response = json!({"schema":"chinwag.bus.journal-change.v1","daemon_endpoint_id":daemon_ep,
+                                "observed_len":observed_len,"observed_inode":observed_inode,"changed":changed,
+                                "scope":"LOCAL_CHANGE_HINT_ONLY"});
+                            send_local_observation(&mut send, response).await; return;
+                        }
                         _ => { conn.close(0x403u32.into(), b"bus_frame_refused"); return; }
                     };
                     let path = if federated {
@@ -1979,6 +2003,15 @@ pub(crate) fn invoke_admitted_bus_task(
 
 pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+    if matches!(sub, "wait" | "wait-ack" | "enroll-host" | "wait-reconcile") {
+        return chinwag_cli::bus_wait_cli::run(args, stdout, stderr, |repo, observed_len, observed_inode, timeout_secs| {
+            let daemon = read_daemon_state(repo).ok_or("WAKE_HOST_OFFLINE")?;
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| "WAKE_UNSUPPORTED")?;
+            let value = rt.block_on(query_local_daemon(&daemon, &BusFrame::JournalChanged { observed_len, observed_inode, timeout_secs }))
+                .map_err(|e| format!("WAKE_HOST_OFFLINE_OR_UNSUPPORTED: {e}"))?;
+            value["changed"].as_bool().ok_or_else(|| "WAKE_UNSUPPORTED".into())
+        });
+    }
     if sub == "--help" || sub == "-h" || sub == "help" {
         return print_bus_help(stdout);
     }
