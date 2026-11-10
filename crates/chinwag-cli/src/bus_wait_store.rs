@@ -284,7 +284,10 @@ mod tests {
     #[test]
     fn atomic_state_is_private_lock_excludes_other_owner_and_unsafe_names_refuse() {
         let repo = tempfile::tempdir().unwrap();
-        let store = PrivateStore::open(repo.path(), "cursors", "WORKHORSE#fixture").unwrap();
+        // macOS TMPDIR commonly uses /var -> /private/var. Keep production's
+        // no-symlink traversal intact and supply the fixture's physical path.
+        let root = fs::canonicalize(repo.path()).unwrap();
+        let store = PrivateStore::open(&root, "cursors", "WORKHORSE#fixture").unwrap();
         let lock = store.lock().unwrap();
         lock.write(&Witness {
             id: "one".into(),

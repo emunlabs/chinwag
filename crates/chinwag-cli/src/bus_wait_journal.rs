@@ -112,8 +112,9 @@ mod tests {
     #[test]
     fn empty_journal_and_partial_tail_are_distinct() {
         let repo = tempfile::tempdir().unwrap();
-        assert!(snapshot(repo.path()).unwrap().rows.is_empty());
-        std::fs::write(repo.path().join(".chinwag/bus/messages.jsonl"), b"{").unwrap();
-        assert!(snapshot(repo.path()).is_err());
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        assert!(snapshot(&root).unwrap().rows.is_empty());
+        std::fs::write(root.join(".chinwag/bus/messages.jsonl"), b"{").unwrap();
+        assert!(snapshot(&root).is_err());
     }
 }
