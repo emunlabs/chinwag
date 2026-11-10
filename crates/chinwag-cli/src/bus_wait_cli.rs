@@ -5,7 +5,7 @@ use crate::{
     bus_wait_grant::{Authority, HostGrant, owner_payload},
     bus_wait_journal::{anchored_snapshot, snapshot},
     bus_wait_message::{decode, hash},
-    bus_wait_store::{PrivateStore, random_token, read_private_path},
+    bus_wait_store::{PrivateStore, Witness, random_token, read_private_path},
 };
 use iroh::{EndpointId, Signature};
 use serde::{Deserialize, Serialize};
@@ -364,6 +364,12 @@ struct Reconciliation {
     expected_cursor_version: u64,
     expires_at_unix: u64,
     outcome: String,
+    #[serde(default)]
+    original_witnesses: Vec<Witness>,
+    #[serde(default)]
+    admission_id: Option<String>,
+    #[serde(default)]
+    turn_id: Option<String>,
     issuer_pubkey_ed25519: String,
     issuer_signature_ed25519: String,
 }
@@ -379,7 +385,10 @@ fn reconcile(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<ser
         || proof.issuer_pubkey_ed25519 != pin.to_string()
         || proof.expires_at_unix < now()
         || proof.expires_at_unix > 9_007_199_254_740_991
-        || proof.outcome != "NEVER_RECEIVED"
+        || !matches!(
+            proof.outcome.as_str(),
+            "NEVER_RECEIVED" | "ALREADY_PROCESSED"
+        )
     {
         return Err("INVALID_OWNER_PROOF".into());
     }
@@ -397,30 +406,94 @@ fn reconcile(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<ser
     if version != proof.expected_cursor_version {
         return Err("CURSOR_VERSION_CHANGED".into());
     }
-    let p = c
+    let index = c
         .pending_deliveries
-        .iter_mut()
-        .find(|p| {
+        .iter()
+        .position(|p| {
             p.delivery_id == proof.delivery_id
                 && p.admission_request_id == proof.admission_request_id
         })
         .ok_or("UNKNOWN_DELIVERY")?;
-    if p.state != DeliveryState::HeldUncertainPreAckOutcome || !p.quota_reserved || p.quota_charged
+    let p = &c.pending_deliveries[index];
+    let witnesses: Vec<Witness> = p
+        .messages
+        .iter()
+        .map(|m| Witness {
+            id: m.id.clone(),
+            digest: m.digest_sha256.clone(),
+        })
+        .collect();
+    if !p.state.held()
+        || witnesses.is_empty()
+        || serde_json::to_value(&witnesses).map_err(|_| "OWNER_ENCODING")?
+            != serde_json::to_value(&proof.original_witnesses).map_err(|_| "OWNER_ENCODING")?
+        || p.admission_id
+            .as_ref()
+            .is_some_and(|id| proof.admission_id.as_ref() != Some(id))
+        || p.turn_id
+            .as_ref()
+            .is_some_and(|id| proof.turn_id.as_ref() != Some(id))
     {
-        return Err("OWNER_RECONCILIATION_UNSUPPORTED_OUTCOME".into());
+        return Err("OWNER_RECONCILIATION_EVIDENCE_MISMATCH".into());
     }
-    p.state = DeliveryState::Received;
-    p.handoff_token_sha256 = None;
-    let lock = store.lock()?;
-    let current = load(&store, &g, &digest)?;
-    if current.version != version {
-        return Err("CURSOR_VERSION_CHANGED".into());
+    match proof.outcome.as_str() {
+        "NEVER_RECEIVED" => {
+            if p.state != DeliveryState::HeldUncertainPreAckOutcome
+                || !p.quota_reserved
+                || p.quota_charged
+                || p.host_admitted_at_unix.is_some()
+                || p.host_turn_started_at_unix.is_some()
+                || p.turn_id.is_some()
+                || proof.turn_id.is_some()
+            {
+                return Err("OWNER_RECONCILIATION_UNSUPPORTED_OUTCOME".into());
+            }
+            let p = &mut c.pending_deliveries[index];
+            p.state = DeliveryState::Received;
+            p.handoff_token_sha256 = None;
+            p.admission_id = None;
+            p.turn_id = None;
+            p.host_admitted_at_unix = None;
+            p.host_turn_started_at_unix = None;
+        }
+        "ALREADY_PROCESSED" => {
+            if p.quota_reserved == p.quota_charged || p.handoff_token_sha256.is_none() {
+                return Err("QUOTA_INVARIANT".into());
+            }
+            let admission = proof
+                .admission_id
+                .as_deref()
+                .ok_or("ADMISSION_ID_REQUIRED")?;
+            let turn = proof.turn_id.as_deref().ok_or("TURN_ID_REQUIRED")?;
+            c.pending_deliveries[index].state = if p.quota_charged {
+                DeliveryState::HostAdmitted
+            } else {
+                DeliveryState::PendingActiveTurn
+            };
+            c.acknowledge(
+                index,
+                "HOST_TURN_STARTED",
+                Some(admission),
+                Some(turn),
+                now(),
+            )?;
+            c.acknowledge(index, "PROCESSED", Some(admission), Some(turn), now())?;
+        }
+        _ => return Err("INVALID_OWNER_PROOF".into()),
     }
+    c.validate(&g, &digest)?;
+    grant(repo, actor, pin)?;
+    if proof.expires_at_unix < now() {
+        return Err("INVALID_OWNER_PROOF".into());
+    }
+    save(&store, version, &mut c)?;
+    // A crash before unlink leaves only an unusable token; the durable state
+    // already prevents replay, reservation release, and duplicate charging.
     store.remove_token(&proof.delivery_id)?;
-    c.version += 1;
-    lock.write(&c)?;
     Ok(
-        json!({"schema":"chinwag.bus.wait-reconciliation-receipt.v1","scope":"OWNER_ASSERTED_NEVER_RECEIVED","quota_preserved":true,"actor":actor,"delivery_id":proof.delivery_id}),
+        json!({"schema":"chinwag.bus.wait-reconciliation-receipt.v1",
+        "scope":format!("OWNER_ASSERTED_{}",proof.outcome),"quota_preserved":true,
+        "actor":actor,"delivery_id":proof.delivery_id,"original_witnesses":witnesses}),
     )
 }
 
@@ -899,6 +972,12 @@ mod tests {
             expected_cursor_version: f.cursor().version,
             expires_at_unix: now() + 60,
             outcome: "NEVER_RECEIVED".into(),
+            original_witnesses: vec![Witness {
+                id: "fixture-msg".into(),
+                digest: "d".repeat(64),
+            }],
+            admission_id: None,
+            turn_id: None,
             issuer_pubkey_ed25519: f.owner.public().to_string(),
             issuer_signature_ed25519: String::new(),
         };
@@ -925,6 +1004,79 @@ mod tests {
         .unwrap();
         assert_eq!(f.cursor().turns_reserved, 1);
         assert!(reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).is_err()); // stale proof cannot be replayed.
+    }
+    #[test]
+    fn r1_signed_processed_converts_reserved_once_and_preserves_charged_work() {
+        for charged in [false, true] {
+            let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+            f.seed_pending();
+            let mut c = f.cursor();
+            c.reserve(0, "e".repeat(64)).unwrap();
+            c.acknowledge(
+                0,
+                if charged {
+                    "HOST_ADMITTED"
+                } else {
+                    "PENDING_ACTIVE_TURN"
+                },
+                Some("admission"),
+                None,
+                now(),
+            )
+            .unwrap();
+            c.hold_uncertain(0).unwrap();
+            f.put(&c);
+            let mut proof = Reconciliation {
+                schema: "chinwag.bus.wait-reconciliation.v1".into(),
+                actor: f.grant.actor.clone(),
+                delivery_id: "a".repeat(64),
+                admission_request_id: "admreq-fixture".into(),
+                expected_cursor_version: c.version,
+                expires_at_unix: now() + 60,
+                outcome: "ALREADY_PROCESSED".into(),
+                original_witnesses: vec![Witness {
+                    id: "fixture-msg".into(),
+                    digest: "d".repeat(64),
+                }],
+                admission_id: Some("admission".into()),
+                turn_id: Some("owner-observed-turn".into()),
+                issuer_pubkey_ed25519: f.owner.public().to_string(),
+                issuer_signature_ed25519: String::new(),
+            };
+            let file = f.root.join("owner-processed");
+            let flags = Flags::from([("--owner-proof-file".into(), file.to_string_lossy().into())]);
+            let sign = |proof: &mut Reconciliation| {
+                proof.issuer_signature_ed25519 = hex(&f
+                    .owner
+                    .sign(&owner_payload("chinwag-wait-reconciliation-v1|", proof).unwrap())
+                    .to_bytes());
+                std::fs::write(&file, serde_json::to_vec(proof).unwrap()).unwrap();
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            };
+            proof.outcome = "NEVER_RECEIVED".into();
+            sign(&mut proof);
+            assert!(reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).is_err());
+            assert_eq!(
+                serde_json::to_value(f.cursor()).unwrap(),
+                serde_json::to_value(&c).unwrap()
+            );
+            proof.outcome = "ALREADY_PROCESSED".into();
+            proof.original_witnesses[0].digest = "bad".into();
+            sign(&mut proof);
+            assert!(reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).is_err());
+            proof.original_witnesses[0].digest = "d".repeat(64);
+            sign(&mut proof);
+            reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).unwrap();
+            let done = f.cursor();
+            assert_eq!((done.turns_reserved, done.turns_used), (0, 1));
+            assert!(done.pending_deliveries.is_empty());
+            assert_eq!(done.completed_deliveries.len(), 1);
+            assert!(reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).is_err());
+            assert_eq!(
+                serde_json::to_value(f.cursor()).unwrap(),
+                serde_json::to_value(done).unwrap()
+            );
+        }
     }
     #[test]
     #[ignore = "owner supplies preserved real native original through CHINWAG_INTEROP_FIXTURE"]
