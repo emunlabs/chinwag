@@ -1150,3 +1150,5 @@ mod instance_dispatch_parser_tests {
         }
     }
 }
+
+pub mod bus_wait_subscription;

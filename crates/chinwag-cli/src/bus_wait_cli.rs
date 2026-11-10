@@ -514,14 +514,16 @@ fn reconcile(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<ser
     )
 }
 
-fn wait<F>(
+fn wait_subscribed<S, F>(
     repo: &Path,
     actor: &str,
     f: &Flags,
     pin: EndpointId,
+    mut subscribe: S,
     mut changed: F,
 ) -> Result<(u8, serde_json::Value)>
 where
+    S: FnMut(&Path, u64) -> Result<()>,
     F: FnMut(&Path, u64, u64, u64) -> Result<bool>,
 {
     let timeout: u64 = f
@@ -554,6 +556,13 @@ where
                 json!({"status":"UNKNOWN","reason":"HOST_RECOVERY_LOOKUP_UNSUPPORTED","state":c.pending_deliveries[index].state,"host_admitted_at_unix":c.pending_deliveries[index].host_admitted_at_unix,"host_turn_started_at_unix":c.pending_deliveries[index].host_turn_started_at_unix}),
             ));
         }
+        subscribe(
+            repo,
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .clamp(1, 3600),
+        )?;
         let journal = anchored_snapshot(repo, &mut c)?;
         c.scan(&journal.rows, &g, now())?;
         c.last_scanned_inode = journal.inode;
@@ -605,15 +614,35 @@ where
         if remaining.is_zero() {
             return Ok((124, json!({"status":"TIMEOUT","actor":actor})));
         }
-        // Server subscribes before comparing this exact journal mark. Any append
-        // between catch-up and subscription forces immediate rescan, closing the gap.
+        // Consume the receiver registered before this catch-up. Marks are
+        // additional hints only; they do not establish the subscription.
         if !changed(repo, journal.len, journal.inode, remaining.as_secs().max(1))? {
             return Ok((124, json!({"status":"TIMEOUT","actor":actor})));
         }
     }
 }
-pub fn run<F>(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write, changed: F) -> u8
+#[cfg(test)]
+fn wait<F>(
+    repo: &Path,
+    actor: &str,
+    flags: &Flags,
+    pin: EndpointId,
+    changed: F,
+) -> Result<(u8, serde_json::Value)>
 where
+    F: FnMut(&Path, u64, u64, u64) -> Result<bool>,
+{
+    wait_subscribed(repo, actor, flags, pin, |_, _| Ok(()), changed)
+}
+pub fn run<S, F>(
+    args: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    subscribe: S,
+    changed: F,
+) -> u8
+where
+    S: FnMut(&Path, u64) -> Result<()>,
     F: FnMut(&Path, u64, u64, u64) -> Result<bool>,
 {
     let result = (|| {
@@ -631,7 +660,7 @@ where
             "enroll-host" => Ok((0, enroll(repo, actor, &f, pin)?)),
             "wait-ack" => Ok((0, ack(repo, actor, &f, pin)?)),
             "wait-reconcile" => Ok((0, reconcile(repo, actor, &f, pin)?)),
-            "wait" => wait(repo, actor, &f, pin, changed),
+            "wait" => wait_subscribed(repo, actor, &f, pin, subscribe, changed),
             _ => Err("UNKNOWN_WAIT_COMMAND".into()),
         }
     })();
