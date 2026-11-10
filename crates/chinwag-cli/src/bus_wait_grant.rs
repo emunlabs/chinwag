@@ -89,12 +89,14 @@ impl HostGrant {
             &self.issuer_signature_ed25519,
             pinned,
         )?;
-        let address = ActorAddress::parse(actor)
+        ActorAddress::parse(actor)
             .and_then(ActorAddress::require_instance)
             .map_err(|_| "INVALID_ENROLLED_ACTOR")?;
         if self.schema != "chinwag.host.enrollment.v3"
             || self.actor != actor
-            || address.instance() != Some(self.conversation_id.as_str())
+            || self.conversation_id.is_empty()
+            || self.conversation_id.len() > 256
+            || self.conversation_id.chars().any(char::is_control)
             || self.grant_id.is_empty()
             || self.grant_id.len() > 160
             || self.host_version.len() > 128
@@ -214,6 +216,34 @@ mod tests {
         forged.max_turns_quota = 100;
         assert!(
             forged
+                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .is_err()
+        );
+        // Only an owner signature can bind the qualified native actor to this
+        // exact different host conversation. It is no live access proof.
+        grant.conversation_id = "different-exact-host-chat".into();
+        assert!(
+            grant
+                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .is_err()
+        );
+        grant.issuer_signature_ed25519 = hex(&owner
+            .sign(&owner_payload("chinwag-host-enrollment-v3|", &grant).unwrap())
+            .to_bytes());
+        assert!(
+            grant
+                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .is_ok()
+        );
+        assert!(
+            grant
+                .verify(&authority, owner.public(), "WORKHORSE", 2)
+                .is_err()
+        );
+        let mut changed_chat = grant.clone();
+        changed_chat.conversation_id = "wrong-chat".into();
+        assert!(
+            changed_chat
                 .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
                 .is_err()
         );
