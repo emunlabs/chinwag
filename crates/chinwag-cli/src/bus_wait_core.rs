@@ -119,10 +119,18 @@ impl Cursor {
                     .filter(|p| p.quota_charged)
                     .count() as u64
                     + self.completed_deliveries.len() as u64
-            || self
-                .pending_deliveries
-                .iter()
-                .any(|p| p.quota_charged && p.quota_reserved)
+            || self.pending_deliveries.iter().any(|p| {
+                (p.quota_charged && p.quota_reserved)
+                    || (p.quota_charged != p.host_admitted_at_unix.is_some())
+                    || (p.turn_id.is_some() != p.host_turn_started_at_unix.is_some())
+                    || (p.turn_id.is_some() && !p.quota_charged)
+                    || (p.quota_charged && p.admission_id.is_none())
+                    || (p.state == DeliveryState::Received && p.quota_charged)
+                    || (p.state != DeliveryState::Received && !p.quota_reserved && !p.quota_charged)
+                    || (p.state == DeliveryState::HeldUncertainPreAckOutcome && p.quota_charged)
+                    || (p.state == DeliveryState::PendingActiveTurn
+                        && (!p.quota_reserved || p.admission_id.is_none()))
+            })
             || self
                 .pending_deliveries
                 .iter()

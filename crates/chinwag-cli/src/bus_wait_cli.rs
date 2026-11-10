@@ -371,7 +371,7 @@ fn ack(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<serde_jso
         "scope":"LOCAL_HOST_LIFECYCLE_ONLY","content_disposition":"DATA_ONLY","pending_messages":pending_messages}),
     )
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reconciliation {
     schema: String,
@@ -1111,6 +1111,33 @@ mod tests {
             sign(&mut proof);
             assert!(reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).is_err());
             proof.original_witnesses[0].digest = "d".repeat(64);
+            for variant in 0..5 {
+                let mut invalid = proof.clone();
+                match variant {
+                    0 => invalid.expected_cursor_version += 1,
+                    1 => invalid.actor = "WORKHORSE#wrong".into(),
+                    2 => invalid.expires_at_unix = now() - 1,
+                    3 => invalid.admission_id = Some("wrong-admission".into()),
+                    _ => invalid.original_witnesses.clear(),
+                }
+                sign(&mut invalid);
+                assert!(reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).is_err());
+                assert_eq!(
+                    serde_json::to_value(f.cursor()).unwrap(),
+                    serde_json::to_value(&c).unwrap()
+                );
+            }
+            let mut inconsistent = c.clone();
+            inconsistent.pending_deliveries[0].quota_reserved = true;
+            inconsistent.pending_deliveries[0].quota_charged = true;
+            f.put(&inconsistent);
+            sign(&mut proof);
+            assert!(reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).is_err());
+            assert_eq!(
+                serde_json::to_value(f.cursor()).unwrap(),
+                serde_json::to_value(inconsistent).unwrap()
+            );
+            f.put(&c);
             sign(&mut proof);
             reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).unwrap();
             let done = f.cursor();
@@ -1123,6 +1150,28 @@ mod tests {
                 serde_json::to_value(done).unwrap()
             );
         }
+    }
+    #[test]
+    fn r1_subscription_boundary_concurrent_cursor_change_refuses_stale_scan() {
+        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let error = wait_subscribed(
+            &f.root,
+            &f.grant.actor,
+            &Flags::new(),
+            f.owner.public(),
+            |_, _| {
+                assert!(f.store().lock().is_ok());
+                let mut c = f.cursor();
+                c.version += 1;
+                f.put(&c);
+                Ok(())
+            },
+            |_, _, _, _| panic!("CAS must reject before blocking"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "CURSOR_VERSION_CHANGED");
+        assert_eq!(f.cursor().version, 1);
+        assert!(f.cursor().pending_deliveries.is_empty());
     }
     #[test]
     #[ignore = "owner supplies preserved real native original through CHINWAG_INTEROP_FIXTURE"]
@@ -1147,13 +1196,24 @@ mod tests {
         let mut line = serde_json::to_vec(&message).unwrap();
         line.push(b'\n');
         let path = f.root.join(".chinwag/bus/messages.jsonl");
-        std::fs::write(path, &line).unwrap();
-        let (code, envelope) = wait(
+        // A deterministic append/rotation after registration and before the
+        // first scan must deliver this unchanged signed original exactly once.
+        std::fs::write(&path, b"").unwrap();
+        let mut registrations = 0;
+        let (code, envelope) = wait_subscribed(
             &f.root,
             &f.grant.actor,
             &Flags::new(),
             f.owner.public(),
-            |_, _, _, _| panic!("verified existing original must catch up"),
+            |_, _| {
+                assert_eq!(registrations, 0);
+                registrations += 1;
+                assert!(f.store().lock().is_ok());
+                std::fs::rename(&path, path.with_file_name("messages.boundary.jsonl")).unwrap();
+                std::fs::write(&path, &line).unwrap();
+                Ok(())
+            },
+            |_, _, _, _| panic!("verified boundary original must catch up"),
         )
         .unwrap();
         assert_eq!(code, 0);
@@ -1163,6 +1223,18 @@ mod tests {
         );
         assert_eq!(f.cursor().turns_reserved, 1);
         assert_eq!(f.cursor().turns_used, 0);
+        assert_eq!(registrations, 1);
+        let held = wait_subscribed(
+            &f.root,
+            &f.grant.actor,
+            &Flags::new(),
+            f.owner.public(),
+            |_, _| panic!("held recovery precedes subscriptions"),
+            |_, _, _, _| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(held.0, 75);
+        assert_eq!(f.cursor().pending_deliveries.len(), 1);
     }
     #[test]
     fn argv_tokens_and_duplicate_flags_refuse() {

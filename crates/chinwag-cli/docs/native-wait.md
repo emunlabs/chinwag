@@ -70,20 +70,27 @@ orphan preceding the atomic reservation is cleared only after checking that no
 committed handoff exists; a committed uncertain handoff is never blindly
 re-emitted.
 
-The native daemon subscribes before comparing the client's journal mark. An
-arrival between catch-up and subscription changes that mark and forces a
-rescan. A notification is only a hint: actual originals and current owner
-authority are checked again. This mechanism requires a daemon version that
-supports the local change-hint frame. It has no empty polling/model turn and
-no provider API call in its wait path.
+The wait client registers an explicit bounded local-daemon subscription before
+opening its catch-up snapshot. Registration is acknowledged only after a
+broadcast receiver exists. The subsequent wait consumes that exact receiver;
+a journal mark is only an additional hint. Ready delivery, errors and return
+cancel unused subscriptions. Registrations are single-use, have an expiry,
+and are bounded to 64 entries; expired entries are pruned on registration.
+This requires a daemon implementing the subscription frames. An older daemon
+fails closed; installing or switching operational binaries is separate work.
+No cursor lock spans registration, waiting, output or other IPC.
 
 Each batch has at most 16 messages and a 256 KiB serialized envelope. This
 implementation conservatively holds at 64 pending messages. A journal snapshot
 is bounded at 64 MiB with 1 MiB record bounds; larger history reports explicit
-backpressure. Rotation resolution searches at most eight `messages.jsonl.*`
-archives and 64 MiB cumulative archive bytes. It drains the exact archived
-anchor's remaining tail before moving to a new generation, retaining original
-ID/digest witnesses. Missing anchors fail closed.
+backpressure. Rotation resolution searches at most eight `messages.jsonl.*` or
+`messages.*.jsonl` archives within a cumulative 64 MiB snapshot bound. It drains
+the anchored generation before each successor. Every generation edge requires
+a verified repeated terminal original as the successor's first row. Names,
+timestamps and unsigned sequence order do not prove an edge. Missing,
+conflicting or ambiguous evidence fails closed, including legacy rotations
+without overlap evidence. Pending-active acknowledgements traverse the same
+bounded chain while capacity remains.
 
 | Exit | Meaning |
 | --- | --- |
@@ -122,12 +129,24 @@ restart, a committed pre-ACK handoff therefore holds
 `HELD_UNCERTAIN_HOST_OUTCOME`. Quota and original messages stay retained. A grant
 claiming lookup support does not fabricate an actual host lookup capability.
 
-`wait-reconcile --owner-proof-file <private-owner-signed-json>` supports the
-owner's explicit `NEVER_RECEIVED` assertion for a held pre-ACK handoff. The proof
-binds actor, delivery, admission request, expected cursor version and expiry.
-It releases no quota slot, cannot be replayed after the version changes, and is
-reported as an owner assertion. Other outcomes remain held for a separately
-admitted host reconciliation adapter; they are not silently considered done.
+`wait-reconcile --owner-proof-file <private-owner-signed-json>` accepts
+`NEVER_RECEIVED` and `ALREADY_PROCESSED`. Each closed proof binds the actor,
+delivery, admission request, expected cursor version, expiry, exact ordered
+`original_witnesses` (`id`/`digest`) and optional `admission_id`/`turn_id`.
+Owner signatures and current enrollment authority are checked independently.
+`ALREADY_PROCESSED` requires admission and turn evidence and completes held
+work using its actual reservation/charge flags: one reserved slot becomes one
+used slot, or an already used slot stays charged once. It records the original
+witnesses durably before token unlink. This is an owner assertion, not an
+observed host completion. `NEVER_RECEIVED` is restricted to held pre-admission
+work; it preserves operation identities and the reserved slot, clears stale
+host witnesses, and cannot reset admitted or started work. Stale, altered,
+expired, inconsistent or replayed proofs do not change durable accounting.
+
+An owner-signed grant may bind a qualified native actor to a different exact
+host conversation ID. Changing that conversation requires a new valid owner
+signature; actor, issuer, epoch, expiry, revocation and exact grant checks
+remain in force. This binding validation does not prove live same-chat access.
 
 Source/unit fixtures exercise cryptography, local authentication, batching,
 durability transitions, rotation, native timeout and notification ordering.
