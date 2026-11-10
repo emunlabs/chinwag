@@ -2,25 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{Event, Manifest, digest, duckdb_ffi::DuckDb, model::MAX_INPUT};
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::{
     collections::BTreeSet,
-    fs::{self, OpenOptions},
+    fs,
     io::{Read, Write},
     path::Path,
 };
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
-fn literal(s: &str) -> String {
+pub(crate) fn literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 pub fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(0x100)
-        .open(path)
-        .map_err(error)?;
+    let mut file = crate::namespace::open_checked(path, false)?;
     let m = file.metadata().map_err(error)?;
     if !m.is_file() || m.nlink() != 1 || m.len() > MAX_INPUT {
         return Err("input is not a bounded regular nonlinked file".into());
@@ -35,26 +31,27 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
-fn private_dir(path: &Path) -> Result<(), String> {
-    let m = fs::symlink_metadata(path).map_err(error)?;
+pub(crate) fn private_dir(path: &Path) -> Result<(), String> {
+    let directory = crate::namespace::open_checked(path, true)?;
+    let m = directory.metadata().map_err(error)?;
     if !m.is_dir() || m.file_type().is_symlink() || m.mode() & 0o777 != 0o700 {
         return Err("dataset directory must be a physical mode0700 directory".into());
     }
     Ok(())
 }
 fn immutable(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(error)?;
+    let mut f = crate::namespace::create_file(path)?;
     f.write_all(bytes).map_err(error)?;
     f.sync_all().map_err(error)
 }
 pub fn events(path: &Path) -> Result<Vec<Event>, String> {
-    let data = read_bounded(path)?;
-    let text = std::str::from_utf8(&data).map_err(error)?;
+    events_bytes(&read_bounded(path)?)
+}
+pub(crate) fn events_bytes(data: &[u8]) -> Result<Vec<Event>, String> {
+    if data.len() as u64 > MAX_INPUT {
+        return Err("input outside byte bound".into());
+    }
+    let text = std::str::from_utf8(data).map_err(error)?;
     let mut ids = BTreeSet::new();
     let mut out = Vec::new();
     for line in text.lines() {
@@ -77,7 +74,7 @@ struct Dataset {
     jsonl_sha256: String,
     parquet_sha256: String,
 }
-fn connect(path: &Path) -> Result<DuckDb, String> {
+pub(crate) fn connect(path: &Path) -> Result<DuckDb, String> {
     let db = DuckDb::open(path)?;
     db.execute("SET autoinstall_known_extensions=false; SET autoload_known_extensions=false; SET memory_limit='128MB'; SET threads=1;")?;
     Ok(db)
@@ -97,14 +94,8 @@ pub fn ingest(manifest: &Manifest, input: &Path, root: &Path) -> Result<serde_js
     if fs::read_dir(root).map_err(error)?.next().is_some() {
         return Err("dataset root must be empty; archives are immutable".into());
     }
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(root.join("objects"))
-        .map_err(error)?;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(root.join("cache"))
-        .map_err(error)?;
+    crate::namespace::mkdir_private(&root.join("objects"))?;
+    crate::namespace::mkdir_private(&root.join("cache"))?;
     let jsonl_sha256 = digest(canonical.as_bytes());
     immutable(
         &root.join("objects").join(format!("{jsonl_sha256}.jsonl")),

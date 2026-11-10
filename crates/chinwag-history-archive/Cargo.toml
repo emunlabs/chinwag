@@ -9,3 +9,7 @@ license.workspace = true
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls-no-provider"] }
+zeroize = "=1.9.1"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustix = { version = "=1.1.5", features = ["fs", "process"] }

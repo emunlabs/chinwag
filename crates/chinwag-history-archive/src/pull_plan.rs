@@ -67,7 +67,7 @@ impl PullPlan {
         if object.key != self.jsonl.key && object.key != self.parquet.key {
             return Err("unapproved object".into());
         }
-        let key = object.key.replace('/', "%2F").replace(':', "%3A");
+        let key = object.key.replace(':', "%3A");
         Ok(format!(
             "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/r2/buckets/{BUCKET}/objects/{key}"
         ))

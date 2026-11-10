@@ -9,4 +9,7 @@ pub use store::{Archive, events, ingest, read_bounded};
 mod cli;
 pub use cli::run_cli;
 mod pull_plan;
-pub use pull_plan::{PullPlan,ObjectSpec};
+pub use pull_plan::{ObjectSpec, PullPlan};
+mod pull;
+pub use pull::pull;
+mod namespace;

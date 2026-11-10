@@ -113,6 +113,49 @@ fn actual_history_dispatch_is_bounded_approved_immutable_and_isolated() {
             .status
             .success()
     );
+    fs::write(&source, format!("{event}\n")).unwrap();
+    assert!(
+        run(&["history", "inspect", source.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let ancestor = temp.path().join("redirect-parent");
+    std::os::unix::fs::symlink(temp.path(), &ancestor).unwrap();
+    let alias = ancestor.join("events.jsonl");
+    let refused = run(&["history", "inspect", alias.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("ancestor"));
+    let alias = ancestor.join("dataset");
+    let refused = run(&["history", "read-event", alias.to_str().unwrap(), "e1"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("ancestor"));
+    let fifo = temp.path().join("input-fifo");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+        .args(["history", "inspect", fifo.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("FIFO inspection blocked");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let object = fs::read_dir(root.join("objects"))
         .unwrap()
         .map(|e| e.unwrap().path())

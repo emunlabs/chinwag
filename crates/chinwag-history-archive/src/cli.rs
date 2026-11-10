@@ -32,6 +32,9 @@ fn inspect(input: &str, offset: usize) -> Result<serde_json::Value, String> {
 }
 fn execute(args: &[String]) -> Result<serde_json::Value, String> {
     match args {
+ [op,plan,expected] if op=="pull-plan"=>crate::PullPlan::load(Path::new(plan),expected)?.describe(),
+ [op,plan,expected,root,flag] if op=="pull"&&flag=="--network"=>crate::pull(&crate::PullPlan::load(Path::new(plan),expected)?,Path::new(root),true),
+
  [op,input] if op=="inspect"=>inspect(input,0),
  [op,input,offset] if op=="inspect"=>inspect(input,offset.parse::<usize>().map_err(|e|e.to_string())?),
  [op,manifest,input,root] if op=="ingest"=>{
@@ -63,7 +66,8 @@ pub fn run_cli(args: &[String], out: &mut impl Write, err: &mut impl Write) -> u
             }
         }
         Err(e) => {
-            let _ = writeln!(err, "history: {e}");
+            let bounded = e.chars().take(512).collect::<String>();
+            let _ = writeln!(err, "history: {bounded}");
             2
         }
     }
