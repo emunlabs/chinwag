@@ -811,6 +811,30 @@ async fn send_local_observation(send: &mut iroh::endpoint::SendStream, response:
     }
 }
 
+async fn native_journal_change_hint<T: Clone>(
+    sender: &broadcast::Sender<T>, timeout: Duration, mark_changed: impl FnOnce() -> bool,
+) -> bool {
+    let mut arrivals = sender.subscribe();
+    mark_changed() || tokio::time::timeout(timeout, arrivals.recv()).await.is_ok()
+}
+
+#[cfg(test)]
+mod native_wait_hint_tests {
+    use super::*;
+    #[tokio::test]
+    async fn bus_wait_subscription_precedes_mark_and_native_timeout_has_no_cursor_lock() {
+        let (sender, _) = broadcast::channel::<()>(1);
+        // An arrival during the mark observation must already have a receiver.
+        assert!(native_journal_change_hint(&sender, Duration::from_secs(1), || {
+            assert_eq!(sender.send(()).unwrap(), 1); false
+        }).await);
+        let started = Instant::now();
+        assert!(!native_journal_change_hint(&sender, Duration::from_millis(40), || false).await);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(native_journal_change_hint(&sender, Duration::from_secs(1), || true).await);
+    }
+}
+
 async fn exchange_local_frame(
     daemon: &DaemonState,
     actor_secret: SecretKey,
@@ -1701,13 +1725,13 @@ async fn run_daemon_loop_inner(
                             }
                             // Subscribe before comparing the client's catch-up mark.
                             // No filesystem/state lock spans the asynchronous wait.
-                            let mut arrivals = tx_clone.subscribe();
-                            let mark = fs::symlink_metadata(messages_jsonl_path(&repo_clone)).ok().map(|m| {
-                                use std::os::unix::fs::MetadataExt;
-                                (m.len(), m.ino())
-                            }).unwrap_or((0,0));
-                            let changed = mark != (observed_len, observed_inode)
-                                || tokio::time::timeout(Duration::from_secs(timeout_secs), arrivals.recv()).await.is_ok();
+                            let changed = native_journal_change_hint(&tx_clone, Duration::from_secs(timeout_secs), || {
+                                let mark = fs::symlink_metadata(messages_jsonl_path(&repo_clone)).ok().map(|m| {
+                                    use std::os::unix::fs::MetadataExt;
+                                    (m.len(), m.ino())
+                                }).unwrap_or((0,0));
+                                mark != (observed_len, observed_inode)
+                            }).await;
                             let response = json!({"schema":"chinwag.bus.journal-change.v1","daemon_endpoint_id":daemon_ep,
                                 "observed_len":observed_len,"observed_inode":observed_inode,"changed":changed,
                                 "scope":"LOCAL_CHANGE_HINT_ONLY"});

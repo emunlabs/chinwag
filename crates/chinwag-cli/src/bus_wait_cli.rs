@@ -3,7 +3,7 @@
 use crate::{
     bus_wait_core::{Cursor, DeliveryState},
     bus_wait_grant::{Authority, HostGrant, owner_payload},
-    bus_wait_journal::snapshot,
+    bus_wait_journal::{anchored_snapshot, snapshot},
     bus_wait_message::{decode, hash},
     bus_wait_store::{PrivateStore, random_token, read_private_path},
 };
@@ -305,6 +305,12 @@ fn ack(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<serde_jso
             f.get("--turn-id").map(String::as_str),
             now(),
         )?;
+        if state == "PENDING_ACTIVE_TURN" {
+            let journal = anchored_snapshot(repo, &mut c)?;
+            c.coalesce_active(index, &journal.rows, &g, now())?;
+            c.last_scanned_inode = journal.inode;
+            c.last_scanned_line1_digest = journal.first_digest;
+        }
         // Recheck current signed authority immediately before committing.
         grant(repo, actor, pin)?;
         save(&store, version, &mut c)?;
@@ -330,8 +336,14 @@ fn ack(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<serde_jso
         }
         store.remove_token(delivery)?;
     }
+    let pending_messages = c
+        .pending_deliveries
+        .iter()
+        .find(|p| p.delivery_id == delivery)
+        .map(|p| &p.messages);
     Ok(
-        json!({"schema":"chinwag.bus.wait-ack.v1","actor":actor,"delivery_id":delivery,"state":state,"scope":"LOCAL_HOST_LIFECYCLE_ONLY"}),
+        json!({"schema":"chinwag.bus.wait-ack.v1","actor":actor,"delivery_id":delivery,"state":state,
+        "scope":"LOCAL_HOST_LIFECYCLE_ONLY","content_disposition":"DATA_ONLY","pending_messages":pending_messages}),
     )
 }
 #[derive(Serialize, Deserialize)]
@@ -438,8 +450,7 @@ where
                 json!({"status":"UNKNOWN","reason":"HOST_RECOVERY_LOOKUP_UNSUPPORTED","state":c.pending_deliveries[index].state,"host_admitted_at_unix":c.pending_deliveries[index].host_admitted_at_unix,"host_turn_started_at_unix":c.pending_deliveries[index].host_turn_started_at_unix}),
             ));
         }
-        let journal = snapshot(repo)?;
-        journal.anchor(&c)?;
+        let journal = anchored_snapshot(repo, &mut c)?;
         c.scan(&journal.rows, &g, now())?;
         c.last_scanned_inode = journal.inode;
         c.last_scanned_line1_digest = journal.first_digest;

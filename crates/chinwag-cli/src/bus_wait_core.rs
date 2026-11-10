@@ -173,8 +173,24 @@ impl Cursor {
     }
     // Private test seam permits ephemeral fixture pins without adding a
     // production CLI or public constructor that can replace the compiled pins.
-    fn scan_checked(&mut self, rows: &[BusMessage], grant: &HostGrant, now: u64,
-        mut verified: impl FnMut(&BusMessage) -> bool) -> Result<bool, String> {
+    fn scan_checked(
+        &mut self,
+        rows: &[BusMessage],
+        grant: &HostGrant,
+        now: u64,
+        verified: impl FnMut(&BusMessage) -> bool,
+    ) -> Result<bool, String> {
+        self.scan_limited(rows, grant, now, 16, 250 * 1024, verified)
+    }
+    fn scan_limited(
+        &mut self,
+        rows: &[BusMessage],
+        grant: &HostGrant,
+        now: u64,
+        max_batch: usize,
+        max_bytes: usize,
+        mut verified: impl FnMut(&BusMessage) -> bool,
+    ) -> Result<bool, String> {
         let pending = self
             .pending_deliveries
             .iter()
@@ -187,7 +203,7 @@ impl Cursor {
         let mut bytes = 0;
         let before = self.last_scanned_seq;
         for message in rows.iter().filter(|m| m.seq > before) {
-            if batch.len() >= 16 || pending + batch.len() >= 64 {
+            if batch.len() >= max_batch || pending + batch.len() >= 64 {
                 break;
             }
             let eligible = verified(message)
@@ -208,7 +224,10 @@ impl Cursor {
                 let size = serde_json::to_vec(message)
                     .map_err(|_| "MESSAGE_ENCODING")?
                     .len();
-                if bytes + size > 250 * 1024 {
+                if bytes + size > max_bytes {
+                    if batch.is_empty() && max_bytes == 250 * 1024 {
+                        return Err("BACKPRESSURE_ENVELOPE_OVERSIZED".into());
+                    }
                     break;
                 }
                 bytes += size;
@@ -252,6 +271,53 @@ impl Cursor {
             });
         }
         Ok(self.last_scanned_seq != before)
+    }
+    /// An adapter explicitly reporting ACTIVE can collect more verified data
+    /// for the same not-yet-started follow-up. No new host request or quota slot.
+    pub fn coalesce_active(
+        &mut self,
+        index: usize,
+        rows: &[BusMessage],
+        grant: &HostGrant,
+        now: u64,
+    ) -> Result<bool, String> {
+        self.coalesce_checked(index, rows, grant, now, |m| verify_original(m).is_ok())
+    }
+    fn coalesce_checked(
+        &mut self,
+        index: usize,
+        rows: &[BusMessage],
+        grant: &HostGrant,
+        now: u64,
+        verified: impl FnMut(&BusMessage) -> bool,
+    ) -> Result<bool, String> {
+        let p = self
+            .pending_deliveries
+            .get(index)
+            .ok_or("UNKNOWN_DELIVERY")?;
+        if p.state != DeliveryState::PendingActiveTurn {
+            return Err("DELIVERY_NOT_QUEUED".into());
+        }
+        let room = 16usize.saturating_sub(p.messages.len());
+        if room == 0 {
+            return Ok(false);
+        }
+        let used = p.messages.iter().try_fold(0usize, |sum, m| {
+            serde_json::to_vec(m)
+                .map(|b| sum + b.len())
+                .map_err(|_| "MESSAGE_ENCODING")
+        })?;
+        let bytes = (250usize * 1024).saturating_sub(used);
+        if bytes == 0 {
+            return Ok(false);
+        }
+        let count = self.pending_deliveries.len();
+        let changed = self.scan_limited(rows, grant, now, room, bytes, verified)?;
+        if self.pending_deliveries.len() > count {
+            let new = self.pending_deliveries.pop().ok_or("COALESCE_INVARIANT")?;
+            self.pending_deliveries[index].messages.extend(new.messages);
+        }
+        Ok(changed)
     }
     pub fn reserve(&mut self, index: usize, token_hash: String) -> Result<(), String> {
         let delivery = self
@@ -430,6 +496,8 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus_wait_message::{decode, hex, message_digest, signing_payload};
+    use iroh::{SecretKey, Signature};
     fn cursor() -> Cursor {
         serde_json::from_value(serde_json::json!({"schema":"chinwag.bus.durable-cursor-and-quota.v4",
             "actor":"WORKHORSE#test","grant_id":"grant","authority_epoch":1,"grant_digest_sha256":"hash",
@@ -452,6 +520,86 @@ mod tests {
             host_admitted_at_unix: None,
             host_turn_started_at_unix: None,
         }
+    }
+    #[test]
+    fn signed_bursts_are_bounded_deduplicated_and_backpressure_never_advances_cursor() {
+        let key = SecretKey::generate();
+        let public = key.public();
+        let grant:HostGrant=serde_json::from_value(serde_json::json!({"schema":"chinwag.host.enrollment.v3","grant_id":"grant","authority_epoch":1,"actor":"WORKHORSE#test",
+            "host_kind":"antigravity_bg_task","host_version":"fixture","conversation_id":"test","supports_idempotent_admission_lookup":false,"allow_legacy_plaintext":true,
+            "owner":"fixture","granted_capabilities":["bus_wait","same_chat_wake"],"allowed_rooms":["#eng"],"allowed_tasks":["TEST"],"max_turns_quota":1,"enrolled_at_unix":1,"expires_at_unix":100,
+            "issuer_pubkey_ed25519":public.to_string(),"issuer_signature_ed25519":"fixture"})).unwrap();
+        let mut rows = Vec::new();
+        for n in 1..=80 {
+            let mut m:BusMessage=serde_json::from_value(serde_json::json!({"id":format!("fixture-{n}"),"seq":n,"ts_unix":1,"ts_iso":"fixture","room":"#eng","sender":"GEMINI-PM#fixture","sender_cast":"",
+                "sender_endpoint_id":public.to_string(),"to":"WORKHORSE#test","task_id":"TEST","body":"fixture @OTHER","digest_sha256":"","pubkey_ed25519":public.to_string(),"signature_ed25519":null,"sig_verified":false})).unwrap();
+            m.digest_sha256 = message_digest(&m);
+            m.signature_ed25519 = Some(hex(&key.sign(signing_payload(&m).as_bytes()).to_bytes()));
+            rows.push(m);
+        }
+        rows.insert(1, rows[0].clone());
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.seq = i as u64 + 1;
+        }
+        let verify = |m: &BusMessage| {
+            m.digest_sha256 == message_digest(m)
+                && public
+                    .verify(
+                        signing_payload(m).as_bytes(),
+                        &Signature::from_bytes(
+                            &decode::<64>(m.signature_ed25519.as_deref().unwrap()).unwrap(),
+                        ),
+                    )
+                    .is_ok()
+        };
+        let mut c = cursor();
+        let mut queued = cursor();
+        queued.scan_checked(&rows[..5], &grant, 2, verify).unwrap();
+        queued.reserve(0, "token".into()).unwrap();
+        queued
+            .acknowledge(0, "PENDING_ACTIVE_TURN", Some("queued"), None, 2)
+            .unwrap();
+        let request = queued.pending_deliveries[0].admission_request_id.clone();
+        queued
+            .coalesce_checked(0, &rows, &grant, 3, verify)
+            .unwrap();
+        assert_eq!(queued.pending_deliveries.len(), 1);
+        assert_eq!(queued.pending_deliveries[0].messages.len(), 16);
+        assert_eq!(queued.pending_deliveries[0].admission_request_id, request);
+        assert_eq!((queued.turns_reserved, queued.turns_used), (1, 0));
+        for _ in 0..4 {
+            c.scan_checked(&rows, &grant, 2, verify).unwrap();
+        }
+        assert_eq!(c.pending_deliveries.len(), 4);
+        assert!(c.pending_deliveries.iter().all(|p| p.messages.len() == 16));
+        let watermark = c.last_scanned_seq;
+        assert!(
+            c.scan_checked(&rows, &grant, 2, verify)
+                .unwrap_err()
+                .contains("BACKPRESSURE")
+        );
+        assert_eq!(c.last_scanned_seq, watermark);
+        let mut replay = c.pending_deliveries[0].messages[0].clone();
+        c.reserve(0, "token".into()).unwrap();
+        c.acknowledge(0, "HOST_ADMITTED", Some("a"), None, 3)
+            .unwrap();
+        c.acknowledge(0, "HOST_TURN_STARTED", Some("a"), Some("t"), 4)
+            .unwrap();
+        c.acknowledge(0, "PROCESSED", Some("a"), Some("t"), 5)
+            .unwrap();
+        replay.seq = watermark + 1;
+        assert!(c.scan_checked(&[replay], &grant, 6, verify).unwrap());
+        assert_eq!(c.pending_deliveries.len(), 3);
+        let mut other = rows[79].clone();
+        other.seq = c.last_scanned_seq + 1;
+        other.to = Some("OTHER#fixture".into());
+        other.body = "@WORKHORSE#test".into();
+        other.digest_sha256 = message_digest(&other);
+        other.signature_ed25519 = Some(hex(&key
+            .sign(signing_payload(&other).as_bytes())
+            .to_bytes()));
+        c.scan_checked(&[other], &grant, 7, verify).unwrap();
+        assert_eq!(c.pending_deliveries.len(), 3);
     }
     #[test]
     fn lost_ack_holds_reserved_quota_and_never_reemits() {
