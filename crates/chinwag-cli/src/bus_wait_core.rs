@@ -345,6 +345,9 @@ impl Cursor {
             .pending_deliveries
             .get_mut(index)
             .ok_or("UNKNOWN_DELIVERY")?;
+        if delivery.state.held() {
+            return Ok(());
+        }
         delivery.state =
             if delivery.quota_charged || delivery.state == DeliveryState::PendingActiveTurn {
                 DeliveryState::HeldUncertainHostOutcome

@@ -180,6 +180,11 @@ fn save(store: &PrivateStore, expected: u64, c: &mut Cursor) -> Result<()> {
     if old.version != expected {
         return Err("CURSOR_VERSION_CHANGED".into());
     }
+    if serde_json::to_value(&old).map_err(|_| "CURSOR_ENCODING")?
+        == serde_json::to_value(&*c).map_err(|_| "CURSOR_ENCODING")?
+    {
+        return Ok(());
+    }
     c.version = expected.checked_add(1).ok_or("CURSOR_VERSION_OVERFLOW")?;
     lock.write(c)
 }
@@ -270,7 +275,10 @@ fn ack(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<serde_jso
     let secret = token(f)?;
     let token_hash = hash(secret.as_bytes());
     let store = PrivateStore::open(repo, "cursors", actor)?;
-    let mut c = load(&store, &g, &digest)?;
+    let mut c = {
+        let _lock = store.lock()?;
+        load(&store, &g, &digest)?
+    };
     let version = c.version;
     let delivery = required(f, "--delivery-id")?;
     let request = required(f, "--admission-request-id")?;
@@ -381,7 +389,10 @@ fn reconcile(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<ser
     )
     .map_err(|_| "INVALID_OWNER_SIGNATURE")?;
     let store = PrivateStore::open(repo, "cursors", actor)?;
-    let mut c = load(&store, &g, &digest)?;
+    let mut c = {
+        let _lock = store.lock()?;
+        load(&store, &g, &digest)?
+    };
     let version = c.version;
     if version != proof.expected_cursor_version {
         return Err("CURSOR_VERSION_CHANGED".into());
@@ -436,7 +447,10 @@ where
     let store = PrivateStore::open(repo, "cursors", actor)?;
     loop {
         let (g, digest) = grant(repo, actor, pin)?;
-        let mut c = load(&store, &g, &digest)?;
+        let mut c = {
+            let _lock = store.lock()?;
+            load(&store, &g, &digest)?
+        };
         let version = c.version;
         if let Some(index) = c
             .pending_deliveries
@@ -674,6 +688,76 @@ mod tests {
                 ),
             ])
         }
+    }
+
+    #[test]
+    fn r1_held_restarts_preserve_classification_quota_witnesses_and_version() {
+        for queued in [false, true] {
+            let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+            f.seed_pending();
+            let mut c = f.cursor();
+            c.reserve(0, "e".repeat(64)).unwrap();
+            if queued {
+                c.acknowledge(0, "PENDING_ACTIVE_TURN", Some("queued"), None, now())
+                    .unwrap();
+            }
+            f.put(&c);
+            let call = || {
+                wait(
+                    &f.root,
+                    &f.grant.actor,
+                    &Flags::new(),
+                    f.owner.public(),
+                    |_, _, _, _| panic!("held work cannot be reissued"),
+                )
+            };
+            assert_eq!(call().unwrap().0, 75);
+            let held = f.cursor();
+            assert_eq!(
+                held.pending_deliveries[0].state,
+                if queued {
+                    DeliveryState::HeldUncertainHostOutcome
+                } else {
+                    DeliveryState::HeldUncertainPreAckOutcome
+                }
+            );
+            assert_eq!((held.turns_reserved, held.turns_used), (1, 0));
+            for _ in 0..3 {
+                assert_eq!(call().unwrap().0, 75);
+                assert_eq!(
+                    serde_json::to_value(f.cursor()).unwrap(),
+                    serde_json::to_value(&held).unwrap()
+                );
+            }
+        }
+    }
+    #[test]
+    fn r1_idle_save_is_noop_and_stale_save_is_rejected() {
+        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let mut c = f.cursor();
+        let version = c.version;
+        save(&f.store(), version, &mut c).unwrap();
+        assert_eq!(f.cursor().version, version);
+        let mut newer = c.clone();
+        newer.version += 1;
+        f.put(&newer);
+        assert_eq!(
+            save(&f.store(), version, &mut c).unwrap_err(),
+            "CURSOR_VERSION_CHANGED"
+        );
+        assert_eq!(f.cursor().version, version + 1);
+        let store = f.store();
+        let _lock = store.lock().unwrap();
+        assert!(
+            wait(
+                &f.root,
+                &f.grant.actor,
+                &Flags::new(),
+                f.owner.public(),
+                |_, _, _, _| Ok(false)
+            )
+            .is_err()
+        );
     }
     #[test]
     fn timeout_and_offline_release_lock_without_claiming_host_admission() {
