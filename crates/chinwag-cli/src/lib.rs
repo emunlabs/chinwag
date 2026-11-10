@@ -37,6 +37,8 @@ pub mod bus_state;
 #[cfg(target_os = "macos")]
 pub mod bus_store;
 #[cfg(target_os = "macos")]
+pub mod bus_wait_message;
+#[cfg(target_os = "macos")]
 pub mod execution_binding;
 #[cfg(target_os = "macos")]
 pub mod task_acceptance;
