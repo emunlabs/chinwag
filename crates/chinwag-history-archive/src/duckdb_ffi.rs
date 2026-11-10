@@ -11,6 +11,7 @@ pub type IdxT = u64;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DuckDbState {
     DuckDBSuccess = 0,
+    #[allow(dead_code)] // Returned by the C ABI rather than constructed in Rust.
     DuckDBError = 1,
 }
 

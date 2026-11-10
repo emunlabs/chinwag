@@ -1,6 +1,10 @@
 // Copyright (c) 2026 Emun Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //! Derived coordinator context, never canonical task authority.
-pub mod duckdb_ffi;
+mod duckdb_ffi;
 mod model;
 pub use model::{Event, Manifest, digest};
+mod store;
+pub use store::{Archive, events, ingest, read_bounded};
+mod cli;
+pub use cli::run_cli;
