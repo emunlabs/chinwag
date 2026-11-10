@@ -469,6 +469,16 @@ where
                 if current.version != version {
                     return Err("CURSOR_VERSION_CHANGED".into());
                 }
+                if current.pending_deliveries.iter().any(|old| {
+                    old.delivery_id == p.delivery_id
+                        && (old.state != DeliveryState::Received
+                            || old.handoff_token_sha256.is_some())
+                }) {
+                    return Err("OWNER_RECONCILIATION_REQUIRED".into());
+                }
+                // An orphan here predates the atomic reservation commit; no
+                // envelope could have escaped. Never clear a committed token.
+                store.clear_uncommitted_token(&p.delivery_id)?;
                 store.write_new_token(&p.delivery_id, &secret)?;
                 c.version = version + 1;
                 lock.write(&c)?;
@@ -534,6 +544,333 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus_federation::BusMessage;
+    use crate::bus_wait_core::Delivery;
+    use crate::bus_wait_message::hex;
+    use iroh::SecretKey;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        owner: SecretKey,
+        grant: HostGrant,
+    }
+    impl Fixture {
+        fn new(actor: &str, room: &str, task: &str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let owner = SecretKey::generate();
+            let instance = actor.split_once('#').unwrap().1;
+            let mut grant = HostGrant {
+                schema: "chinwag.host.enrollment.v3".into(),
+                grant_id: "fixture-grant".into(),
+                authority_epoch: 1,
+                actor: actor.into(),
+                host_kind: "antigravity_bg_task".into(),
+                host_version: "fixture".into(),
+                host_node: None,
+                conversation_id: instance.into(),
+                supports_idempotent_admission_lookup: false,
+                allow_legacy_plaintext: true,
+                owner: "fixture owner".into(),
+                granted_capabilities: vec!["bus_wait".into(), "same_chat_wake".into()],
+                allowed_rooms: vec![room.into()],
+                allowed_tasks: vec![task.into()],
+                max_turns_quota: 32,
+                enrolled_at_unix: now() - 1,
+                expires_at_unix: now() + 3600,
+                issuer_pubkey_ed25519: owner.public().to_string(),
+                issuer_signature_ed25519: String::new(),
+            };
+            grant.issuer_signature_ed25519 = hex(&owner
+                .sign(&owner_payload("chinwag-host-enrollment-v3|", &grant).unwrap())
+                .to_bytes());
+            let mut authority = Authority {
+                schema: "chinwag.host.authority.v1".into(),
+                min_authority_epoch: 1,
+                revoked_grant_ids: vec![],
+                issuer_pubkey_ed25519: owner.public().to_string(),
+                issuer_signature_ed25519: String::new(),
+            };
+            authority.issuer_signature_ed25519 = hex(&owner
+                .sign(&owner_payload("chinwag-host-authority-v1|", &authority).unwrap())
+                .to_bytes());
+            let e = PrivateStore::open(&root, "enrollments", actor).unwrap();
+            let authority_path = root.join(".chinwag/bus/enrollments/authority-state.json");
+            std::fs::write(&authority_path, serde_json::to_vec(&authority).unwrap()).unwrap();
+            std::fs::set_permissions(&authority_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            e.lock().unwrap().write(&grant).unwrap();
+            let c = Cursor::new(
+                &grant,
+                hash(&serde_json::to_vec(&grant).unwrap()),
+                "ExplicitWatermarkSeq".into(),
+            );
+            PrivateStore::open(&root, "cursors", actor)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .write(&c)
+                .unwrap();
+            Self {
+                _temp: temp,
+                root,
+                owner,
+                grant,
+            }
+        }
+        fn store(&self) -> PrivateStore {
+            PrivateStore::open(&self.root, "cursors", &self.grant.actor).unwrap()
+        }
+        fn cursor(&self) -> Cursor {
+            self.store().read().unwrap().unwrap()
+        }
+        fn put(&self, c: &Cursor) {
+            self.store().lock().unwrap().write(c).unwrap();
+        }
+        fn seed_pending(&self) {
+            let mut c = self.cursor();
+            let message:BusMessage=serde_json::from_value(json!({"id":"fixture-msg","seq":1,"ts_unix":1,"ts_iso":"fixture","room":"#eng","sender":"GEMINI-PM#fixture","sender_cast":"","sender_endpoint_id":"fixture","to":self.grant.actor,"task_id":"TEST","body":"fixture","digest_sha256":"d".repeat(64),"pubkey_ed25519":null,"signature_ed25519":null,"sig_verified":false})).unwrap();
+            // Trusted private-state fixture tests handoff mechanics only. Crypto
+            // interoperability uses the separate preserved-original integration.
+            c.pending_deliveries.push(Delivery {
+                delivery_id: "a".repeat(64),
+                admission_request_id: "admreq-fixture".into(),
+                state: DeliveryState::Received,
+                messages: vec![message],
+                handoff_token_sha256: None,
+                quota_reserved: false,
+                quota_charged: false,
+                admission_id: None,
+                turn_id: None,
+                first_seen_at_unix: now(),
+                host_admitted_at_unix: None,
+                host_turn_started_at_unix: None,
+            });
+            self.put(&c);
+        }
+        fn ack_flags(&self, token_file: &Path, state: &str) -> Flags {
+            BTreeMap::from([
+                ("--delivery-id".into(), "a".repeat(64)),
+                ("--admission-request-id".into(), "admreq-fixture".into()),
+                ("--msg-id".into(), "fixture-msg".into()),
+                ("--digest-sha256".into(), "d".repeat(64)),
+                ("--state".into(), state.into()),
+                (
+                    "--handoff-token-file".into(),
+                    token_file.to_string_lossy().into(),
+                ),
+            ])
+        }
+    }
+    #[test]
+    fn timeout_and_offline_release_lock_without_claiming_host_admission() {
+        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let args = Flags::from([("--timeout-secs".into(), "5".into())]);
+        let mut calls = 0;
+        let (code, value) = wait(
+            &f.root,
+            &f.grant.actor,
+            &args,
+            f.owner.public(),
+            |_, _, _, seconds| {
+                calls += 1;
+                assert!(seconds <= 5);
+                assert!(f.store().lock().is_ok());
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 124);
+        assert_eq!(value["status"], "TIMEOUT");
+        assert_eq!(calls, 1);
+        assert!(f.cursor().pending_deliveries.is_empty());
+        assert_eq!(f.cursor().turns_used, 0);
+        assert!(
+            wait(
+                &f.root,
+                &f.grant.actor,
+                &args,
+                f.owner.public(),
+                |_, _, _, _| Err("WAKE_HOST_OFFLINE".into())
+            )
+            .unwrap_err()
+            .contains("OFFLINE")
+        );
+        assert!(f.store().lock().is_ok());
+    }
+    #[test]
+    fn durable_handoff_ack_auth_and_all_lifecycle_states_preserve_one_quota_slot() {
+        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        f.seed_pending();
+        // Crash before the cursor reservation can leave a private token orphan.
+        f.store()
+            .write_new_token(&"a".repeat(64), &"b".repeat(64))
+            .unwrap();
+        let (code, envelope) = wait(
+            &f.root,
+            &f.grant.actor,
+            &Flags::new(),
+            f.owner.public(),
+            |_, _, _, _| panic!("ready pending batch must not block"),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(envelope["content_disposition"], "DATA_ONLY");
+        assert!(f.store().lock().is_ok());
+        let token_file = PathBuf::from(envelope["handoff_token_file"].as_str().unwrap());
+        assert_eq!(
+            std::fs::metadata(&token_file).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!((f.cursor().turns_reserved, f.cursor().turns_used), (1, 0));
+        let mut args = f.ack_flags(&token_file, "HOST_ADMITTED");
+        args.insert("--admission-id".into(), "admission".into());
+        let mut wrong = args.clone();
+        wrong.insert("--msg-id".into(), "wrong".into());
+        assert!(
+            ack(&f.root, &f.grant.actor, &wrong, f.owner.public())
+                .unwrap_err()
+                .contains("UNAUTHORIZED")
+        );
+        let wrong_file = f.root.join("wrong-token");
+        std::fs::write(&wrong_file, "c".repeat(64)).unwrap();
+        std::fs::set_permissions(&wrong_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        wrong = args.clone();
+        wrong.insert(
+            "--handoff-token-file".into(),
+            wrong_file.to_string_lossy().into(),
+        );
+        assert!(
+            ack(&f.root, &f.grant.actor, &wrong, f.owner.public())
+                .unwrap_err()
+                .contains("UNAUTHORIZED")
+        );
+        let mut premature = args.clone();
+        premature.insert("--turn-id".into(), "premature".into());
+        assert!(ack(&f.root, &f.grant.actor, &premature, f.owner.public()).is_err());
+        for state in [
+            "HOST_CALL_DISPATCHING",
+            "PENDING_ACTIVE_TURN",
+            "HOST_ADMITTED",
+        ] {
+            args.insert("--state".into(), state.into());
+            ack(&f.root, &f.grant.actor, &args, f.owner.public()).unwrap();
+        }
+        assert_eq!((f.cursor().turns_reserved, f.cursor().turns_used), (0, 1));
+        assert!(
+            f.cursor().pending_deliveries[0]
+                .host_turn_started_at_unix
+                .is_none()
+        );
+        args.insert("--state".into(), "HOST_TURN_STARTED".into());
+        args.insert("--turn-id".into(), "turn".into());
+        ack(&f.root, &f.grant.actor, &args, f.owner.public()).unwrap();
+        args.insert("--state".into(), "PROCESSED".into());
+        ack(&f.root, &f.grant.actor, &args, f.owner.public()).unwrap();
+        assert!(!token_file.exists());
+        assert!(f.cursor().pending_deliveries.is_empty());
+        assert_eq!(f.cursor().completed_recent_digests.len(), 1);
+    }
+    #[test]
+    fn restart_before_ack_holds_unknown_and_owner_reconciliation_cannot_reset_quota() {
+        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        f.seed_pending();
+        wait(
+            &f.root,
+            &f.grant.actor,
+            &Flags::new(),
+            f.owner.public(),
+            |_, _, _, _| Ok(false),
+        )
+        .unwrap();
+        let (code, value) = wait(
+            &f.root,
+            &f.grant.actor,
+            &Flags::new(),
+            f.owner.public(),
+            |_, _, _, _| panic!("uncertain host must not be retried"),
+        )
+        .unwrap();
+        assert_eq!(code, 75);
+        assert_eq!(value["state"], "HELD_UNCERTAIN_PRE_ACK_OUTCOME");
+        assert_eq!(f.cursor().turns_reserved, 1);
+        let mut proof = Reconciliation {
+            schema: "chinwag.bus.wait-reconciliation.v1".into(),
+            actor: f.grant.actor.clone(),
+            delivery_id: "a".repeat(64),
+            admission_request_id: "admreq-fixture".into(),
+            expected_cursor_version: f.cursor().version,
+            expires_at_unix: now() + 60,
+            outcome: "NEVER_RECEIVED".into(),
+            issuer_pubkey_ed25519: f.owner.public().to_string(),
+            issuer_signature_ed25519: String::new(),
+        };
+        proof.issuer_signature_ed25519 = hex(&f
+            .owner
+            .sign(&owner_payload("chinwag-wait-reconciliation-v1|", &proof).unwrap())
+            .to_bytes());
+        let proof_file = f.root.join("owner-proof");
+        std::fs::write(&proof_file, serde_json::to_vec(&proof).unwrap()).unwrap();
+        std::fs::set_permissions(&proof_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let flags = Flags::from([(
+            "--owner-proof-file".into(),
+            proof_file.to_string_lossy().into(),
+        )]);
+        reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).unwrap();
+        assert_eq!(f.cursor().turns_reserved, 1);
+        wait(
+            &f.root,
+            &f.grant.actor,
+            &Flags::new(),
+            f.owner.public(),
+            |_, _, _, _| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(f.cursor().turns_reserved, 1);
+        assert!(reconcile(&f.root, &f.grant.actor, &flags, f.owner.public()).is_err()); // stale proof cannot be replayed.
+    }
+    #[test]
+    #[ignore = "owner supplies preserved real native original through CHINWAG_INTEROP_FIXTURE"]
+    fn preserved_original_drives_durable_handoff_without_resigning() {
+        let bytes =
+            std::fs::read_to_string(std::env::var("CHINWAG_INTEROP_FIXTURE").unwrap()).unwrap();
+        let mut message = bytes
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|v| {
+                serde_json::from_value::<BusMessage>(v.get("message").unwrap_or(&v).clone()).ok()
+            })
+            .find(|m| m.id == "bus-1794264873-2b8773b6")
+            .unwrap();
+        crate::bus_wait_message::verify_original(&message).unwrap();
+        message.seq = 1;
+        let f = Fixture::new(
+            message.to.as_deref().unwrap(),
+            &message.room,
+            message.task_id.as_deref().unwrap(),
+        );
+        let mut line = serde_json::to_vec(&message).unwrap();
+        line.push(b'\n');
+        let path = f.root.join(".chinwag/bus/messages.jsonl");
+        std::fs::write(path, &line).unwrap();
+        let (code, envelope) = wait(
+            &f.root,
+            &f.grant.actor,
+            &Flags::new(),
+            f.owner.public(),
+            |_, _, _, _| panic!("verified existing original must catch up"),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            envelope["messages"][0]["digest_sha256"],
+            message.digest_sha256
+        );
+        assert_eq!(f.cursor().turns_reserved, 1);
+        assert_eq!(f.cursor().turns_used, 0);
+    }
     #[test]
     fn argv_tokens_and_duplicate_flags_refuse() {
         assert!(

@@ -92,7 +92,9 @@ fn verify_with_roster(
     message: &BusMessage,
     roster: &BTreeMap<String, String>,
 ) -> Result<(), &'static str> {
-    ActorAddress::parse(&message.sender).map_err(|_| "INVALID_SENDER")?;
+    ActorAddress::parse(&message.sender)
+        .and_then(ActorAddress::require_instance)
+        .map_err(|_| "INVALID_SENDER")?;
     if message.id.len() > 160
         || message.sender.len() > 256
         || message.room.len() > 128

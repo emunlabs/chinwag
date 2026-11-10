@@ -1934,6 +1934,10 @@ fn print_bus_help(stdout: &mut dyn Write) -> u8 {
   chinwag bus send --from <SEAT#INSTANCE> [--room <ROOM>] [--to <ADDRESS,...>] [--task <TASK-ID>] [--json] --message <BODY>
   chinwag bus send --from <SEAT> --instance <INSTANCE> [options] --message <BODY>
   chinwag bus inbox --for <SEAT#INSTANCE|SEAT> [--limit <N>] [--json]
+  chinwag bus enroll-host --repo <physical-absolute-path> --for <SEAT#INSTANCE> --grant-file <owner-signed-0600-json> (--current-tail | --since-seq <N> --since-id <ID|GENESIS>)
+  chinwag bus wait --repo <physical-absolute-path> --for <SEAT#INSTANCE> [--timeout-secs <1..3600>] --json
+  chinwag bus wait-ack --repo <path> --for <SEAT#INSTANCE> --delivery-id <ID> --admission-request-id <ID> --msg-id <ID> --digest-sha256 <SHA256> --handoff-token-file <0600-path> --state <STATE> [--admission-id <ID>] [--turn-id <ID>]
+  chinwag bus wait-reconcile --repo <path> --for <SEAT#INSTANCE> --owner-proof-file <owner-signed-0600-json>
   chinwag bus tail [--room <ROOM>] [--task <TASK-ID>] [--limit <N>] [-f] [--json]
   chinwag bus worker --seat <SEAT> --from <CALLER#INSTANCE> --task <TASK-ID> --message <BODY>
   chinwag bus wake [--seat <SEAT|ALL>]
@@ -1946,6 +1950,9 @@ Use one --to with a comma-separated list. Repeated --to/-t flags fail before pub
 A legacy ACK acknowledges publication only: completion_scope=PUBLISH_ONLY, durability UNKNOWN.
 subscribers_notified counts broadcast receivers; it proves neither processing nor task start.
 Existing-conversation scheduling has no supported adapter in this binary and reports UNSUPPORTED.
+Native wait emits a durable DATA_ONLY handoff; it does not itself start a host turn.
+Owner enrollment/authority signatures and the pinned ~/.chinwag/signing/owner_ed25519.pub are required.
+Wait exits: 0 handoff committed, 124 timeout, 75 uncertain/offline/unsupported. Raw tokens in argv are forbidden.
 "#
     );
     0

@@ -39,8 +39,43 @@ fn validate_file(file: &File, private: bool) -> Result<()> {
 }
 
 pub fn read_private_path(path: &Path, bound: usize) -> Result<Vec<u8>> {
-    let fd = rustix::fs::open(
-        path,
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err("UNSAFE_CURSOR_OR_ENROLLMENT_PATH".into());
+    }
+    let mut directory = File::from(
+        rustix::fs::open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io)?,
+    );
+    let components = path.components().collect::<Vec<_>>();
+    for component in components
+        .iter()
+        .skip(1)
+        .take(components.len().saturating_sub(2))
+    {
+        let Component::Normal(name) = component else {
+            return Err("UNSAFE_CURSOR_OR_ENROLLMENT_PATH".into());
+        };
+        directory = File::from(
+            openat(
+                &directory,
+                *name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io)?,
+        );
+    }
+    let Some(Component::Normal(name)) = components.last() else {
+        return Err("UNSAFE_CURSOR_OR_ENROLLMENT_PATH".into());
+    };
+    let fd = openat(
+        &directory,
+        *name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -228,6 +263,11 @@ impl PrivateStore {
             self.directory.sync_all().map_err(io)?;
         }
         Ok(())
+    }
+    /// Only a caller holding the cursor lock and proving no committed handoff
+    /// may clear an orphan created before the cursor's single-rename commit.
+    pub fn clear_uncommitted_token(&self, delivery_id: &str) -> Result<()> {
+        self.remove_token(delivery_id)
     }
 }
 

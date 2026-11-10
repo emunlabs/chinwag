@@ -106,6 +106,23 @@ impl Cursor {
             || self.authority_epoch != grant.authority_epoch
             || self.max_turns_quota != grant.max_turns_quota
             || self.turns_used.saturating_add(self.turns_reserved) > self.max_turns_quota
+            || self.turns_reserved
+                != self
+                    .pending_deliveries
+                    .iter()
+                    .filter(|p| p.quota_reserved)
+                    .count() as u64
+            || self.turns_used
+                != self
+                    .pending_deliveries
+                    .iter()
+                    .filter(|p| p.quota_charged)
+                    .count() as u64
+                    + self.completed_deliveries.len() as u64
+            || self
+                .pending_deliveries
+                .iter()
+                .any(|p| p.quota_charged && p.quota_reserved)
             || self
                 .pending_deliveries
                 .iter()
@@ -152,6 +169,12 @@ impl Cursor {
         grant: &HostGrant,
         now: u64,
     ) -> Result<bool, String> {
+        self.scan_checked(rows, grant, now, |message| verify_original(message).is_ok())
+    }
+    // Private test seam permits ephemeral fixture pins without adding a
+    // production CLI or public constructor that can replace the compiled pins.
+    fn scan_checked(&mut self, rows: &[BusMessage], grant: &HostGrant, now: u64,
+        mut verified: impl FnMut(&BusMessage) -> bool) -> Result<bool, String> {
         let pending = self
             .pending_deliveries
             .iter()
@@ -167,7 +190,7 @@ impl Cursor {
             if batch.len() >= 16 || pending + batch.len() >= 64 {
                 break;
             }
-            let eligible = verify_original(message).is_ok()
+            let eligible = verified(message)
                 && message.to.as_deref() == Some(self.actor.as_str())
                 && message.sender != self.actor
                 && grant.allowed_rooms.contains(&message.room)
@@ -177,7 +200,11 @@ impl Cursor {
                     .is_some_and(|task| grant.allowed_tasks.contains(task))
                 && classify_body(&message.body, grant.allow_legacy_plaintext)
                     .is_ok_and(|body| body.event_kind.wakes());
-            if eligible && !self.seen(message)? {
+            let in_batch = batch.iter().find(|old: &&BusMessage| old.id == message.id);
+            if in_batch.is_some_and(|old| old.digest_sha256 != message.digest_sha256) {
+                return Err("ORIGINAL_ID_CONFLICT".into());
+            }
+            if eligible && !self.seen(message)? && in_batch.is_none() {
                 let size = serde_json::to_vec(message)
                     .map_err(|_| "MESSAGE_ENCODING")?
                     .len();
@@ -283,6 +310,9 @@ impl Cursor {
             "PROCESSED" => DeliveryState::HostTurnStarted,
             _ => return Err("INVALID_DELIVERY_TRANSITION".into()),
         };
+        if turn.is_some() && target != DeliveryState::HostTurnStarted {
+            return Err("UNOBSERVED_TURN_START".into());
+        }
         if admission.is_some_and(|s| s.is_empty() || s.len() > 160)
             || turn.is_some_and(|s| s.is_empty() || s.len() > 160)
         {
