@@ -314,10 +314,27 @@ fn ack(repo: &Path, actor: &str, f: &Flags, pin: EndpointId) -> Result<serde_jso
             now(),
         )?;
         if state == "PENDING_ACTIVE_TURN" {
-            let journal = anchored_snapshot(repo, &mut c)?;
-            c.coalesce_active(index, &journal.rows, &g, now())?;
-            c.last_scanned_inode = journal.inode;
-            c.last_scanned_line1_digest = journal.first_digest;
+            for _ in 0..=8 {
+                let before = (
+                    c.last_scanned_inode,
+                    c.last_scanned_seq,
+                    c.last_scanned_id.clone(),
+                );
+                let journal = anchored_snapshot(repo, &mut c)?;
+                c.coalesce_active(index, &journal.rows, &g, now())?;
+                c.last_scanned_inode = journal.inode;
+                c.last_scanned_line1_digest = journal.first_digest;
+                if c.pending_deliveries[index].messages.len() == 16
+                    || before
+                        == (
+                            c.last_scanned_inode,
+                            c.last_scanned_seq,
+                            c.last_scanned_id.clone(),
+                        )
+                {
+                    break;
+                }
+            }
         }
         // Recheck current signed authority immediately before committing.
         grant(repo, actor, pin)?;
