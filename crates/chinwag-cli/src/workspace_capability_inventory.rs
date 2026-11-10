@@ -191,6 +191,7 @@ pub enum InventoryError {
     DirtyOrMismatchedBuildProvenance(String),
     InventoryNotExecutionAuthority,
     ConflictingReplay(String),
+    IncompleteIntentHeld(String),
     JournalCorruptOrBounded(String),
     Io(String),
 }
@@ -502,6 +503,7 @@ impl CapabilityProvenanceRecordV1 {
             )
         {
             self.effective_classification = CapabilityClassificationV1::Held;
+            self.installed_binary_sha256 = None;
             let reason = format!(
                 "capability {:?} claims {:?} on dirty/uncommitted source tree",
                 self.capability_id, self.claimed_classification
@@ -531,6 +533,7 @@ impl CapabilityProvenanceRecordV1 {
             CapabilityClassificationV1::Implemented => {
                 if !self.handler_wired {
                     self.effective_classification = CapabilityClassificationV1::Held;
+                    self.installed_binary_sha256 = None;
                     let reason = format!(
                         "capability {:?} claims Implemented without wired handler",
                         self.capability_id
@@ -545,6 +548,7 @@ impl CapabilityProvenanceRecordV1 {
             CapabilityClassificationV1::Tested => {
                 if !self.handler_wired || !self.unit_tests_passed {
                     self.effective_classification = CapabilityClassificationV1::Held;
+                    self.installed_binary_sha256 = None;
                     let reason = format!(
                         "capability {:?} claims Tested without handler_wired && unit_tests_passed",
                         self.capability_id
@@ -562,6 +566,7 @@ impl CapabilityProvenanceRecordV1 {
                     || self.accepted_source_commit != Some(self.source_commit)
                 {
                     self.effective_classification = CapabilityClassificationV1::Held;
+                    self.installed_binary_sha256 = None;
                     let reason = format!(
                         "capability {:?} claims AcceptedSource without matching accepted_source_commit",
                         self.capability_id
@@ -579,6 +584,7 @@ impl CapabilityProvenanceRecordV1 {
                     || self.accepted_source_commit != Some(self.source_commit)
                 {
                     self.effective_classification = CapabilityClassificationV1::Held;
+                    self.installed_binary_sha256 = None;
                     let reason = format!(
                         "capability {:?} claims Installed without AcceptedSource provenance",
                         self.capability_id
@@ -600,6 +606,7 @@ impl CapabilityProvenanceRecordV1 {
                     }
                     _ => {
                         self.effective_classification = CapabilityClassificationV1::Held;
+                        self.installed_binary_sha256 = None;
                         let reason = format!(
                             "capability {:?} claims Installed with missing or mismatched binary digest",
                             self.capability_id
@@ -618,6 +625,7 @@ impl CapabilityProvenanceRecordV1 {
                     || self.compiled_artifact_sha256 != self.installed_binary_sha256
                 {
                     self.effective_classification = CapabilityClassificationV1::Held;
+                    self.installed_binary_sha256 = None;
                     let reason = format!(
                         "capability {:?} claims Operational without verified installed binary and runtime health",
                         self.capability_id
@@ -640,6 +648,7 @@ impl CapabilityProvenanceRecordV1 {
                     || self.task_ref.is_none()
                 {
                     self.effective_classification = CapabilityClassificationV1::Held;
+                    self.installed_binary_sha256 = None;
                     let reason = format!(
                         "capability {:?} claims Authorized without full operational + admission + TaskRef provenance",
                         self.capability_id
@@ -730,6 +739,7 @@ pub struct DiscoverySnapshotV1 {
     pub workspaces: Vec<WorkspaceOwnershipRecordV1>,
     pub capabilities: Vec<CapabilityProvenanceRecordV1>,
     pub incomplete_operations_held: Vec<String>,
+    pub corrupt_or_ambiguous_tail_reason: Option<String>,
 }
 
 /// Independently opened descriptors retain both locks for the whole transaction.
@@ -903,8 +913,11 @@ pub struct ContinuousInventoryRegistryV1 {
     workspaces: BTreeMap<String, WorkspaceOwnershipRecordV1>,
     capabilities: BTreeMap<String, CapabilityProvenanceRecordV1>,
     committed_ops: BTreeMap<String, String>,
+    rejected_ops: BTreeMap<String, (String, Option<String>)>,
     incomplete_ops_held: BTreeMap<String, String>,
     journal_path: Option<PathBuf>,
+    bound_journal_identity: Option<(FsEntryIdentityV1, std::ffi::OsString, (u64, u64))>,
+    corrupt_or_ambiguous_tail_reason: Option<String>,
     #[cfg(test)]
     fail_next_result_append: bool,
 }
@@ -926,11 +939,45 @@ impl ContinuousInventoryRegistryV1 {
             workspaces: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             committed_ops: BTreeMap::new(),
+            rejected_ops: BTreeMap::new(),
             incomplete_ops_held: BTreeMap::new(),
             journal_path: None,
+            bound_journal_identity: None,
+            corrupt_or_ambiguous_tail_reason: None,
             #[cfg(test)]
             fail_next_result_append: false,
         })
+    }
+
+    fn verify_or_bind_journal_identity(
+        &mut self,
+        journal: &LockedInventoryJournal,
+    ) -> InventoryResult<()> {
+        if let Some((expected_parent, expected_name, expected_file_id)) =
+            &self.bound_journal_identity
+        {
+            if expected_parent.dev != journal.parent_identity.dev
+                || expected_parent.ino != journal.parent_identity.ino
+                || expected_name != &journal.file_name
+                || *expected_file_id != journal.file_identity
+            {
+                return Err(InventoryError::InvalidPath(
+                    "registry instance is already bound to a different authoritative journal identity"
+                        .to_owned(),
+                ));
+            }
+        } else {
+            self.bound_journal_identity = Some((
+                journal.parent_identity,
+                journal.file_name.clone(),
+                journal.file_identity,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn corrupt_or_ambiguous_tail_reason(&self) -> Option<&str> {
+        self.corrupt_or_ambiguous_tail_reason.as_deref()
     }
 
     fn payload_digest(payload: &InventoryPayloadV1) -> InventoryResult<String> {
@@ -970,7 +1017,11 @@ impl ContinuousInventoryRegistryV1 {
         let digest = Self::payload_digest(&payload)?;
         let mut journal = LockedInventoryJournal::open(journal_path, true)?
             .ok_or_else(|| InventoryError::Io("created journal is missing".to_owned()))?;
-        let existing_record_count = self.refresh_from_journal(journal_path, &mut journal)?;
+        self.verify_or_bind_journal_identity(&journal)?;
+        let existing_record_count = self.refresh_from_journal_locked(journal_path, &mut journal)?;
+        if let Some(reason) = &self.corrupt_or_ambiguous_tail_reason {
+            return Err(InventoryError::JournalCorruptOrBounded(reason.clone()));
+        }
         if let Some(existing_digest) = self.committed_ops.get(operation_id) {
             if existing_digest == &digest {
                 return Ok(InventorySubmissionOutcomeV1::IdempotentReplay);
@@ -979,10 +1030,17 @@ impl ContinuousInventoryRegistryV1 {
                 "operation_id {operation_id:?} replayed with different payload digest"
             )));
         }
-        if self.incomplete_ops_held.contains_key(operation_id) {
+        if let Some((existing_digest, hold_reason)) = self.rejected_ops.get(operation_id) {
             return Err(InventoryError::ConflictingReplay(format!(
-                "operation_id {operation_id:?} is held due to prior incomplete execution"
+                "operation_id {operation_id} was already durably rejected/held (digest_match={}): {}",
+                existing_digest == &digest,
+                hold_reason.as_deref().unwrap_or("rejected")
             )));
+        }
+        if self.incomplete_ops_held.contains_key(operation_id) {
+            return Err(InventoryError::IncompleteIntentHeld(
+                operation_id.to_owned(),
+            ));
         }
 
         // A rejected new capability has no journal effect. An existing capability
@@ -997,17 +1055,13 @@ impl ContinuousInventoryRegistryV1 {
                             | InventoryError::DirtyOrMismatchedBuildProvenance(_)
                     )
                 {
-                    let hold = InventoryPayloadV1::HoldCapability {
-                        capability_id: record.capability_id.clone(),
-                        hold_reason: err.to_string(),
-                        updated_unix_ms: now_unix_ms,
-                    };
-                    self.commit_automatic_hold(
+                    return self.commit_payload(
                         &mut journal,
                         existing_record_count,
+                        operation_id,
                         now_unix_ms,
-                        hold,
-                    )?;
+                        payload,
+                    );
                 }
                 return Err(err);
             }
@@ -1021,11 +1075,21 @@ impl ContinuousInventoryRegistryV1 {
         )
     }
 
-    fn refresh_from_journal(
+    /// Refresh discovery state from the bound authoritative journal without
+    /// appending records. An ambiguous append remains held on this handle.
+    pub fn refresh_from_journal(&mut self, journal_path: &Path) -> InventoryResult<()> {
+        let mut journal = LockedInventoryJournal::open(journal_path, false)?
+            .ok_or_else(|| InventoryError::Io("authoritative journal is missing".to_owned()))?;
+        self.refresh_from_journal_locked(journal_path, &mut journal)?;
+        Ok(())
+    }
+
+    fn refresh_from_journal_locked(
         &mut self,
         journal_path: &Path,
         journal: &mut LockedInventoryJournal,
     ) -> InventoryResult<usize> {
+        self.verify_or_bind_journal_identity(journal)?;
         let (mut staging, existing_record_count) = Self::replay_journal(
             self.shared_git_store_identity,
             self.operational_checkout_identity,
@@ -1034,6 +1098,10 @@ impl ContinuousInventoryRegistryV1 {
         // Local reconciliation holds remain conservative across shared-journal refreshes.
         for (id, record) in &self.workspaces {
             if record.status == WorkspaceOwnershipStatusV1::HeldStaleOrUnknown {
+                if self.corrupt_or_ambiguous_tail_reason.is_some() {
+                    staging.workspaces.insert(id.clone(), record.clone());
+                    continue;
+                }
                 staging
                     .workspaces
                     .entry(id.clone())
@@ -1050,6 +1118,19 @@ impl ContinuousInventoryRegistryV1 {
         staging
             .incomplete_ops_held
             .extend(self.incomplete_ops_held.clone());
+        staging.rejected_ops.extend(self.rejected_ops.clone());
+        if self.corrupt_or_ambiguous_tail_reason.is_some() {
+            for (id, record) in &self.capabilities {
+                if record.effective_classification == CapabilityClassificationV1::Held {
+                    staging.capabilities.insert(id.clone(), record.clone());
+                }
+            }
+            if staging.corrupt_or_ambiguous_tail_reason.is_none() {
+                staging.corrupt_or_ambiguous_tail_reason =
+                    self.corrupt_or_ambiguous_tail_reason.clone();
+            }
+        }
+        staging.bound_journal_identity = self.bound_journal_identity.clone();
         staging.journal_path = Some(journal_path.to_owned());
         #[cfg(test)]
         {
@@ -1070,6 +1151,7 @@ impl ContinuousInventoryRegistryV1 {
         let digest = Self::payload_digest(&payload)?;
         let mut candidate = self.clone();
         let apply_outcome = candidate.apply_payload(payload.clone(), false);
+        let hold_reason = apply_outcome.as_ref().err().map(ToString::to_string);
         let intent_line = Self::journal_line(&JournalEntryV1::Intent {
             operation_id: operation_id.to_owned(),
             intent_digest: digest.clone(),
@@ -1081,7 +1163,7 @@ impl ContinuousInventoryRegistryV1 {
             intent_digest: digest.clone(),
             completed_unix_ms: now_unix_ms,
             committed: apply_outcome.is_ok(),
-            hold_reason: apply_outcome.as_ref().err().map(ToString::to_string),
+            hold_reason: hold_reason.clone(),
         })?;
         if existing_record_count
             .checked_add(2)
@@ -1095,7 +1177,12 @@ impl ContinuousInventoryRegistryV1 {
                 "inventory journal cannot reserve both Intent and Result".to_owned(),
             ));
         }
-        journal.append_line(&intent_line)?;
+        if let Err(err) = journal.append_line(&intent_line) {
+            self.hold_incomplete(operation_id.to_owned(), digest, payload);
+            self.corrupt_or_ambiguous_tail_reason =
+                Some(format!("ambiguous_intent_append:{operation_id}:{err}"));
+            return Err(err);
+        }
         #[cfg(test)]
         let result_persistence = if std::mem::take(&mut self.fail_next_result_append) {
             Err(InventoryError::Io(
@@ -1108,6 +1195,8 @@ impl ContinuousInventoryRegistryV1 {
         let result_persistence = journal.append_line(&result_line);
         if let Err(err) = result_persistence {
             self.hold_incomplete(operation_id.to_owned(), digest, payload);
+            self.corrupt_or_ambiguous_tail_reason =
+                Some(format!("ambiguous_result_append:{operation_id}:{err}"));
             return Err(err);
         }
         match apply_outcome {
@@ -1118,7 +1207,13 @@ impl ContinuousInventoryRegistryV1 {
                 *self = candidate;
                 Ok(InventorySubmissionOutcomeV1::Applied)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                candidate
+                    .rejected_ops
+                    .insert(operation_id.to_owned(), (digest, hold_reason));
+                *self = candidate;
+                Err(err)
+            }
         }
     }
 
@@ -1132,7 +1227,9 @@ impl ContinuousInventoryRegistryV1 {
         let mut sequence = record_count;
         let operation_id = loop {
             let id = format!("auto-hold-seq-{sequence}");
-            if !self.committed_ops.contains_key(&id) && !self.incomplete_ops_held.contains_key(&id)
+            if !self.committed_ops.contains_key(&id)
+                && !self.rejected_ops.contains_key(&id)
+                && !self.incomplete_ops_held.contains_key(&id)
             {
                 break id;
             }
@@ -1166,24 +1263,37 @@ impl ContinuousInventoryRegistryV1 {
         let Some(path) = self.journal_path.clone() else {
             return self.apply_payload(payload, false);
         };
-        let persistence = (|| {
-            let mut journal = LockedInventoryJournal::open(&path, true)?
-                .ok_or_else(|| InventoryError::Io("created journal is missing".to_owned()))?;
-            let count = self.refresh_from_journal(&path, &mut journal)?;
-            if !self
-                .workspaces
-                .get(record_id)
-                .is_some_and(|record| record.status == WorkspaceOwnershipStatusV1::Active)
-            {
-                return Ok(());
+        let opened = LockedInventoryJournal::open(&path, true).and_then(|journal| {
+            journal.ok_or_else(|| InventoryError::Io("created journal is missing".to_owned()))
+        });
+        let mut journal = match opened {
+            Ok(journal) => journal,
+            Err(err) => {
+                self.apply_payload(payload, false)?;
+                return Err(err);
             }
-            self.commit_automatic_hold(&mut journal, count, now_unix_ms, payload.clone())
-        })();
-        if let Err(err) = persistence {
-            self.apply_payload(payload, false)?;
-            return Err(err);
+        };
+        // A foreign journal must be rejected before even a local hold changes
+        // the state belonging to this handle's authoritative journal.
+        self.verify_or_bind_journal_identity(&journal)?;
+        let count = match self.refresh_from_journal_locked(&path, &mut journal) {
+            Ok(count) => count,
+            Err(err) => {
+                self.apply_payload(payload, false)?;
+                return Err(err);
+            }
+        };
+        if let Some(reason) = &self.corrupt_or_ambiguous_tail_reason {
+            return Err(InventoryError::JournalCorruptOrBounded(reason.clone()));
         }
-        Ok(())
+        if !self
+            .workspaces
+            .get(record_id)
+            .is_some_and(|record| record.status == WorkspaceOwnershipStatusV1::Active)
+        {
+            return Ok(());
+        }
+        self.commit_automatic_hold(&mut journal, count, now_unix_ms, payload)
     }
 
     fn apply_payload(
@@ -1299,11 +1409,10 @@ impl ContinuousInventoryRegistryV1 {
                         err,
                         InventoryError::UnprovenCapabilityClaim(_)
                             | InventoryError::DirtyOrMismatchedBuildProvenance(_)
-                    ) && let Some(existing) = self.capabilities.get_mut(&record.capability_id)
+                    ) && self.capabilities.contains_key(&record.capability_id)
                     {
-                        existing.effective_classification = CapabilityClassificationV1::Held;
-                        existing.hold_or_downgrade_reason = Some(err.to_string());
-                        existing.installed_binary_sha256 = None;
+                        self.capabilities
+                            .insert(record.capability_id.clone(), *record);
                     }
                     return Err(err);
                 }
@@ -1469,7 +1578,11 @@ impl ContinuousInventoryRegistryV1 {
             operational_checkout_identity,
             &mut journal,
         )?;
+        registry.verify_or_bind_journal_identity(&journal)?;
         registry.journal_path = Some(journal_path.to_owned());
+        if registry.corrupt_or_ambiguous_tail_reason.is_some() {
+            return Ok(registry);
+        }
         // Release the replay lock before automatic hold transactions reopen it.
         drop(journal);
         registry.reconcile_workspaces(0, |_, _| true);
@@ -1483,22 +1596,65 @@ impl ContinuousInventoryRegistryV1 {
     ) -> InventoryResult<(Self, usize)> {
         let mut registry = Self::new(shared_git_store_identity, operational_checkout_identity)?;
         let bytes = journal.read_from_start()?;
+        if bytes.is_empty() {
+            return Ok((registry, 0));
+        }
+        let lines: Vec<&[u8]> = bytes.split_inclusive(|byte| *byte == b'\n').collect();
         let mut pending_intents: BTreeMap<String, (String, InventoryPayloadV1)> = BTreeMap::new();
         let mut count = 0usize;
-        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        for (idx, raw_line) in lines.iter().enumerate() {
             count += 1;
             if count > MAX_INVENTORY_RECORDS {
                 return Err(InventoryError::JournalCorruptOrBounded(
                     "journal record count exceeds MAX_INVENTORY_RECORDS".to_owned(),
                 ));
             }
-            let raw = line.strip_suffix(b"\n").ok_or_else(|| {
-                InventoryError::JournalCorruptOrBounded("unterminated journal record".to_owned())
-            })?;
-            strict_json_object(raw, MAX_INVENTORY_JOURNAL_BYTES as usize)
-                .map_err(|e| InventoryError::JournalCorruptOrBounded(e.to_string()))?;
-            let entry: JournalEntryV1 = serde_json::from_slice(raw)
-                .map_err(|e| InventoryError::JournalCorruptOrBounded(e.to_string()))?;
+            let parsed = (|| {
+                let line = raw_line.strip_suffix(b"\n").ok_or_else(|| {
+                    InventoryError::JournalCorruptOrBounded(
+                        "unterminated journal record".to_owned(),
+                    )
+                })?;
+                strict_json_object(line, MAX_INVENTORY_JOURNAL_BYTES as usize)
+                    .map_err(|e| InventoryError::JournalCorruptOrBounded(e.to_string()))?;
+                serde_json::from_slice::<JournalEntryV1>(line)
+                    .map_err(|e| InventoryError::JournalCorruptOrBounded(e.to_string()))
+            })();
+            let entry = match parsed {
+                Ok(entry) => entry,
+                Err(_) if idx + 1 == lines.len() => {
+                    for (op_id, (digest, payload)) in pending_intents {
+                        registry.hold_incomplete(op_id, digest, payload);
+                    }
+                    let reason = format!("torn_or_corrupt_journal_tail_at_line_{}", idx + 1);
+                    registry.corrupt_or_ambiguous_tail_reason = Some(reason.clone());
+                    registry.incomplete_ops_held.insert(
+                        format!("torn-journal-tail-line-{}", idx + 1),
+                        reason.clone(),
+                    );
+                    for record in registry.workspaces.values_mut() {
+                        if record.status == WorkspaceOwnershipStatusV1::Active {
+                            record.status = WorkspaceOwnershipStatusV1::HeldStaleOrUnknown;
+                            record.hold_reason = Some(format!("fenced_by_{reason}"));
+                            record.pid_birth_binding = None;
+                        }
+                    }
+                    // Every positive classification in this schema is evidence
+                    // of readiness; none survives an untrustworthy journal tail.
+                    for record in registry.capabilities.values_mut() {
+                        if !matches!(
+                            record.effective_classification,
+                            CapabilityClassificationV1::Unknown | CapabilityClassificationV1::Held
+                        ) {
+                            record.effective_classification = CapabilityClassificationV1::Held;
+                            record.hold_or_downgrade_reason = Some(format!("fenced_by_{reason}"));
+                            record.installed_binary_sha256 = None;
+                        }
+                    }
+                    return Ok((registry, count));
+                }
+                Err(err) => return Err(err),
+            };
             match entry {
                 JournalEntryV1::Intent {
                     operation_id,
@@ -1512,10 +1668,11 @@ impl ContinuousInventoryRegistryV1 {
                         )));
                     }
                     if registry.committed_ops.contains_key(&operation_id)
+                        || registry.rejected_ops.contains_key(&operation_id)
                         || pending_intents.contains_key(&operation_id)
                     {
                         return Err(InventoryError::JournalCorruptOrBounded(format!(
-                            "duplicate intent for operation_id {operation_id:?}"
+                            "duplicate journal intent for operation_id {operation_id}"
                         )));
                     }
                     pending_intents.insert(operation_id, (intent_digest, payload));
@@ -1524,6 +1681,7 @@ impl ContinuousInventoryRegistryV1 {
                     operation_id,
                     intent_digest,
                     committed,
+                    hold_reason,
                     ..
                 } => {
                     let Some((expected_digest, payload)) = pending_intents.remove(&operation_id)
@@ -1540,6 +1698,18 @@ impl ContinuousInventoryRegistryV1 {
                     if committed {
                         registry.apply_payload(payload, true)?;
                         registry.committed_ops.insert(operation_id, intent_digest);
+                    } else {
+                        if let InventoryPayloadV1::UpsertCapability { mut record } = payload
+                            && registry.capabilities.contains_key(&record.capability_id)
+                        {
+                            let _ = record.verify_and_classify();
+                            registry
+                                .capabilities
+                                .insert(record.capability_id.clone(), *record);
+                        }
+                        registry
+                            .rejected_ops
+                            .insert(operation_id, (intent_digest, hold_reason));
                     }
                 }
             }
@@ -1562,9 +1732,15 @@ impl ContinuousInventoryRegistryV1 {
                     "incomplete_journal_intent:{op_id}:register_workspace_unconfirmed"
                 ));
                 record.pid_birth_binding = None;
-                self.workspaces
-                    .entry(record.record_id.clone())
-                    .or_insert(*record);
+                if self
+                    .workspaces
+                    .get(&record.record_id)
+                    .is_some_and(|existing| existing.status.blocks_exclusive_claim())
+                {
+                    let footprint_id = format!("{}#incomplete:{op_id}", record.record_id);
+                    record.record_id = footprint_id;
+                }
+                self.workspaces.insert(record.record_id.clone(), *record);
             }
             InventoryPayloadV1::ReleaseWorkspace {
                 record_id,
@@ -1612,6 +1788,7 @@ impl ContinuousInventoryRegistryV1 {
             workspaces: self.workspaces.values().cloned().collect(),
             capabilities: self.capabilities.values().cloned().collect(),
             incomplete_operations_held: self.incomplete_ops_held.keys().cloned().collect(),
+            corrupt_or_ambiguous_tail_reason: self.corrupt_or_ambiguous_tail_reason.clone(),
         }
     }
 }
@@ -2319,6 +2496,10 @@ mod tests {
                 .unwrap();
         assert_eq!(loaded.workspaces.get(&owner.record_id), Some(&owner));
         assert!(loaded.incomplete_ops_held.contains_key("failed-collision"));
+        assert!(registry.corrupt_or_ambiguous_tail_reason().is_some());
+        // A handle with an ambiguous append cannot attempt another mutation.
+        // Explicit recovery creates a new handle from the complete prefix.
+        registry = loaded;
         registry.fail_next_result_append = true;
         assert!(matches!(
             registry.submit_durable(
@@ -2346,6 +2527,8 @@ mod tests {
             WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
         );
         assert!(loaded.incomplete_ops_held.contains_key("failed-release"));
+        assert!(registry.corrupt_or_ambiguous_tail_reason().is_some());
+        registry = loaded;
 
         // A local reconciliation hold must survive an authoritative replay.
         assert_eq!(
@@ -2504,6 +2687,14 @@ mod tests {
             effective_classification: CapabilityClassificationV1::Unknown,
             hold_or_downgrade_reason: None,
         }
+    }
+
+    fn read_journal_entries(path: &Path) -> Vec<JournalEntryV1> {
+        fs::read(path)
+            .unwrap()
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
     }
 
     #[test]
@@ -2869,15 +3060,20 @@ mod tests {
                     held.effective_classification,
                     CapabilityClassificationV1::Held
                 );
-                assert_eq!(held.hold_or_downgrade_reason, Some(error.to_string()));
+                let mut expected = negative.clone();
+                assert_eq!(expected.verify_and_classify(), Err(error));
+                assert_eq!(held, expected);
                 assert_eq!(held.installed_binary_sha256, None);
                 let bytes = fs::read(&f.journal_path).unwrap();
-                assert!(
-                    String::from_utf8(bytes.clone())
-                        .unwrap()
-                        .contains("\"op\":\"hold_capability\"")
-                );
+                let entries = read_journal_entries(&f.journal_path);
+                assert_eq!(entries.len(), 4);
+                assert!(matches!(
+                    &entries[3],
+                    JournalEntryV1::Result { operation_id, committed: false, hold_reason: Some(_), .. }
+                        if operation_id == "negative-observation"
+                ));
                 assert!(!registry.committed_ops.contains_key("negative-observation"));
+                assert!(registry.rejected_ops.contains_key("negative-observation"));
                 for _ in 0..2 {
                     let recovered = ContinuousInventoryRegistryV1::load_and_reconcile(
                         f.store_id,
@@ -2985,6 +3181,756 @@ mod tests {
                 .unwrap(),
             InventorySubmissionOutcomeV1::Applied
         );
+    }
+
+    #[test]
+    fn registry_rejects_cross_journal_path_mutation_and_refresh() {
+        let f = EnvFixture::new();
+        let owner = s2b_workspace(&f, false);
+        let payload = InventoryPayloadV1::RegisterWorkspace {
+            record: Box::new(owner.clone()),
+        };
+        let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+        registry
+            .submit_durable(&f.journal_path, "op-bind", 2_000, payload.clone())
+            .unwrap();
+        let before = registry.inspect_discovery_snapshot();
+        let binding = registry.bound_journal_identity.clone();
+        let committed = registry.committed_ops.clone();
+        let journal_a_bytes = fs::read(&f.journal_path).unwrap();
+
+        // Exercise both a different leaf name and a different parent identity.
+        // Invalid foreign contents prove identity rejection precedes replay.
+        for journal_b in [
+            f.journal_path.with_file_name("journal-b.jsonl"),
+            f.ws2_dir.join(f.journal_path.file_name().unwrap()),
+        ] {
+            let journal_b_bytes = b"foreign journal must never be replayed\n";
+            fs::write(&journal_b, journal_b_bytes).unwrap();
+            fs::set_permissions(&journal_b, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(matches!(
+                registry.submit_durable(&journal_b, "op-foreign", 3_000, payload.clone()),
+                Err(InventoryError::InvalidPath(_))
+            ));
+            assert!(matches!(
+                registry.refresh_from_journal(&journal_b),
+                Err(InventoryError::InvalidPath(_))
+            ));
+            let mut holding = registry.clone();
+            holding.journal_path = Some(journal_b.clone());
+            assert!(matches!(
+                holding.hold_workspace(&owner.record_id, "foreign hold".to_owned(), 3_000),
+                Err(InventoryError::InvalidPath(_))
+            ));
+            assert_eq!(holding.inspect_discovery_snapshot(), before);
+            assert_eq!(registry.inspect_discovery_snapshot(), before);
+            assert_eq!(registry.bound_journal_identity, binding);
+            assert_eq!(registry.committed_ops, committed);
+            assert_eq!(fs::read(&f.journal_path).unwrap(), journal_a_bytes);
+            assert_eq!(fs::read(&journal_b).unwrap(), journal_b_bytes);
+        }
+
+        registry.refresh_from_journal(&f.journal_path).unwrap();
+        assert_eq!(registry.bound_journal_identity, binding);
+        // The same pathname with a replacement inode is also a foreign journal.
+        fs::rename(&f.journal_path, f.journal_path.with_extension("original")).unwrap();
+        fs::write(&f.journal_path, &journal_a_bytes).unwrap();
+        fs::set_permissions(&f.journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            registry.refresh_from_journal(&f.journal_path),
+            Err(InventoryError::InvalidPath(_))
+        ));
+        assert_eq!(registry.inspect_discovery_snapshot(), before);
+        assert_eq!(registry.bound_journal_identity, binding);
+        assert_eq!(fs::read(&f.journal_path).unwrap(), journal_a_bytes);
+    }
+
+    #[test]
+    fn rejected_operation_id_cannot_be_reused_with_same_or_different_payload_and_pre_admission_leaves_no_footprint()
+     {
+        let f = EnvFixture::new();
+        let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+        let ready = s2b_capability("cap-1");
+        let mut dirty = ready.clone();
+        dirty.source_tree_clean = false;
+        let dirty_payload = InventoryPayloadV1::UpsertCapability {
+            record: Box::new(dirty.clone()),
+        };
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "op-pre-reject",
+                2_000,
+                dirty_payload.clone()
+            ),
+            Err(InventoryError::DirtyOrMismatchedBuildProvenance(_))
+        ));
+        assert!(fs::read(&f.journal_path).unwrap().is_empty());
+        assert!(!registry.rejected_ops.contains_key("op-pre-reject"));
+        assert!(registry.capabilities.is_empty());
+        assert!(registry.incomplete_ops_held.is_empty());
+        let ready_payload = InventoryPayloadV1::UpsertCapability {
+            record: Box::new(ready.clone()),
+        };
+        // Pre-admission rejection does not consume the operation ID.
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "op-pre-reject",
+                2_001,
+                ready_payload.clone(),
+            )
+            .unwrap();
+        let before_invalid = fs::read(&f.journal_path).unwrap();
+        let mut invalid = ready.clone();
+        invalid.handler_symbol.clear();
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "op-invalid-field",
+                2_002,
+                InventoryPayloadV1::UpsertCapability {
+                    record: Box::new(invalid)
+                }
+            ),
+            Err(InventoryError::InvalidIdentifier(_))
+        ));
+        assert_eq!(fs::read(&f.journal_path).unwrap(), before_invalid);
+        assert!(!registry.rejected_ops.contains_key("op-invalid-field"));
+        assert_eq!(
+            registry.capabilities["cap-1"].effective_classification,
+            CapabilityClassificationV1::Operational
+        );
+
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "op-cap-dirty",
+                3_000,
+                dirty_payload.clone()
+            ),
+            Err(InventoryError::DirtyOrMismatchedBuildProvenance(_))
+        ));
+        let entries = read_journal_entries(&f.journal_path);
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(
+            &entries[2],
+            JournalEntryV1::Intent { operation_id, payload, .. }
+                if operation_id == "op-cap-dirty" && payload == &dirty_payload
+        ));
+        assert!(matches!(
+            &entries[3],
+            JournalEntryV1::Result { operation_id, committed: false, hold_reason: Some(_), .. }
+                if operation_id == "op-cap-dirty"
+        ));
+        let held = registry.capabilities["cap-1"].clone();
+        assert_eq!(
+            held.effective_classification,
+            CapabilityClassificationV1::Held
+        );
+        assert_eq!(held.installed_binary_sha256, None);
+        assert!(!held.source_tree_clean);
+        assert!(registry.rejected_ops.contains_key("op-cap-dirty"));
+        let rejected_bytes = fs::read(&f.journal_path).unwrap();
+        let mut recovered =
+            ContinuousInventoryRegistryV1::load_and_reconcile(f.store_id, f.op_id, &f.journal_path)
+                .unwrap();
+        assert_eq!(recovered.capabilities["cap-1"], held);
+        assert_eq!(recovered.rejected_ops, registry.rejected_ops);
+        for handle in [&mut registry, &mut recovered] {
+            for (payload, digest_matches) in [
+                (dirty_payload.clone(), true),
+                (ready_payload.clone(), false),
+            ] {
+                let error = handle
+                    .submit_durable(&f.journal_path, "op-cap-dirty", 3_001, payload)
+                    .unwrap_err();
+                assert!(
+                    matches!(error, InventoryError::ConflictingReplay(ref reason)
+                    if reason.contains(&format!("digest_match={digest_matches}")))
+                );
+                assert_eq!(handle.capabilities["cap-1"], held);
+                assert_eq!(fs::read(&f.journal_path).unwrap(), rejected_bytes);
+            }
+        }
+
+        let owner = s2b_workspace(&f, false);
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "op-ws-owner",
+                4_000,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(owner.clone()),
+                },
+            )
+            .unwrap();
+        let mut conflict = owner;
+        conflict.record_id = "ws-conflict".to_owned();
+        conflict.workspace_name = "ws-conflict".to_owned();
+        let conflict_payload = InventoryPayloadV1::RegisterWorkspace {
+            record: Box::new(conflict),
+        };
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "op-ws-conflict",
+                4_001,
+                conflict_payload.clone()
+            ),
+            Err(InventoryError::DuplicatePhysicalWorkspace(_))
+        ));
+        let entries = read_journal_entries(&f.journal_path);
+        assert_eq!(entries.len(), 8);
+        assert!(matches!(
+            &entries[6],
+            JournalEntryV1::Intent { operation_id, .. } if operation_id == "op-ws-conflict"
+        ));
+        assert!(matches!(
+            &entries[7],
+            JournalEntryV1::Result { operation_id, committed: false, hold_reason: Some(_), .. }
+                if operation_id == "op-ws-conflict"
+        ));
+        let rejected_bytes = fs::read(&f.journal_path).unwrap();
+        let mut recovered =
+            ContinuousInventoryRegistryV1::load_and_reconcile(f.store_id, f.op_id, &f.journal_path)
+                .unwrap();
+        let different_payload = InventoryPayloadV1::RegisterWorkspace {
+            record: Box::new(s2b_workspace(&f, true)),
+        };
+        for handle in [&mut registry, &mut recovered] {
+            assert!(handle.rejected_ops.contains_key("op-ws-conflict"));
+            for payload in [conflict_payload.clone(), different_payload.clone()] {
+                assert!(matches!(
+                    handle.submit_durable(&f.journal_path, "op-ws-conflict", 4_002, payload),
+                    Err(InventoryError::ConflictingReplay(_))
+                ));
+                assert_eq!(fs::read(&f.journal_path).unwrap(), rejected_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_register_workspace_colliding_record_id_and_released_record_id_preserve_both_footprints()
+     {
+        let f = EnvFixture::new();
+        let mut owner = s2b_workspace(&f, false);
+        owner.record_id = "ws-1".to_owned();
+        let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "op-owner",
+                2_000,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(owner.clone()),
+                },
+            )
+            .unwrap();
+        let mut collision = s2b_workspace(&f, true);
+        collision.record_id = owner.record_id.clone();
+        let payload = InventoryPayloadV1::RegisterWorkspace {
+            record: Box::new(collision.clone()),
+        };
+        ContinuousInventoryRegistryV1::append_journal_entry(
+            &f.journal_path,
+            &JournalEntryV1::Intent {
+                operation_id: "op-incomplete-collision".to_owned(),
+                intent_digest: ContinuousInventoryRegistryV1::payload_digest(&payload).unwrap(),
+                recorded_unix_ms: 3_000,
+                payload,
+            },
+        )
+        .unwrap();
+        let bytes = fs::read(&f.journal_path).unwrap();
+        let mut recovered =
+            ContinuousInventoryRegistryV1::load_and_reconcile(f.store_id, f.op_id, &f.journal_path)
+                .unwrap();
+        assert_eq!(recovered.workspaces["ws-1"], owner);
+        let footprint_id = "ws-1#incomplete:op-incomplete-collision";
+        let footprint = &recovered.workspaces[footprint_id];
+        assert_eq!(
+            footprint.status,
+            WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
+        );
+        assert_eq!(footprint.workspace_identity, collision.workspace_identity);
+        assert_eq!(footprint.workspace_name, collision.workspace_name);
+        assert_eq!(
+            footprint.jj_working_copy_change_id,
+            collision.jj_working_copy_change_id
+        );
+        assert_eq!(
+            footprint.jj_working_copy_commit_id,
+            collision.jj_working_copy_commit_id
+        );
+        assert_eq!(footprint.pid_birth_binding, None);
+        assert_eq!(recovered.workspaces.len(), 2);
+        assert_eq!(fs::read(&f.journal_path).unwrap(), bytes);
+        let third_path = f._tmp.path().join("ws-third");
+        fs::create_dir(&third_path).unwrap();
+        fs::set_permissions(&third_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let third_identity = verify_private_directory_identity(&third_path, true).unwrap();
+
+        // Independently collide with the held inode, name, change, and commit.
+        for conflict in 0..4 {
+            let mut claim = collision.clone();
+            claim.record_id = "ws-2".to_owned();
+            claim.workspace_path = third_path.to_str().unwrap().to_owned();
+            claim.workspace_identity = third_identity;
+            claim.workspace_name = "ws-2".to_owned();
+            claim.jj_working_copy_change_id = "unique-third-change".to_owned();
+            claim.jj_working_copy_commit_id =
+                GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
+            match conflict {
+                0 => {
+                    claim.workspace_path.clone_from(&collision.workspace_path);
+                    claim.workspace_identity = collision.workspace_identity;
+                }
+                1 => claim.workspace_name.clone_from(&collision.workspace_name),
+                2 => claim
+                    .jj_working_copy_change_id
+                    .clone_from(&collision.jj_working_copy_change_id),
+                _ => claim.jj_working_copy_commit_id = collision.jj_working_copy_commit_id,
+            }
+            let error = recovered
+                .submit_durable(
+                    &f.journal_path,
+                    &format!("op-claim-{conflict}"),
+                    4_000,
+                    InventoryPayloadV1::RegisterWorkspace {
+                        record: Box::new(claim),
+                    },
+                )
+                .unwrap_err();
+            match conflict {
+                0 => assert!(matches!(
+                    error,
+                    InventoryError::DuplicatePhysicalWorkspace(_)
+                )),
+                1 => assert!(matches!(error, InventoryError::DuplicateWorkspaceName(_))),
+                _ => assert!(matches!(error, InventoryError::SharedMutableJjChange(_))),
+            }
+            assert_eq!(recovered.workspaces["ws-1"], owner);
+            assert_eq!(recovered.workspaces.len(), 2);
+        }
+        let before = fs::read(&f.journal_path).unwrap();
+        assert!(matches!(
+            recovered.submit_durable(
+                &f.journal_path,
+                "op-incomplete-collision",
+                4_001,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(collision)
+                }
+            ),
+            Err(InventoryError::IncompleteIntentHeld(_))
+        ));
+        assert_eq!(fs::read(&f.journal_path).unwrap(), before);
+
+        let f = EnvFixture::new();
+        let mut released = s2b_workspace(&f, false);
+        released.record_id = "ws-rel".to_owned();
+        let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "op-register-released",
+                2_000,
+                InventoryPayloadV1::RegisterWorkspace {
+                    record: Box::new(released.clone()),
+                },
+            )
+            .unwrap();
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "op-release",
+                3_000,
+                InventoryPayloadV1::ReleaseWorkspace {
+                    record_id: released.record_id,
+                    actor: released.owner_actor,
+                    released_unix_ms: 3_000,
+                },
+            )
+            .unwrap();
+        let mut replacement = s2b_workspace(&f, true);
+        replacement.record_id = "ws-rel".to_owned();
+        let payload = InventoryPayloadV1::RegisterWorkspace {
+            record: Box::new(replacement.clone()),
+        };
+        ContinuousInventoryRegistryV1::append_journal_entry(
+            &f.journal_path,
+            &JournalEntryV1::Intent {
+                operation_id: "op-incomplete-reregister".to_owned(),
+                intent_digest: ContinuousInventoryRegistryV1::payload_digest(&payload).unwrap(),
+                recorded_unix_ms: 4_000,
+                payload,
+            },
+        )
+        .unwrap();
+        let bytes = fs::read(&f.journal_path).unwrap();
+        let recovered =
+            ContinuousInventoryRegistryV1::load_and_reconcile(f.store_id, f.op_id, &f.journal_path)
+                .unwrap();
+        let held = &recovered.workspaces["ws-rel"];
+        assert_eq!(held.status, WorkspaceOwnershipStatusV1::HeldStaleOrUnknown);
+        assert_eq!(held.workspace_identity, replacement.workspace_identity);
+        assert_eq!(held.workspace_name, replacement.workspace_name);
+        assert_eq!(
+            held.jj_working_copy_change_id,
+            replacement.jj_working_copy_change_id
+        );
+        assert_eq!(
+            held.jj_working_copy_commit_id,
+            replacement.jj_working_copy_commit_id
+        );
+        assert_eq!(held.pid_birth_binding, None);
+        assert_eq!(
+            held.hold_reason.as_deref(),
+            Some(
+                "incomplete_journal_intent:op-incomplete-reregister:register_workspace_unconfirmed"
+            )
+        );
+        assert_eq!(recovered.workspaces.len(), 1);
+        assert_eq!(fs::read(&f.journal_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn torn_journal_tail_preserves_valid_prefix_for_discovery_fences_active_entries_and_blocks_mutations_without_truncating()
+     {
+        for tail in [
+            b"{\"record_kind\":\"intent\"".as_slice(),
+            b"not JSON\n".as_slice(),
+            b"{\"record_kind\":\"intent\"}\n".as_slice(),
+            b"{\"record_kind\":\"intent\",\"record_kind\":\"result\"}\n".as_slice(),
+        ] {
+            let f = EnvFixture::new();
+            let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+            let mut owner = s2b_workspace(&f, false);
+            owner.record_id = "ws-1".to_owned();
+            registry
+                .submit_durable(
+                    &f.journal_path,
+                    "op-owner",
+                    2_000,
+                    InventoryPayloadV1::RegisterWorkspace {
+                        record: Box::new(owner),
+                    },
+                )
+                .unwrap();
+            registry
+                .submit_durable(
+                    &f.journal_path,
+                    "op-ready",
+                    2_000,
+                    InventoryPayloadV1::UpsertCapability {
+                        record: Box::new(s2b_capability("cap-1")),
+                    },
+                )
+                .unwrap();
+            let pending = InventoryPayloadV1::RegisterWorkspace {
+                record: Box::new(s2b_workspace(&f, true)),
+            };
+            ContinuousInventoryRegistryV1::append_journal_entry(
+                &f.journal_path,
+                &JournalEntryV1::Intent {
+                    operation_id: "op-pending-prefix".to_owned(),
+                    intent_digest: ContinuousInventoryRegistryV1::payload_digest(&pending).unwrap(),
+                    recorded_unix_ms: 3_000,
+                    payload: pending,
+                },
+            )
+            .unwrap();
+            let mut bytes = fs::read(&f.journal_path).unwrap();
+            bytes.extend_from_slice(tail);
+            fs::write(&f.journal_path, &bytes).unwrap();
+            let size = fs::metadata(&f.journal_path).unwrap().len();
+            // Reconciliation would ordinarily persist a hold for this missing
+            // path. Torn-tail recovery must remain a discovery-only operation.
+            fs::remove_dir(&f.ws1_dir).unwrap();
+            let mut recovered = ContinuousInventoryRegistryV1::load_and_reconcile(
+                f.store_id,
+                f.op_id,
+                &f.journal_path,
+            )
+            .unwrap();
+            let snapshot = recovered.inspect_discovery_snapshot();
+            let reason = "torn_or_corrupt_journal_tail_at_line_6";
+            assert_eq!(
+                snapshot.corrupt_or_ambiguous_tail_reason.as_deref(),
+                Some(reason)
+            );
+            assert_eq!(recovered.corrupt_or_ambiguous_tail_reason(), Some(reason));
+            let owner = snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.record_id == "ws-1")
+                .unwrap();
+            assert_eq!(owner.status, WorkspaceOwnershipStatusV1::HeldStaleOrUnknown);
+            assert_eq!(owner.pid_birth_binding, None);
+            assert_eq!(owner.hold_reason, Some(format!("fenced_by_{reason}")));
+            let capability = snapshot
+                .capabilities
+                .iter()
+                .find(|c| c.capability_id == "cap-1")
+                .unwrap();
+            assert_eq!(
+                capability.effective_classification,
+                CapabilityClassificationV1::Held
+            );
+            assert_eq!(capability.installed_binary_sha256, None);
+            assert_eq!(
+                capability.hold_or_downgrade_reason,
+                Some(format!("fenced_by_{reason}"))
+            );
+            assert_eq!(
+                snapshot.incomplete_operations_held,
+                vec![
+                    "op-pending-prefix".to_owned(),
+                    "torn-journal-tail-line-6".to_owned()
+                ]
+            );
+            assert_eq!(snapshot.workspaces.len(), 2);
+            assert_eq!(
+                recovered.workspaces["s2b-second"].status,
+                WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
+            );
+            assert_eq!(fs::metadata(&f.journal_path).unwrap().len(), size);
+            assert_eq!(fs::read(&f.journal_path).unwrap(), bytes);
+
+            // Both a freshly loaded handle and a stale live handle fail closed.
+            for handle in [&mut recovered, &mut registry] {
+                assert!(matches!(
+                    handle.submit_durable(
+                        &f.journal_path,
+                        "op-after-tail",
+                        4_000,
+                        InventoryPayloadV1::UpsertCapability {
+                            record: Box::new(s2b_capability("cap-after-tail"))
+                        }
+                    ),
+                    Err(InventoryError::JournalCorruptOrBounded(_))
+                ));
+                assert!(matches!(
+                    handle.hold_workspace("ws-1", "after tail".to_owned(), 4_001),
+                    Err(InventoryError::JournalCorruptOrBounded(_))
+                ));
+                handle.refresh_from_journal(&f.journal_path).unwrap();
+                assert_eq!(handle.inspect_discovery_snapshot(), snapshot);
+                assert_eq!(fs::metadata(&f.journal_path).unwrap().len(), size);
+                assert_eq!(fs::read(&f.journal_path).unwrap(), bytes);
+            }
+            let mut journal = LockedInventoryJournal::open(&f.journal_path, false)
+                .unwrap()
+                .unwrap();
+            let (_, physical_record_count) =
+                ContinuousInventoryRegistryV1::replay_journal(f.store_id, f.op_id, &mut journal)
+                    .unwrap();
+            assert_eq!(physical_record_count, 6);
+        }
+    }
+
+    #[test]
+    fn ambiguous_append_failures_preserve_holds_and_disposition_across_refresh() {
+        for fail_result in [false, true] {
+            for upsert_capability in [false, true] {
+                let f = EnvFixture::new();
+                let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+                let owner = s2b_workspace(&f, false);
+                let ready = s2b_capability("cap-1");
+                registry
+                    .submit_durable(
+                        &f.journal_path,
+                        "op-owner",
+                        2_000,
+                        InventoryPayloadV1::RegisterWorkspace {
+                            record: Box::new(owner.clone()),
+                        },
+                    )
+                    .unwrap();
+                registry
+                    .submit_durable(
+                        &f.journal_path,
+                        "op-ready",
+                        2_000,
+                        InventoryPayloadV1::UpsertCapability {
+                            record: Box::new(ready.clone()),
+                        },
+                    )
+                    .unwrap();
+                let mut collision = owner;
+                collision.record_id = "ws-conflict".to_owned();
+                collision.workspace_name = "ws-conflict".to_owned();
+                assert!(matches!(
+                    registry.submit_durable(
+                        &f.journal_path,
+                        "op-rejected",
+                        3_000,
+                        InventoryPayloadV1::RegisterWorkspace {
+                            record: Box::new(collision)
+                        }
+                    ),
+                    Err(InventoryError::DuplicatePhysicalWorkspace(_))
+                ));
+                let payload = if upsert_capability {
+                    InventoryPayloadV1::UpsertCapability {
+                        record: Box::new(ready),
+                    }
+                } else {
+                    InventoryPayloadV1::RegisterWorkspace {
+                        record: Box::new(s2b_workspace(&f, true)),
+                    }
+                };
+                let before_failure = fs::read(&f.journal_path).unwrap();
+                let error = if fail_result {
+                    registry.fail_next_result_append = true;
+                    registry
+                        .submit_durable(&f.journal_path, "op-ambiguous", 4_000, payload.clone())
+                        .unwrap_err()
+                } else {
+                    // An actual read-only descriptor makes Intent append fail
+                    // without changing any bytes on disk.
+                    let mut journal = LockedInventoryJournal::open(&f.journal_path, false)
+                        .unwrap()
+                        .unwrap();
+                    registry
+                        .commit_payload(&mut journal, 6, "op-ambiguous", 4_000, payload.clone())
+                        .unwrap_err()
+                };
+                assert!(matches!(error, InventoryError::Io(_)));
+                let reason_prefix = if fail_result {
+                    "ambiguous_result_append:op-ambiguous:"
+                } else {
+                    "ambiguous_intent_append:op-ambiguous:"
+                };
+                assert!(
+                    registry
+                        .corrupt_or_ambiguous_tail_reason()
+                        .is_some_and(|reason| reason.starts_with(reason_prefix))
+                );
+                assert!(registry.incomplete_ops_held.contains_key("op-ambiguous"));
+                if upsert_capability {
+                    assert_eq!(
+                        registry.capabilities["cap-1"].effective_classification,
+                        CapabilityClassificationV1::Held
+                    );
+                    assert_eq!(registry.capabilities["cap-1"].installed_binary_sha256, None);
+                } else {
+                    assert_eq!(
+                        registry.workspaces["s2b-second"].status,
+                        WorkspaceOwnershipStatusV1::HeldStaleOrUnknown
+                    );
+                    assert_eq!(registry.workspaces["s2b-second"].pid_birth_binding, None);
+                }
+                let after_failure = fs::read(&f.journal_path).unwrap();
+                if fail_result {
+                    assert_eq!(read_journal_entries(&f.journal_path).len(), 7);
+                } else {
+                    assert_eq!(after_failure, before_failure);
+                }
+                let snapshot = registry.inspect_discovery_snapshot();
+                let rejected = registry.rejected_ops.clone();
+                registry.refresh_from_journal(&f.journal_path).unwrap();
+                assert_eq!(registry.inspect_discovery_snapshot(), snapshot);
+                assert_eq!(registry.rejected_ops, rejected);
+                assert!(matches!(
+                    registry.submit_durable(&f.journal_path, "op-ambiguous", 4_001, payload),
+                    Err(InventoryError::JournalCorruptOrBounded(_))
+                ));
+                assert!(matches!(
+                    registry.hold_workspace("s2b-first", "blocked hold".to_owned(), 4_001),
+                    Err(InventoryError::JournalCorruptOrBounded(_))
+                ));
+                assert_eq!(registry.inspect_discovery_snapshot(), snapshot);
+                assert_eq!(fs::read(&f.journal_path).unwrap(), after_failure);
+            }
+        }
+    }
+
+    #[test]
+    fn journal_semantic_corruption_and_nonfinal_syntax_errors_fail_closed() {
+        let f = EnvFixture::new();
+        let mut registry = ContinuousInventoryRegistryV1::new(f.store_id, f.op_id).unwrap();
+        let mut capability = s2b_capability("cap-1");
+        registry
+            .submit_durable(
+                &f.journal_path,
+                "op-ready",
+                2_000,
+                InventoryPayloadV1::UpsertCapability {
+                    record: Box::new(capability.clone()),
+                },
+            )
+            .unwrap();
+        capability.source_tree_clean = false;
+        assert!(matches!(
+            registry.submit_durable(
+                &f.journal_path,
+                "op-rejected",
+                3_000,
+                InventoryPayloadV1::UpsertCapability {
+                    record: Box::new(capability)
+                }
+            ),
+            Err(InventoryError::DirtyOrMismatchedBuildProvenance(_))
+        ));
+        let entries = read_journal_entries(&f.journal_path);
+        let prefix = fs::read(&f.journal_path).unwrap();
+        let payload = InventoryPayloadV1::UpsertCapability {
+            record: Box::new(s2b_capability("cap-new")),
+        };
+        let digest = ContinuousInventoryRegistryV1::payload_digest(&payload).unwrap();
+        let pending = JournalEntryV1::Intent {
+            operation_id: "op-pending".to_owned(),
+            intent_digest: digest.clone(),
+            recorded_unix_ms: 4_000,
+            payload: payload.clone(),
+        };
+        let orphan = JournalEntryV1::Result {
+            operation_id: "op-orphan".to_owned(),
+            intent_digest: digest,
+            completed_unix_ms: 4_000,
+            committed: false,
+            hold_reason: Some("orphan result".to_owned()),
+        };
+        let bad_digest = JournalEntryV1::Intent {
+            operation_id: "op-bad-digest".to_owned(),
+            intent_digest: "invalid digest".to_owned(),
+            recorded_unix_ms: 4_000,
+            payload,
+        };
+        let mismatched_result = JournalEntryV1::Result {
+            operation_id: "op-pending".to_owned(),
+            intent_digest: "mismatched result digest".to_owned(),
+            completed_unix_ms: 4_000,
+            committed: false,
+            hold_reason: Some("invalid digest".to_owned()),
+        };
+        let line = |entry| ContinuousInventoryRegistryV1::journal_line(entry).unwrap();
+        let duplicate_pending = [line(&pending), line(&pending)].concat();
+        let nonfinal_syntax = [b"not JSON\n".to_vec(), line(&pending)].concat();
+        let mismatched_result = [line(&pending), line(&mismatched_result)].concat();
+        for suffix in [
+            line(&entries[0]), // Duplicate committed Intent.
+            line(&entries[2]), // Duplicate durably rejected Intent.
+            duplicate_pending,
+            line(&orphan),
+            line(&bad_digest),
+            mismatched_result,
+            nonfinal_syntax,
+        ] {
+            let bytes = [prefix.clone(), suffix].concat();
+            fs::write(&f.journal_path, &bytes).unwrap();
+            assert!(matches!(
+                ContinuousInventoryRegistryV1::load_and_reconcile(
+                    f.store_id,
+                    f.op_id,
+                    &f.journal_path
+                ),
+                Err(InventoryError::JournalCorruptOrBounded(_))
+            ));
+            assert_eq!(fs::read(&f.journal_path).unwrap(), bytes);
+        }
     }
 
     #[test]
