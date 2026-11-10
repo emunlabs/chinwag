@@ -614,6 +614,11 @@ where
         if remaining.is_zero() {
             return Ok((124, json!({"status":"TIMEOUT","actor":actor})));
         }
+        // An archived tail can contain no eligible wake. Existing successor
+        // generations still need catch-up without waiting for a new arrival.
+        if journal.inode != snapshot(repo)?.inode {
+            continue;
+        }
         // Consume the receiver registered before this catch-up. Marks are
         // additional hints only; they do not establish the subscription.
         if !changed(repo, journal.len, journal.inode, remaining.as_secs().max(1))? {
@@ -1150,6 +1155,55 @@ mod tests {
                 serde_json::to_value(done).unwrap()
             );
         }
+    }
+    #[test]
+    fn r1_archived_nonwaking_tail_resolves_before_idle_and_unproved_successor_holds() {
+        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        f.seed_pending();
+        let mut c = f.cursor();
+        let mut row = c.pending_deliveries.remove(0).messages.remove(0);
+        row.id = "archive-one".into();
+        row.seq = 1;
+        let mut tail = row.clone();
+        tail.id = "archive-two".into();
+        tail.seq = 2;
+        let path = f.root.join(".chinwag/bus/messages.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&row).unwrap(),
+                serde_json::to_string(&tail).unwrap()
+            ),
+        )
+        .unwrap();
+        let initial = snapshot(&f.root).unwrap();
+        c.last_scanned_seq = 1;
+        c.last_scanned_id = row.id.clone();
+        c.last_scanned_digest = row.digest_sha256.clone();
+        c.last_scanned_inode = initial.inode;
+        c.last_scanned_line1_digest = initial.first_digest;
+        f.put(&c);
+        std::fs::rename(&path, path.with_file_name("messages.jsonl.old")).unwrap();
+        let mut current = row.clone();
+        current.id = "unproved-successor".into();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&current).unwrap()),
+        )
+        .unwrap();
+        let error = wait_subscribed(
+            &f.root,
+            &f.grant.actor,
+            &Flags::new(),
+            f.owner.public(),
+            |_, _| Ok(()),
+            |_, _, _, _| panic!("an existing generation must resolve before idle"),
+        )
+        .unwrap_err();
+        assert!(error.contains("CONTINUITY_UNPROVEN"));
+        assert_eq!(f.cursor().last_scanned_id, "archive-two");
+        assert!(f.cursor().pending_deliveries.is_empty());
     }
     #[test]
     fn r1_subscription_boundary_concurrent_cursor_change_refuses_stale_scan() {
