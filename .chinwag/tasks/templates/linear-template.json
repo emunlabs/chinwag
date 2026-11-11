@@ -1,0 +1,58 @@
+{
+  "schema": "chinwag.linear.template.v1",
+  "version": "1.0.0",
+  "team_key": "CHWG",
+  "team_name": "Chinwag Engineering Velocity & Agent Fleet",
+  "default_visibility": "private",
+  "public_board": false,
+  "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
+  "invariants": [
+    "INV-DEFAULT-PRIVATE-BOARD-01",
+    "INV-DEFAULT-PRIVATE-TASK-01",
+    "INV-CHINWAG-TASKS-REPO-01",
+    "INV-NO-FAKE-DONE-01"
+  ],
+  "engines": {
+    "delivery_supervisor": "Chinwag Delivery-2",
+    "reflex_worker": "Chinwag Reflex-1",
+    "visual_tribunal": "Chinwag Vision-3"
+  },
+  "workflow_states": [
+    {
+      "code": "01_OPEN_BOUNTY",
+      "name": "01 · 🌱 OPEN BOUNTY (+500 CR)",
+      "type": "triage"
+    },
+    {
+      "code": "02_SCOPED_BENCHMARKED",
+      "name": "02 · 📐 SCOPED & BENCHMARKED",
+      "type": "unstarted"
+    },
+    {
+      "code": "03_IN_FLIGHT",
+      "name": "03 · ⚡ IN FLIGHT — CLOCK LIVE",
+      "type": "started"
+    },
+    {
+      "code": "04_TRIBUNAL_GATE",
+      "name": "04 · ⚖️ TRIBUNAL & COPY GATE",
+      "type": "started"
+    },
+    {
+      "code": "05_SHIPPED_VERIFIED",
+      "name": "05 · ✓ SHIPPED — Δ VERIFIED",
+      "type": "completed"
+    }
+  ],
+  "labels": [
+    "Tier S · 8.5h Eng",
+    "Tier M · 27h Eng",
+    "Tier L · 50h Eng",
+    "Tier XL · 112h Eng",
+    "⚡ 100x+ Faster vs. DORA",
+    "Pair (100 Cr)",
+    "Triad (150 Cr)",
+    "Quad (200 Cr)",
+    "SURV:PENDING_168H"
+  ]
+}

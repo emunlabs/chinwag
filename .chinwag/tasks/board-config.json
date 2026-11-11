@@ -76,7 +76,10 @@
     "CHWG-0198": "I_kwDOVU4K-c8AAAABeL1MCw",
     "CHWG-0199": "I_kwDOVU4K-c8AAAABeL1TQw",
     "CHWG-0200": "I_kwDOVU4K-c8AAAABeL1aMg",
-    "CHWG-0201": "I_kwDOVU4K-c8AAAABeL1h6w"
+    "CHWG-0201": "I_kwDOVU4K-c8AAAABeL1h6w",
+    "CHWG-0202": "I_kwDOVU4K-c8AAAABeMDLQA",
+    "CHWG-0203": "I_kwDOVU4K-c8AAAABeMDT-g",
+    "CHWG-0204": "I_kwDOVU4K-c8AAAABeMDdFQ"
   },
   "synced_issue_numbers": {
     "CHWG-0189": 19,
@@ -91,7 +94,10 @@
     "CHWG-0198": 28,
     "CHWG-0199": 29,
     "CHWG-0200": 30,
-    "CHWG-0201": 31
+    "CHWG-0201": 31,
+    "CHWG-0202": 32,
+    "CHWG-0203": 33,
+    "CHWG-0204": 34
   },
   "synced_issue_urls": {
     "CHWG-0189": "https://github.com/emunlabs/chinwag/issues/19",
@@ -106,7 +112,10 @@
     "CHWG-0198": "https://github.com/emunlabs/chinwag/issues/28",
     "CHWG-0199": "https://github.com/emunlabs/chinwag/issues/29",
     "CHWG-0200": "https://github.com/emunlabs/chinwag/issues/30",
-    "CHWG-0201": "https://github.com/emunlabs/chinwag/issues/31"
+    "CHWG-0201": "https://github.com/emunlabs/chinwag/issues/31",
+    "CHWG-0202": "https://github.com/emunlabs/chinwag/issues/32",
+    "CHWG-0203": "https://github.com/emunlabs/chinwag/issues/33",
+    "CHWG-0204": "https://github.com/emunlabs/chinwag/issues/34"
   },
   "synced_project_item_ids": {
     "CHWG-0189": "PVTI_lADOFJPsXM4BrFUVzhHrxhs",
@@ -121,6 +130,9 @@
     "CHWG-0198": "PVTI_lADOFJPsXM4BrFUVzhHsrqw",
     "CHWG-0199": "PVTI_lADOFJPsXM4BrFUVzhHsrx8",
     "CHWG-0200": "PVTI_lADOFJPsXM4BrFUVzhHsr4o",
-    "CHWG-0201": "PVTI_lADOFJPsXM4BrFUVzhHssAI"
+    "CHWG-0201": "PVTI_lADOFJPsXM4BrFUVzhHssAI",
+    "CHWG-0202": "PVTI_lADOFJPsXM4BrFUVzhHs6j4",
+    "CHWG-0203": "PVTI_lADOFJPsXM4BrFUVzhHs6sw",
+    "CHWG-0204": "PVTI_lADOFJPsXM4BrFUVzhHs63c"
   }
 }
