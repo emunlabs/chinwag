@@ -134,4 +134,4 @@ if [[ -f "$SCRIPT_SELF" && ! -L "$SCRIPT_SELF" ]]; then
   mv -f "$WRAPPER_TMP" "${HOME}/.local/bin/chinwag-release-publish"
 fi
 
-exec "$RUNNER_CHINWAG" "${PUBLISH_ARGS[@]}"
+exec -a chinwag "$RUNNER_CHINWAG" "${PUBLISH_ARGS[@]}"

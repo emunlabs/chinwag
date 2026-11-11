@@ -1382,6 +1382,12 @@ async fn drive_daemon_room(
             session.close_for_reconnect().await;
             reconnecting = true;
             loop {
+                if reconnect_attempt >= chinwag_swarm::room::MAX_CONSECUTIVE_RECONNECT_ATTEMPTS {
+                    session.close().await;
+                    return RoomOwnerFailure::ReceiveFailed(format!(
+                        "reconnect attempts exhausted after {reconnect_attempt} tries ({reason})"
+                    ));
+                }
                 let backoff = chinwag_swarm::room::next_reconnect_backoff(reconnect_attempt);
                 let _ = room_events.try_send(json!({
                     "event": "native_room_reconnect_scheduled",
@@ -1722,8 +1728,17 @@ async fn run_daemon_loop_reexecable(
         .ok()
         .and_then(|exe| chinwag_cli::release_sync::local_binary_sha256(&exe));
 
+    const MAX_RELEASE_SYNC_TRANSIENT_RETRIES: u32 = 12;
+    let release_reconcile_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_new_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut release_retry_attempts: u32 = 0;
+    let mut next_release_retry_at: Option<Instant> = None;
+
     let (release_done_tx, mut release_done_rx) = tokio::sync::mpsc::channel::<
-        Result<(String, chinwag_cli::release_sync::ReleaseApplyOutcome), String>,
+        Result<
+            (String, chinwag_cli::release_sync::ReleaseApplyOutcome),
+            (String, chinwag_cli::release_sync::ReleaseSyncError),
+        >,
     >(16);
     let release_job_tx = if !no_governors && controlled_local_driver.is_none() {
         let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(32);
@@ -1744,44 +1759,51 @@ async fn run_daemon_loop_reexecable(
                         chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_clone.clone());
                     match job {
                         ReleaseDaemonJob::StartupCatchup => {
-                            chinwag_cli::release_sync::sync_releases_from_journal_and_r2(
+                            chinwag_cli::release_sync::sync_releases_from_journal_and_r2_per_binary(
                                 &home_clone,
                                 &journal_clone,
                                 &store,
                                 true,
                                 Some(&ep_clone),
                             )
-                            .map_err(|e| e.to_string())
                         }
                         ReleaseDaemonJob::LiveMessage(msg) => {
                             let binary =
                                 chinwag_cli::release_sync::verify_release_built_message(&msg)
                                     .map(|m| m.binary)
                                     .unwrap_or_else(|_| "unknown".to_owned());
-                            chinwag_cli::release_sync::apply_release_built_message(
+                            let res = chinwag_cli::release_sync::apply_release_built_message(
                                 &home_clone,
                                 &store,
                                 &msg,
                                 Some(&ep_clone),
-                            )
-                            .map(|outcome| vec![(binary, outcome)])
-                            .map_err(|e| e.to_string())
+                            );
+                            Ok(vec![(binary, res)])
                         }
                     }
                 })
                 .await;
                 match outcomes {
                     Ok(Ok(items)) => {
-                        for item in items {
-                            let _ = done_tx.send(Ok(item)).await;
+                        for (binary, res) in items {
+                            let event = match res {
+                                Ok(outcome) => Ok((binary, outcome)),
+                                Err(err) => Err((binary, err)),
+                            };
+                            let _ = done_tx.send(event).await;
                         }
                     }
                     Ok(Err(err)) => {
-                        let _ = done_tx.send(Err(err)).await;
+                        let _ = done_tx.send(Err(("all".to_owned(), err))).await;
                     }
                     Err(_) => {
                         let _ = done_tx
-                            .send(Err("release sync worker panicked".to_owned()))
+                            .send(Err((
+                                "worker".to_owned(),
+                                chinwag_cli::release_sync::ReleaseSyncError::InstallFailed(
+                                    "release sync worker panicked".to_owned(),
+                                ),
+                            )))
                             .await;
                     }
                 }
@@ -1848,6 +1870,9 @@ async fn run_daemon_loop_reexecable(
             Some(release_event) = release_done_rx.recv() => {
                 match release_event {
                     Ok((binary, outcome)) => {
+                        if next_release_retry_at.is_none() {
+                            release_retry_attempts = 0;
+                        }
                         match outcome {
                             chinwag_cli::release_sync::ReleaseApplyOutcome::Installed {
                                 manifest,
@@ -1952,16 +1977,30 @@ async fn run_daemon_loop_reexecable(
                             }
                         }
                     }
-                    Err(reason) => {
+                    Err((binary, err)) => {
+                        if release_new_signal.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            release_retry_attempts = 0;
+                        }
+                        let retryable = err.is_transient_retryable();
                         let _ = writeln!(
                             stdout,
                             "{}",
                             json!({
                                 "event": "native_release_sync_rejected",
-                                "reason": reason
+                                "binary": binary,
+                                "reason": err.to_string(),
+                                "retryable": retryable
                             })
                         );
                         let _ = stdout.flush();
+                        if retryable && release_retry_attempts < MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
+                            let delay_secs = 10u64
+                                .saturating_mul(1u64 << release_retry_attempts.min(5))
+                                .min(300);
+                            release_retry_attempts = release_retry_attempts.saturating_add(1);
+                            next_release_retry_at =
+                                Some(Instant::now() + Duration::from_secs(delay_secs));
+                        }
                     }
                 }
             }
@@ -2053,6 +2092,21 @@ async fn run_daemon_loop_reexecable(
                     exit_code = 1;
                     break;
                 }
+                if let Some(job_tx) = &release_job_tx {
+                    if release_new_signal.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        release_retry_attempts = 0;
+                    }
+                    let retry_due = next_release_retry_at.is_some_and(|due| Instant::now() >= due);
+                    let overflow_due =
+                        release_reconcile_needed.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    if retry_due || overflow_due {
+                        next_release_retry_at = None;
+                        if job_tx.try_send(ReleaseDaemonJob::StartupCatchup).is_err() {
+                            release_reconcile_needed
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
             }
             _ = governor_tick.tick(), if !no_governors => {
                 // Reconciliation is a trigger, not authority to create a new task invocation.
@@ -2083,6 +2137,8 @@ async fn run_daemon_loop_reexecable(
                 let state_error = state_error_tx.clone();
                 let receipts = receipts.clone();
                 let release_queue = release_job_tx.clone();
+                let release_reconcile = release_reconcile_needed.clone();
+                let release_signal = release_new_signal.clone();
                 handlers.spawn(async move {
                     let _slot = slot;
                     let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), incoming).await else {
@@ -2215,7 +2271,13 @@ async fn run_daemon_loop_reexecable(
                         && chinwag_cli::release_sync::is_release_built_candidate(&message)
                         && let Some(queue) = &release_queue
                     {
-                        let _ = queue.try_send(ReleaseDaemonJob::LiveMessage(Box::new(message.clone())));
+                        release_signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if queue
+                            .try_send(ReleaseDaemonJob::LiveMessage(Box::new(message.clone())))
+                            .is_err()
+                        {
+                            release_reconcile.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                     let ack = match result {
                         Ok((seq, subscribers)) => BusAck { ok:true, seq, message_id:message.id.clone(), daemon_endpoint_id:daemon_ep,
@@ -3280,6 +3342,22 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 DaemonOutcome::Exit(code) => code,
                 DaemonOutcome::Reexec(exec_path) => {
                     use std::os::unix::process::CommandExt;
+                    let Ok(meta) = fs::symlink_metadata(&exec_path) else {
+                        let _ = writeln!(
+                            stderr,
+                            "chinwag bus daemon: re-exec refused (missing target {})",
+                            exec_path.display()
+                        );
+                        return 1;
+                    };
+                    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                        let _ = writeln!(
+                            stderr,
+                            "chinwag bus daemon: re-exec refused (non-regular target {})",
+                            exec_path.display()
+                        );
+                        return 1;
+                    }
                     let _ = writeln!(
                         stdout,
                         "chinwag bus daemon: re-executing updated binary at {}",
@@ -3966,7 +4044,7 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
                 });
             let store = chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_dir.clone());
             let journal_path = messages_jsonl_path(&repo_root);
-            match chinwag_cli::release_sync::sync_releases_from_journal_and_r2(
+            match chinwag_cli::release_sync::sync_releases_from_journal_and_r2_per_binary(
                 &home_dir,
                 &journal_path,
                 &store,
@@ -3975,14 +4053,15 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
             ) {
                 Ok(outcomes) => {
                     let mut rows = Vec::new();
-                    for (binary, outcome) in outcomes {
-                        match outcome {
-                            chinwag_cli::release_sync::ReleaseApplyOutcome::Installed {
+                    let mut had_error = false;
+                    for (binary, res) in outcomes {
+                        match res {
+                            Ok(chinwag_cli::release_sync::ReleaseApplyOutcome::Installed {
                                 manifest,
                                 install_path,
                                 receipt_message,
                                 ..
-                            } => {
+                            }) => {
                                 if let Some(receipt) = receipt_message {
                                     let _ = publish_prebuilt_bus_message_sync(&repo_root, *receipt);
                                 }
@@ -3994,10 +4073,12 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
                                     "install_path": install_path.to_string_lossy(),
                                 }));
                             }
-                            chinwag_cli::release_sync::ReleaseApplyOutcome::AlreadyInstalled {
-                                manifest,
-                                install_path,
-                            } => {
+                            Ok(
+                                chinwag_cli::release_sync::ReleaseApplyOutcome::AlreadyInstalled {
+                                    manifest,
+                                    install_path,
+                                },
+                            ) => {
                                 rows.push(json!({
                                     "binary": binary,
                                     "status": "already_installed",
@@ -4006,10 +4087,12 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
                                     "install_path": install_path.to_string_lossy(),
                                 }));
                             }
-                            chinwag_cli::release_sync::ReleaseApplyOutcome::SkippedTargetMismatch {
-                                manifest_target,
-                                local_target,
-                            } => {
+                            Ok(
+                                chinwag_cli::release_sync::ReleaseApplyOutcome::SkippedTargetMismatch {
+                                    manifest_target,
+                                    local_target,
+                                },
+                            ) => {
                                 rows.push(json!({
                                     "binary": binary,
                                     "status": "skipped_target_mismatch",
@@ -4017,11 +4100,23 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
                                     "local_target": local_target,
                                 }));
                             }
+                            Err(err) => {
+                                had_error = true;
+                                if !is_json {
+                                    let _ =
+                                        writeln!(stderr, "chinwag release sync ({binary}): {err}");
+                                }
+                                rows.push(json!({
+                                    "binary": binary,
+                                    "status": "error",
+                                    "error": err.to_string(),
+                                }));
+                            }
                         }
                     }
                     if is_json {
                         let out = json!({
-                            "ok": true,
+                            "ok": !had_error,
                             "outcomes": rows,
                         });
                         let _ = writeln!(
@@ -4045,7 +4140,7 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
                             );
                         }
                     }
-                    0
+                    u8::from(had_error)
                 }
                 Err(err) => {
                     let _ = writeln!(stderr, "chinwag release sync: {err}");

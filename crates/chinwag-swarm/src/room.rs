@@ -247,6 +247,7 @@ pub const ATTACH_CHALLENGE_MAX_RETRIES: usize = 2;
 const ATTACH_WARMUP_BACKOFF_MS: [u64; ATTACH_CHALLENGE_MAX_RETRIES] = [500, 1500];
 pub const RECONNECT_BACKOFF_MIN_MS: u64 = 250;
 pub const RECONNECT_BACKOFF_MAX_MS: u64 = 30_000;
+pub const MAX_CONSECUTIVE_RECONNECT_ATTEMPTS: u32 = 240;
 
 fn startup_http_phase(phase: &'static str, error: Error) -> Error {
     match error {
@@ -267,9 +268,10 @@ pub fn is_retryable_attach_challenge_error(error: &Error) -> bool {
     matches!(
         error,
         Error::Timeout
-            | Error::PhaseTimeout(_)
+            | Error::PhaseTimeout("attach_challenge_http")
             | Error::Http("timeout" | "connect")
             | Error::HttpResponse {
+                phase: "challenge_response_headers" | "challenge_response_body",
                 category: "timeout" | "connect",
                 ..
             }
@@ -303,6 +305,10 @@ pub fn is_reconnectable_room_error(error: &Error) -> bool {
             )
             | Error::Http("timeout" | "connect")
             | Error::HttpResponse {
+                phase: "challenge_response_headers"
+                    | "challenge_response_body"
+                    | "peer_store_response_headers"
+                    | "peer_store_response_body",
                 category: "timeout" | "connect",
                 ..
             }
@@ -821,14 +827,34 @@ impl RoomClient {
         })
         .await
         .map_err(|_| Error::PhaseTimeout("transport_presence_renewal"))??;
-        session
+        let attempted_nonce = result.0.challenge_nonce.clone();
+        let owner = session
             .daemon_owner
             .as_mut()
-            .ok_or(BindingError::Unavailable)?
-            .commit_renewal(ticket, result.0, result.1)?;
-        cancellation.committed = true;
-        tracing::info!(room_phase = "own_transport_presence_renewed");
-        Ok(())
+            .ok_or(BindingError::Unavailable)?;
+        match owner.commit_renewal(ticket, result.0, result.1) {
+            Ok(()) => {
+                cancellation.committed = true;
+                tracing::info!(room_phase = "own_transport_presence_renewed");
+                Ok(())
+            }
+            Err(BindingError::Expired) => {
+                // Lease crossed expiry while renewal HTTP I/O was in flight.
+                // Retire the issued challenge nonce and suspend the gate (leaving
+                // admission deny-all) before disarming `PresenceRenewalGuard` so
+                // the caller can reconnect cleanly on a fresh coordinator session.
+                if owner
+                    .record_retired_nonce_and_suspend(&attempted_nonce)
+                    .is_ok()
+                {
+                    cancellation.committed = true;
+                    Err(BindingError::Expired.into())
+                } else {
+                    Err(BindingError::Revoked.into())
+                }
+            }
+            Err(other) => Err(other.into()),
+        }
     }
 
     async fn open_inner<S: RoomSigner + ?Sized>(
@@ -1503,6 +1529,20 @@ mod tests {
         assert!(matches!(refused, Err(Error::Refused(403))));
         assert_eq!(refusal_calls.load(Ordering::SeqCst), 1);
         assert_eq!(refusal_sleeps.load(Ordering::SeqCst), 0);
+        assert!(is_retryable_attach_challenge_error(&Error::PhaseTimeout(
+            "attach_challenge_http"
+        )));
+        assert!(!is_retryable_attach_challenge_error(&Error::PhaseTimeout(
+            "transport_presence_renewal"
+        )));
+        assert!(!is_retryable_attach_challenge_error(&Error::HttpResponse {
+            phase: "other_response_headers",
+            category: "timeout",
+            elapsed_ms: 5000,
+        }));
+        assert!(!is_reconnectable_room_error(&Error::PhaseTimeout(
+            "transport_presence_renewal"
+        )));
     }
 }
 

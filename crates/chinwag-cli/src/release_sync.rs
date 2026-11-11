@@ -30,13 +30,14 @@ use crate::canonical_seat_pubkeys::CANONICAL_SEAT_PUBKEYS;
 use chinwag_swarm::identity::Identity;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::{TryRngCore, rngs::OsRng};
+use rustix::fs::{FlockOperation, Mode, OFlags, flock, open as rustix_open};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -58,6 +59,8 @@ pub const R2_ARTIFACT_PREFIX: &str = "chinwag-artifacts/releases";
 
 const MAX_RELEASE_MANIFEST_JSON_BYTES: usize = 16 * 1024;
 const MAX_RELEASE_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
+const MAX_APPLIED_RELEASE_HISTORY: usize = 64;
 const VERSION_SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRANGLER_R2_TIMEOUT: Duration = Duration::from_secs(120);
 const CRATE_MEMORY_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -116,6 +119,32 @@ pub struct InstalledBinaryState {
     pub updated_at_ms: u64,
     #[serde(default)]
     pub source_message_id: Option<String>,
+    #[serde(default)]
+    pub max_commit_epoch_seen: u64,
+    #[serde(default)]
+    pub max_built_at_ms_seen: u64,
+    #[serde(default)]
+    pub applied_release_keys: Vec<String>,
+}
+
+impl InstalledBinaryState {
+    pub fn effective_max_commit_epoch(&self) -> u64 {
+        self.max_commit_epoch_seen.max(self.commit_epoch)
+    }
+
+    pub fn effective_max_built_at_ms(&self) -> u64 {
+        self.max_built_at_ms_seen.max(self.built_at_ms)
+    }
+
+    pub fn release_history_key(manifest: &ReleaseManifestV1) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            manifest.sha256,
+            manifest.commit_epoch,
+            manifest.built_at_ms,
+            u8::from(manifest.rollback)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +190,8 @@ pub struct ReleasePublishOutcome {
     pub bus_seq: u64,
     pub crate_memory_synced: bool,
 }
+
+pub type PerBinarySyncResult = (String, Result<ReleaseApplyOutcome, ReleaseSyncError>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseSyncError {
@@ -239,6 +270,18 @@ impl std::fmt::Display for ReleaseSyncError {
 
 impl std::error::Error for ReleaseSyncError {}
 
+impl ReleaseSyncError {
+    /// True only for transient storage/transport errors where reconciling later
+    /// from the durable bus journal can succeed without sacrificing fail-closed
+    /// rejection of invalid signatures, digests, codesign checks, or downgrades.
+    pub fn is_transient_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::ArtifactStoreFailed(_) | Self::BusPublishFailed(_)
+        )
+    }
+}
+
 pub trait ReleaseArtifactStore: Send + Sync {
     fn upload_artifact(
         &self,
@@ -285,20 +328,20 @@ impl WranglerR2ArtifactStore {
     fn resolve_wrangler_bin() -> Result<PathBuf, ReleaseSyncError> {
         if let Some(override_bin) = std::env::var_os("CHINWAG_WRANGLER_BIN") {
             let candidate = PathBuf::from(override_bin);
-            if is_regular_non_symlink_or_valid_exec(&candidate) {
+            if is_resolvable_host_cli_binary(&candidate) {
                 return Ok(candidate);
             }
         }
         for candidate in ["/opt/homebrew/bin/wrangler", "/usr/local/bin/wrangler"] {
             let path = Path::new(candidate);
-            if is_regular_non_symlink_or_valid_exec(path) {
+            if is_resolvable_host_cli_binary(path) {
                 return Ok(path.to_path_buf());
             }
         }
         if let Some(path_os) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path_os) {
                 let candidate = dir.join("wrangler");
-                if is_regular_non_symlink_or_valid_exec(&candidate) {
+                if is_resolvable_host_cli_binary(&candidate) {
                     return Ok(candidate);
                 }
             }
@@ -443,8 +486,18 @@ impl ReleaseArtifactStore for WranglerR2ArtifactStore {
         let chinwag_dir = ensure_private_dir(&self.home_dir.join(".chinwag"))?;
         let nonce = csprng_hex_16()?;
         let tmp = chinwag_dir.join(format!(".release-envelope-fetch.{nonce}.json"));
+        let pre_created = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|_| {
+                ReleaseSyncError::StatePersistenceFailed("envelope_fetch_create".into())
+            })?;
+        drop(pre_created);
         let object_path = format!("{}/{key}", self.bucket);
         let Some(tmp_str) = tmp.to_str() else {
+            let _ = fs::remove_file(&tmp);
             return Err(ReleaseSyncError::SafePathViolation("non_utf8_staging_path"));
         };
         let fetch = self.run_wrangler(&[
@@ -460,7 +513,17 @@ impl ReleaseArtifactStore for WranglerR2ArtifactStore {
             let _ = fs::remove_file(&tmp);
             return Ok(None);
         }
-        let bytes = fs::read(&tmp).ok();
+        let max_bytes = (MAX_RELEASE_MANIFEST_JSON_BYTES * 2) as u64;
+        let bytes = open_regular_file_nofollow(&tmp, true, true)
+            .ok()
+            .and_then(|(file, meta)| {
+                if meta.len() == 0 || meta.len() > max_bytes {
+                    return None;
+                }
+                let mut buf = Vec::with_capacity(meta.len() as usize);
+                file.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+                Some(buf)
+            });
         let _ = fs::remove_file(&tmp);
         Ok(bytes.filter(|b| !b.is_empty() && b.len() <= MAX_RELEASE_MANIFEST_JSON_BYTES * 2))
     }
@@ -675,16 +738,61 @@ fn iso_now_string() -> String {
     now_unix_secs().to_string()
 }
 
-pub fn compute_file_digests(path: &Path) -> Result<(u64, [u8; 32], [u8; 32]), ReleaseSyncError> {
-    let meta = fs::symlink_metadata(path)
-        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("stat failed: {e}")))?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+/// Opens `path` strictly with `O_NOFOLLOW | O_CLOEXEC`, cross-checking `lstat`
+/// and `fstat` `(dev, ino)` to eliminate symlink/TOCTOU swap races.
+fn open_regular_file_nofollow(
+    path: &Path,
+    require_single_link: bool,
+    require_owner: bool,
+) -> Result<(File, fs::Metadata), ReleaseSyncError> {
+    let lstat = fs::symlink_metadata(path)
+        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("lstat failed: {e}")))?;
+    if lstat.file_type().is_symlink() || !lstat.file_type().is_file() {
         return Err(ReleaseSyncError::SafePathViolation(
             "non_regular_binary_file",
         ));
     }
-    let mut file = File::open(path)
-        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("open failed: {e}")))?;
+    let fd = match rustix_open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
+            return Err(ReleaseSyncError::SafePathViolation("symlink_open_refused"));
+        }
+        Err(err) => {
+            return Err(ReleaseSyncError::SourceUnavailable(format!(
+                "open failed: {err}"
+            )));
+        }
+    };
+    let file = File::from(fd);
+    let fstat = file
+        .metadata()
+        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("fstat failed: {e}")))?;
+    if fstat.file_type().is_symlink() || !fstat.file_type().is_file() {
+        return Err(ReleaseSyncError::SafePathViolation(
+            "non_regular_binary_file",
+        ));
+    }
+    if (fstat.dev(), fstat.ino()) != (lstat.dev(), lstat.ino()) {
+        return Err(ReleaseSyncError::SafePathViolation("inode_swap_detected"));
+    }
+    if require_single_link && fstat.nlink() != 1 {
+        return Err(ReleaseSyncError::SafePathViolation("unexpected_hardlink"));
+    }
+    if require_owner && fstat.uid() != rustix::process::geteuid().as_raw() {
+        return Err(ReleaseSyncError::SafePathViolation("unexpected_file_owner"));
+    }
+    Ok((file, fstat))
+}
+
+fn compute_digests_from_open_file(
+    file: &mut File,
+    expected_len: u64,
+    expected_id: (u64, u64),
+) -> Result<(u64, [u8; 32], [u8; 32]), ReleaseSyncError> {
     let mut sha256_hasher = Sha256::new();
     let mut blake3_hasher = blake3::Hasher::new();
     let mut total: u64 = 0;
@@ -705,14 +813,26 @@ pub fn compute_file_digests(path: &Path) -> Result<(u64, [u8; 32], [u8; 32]), Re
         sha256_hasher.update(&buf[..read]);
         blake3_hasher.update(&buf[..read]);
     }
-    if total != meta.len() || total == 0 {
+    let post = file
+        .metadata()
+        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("post-read fstat: {e}")))?;
+    if (post.dev(), post.ino()) != expected_id
+        || total != expected_len
+        || total != post.len()
+        || total == 0
+    {
         return Err(ReleaseSyncError::SourceUnavailable(
-            "concurrent size mutation or empty binary".into(),
+            "concurrent size/inode mutation or empty binary".into(),
         ));
     }
     let sha_out: [u8; 32] = sha256_hasher.finalize().into();
     let b3_out: [u8; 32] = *blake3_hasher.finalize().as_bytes();
     Ok((total, sha_out, b3_out))
+}
+
+pub fn compute_file_digests(path: &Path) -> Result<(u64, [u8; 32], [u8; 32]), ReleaseSyncError> {
+    let (mut file, fstat) = open_regular_file_nofollow(path, false, false)?;
+    compute_digests_from_open_file(&mut file, fstat.len(), (fstat.dev(), fstat.ino()))
 }
 
 pub fn compute_sha256_bytes(data: &[u8]) -> [u8; 32] {
@@ -730,8 +850,57 @@ pub fn local_binary_sha256(path: &Path) -> Option<[u8; 32]> {
     Some(sha256)
 }
 
-fn is_regular_non_symlink_or_valid_exec(path: &Path) -> bool {
+/// Used solely to locate host `wrangler` CLI (which on Homebrew is a symlink
+/// into `/opt/homebrew/Cellar/...`). Never used for release artifacts, state,
+/// or signing keys, all of which use `open_regular_file_nofollow` (`O_NOFOLLOW`).
+fn is_resolvable_host_cli_binary(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// Acquires an exclusive cross-process `flock` (`O_NOFOLLOW | O_CLOEXEC`, `0600`)
+/// on `$HOME/.chinwag/release_sync.lock` to serialize release installation and
+/// watermark state updates across concurrent daemons and CLI invocations.
+fn acquire_release_sync_lock(home_dir: &Path) -> Result<File, ReleaseSyncError> {
+    let chinwag_dir = ensure_private_dir(&home_dir.join(".chinwag"))?;
+    let lock_path = chinwag_dir.join("release_sync.lock");
+    let fd = match rustix_open(
+        &lock_path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(fd) => fd,
+        Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
+            return Err(ReleaseSyncError::SafePathViolation("lock_file_symlink"));
+        }
+        Err(err) => {
+            return Err(ReleaseSyncError::StatePersistenceFailed(format!(
+                "lock open: {err}"
+            )));
+        }
+    };
+    let file = File::from(fd);
+    let meta = file
+        .metadata()
+        .map_err(|_| ReleaseSyncError::StatePersistenceFailed("lock_fstat".into()))?;
+    if meta.file_type().is_symlink()
+        || !meta.file_type().is_file()
+        || meta.nlink() != 1
+        || meta.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(ReleaseSyncError::SafePathViolation("unsafe_lock_file"));
+    }
+    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    loop {
+        match flock(&file, FlockOperation::LockExclusive) {
+            Ok(()) => return Ok(file),
+            Err(err) if err == rustix::io::Errno::INTR => continue,
+            Err(err) => {
+                return Err(ReleaseSyncError::StatePersistenceFailed(format!(
+                    "flock failed: {err}"
+                )));
+            }
+        }
+    }
 }
 
 fn ensure_private_dir(dir: &Path) -> Result<PathBuf, ReleaseSyncError> {
@@ -795,8 +964,21 @@ pub fn load_release_sync_state(home_dir: &Path) -> Result<ReleaseSyncStateV1, Re
             "state_symlink_or_non_file",
         ));
     }
-    let bytes =
-        fs::read(&path).map_err(|_| ReleaseSyncError::StatePersistenceFailed("read".into()))?;
+    let (file, fstat) = open_regular_file_nofollow(&path, true, true)?;
+    if fstat.len() > MAX_STATE_FILE_BYTES {
+        return Err(ReleaseSyncError::StatePersistenceFailed(
+            "state_too_large".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(fstat.len() as usize);
+    file.take(MAX_STATE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReleaseSyncError::StatePersistenceFailed("read".into()))?;
+    if bytes.len() as u64 > MAX_STATE_FILE_BYTES {
+        return Err(ReleaseSyncError::StatePersistenceFailed(
+            "state_too_large".into(),
+        ));
+    }
     let state: ReleaseSyncStateV1 = serde_json::from_slice(&bytes)
         .map_err(|_| ReleaseSyncError::StatePersistenceFailed("corrupt_state_json".into()))?;
     if state.schema != RELEASE_SYNC_STATE_SCHEMA {
@@ -946,13 +1128,32 @@ fn smoke_test_binary_version(
 
 /// Preserves `<bin_dir>/<binary>.prev` via an APFS hard-link + atomic rename
 /// (so `<bin_dir>/<binary>` never disappears even momentarily) and atomically
-/// renames `<staged_path>` onto `<bin_dir>/<binary>`.
+/// renames `<staged_path>` onto `<bin_dir>/<binary>`, re-verifying staged inode
+/// identity (`expected_staged_id`) immediately prior to `rename`.
 fn atomic_install_staged_binary(
     bin_dir: &Path,
     binary: &str,
     staged_path: &Path,
+    expected_staged_id: Option<(u64, u64)>,
 ) -> Result<(PathBuf, Option<PathBuf>), ReleaseSyncError> {
     validate_binary_name(binary)?;
+    let staged_meta = fs::symlink_metadata(staged_path)
+        .map_err(|_| ReleaseSyncError::SafePathViolation("staged_stat_failed"))?;
+    if staged_meta.file_type().is_symlink()
+        || !staged_meta.file_type().is_file()
+        || staged_meta.nlink() != 1
+        || staged_meta.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(ReleaseSyncError::SafePathViolation(
+            "staged_symlink_or_hardlink",
+        ));
+    }
+    if let Some(expected_id) = expected_staged_id
+        && (staged_meta.dev(), staged_meta.ino()) != expected_id
+    {
+        return Err(ReleaseSyncError::SafePathViolation("staged_inode_swap"));
+    }
+
     let install_path = bin_dir.join(binary);
     if let Ok(meta) = fs::symlink_metadata(&install_path)
         && meta.file_type().is_symlink()
@@ -988,6 +1189,19 @@ fn atomic_install_staged_binary(
     } else {
         None
     };
+
+    // Final inode recheck immediately before atomic rename into `.local/bin`.
+    if let Some(expected_id) = expected_staged_id {
+        let pre_rename = fs::symlink_metadata(staged_path)
+            .map_err(|_| ReleaseSyncError::SafePathViolation("staged_stat_failed"))?;
+        if pre_rename.file_type().is_symlink()
+            || !pre_rename.file_type().is_file()
+            || pre_rename.nlink() != 1
+            || (pre_rename.dev(), pre_rename.ino()) != expected_id
+        {
+            return Err(ReleaseSyncError::SafePathViolation("staged_inode_swap"));
+        }
+    }
 
     fs::rename(staged_path, &install_path)
         .map_err(|e| ReleaseSyncError::InstallFailed(format!("atomic rename: {e}")))?;
@@ -1061,18 +1275,32 @@ fn load_verified_seat_signing_key(
         return Err(ReleaseSyncError::SafePathViolation("signing_dir_symlink"));
     }
     let key_path = signing_dir.join(format!("{slug}_ed25519"));
-    let key_meta = fs::symlink_metadata(&key_path)
-        .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("key_file_missing"))?;
-    if key_meta.file_type().is_symlink() || !key_meta.file_type().is_file() {
-        return Err(ReleaseSyncError::SafePathViolation("signing_key_symlink"));
+    if fs::symlink_metadata(&key_path).is_err() {
+        return Err(ReleaseSyncError::SigningIdentityUnavailable(
+            "key_file_missing",
+        ));
     }
-    if (key_meta.permissions().mode() & 0o077) != 0 {
+    let (_pinned_key_file, key_fstat) =
+        open_regular_file_nofollow(&key_path, true, true).map_err(|err| match err {
+            ReleaseSyncError::SafePathViolation(_) => {
+                ReleaseSyncError::SafePathViolation("signing_key_symlink")
+            }
+            _ => ReleaseSyncError::SigningIdentityUnavailable("key_file_missing"),
+        })?;
+    if (key_fstat.permissions().mode() & 0o077) != 0 {
         return Err(ReleaseSyncError::SafePathViolation(
             "signing_key_permissions",
         ));
     }
     let identity = Identity::from_ssh_signing_file(&key_path)
         .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("invalid_openssh_key"))?;
+    let post_meta = fs::symlink_metadata(&key_path)
+        .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("key_file_missing"))?;
+    if post_meta.file_type().is_symlink()
+        || (post_meta.dev(), post_meta.ino()) != (key_fstat.dev(), key_fstat.ino())
+    {
+        return Err(ReleaseSyncError::SafePathViolation("signing_key_symlink"));
+    }
     let derived_pub = identity.ssh_public_bytes();
     if !bool::from(derived_pub.ct_eq(&expected_pubkey)) {
         return Err(ReleaseSyncError::SigningIdentityUnavailable(
@@ -1235,17 +1463,33 @@ fn check_monotonic_gate(
     let prev_sha = decode_lowercase_hex_32(&prev.sha256);
     let same_recorded_release = prev_sha.is_some_and(|p| bool::from(p.ct_eq(manifest_sha256)))
         && prev.commit_epoch == manifest.commit_epoch
-        && prev.built_at_ms == manifest.built_at_ms;
+        && prev.built_at_ms == manifest.built_at_ms
+        && prev.rollback == manifest.rollback;
     if same_recorded_release && local_matches_manifest {
         return Ok(true);
     }
-    if manifest.rollback {
-        if manifest.built_at_ms <= prev.built_at_ms {
-            return Err(ReleaseSyncError::DowngradeOrReplayRejected);
-        }
-    } else if (manifest.commit_epoch, manifest.built_at_ms) <= (prev.commit_epoch, prev.built_at_ms)
+
+    // Reject any historical release that was already applied and superseded,
+    // preventing `normal (200,2000) -> rollback (100,3000) -> normal (200,2000)` cycles.
+    let candidate_key = InstalledBinaryState::release_history_key(manifest);
+    if !same_recorded_release
+        && prev
+            .applied_release_keys
+            .iter()
+            .any(|k| k == &candidate_key)
     {
         return Err(ReleaseSyncError::DowngradeOrReplayRejected);
+    }
+
+    let max_built = prev.effective_max_built_at_ms();
+    let max_epoch = prev.effective_max_commit_epoch();
+    if !same_recorded_release {
+        if manifest.built_at_ms <= max_built {
+            return Err(ReleaseSyncError::DowngradeOrReplayRejected);
+        }
+        if !manifest.rollback && manifest.commit_epoch < max_epoch {
+            return Err(ReleaseSyncError::DowngradeOrReplayRejected);
+        }
     }
     Ok(local_matches_manifest)
 }
@@ -1255,7 +1499,41 @@ fn record_installed_state(
     state: &mut ReleaseSyncStateV1,
     manifest: &ReleaseManifestV1,
     source_message_id: Option<String>,
+    observed_max_epoch: Option<u64>,
 ) -> Result<(), ReleaseSyncError> {
+    let existing = state.binaries.get(&manifest.binary);
+    let max_commit_epoch_seen = existing
+        .map_or(0, InstalledBinaryState::effective_max_commit_epoch)
+        .max(manifest.commit_epoch)
+        .max(observed_max_epoch.unwrap_or(0));
+    let max_built_at_ms_seen = existing
+        .map_or(0, InstalledBinaryState::effective_max_built_at_ms)
+        .max(manifest.built_at_ms);
+
+    let mut applied_release_keys: Vec<String> = existing
+        .map(|p| p.applied_release_keys.clone())
+        .unwrap_or_default();
+    if let Some(prev) = existing {
+        let prev_key = format!(
+            "{}:{}:{}:{}",
+            prev.sha256,
+            prev.commit_epoch,
+            prev.built_at_ms,
+            u8::from(prev.rollback)
+        );
+        if !applied_release_keys.contains(&prev_key) {
+            applied_release_keys.push(prev_key);
+        }
+    }
+    let current_key = InstalledBinaryState::release_history_key(manifest);
+    if !applied_release_keys.contains(&current_key) {
+        applied_release_keys.push(current_key);
+    }
+    if applied_release_keys.len() > MAX_APPLIED_RELEASE_HISTORY {
+        let drain_count = applied_release_keys.len() - MAX_APPLIED_RELEASE_HISTORY;
+        applied_release_keys.drain(0..drain_count);
+    }
+
     state.binaries.insert(
         manifest.binary.clone(),
         InstalledBinaryState {
@@ -1270,6 +1548,9 @@ fn record_installed_state(
             rollback: manifest.rollback,
             updated_at_ms: now_unix_ms(),
             source_message_id,
+            max_commit_epoch_seen,
+            max_built_at_ms_seen,
+            applied_release_keys,
         },
     );
     save_release_sync_state(home_dir, state)
@@ -1288,6 +1569,7 @@ pub fn apply_release_built_message(
         local_iroh_endpoint,
         &ReleaseTrustRoots::production(),
         None,
+        None,
     )
 }
 
@@ -1298,6 +1580,7 @@ fn apply_release_built_message_inner(
     local_iroh_endpoint: Option<&str>,
     roots: &ReleaseTrustRoots<'_>,
     receipt_key_override: Option<&SigningKey>,
+    observed_max_epoch: Option<u64>,
 ) -> Result<ReleaseApplyOutcome, ReleaseSyncError> {
     let manifest = verify_release_built_message_with_roots(msg, roots)?;
     if manifest.target_triple != CURRENT_TARGET_TRIPLE {
@@ -1310,22 +1593,32 @@ fn apply_release_built_message_inner(
     let (bin_dir, staging_dir) = ensure_bin_and_staging_dirs(home_dir)?;
     let install_path = bin_dir.join(&manifest.binary);
 
-    let local_matches = local_binary_sha256(&install_path)
-        .is_some_and(|actual| bool::from(actual.ct_eq(&expected_sha256)));
-    let mut sync_state = load_release_sync_state(home_dir)?;
-    let already_satisfied = check_monotonic_gate(
-        sync_state.binaries.get(&manifest.binary),
-        &manifest,
-        &expected_sha256,
-        local_matches,
-    )?;
-
-    if already_satisfied {
-        record_installed_state(home_dir, &mut sync_state, &manifest, Some(msg.id.clone()))?;
-        return Ok(ReleaseApplyOutcome::AlreadyInstalled {
-            manifest,
-            install_path,
-        });
+    // Pre-download check under the cross-process lock so replays, downgrades,
+    // and already-installed publisher/peer binaries short-circuit in 0ms without R2 I/O.
+    {
+        let _lock = acquire_release_sync_lock(home_dir)?;
+        let local_matches = local_binary_sha256(&install_path)
+            .is_some_and(|actual| bool::from(actual.ct_eq(&expected_sha256)));
+        let mut sync_state = load_release_sync_state(home_dir)?;
+        let already_satisfied = check_monotonic_gate(
+            sync_state.binaries.get(&manifest.binary),
+            &manifest,
+            &expected_sha256,
+            local_matches,
+        )?;
+        if already_satisfied {
+            record_installed_state(
+                home_dir,
+                &mut sync_state,
+                &manifest,
+                Some(msg.id.clone()),
+                observed_max_epoch,
+            )?;
+            return Ok(ReleaseApplyOutcome::AlreadyInstalled {
+                manifest,
+                install_path,
+            });
+        }
     }
 
     let nonce = csprng_hex_16()?;
@@ -1343,21 +1636,18 @@ fn apply_release_built_message_inner(
         .map_err(|e| ReleaseSyncError::InstallFailed(format!("stage create failed: {e}")))?;
     drop(pre_created);
 
-    let verified_stage = (|| -> Result<(), ReleaseSyncError> {
+    let verified_stage = (|| -> Result<(u64, u64), ReleaseSyncError> {
         store.download_artifact(&manifest.artifact_key, &staged_path)?;
-        let staged_meta = fs::symlink_metadata(&staged_path)
-            .map_err(|_| ReleaseSyncError::SafePathViolation("staged_stat_failed"))?;
-        if staged_meta.file_type().is_symlink() || !staged_meta.file_type().is_file() {
-            return Err(ReleaseSyncError::SafePathViolation(
-                "staged_symlink_or_non_file",
-            ));
-        }
-        // Explicitly lock permissions to 0600 (zero execute bits!) BEFORE computing
-        // and comparing digests in constant time (`INV-HASH-BEFORE-EXEC-01`).
-        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))
+        let (mut staged_file, staged_fstat) = open_regular_file_nofollow(&staged_path, true, true)?;
+        let staged_id = (staged_fstat.dev(), staged_fstat.ino());
+        // Explicitly lock permissions to 0600 on the open FD (zero execute bits!)
+        // BEFORE computing and comparing digests in constant time (`INV-HASH-BEFORE-EXEC-01`).
+        staged_file
+            .set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|_| ReleaseSyncError::InstallFailed("chmod_0600_failed".into()))?;
 
-        let (actual_size, actual_sha256, actual_blake3) = compute_file_digests(&staged_path)?;
+        let (actual_size, actual_sha256, actual_blake3) =
+            compute_digests_from_open_file(&mut staged_file, staged_fstat.len(), staged_id)?;
         let size_ok = actual_size == manifest.size_bytes;
         let sha_ok = bool::from(actual_sha256.ct_eq(&expected_sha256));
         let b3_ok = bool::from(actual_blake3.ct_eq(&expected_blake3));
@@ -1368,29 +1658,100 @@ fn apply_release_built_message_inner(
         // Verify macOS code signature strictly while still non-executable (never `-f`!).
         verify_codesign_strict(&staged_path)?;
 
-        // Only AFTER size + SHA-256 + BLAKE3 + strict codesign pass do we set 0755.
-        fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o755))
+        let post_codesign = fs::symlink_metadata(&staged_path)
+            .map_err(|_| ReleaseSyncError::SafePathViolation("staged_stat_failed"))?;
+        if post_codesign.file_type().is_symlink()
+            || post_codesign.nlink() != 1
+            || (post_codesign.dev(), post_codesign.ino()) != staged_id
+        {
+            return Err(ReleaseSyncError::SafePathViolation("staged_inode_swap"));
+        }
+
+        // Only AFTER size + SHA-256 + BLAKE3 + strict codesign pass do we set 0755 on the pinned FD.
+        staged_file
+            .set_permissions(fs::Permissions::from_mode(0o755))
             .map_err(|_| ReleaseSyncError::InstallFailed("chmod_0755_failed".into()))?;
+        drop(staged_file);
 
         smoke_test_binary_version(&staged_path, &manifest.binary)?;
-        Ok(())
+        Ok(staged_id)
     })();
 
-    if let Err(err) = verified_stage {
-        let _ = fs::remove_file(&staged_path);
-        return Err(err);
-    }
+    let staged_id = match verified_stage {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = fs::remove_file(&staged_path);
+            return Err(err);
+        }
+    };
 
-    let (install_path, previous_backup_path) =
-        match atomic_install_staged_binary(&bin_dir, &manifest.binary, &staged_path) {
+    // Re-acquire exclusive lock and revalidate against current on-disk state so a
+    // stalled download of an older epoch can NEVER overwrite a newer epoch committed
+    // concurrently by `chinwag release sync` or `chinwag release publish`.
+    let (install_path, previous_backup_path) = {
+        let _lock = match acquire_release_sync_lock(home_dir) {
+            Ok(lock) => lock,
+            Err(err) => {
+                let _ = fs::remove_file(&staged_path);
+                return Err(err);
+            }
+        };
+        let local_matches = local_binary_sha256(&install_path)
+            .is_some_and(|actual| bool::from(actual.ct_eq(&expected_sha256)));
+        let mut sync_state = match load_release_sync_state(home_dir) {
+            Ok(s) => s,
+            Err(err) => {
+                let _ = fs::remove_file(&staged_path);
+                return Err(err);
+            }
+        };
+        let already_satisfied = match check_monotonic_gate(
+            sync_state.binaries.get(&manifest.binary),
+            &manifest,
+            &expected_sha256,
+            local_matches,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = fs::remove_file(&staged_path);
+                return Err(err);
+            }
+        };
+        if already_satisfied {
+            let _ = fs::remove_file(&staged_path);
+            record_installed_state(
+                home_dir,
+                &mut sync_state,
+                &manifest,
+                Some(msg.id.clone()),
+                observed_max_epoch,
+            )?;
+            return Ok(ReleaseApplyOutcome::AlreadyInstalled {
+                manifest,
+                install_path,
+            });
+        }
+        let paths = match atomic_install_staged_binary(
+            &bin_dir,
+            &manifest.binary,
+            &staged_path,
+            Some(staged_id),
+        ) {
             Ok(paths) => paths,
             Err(err) => {
                 let _ = fs::remove_file(&staged_path);
                 return Err(err);
             }
         };
-
-    record_installed_state(home_dir, &mut sync_state, &manifest, Some(msg.id.clone()))?;
+        record_installed_state(
+            home_dir,
+            &mut sync_state,
+            &manifest,
+            Some(msg.id.clone()),
+            observed_max_epoch,
+        )?;
+        paths
+    };
 
     let receipt_message = build_release_installed_bus_message(
         home_dir,
@@ -1610,9 +1971,8 @@ fn publish_release_inner(
         }
     };
 
-    let src_meta = fs::symlink_metadata(req.source_binary_path)
-        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("source stat: {e}")))?;
-    if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() || src_meta.len() == 0 {
+    let (mut src, src_fstat) = open_regular_file_nofollow(req.source_binary_path, false, true)?;
+    if src_fstat.len() == 0 {
         return Err(ReleaseSyncError::SourceUnavailable(
             "source must be a non-empty regular file (not a symlink)".into(),
         ));
@@ -1623,14 +1983,15 @@ fn publish_release_inner(
         None => resolve_git_commit_and_epoch(req.repo_root)?,
     };
 
-    let mut sync_state = load_release_sync_state(req.home_dir)?;
-    let mut built_at_ms = now_unix_ms().max(1);
-    if let Some(prev) = sync_state.binaries.get(req.binary) {
-        if !req.rollback && commit_epoch < prev.commit_epoch {
+    // Fast pre-flight monotonic check under the cross-process lock before staging/uploading.
+    {
+        let _lock = acquire_release_sync_lock(req.home_dir)?;
+        let sync_state = load_release_sync_state(req.home_dir)?;
+        if let Some(prev) = sync_state.binaries.get(req.binary)
+            && !req.rollback
+            && commit_epoch < prev.effective_max_commit_epoch()
+        {
             return Err(ReleaseSyncError::DowngradeOrReplayRejected);
-        }
-        if built_at_ms <= prev.built_at_ms {
-            built_at_ms = prev.built_at_ms.saturating_add(1);
         }
     }
 
@@ -1642,9 +2003,7 @@ fn publish_release_inner(
         std::process::id()
     ));
 
-    let prep_result = (|| -> Result<(u64, String, String), ReleaseSyncError> {
-        let mut src = File::open(req.source_binary_path)
-            .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("open source: {e}")))?;
+    let prep_result = (|| -> Result<((u64, u64), u64, String, String), ReleaseSyncError> {
         let mut dst = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1656,21 +2015,26 @@ fn publish_release_inner(
         dst.sync_all()
             .map_err(|e| ReleaseSyncError::InstallFailed(format!("stage sync: {e}")))?;
         drop(dst);
+        drop(src);
 
         // Ensure valid macOS signature ONCE on the publisher's staged copy BEFORE
         // computing SHA-256 and BLAKE3 so every peer verifies identical bytes.
         ensure_publisher_codesigned(&staged_path)?;
         smoke_test_binary_version(&staged_path, req.binary)?;
 
-        let (size_bytes, sha256_bytes, blake3_bytes) = compute_file_digests(&staged_path)?;
+        let (mut staged_file, staged_fstat) = open_regular_file_nofollow(&staged_path, true, true)?;
+        let staged_id = (staged_fstat.dev(), staged_fstat.ino());
+        let (size_bytes, sha256_bytes, blake3_bytes) =
+            compute_digests_from_open_file(&mut staged_file, staged_fstat.len(), staged_id)?;
         Ok((
+            staged_id,
             size_bytes,
             encode_hex(&sha256_bytes),
             encode_hex(&blake3_bytes),
         ))
     })();
 
-    let (size_bytes, sha256, blake3) = match prep_result {
+    let (staged_id, size_bytes, sha256, blake3) = match prep_result {
         Ok(v) => v,
         Err(err) => {
             let _ = fs::remove_file(&staged_path);
@@ -1680,55 +2044,95 @@ fn publish_release_inner(
 
     let target_triple = CURRENT_TARGET_TRIPLE.to_owned();
     let artifact_key = expected_artifact_key(req.binary, &target_triple, &sha256);
-    let manifest = ReleaseManifestV1 {
-        schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
-        binary: req.binary.to_owned(),
-        target_triple: target_triple.clone(),
-        git_commit,
-        commit_epoch,
-        built_at_ms,
-        sha256,
-        blake3,
-        size_bytes,
-        artifact_key: artifact_key.clone(),
-        rollback: req.rollback,
-    };
-    if let Err(err) = manifest.validate_structural() {
-        let _ = fs::remove_file(&staged_path);
-        return Err(err);
-    }
 
     if let Err(err) = store.upload_artifact(&artifact_key, &staged_path) {
         let _ = fs::remove_file(&staged_path);
         return Err(err);
     }
 
-    let (install_path, previous_backup_path) =
-        match atomic_install_staged_binary(&bin_dir, req.binary, &staged_path) {
-            Ok(paths) => paths,
+    // Re-acquire exclusive lock for commit-time revalidation, strictly monotonic
+    // `built_at_ms` assignment, atomic local installation, and watermark persistence.
+    let (manifest, install_path, previous_backup_path, release_built_message) = {
+        let _lock = match acquire_release_sync_lock(req.home_dir) {
+            Ok(lock) => lock,
             Err(err) => {
                 let _ = fs::remove_file(&staged_path);
                 return Err(err);
             }
         };
+        let mut sync_state = match load_release_sync_state(req.home_dir) {
+            Ok(s) => s,
+            Err(err) => {
+                let _ = fs::remove_file(&staged_path);
+                return Err(err);
+            }
+        };
+        let mut built_at_ms = now_unix_ms().max(1);
+        if let Some(prev) = sync_state.binaries.get(req.binary) {
+            if !req.rollback && commit_epoch < prev.effective_max_commit_epoch() {
+                let _ = fs::remove_file(&staged_path);
+                return Err(ReleaseSyncError::DowngradeOrReplayRejected);
+            }
+            let max_built = prev.effective_max_built_at_ms();
+            if built_at_ms <= max_built {
+                built_at_ms = max_built.saturating_add(1);
+            }
+        }
 
-    let manifest_json = serde_json::to_string(&manifest)
-        .map_err(|_| ReleaseSyncError::InstallFailed("manifest_serialize".into()))?;
-    let body = format!("{RELEASE_BUILT_PREFIX}{manifest_json}");
-    let release_built_message = sign_structured_bus_message(
-        &publisher_actor,
-        "#all",
-        Some("CHWG-0261".to_owned()),
-        body,
-        signing_key,
-    );
+        let manifest = ReleaseManifestV1 {
+            schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+            binary: req.binary.to_owned(),
+            target_triple: target_triple.clone(),
+            git_commit,
+            commit_epoch,
+            built_at_ms,
+            sha256,
+            blake3,
+            size_bytes,
+            artifact_key: artifact_key.clone(),
+            rollback: req.rollback,
+        };
+        if let Err(err) = manifest.validate_structural() {
+            let _ = fs::remove_file(&staged_path);
+            return Err(err);
+        }
 
-    record_installed_state(
-        req.home_dir,
-        &mut sync_state,
-        &manifest,
-        Some(release_built_message.id.clone()),
-    )?;
+        let (install_path, previous_backup_path) =
+            match atomic_install_staged_binary(&bin_dir, req.binary, &staged_path, Some(staged_id))
+            {
+                Ok(paths) => paths,
+                Err(err) => {
+                    let _ = fs::remove_file(&staged_path);
+                    return Err(err);
+                }
+            };
+
+        let manifest_json = serde_json::to_string(&manifest)
+            .map_err(|_| ReleaseSyncError::InstallFailed("manifest_serialize".into()))?;
+        let body = format!("{RELEASE_BUILT_PREFIX}{manifest_json}");
+        let release_built_message = sign_structured_bus_message(
+            &publisher_actor,
+            "#all",
+            Some("CHWG-0261".to_owned()),
+            body,
+            signing_key,
+        );
+
+        record_installed_state(
+            req.home_dir,
+            &mut sync_state,
+            &manifest,
+            Some(release_built_message.id.clone()),
+            None,
+        )?;
+
+        (
+            manifest,
+            install_path,
+            previous_backup_path,
+            release_built_message,
+        )
+    };
 
     if let Ok(envelope_bytes) = serde_json::to_vec(&release_built_message) {
         let _ = store.upload_latest_signed_envelope(req.binary, &target_triple, &envelope_bytes);
@@ -1751,17 +2155,39 @@ fn publish_release_inner(
 
 /// Scans `.chinwag/bus/messages.jsonl` (and optionally R2 signed envelopes) for
 /// the latest cryptographically verified `INFRAJR` `RELEASE_BUILT` per binary
-/// matching `CURRENT_TARGET_TRIPLE` and applies each monotonically.
-pub fn sync_releases_from_journal_and_r2(
+/// matching `CURRENT_TARGET_TRIPLE` and applies each binary independently so a
+/// single binary's failure never discards earlier binaries' install receipts.
+pub fn sync_releases_from_journal_and_r2_per_binary(
     home_dir: &Path,
     messages_jsonl_path: &Path,
     store: &dyn ReleaseArtifactStore,
     check_r2_envelopes: bool,
     local_iroh_endpoint: Option<&str>,
-) -> Result<Vec<(String, ReleaseApplyOutcome)>, ReleaseSyncError> {
-    let mut latest_per_binary: BTreeMap<String, (BusMessage, ReleaseManifestV1)> = BTreeMap::new();
+) -> Result<Vec<PerBinarySyncResult>, ReleaseSyncError> {
+    sync_releases_from_journal_and_r2_per_binary_inner(
+        home_dir,
+        messages_jsonl_path,
+        store,
+        check_r2_envelopes,
+        local_iroh_endpoint,
+        &ReleaseTrustRoots::production(),
+        None,
+    )
+}
 
-    if let Ok(file) = File::open(messages_jsonl_path) {
+fn sync_releases_from_journal_and_r2_per_binary_inner(
+    home_dir: &Path,
+    messages_jsonl_path: &Path,
+    store: &dyn ReleaseArtifactStore,
+    check_r2_envelopes: bool,
+    local_iroh_endpoint: Option<&str>,
+    roots: &ReleaseTrustRoots<'_>,
+    receipt_key_override: Option<&SigningKey>,
+) -> Result<Vec<PerBinarySyncResult>, ReleaseSyncError> {
+    let mut candidates_per_binary: BTreeMap<String, Vec<(BusMessage, ReleaseManifestV1)>> =
+        BTreeMap::new();
+
+    if let Ok((file, _)) = open_regular_file_nofollow(messages_jsonl_path, false, false) {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim();
@@ -1769,10 +2195,13 @@ pub fn sync_releases_from_journal_and_r2(
                 continue;
             }
             if let Ok(msg) = serde_json::from_str::<BusMessage>(trimmed)
-                && let Ok(manifest) = verify_release_built_message(&msg)
+                && let Ok(manifest) = verify_release_built_message_with_roots(&msg, roots)
                 && manifest.target_triple == CURRENT_TARGET_TRIPLE
             {
-                record_newer_candidate(&mut latest_per_binary, msg, manifest);
+                candidates_per_binary
+                    .entry(manifest.binary.clone())
+                    .or_default()
+                    .push((msg, manifest));
             }
         }
     }
@@ -1782,42 +2211,131 @@ pub fn sync_releases_from_journal_and_r2(
             if let Ok(Some(bytes)) =
                 store.download_latest_signed_envelope(binary, CURRENT_TARGET_TRIPLE)
                 && let Ok(msg) = serde_json::from_slice::<BusMessage>(&bytes)
-                && let Ok(manifest) = verify_release_built_message(&msg)
+                && let Ok(manifest) = verify_release_built_message_with_roots(&msg, roots)
                 && manifest.binary == *binary
                 && manifest.target_triple == CURRENT_TARGET_TRIPLE
             {
-                record_newer_candidate(&mut latest_per_binary, msg, manifest);
+                candidates_per_binary
+                    .entry(manifest.binary.clone())
+                    .or_default()
+                    .push((msg, manifest));
             }
         }
     }
 
-    let mut outcomes = Vec::new();
-    for (binary, (msg, _)) in latest_per_binary {
-        let outcome = apply_release_built_message(home_dir, store, &msg, local_iroh_endpoint)?;
+    let current_state = {
+        let _lock = acquire_release_sync_lock(home_dir)?;
+        load_release_sync_state(home_dir)?
+    };
+
+    let mut winners: BTreeMap<String, (BusMessage, ReleaseManifestV1, u64)> = BTreeMap::new();
+    for (binary, mut list) in candidates_per_binary {
+        list.sort_by(|(_, a), (_, b)| {
+            (
+                a.built_at_ms,
+                a.commit_epoch,
+                u8::from(a.rollback),
+                &a.sha256,
+            )
+                .cmp(&(
+                    b.built_at_ms,
+                    b.commit_epoch,
+                    u8::from(b.rollback),
+                    &b.sha256,
+                ))
+        });
+
+        let prev = current_state.binaries.get(&binary);
+        let mut watermark_built = prev.map_or(0, InstalledBinaryState::effective_max_built_at_ms);
+        let mut watermark_epoch = prev.map_or(0, InstalledBinaryState::effective_max_commit_epoch);
+        let mut seen_keys: std::collections::BTreeSet<String> = prev
+            .map(|p| p.applied_release_keys.iter().cloned().collect())
+            .unwrap_or_default();
+        if let Some(p) = prev {
+            seen_keys.insert(format!(
+                "{}:{}:{}:{}",
+                p.sha256,
+                p.commit_epoch,
+                p.built_at_ms,
+                u8::from(p.rollback)
+            ));
+        }
+
+        let mut winner: Option<(BusMessage, ReleaseManifestV1, u64)> = None;
+        let mut last_dedup_key: Option<String> = None;
+        for (msg, m) in list {
+            let key = InstalledBinaryState::release_history_key(&m);
+            if last_dedup_key.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            last_dedup_key = Some(key.clone());
+
+            let same_as_prev = prev.is_some_and(|p| {
+                p.sha256 == m.sha256
+                    && p.commit_epoch == m.commit_epoch
+                    && p.built_at_ms == m.built_at_ms
+                    && p.rollback == m.rollback
+            });
+            if same_as_prev {
+                if winner.is_none() {
+                    winner = Some((msg, m, watermark_epoch));
+                }
+                continue;
+            }
+            if seen_keys.contains(&key) {
+                continue;
+            }
+            if m.built_at_ms > watermark_built && (m.rollback || m.commit_epoch >= watermark_epoch)
+            {
+                watermark_built = m.built_at_ms;
+                watermark_epoch = watermark_epoch.max(m.commit_epoch);
+                seen_keys.insert(key);
+                winner = Some((msg, m, watermark_epoch));
+            }
+        }
+        if let Some(selected) = winner {
+            winners.insert(binary, selected);
+        }
+    }
+
+    let mut outcomes = Vec::with_capacity(winners.len());
+    for (binary, (msg, _, observed_max_epoch)) in winners {
+        let outcome = apply_release_built_message_inner(
+            home_dir,
+            store,
+            &msg,
+            local_iroh_endpoint,
+            roots,
+            receipt_key_override,
+            Some(observed_max_epoch),
+        );
         outcomes.push((binary, outcome));
     }
     Ok(outcomes)
 }
 
-fn record_newer_candidate(
-    map: &mut BTreeMap<String, (BusMessage, ReleaseManifestV1)>,
-    msg: BusMessage,
-    manifest: ReleaseManifestV1,
-) {
-    let replace = match map.get(&manifest.binary) {
-        None => true,
-        Some((_, current)) => {
-            if manifest.rollback {
-                manifest.built_at_ms > current.built_at_ms
-            } else {
-                (manifest.commit_epoch, manifest.built_at_ms)
-                    > (current.commit_epoch, current.built_at_ms)
-            }
-        }
-    };
-    if replace {
-        map.insert(manifest.binary.clone(), (msg, manifest));
+/// Scans `.chinwag/bus/messages.jsonl` (and optionally R2 signed envelopes) for
+/// the latest cryptographically verified `INFRAJR` `RELEASE_BUILT` per binary
+/// matching `CURRENT_TARGET_TRIPLE` and applies each monotonically.
+pub fn sync_releases_from_journal_and_r2(
+    home_dir: &Path,
+    messages_jsonl_path: &Path,
+    store: &dyn ReleaseArtifactStore,
+    check_r2_envelopes: bool,
+    local_iroh_endpoint: Option<&str>,
+) -> Result<Vec<(String, ReleaseApplyOutcome)>, ReleaseSyncError> {
+    let per_binary = sync_releases_from_journal_and_r2_per_binary(
+        home_dir,
+        messages_jsonl_path,
+        store,
+        check_r2_envelopes,
+        local_iroh_endpoint,
+    )?;
+    let mut outcomes = Vec::with_capacity(per_binary.len());
+    for (binary, res) in per_binary {
+        outcomes.push((binary, res?));
     }
+    Ok(outcomes)
 }
 
 pub fn collect_release_status_json(home_dir: &Path) -> Result<serde_json::Value, ReleaseSyncError> {
@@ -1866,6 +2384,7 @@ mod tests {
         blobs: Mutex<BTreeMap<String, Vec<u8>>>,
         envelopes: Mutex<BTreeMap<(String, String), Vec<u8>>>,
         download_calls: Mutex<usize>,
+        on_download: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl InMemoryArtifactStore {
@@ -1874,6 +2393,7 @@ mod tests {
                 blobs: Mutex::new(BTreeMap::new()),
                 envelopes: Mutex::new(BTreeMap::new()),
                 download_calls: Mutex::new(0),
+                on_download: Mutex::new(None),
             }
         }
 
@@ -1883,6 +2403,10 @@ mod tests {
 
         fn tamper_blob(&self, key: &str, new_bytes: Vec<u8>) {
             self.blobs.lock().unwrap().insert(key.to_owned(), new_bytes);
+        }
+
+        fn set_on_download(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.on_download.lock().unwrap() = Some(Box::new(hook));
         }
     }
 
@@ -1916,7 +2440,12 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| ReleaseSyncError::ArtifactStoreFailed("missing_blob".into()))?;
             fs::write(destination_file, bytes)
-                .map_err(|e| ReleaseSyncError::ArtifactStoreFailed(e.to_string()))
+                .map_err(|e| ReleaseSyncError::ArtifactStoreFailed(e.to_string()))?;
+            let maybe_hook = self.on_download.lock().unwrap().take();
+            if let Some(hook) = maybe_hook {
+                hook();
+            }
+            Ok(())
         }
 
         fn upload_latest_signed_envelope(
@@ -2115,6 +2644,7 @@ mod tests {
             Some("peer-pub-ep"),
             &roots,
             Some(&infrajr_key),
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -2131,6 +2661,7 @@ mod tests {
             Some("peer-sub-ep"),
             &roots,
             Some(&infrajr_key),
+            None,
         )
         .unwrap();
         let ReleaseApplyOutcome::Installed {
@@ -2161,6 +2692,7 @@ mod tests {
             Some("peer-sub-ep"),
             &roots,
             Some(&infrajr_key),
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -2194,6 +2726,7 @@ mod tests {
             Some("peer-sub-ep"),
             &roots,
             Some(&infrajr_key),
+            None,
         )
         .unwrap();
         let ReleaseApplyOutcome::Installed {
@@ -2214,6 +2747,7 @@ mod tests {
             Some("peer-sub-ep"),
             &roots,
             Some(&infrajr_key),
+            None,
         );
         assert_eq!(
             downgrade.unwrap_err(),
@@ -2245,6 +2779,7 @@ mod tests {
             Some("peer-sub-ep"),
             &roots,
             Some(&infrajr_key),
+            None,
         )
         .unwrap();
         assert!(matches!(sub_rb, ReleaseApplyOutcome::Installed { .. }));
@@ -2309,6 +2844,7 @@ mod tests {
                 None,
                 &roots,
                 None,
+                None,
             );
             assert_eq!(res.unwrap_err(), ReleaseSyncError::UnauthorizedSigner);
             assert_eq!(store.downloads(), 0);
@@ -2328,6 +2864,7 @@ mod tests {
                 &spoofed_msg,
                 None,
                 &roots,
+                None,
                 None,
             );
             assert_eq!(spoof_res.unwrap_err(), ReleaseSyncError::SignatureInvalid);
@@ -2384,6 +2921,7 @@ mod tests {
             None,
             &roots,
             Some(&infrajr_key),
+            None,
         );
         assert_eq!(res.unwrap_err(), ReleaseSyncError::DigestMismatch);
         assert!(!sub_home.join(".local/bin/chinwag").exists());
@@ -2489,6 +3027,7 @@ mod tests {
             None,
             &roots,
             Some(&infrajr_key),
+            None,
         );
         assert!(matches!(res, Err(ReleaseSyncError::CodesignFailed(_))));
         assert!(!sub_home.join(".local/bin/chinwag").exists());
@@ -2498,6 +3037,487 @@ mod tests {
                 .next()
                 .is_none(),
             "unsigned staged file must be unlinked before 0755 execute bits are ever set"
+        );
+    }
+
+    #[test]
+    fn rollback_preserves_replay_protection_and_blocks_historical_cycles() {
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let sub_home = temp.path().join("sub-home");
+        let cold_home = temp.path().join("cold-home");
+        let build_dir = temp.path().join("build");
+        for d in [&pub_home, &sub_home, &cold_home, &build_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = InMemoryArtifactStore::new();
+        let bin_100 = build_macho_test_binary(&build_dir, "ep100");
+        let bin_150 = build_macho_test_binary(&build_dir, "ep150");
+        let bin_200 = build_macho_test_binary(&build_dir, "ep200");
+        let bin_210 = build_macho_test_binary(&build_dir, "ep210");
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor = ActorAddress::parse(&actor_str).unwrap();
+
+        // Publish normal (epoch=200), then rollback (epoch=100).
+        let pub_200 = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &bin_200,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("2000200020002000".into(), 200)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+
+        let pub_rb_100 = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &bin_100,
+                explicit_from: Some(&actor_str),
+                rollback: true,
+                commit_override: Some(("1000100010001000".into(), 100)),
+            },
+            &store,
+            |_| Ok(2),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        assert!(pub_rb_100.manifest.built_at_ms > pub_200.manifest.built_at_ms);
+
+        // Apply normal (200), then rollback (100) on subscriber.
+        apply_release_built_message_inner(
+            &sub_home,
+            &store,
+            &pub_200.release_built_message,
+            Some("sub-ep"),
+            &roots,
+            Some(&infrajr_key),
+            None,
+        )
+        .unwrap();
+        apply_release_built_message_inner(
+            &sub_home,
+            &store,
+            &pub_rb_100.release_built_message,
+            Some("sub-ep"),
+            &roots,
+            Some(&infrajr_key),
+            None,
+        )
+        .unwrap();
+
+        // 1. Replaying historical normal (200) MUST fail closed instead of undoing rollback!
+        let replay_200 = apply_release_built_message_inner(
+            &sub_home,
+            &store,
+            &pub_200.release_built_message,
+            Some("sub-ep"),
+            &roots,
+            Some(&infrajr_key),
+            None,
+        );
+        assert_eq!(
+            replay_200.unwrap_err(),
+            ReleaseSyncError::DowngradeOrReplayRejected
+        );
+
+        // 2. Unflagged normal build with commit_epoch=150 (< max_commit_epoch_seen=200) MUST fail closed
+        //    even if its built_at_ms is newer than rollback (100)!
+        let (_, sha_150, b3_150) = compute_file_digests(&bin_150).unwrap();
+        let sha_150_hex = encode_hex(&sha_150);
+        let key_150 = expected_artifact_key("chinwag", CURRENT_TARGET_TRIPLE, &sha_150_hex);
+        store.upload_artifact(&key_150, &bin_150).unwrap();
+        let unflagged_150 = ReleaseManifestV1 {
+            schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+            binary: "chinwag".into(),
+            target_triple: CURRENT_TARGET_TRIPLE.into(),
+            git_commit: "1500150015001500".into(),
+            commit_epoch: 150,
+            built_at_ms: pub_rb_100.manifest.built_at_ms + 500,
+            sha256: sha_150_hex,
+            blake3: encode_hex(&b3_150),
+            size_bytes: fs::metadata(&bin_150).unwrap().len(),
+            artifact_key: key_150,
+            rollback: false,
+        };
+        let msg_150 = sign_structured_bus_message(
+            &actor,
+            "#all",
+            Some("CHWG-0261".into()),
+            format!(
+                "{RELEASE_BUILT_PREFIX}{}",
+                serde_json::to_string(&unflagged_150).unwrap()
+            ),
+            &infrajr_key,
+        );
+        assert_eq!(
+            apply_release_built_message_inner(
+                &sub_home,
+                &store,
+                &msg_150,
+                Some("sub-ep"),
+                &roots,
+                Some(&infrajr_key),
+                None,
+            )
+            .unwrap_err(),
+            ReleaseSyncError::DowngradeOrReplayRejected
+        );
+
+        // 3. Even if R2 envelope holds stale normal (200) while journal holds rollback (100),
+        //    both an already-rolled-back peer AND a cold peer select rollback (100) cleanly!
+        store
+            .upload_latest_signed_envelope(
+                "chinwag",
+                CURRENT_TARGET_TRIPLE,
+                &serde_json::to_vec(&pub_200.release_built_message).unwrap(),
+            )
+            .unwrap();
+        let journal = temp.path().join("messages.jsonl");
+        fs::write(
+            &journal,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&pub_200.release_built_message).unwrap(),
+                serde_json::to_string(&pub_rb_100.release_built_message).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let sub_sync = sync_releases_from_journal_and_r2_per_binary_inner(
+            &sub_home,
+            &journal,
+            &store,
+            true,
+            Some("sub-ep"),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        assert_eq!(sub_sync.len(), 1);
+        assert!(matches!(
+            sub_sync[0].1,
+            Ok(ReleaseApplyOutcome::AlreadyInstalled { .. })
+        ));
+
+        let cold_sync = sync_releases_from_journal_and_r2_per_binary_inner(
+            &cold_home,
+            &journal,
+            &store,
+            true,
+            Some("cold-ep"),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        let ReleaseApplyOutcome::Installed {
+            manifest: cold_m, ..
+        } = cold_sync.into_iter().next().unwrap().1.unwrap()
+        else {
+            panic!("expected cold peer to install rollback winner");
+        };
+        assert!(cold_m.rollback);
+        assert_eq!(cold_m.commit_epoch, 100);
+        let cold_state = load_release_sync_state(&cold_home).unwrap();
+        assert_eq!(
+            cold_state.binaries["chinwag"].max_commit_epoch_seen, 200,
+            "cold peer fold must preserve observed epoch 200 watermark"
+        );
+
+        // 4. Genuine forward fix (epoch=210) succeeds, and replaying rollback (100) after 210 is rejected!
+        let pub_210 = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &bin_210,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("2100210021002100".into(), 210)),
+            },
+            &store,
+            |_| Ok(3),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_release_built_message_inner(
+                &sub_home,
+                &store,
+                &pub_210.release_built_message,
+                Some("sub-ep"),
+                &roots,
+                Some(&infrajr_key),
+                None,
+            )
+            .unwrap(),
+            ReleaseApplyOutcome::Installed { .. }
+        ));
+        assert_eq!(
+            apply_release_built_message_inner(
+                &sub_home,
+                &store,
+                &pub_rb_100.release_built_message,
+                Some("sub-ep"),
+                &roots,
+                Some(&infrajr_key),
+                None,
+            )
+            .unwrap_err(),
+            ReleaseSyncError::DowngradeOrReplayRejected
+        );
+    }
+
+    #[test]
+    fn commit_time_revalidation_blocks_stalled_installer_downgrade() {
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let sub_home = temp.path().join("sub-home");
+        let build_dir = temp.path().join("build");
+        for d in [&pub_home, &sub_home, &build_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = std::sync::Arc::new(InMemoryArtifactStore::new());
+        let bin_101 = build_macho_test_binary(&build_dir, "ep101");
+        let bin_102 = build_macho_test_binary(&build_dir, "ep102");
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+
+        let pub_101 = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &bin_101,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("1010101010101010".into(), 101)),
+            },
+            store.as_ref(),
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        let pub_102 = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &bin_102,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("1020102010201020".into(), 102)),
+            },
+            store.as_ref(),
+            |_| Ok(2),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+
+        // Simulate a concurrent `chinwag release sync` installing epoch 102 while
+        // the slower installer is mid-download on epoch 101.
+        let sub_home_race = sub_home.clone();
+        let store_race = store.clone();
+        let msg_102 = pub_102.release_built_message.clone();
+        let key_race = infrajr_key.clone();
+        let pub_bytes_race = infrajr_key.verifying_key().to_bytes();
+        store.set_on_download(move || {
+            let race_table = [("INFRAJR", pub_bytes_race)];
+            let race_roots = ReleaseTrustRoots {
+                seat_pubkeys: &race_table,
+                allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            };
+            apply_release_built_message_inner(
+                &sub_home_race,
+                store_race.as_ref(),
+                &msg_102,
+                Some("sub-ep"),
+                &race_roots,
+                Some(&key_race),
+                None,
+            )
+            .expect("concurrent newer epoch 102 install must succeed");
+        });
+
+        let stalled_101 = apply_release_built_message_inner(
+            &sub_home,
+            store.as_ref(),
+            &pub_101.release_built_message,
+            Some("sub-ep"),
+            &roots,
+            Some(&infrajr_key),
+            None,
+        );
+        assert_eq!(
+            stalled_101.unwrap_err(),
+            ReleaseSyncError::DowngradeOrReplayRejected,
+            "stalled epoch 101 installer must fail closed at commit-time lock revalidation"
+        );
+
+        let (_, on_disk_sha, _) =
+            compute_file_digests(&sub_home.join(".local/bin/chinwag")).unwrap();
+        assert_eq!(
+            encode_hex(&on_disk_sha),
+            pub_102.manifest.sha256,
+            "installed binary must remain epoch 102"
+        );
+        let final_state = load_release_sync_state(&sub_home).unwrap();
+        assert_eq!(final_state.binaries["chinwag"].commit_epoch, 102);
+    }
+
+    #[test]
+    fn symlink_source_and_state_files_fail_closed_with_o_nofollow() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_file = temp.path().join("real.bin");
+        fs::write(&real_file, b"non-empty-payload").unwrap();
+        let link_file = temp.path().join("link.bin");
+        symlink(&real_file, &link_file).unwrap();
+
+        assert!(matches!(
+            open_regular_file_nofollow(&link_file, false, false),
+            Err(ReleaseSyncError::SafePathViolation(_))
+        ));
+
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join(".chinwag")).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(home.join(".chinwag"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Symlinked `release_sync_state.json` must fail closed.
+        symlink(&real_file, home.join(".chinwag/release_sync_state.json")).unwrap();
+        assert!(matches!(
+            load_release_sync_state(&home),
+            Err(ReleaseSyncError::SafePathViolation(_))
+        ));
+        fs::remove_file(home.join(".chinwag/release_sync_state.json")).unwrap();
+
+        // Symlinked `release_sync.lock` must fail closed with `O_NOFOLLOW`.
+        symlink(&real_file, home.join(".chinwag/release_sync.lock")).unwrap();
+        assert!(matches!(
+            acquire_release_sync_lock(&home),
+            Err(ReleaseSyncError::SafePathViolation(_))
+        ));
+    }
+
+    #[test]
+    fn per_binary_catchup_preserves_chinwag_install_when_chinwag_ci_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let sub_home = temp.path().join("sub-home");
+        let build_dir = temp.path().join("build");
+        for d in [&pub_home, &sub_home, &build_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = InMemoryArtifactStore::new();
+        let cw_bin = build_macho_test_binary(&build_dir, "cw");
+        let ci_bin = build_macho_test_binary(&build_dir, "ci");
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+
+        let pub_cw = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &cw_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("aaaa1111aaaa1111".into(), 300)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        let pub_ci = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag-ci",
+                source_binary_path: &ci_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("bbbb2222bbbb2222".into(), 300)),
+            },
+            &store,
+            |_| Ok(2),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+
+        // Corrupt `chinwag-ci` blob while keeping `chinwag` intact.
+        store.tamper_blob(&pub_ci.manifest.artifact_key, b"corrupted".to_vec());
+
+        let journal = temp.path().join("messages.jsonl");
+        fs::write(
+            &journal,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&pub_cw.release_built_message).unwrap(),
+                serde_json::to_string(&pub_ci.release_built_message).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let outcomes = sync_releases_from_journal_and_r2_per_binary_inner(
+            &sub_home,
+            &journal,
+            &store,
+            false,
+            Some("sub-ep"),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].0, "chinwag");
+        assert!(matches!(
+            outcomes[0].1,
+            Ok(ReleaseApplyOutcome::Installed {
+                receipt_message: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(outcomes[1].0, "chinwag-ci");
+        assert_eq!(
+            outcomes[1].1.as_ref().unwrap_err(),
+            &ReleaseSyncError::DigestMismatch
         );
     }
 }
