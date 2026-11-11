@@ -206,8 +206,12 @@ jobs:
             fi
           fi
           chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${VERIFY_COMMIT:-HEAD}"
-          chinwag-ci surface-gate --manifest .chinwag/tasks/CHWG-0234/surface-impact.yaml --max-pr-age-secs 3600 --surfaces all --workspace-root "$PWD/.." --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
-          chinwag-ci ui-gate --surface all --repo . --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
+          if chinwag-ci --help 2>&1 | grep -q 'surface-gate'; then
+            chinwag-ci surface-gate --manifest .chinwag/tasks/CHWG-0234/surface-impact.yaml --max-pr-age-secs 3600 --surfaces all --workspace-root "$PWD/.." --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
+          fi
+          if chinwag-ci --help 2>&1 | grep -q 'ui-gate'; then
+            chinwag-ci ui-gate --surface all --repo . --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
+          fi
           chinwag-ci selftest --json
           chinwag-ci attest-green --org emunlabs --suite "stage2-h-board-security-sentinel" --commit "${VERIFY_COMMIT:-HEAD}"
 

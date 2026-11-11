@@ -1918,6 +1918,8 @@ fn parse_inline_yaml_string_list(raw: &str) -> Option<Vec<String>> {
 
         let trimmed_item = item.trim();
         if trimmed_item.is_empty()
+            || trimmed_item == "~"
+            || trimmed_item.eq_ignore_ascii_case("null")
             || trimmed_item.split('/').any(|seg| seg == "..")
             || trimmed_item.split('\\').any(|seg| seg == "..")
         {
@@ -1931,6 +1933,99 @@ fn parse_inline_yaml_string_list(raw: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+fn parse_yaml_path_scalar(raw_item: &str) -> Option<String> {
+    let s = raw_item.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let parsed = if let Some(rest) = s.strip_prefix('"') {
+        let mut buf = String::new();
+        let mut chars = rest.chars();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                let esc = chars.next()?;
+                match esc {
+                    '"' | '\\' | '/' => buf.push(esc),
+                    't' => buf.push('\t'),
+                    _ => return None,
+                }
+            } else if c == '"' {
+                closed = true;
+                break;
+            } else if c.is_control() {
+                return None;
+            } else {
+                buf.push(c);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        let trailing = chars.as_str().trim();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return None;
+        }
+        buf
+    } else if let Some(rest) = s.strip_prefix('\'') {
+        let mut buf = String::new();
+        let mut chars = rest.chars().peekable();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    buf.push('\'');
+                } else {
+                    closed = true;
+                    break;
+                }
+            } else if c.is_control() {
+                return None;
+            } else {
+                buf.push(c);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        let trailing: String = chars.collect();
+        let trailing = trailing.trim();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return None;
+        }
+        buf
+    } else {
+        let without_comment = match s.find(" #") {
+            Some(idx) => &s[..idx],
+            None => s,
+        };
+        let bare = without_comment.trim();
+        if bare.is_empty()
+            || bare.starts_with([
+                '#', '[', ']', '{', '}', '&', '*', '!', '|', '>', '\'', '"', ',',
+            ])
+            || bare
+                .chars()
+                .any(|c| c.is_control() || c == '"' || c == '\'')
+        {
+            return None;
+        }
+        bare.to_string()
+    };
+
+    let clean = parsed.trim();
+    if clean.is_empty()
+        || clean == "~"
+        || clean.eq_ignore_ascii_case("null")
+        || clean.split('/').any(|seg| seg == "..")
+        || clean.split('\\').any(|seg| seg == "..")
+    {
+        return None;
+    }
+    Some(clean.to_string())
+}
+
 pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
     let mut cfg = WorkflowConfig::default();
     let Ok(Some(raw)) =
@@ -1940,8 +2035,9 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
     };
 
     let mut in_protected_paths = false;
-    let mut saw_protected_paths_key = false;
-    let mut parsed_paths: Vec<String> = Vec::new();
+    let mut block_invalid = false;
+    let mut block_paths: Vec<String> = Vec::new();
+    let mut resolved_protected_paths: Option<Vec<String>> = None;
     let mut seen_credits: Option<u64> = None;
     let mut seen_mode_credits: Option<u64> = None;
     for line in raw.lines() {
@@ -1950,14 +2046,25 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
             continue;
         }
         if in_protected_paths {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                let clean = item.trim().trim_matches('"').trim_matches('\'').to_string();
-                if !clean.is_empty() {
-                    parsed_paths.push(clean);
+            if trimmed == "-" {
+                block_invalid = true;
+                continue;
+            } else if let Some(item) = trimmed.strip_prefix("- ") {
+                if let Some(clean) = parse_yaml_path_scalar(item) {
+                    block_paths.push(clean);
+                } else {
+                    block_invalid = true;
                 }
                 continue;
             } else {
+                if !block_invalid && !block_paths.is_empty() {
+                    resolved_protected_paths = Some(std::mem::take(&mut block_paths));
+                } else {
+                    resolved_protected_paths = None;
+                    block_paths.clear();
+                }
                 in_protected_paths = false;
+                block_invalid = false;
             }
         }
         let Some((k, v_raw)) = trimmed.split_once(':') else {
@@ -2028,20 +2135,30 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
             "protected_paths" => {
                 let raw_after_colon = v_raw.trim();
                 if raw_after_colon.is_empty() {
-                    saw_protected_paths_key = true;
-                    parsed_paths.clear();
                     in_protected_paths = true;
+                    block_invalid = false;
+                    block_paths.clear();
+                    resolved_protected_paths = None;
                 } else if let Some(inline_items) = parse_inline_yaml_string_list(raw_after_colon) {
-                    saw_protected_paths_key = true;
-                    parsed_paths = inline_items;
+                    resolved_protected_paths = Some(inline_items);
                     in_protected_paths = false;
+                    block_invalid = false;
+                    block_paths.clear();
                 } else {
-                    saw_protected_paths_key = false;
-                    parsed_paths.clear();
+                    resolved_protected_paths = None;
                     in_protected_paths = false;
+                    block_invalid = false;
+                    block_paths.clear();
                 }
             }
             _ => {}
+        }
+    }
+    if in_protected_paths {
+        if !block_invalid && !block_paths.is_empty() {
+            resolved_protected_paths = Some(block_paths);
+        } else {
+            resolved_protected_paths = None;
         }
     }
     if let Some(c) = seen_credits.or(seen_mode_credits) {
@@ -2050,8 +2167,8 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
             cfg.review_mode = mode.to_string();
         }
     }
-    if saw_protected_paths_key {
-        cfg.protected_paths = parsed_paths;
+    if let Some(paths) = resolved_protected_paths {
+        cfg.protected_paths = paths;
     }
     ensure_distinct_workflow_slots(&mut cfg, None);
     cfg
@@ -6526,27 +6643,32 @@ mod tests {
             ]
         );
 
-        // Malformed inline lists (`[,]`, trailing comma, unclosed quote, empty string, traversal `..`)
-        // and unparseable scalars all fail safe to default protected paths (never fail open to `[]`).
-        for bad_line in [
-            "protected_paths: malformed_scalar",
-            "protected_paths: [,]",
-            "protected_paths: [\".env*\",]",
-            "protected_paths: [,\"secrets/**\"]",
-            "protected_paths: [\"unclosed]",
-            "protected_paths: [\"\"]",
-            "protected_paths: [\"../outside\"]",
+        // Malformed inline lists (`[,]`, trailing comma, unclosed quote, empty string, traversal `..`),
+        // YAML null / bare `protected_paths:` blocks (at EOF or before another mapping key),
+        // and blocks containing empty/traversal items (`- ""`, `-`, `- "../outside"`) all fail safe
+        // to default protected paths while explicit `protected_paths: []` stays empty.
+        for bad_doc in [
+            "version: 1\nprotected_paths: malformed_scalar\n",
+            "version: 1\nprotected_paths: [,]\n",
+            "version: 1\nprotected_paths: [\".env*\",]\n",
+            "version: 1\nprotected_paths: [,\"secrets/**\"]\n",
+            "version: 1\nprotected_paths: [\"unclosed]\n",
+            "version: 1\nprotected_paths: [\"\"]\n",
+            "version: 1\nprotected_paths: [\"../outside\"]\n",
+            "version: 1\nprotected_paths: [~]\n",
+            "version: 1\nprotected_paths: null\n",
+            "version: 1\nprotected_paths:\n",
+            "version: 1\nprotected_paths:\nreview_tier_credits: 200\n",
+            "version: 1\nprotected_paths:\n  - \"\"\n",
+            "version: 1\nprotected_paths:\n  -\n",
+            "version: 1\nprotected_paths:\n  - \".env*\"\n  - \"../outside\"\n",
         ] {
-            fs::write(
-                repo.join(".chinwag/workflow.yaml"),
-                format!("version: 1\n{bad_line}\n"),
-            )
-            .unwrap();
+            fs::write(repo.join(".chinwag/workflow.yaml"), bad_doc).unwrap();
             let malformed_loaded = load_workflow_config(&repo);
             assert_eq!(
                 malformed_loaded.protected_paths,
                 WorkflowConfig::default().protected_paths,
-                "malformed protected_paths line `{bad_line}` must fail safe to defaults"
+                "malformed/null protected_paths doc `{bad_doc:?}` must fail safe to defaults"
             );
         }
 
