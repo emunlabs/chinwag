@@ -11,6 +11,6 @@
   "signature_ed25519": "301039cee3aa5c02931935f682a8773518421b2aa8f2827400bc6d4e27e361ecd2833421a57de6298e95ad5b322310de31bcc2d5c5dd7c16113037b18690c804",
   "signer_pubkey_ed25519": "fa80fada8ea3af9d8af8e86709d6e23d48736aa2bb02d8508ceb8ea5882e7d6a",
   "signer_seat": "ALISTAIR",
-  "studio_issuer": "Rogue Machine Media LLC (d/b/a Lag Lords)",
+  "studio_issuer": "Emun Labs, Inc. (Break Room Studio)",
   "zero_knowledge_chip_mint": "INV-PLUGIN-CHIP-01"
 }

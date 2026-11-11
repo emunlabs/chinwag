@@ -1,0 +1,337 @@
+{
+  "public_board": true,
+  "public_items": 34,
+  "public_population": {
+    "Assignees": 34,
+    "Baseline Hours": 34,
+    "Chinwag Cycle Time": 34,
+    "Created": 34,
+    "Credits Used": 34,
+    "DORA Baseline": 34,
+    "Execution Mode": 34,
+    "Function / Team": 34,
+    "Net Hours Saved": 34,
+    "Repository": 34,
+    "Status": 34,
+    "Title": 34,
+    "Updated": 34,
+    "Verification Receipt": 34,
+    "Δ Speedup vs. DORA": 34
+  },
+  "shipped_public_items": 16,
+  "measured_shipped_public_items": 13,
+  "public_net_hours_saved": 616.1,
+  "public_credits_used": 2650.0,
+  "unshipped_hours_saved": 0,
+  "ui_view_recipes": [
+    {
+      "number": 2,
+      "name": "02 · Velocity & DORA Ledger",
+      "recommended_group_by": "Status",
+      "group_by_applied_in_web_ui": false,
+      "recommended_sort_by": {
+        "field": "Updated",
+        "direction": "DESC"
+      },
+      "sort_by_applied_in_web_ui": false
+    },
+    {
+      "number": 3,
+      "name": "03 · Work by Function",
+      "recommended_group_by": "Function / Team",
+      "group_by_applied_in_web_ui": false,
+      "recommended_sort_by": null,
+      "sort_by_applied_in_web_ui": true
+    }
+  ],
+  "views": [
+    {
+      "id": "PVTV_lADOFJPsXM4BrFUVzgMgEWo",
+      "number": 1,
+      "name": "01 · Kanban Execution Board",
+      "layout": "BOARD_LAYOUT",
+      "filter": "",
+      "groupByFields": {
+        "nodes": []
+      },
+      "verticalGroupByFields": {
+        "nodes": [
+          {
+            "name": "Status"
+          }
+        ]
+      },
+      "sortByFields": {
+        "nodes": []
+      },
+      "configuration": {
+        "visibleFields": {
+          "nodes": [
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZI",
+              "name": "Title"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZM",
+              "name": "Assignees"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpah98",
+              "name": "Function / Team"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQw",
+              "name": "DORA Baseline"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZnQ0",
+              "name": "Chinwag Cycle Time"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQs",
+              "name": "Δ Speedup vs. DORA"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZnQ4",
+              "name": "Net Hours Saved"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah_Y",
+              "name": "Credits Used"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQ8",
+              "name": "Execution Mode"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah_c",
+              "name": "Verification Receipt"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "PVTV_lADOFJPsXM4BrFUVzgMgI98",
+      "number": 2,
+      "name": "02 · Velocity & DORA Ledger",
+      "layout": "TABLE_LAYOUT",
+      "filter": "",
+      "groupByFields": {
+        "nodes": []
+      },
+      "verticalGroupByFields": {
+        "nodes": []
+      },
+      "sortByFields": {
+        "nodes": []
+      },
+      "configuration": {
+        "visibleFields": {
+          "nodes": [
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZI",
+              "name": "Title"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZlZQ",
+              "name": "Status"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZM",
+              "name": "Assignees"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpah98",
+              "name": "Function / Team"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZo",
+              "name": "Repository"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQw",
+              "name": "DORA Baseline"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah-4",
+              "name": "Baseline Hours"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZnQ0",
+              "name": "Chinwag Cycle Time"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQs",
+              "name": "Δ Speedup vs. DORA"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZnQ4",
+              "name": "Net Hours Saved"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah_Y",
+              "name": "Credits Used"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQ8",
+              "name": "Execution Mode"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah_c",
+              "name": "Verification Receipt"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlaQ",
+              "name": "Created"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlaY",
+              "name": "Updated"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "PVTV_lADOFJPsXM4BrFUVzgMgMM4",
+      "number": 3,
+      "name": "03 · Work by Function",
+      "layout": "TABLE_LAYOUT",
+      "filter": "has:status",
+      "groupByFields": {
+        "nodes": []
+      },
+      "verticalGroupByFields": {
+        "nodes": []
+      },
+      "sortByFields": {
+        "nodes": []
+      },
+      "configuration": {
+        "visibleFields": {
+          "nodes": [
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZI",
+              "name": "Title"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZlZQ",
+              "name": "Status"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZM",
+              "name": "Assignees"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpah98",
+              "name": "Function / Team"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZo",
+              "name": "Repository"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQw",
+              "name": "DORA Baseline"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah-4",
+              "name": "Baseline Hours"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZnQ0",
+              "name": "Chinwag Cycle Time"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQs",
+              "name": "Δ Speedup vs. DORA"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZnQ4",
+              "name": "Net Hours Saved"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah_Y",
+              "name": "Credits Used"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQ8",
+              "name": "Execution Mode"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah_c",
+              "name": "Verification Receipt"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlaQ",
+              "name": "Created"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlaY",
+              "name": "Updated"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "PVTV_lADOFJPsXM4BrFUVzgMgMM8",
+      "number": 4,
+      "name": "04 · 🌱 Open Bounties (+500 Credits)",
+      "layout": "BOARD_LAYOUT",
+      "filter": "status:\"01 · 🌱 OPEN BOUNTY (+500 CR)\"",
+      "groupByFields": {
+        "nodes": []
+      },
+      "verticalGroupByFields": {
+        "nodes": [
+          {
+            "name": "Status"
+          }
+        ]
+      },
+      "sortByFields": {
+        "nodes": []
+      },
+      "configuration": {
+        "visibleFields": {
+          "nodes": [
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZI",
+              "name": "Title"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZlZQ",
+              "name": "Status"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpZlZM",
+              "name": "Assignees"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpah98",
+              "name": "Function / Team"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQw",
+              "name": "DORA Baseline"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah-4",
+              "name": "Baseline Hours"
+            },
+            {
+              "id": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQ8",
+              "name": "Execution Mode"
+            },
+            {
+              "id": "PVTF_lADOFJPsXM4BrFUVzhpah_c",
+              "name": "Verification Receipt"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

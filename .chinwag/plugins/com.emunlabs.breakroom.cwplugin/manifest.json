@@ -23,7 +23,7 @@
   "signer_pubkey_ed25519": "fa80fada8ea3af9d8af8e86709d6e23d48736aa2bb02d8508ceb8ea5882e7d6a",
   "signer_seat": "ALISTAIR",
   "signing_key_id": "pub_plugin_emun_2026",
-  "studio_issuer": "Rogue Machine Media LLC (d/b/a Lag Lords)",
+  "studio_issuer": "Emun Labs, Inc. (Break Room Studio)",
   "ui_mount": "/plugins/breakroom",
   "version": "0.2.4"
 }

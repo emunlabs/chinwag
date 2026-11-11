@@ -17,13 +17,14 @@ use std::process::Command;
 
 pub const NOT_IMPLEMENTED: &str = "ui-gate not implemented; not gate evidence";
 
-fn resolve_chinwag_ci_bin() -> &'static str {
-    let canonical = "/Users/brianspector/.local/bin/chinwag-ci";
-    if Path::new(canonical).is_file() {
-        canonical
-    } else {
-        "chinwag-ci"
+fn resolve_chinwag_ci_bin() -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = format!("{home}/.local/bin/chinwag-ci");
+        if Path::new(&candidate).is_file() {
+            return candidate;
+        }
     }
+    "chinwag-ci".to_string()
 }
 
 pub fn run_ui_gate(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
@@ -49,7 +50,7 @@ pub fn run_ui_gate(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     }
 
     let bin = resolve_chinwag_ci_bin();
-    match Command::new(bin).arg("ui-gate").args(args).output() {
+    match Command::new(&bin).arg("ui-gate").args(args).output() {
         Ok(output) => {
             let _ = stdout.write_all(&output.stdout);
             let _ = stderr.write_all(&output.stderr);

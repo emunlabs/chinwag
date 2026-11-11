@@ -289,7 +289,10 @@ pub fn resolve_identity_config() -> IdentityConfig {
         mission_control_url = if effective_is_studio {
             "http://127.0.0.1:5487".to_string()
         } else {
-            "http://100.66.156.76:5487".to_string()
+            env::var("CHINWAG_HUB_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:5487".to_string())
         };
     }
     mission_control_url = mission_control_url.trim_end_matches('/').to_string();
