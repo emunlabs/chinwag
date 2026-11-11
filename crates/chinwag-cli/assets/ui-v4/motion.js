@@ -416,7 +416,23 @@ export function createElapsedClock(format) {
 }
 
 // ── Delivery-2 Rail Toggle (single-frame grid snap + GPU clip/counter-translate) ─
+let railAnimGenCounter = 0;
+
 export function animateRailToggle(railEl, trackEl, spineEl, mainEl, nextExpanded, applyAttr) {
+  const myGen = ++railAnimGenCounter;
+  if (railEl) {
+    if (Array.isArray(railEl._d2ActiveAnims)) {
+      for (const prevAnim of railEl._d2ActiveAnims) {
+        if (prevAnim && typeof prevAnim.cancel === "function") {
+          try {
+            prevAnim.cancel();
+          } catch {}
+        }
+      }
+    }
+    railEl._d2ActiveAnims = [];
+    railEl._d2AnimGen = myGen;
+  }
   const canAnimate = Boolean(railEl && !prefersReducedMotion());
   if (canAnimate && railEl.dataset) {
     railEl.dataset.railAnimating = nextExpanded ? "expanding" : "collapsing";
@@ -427,9 +443,12 @@ export function animateRailToggle(railEl, trackEl, spineEl, mainEl, nextExpanded
     applyAttr,
   );
   if (!canAnimate) {
-    if (railEl && railEl.dataset) delete railEl.dataset.railAnimating;
+    if (railEl && railEl.dataset && railEl._d2AnimGen === myGen) {
+      delete railEl.dataset.railAnimating;
+    }
     return Promise.resolve();
   }
+  const activeAnims = [];
   const jobs = [];
   if (trackEl && typeof trackEl.animate === "function") {
     const frames = nextExpanded
@@ -441,17 +460,29 @@ export function animateRailToggle(railEl, trackEl, spineEl, mainEl, nextExpanded
           { transform: "translate3d(0, 0, 0)", opacity: 1 },
           { transform: "translate3d(-276px, 0, 0)", opacity: 0 },
         ];
-    jobs.push(done(play(trackEl, frames, "--dur-rail", "--ease-out-expo", "d2-rail-track")));
+    const anim = play(trackEl, frames, "--dur-rail", "--ease-out-expo", "d2-rail-track");
+    if (anim) activeAnims.push(anim);
+    jobs.push(done(anim));
   }
   if (nextExpanded && typeof railEl.animate === "function") {
     const clipFrames = [{ clipPath: "inset(0 276px 0 0)" }, { clipPath: "inset(0 0px 0 0)" }];
-    jobs.push(done(play(railEl, clipFrames, "--dur-rail", "--ease-out-expo", "d2-rail-clip")));
+    const anim = play(railEl, clipFrames, "--dur-rail", "--ease-out-expo", "d2-rail-clip");
+    if (anim) activeAnims.push(anim);
+    jobs.push(done(anim));
   }
   if (spineEl && !nextExpanded && typeof spineEl.animate === "function") {
-    jobs.push(done(play(spineEl, [{ opacity: 0 }, { opacity: 1 }], "--dur-rail-fade", "--ease-standard", "d2-spine-in")));
+    const anim = play(spineEl, [{ opacity: 0 }, { opacity: 1 }], "--dur-rail-fade", "--ease-standard", "d2-spine-in");
+    if (anim) activeAnims.push(anim);
+    jobs.push(done(anim));
+  }
+  if (railEl) {
+    railEl._d2ActiveAnims = activeAnims;
   }
   return Promise.all(jobs).finally(() => {
-    if (railEl && railEl.dataset) delete railEl.dataset.railAnimating;
+    if (railEl && railEl._d2AnimGen === myGen) {
+      railEl._d2ActiveAnims = [];
+      if (railEl.dataset) delete railEl.dataset.railAnimating;
+    }
   });
 }
 

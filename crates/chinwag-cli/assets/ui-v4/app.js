@@ -890,6 +890,7 @@ const state = {
   d2ComposerError: null,
   d2Sending: false,
   d2ActiveTurnId: null,
+  d2CancelledTurnIds: new Set(),
   d2ActiveAbort: null,
   d2ActiveStreamer: null,
   d2StreamingEntryId: null,
@@ -1513,17 +1514,26 @@ function normalizeBootstrap(raw) {
 function safeChinwagOutboundUrl(raw, fallback = "https://chinwag.sh/open") {
   const s = String(raw ?? "").trim();
   if (!s || /[\u0000-\u001F\u007F\s]/.test(s)) return fallback;
-  if (
+  const allowedPrefix =
     s === "https://chinwag.sh/security" ||
     s === "https://chinwag.sh/pricing" ||
     s.startsWith("https://chinwag.sh/pricing?") ||
     s.startsWith("https://chinwag.sh/pricing#") ||
     s === "https://chinwag.sh/open" ||
-    s.startsWith("https://chinwag.sh/open?")
+    s.startsWith("https://chinwag.sh/open?");
+  if (!allowedPrefix) return fallback;
+  const tailLower = s.slice("https://chinwag.sh/".length).toLowerCase();
+  if (
+    tailLower.includes("://") ||
+    tailLower.includes("//") ||
+    tailLower.includes("javascript:") ||
+    tailLower.includes("data:") ||
+    tailLower.includes("%2f%2f") ||
+    tailLower.includes("%3a")
   ) {
-    return s;
+    return fallback;
   }
-  return fallback;
+  return s;
 }
 
 function normalizeDelivery2State(rawD2, baseData = null) {
@@ -5749,8 +5759,16 @@ async function resumeDelivery2FromCursor() {
       `/api/v1/delivery2/state?since_seq=${encodeURIComponent(String(sinceSeq))}`,
     );
     if (!raw || typeof raw !== "object") return false;
+    const liveSeq = Number(state.d2LastCursorSeq) || 0;
     const incomingSeq = Math.max(1, Number(raw.seq ?? raw.cursor_seq) || 1);
-    if (raw.unchanged && state.d2Loaded && incomingSeq === sinceSeq) {
+    if (state.d2Loaded && incomingSeq < liveSeq) {
+      return false;
+    }
+    if (raw.unchanged && state.d2Loaded) {
+      // Arbitrate strictly against the CURRENT live cursor immediately before committing!
+      if (incomingSeq !== liveSeq || sinceSeq !== liveSeq) {
+        return false;
+      }
       if (raw.sync_radar && state.data.delivery2) {
         const norm = normalizeDelivery2State(raw, state.data);
         state.data.delivery2.sync_radar = norm.sync_radar;
@@ -5942,7 +5960,10 @@ async function submitDelivery2Prompt(rawPrompt) {
       { prompt, turn_id: turnId },
       abortCtrl ? { signal: abortCtrl.signal } : null,
     );
-    if (state.d2ActiveTurnId !== turnId) {
+    if (
+      state.d2ActiveTurnId !== turnId ||
+      (state.d2CancelledTurnIds && state.d2CancelledTurnIds.has(turnId))
+    ) {
       return false;
     }
 
@@ -5953,7 +5974,7 @@ async function submitDelivery2Prompt(rawPrompt) {
     }
 
     const entry = res && res.entry && typeof res.entry === "object" ? res.entry : null;
-    if (entry && entry.kind === "qa_card" && !isAbsent(entry.body)) {
+    if (entry && entry.kind === "qa_card" && !entry.stopped && !isAbsent(entry.body)) {
       const fullBody = String(entry.body);
       state.d2StreamingEntryId = String(entry.id);
       state.d2StreamingText = "";
@@ -6024,7 +6045,15 @@ async function cancelDelivery2Turn() {
   const turnId = state.d2ActiveTurnId || "active";
   const stoppedEntryId = state.d2StreamingEntryId || null;
   const partialText = String(state.d2StreamingText || "");
-  const truncatedLen = stoppedEntryId ? Array.from(partialText).length : null;
+  const truncatedLen = stoppedEntryId ? Array.from(partialText).length : 0;
+
+  if (turnId && turnId !== "active" && state.d2CancelledTurnIds) {
+    state.d2CancelledTurnIds.add(turnId);
+    if (state.d2CancelledTurnIds.size > 64) {
+      const oldest = state.d2CancelledTurnIds.values().next().value;
+      if (oldest) state.d2CancelledTurnIds.delete(oldest);
+    }
+  }
 
   state.d2Sending = false;
   state.d2ActiveTurnId = null;
@@ -6039,15 +6068,21 @@ async function cancelDelivery2Turn() {
   }
   state.d2ActiveStreamer = null;
 
-  if (stoppedEntryId && state.data && state.data.delivery2 && Array.isArray(state.data.delivery2.entries)) {
+  if (state.data && state.data.delivery2 && Array.isArray(state.data.delivery2.entries)) {
     const healedPartial = healUnclosedInlineMarkdown(partialText);
-    const clampedBody = healedPartial.trim() ? healedPartial : "[Stopped]";
+    const clampedBody = stoppedEntryId && healedPartial.trim() ? healedPartial : "[Stopped]";
     const targetEntry = state.data.delivery2.entries.find(
-      (e) => e && String(e.id) === String(stoppedEntryId),
+      (e) =>
+        e &&
+        ((stoppedEntryId && String(e.id) === String(stoppedEntryId)) ||
+          (!stoppedEntryId && turnId !== "active" && e.kind === "qa_card" && e.turn_id === turnId)),
     );
     if (targetEntry) {
       targetEntry.body = clampedBody;
       targetEntry.stopped = true;
+      if (!stoppedEntryId || truncatedLen === 0) {
+        targetEntry.sources = [];
+      }
     }
   }
 
@@ -6056,10 +6091,12 @@ async function cancelDelivery2Turn() {
   renderDelivery2Panel();
 
   try {
-    const cancelPayload = { turn_id: turnId };
+    const cancelPayload = {
+      turn_id: turnId,
+      truncated_len: truncatedLen,
+    };
     if (stoppedEntryId) {
       cancelPayload.entry_id = stoppedEntryId;
-      cancelPayload.truncated_len = truncatedLen;
     }
     const res = await apiRequest("POST", "/api/v1/delivery2/cancel", cancelPayload);
     if (res && res.state) applyDelivery2ServerPayload(res.state);
@@ -6231,7 +6268,11 @@ function renderDelivery2Entry(entry) {
 
     const disclosureBody = el(
       "div",
-      { className: "d2-disclosure-body", dataset: { open: expanded ? "true" : "false" } },
+      {
+        className: "d2-disclosure-body",
+        "aria-hidden": expanded ? "false" : "true",
+        dataset: { open: expanded ? "true" : "false" },
+      },
       el(
         "div",
         { className: "d2-disclosure-inner" },
@@ -6259,6 +6300,7 @@ function renderDelivery2Entry(entry) {
         ),
       ),
     );
+    disclosureBody.inert = !expanded;
 
     const stepsBtn = el(
       "button",
@@ -6272,6 +6314,8 @@ function renderDelivery2Entry(entry) {
           else state.d2ExpandedSteps.delete(entry.id);
           stepsBtn.setAttribute("aria-expanded", next ? "true" : "false");
           disclosureBody.dataset.open = next ? "true" : "false";
+          disclosureBody.inert = !next;
+          disclosureBody.setAttribute("aria-hidden", next ? "false" : "true");
         },
       },
       ICONS.chevronRight(),
@@ -6591,7 +6635,11 @@ function renderDelivery2Entry(entry) {
   if (sources.length > 0) {
     provDisclosure = el(
       "div",
-      { className: "d2-disclosure-body", dataset: { open: srcOpen ? "true" : "false" } },
+      {
+        className: "d2-disclosure-body",
+        "aria-hidden": srcOpen ? "false" : "true",
+        dataset: { open: srcOpen ? "true" : "false" },
+      },
       el(
         "div",
         { className: "d2-disclosure-inner" },
@@ -6613,6 +6661,7 @@ function renderDelivery2Entry(entry) {
         ),
       ),
     );
+    provDisclosure.inert = !srcOpen;
 
     provToggle = el(
       "button",
@@ -6626,6 +6675,8 @@ function renderDelivery2Entry(entry) {
           else state.d2ExpandedSources.delete(entry.id);
           provToggle.setAttribute("aria-expanded", next ? "true" : "false");
           provDisclosure.dataset.open = next ? "true" : "false";
+          provDisclosure.inert = !next;
+          provDisclosure.setAttribute("aria-hidden", next ? "false" : "true");
         },
       },
       ICONS.chevronRight(),
@@ -7228,13 +7279,13 @@ function findAncestorWithClass(node, cls) {
 }
 
 function isFocusableInD2Drawer(node, rootTrack) {
-  if (!node || node.hidden || node.disabled) return false;
+  if (!node || node.hidden || node.disabled || node.inert) return false;
   if (node.getAttribute("aria-disabled") === "true") return false;
   if (node.getAttribute("aria-hidden") === "true") return false;
   if (node.getAttribute("tabindex") === "-1") return false;
   let cur = node.parentNode || null;
   while (cur && cur !== rootTrack) {
-    if (cur.hidden || cur.getAttribute("aria-hidden") === "true") return false;
+    if (cur.hidden || cur.inert || cur.getAttribute("aria-hidden") === "true") return false;
     if (cur.dataset && cur.dataset.open === "false") return false;
     cur = cur.parentNode || null;
   }
@@ -7444,8 +7495,6 @@ async function refreshBootstrapQuietly() {
   try {
     const hadInFlightAtStart = (state.workflowSaveInFlight || 0) > 0;
     const startSaveSeq = state.workflowSaveSeq || 0;
-    const prevD2 = state.data ? state.data.delivery2 : null;
-    const prevSeq = Number(state.d2LastCursorSeq) || 0;
     const raw = await apiRequest("GET", "/api/v4/bootstrap");
     const fresh = normalizeBootstrap(raw);
     if (
@@ -7457,11 +7506,15 @@ async function refreshBootstrapQuietly() {
     } else {
       state.committedWorkflow = snapshotWorkflowState(fresh.agents);
     }
+    // Read the CURRENT Delivery-2 cursor & snapshot AFTER `await` resolves so delayed
+    // bootstrap responses can never roll back newer mutations applied while in flight.
+    const livePrevD2 = state.data ? state.data.delivery2 : null;
+    const livePrevSeq = Number(state.d2LastCursorSeq) || 0;
     const incomingSeq = Math.max(1, Number(fresh.delivery2 && fresh.delivery2.seq) || 1);
-    if (state.d2Loaded && prevD2 && incomingSeq < prevSeq) {
-      fresh.delivery2 = prevD2;
+    if (state.d2Loaded && livePrevD2 && incomingSeq < livePrevSeq) {
+      fresh.delivery2 = livePrevD2;
     } else {
-      state.d2LastCursorSeq = Math.max(prevSeq, incomingSeq);
+      state.d2LastCursorSeq = Math.max(livePrevSeq, incomingSeq);
       state.d2Loaded = true;
     }
     state.data = fresh;

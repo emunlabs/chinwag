@@ -576,7 +576,9 @@ const sandbox = {
   fetch: async (url, opts = {}) => {
     const body = opts.body ? JSON.parse(opts.body) : {};
     if (url === "/api/v4/bootstrap") {
-      return { ok: true, status: 200, json: async () => mockBootstrapPayload };
+      const payload =
+        typeof mockBootstrapPayload === "function" ? await mockBootstrapPayload() : mockBootstrapPayload;
+      return { ok: true, status: 200, json: async () => payload };
     }
     if (url === "/api/v4/workflow") {
       try {
@@ -1157,10 +1159,215 @@ assert.equal(stubDocument.activeElement, btnD2Drawer, "Closing mobile drawer mus
 stubWindow.innerWidth = 1440;
 T.syncDelivery2DrawerDom();
 
+// Suite K: Round-3 Tribunal Regression Ratchets (ARCHITECT-R2-1/6/7/8 + QA-R2-1/open-redirect)
+// K1: In-flight mutation advancing seq during delayed refreshBootstrapQuietly or unchanged cursor poll NEVER rolls back
+T.applyDelivery2ServerPayload({
+  seq: 20,
+  status: "waiting_for_you",
+  entries: [{ id: "entry-hitl-k", kind: "approval_card", seq: 20, approval_id: "hitl-k1", settled: false }],
+});
+let releaseDelayedBoot;
+mockBootstrapPayload = () =>
+  new Promise((resolve) => {
+    releaseDelayedBoot = () =>
+      resolve({
+        delivery2: {
+          seq: 20,
+          status: "waiting_for_you",
+          entries: [{ id: "entry-hitl-k", kind: "approval_card", seq: 20, approval_id: "hitl-k1", settled: false }],
+        },
+      });
+  });
+const pendingBootRefresh = T.refreshBootstrapQuietly();
+await sleep(5);
+// Concurrent mutation settles hitl-k1 at seq=21 BEFORE delayed /api/v4/bootstrap resolves!
+T.applyDelivery2ServerPayload({
+  seq: 21,
+  status: "live",
+  entries: [
+    {
+      id: "entry-hitl-k",
+      kind: "approval_card",
+      seq: 21,
+      approval_id: "hitl-k1",
+      settled: true,
+      settled_decision: "approved",
+    },
+  ],
+});
+releaseDelayedBoot();
+await pendingBootRefresh;
+assert.equal(T.state.data.delivery2.seq, 21, "Delayed bootstrap response must NEVER overwrite newer in-flight seq=21");
+assert.equal(
+  T.state.data.delivery2.entries[0].settled,
+  true,
+  "Delayed bootstrap response must NEVER roll back settled approval",
+);
+
+let releaseDelayedCursor;
+mockD2StateHandler = () =>
+  new Promise((resolve) => {
+    releaseDelayedCursor = () => resolve({ ok: true, seq: 21, cursor_seq: 21, unchanged: true, delta_entries: [] });
+  });
+const pendingCursorPoll = T.resumeDelivery2FromCursor();
+await sleep(5);
+T.applyDelivery2ServerPayload({
+  seq: 22,
+  status: "live",
+  entries: [{ id: "entry-qa-22", kind: "qa_card", seq: 22, body: "Newer turn arrived." }],
+});
+releaseDelayedCursor();
+await pendingCursorPoll;
+assert.equal(
+  T.state.d2LastCursorSeq,
+  22,
+  "Delayed unchanged cursor poll must NEVER rewind d2LastCursorSeq from 22 back to 21",
+);
+
+// K2: Pre-receipt Stop (cancelDelivery2Turn BEFORE /api/v1/delivery2/message resolves) sends truncated_len=0 and never reveals unseen body
+let resolveLateMessage;
+mockD2MessageHandler = (body) =>
+  new Promise((resolve) => {
+    resolveLateMessage = () =>
+      resolve({
+        ok: true,
+        entry: {
+          id: "qa-late-prestop",
+          kind: "qa_card",
+          seq: 23,
+          turn_id: body.turn_id,
+          author: "Delivery-2",
+          body: "UNSEEN LATE BODY THAT MUST NEVER RENDER AFTER PRE-RECEIPT STOP",
+          sources: [{ id: "src-late", label: "Inbox", hash: "#inbox" }],
+        },
+      });
+  });
+d2CancelCalls = [];
+const lateTurnPromise = T.submitDelivery2Prompt("Question cancelled before response arrives");
+await sleep(5);
+await T.cancelDelivery2Turn();
+assert.equal(d2CancelCalls.length, 1);
+assert.equal(d2CancelCalls[0].truncated_len, 0, "Pre-receipt Stop must send truncated_len: 0");
+assert.ok(String(d2CancelCalls[0].turn_id || "").startsWith("turn-"), "Pre-receipt Stop must carry turn_id");
+releaseDelayedMessage: {
+  resolveLateMessage();
+  await lateTurnPromise;
+}
+assert.equal(
+  d2Track.textContent.includes("UNSEEN LATE BODY"),
+  false,
+  "Late /message response for cancelled turn must NEVER reveal unseen answer text",
+);
+
+// K3: Collapsed .d2-disclosure-body sets .inert=true + aria-hidden="true" and clears both on expand
+T.applyDelivery2ServerPayload({
+  seq: 24,
+  status: "live",
+  entries: [
+    {
+      id: "qa-disc-k3",
+      kind: "qa_card",
+      seq: 24,
+      author: "Delivery-2",
+      body: "Grounded answer.",
+      sources: [{ id: "src-k3", label: "Inbox · #42", hash: "#inbox" }],
+    },
+  ],
+});
+T.renderDelivery2Panel();
+const discBody = d2Track.querySelector(".d2-disclosure-body");
+const discToggle = Array.from(d2Track.querySelectorAll("button")).find((b) =>
+  b.textContent.includes("Verified sources"),
+);
+assert.ok(discBody && discToggle, "Verified sources disclosure must render");
+assert.equal(discBody.inert, true, "Collapsed disclosure body must be inert so hidden buttons cannot take Tab focus");
+assert.equal(discBody.getAttribute("aria-hidden"), "true");
+discToggle.click();
+assert.equal(discBody.inert, false, "Expanded disclosure body must clear inert");
+assert.equal(discBody.getAttribute("aria-hidden"), "false");
+
+// K4: Real motion.js animateRailToggle generation guard — older transition finishing never deletes active dataset.railAnimating
+const motionCtx = {
+  console,
+  setTimeout,
+  clearTimeout,
+  requestAnimationFrame: (fn) => setTimeout(fn, 0),
+  Date,
+  Math,
+  Number,
+  Boolean,
+  Promise,
+  Array,
+  document: stubDocument,
+  window: stubWindow,
+  getComputedStyle: () => ({
+    getPropertyValue: (prop) => (prop.startsWith("--dur") ? "180ms" : "cubic-bezier(0.16, 1, 0.3, 1)"),
+    backgroundColor: "#fff",
+  }),
+};
+vm.createContext(motionCtx);
+vm.runInContext(`${motionJs.replace(/^export\s+/gm, "")}\nglobalThis.__realMotion = { animateRailToggle };`, motionCtx);
+
+const finishWaveA = [];
+const finishWaveB = [];
+let animACancelledCount = 0;
+let callIdx = 0;
+const makeAnimTarget = () => ({
+  dataset: {},
+  getBoundingClientRect: () => ({ top: 0 }),
+  animate: () => {
+    callIdx += 1;
+    const isFirstWave = callIdx <= 2; // wave 1 (expand): track + rail clip; wave 2 (collapse): track + spine
+    let resolveFn;
+    const finished = new Promise((r) => {
+      resolveFn = r;
+    });
+    if (isFirstWave) finishWaveA.push(resolveFn);
+    else finishWaveB.push(resolveFn);
+    return {
+      finished,
+      cancel() {
+        if (isFirstWave) animACancelledCount += 1;
+        resolveFn();
+      },
+    };
+  },
+});
+const mRail = makeAnimTarget();
+const mTrack = makeAnimTarget();
+const mSpine = makeAnimTarget();
+const mMain = { getBoundingClientRect: () => ({ top: 0 }) };
+
+const pExpand = motionCtx.__realMotion.animateRailToggle(mRail, mTrack, mSpine, mMain, true, () => {});
+assert.equal(mRail.dataset.railAnimating, "expanding");
+const pCollapse = motionCtx.__realMotion.animateRailToggle(mRail, mTrack, mSpine, mMain, false, () => {});
+assert.equal(animACancelledCount, 2, "Superseding rail toggle must cancel all in-flight Web Animations");
+assert.equal(mRail.dataset.railAnimating, "collapsing");
+for (const fn of finishWaveA) fn();
+await pExpand;
+assert.equal(
+  mRail.dataset.railAnimating,
+  "collapsing",
+  "Superseded animation A finishing must NOT delete active animation B dataset.railAnimating",
+);
+for (const fn of finishWaveB) fn();
+await pCollapse;
+assert.equal(mRail.dataset.railAnimating, undefined, "Active animation B finishing clears dataset.railAnimating");
+
+// K5: Open-redirect query/fragment schemes on https://chinwag.sh/open are neutralized
+assert.equal(
+  T.safeChinwagOutboundUrl("https://chinwag.sh/open?next=https://evil.example/phish"),
+  "https://chinwag.sh/open",
+);
+assert.equal(
+  T.safeChinwagOutboundUrl("https://chinwag.sh/pricing?redirect=//evil.example"),
+  "https://chinwag.sh/open",
+);
+
 console.log(
   JSON.stringify({
     ok: true,
     script: "verify-ui-v4-contracts.mjs",
-    suites_passed: 10,
+    suites_passed: 11,
   }),
 );

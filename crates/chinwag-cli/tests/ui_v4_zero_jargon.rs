@@ -1675,6 +1675,11 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
         ),
     )
     .unwrap();
+    fs::write(
+        temp_repo.join(".chinwag/slack.json"),
+        r#"{"verified":true,"workspace":"emun-labs"}"#,
+    )
+    .unwrap();
 
     let ui_port = reserve_ephemeral_port();
     let ui_addr: SocketAddr = format!("127.0.0.1:{ui_port}").parse().unwrap();
@@ -1943,16 +1948,23 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
     );
     assert_eq!(mem_restore_json["memory"]["status"], "saved");
 
-    // 6. POST /api/v1/delivery2/approval — blocks sample walkthrough, enforces first-answer-wins HITL & OAuth pause-and-resume
-    let (sample_hitl_hdr, _, sample_hitl_json) = post_json(
-        "/api/v1/delivery2/approval",
+    // 6. POST /api/v1/delivery2/approval — blocks sample walkthrough (including hitl-sample-walkthrough without is_sample),
+    // enforces first-answer-wins HITL & verified-receipt OAuth pause-and-resume (zero hardcoded Slack or unverified JSON bypass)
+    for sample_payload in [
         json!({ "id": "sample-walkthrough", "decision": "approve", "is_sample": true }),
-    );
-    assert!(sample_hitl_hdr.starts_with("HTTP/1.1 403 Forbidden"));
-    assert_eq!(
-        sample_hitl_json["error_code"],
-        "SampleWalkthroughShipForbidden"
-    );
+        json!({ "id": "hitl-sample-walkthrough", "decision": "approve" }),
+    ] {
+        let (sample_hitl_hdr, _, sample_hitl_json) =
+            post_json("/api/v1/delivery2/approval", sample_payload.clone());
+        assert!(
+            sample_hitl_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+            "expected 403 for {sample_payload}, got {sample_hitl_hdr}"
+        );
+        assert_eq!(
+            sample_hitl_json["error_code"],
+            "SampleWalkthroughShipForbidden"
+        );
+    }
 
     let (hitl1_hdr, _, hitl1_json) = post_json(
         "/api/v1/delivery2/approval",
@@ -2024,8 +2036,64 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
     assert_eq!(oauth_unlinked_json["error_code"], "oauth_not_verified");
     assert_eq!(oauth_unlinked_json["authorized"], false);
 
-    // Once the workspace actually has verified Linear configuration, 'verify' with bound state+thread succeeds!
+    // Unverified config file without `"verified": true` + matching `oauth_state` must ALSO fail closed (409 oauth_not_verified)
     fs::write(temp_repo.join(".chinwag/linear.json"), r#"{"team":"ENG"}"#).unwrap();
+    let (oauth_unverified_file_hdr, _, oauth_unverified_file_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "kind": "oauth",
+            "surface": "linear",
+            "decision": "verify",
+            "oauth_state": oauth_nonce,
+            "thread_id": "thr-main"
+        }),
+    );
+    assert!(
+        oauth_unverified_file_hdr.starts_with("HTTP/1.1 409 Conflict"),
+        "{oauth_unverified_file_hdr}"
+    );
+    assert_eq!(
+        oauth_unverified_file_json["error_code"],
+        "oauth_not_verified"
+    );
+
+    // Unlinked Slack (no `.chinwag/slack.json` receipt) must ALSO fail closed (zero hardcoded `"slack" => true`)
+    fs::remove_file(temp_repo.join(".chinwag/slack.json")).unwrap();
+    let (_, _, slack_conn_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({ "kind": "oauth", "surface": "slack", "decision": "connect" }),
+    );
+    let slack_nonce = slack_conn_json["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "entry-oauth-slack")
+        .unwrap()["oauth_state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (slack_unlinked_hdr, _, slack_unlinked_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "kind": "oauth",
+            "surface": "slack",
+            "decision": "verify",
+            "oauth_state": slack_nonce,
+            "thread_id": "thr-main"
+        }),
+    );
+    assert!(
+        slack_unlinked_hdr.starts_with("HTTP/1.1 409 Conflict"),
+        "{slack_unlinked_hdr}"
+    );
+    assert_eq!(slack_unlinked_json["error_code"], "oauth_not_verified");
+
+    // Once the workspace has a verified Linear receipt bound to `oauth_state`, 'verify' succeeds!
+    fs::write(
+        temp_repo.join(".chinwag/linear.json"),
+        format!(r#"{{"verified":true,"account":"emun-eng","oauth_state":"{oauth_nonce}"}}"#),
+    )
+    .unwrap();
 
     let (oauth_verify_hdr, _, oauth_verify_json) = post_json(
         "/api/v1/delivery2/approval",

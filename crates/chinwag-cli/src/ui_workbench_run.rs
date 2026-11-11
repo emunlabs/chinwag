@@ -256,6 +256,8 @@ struct Delivery2Store {
     #[serde(default)]
     active_turn_id: Option<String>,
     #[serde(default)]
+    cancelled_turn_ids: Vec<String>,
+    #[serde(default)]
     threads: Vec<Delivery2Thread>,
     #[serde(default)]
     memories: BTreeMap<String, Delivery2Memory>,
@@ -281,6 +283,7 @@ impl Default for Delivery2Store {
             morning_collapsed: false,
             active_thread_id: default_d2_thread_id(),
             active_turn_id: None,
+            cancelled_turn_ids: Vec::new(),
             threads: Vec::new(),
             memories: BTreeMap::new(),
             approvals: BTreeMap::new(),
@@ -4504,8 +4507,9 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
         let hh_mm = format_utc_hh_mm(now);
         let hitl_key = format!("hitl-{item_id}");
 
-        // Canonical cross-surface arbitration: refuse stale Inbox rejection/revision after
-        // an item has already been approved/applied on either Inbox or Delivery-2.
+        // Symmetric cross-surface arbitration:
+        // 1. Refuse stale Inbox rejection/revision after an item was approved/applied.
+        // 2. Refuse stale Inbox approval/apply after an item was denied/rejected until explicit `undo_reject`.
         let already_approved = state
             .item_decisions
             .get(item_id)
@@ -4514,6 +4518,7 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
                 .delivery2
                 .approvals
                 .get(&hitl_key)
+                .or_else(|| state.delivery2.approvals.get(item_id))
                 .is_some_and(|r| r.decision == "approved");
         if already_approved && !matches!(action, "approve" | "apply_locally") {
             return Err((
@@ -4522,6 +4527,26 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
                     "ok": false,
                     "error_code": "already_approved",
                     "error": "This item was already approved; refresh to inspect the settled status."
+                }),
+            ));
+        }
+        let already_rejected = state
+            .item_decisions
+            .get(item_id)
+            .is_some_and(|d| d.status == "rejected")
+            || state
+                .delivery2
+                .approvals
+                .get(&hitl_key)
+                .or_else(|| state.delivery2.approvals.get(item_id))
+                .is_some_and(|r| r.decision == "denied");
+        if already_rejected && matches!(action, "approve" | "apply_locally") {
+            return Err((
+                "409 Conflict",
+                json!({
+                    "ok": false,
+                    "error_code": "already_rejected",
+                    "error": "This item was denied; undo rejection first before approving."
                 }),
             ));
         }
@@ -4540,6 +4565,7 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
         let next_seq = state.delivery2.seq;
         match action {
             "approve" | "apply_locally" => {
+                state.delivery2.approvals.remove(item_id);
                 state.delivery2.approvals.insert(
                     hitl_key.clone(),
                     Delivery2ApprovalRecord {
@@ -4553,6 +4579,7 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
                 );
             }
             "reject" => {
+                state.delivery2.approvals.remove(item_id);
                 state.delivery2.approvals.insert(
                     hitl_key.clone(),
                     Delivery2ApprovalRecord {
@@ -4567,6 +4594,7 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
             }
             "undo_reject" | "request_changes" => {
                 state.delivery2.approvals.remove(&hitl_key);
+                state.delivery2.approvals.remove(item_id);
             }
             _ => {}
         }
@@ -5273,16 +5301,85 @@ pub fn sanitize_chinwag_outbound_url(raw: &str, fallback: &str) -> String {
     if s.is_empty() || s.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return fallback.to_string();
     }
-    if s == "https://chinwag.sh/security"
+    let allowed_prefix = s == "https://chinwag.sh/security"
         || s == "https://chinwag.sh/pricing"
         || s.starts_with("https://chinwag.sh/pricing?")
         || s.starts_with("https://chinwag.sh/pricing#")
         || s == "https://chinwag.sh/open"
-        || s.starts_with("https://chinwag.sh/open?")
-    {
-        return s.to_string();
+        || s.starts_with("https://chinwag.sh/open?");
+    if !allowed_prefix {
+        return fallback.to_string();
     }
-    fallback.to_string()
+    // Reject embedded redirect URLs or scheme injections inside query/fragment parameters.
+    if let Some(tail) = s.get("https://chinwag.sh/".len()..) {
+        let tail_lower = tail.to_ascii_lowercase();
+        if tail_lower.contains("://")
+            || tail_lower.contains("//")
+            || tail_lower.contains("javascript:")
+            || tail_lower.contains("data:")
+            || tail_lower.contains("%2f%2f")
+            || tail_lower.contains("%3a")
+        {
+            return fallback.to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Verify an authenticated workspace OAuth receipt under `.chinwag/<surface>-oauth.json`
+/// or `.chinwag/<surface>.json` (strict regular file, zero symlinks, zero tool/remote-hint bypass).
+fn has_verified_workspace_oauth_receipt(
+    repo_root: &Path,
+    surface: &str,
+    expected_nonce: Option<&str>,
+) -> bool {
+    if !matches!(surface, "github" | "linear" | "slack") {
+        return false;
+    }
+    let candidates = [
+        repo_root
+            .join(".chinwag")
+            .join(format!("{surface}-oauth.json")),
+        repo_root.join(".chinwag").join(format!("{surface}.json")),
+    ];
+    for candidate in candidates {
+        let Ok(meta) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 65_536 {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&candidate) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if val.get("verified").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let has_identity = val
+            .get("account")
+            .or_else(|| val.get("workspace"))
+            .or_else(|| val.get("user"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.trim().len() >= 2);
+        if !has_identity {
+            continue;
+        }
+        if let Some(rec_surface) = val.get("surface").and_then(Value::as_str)
+            && !rec_surface.eq_ignore_ascii_case(surface)
+        {
+            continue;
+        }
+        if let Some(nonce) = expected_nonce
+            && val.get("oauth_state").and_then(Value::as_str) != Some(nonce)
+        {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 fn is_secret_assignment_key(k: &str) -> bool {
@@ -5294,6 +5391,10 @@ fn is_secret_assignment_key(k: &str) -> bool {
             | "secret"
             | "secret_key"
             | "secret-key"
+            | "access_key"
+            | "access-key"
+            | "secret_access_key"
+            | "secret-access-key"
             | "client_secret"
             | "client-secret"
             | "password"
@@ -5305,10 +5406,21 @@ fn is_secret_assignment_key(k: &str) -> bool {
             | "private_key"
             | "private-key"
             | "token"
+            | "pat"
     ) || k.ends_with("_api_key")
         || k.ends_with("-api-key")
         || k.ends_with("_apikey")
         || k.ends_with("-apikey")
+        || k.ends_with("_access_key")
+        || k.ends_with("-access-key")
+        || k.ends_with("_secret_access_key")
+        || k.ends_with("-secret-access-key")
+        || k.ends_with("_key_id")
+        || k.ends_with("-key-id")
+        || k.ends_with("_auth_key")
+        || k.ends_with("-auth-key")
+        || k.ends_with("_pat")
+        || k.ends_with("-pat")
         || k.ends_with("_token")
         || k.ends_with("-token")
         || k.ends_with("_secret")
@@ -5323,8 +5435,55 @@ fn is_secret_assignment_key(k: &str) -> bool {
         || k.ends_with("-private-key")
 }
 
+fn is_non_secret_placeholder_value(v_lower: &str) -> bool {
+    matches!(
+        v_lower,
+        "undefined"
+            | "null"
+            | "none"
+            | "nil"
+            | "true"
+            | "false"
+            | "required"
+            | "optional"
+            | "disabled"
+            | "enabled"
+            | "configured"
+            | "redacted"
+            | "missing"
+            | "empty"
+            | "default"
+            | "production"
+            | "staging"
+            | "development"
+            | "local"
+            | "test"
+            | "example"
+            | "placeholder"
+    )
+}
+
 pub fn contains_secret_shaped_token(raw: &str) -> bool {
-    let trimmed = raw.trim();
+    // Strip zero-width, bidi, and compatibility format characters first so `sk-\u{200B}proj-...` cannot evade scanning.
+    let cleaned: String = raw
+        .chars()
+        .filter(|&ch| {
+            let u = ch as u32;
+            !matches!(
+                u,
+                0x00AD
+                    | 0x034F
+                    | 0x061C
+                    | 0x180E
+                    | 0x200B..=0x200F
+                    | 0x202A..=0x202E
+                    | 0x2060..=0x206F
+                    | 0xFE00..=0xFE0F
+                    | 0xFEFF
+            )
+        })
+        .collect();
+    let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return false;
     }
@@ -5376,7 +5535,10 @@ pub fn contains_secret_shaped_token(raw: &str) -> bool {
         if key_start == key_end {
             continue;
         }
-        let key_norm = trimmed[key_start..key_end].to_ascii_lowercase();
+        let Some(key_raw) = trimmed.get(key_start..key_end) else {
+            continue;
+        };
+        let key_norm = key_raw.to_ascii_lowercase();
         if !is_secret_assignment_key(&key_norm) {
             continue;
         }
@@ -5389,7 +5551,7 @@ pub fn contains_secret_shaped_token(raw: &str) -> bool {
         if val_start >= bytes.len() {
             continue;
         }
-        let val_slice = if matches!(bytes[val_start], b'"' | b'\'') {
+        let val_opt = if matches!(bytes[val_start], b'"' | b'\'') {
             let quote = bytes[val_start];
             let content_start = val_start + 1;
             let mut content_end = content_start;
@@ -5400,7 +5562,7 @@ pub fn contains_secret_shaped_token(raw: &str) -> bool {
             {
                 content_end += 1;
             }
-            &trimmed[content_start..content_end]
+            trimmed.get(content_start..content_end)
         } else {
             let mut content_end = val_start;
             while content_end < bytes.len()
@@ -5412,29 +5574,31 @@ pub fn contains_secret_shaped_token(raw: &str) -> bool {
             {
                 content_end += 1;
             }
-            &trimmed[val_start..content_end]
+            trimmed.get(val_start..content_end)
         };
-        let v_trim = val_slice.trim();
+        let Some(val_slice) = val_opt else {
+            continue;
+        };
+        let v_trim = val_slice.trim().trim_end_matches('?');
         let v_lower = v_trim.to_ascii_lowercase();
         if v_trim.len() >= 8
             && !v_trim.chars().any(char::is_whitespace)
-            && !matches!(
-                v_lower.as_str(),
-                "required" | "optional" | "disabled" | "configured" | "redacted"
-            )
+            && !is_non_secret_placeholder_value(&v_lower)
         {
             return true;
         }
     }
 
+    // Split on whitespace AND assignment/query/punctuation delimiters (`=`, `:`, `?`, `&`, ...)
+    // so `OPENAI_KEY=sk-proj-...`, `.../js?key=AIzaSy...`, `session=eyJ...`, and `key:sk-ant-...` are caught.
     for raw_tok in trimmed.split(|c: char| {
         c.is_whitespace()
             || matches!(
                 c,
-                ',' | ';' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
+                '=' | ':' | '?' | '&' | ',' | ';' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
             )
     }) {
-        let tok = raw_tok.trim_matches(|c: char| matches!(c, '.' | ':' | '='));
+        let tok = raw_tok.trim_matches('.');
         if tok.len() < 12 {
             continue;
         }
@@ -5523,8 +5687,12 @@ fn extract_why_target_id(prompt: &str) -> Option<String> {
         }
     }
     let trimmed = prompt.trim();
-    if trimmed.len() > 4 && trimmed[..4].eq_ignore_ascii_case("why ") {
-        let first_word: String = trimmed[4..]
+    if let Some(after_why) = trimmed
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("why "))
+        .and_then(|_| trimmed.get(4..))
+    {
+        let first_word: String = after_why
             .trim()
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || matches!(*c, '-' | '_' | '.'))
@@ -5942,22 +6110,15 @@ pub fn build_delivery2_state_json_with_cursor(
     let credits = build_credits_json(repo_root, shipped_count);
     let state = load_ui_v4_state(repo_root);
 
-    let github_detected = repo_info
-        .get("github_connected")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let linear_detected = repo_info
-        .get("linear_connected")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
     let gh_pref = state.delivery2.connections.get("github");
     let ln_pref = state.delivery2.connections.get("linear");
     let sl_pref = state.delivery2.connections.get("slack");
 
-    // Authorization derives strictly from verified workspace/account state (zero client self-assertion bypass).
-    let gh_auth = github_detected;
-    let ln_auth = linear_detected;
+    // Authorization derives strictly from verified OAuth receipts (`.chinwag/<surface>[-oauth].json`),
+    // never from ambient CLI/remote hints or client self-assertion.
+    let gh_auth = has_verified_workspace_oauth_receipt(repo_root, "github", None);
+    let ln_auth = has_verified_workspace_oauth_receipt(repo_root, "linear", None);
+    let sl_auth = has_verified_workspace_oauth_receipt(repo_root, "slack", None);
 
     let gh_connect_url = sanitize_chinwag_outbound_url(
         gh_pref
@@ -5970,6 +6131,12 @@ pub fn build_delivery2_state_json_with_cursor(
             .and_then(|p| p.challenge_url.as_deref())
             .unwrap_or("https://chinwag.sh/open?connect=linear&source=local_ui"),
         "https://chinwag.sh/open?connect=linear&source=local_ui",
+    );
+    let sl_connect_url = sanitize_chinwag_outbound_url(
+        sl_pref
+            .and_then(|p| p.challenge_url.as_deref())
+            .unwrap_or("https://chinwag.sh/open?connect=slack&source=local_ui"),
+        "https://chinwag.sh/open?connect=slack&source=local_ui",
     );
 
     let surfaces = vec![
@@ -6006,13 +6173,13 @@ pub fn build_delivery2_state_json_with_cursor(
         json!({
             "id": "slack",
             "label": "Slack",
-            "authorized": true,
-            "in_thread": sl_pref.and_then(|p| p.in_thread).unwrap_or(false),
+            "authorized": sl_auth,
+            "in_thread": sl_auth && sl_pref.and_then(|p| p.in_thread).unwrap_or(false),
             "locked_in_thread": false,
             "role_mode": "ambient_status_only",
-            "auth_status": "Connected · ambient status cards only",
+            "auth_status": if sl_auth { "Connected · ambient status cards only" } else { "Needs sign-in · pauses at 0 Cr" },
             "policy_note": "Slack posts ambient status cards with [Open in Chinwag ↗] deep-links only — Delivery-2 lives here in Chinwag.",
-            "connect_url": "https://chinwag.sh/open?connect=slack&source=local_ui"
+            "connect_url": sl_connect_url
         }),
     ];
 
@@ -6301,12 +6468,19 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
         );
     }
 
+    let client_turn_id = parsed
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "active")
+        .map(scrub_customer_ui_text);
+
     let lower = raw_prompt.to_ascii_lowercase();
     let memory_note_opt = ["remember:", "remember that ", "save rule:", "note:"]
         .iter()
         .find_map(|prefix| {
             if lower.starts_with(prefix) {
-                Some(raw_prompt[prefix.len()..].trim())
+                raw_prompt.get(prefix.len()..).map(str::trim)
             } else {
                 None
             }
@@ -6346,7 +6520,44 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
             "body": clean_user_prompt
         });
 
-        let assistant_entry = if let Some(note_raw) = memory_note_opt {
+        // If `Stop` arrived before `/message` committed on the server, persist only a zero-length stopped card.
+        if let Some(ref tid) = client_turn_id
+            && state.delivery2.cancelled_turn_ids.iter().any(|c| c == tid)
+        {
+            let stopped_qa = json!({
+                "id": format!("entry-qa-{next_seq}"),
+                "kind": "qa_card",
+                "seq": next_seq,
+                "turn_id": tid,
+                "role": "assistant",
+                "author": "Delivery-2",
+                "body": "[Stopped]",
+                "stopped": true,
+                "sources": []
+            });
+            let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
+            if thr.title == "New thread" {
+                thr.title = clean_user_prompt.chars().take(48).collect();
+            }
+            thr.updated_at_unix = now;
+            thr.entries.push(user_entry);
+            thr.entries.push(stopped_qa.clone());
+            return Ok(json!({
+                "ok": true,
+                "seq": next_seq,
+                "entry": stopped_qa,
+                "stopped": true,
+                "credits_charged": 0
+            }));
+        }
+
+        let explicit_why_target = if lower.starts_with("why ") || lower.contains("why #") {
+            extract_why_target_id(raw_prompt)
+        } else {
+            None
+        };
+
+        let mut assistant_entry = if let Some(note_raw) = memory_note_opt {
             if note_raw.is_empty() {
                 return Err((
                     "400 Bad Request",
@@ -6377,6 +6588,134 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
                 "note": clean_note,
                 "status": "saved"
             })
+        } else if let Some(requested_raw) = explicit_why_target {
+            let rules_count = learned_rules.len();
+            let prot_list = if workflow.protected_paths.is_empty() {
+                "none configured".to_string()
+            } else {
+                workflow.protected_paths.join(", ")
+            };
+            let lookup_id = if requested_raw.eq_ignore_ascii_case("sample") {
+                "sample-walkthrough"
+            } else {
+                requested_raw.as_str()
+            };
+            let inbox_match = inbox
+                .get("items")
+                .and_then(Value::as_array)
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|i| i.get("id").and_then(Value::as_str) == Some(lookup_id))
+                });
+            let board_match = board
+                .get("columns")
+                .and_then(Value::as_array)
+                .and_then(|cols| {
+                    cols.iter().find_map(|col| {
+                        col.get("items").and_then(Value::as_array).and_then(|arr| {
+                            arr.iter()
+                                .find(|c| c.get("id").and_then(Value::as_str) == Some(lookup_id))
+                        })
+                    })
+                });
+
+            if let Some(item) = inbox_match.or(board_match) {
+                let clean_id = scrub_customer_ui_text(lookup_id);
+                let title = item
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Workspace item");
+                let status_lbl = item
+                    .get("status_label")
+                    .or_else(|| item.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tracked");
+                let tool_lbl = item
+                    .get("tool_label")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("unassigned");
+                let is_sample = item
+                    .get("is_sample")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let files_changed = inbox_match
+                    .and_then(|i| i.get("files_changed"))
+                    .and_then(Value::as_u64);
+                let tests_passed = inbox_match
+                    .and_then(|i| i.get("tests_passed"))
+                    .and_then(Value::as_bool);
+                let verified_rev = inbox_match
+                    .and_then(|i| i.get("reviewer_label"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty());
+
+                let diff_note = if let Some(fc) = files_changed {
+                    let add = inbox_match
+                        .and_then(|i| i.get("additions"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let del = inbox_match
+                        .and_then(|i| i.get("deletions"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    format!("{fc} files (+{add}/-{del})")
+                } else {
+                    "diff stats not yet recorded".to_string()
+                };
+                let test_note = match tests_passed {
+                    Some(true) => "local test suite passed",
+                    Some(false) => "local test suite failed",
+                    None => "test receipt not yet recorded",
+                };
+                let review_note = match verified_rev {
+                    Some(r) => format!("independent review by {r} recorded"),
+                    None => "independent review not yet recorded".to_string(),
+                };
+
+                let primary_source = if inbox_match.is_some() {
+                    json!({
+                        "label": format!("Inbox · #{clean_id} ({status_lbl})"),
+                        "target_tab": "inbox",
+                        "hash": if is_sample { "#walkthrough".to_string() } else { format!("#diff/{clean_id}") }
+                    })
+                } else {
+                    json!({
+                        "label": format!("Board · #{clean_id} ({status_lbl})"),
+                        "target_tab": "board",
+                        "hash": "#board"
+                    })
+                };
+
+                json!({
+                    "id": format!("entry-qa-{next_seq}"),
+                    "kind": "qa_card",
+                    "seq": next_seq,
+                    "role": "assistant",
+                    "author": "Delivery-2",
+                    "body": format!(
+                        "**#{clean_id}** (\"{title}\") is currently **{status_lbl}** (driver: **{tool_lbl}**, {diff_note}, {test_note}, {review_note}). Repository guardrails protect `{prot_list}` ({rules_count} learned repo {}, `0 Cr` while paused).",
+                        if rules_count == 1 { "rule" } else { "rules" }
+                    ),
+                    "sources": [
+                        primary_source,
+                        { "label": format!("Agents & Rules · {} protected paths", workflow.protected_paths.len()), "target_tab": "agents", "hash": "#agents" }
+                    ]
+                })
+            } else {
+                let clean_missing = scrub_customer_ui_text(&requested_raw);
+                json!({
+                    "id": format!("entry-qa-{next_seq}"),
+                    "kind": "qa_card",
+                    "seq": next_seq,
+                    "role": "assistant",
+                    "author": "Delivery-2",
+                    "body": format!(
+                        "Item `#{clean_missing}` was not found in your local Inbox or Board, so no diff, test run, or independent review receipt is available."
+                    ),
+                    "sources": []
+                })
+            }
         } else if lower.contains("what did i miss") || lower.contains("morning") {
             let ready = inbox["counts"]["needs_decision"].as_u64().unwrap_or(0);
             let running = inbox["counts"]["running"].as_u64().unwrap_or(0);
@@ -6431,146 +6770,20 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
             } else {
                 workflow.protected_paths.join(", ")
             };
-
-            if let Some(requested_raw) = extract_why_target_id(raw_prompt) {
-                let lookup_id = if requested_raw.eq_ignore_ascii_case("sample") {
-                    "sample-walkthrough"
-                } else {
-                    requested_raw.as_str()
-                };
-                let inbox_match = inbox
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .and_then(|arr| {
-                        arr.iter()
-                            .find(|i| i.get("id").and_then(Value::as_str) == Some(lookup_id))
-                    });
-                let board_match = board
-                    .get("columns")
-                    .and_then(Value::as_array)
-                    .and_then(|cols| {
-                        cols.iter().find_map(|col| {
-                            col.get("items").and_then(Value::as_array).and_then(|arr| {
-                                arr.iter().find(|c| {
-                                    c.get("id").and_then(Value::as_str) == Some(lookup_id)
-                                })
-                            })
-                        })
-                    });
-
-                if let Some(item) = inbox_match.or(board_match) {
-                    let clean_id = scrub_customer_ui_text(lookup_id);
-                    let title = item
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Workspace item");
-                    let status_lbl = item
-                        .get("status_label")
-                        .or_else(|| item.get("status"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("tracked");
-                    let tool_lbl = item
-                        .get("tool_label")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or("unassigned");
-                    let is_sample = item
-                        .get("is_sample")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let files_changed = inbox_match
-                        .and_then(|i| i.get("files_changed"))
-                        .and_then(Value::as_u64);
-                    let tests_passed = inbox_match
-                        .and_then(|i| i.get("tests_passed"))
-                        .and_then(Value::as_bool);
-                    let verified_rev = inbox_match
-                        .and_then(|i| i.get("reviewer_label"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.trim().is_empty());
-
-                    let diff_note = if let Some(fc) = files_changed {
-                        let add = inbox_match
-                            .and_then(|i| i.get("additions"))
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        let del = inbox_match
-                            .and_then(|i| i.get("deletions"))
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        format!("{fc} files (+{add}/-{del})")
-                    } else {
-                        "diff stats not yet recorded".to_string()
-                    };
-                    let test_note = match tests_passed {
-                        Some(true) => "local test suite passed",
-                        Some(false) => "local test suite failed",
-                        None => "test receipt not yet recorded",
-                    };
-                    let review_note = match verified_rev {
-                        Some(r) => format!("independent review by {r} recorded"),
-                        None => "independent review not yet recorded".to_string(),
-                    };
-
-                    let primary_source = if inbox_match.is_some() {
-                        json!({
-                            "label": format!("Inbox · #{clean_id} ({status_lbl})"),
-                            "target_tab": "inbox",
-                            "hash": if is_sample { "#walkthrough".to_string() } else { format!("#diff/{clean_id}") }
-                        })
-                    } else {
-                        json!({
-                            "label": format!("Board · #{clean_id} ({status_lbl})"),
-                            "target_tab": "board",
-                            "hash": "#board"
-                        })
-                    };
-
-                    json!({
-                        "id": format!("entry-qa-{next_seq}"),
-                        "kind": "qa_card",
-                        "seq": next_seq,
-                        "role": "assistant",
-                        "author": "Delivery-2",
-                        "body": format!(
-                            "**#{clean_id}** (\"{title}\") is currently **{status_lbl}** (driver: **{tool_lbl}**, {diff_note}, {test_note}, {review_note}). Repository guardrails protect `{prot_list}` ({rules_count} learned repo {}, `0 Cr` while paused).",
-                            if rules_count == 1 { "rule" } else { "rules" }
-                        ),
-                        "sources": [
-                            primary_source,
-                            { "label": format!("Agents & Rules · {} protected paths", workflow.protected_paths.len()), "target_tab": "agents", "hash": "#agents" }
-                        ]
-                    })
-                } else {
-                    let clean_missing = scrub_customer_ui_text(&requested_raw);
-                    json!({
-                        "id": format!("entry-qa-{next_seq}"),
-                        "kind": "qa_card",
-                        "seq": next_seq,
-                        "role": "assistant",
-                        "author": "Delivery-2",
-                        "body": format!(
-                            "Item `#{clean_missing}` was not found in your local Inbox or Board, so no diff, test run, or independent review receipt is available."
-                        ),
-                        "sources": []
-                    })
-                }
-            } else {
-                json!({
-                    "id": format!("entry-qa-{next_seq}"),
-                    "kind": "qa_card",
-                    "seq": next_seq,
-                    "role": "assistant",
-                    "author": "Delivery-2",
-                    "body": format!(
-                        "Repository safety rules gate changes touching `{prot_list}` ({rules_count} learned repo {} configured; workflow pairs **{driver_lbl}** with **{reviewer_lbl}**, `0 Cr` while paused).",
-                        if rules_count == 1 { "rule" } else { "rules" }
-                    ),
-                    "sources": [
-                        { "label": format!("Agents & Rules · {} protected paths", workflow.protected_paths.len()), "target_tab": "agents", "hash": "#agents" }
-                    ]
-                })
-            }
+            json!({
+                "id": format!("entry-qa-{next_seq}"),
+                "kind": "qa_card",
+                "seq": next_seq,
+                "role": "assistant",
+                "author": "Delivery-2",
+                "body": format!(
+                    "Repository safety rules gate changes touching `{prot_list}` ({rules_count} learned repo {} configured; workflow pairs **{driver_lbl}** with **{reviewer_lbl}**, `0 Cr` while paused).",
+                    if rules_count == 1 { "rule" } else { "rules" }
+                ),
+                "sources": [
+                    { "label": format!("Agents & Rules · {} protected paths", workflow.protected_paths.len()), "target_tab": "agents", "hash": "#agents" }
+                ]
+            })
         } else {
             let driver_lbl = friendly_workflow_tool_label(&workflow.driver_tool);
             let reviewer_lbl = friendly_workflow_tool_label(&workflow.reviewer_tool);
@@ -6582,7 +6795,7 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
             }
             thr.updated_at_unix = now;
             thr.entries.push(user_entry);
-            let run_card = json!({
+            let mut run_card = json!({
                 "id": format!("entry-run-{next_seq}"),
                 "kind": "run_card",
                 "seq": next_seq,
@@ -6596,7 +6809,7 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
                 "diff_target_id": "sample-walkthrough",
                 "steps": build_twelve_step_ladder_json(4, false)
             });
-            let qa_card = json!({
+            let mut qa_card = json!({
                 "id": format!("entry-qa-{next_seq}"),
                 "kind": "qa_card",
                 "seq": next_seq,
@@ -6610,6 +6823,14 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
                     { "label": format!("Estimate · ~{per_review} Cr"), "target_tab": "credits", "hash": "#credits" }
                 ]
             });
+            if let Some(ref tid) = client_turn_id {
+                if let Some(obj) = run_card.as_object_mut() {
+                    obj.insert("turn_id".to_string(), Value::String(tid.clone()));
+                }
+                if let Some(obj) = qa_card.as_object_mut() {
+                    obj.insert("turn_id".to_string(), Value::String(tid.clone()));
+                }
+            }
             thr.entries.push(run_card.clone());
             thr.entries.push(qa_card.clone());
             return Ok(json!({
@@ -6620,6 +6841,12 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
                 "credits_charged": 0
             }));
         };
+
+        if let Some(ref tid) = client_turn_id
+            && let Some(obj) = assistant_entry.as_object_mut()
+        {
+            obj.insert("turn_id".to_string(), Value::String(tid.clone()));
+        }
 
         let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
         if thr.title == "New thread" {
@@ -6688,6 +6915,25 @@ fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
     let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
         let seeded =
             build_seeded_delivery2_entries(&repo_info, &inbox, &board, &credits, &workflow, state);
+        let clean_turn_id = scrub_customer_ui_text(&turn_id);
+        if !clean_turn_id.is_empty()
+            && clean_turn_id != "active"
+            && !state
+                .delivery2
+                .cancelled_turn_ids
+                .iter()
+                .any(|c| c == &clean_turn_id)
+        {
+            state
+                .delivery2
+                .cancelled_turn_ids
+                .push(clean_turn_id.clone());
+            if state.delivery2.cancelled_turn_ids.len() > 64 {
+                let drop_n = state.delivery2.cancelled_turn_ids.len() - 64;
+                state.delivery2.cancelled_turn_ids.drain(..drop_n);
+            }
+        }
+
         state.delivery2.active_turn_id = None;
         state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
         let next_seq = state.delivery2.seq;
@@ -6695,19 +6941,38 @@ fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
             "id": format!("entry-cancel-{next_seq}"),
             "kind": "cancel_receipt",
             "seq": next_seq,
-            "turn_id": scrub_customer_ui_text(&turn_id),
+            "turn_id": clean_turn_id,
             "receipt": "Reply stopped by you · 0 Cr"
         });
         let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
         thr.updated_at_unix = unix_now();
 
-        // If the client stopped mid-reveal, clamp the persisted assistant card to the exact displayed prefix.
-        if let Some(max_chars) = truncated_len_opt {
+        // Clamp persisted assistant card to the exact displayed prefix, including pre-receipt Stop (`truncated_len == 0` or matched by `turn_id`).
+        let effective_max_chars = if let Some(mc) = truncated_len_opt {
+            Some(mc)
+        } else if entry_id_opt.is_none() && !clean_turn_id.is_empty() && clean_turn_id != "active" {
+            Some(0)
+        } else {
+            None
+        };
+
+        if let Some(max_chars) = effective_max_chars {
+            if max_chars == 0 && !clean_turn_id.is_empty() && clean_turn_id != "active" {
+                thr.entries.retain(|e| {
+                    !(e.get("kind").and_then(Value::as_str) == Some("run_card")
+                        && e.get("turn_id").and_then(Value::as_str) == Some(clean_turn_id.as_str()))
+                });
+            }
             let target_entry = if let Some(ref eid) = entry_id_opt {
                 thr.entries
                     .iter_mut()
                     .rev()
                     .find(|e| e.get("id").and_then(Value::as_str) == Some(eid.as_str()))
+            } else if !clean_turn_id.is_empty() && clean_turn_id != "active" {
+                thr.entries.iter_mut().rev().find(|e| {
+                    e.get("kind").and_then(Value::as_str) == Some("qa_card")
+                        && e.get("turn_id").and_then(Value::as_str) == Some(clean_turn_id.as_str())
+                })
             } else {
                 thr.entries
                     .iter_mut()
@@ -6719,7 +6984,7 @@ fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
                 && let Some(full_body) = obj.get("body").and_then(Value::as_str)
             {
                 let clamped: String = full_body.chars().take(max_chars).collect();
-                let final_body = if clamped.trim().is_empty() {
+                let final_body = if max_chars == 0 || clamped.trim().is_empty() {
                     "[Stopped]".to_string()
                 } else {
                     clamped
@@ -6727,6 +6992,9 @@ fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
                 obj.insert("body".to_string(), Value::String(final_body));
                 obj.insert("stopped".to_string(), Value::Bool(true));
                 obj.insert("seq".to_string(), Value::Number(next_seq.into()));
+                if max_chars == 0 {
+                    obj.insert("sources".to_string(), json!([]));
+                }
             }
         }
 
@@ -6809,14 +7077,6 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
             );
         }
         let repo_info = discover_repo_info(repo_root);
-        let github_detected = repo_info
-            .get("github_connected")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let linear_detected = repo_info
-            .get("linear_connected")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
         let workflow = load_workflow_config(repo_root);
         let credits = build_credits_json(repo_root, shipped_count);
@@ -6901,12 +7161,8 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
                         }),
                     ));
                 }
-                let verified_auth = match surface.as_str() {
-                    "github" => github_detected,
-                    "linear" => linear_detected,
-                    "slack" => true,
-                    _ => false,
-                };
+                let verified_auth =
+                    has_verified_workspace_oauth_receipt(repo_root, &surface, Some(expected_nonce));
                 if !verified_auth {
                     return Err((
                         "409 Conflict",
@@ -7040,12 +7296,7 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
                 }
             }
 
-            let verified_auth = match surface.as_str() {
-                "github" => github_detected,
-                "linear" => linear_detected,
-                "slack" => true,
-                _ => false,
-            };
+            let verified_auth = has_verified_workspace_oauth_receipt(repo_root, &surface, None);
 
             Ok(json!({
                 "ok": true,
@@ -7084,12 +7335,6 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
         .and_then(Value::as_str)
         .unwrap_or(approval_id)
         .trim();
-    let is_sample = parsed
-        .get("is_sample")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || approval_id == "sample-walkthrough"
-        || item_id == "sample-walkthrough";
 
     if approval_id.is_empty() || !matches!(decision.as_str(), "approve" | "deny") {
         return (
@@ -7102,6 +7347,22 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
         );
     }
 
+    let stripped_item = item_id.strip_prefix("hitl-").unwrap_or(item_id);
+    let stripped_approval = approval_id.strip_prefix("hitl-").unwrap_or(approval_id);
+    let canonical_item_id = if !stripped_item.is_empty() {
+        stripped_item.to_string()
+    } else {
+        stripped_approval.to_string()
+    };
+    let canonical_approval_id = format!("hitl-{canonical_item_id}");
+
+    let is_sample = parsed
+        .get("is_sample")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || canonical_item_id.eq_ignore_ascii_case("sample-walkthrough")
+        || stripped_approval.eq_ignore_ascii_case("sample-walkthrough");
+
     if is_sample && decision == "approve" {
         return (
             "403 Forbidden",
@@ -7112,20 +7373,6 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
             }),
         );
     }
-
-    let canonical_item_id = if !item_id.is_empty() && !item_id.starts_with("hitl-") {
-        item_id.to_string()
-    } else {
-        approval_id
-            .strip_prefix("hitl-")
-            .unwrap_or(approval_id)
-            .to_string()
-    };
-    let canonical_approval_id = if approval_id.starts_with("hitl-") {
-        approval_id.to_string()
-    } else {
-        format!("hitl-{canonical_item_id}")
-    };
 
     let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
         // First-answer-wins idempotency across both `delivery2.approvals` and `item_decisions`.
@@ -7448,14 +7695,6 @@ fn handle_delivery2_thread(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
     }
 
     let repo_info = discover_repo_info(repo_root);
-    let github_detected = repo_info
-        .get("github_connected")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let linear_detected = repo_info
-        .get("linear_connected")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
     let workflow = load_workflow_config(repo_root);
     let credits = build_credits_json(repo_root, shipped_count);
@@ -7567,12 +7806,7 @@ fn handle_delivery2_thread(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
                 );
             }
             let req_in_thread = parsed.get("in_thread").and_then(Value::as_bool);
-            let verified_auth = match surface.as_str() {
-                "github" => github_detected,
-                "linear" => linear_detected,
-                "slack" => true,
-                _ => false,
-            };
+            let verified_auth = has_verified_workspace_oauth_receipt(repo_root, &surface, None);
             if req_in_thread == Some(true) && !verified_auth {
                 return (
                     "409 Conflict",
@@ -9045,8 +9279,18 @@ mod tests {
         );
         let slack_surf = &initial["sync_radar"]["surfaces"][3];
         assert_eq!(slack_surf["id"], "slack");
+        assert_eq!(slack_surf["role_mode"], "ambient_status_only");
+        assert_eq!(slack_surf["authorized"], false);
+        assert_eq!(slack_surf["auth_status"], "Needs sign-in · pauses at 0 Cr");
+        fs::create_dir_all(repo.join(".chinwag")).unwrap();
+        fs::write(
+            repo.join(".chinwag/slack.json"),
+            r#"{"verified":true,"workspace":"emun-labs"}"#,
+        )
+        .unwrap();
+        let with_slack = build_delivery2_state_json(&repo, 5487);
         assert_eq!(
-            slack_surf["auth_status"],
+            with_slack["sync_radar"]["surfaces"][3]["auth_status"],
             "Connected · ambient status cards only"
         );
         assert_eq!(
@@ -10113,7 +10357,7 @@ mod tests {
             );
         }
 
-        // 2. Outbound URL sanitizer (ALISTAIR-1)
+        // 2. Outbound URL sanitizer + open-redirect query guard (ALISTAIR-1 + Round-3)
         assert_eq!(
             sanitize_chinwag_outbound_url("javascript:alert(1)", "https://chinwag.sh/open"),
             "https://chinwag.sh/open"
@@ -10127,13 +10371,38 @@ mod tests {
         );
         assert_eq!(
             sanitize_chinwag_outbound_url(
+                "https://chinwag.sh/open?next=https://evil.example",
+                "https://chinwag.sh/open"
+            ),
+            "https://chinwag.sh/open"
+        );
+        assert_eq!(
+            sanitize_chinwag_outbound_url(
+                "https://chinwag.sh/pricing?redirect=//evil.example",
+                "https://chinwag.sh/pricing"
+            ),
+            "https://chinwag.sh/pricing"
+        );
+        assert_eq!(
+            sanitize_chinwag_outbound_url(
                 "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
                 "https://chinwag.sh/pricing"
             ),
             "https://chinwag.sh/pricing?talk=1&source=local_ui#founders"
         );
 
-        // 3. Secret-shape rejection across quoted, space-separated, prefixed env, digitless Bearer, PGP/Age, ASIA (ALISTAIR-2)
+        // 3. Secret-shape rejection across quoted, space-separated, `=`/`:`/`?`/`&` attached prefixes,
+        // _access_key/_key_id/_pat keys, zero-width obfuscation, digitless Bearer, PGP/Age, ASIA (ALISTAIR-2 + QA-R2-1)
+        let stripe_live_sample = format!("STRIPE_KEY={}{}", "sk_live_", "1234567890abcdef");
+        let slack_bot_sample = format!("SLACK_BOT={}{}", "xoxb-", "1234567890-abcdef");
+        let openai_eq_sample = format!("OPENAI_KEY={}{}", "sk-proj-", "1234567890abcdef");
+        let anthropic_eq_sample = format!("ANTHROPIC_KEY={}{}", "sk-ant-", "1234567890abcdef");
+        let anthropic_colon_sample = format!("key:{}{}", "sk-ant-", "1234567890abcdef");
+        let gh_pat_sample = format!("GH_PAT={}{}", "ghp_", "1234567890abcdefghijkl");
+        let zw_openai_sample = format!(
+            "Remember: {}{}{}",
+            "sk-", "\u{200B}proj-", "1234567890abcdef"
+        );
         for secret_sample in [
             r#"Remember: API_KEY="supersecretvalue12345""#,
             "Remember: api_key: supersecretvalue12345",
@@ -10142,6 +10411,17 @@ mod tests {
             "Remember: GITHUB_TOKEN=token_value_abcdef123456",
             "Remember: STRIPE_SECRET_KEY=secret_value_99887766",
             "Remember: DB_PASSWORD=my_database_password_123",
+            "Remember: AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            "Remember: AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            openai_eq_sample.as_str(),
+            anthropic_eq_sample.as_str(),
+            anthropic_colon_sample.as_str(),
+            gh_pat_sample.as_str(),
+            stripe_live_sample.as_str(),
+            slack_bot_sample.as_str(),
+            zw_openai_sample.as_str(),
+            "https://example.com/js?key=AIzaSyA12345678901234567890",
+            "session=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature",
             "Remember: Authorization: Bearer abcdefghijklmnopqrstuvwxyzABCDEF",
             "-----BEGIN PGP PRIVATE KEY BLOCK-----",
             "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
@@ -10154,6 +10434,10 @@ mod tests {
         }
         assert!(!contains_secret_shaped_token(
             "Remember: Run webhook and idempotency tests before opening a PR."
+        ));
+        assert!(!contains_secret_shaped_token("Why is api_key: undefined?"));
+        assert!(!contains_secret_shaped_token(
+            "Remember: secret=production mode uses strict checks."
         ));
 
         // 4. Thread title secret check + Why #nonexistent? truthful response + cursor resume + Inbox <-> Delivery-2 arbitration
@@ -10181,6 +10465,62 @@ mod tests {
         let missing_body = val_why_missing["entry"]["body"].as_str().unwrap_or("");
         assert!(missing_body.contains("not found"));
         assert_eq!(val_why_missing["entry"]["sources"], json!([]));
+
+        // ARCHITECT-R2-4 + ARCHITECT-R2-5: multi-byte UTF-8 before 'why' never panics, and
+        // explicit `Why #<id>?` containing 'credit' or 'morning' resolves as Why-lookup (not generic summary)
+        for why_edge in [
+            r#"{"prompt":"a😀 why #?"}"#,
+            r#"{"prompt":"Why #nonexistent-credit?"}"#,
+            r#"{"prompt":"Why #morning-job?"}"#,
+        ] {
+            let (st_edge, val_edge) = handle_delivery2_message(&repo, 5487, why_edge.as_bytes());
+            assert_eq!(st_edge, "200 OK", "failed on {why_edge}");
+            if why_edge.contains("#nonexistent-credit") || why_edge.contains("#morning-job") {
+                assert!(
+                    val_edge["entry"]["body"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("not found"),
+                    "expected not-found for {why_edge}, got {}",
+                    val_edge["entry"]["body"]
+                );
+                assert_eq!(val_edge["entry"]["sources"], json!([]));
+            }
+        }
+
+        // ALISTAIR-R2-1: `id: "hitl-sample-walkthrough"` without `item_id` or `is_sample` must return 403 Forbidden
+        let (st_hitl_sample, val_hitl_sample) = handle_delivery2_approval(
+            &repo,
+            5487,
+            br#"{"id":"hitl-sample-walkthrough","decision":"approve"}"#,
+        );
+        assert_eq!(st_hitl_sample, "403 Forbidden");
+        assert_eq!(
+            val_hitl_sample["error_code"],
+            "SampleWalkthroughShipForbidden"
+        );
+
+        // ARCHITECT-R2-6: Pre-receipt `/cancel` matching `turn_id` without `entry_id` clamps unseen answer to `[Stopped]`
+        let (st_premsg, _) = handle_delivery2_message(
+            &repo,
+            5487,
+            br#"{"prompt":"What did I miss?","turn_id":"turn-prestop-unit-1"}"#,
+        );
+        assert_eq!(st_premsg, "200 OK");
+        let (st_precancel, val_precancel) = handle_delivery2_cancel(
+            &repo,
+            5487,
+            br#"{"turn_id":"turn-prestop-unit-1","truncated_len":0}"#,
+        );
+        assert_eq!(st_precancel, "200 OK");
+        let prestopped_entry = val_precancel["state"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["turn_id"] == "turn-prestop-unit-1")
+            .expect("cancelled turn qa_card");
+        assert_eq!(prestopped_entry["body"], "[Stopped]");
+        assert_eq!(prestopped_entry["sources"], json!([]));
 
         // Materialize thread, approve CHWG-777 in Delivery-2 -> run_card advances to 12 · Passed · Merge-ready
         let (st_app, val_app) = handle_delivery2_approval(
@@ -10244,5 +10584,27 @@ mod tests {
         assert_eq!(st_d2_after_rej, "200 OK");
         assert_eq!(val_d2_after_rej["already_settled"], true);
         assert_eq!(val_d2_after_rej["decision"], "denied");
+
+        // (c) ALISTAIR-R2-2 + ARCHITECT-R2-3: Unprefixed Delivery-2 `deny` blocks stale Inbox `approve` (409 already_rejected),
+        // and Inbox `undo_reject` clears both `hitl-<id>` and `<id>` so subsequent Delivery-2 `approve` succeeds!
+        let (st_unpref_deny, val_unpref_deny) =
+            handle_delivery2_approval(&repo, 5487, br#"{"id":"CHWG-779","decision":"deny"}"#);
+        assert_eq!(st_unpref_deny, "200 OK");
+        assert_eq!(val_unpref_deny["decision"], "denied");
+
+        let (st_stale_inb_app, val_stale_inb_app) =
+            handle_inbox_action(&repo, br#"{"id":"CHWG-779","action":"approve"}"#);
+        assert_eq!(st_stale_inb_app, "409 Conflict");
+        assert_eq!(val_stale_inb_app["error_code"], "already_rejected");
+
+        let (st_undo_rej, _) =
+            handle_inbox_action(&repo, br#"{"id":"CHWG-779","action":"undo_reject"}"#);
+        assert_eq!(st_undo_rej, "200 OK");
+
+        let (st_reapprove, val_reapprove) =
+            handle_delivery2_approval(&repo, 5487, br#"{"id":"CHWG-779","decision":"approve"}"#);
+        assert_eq!(st_reapprove, "200 OK");
+        assert_eq!(val_reapprove["already_settled"], false);
+        assert_eq!(val_reapprove["decision"], "approved");
     }
 }
