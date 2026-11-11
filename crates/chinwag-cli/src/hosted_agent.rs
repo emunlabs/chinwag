@@ -250,10 +250,14 @@ impl ProvidersConfig {
                 credential: cf_token_ref.clone(),
             },
         );
+        let flint_endpoint = std::env::var("CHINWAG_FLINT_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:11500/v1/chat/completions".to_owned());
         providers.insert(
             "flint-local-openai".to_owned(),
             ProviderConfig::OpenAiChatCompletions {
-                endpoint: "http://100.108.108.25:11500/v1/chat/completions".to_owned(),
+                endpoint: flint_endpoint,
                 credential: None,
             },
         );

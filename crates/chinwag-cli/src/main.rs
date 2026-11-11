@@ -283,6 +283,7 @@ fn main() -> ExitCode {
             ))
         }
         chinwag_cli::Dispatch::AgentDispatch(request) => {
+            chinwag_cli::board::emit_active_crisis_alert_from_cwd(&mut std::io::stderr());
             ExitCode::from(chinwag_cli::run_agent_dispatch(
                 request,
                 &mut std::io::stdin().lock(),
@@ -290,10 +291,13 @@ fn main() -> ExitCode {
                 &mut std::io::stderr().lock(),
             ))
         }
-        chinwag_cli::Dispatch::Memory(request) => ExitCode::from(chinwag_cli::run_memory(
-            request,
-            &mut std::io::stdout().lock(),
-            &mut std::io::stderr().lock(),
-        )),
+        chinwag_cli::Dispatch::Memory(request) => {
+            chinwag_cli::board::emit_active_crisis_alert_from_cwd(&mut std::io::stderr());
+            ExitCode::from(chinwag_cli::run_memory(
+                request,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            ))
+        }
     }
 }

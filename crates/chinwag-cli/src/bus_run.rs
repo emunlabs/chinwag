@@ -2204,6 +2204,13 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     let mut is_json = false;
     let mut original_id_arg = None;
     let mut original_digest_arg = None;
+    let mut worktree_arg: Option<String> = None;
+    let mut branch_arg: Option<String> = None;
+    let mut surfaces_arg: Option<String> = None;
+    let mut resolve_crisis = false;
+    let mut binary_arg: Option<String> = None;
+    let mut sha256_arg: Option<String> = None;
+    let mut commit_arg: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -2338,6 +2345,34 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 positionals.push(args[i + 1].clone());
                 i += 2;
             }
+            "--worktree" if i + 1 < args.len() => {
+                worktree_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--branch" if i + 1 < args.len() => {
+                branch_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--surfaces" | "--surface-globs" if i + 1 < args.len() => {
+                surfaces_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--resolve" | "--clear" => {
+                resolve_crisis = true;
+                i += 1;
+            }
+            "--binary" if i + 1 < args.len() => {
+                binary_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--sha256" if i + 1 < args.len() => {
+                sha256_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--commit" if i + 1 < args.len() => {
+                commit_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
             flag if flag.starts_with('-') => {
                 let _ = writeln!(stderr, "chinwag bus: invalid_arguments");
                 return 2;
@@ -2426,8 +2461,354 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
         return 2;
     }
     let repo_root = selected.execution_root().to_path_buf();
+    if !matches!(sub, "receipt" | "network-status" | "crisis" | "all-stop") {
+        chinwag_cli::board::emit_active_crisis_alert_if_any(&repo_root, stderr);
+    }
 
     match sub {
+        "beacon" | "task-start" => {
+            let sender_raw = from_arg.or_else(|| std::env::var("CHINWAG_ACTOR").ok());
+            let Some(sender_raw) = sender_raw else {
+                let _ = writeln!(stderr, "chinwag bus beacon: actor_required");
+                return 2;
+            };
+            let sender = match resolve_actor_with_instance(&sender_raw, instance_arg.as_deref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = writeln!(stderr, "chinwag bus beacon: {error}");
+                    return 2;
+                }
+            };
+            let ticket_id = task_arg
+                .clone()
+                .or_else(|| positionals.first().cloned())
+                .unwrap_or_else(|| "CHWG-0000".to_string());
+            let worktree = worktree_arg.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| repo_root.clone())
+                    .to_string_lossy()
+                    .to_string()
+            });
+            let branch = branch_arg.unwrap_or_else(|| {
+                Command::new("git")
+                    .args(["-C", &worktree, "rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "main".to_string())
+            });
+            let mut surface_globs: Vec<String> = surfaces_arg
+                .as_deref()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if surface_globs.is_empty() {
+                let issue_md = repo_root
+                    .join(".chinwag/tasks/issues")
+                    .join(format!("{ticket_id}.md"));
+                if let Ok(raw) = fs::read_to_string(&issue_md)
+                    && let Ok(iss) = chinwag_cli::board::AtomicTaskIssue::from_markdown(&raw)
+                {
+                    surface_globs = iss
+                        .file_scope
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+            if surface_globs.is_empty() {
+                surface_globs.push("*".to_string());
+            }
+            let surfaces_joined = surface_globs.join(", ");
+            let live_threads =
+                chinwag_cli::board::discover_live_thread_instances(&repo_root, Some(&sender));
+            let to_recipients = if live_threads.is_empty() {
+                None
+            } else {
+                Some(
+                    live_threads
+                        .iter()
+                        .map(|t| format!("@{t}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            };
+            let body = format!(
+                "[TASK-START BEACON] {sender} started {ticket_id} | worktree: {worktree} | branch: {branch} | surfaces: {surfaces_joined}"
+            );
+            let (msg, ack) = match send_bus_message_sync(
+                &repo_root,
+                &sender,
+                "#all",
+                to_recipients.clone(),
+                Some(ticket_id.clone()),
+                &body,
+            ) {
+                Ok(v) => v,
+                Err(error) => {
+                    let _ = writeln!(stderr, "chinwag bus beacon: {error}");
+                    return 2;
+                }
+            };
+            let collisions = chinwag_cli::board::detect_in_flight_surface_collisions(
+                &repo_root,
+                &ticket_id,
+                &sender,
+                &surface_globs,
+            );
+            let mut collision_warnings = Vec::new();
+            for col in &collisions {
+                let warn_to = if col.other_owner.contains('#') {
+                    format!("@{},@ARCHITECT", col.other_owner)
+                } else {
+                    "@ARCHITECT".to_string()
+                };
+                let warn_body = format!(
+                    "[SURFACE COLLISION WARNING] {sender} ({ticket_id}) and {} ({}) both have 03_IN_FLIGHT work touching overlapping surfaces: {}",
+                    col.other_owner,
+                    col.other_ticket_id,
+                    col.overlapping_globs.join(", ")
+                );
+                if let Ok((wmsg, _)) = send_bus_message_sync(
+                    &repo_root,
+                    &sender,
+                    "#eng",
+                    Some(warn_to),
+                    Some(ticket_id.clone()),
+                    &warn_body,
+                ) {
+                    collision_warnings.push(wmsg.id);
+                }
+            }
+            let out = json!({
+                "ok": true,
+                "invariant": "INV-LIVE-THREAD-WORKTREE-BEACON-01",
+                "command": "chinwag bus beacon",
+                "sender": sender,
+                "ticket_id": ticket_id,
+                "worktree": worktree,
+                "branch": branch,
+                "surfaces": surface_globs,
+                "notified_live_threads": live_threads,
+                "surface_collisions": collisions,
+                "collision_warning_message_ids": collision_warnings,
+                "message_id": msg.id,
+                "seq": ack.seq,
+                "sig_verified": ack.sig_verified,
+            });
+            if is_json {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&out).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(
+                    stdout,
+                    "{}\n  ↳ Broadcast to {} live thread(s) ({} surface collision warning(s))",
+                    format_bus_line(&msg),
+                    live_threads.len(),
+                    collisions.len()
+                );
+            }
+            0
+        }
+        "crisis" | "all-stop" => {
+            let sender_raw = from_arg.or_else(|| std::env::var("CHINWAG_ACTOR").ok());
+            let Some(sender_raw) = sender_raw else {
+                let _ = writeln!(stderr, "chinwag bus crisis: actor_required");
+                return 2;
+            };
+            let sender = match resolve_actor_with_instance(&sender_raw, instance_arg.as_deref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = writeln!(stderr, "chinwag bus crisis: {error}");
+                    return 2;
+                }
+            };
+            let raw_msg = positionals.join(" ").trim().to_string();
+            if raw_msg.is_empty() && !resolve_crisis {
+                let _ = writeln!(
+                    stderr,
+                    "Usage: chinwag bus crisis --repo <path> --from <SEAT#INSTANCE> [--task <ID>] [--resolve] \"<message>\""
+                );
+                return 2;
+            }
+            let live_threads =
+                chinwag_cli::board::discover_live_thread_instances(&repo_root, Some(&sender));
+            let to_recipients = if live_threads.is_empty() {
+                None
+            } else {
+                Some(
+                    live_threads
+                        .iter()
+                        .map(|t| format!("@{t}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            };
+            let prefix = if resolve_crisis {
+                "[✅ CRISIS RESOLVED]"
+            } else {
+                "[🚨 CRISIS ALL-STOP]"
+            };
+            let body = if raw_msg.is_empty() {
+                format!("{prefix} Crisis resolved by {sender}")
+            } else {
+                format!("{prefix} {raw_msg}")
+            };
+            let rooms = if resolve_crisis {
+                vec!["#all"]
+            } else {
+                vec!["#all", "#eng", "#mgmt"]
+            };
+            let mut published_ids = Vec::new();
+            for room in rooms {
+                match send_bus_message_sync(
+                    &repo_root,
+                    &sender,
+                    room,
+                    to_recipients.clone(),
+                    task_arg.clone(),
+                    &body,
+                ) {
+                    Ok((m, _)) => published_ids.push(m.id),
+                    Err(error) => {
+                        let _ = writeln!(stderr, "chinwag bus crisis: {error}");
+                        return 2;
+                    }
+                }
+            }
+            let record = chinwag_cli::board::ActiveCrisisRecord {
+                schema: "chinwag.bus.crisis.v1".to_string(),
+                invariant: "INV-CRISIS-ALL-STOP-BROADCAST-01".to_string(),
+                active: !resolve_crisis,
+                sender: sender.clone(),
+                task_id: task_arg.clone(),
+                message: if raw_msg.is_empty() {
+                    body.clone()
+                } else {
+                    raw_msg
+                },
+                ts_unix: unix_now(),
+                ts_iso: iso_now(),
+                notified_threads: live_threads.clone(),
+            };
+            let _ = chinwag_cli::board::write_active_crisis(&repo_root, &record);
+            let out = json!({
+                "ok": true,
+                "invariant": "INV-CRISIS-ALL-STOP-BROADCAST-01",
+                "command": "chinwag bus crisis",
+                "active": record.active,
+                "sender": sender,
+                "notified_live_threads": live_threads,
+                "published_message_ids": published_ids,
+                "active_crisis_path": chinwag_cli::board::active_crisis_path(&repo_root).to_string_lossy(),
+            });
+            if is_json {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&out).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(
+                    stdout,
+                    "{body}\n  ↳ Multicast to #all, #eng, #mgmt and {} live thread(s) across all models",
+                    live_threads.len()
+                );
+            }
+            0
+        }
+        "release-notes" | "release" => {
+            let sender_raw = from_arg.or_else(|| std::env::var("CHINWAG_ACTOR").ok());
+            let Some(sender_raw) = sender_raw else {
+                let _ = writeln!(stderr, "chinwag bus release-notes: actor_required");
+                return 2;
+            };
+            let sender = match resolve_actor_with_instance(&sender_raw, instance_arg.as_deref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = writeln!(stderr, "chinwag bus release-notes: {error}");
+                    return 2;
+                }
+            };
+            let binary_name = binary_arg.unwrap_or_else(|| "chinwag".to_string());
+            let sha256_hex = sha256_arg.unwrap_or_else(|| "unspecified".to_string());
+            let commit_sha = commit_arg.unwrap_or_else(|| "HEAD".to_string());
+            let notes = positionals.join(" ").trim().to_string();
+            if notes.is_empty() {
+                let _ = writeln!(
+                    stderr,
+                    "Usage: chinwag bus release-notes --repo <path> --from <SEAT#INSTANCE> --binary <chinwag|chinwag-ci> --sha256 <hex> --commit <sha> \"<release-notes>\""
+                );
+                return 2;
+            }
+            let live_threads =
+                chinwag_cli::board::discover_live_thread_instances(&repo_root, Some(&sender));
+            let to_recipients = if live_threads.is_empty() {
+                None
+            } else {
+                Some(
+                    live_threads
+                        .iter()
+                        .map(|t| format!("@{t}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            };
+            let body = format!(
+                "[BINARY-RELEASE-NOTES] binary: {binary_name} | commit: {commit_sha} | sha256: {sha256_hex} | {notes}"
+            );
+            let mut published_ids = Vec::new();
+            for room in ["#all", "#eng"] {
+                match send_bus_message_sync(
+                    &repo_root,
+                    &sender,
+                    room,
+                    to_recipients.clone(),
+                    task_arg.clone(),
+                    &body,
+                ) {
+                    Ok((m, _)) => published_ids.push(m.id),
+                    Err(error) => {
+                        let _ = writeln!(stderr, "chinwag bus release-notes: {error}");
+                        return 2;
+                    }
+                }
+            }
+            let out = json!({
+                "ok": true,
+                "invariant": "INV-BINARY-RELEASE-BROADCAST-01",
+                "command": "chinwag bus release-notes",
+                "binary": binary_name,
+                "commit": commit_sha,
+                "sha256": sha256_hex,
+                "notified_live_threads": live_threads,
+                "published_message_ids": published_ids,
+            });
+            if is_json {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&out).unwrap_or_default()
+                );
+            } else {
+                let _ = writeln!(
+                    stdout,
+                    "{body}\n  ↳ Release notes multicast to #all, #eng and {} live thread(s)",
+                    live_threads.len()
+                );
+            }
+            0
+        }
         "receipt" | "network-status" => {
             let frame = if sub == "receipt" {
                 let (Some(original_id), Some(original_digest_sha256)) =

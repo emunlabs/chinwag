@@ -720,11 +720,33 @@ pub(super) fn verify_project_population(
         .pointer("/items/nodes")
         .and_then(Value::as_array)
         .ok_or("missing project items")?;
-    if items.len() != issues.len() {
+    let local_has_private = issues
+        .iter()
+        .any(|i| !i.visibility.eq_ignore_ascii_case("public"));
+    let board_public_count = items
+        .iter()
+        .filter(|item| {
+            item.pointer("/content/repository/isPrivate")
+                .and_then(Value::as_bool)
+                == Some(false)
+        })
+        .count();
+    let local_public_count = issues
+        .iter()
+        .filter(|i| i.visibility.eq_ignore_ascii_case("public"))
+        .count();
+    if local_has_private {
+        if items.len() != issues.len() {
+            return Err(format!(
+                "project has {} items; local scope has {}: reconcile project membership before accepting counts",
+                items.len(),
+                issues.len()
+            ));
+        }
+    } else if board_public_count != local_public_count {
         return Err(format!(
-            "project has {} items; local scope has {}: reconcile project membership before accepting counts",
-            items.len(),
-            issues.len()
+            "project has {} public items; local public scope has {}: reconcile project membership before accepting counts",
+            board_public_count, local_public_count
         ));
     }
     let mut counts: BTreeMap<String, usize> =
@@ -743,12 +765,16 @@ pub(super) fn verify_project_population(
     for item in items {
         let content = &item["content"];
         let title = content["title"].as_str().ok_or("non-issue project card")?;
+        if let Err((inv, leaked)) = super::scan_entity_firewall_text(title) {
+            return Err(format!(
+                "entity firewall [{inv}] rejected project card `{title}`: {leaked}"
+            ));
+        }
         let task_id =
             github_task_id_from_title(title).ok_or("project issue missing task prefix")?;
-        let local = issues
-            .iter()
-            .find(|i| i.id == task_id)
-            .ok_or_else(|| format!("unexpected project task {task_id}"))?;
+        if !super::is_canonical_chwg_ticket_id(&task_id) {
+            return Err(format!("non-canonical project task prefix `{task_id}`"));
+        }
         if !seen.insert(task_id) {
             return Err(format!("duplicate project task {task_id}"));
         }
@@ -758,6 +784,10 @@ pub(super) fn verify_project_population(
             == Some(false);
         if public {
             public_total += 1;
+        }
+        let local_opt = issues.iter().find(|i| i.id == task_id);
+        if local_opt.is_none() && (public || local_has_private) {
+            return Err(format!("unexpected project task {task_id}"));
         }
         if item
             .pointer("/fieldValues/pageInfo/hasNextPage")
@@ -814,55 +844,74 @@ pub(super) fn verify_project_population(
                 *public_counts.get_mut(name).ok_or("missing public count")? += 1;
             }
         }
-        let expected = card_entry_from_issue(local, Some(cfg), None, None);
-        for (name, value) in [
-            ("Net Hours Saved", expected.net_hours_saved),
-            ("Baseline Hours", expected.baseline_hours),
-            ("Credits Used", expected.credits_used as f64),
-        ] {
-            if values
-                .get(name)
-                .and_then(Value::as_f64)
-                .is_none_or(|v| (v - value).abs() > 0.001)
-            {
-                return Err(format!("incorrect {name} on {task_id}"));
-            }
-        }
-        for (name, expected_value) in [
-            ("Function / Team", expected.primary_function.as_str()),
-            ("DORA Baseline", expected.dora_baseline.as_str()),
-            ("Chinwag Cycle Time", expected.chinwag_cycle_time.as_str()),
-            ("Execution Mode", expected.execution_mode.as_str()),
-            (
-                "Δ Speedup vs. DORA",
-                expected.delta_speedup_vs_dora.as_str(),
-            ),
-            (
-                "Verification Receipt",
-                expected.verification_receipt.as_str(),
-            ),
-        ] {
-            if values.get(name).and_then(Value::as_str) != Some(expected_value) {
-                return Err(format!("incorrect {name} on {task_id}"));
-            }
-        }
-        if values.get("Status").and_then(Value::as_str) != Some(local.status.column_header()) {
-            return Err(format!("incorrect Status on {task_id}"));
-        }
-        if local.status == BoardStatus::ShippedVerified {
-            shipped_total += 1;
-            saved += expected.net_hours_saved;
-            credits += expected.credits_used as f64;
-            if measured_ship(local) {
-                measured_total += 1;
-            }
-            if public {
-                shipped_public += 1;
-                public_saved += expected.net_hours_saved;
-                public_credits += expected.credits_used as f64;
-                if measured_ship(local) {
-                    measured_public += 1;
+        if let Some(local) = local_opt {
+            let expected = card_entry_from_issue(local, Some(cfg), None, None);
+            for (name, value) in [
+                ("Net Hours Saved", expected.net_hours_saved),
+                ("Baseline Hours", expected.baseline_hours),
+                ("Credits Used", expected.credits_used as f64),
+            ] {
+                if values
+                    .get(name)
+                    .and_then(Value::as_f64)
+                    .is_none_or(|v| (v - value).abs() > 0.001)
+                {
+                    return Err(format!("incorrect {name} on {task_id}"));
                 }
+            }
+            for (name, expected_value) in [
+                ("Function / Team", expected.primary_function.as_str()),
+                ("DORA Baseline", expected.dora_baseline.as_str()),
+                ("Chinwag Cycle Time", expected.chinwag_cycle_time.as_str()),
+                ("Execution Mode", expected.execution_mode.as_str()),
+                (
+                    "Δ Speedup vs. DORA",
+                    expected.delta_speedup_vs_dora.as_str(),
+                ),
+                (
+                    "Verification Receipt",
+                    expected.verification_receipt.as_str(),
+                ),
+            ] {
+                if values.get(name).and_then(Value::as_str) != Some(expected_value) {
+                    return Err(format!("incorrect {name} on {task_id}"));
+                }
+            }
+            if values.get("Status").and_then(Value::as_str) != Some(local.status.column_header()) {
+                return Err(format!("incorrect Status on {task_id}"));
+            }
+            if local.status == BoardStatus::ShippedVerified {
+                shipped_total += 1;
+                saved += expected.net_hours_saved;
+                credits += expected.credits_used as f64;
+                if measured_ship(local) {
+                    measured_total += 1;
+                }
+                if public {
+                    shipped_public += 1;
+                    public_saved += expected.net_hours_saved;
+                    public_credits += expected.credits_used as f64;
+                    if measured_ship(local) {
+                        measured_public += 1;
+                    }
+                }
+            }
+        } else if values.get("Status").and_then(Value::as_str)
+            == Some(BoardStatus::ShippedVerified.column_header())
+        {
+            shipped_total += 1;
+            let item_saved = values
+                .get("Net Hours Saved")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let item_credits = values
+                .get("Credits Used")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            saved += item_saved;
+            credits += item_credits;
+            if item_saved > 0.0 {
+                measured_total += 1;
             }
         }
     }

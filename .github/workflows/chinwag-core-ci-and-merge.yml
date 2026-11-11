@@ -53,8 +53,8 @@ env:
 jobs:
   stage1-h2-cleanroom-rust-gate:
     if: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && github.ref != 'refs/heads/workhorse/review-ci-idle-wake-20261108' }}
-    name: "Stage 1 — H2 Cleanroom Rust & WORKHORSE 288+ Test Ratchet Gate"
-    runs-on: [self-hosted, macOS, ARM64]
+    name: "Stage 1 — H2 Cleanroom Rust & chinwag-ci Dogfood Gate"
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -62,11 +62,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify WORKHORSE Test Suite, Clippy, Formatting & Monotonic Ratchet (288+ Floor)
+      - name: Build or Locate chinwag-ci & Execute Dogfood Gates (verify-signer, wrap, attest-green)
         id: h2_gate
         run: |
-          chmod +x ./scripts/verify-workhorse-test-suite.sh
-          ./scripts/verify-workhorse-test-suite.sh --sync-node2
+          set -euo pipefail
+          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+          if ! command -v chinwag-ci >/dev/null 2>&1; then
+            rustup toolchain install 1.97.1 --profile minimal --no-self-update
+            CI_SRC="${RUNNER_TEMP:-/tmp}/chinwag-ci-standalone"
+            rm -rf "$CI_SRC"
+            git clone --depth 1 https://github.com/emunlabs/chinwag-ci.git "$CI_SRC"
+            cargo +1.97.1 build --locked --release --manifest-path "$CI_SRC/Cargo.toml"
+            export PATH="$CI_SRC/target/release:$PATH"
+          fi
+          chinwag-ci --version
+          chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${GITHUB_SHA:-HEAD}"
+          chinwag-ci wrap --org emunlabs -- cargo +1.97.1 test --locked --package chinwag-ci
+          if [[ -d "$HOME/.chinwag-native-inputs" && -x ./scripts/verify-workhorse-test-suite.sh ]]; then
+            chmod +x ./scripts/verify-workhorse-test-suite.sh
+            chinwag-ci wrap --org emunlabs -- ./scripts/verify-workhorse-test-suite.sh --sync-node2
+          fi
+          chinwag-ci attest-green --org emunlabs --suite "stage1-h2-cleanroom-rust-gate" --commit "${GITHUB_SHA:-HEAD}"
 
       - name: "Execute Autonomous CI Board & Direct-to-Agent Report (INV-CI-BOARD-MUTATION-01 / INV-DIRECT-CI-AGENT-ROUTING-01)"
         if: always()
@@ -90,8 +106,8 @@ jobs:
 
   stage2-h-board-security-sentinel:
     if: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && github.ref != 'refs/heads/workhorse/review-ci-idle-wake-20261108' }}
-    name: "Stage 2 — H_board & Security Sentinel (INV-ZERO-ANTHROPIC-01 / INV-BOARD-ZERO-LEAK-01)"
-    runs-on: [self-hosted, macOS, ARM64]
+    name: "Stage 2 — H_board, chinwag-ci Surface/UI Gate & Security Sentinel (INV-ZERO-ANTHROPIC-01 / INV-BOARD-ZERO-LEAK-01)"
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -117,7 +133,7 @@ jobs:
           fi
           echo "OK: Tombstone framework guard verified."
 
-      - name: "Check INV-BOARD-ZERO-LEAK-01 (No Tracked .crdb Databases, Private Keys, or Secret Leaks)"
+      - name: "Check INV-BOARD-ZERO-LEAK-01 & INV-ENTITY-SEP-01 (No Tracked .crdb Databases, Private Keys, Secret Leaks, or Foreign Entity Names)"
         run: |
           echo "Checking tracked git index for forbidden .crdb state files or private keys..."
           LEAKED_FILES="$(git ls-files | grep -E '\.(crdb|crdb-shm|crdb-wal|leann|pem)$|_ed25519$' || true)"
@@ -134,7 +150,29 @@ jobs:
             echo "FAIL: INV-BOARD-ZERO-LEAK-01 violated — hardcoded Tailscale CGNAT IP detected." >&2
             exit 1
           fi
-          echo "OK: INV-BOARD-ZERO-LEAK-01 verified."
+          if git grep -n -iE '\b(drey|dreybits|dreywallet|rogue machine|rmm-|2real|squirrelsystems|robert r\.?[[:space:]]*khan)\b' -- '.chinwag/'; then
+            echo "FAIL: INV-ENTITY-SEP-01 violated — foreign entity reference detected in .chinwag/." >&2
+            exit 1
+          fi
+          echo "OK: INV-BOARD-ZERO-LEAK-01 & INV-ENTITY-SEP-01 verified."
+
+      - name: "Execute chinwag-ci 12-Pillar Gate Suite (verify-signer, policy-gate, surface-gate, ui-gate, selftest, attest-green)"
+        run: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+          if ! command -v chinwag-ci >/dev/null 2>&1; then
+            rustup toolchain install 1.97.1 --profile minimal --no-self-update
+            CI_SRC="${RUNNER_TEMP:-/tmp}/chinwag-ci-standalone"
+            rm -rf "$CI_SRC"
+            git clone --depth 1 https://github.com/emunlabs/chinwag-ci.git "$CI_SRC"
+            cargo +1.97.1 build --locked --release --manifest-path "$CI_SRC/Cargo.toml"
+            export PATH="$CI_SRC/target/release:$PATH"
+          fi
+          chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${GITHUB_SHA:-HEAD}"
+          chinwag-ci surface-gate --manifest .chinwag/tasks/CHWG-0234/surface-impact.yaml --max-pr-age-secs 3600 --surfaces all --workspace-root "$PWD/.." --org emunlabs --commit "${GITHUB_SHA:-HEAD}" --json
+          chinwag-ci ui-gate --surface all --repo . --org emunlabs --commit "${GITHUB_SHA:-HEAD}" --json
+          chinwag-ci selftest --json
+          chinwag-ci attest-green --org emunlabs --suite "stage2-h-board-security-sentinel" --commit "${GITHUB_SHA:-HEAD}"
 
   stage3-h5-automated-review-merge:
     name: "Stage 3 — H5 Automated Review & Fast-Forward Merge Gate (review/** -> main)"
@@ -142,7 +180,7 @@ jobs:
       - stage1-h2-cleanroom-rust-gate
       - stage2-h-board-security-sentinel
     if: ${{ always() && github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/workhorse/review-ci-failure-artifact-20261107' && github.ref != 'refs/heads/workhorse/review-ci-idle-wake-20261108' && startsWith(github.ref, 'refs/heads/review/') }}
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout repository

@@ -1,0 +1,19 @@
+schema = "chinwag.adr.registry.v1"
+updated_at = "2026-11-11"
+
+[[adr]]
+id = "ADR-013"
+title = "60-Minute Maximum PR TTL (INV-PR-MAX-TTL-60M-01) & Compounding CI Behavioral Ratchet (INV-CI-BEHAVIORAL-RATCHET-01)"
+status = "accepted"
+owner = "ARCHITECT"
+date = "2026-11-11"
+invariants = ["INV-PR-MAX-TTL-60M-01", "INV-CI-BEHAVIORAL-RATCHET-01"]
+doc_path = "ADR/ADR-013-pr-ttl-60m-and-ci-behavioral-ratchet.md"
+summary = "Enforce a 60-minute (3600s) maximum unmerged PR TTL (ERR_PR_TTL_EXCEEDED_60M) and require every PR to declare expected_behaviors and pass a monotonically non-decreasing <50ms cassette + UI invariant ratchet in chinwag-ci."
+rationale = "Prevents multi-day stale PR drift, guarantees continuous binary deployment parity across fleet nodes, and ensures chinwag-ci gets strictly smarter with every merged PR."
+forbidden_prompt_patterns = ["disable pr ttl check", "ignore behavioral ratchet", "skip chinwag-ci surface-gate"]
+forbidden_code_patterns = ["disable_pr_ttl_60m", "bypass_behavioral_ratchet"]
+forbidden_crates = []
+forbidden_binaries = []
+scope_globs = ["crates/**", ".github/workflows/**", ".chinwag/tasks/**"]
+remediation = "Rebase onto origin/main within 60 minutes (3600s), declare expected_behaviors in surface-impact.yaml, and pass chinwag-ci surface-gate + ui-gate + wrap + attest-green. Escalate via --adr-proposal to @ARCHITECT."

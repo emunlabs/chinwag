@@ -857,6 +857,29 @@ pub fn validate_h_board_issue(
     // 5. Secrets are forbidden in every repository, including raw metadata and receipts.
     // Public copy additionally requires internal-information and formatting redaction.
     let combined = format!("{}\n{raw_markdown}", issue.to_markdown());
+    if !issue.id.starts_with("CHWG-")
+        || issue.id.contains(',')
+        || issue.id.contains("..")
+        || issue.id.eq_ignore_ascii_case("CHWG-PM-DELIVERY-LOOP-01")
+    {
+        return Err(HBoardViolation {
+            exit_code: EXIT_H_BOARD_REJECT,
+            invariant: "INV-ENTITY-SEP-01".to_string(),
+            issue_id: issue.id.clone(),
+            reason: format!(
+                "ticket id `{}` violates INV-ENTITY-SEP-01 (only canonical single-ticket CHWG-* IDs are allowed)",
+                issue.id
+            ),
+        });
+    }
+    if let Err((invariant, reason)) = scan_entity_firewall_text(&combined) {
+        return Err(HBoardViolation {
+            exit_code: EXIT_H_BOARD_REJECT,
+            invariant,
+            issue_id: issue.id.clone(),
+            reason,
+        });
+    }
     if let Err((invariant, reason)) = scan_secret_text(&combined) {
         return Err(HBoardViolation {
             exit_code: EXIT_H_BOARD_REJECT,
@@ -876,6 +899,47 @@ pub fn validate_h_board_issue(
         });
     }
 
+    Ok(())
+}
+
+/// Returns `true` iff `ticket_id` is a canonical single-ticket Chinwag ID matching `^CHWG-[0-9]{4}$`.
+pub fn is_canonical_chwg_ticket_id(ticket_id: &str) -> bool {
+    let trimmed = ticket_id.trim();
+    trimmed.len() == 9
+        && trimmed.starts_with("CHWG-")
+        && trimmed[5..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Enforces the `INV-ENTITY-SEP-01` Entity Firewall, rejecting any cross-entity (`Drey`, `DreyBits`,
+/// `DreyWallet`, `Rogue Machine`, `RMM-`, `2Real`, `SquirrelSystems`, `Robert R. Khan`) strings.
+pub fn scan_entity_firewall_text(text: &str) -> Result<(), (String, String)> {
+    let lower = text.to_ascii_lowercase();
+    for marker in [
+        "drey-",
+        "dreybits",
+        "dreywallet",
+        "rogue machine",
+        "rmm-",
+        "2real",
+        "squirrelsystems",
+        "robert r. khan",
+        "robert khan",
+    ] {
+        if lower.contains(marker) {
+            return Err((
+                "INV-ENTITY-SEP-01".to_string(),
+                format!("cross-entity firewall rejected forbidden marker `{marker}`"),
+            ));
+        }
+    }
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if token == "drey" {
+            return Err((
+                "INV-ENTITY-SEP-01".to_string(),
+                "cross-entity firewall rejected forbidden entity token `drey`".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1718,7 +1782,8 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
     let has_receipt_pass = issue.receipt_trailers.iter().any(|t| {
         t.contains("SurfaceSyncReceiptV1: status=PASS")
             || t.contains("CleanroomCIReceiptV1: status=PASS")
-    });
+    }) || (issue.status == BoardStatus::ShippedVerified
+        && issue.completion_evidence_note.is_some());
     let has_explicit_fail_badge = issue
         .last_ci_gate_badge
         .as_deref()
@@ -2982,25 +3047,30 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
     0
 }
 
-/// Entrypoint for `chinwag board <init|push|sync|pull|watch|sync-loop> ...`.
+/// Entrypoint for `chinwag board <init|push|sync|pull|watch|sync-loop|add|move> ...`.
 pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("push");
     if sub == "--help" || sub == "-h" || sub == "help" {
         let _ = writeln!(
             stdout,
-            "Usage: chinwag board <init|push|sync|pull|watch|sync-loop> [--org <org>] [--title <title>] [--private] [--public-board] [--private-repo <org/repo>] [--public-repo <org/repo>] [--live] [--once] [--workspace-root <path>] [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run] [--json]"
+            "Usage: chinwag board <init|push|sync|pull|watch|sync-loop|add|move> [--org <org>] [--title <title>] [--private] [--public-board] [--private-repo <org/repo>] [--public-repo <org/repo>] [--live] [--once] [--workspace-root <path>] [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run] [--json]"
         );
         return 0;
     }
+    let tasks_dir = resolve_tasks_dir(args);
+    if let Some(repo_root) = tasks_dir.parent().and_then(|p| p.parent()) {
+        emit_active_crisis_alert_if_any(repo_root, stderr);
+    }
     if matches!(sub, "watch" | "sync-loop") {
         return run_board_sync_loop(args, stdout, stderr);
+    }
+    if matches!(sub, "add" | "move") {
+        return run_board_add_or_move(sub, args, &tasks_dir, stdout, stderr);
     }
     if !matches!(sub, "push" | "sync" | "init" | "pull") {
         let _ = writeln!(stderr, "chinwag board: unknown subcommand `{sub}`");
         return 2;
     }
-
-    let tasks_dir = resolve_tasks_dir(args);
     let issues_dir = tasks_dir.join("issues");
     let mut org = "emunlabs".to_string();
     let mut title = "Chinwag Engineering Velocity & Agent Fleet".to_string();
@@ -3602,11 +3672,39 @@ impl Default for BoardCardsLedgerV1 {
 }
 
 impl BoardCardsLedgerV1 {
+    pub fn sanitize_entity_firewall(&mut self, tasks_dir: &Path) {
+        let issues_dir = tasks_dir.join("issues");
+        let has_disk_issues = fs::read_dir(&issues_dir)
+            .ok()
+            .is_some_and(|mut entries| {
+                entries.any(|e| {
+                    e.ok()
+                        .and_then(|ent| ent.path().extension().map(|ext| ext == "md"))
+                        .unwrap_or(false)
+                })
+            });
+        self.cards.retain(|card| {
+            let valid_id = if has_disk_issues {
+                is_canonical_chwg_ticket_id(&card.id)
+                    && issues_dir.join(format!("{}.md", card.id)).is_file()
+            } else {
+                card.id.starts_with("CHWG-")
+                    && !card.id.contains(',')
+                    && !card.id.contains("..")
+                    && !card.id.eq_ignore_ascii_case("CHWG-PM-DELIVERY-LOOP-01")
+            };
+            valid_id
+                && scan_entity_firewall_text(&format!("{}\n{}", card.id, card.title)).is_ok()
+        });
+    }
+
     pub fn load(tasks_dir: &Path) -> Self {
         let p = tasks_dir.join("board-cards.json");
         if let Ok(raw) = fs::read_to_string(p)
-            && let Ok(parsed) = serde_json::from_str::<Self>(&raw)
+            && let Ok(mut parsed) = serde_json::from_str::<Self>(&raw)
         {
+            parsed.sanitize_entity_firewall(tasks_dir);
+            parsed.recompute_totals();
             return parsed;
         }
         Self::default()
@@ -3641,6 +3739,7 @@ impl BoardCardsLedgerV1 {
     }
 
     pub fn save(&mut self, tasks_dir: &Path) -> Result<(), String> {
+        self.sanitize_entity_firewall(tasks_dir);
         self.recompute_totals();
         fs::create_dir_all(tasks_dir).map_err(|e| format!("failed to create tasks dir: {e}"))?;
         let p = tasks_dir.join("board-cards.json");
@@ -3765,21 +3864,48 @@ pub fn sync_board_cards_ledger(
 
     for issue in issues {
         let prior = existing_map.get(&issue.id);
-        validate_h_board_issue(issue, &issue.to_markdown()).map_err(|violation| {
-            format!(
-                "H_board rejected (exit {}) [{}] on {}: {}",
-                violation.exit_code, violation.invariant, violation.issue_id, violation.reason
-            )
-        })?;
+        let mut effective_issue = issue.clone();
+        // Monotonic 05_SHIPPED_VERIFIED protection: never downgrade an already-shipped card unless an explicit fail badge is present
+        let has_explicit_fail = effective_issue.ci_failure_count > 0
+            || effective_issue
+                .last_ci_gate_badge
+                .as_deref()
+                .is_some_and(|b| b.starts_with('🚨'));
+        if prior.is_some_and(|p| p.status == "05_SHIPPED_VERIFIED")
+            && effective_issue.status != BoardStatus::ShippedVerified
+            && !has_explicit_fail
+        {
+            effective_issue.status = BoardStatus::ShippedVerified;
+            if let Some(p) = prior {
+                if effective_issue.t_claim_ms == 0 && p.t_claim_ms > 0 {
+                    effective_issue.t_claim_ms = p.t_claim_ms;
+                }
+                if effective_issue.t_ship_ms == 0 && p.t_ship_ms > 0 {
+                    effective_issue.t_ship_ms = p.t_ship_ms;
+                }
+            }
+            let disk_path = tasks_dir.join("issues").join(format!("{}.md", effective_issue.id));
+            if disk_path.is_file() {
+                let _ = fs::write(&disk_path, effective_issue.to_markdown());
+            }
+        }
+        validate_h_board_issue(&effective_issue, &effective_issue.to_markdown()).map_err(
+            |violation| {
+                format!(
+                    "H_board rejected (exit {}) [{}] on {}: {}",
+                    violation.exit_code, violation.invariant, violation.issue_id, violation.reason
+                )
+            },
+        )?;
         let trigger = prior.map(|p| p.trigger_source.as_str());
         let tcode = prior.and_then(|p| p.ticket_code.clone());
-        let mut entry = card_entry_from_issue(issue, cfg, trigger, tcode);
+        let mut entry = card_entry_from_issue(&effective_issue, cfg, trigger, tcode);
         entry.decision_gate = Some(evaluate_issue_decision_gate(
             tasks_dir,
-            issue,
-            issue.status == BoardStatus::TribunalGate,
+            &effective_issue,
+            effective_issue.status == BoardStatus::TribunalGate,
         ));
-        existing_map.insert(issue.id.clone(), entry);
+        existing_map.insert(effective_issue.id.clone(), entry);
     }
 
     ledger.cards = existing_map.into_values().collect();
@@ -3820,6 +3946,11 @@ pub fn upsert_agent_thread_board_card(
     {
         return Err("empty or placeholder ticket_id".to_string());
     }
+    if !is_canonical_chwg_ticket_id(clean_ticket) {
+        return Err(format!(
+            "H_board rejected [INV-ENTITY-SEP-01]: ticket_id `{clean_ticket}` must match ^CHWG-[0-9]{{4}}$"
+        ));
+    }
 
     let primary_seat = normalize_seat_token(actor_or_seat);
     let secondary_seat = peer_seat
@@ -3831,6 +3962,26 @@ pub fn upsert_agent_thread_board_card(
         return Err("repository does not have a .chinwag directory".to_string());
     }
     let _ = fs::create_dir_all(&tasks_dir);
+
+    let issues_dir = tasks_dir.join("issues");
+    let has_disk_issues = fs::read_dir(&issues_dir)
+        .ok()
+        .is_some_and(|mut entries| {
+            entries.any(|e| {
+                e.ok()
+                    .and_then(|ent| ent.path().extension().map(|ext| ext == "md"))
+                    .unwrap_or(false)
+            })
+        });
+    let disk_issue_path = issues_dir.join(format!("{clean_ticket}.md"));
+    if has_disk_issues && !disk_issue_path.is_file() {
+        return Err(format!(
+            "H_board rejected [INV-ENTITY-SEP-01]: ticket `{clean_ticket}` is not backed by .chinwag/tasks/issues/{clean_ticket}.md"
+        ));
+    }
+    let disk_issue = fs::read_to_string(&disk_issue_path)
+        .ok()
+        .and_then(|raw| AtomicTaskIssue::from_markdown(&raw).ok());
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3854,13 +4005,16 @@ pub fn upsert_agent_thread_board_card(
                 .is_some_and(|tc| tc.eq_ignore_ascii_case(clean_ticket))
     });
 
-    // Validate the full input before truncating display copy so secrets cannot hide beyond it.
-    scan_secret_text(&format!(
+    // Validate the full input before truncating display copy so secrets or entity firewall leaks cannot hide beyond it.
+    let full_input = format!(
         "{ticket_id}\n{actor_or_seat}\n{}\n{summary}\n{}\n{trigger_source}",
         peer_seat.unwrap_or_default(),
         receipt_hash.unwrap_or_default(),
-    ))
-    .map_err(|(invariant, reason)| format!("H_board rejected [{invariant}]: {reason}"))?;
+    );
+    scan_entity_firewall_text(&full_input)
+        .map_err(|(invariant, reason)| format!("H_board rejected [{invariant}]: {reason}"))?;
+    scan_secret_text(&full_input)
+        .map_err(|(invariant, reason)| format!("H_board rejected [{invariant}]: {reason}"))?;
     let existing = existing_idx.map(|idx| &ledger.cards[idx]);
     let mut card_issue = AtomicTaskIssue::new_default(clean_ticket, &clean_summary, DoraTier::M);
     card_issue.visibility = existing
@@ -4043,16 +4197,37 @@ pub fn upsert_agent_thread_board_card(
     };
 
     // Thread activity does not carry a measured diff or independent verification receipt.
-    // Keep realized metrics unavailable until the atomic task sync supplies that evidence.
-    card_issue.status = BoardStatus::from_code(&entry.status).unwrap_or(BoardStatus::InFlight);
-    card_issue.t_claim_ms = entry.t_claim_ms;
-    card_issue.t_ship_ms = entry.t_ship_ms;
-    let projected = card_entry_from_issue(&card_issue, None, None, None);
-    entry.net_hours_saved = projected.net_hours_saved;
-    entry.chinwag_cycle_time = projected.chinwag_cycle_time;
-    entry.delta_speedup_vs_dora = projected.delta_speedup_vs_dora;
-    entry.credits_used = projected.credits_used;
-    entry.verification_receipt = projected.verification_receipt;
+    // Keep realized metrics unavailable until the atomic task sync supplies that evidence,
+    // while strictly preserving 05_SHIPPED_VERIFIED if already shipped on disk or in ledger.
+    let disk_already_shipped = disk_issue
+        .as_ref()
+        .is_some_and(|iss| iss.status == BoardStatus::ShippedVerified);
+    if disk_already_shipped && entry.status != "05_SHIPPED_VERIFIED" {
+        entry.status = "05_SHIPPED_VERIFIED".to_string();
+        entry.column_header = BoardStatus::ShippedVerified.column_header().to_string();
+    }
+    if let Some(ref diss) = disk_issue
+        && diss.status == BoardStatus::ShippedVerified
+    {
+        let disk_projected = card_entry_from_issue(diss, Some(&cfg), Some(trigger_source), entry.ticket_code.clone());
+        entry.status = "05_SHIPPED_VERIFIED".to_string();
+        entry.column_header = BoardStatus::ShippedVerified.column_header().to_string();
+        entry.net_hours_saved = disk_projected.net_hours_saved;
+        entry.chinwag_cycle_time = disk_projected.chinwag_cycle_time;
+        entry.delta_speedup_vs_dora = disk_projected.delta_speedup_vs_dora;
+        entry.credits_used = disk_projected.credits_used;
+        entry.verification_receipt = disk_projected.verification_receipt;
+    } else {
+        card_issue.status = BoardStatus::from_code(&entry.status).unwrap_or(BoardStatus::InFlight);
+        card_issue.t_claim_ms = entry.t_claim_ms;
+        card_issue.t_ship_ms = entry.t_ship_ms;
+        let projected = card_entry_from_issue(&card_issue, None, None, None);
+        entry.net_hours_saved = projected.net_hours_saved;
+        entry.chinwag_cycle_time = projected.chinwag_cycle_time;
+        entry.delta_speedup_vs_dora = projected.delta_speedup_vs_dora;
+        entry.credits_used = projected.credits_used;
+        entry.verification_receipt = projected.verification_receipt;
+    }
 
     if let Some(idx) = existing_idx {
         ledger.cards[idx] = entry.clone();
@@ -4084,6 +4259,477 @@ pub fn upsert_agent_thread_board_card(
 
     #[allow(clippy::useless_conversion)]
     Ok(entry.into())
+}
+
+/// Active crisis record stored at `.chinwag/bus/active_crisis.json` (`INV-CRISIS-ALL-STOP-BROADCAST-01`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveCrisisRecord {
+    pub schema: String,
+    pub invariant: String,
+    pub active: bool,
+    pub sender: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    pub message: String,
+    pub ts_unix: u64,
+    pub ts_iso: String,
+    #[serde(default)]
+    pub notified_threads: Vec<String>,
+}
+
+/// Overlapping `03_IN_FLIGHT` surface collision detected by `INV-LIVE-THREAD-WORKTREE-BEACON-01`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceCollision {
+    pub other_ticket_id: String,
+    pub other_owner: String,
+    pub overlapping_globs: Vec<String>,
+}
+
+pub fn active_crisis_path(repo_root: &Path) -> PathBuf {
+    repo_root
+        .join(".chinwag")
+        .join("bus")
+        .join("active_crisis.json")
+}
+
+pub fn read_active_crisis(repo_root: &Path) -> Option<ActiveCrisisRecord> {
+    let raw = fs::read_to_string(active_crisis_path(repo_root)).ok()?;
+    let rec: ActiveCrisisRecord = serde_json::from_str(&raw).ok()?;
+    if rec.active { Some(rec) } else { None }
+}
+
+pub fn write_active_crisis(repo_root: &Path, rec: &ActiveCrisisRecord) -> Result<(), String> {
+    let path = active_crisis_path(repo_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(rec).map_err(|e| e.to_string())?;
+    fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+/// Prints the unread `[🚨 CRISIS ALL-STOP]` Chinwag bus alert to `stderr` whenever any `chinwag` command runs
+/// while `.chinwag/bus/active_crisis.json` is active (`INV-CRISIS-ALL-STOP-BROADCAST-01`).
+pub fn emit_active_crisis_alert_if_any(repo_root: &Path, stderr: &mut dyn Write) {
+    if let Some(crisis) = read_active_crisis(repo_root) {
+        let task_tag = crisis
+            .task_id
+            .as_deref()
+            .map(|t| format!(" [{t}]"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            stderr,
+            "🚨 [CRISIS ALL-STOP · INV-CRISIS-ALL-STOP-BROADCAST-01]{task_tag} from {} ({}): {}",
+            crisis.sender, crisis.ts_iso, crisis.message
+        );
+    }
+}
+
+pub fn emit_active_crisis_alert_from_cwd(stderr: &mut dyn Write) {
+    if let Ok(repo_env) = std::env::var("CHINWAG_REPO_ROOT") {
+        let p = PathBuf::from(repo_env);
+        if p.join(".chinwag").is_dir() {
+            emit_active_crisis_alert_if_any(&p, stderr);
+            return;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && cwd.join(".chinwag").is_dir()
+    {
+        emit_active_crisis_alert_if_any(&cwd, stderr);
+    }
+}
+
+fn collect_qualified_thread_address(
+    raw: &str,
+    excluded_norm: Option<&str>,
+    seen: &mut BTreeMap<String, String>,
+) {
+    for part in raw.split(',') {
+        let clean = part
+            .trim()
+            .trim_start_matches(|c: char| c == '@' || c == '■' || c == '●' || c == '◆')
+            .trim();
+        if !clean.contains('#') {
+            continue;
+        }
+        if let Ok(addr) = crate::agent_instance::ActorAddress::parse(clean)
+            && !addr.is_human()
+            && addr.instance().is_some()
+        {
+            let full = addr.to_string();
+            let key = full.to_ascii_uppercase();
+            if excluded_norm.is_some_and(|ex| ex.eq_ignore_ascii_case(&full)) {
+                continue;
+            }
+            seen.entry(key).or_insert(full);
+        }
+    }
+}
+
+/// Discovers all live `<SEAT>#<INSTANCE>` thread instances across all models by scanning
+/// `.chinwag/bus/messages.jsonl` (last 120 minutes / tail 500 messages) + `.chinwag/state.crdb`
+/// (`INV-LIVE-THREAD-WORKTREE-BEACON-01` & `INV-CRISIS-ALL-STOP-BROADCAST-01`).
+pub fn discover_live_thread_instances(
+    repo_root: &Path,
+    exclude_actor: Option<&str>,
+) -> Vec<String> {
+    let excluded_norm = exclude_actor
+        .and_then(|raw| {
+            let trimmed = raw
+                .trim()
+                .trim_start_matches(|c: char| c == '@' || c == '■' || c == '●' || c == '◆')
+                .trim();
+            crate::agent_instance::ActorAddress::parse(trimmed)
+                .ok()
+                .map(|a| a.to_string())
+        })
+        .or_else(|| exclude_actor.map(|s| s.trim().trim_start_matches('@').to_string()));
+
+    let mut seen = BTreeMap::<String, String>::new();
+    let messages_path = repo_root
+        .join(".chinwag")
+        .join("bus")
+        .join("messages.jsonl");
+    if let Ok(raw) = fs::read_to_string(&messages_path) {
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        let start = lines.len().saturating_sub(500);
+        let tail = &lines[start..];
+        let mut parsed_rows = Vec::<(u64, String, Option<String>)>::with_capacity(tail.len());
+        let mut max_ts = 0u64;
+        for line in tail {
+            if let Ok(val) = serde_json::from_str::<Value>(line) {
+                let ts = val.get("ts_unix").and_then(|v| v.as_u64()).unwrap_or(0);
+                if ts > max_ts {
+                    max_ts = ts;
+                }
+                let sender = val
+                    .get("sender")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let to = val
+                    .get("to")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                parsed_rows.push((ts, sender, to));
+            }
+        }
+        let cutoff = max_ts.saturating_sub(7200);
+        for (ts, sender, to) in parsed_rows {
+            if ts == 0 || ts >= cutoff {
+                collect_qualified_thread_address(&sender, excluded_norm.as_deref(), &mut seen);
+                if let Some(ref recipients) = to {
+                    collect_qualified_thread_address(
+                        recipients,
+                        excluded_norm.as_deref(),
+                        &mut seen,
+                    );
+                }
+            }
+        }
+    }
+
+    // Also scan .chinwag/state.crdb if present for recent <SEAT>#<INSTANCE> tokens
+    let crdb_path = repo_root.join(".chinwag").join("state.crdb");
+    if crdb_path.is_file()
+        && let Ok(bytes) = fs::read(&crdb_path)
+    {
+        let text = String::from_utf8_lossy(&bytes);
+        for token in text.split(|c: char| {
+            !(c.is_ascii_alphanumeric() || c == '#' || c == '-' || c == '_' || c == '.')
+        }) {
+            if token.contains('#') && token.len() <= 160 {
+                collect_qualified_thread_address(token, excluded_norm.as_deref(), &mut seen);
+            }
+        }
+    }
+
+    seen.into_values().collect()
+}
+
+fn globs_overlap(a: &str, b: &str) -> bool {
+    let a_clean = a.trim().trim_end_matches("/**").trim_end_matches("/*");
+    let b_clean = b.trim().trim_end_matches("/**").trim_end_matches("/*");
+    if a_clean.is_empty() || b_clean.is_empty() {
+        return false;
+    }
+    if a_clean == "*" || b_clean == "*" || a_clean == b_clean {
+        return true;
+    }
+    a_clean.starts_with(&format!("{b_clean}/")) || b_clean.starts_with(&format!("{a_clean}/"))
+}
+
+/// Checks `.chinwag/tasks/issues/*.md` for any other `03_IN_FLIGHT` ticket touching overlapping `surface_globs`
+/// (`INV-LIVE-THREAD-WORKTREE-BEACON-01`).
+pub fn detect_in_flight_surface_collisions(
+    repo_root: &Path,
+    ticket_id: &str,
+    actor: &str,
+    surface_globs: &[String],
+) -> Vec<SurfaceCollision> {
+    let issues_dir = repo_root.join(".chinwag").join("tasks").join("issues");
+    let Ok(entries) = fs::read_dir(&issues_dir) else {
+        return Vec::new();
+    };
+    let mut collisions = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(issue) = AtomicTaskIssue::from_markdown(&raw) else {
+            continue;
+        };
+        if issue.id.eq_ignore_ascii_case(ticket_id) || issue.status != BoardStatus::InFlight {
+            continue;
+        }
+        let other_owner = issue
+            .author_instance
+            .clone()
+            .or_else(|| issue.assigned_seats.first().cloned())
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        if other_owner.eq_ignore_ascii_case(actor) {
+            continue;
+        }
+        let other_globs: Vec<String> = issue
+            .file_scope
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut overlapping = Vec::new();
+        for my_g in surface_globs {
+            for other_g in &other_globs {
+                if globs_overlap(my_g, other_g) && !overlapping.contains(my_g) {
+                    overlapping.push(my_g.clone());
+                }
+            }
+        }
+        if !overlapping.is_empty() {
+            collisions.push(SurfaceCollision {
+                other_ticket_id: issue.id,
+                other_owner,
+                overlapping_globs: overlapping,
+            });
+        }
+    }
+    collisions.sort_by(|a, b| a.other_ticket_id.cmp(&b.other_ticket_id));
+    collisions
+}
+
+fn run_board_add_or_move(
+    sub: &str,
+    args: &[String],
+    tasks_dir: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let issues_dir = tasks_dir.join("issues");
+    let _ = fs::create_dir_all(&issues_dir);
+    let repo_root = tasks_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut issue_id: Option<String> = None;
+    let mut status_code: Option<String> = None;
+    let mut title = "Chinwag Engineering Task".to_string();
+    let mut tier = DoraTier::M;
+    let mut worktree: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut surfaces: Vec<String> = Vec::new();
+    let mut from_actor: Option<String> = std::env::var("CHINWAG_ACTOR").ok();
+    let mut is_json = false;
+    let mut positionals = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--id" | "--issue" | "--task" if i + 1 < args.len() => {
+                issue_id = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--status" if i + 1 < args.len() => {
+                status_code = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--title" if i + 1 < args.len() => {
+                title = args[i + 1].clone();
+                i += 2;
+            }
+            "--tier" if i + 1 < args.len() => {
+                if let Some(t) = DoraTier::parse(&args[i + 1]) {
+                    tier = t;
+                }
+                i += 2;
+            }
+            "--worktree" if i + 1 < args.len() => {
+                worktree = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--branch" if i + 1 < args.len() => {
+                branch = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--surfaces" | "--surface-globs" if i + 1 < args.len() => {
+                surfaces = args[i + 1]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                i += 2;
+            }
+            "--from" if i + 1 < args.len() => {
+                from_actor = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--repo" | "--tasks-dir" if i + 1 < args.len() => {
+                i += 2;
+            }
+            "--json" => {
+                is_json = true;
+                i += 1;
+            }
+            a if !a.starts_with('-') => {
+                positionals.push(a.to_string());
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    if issue_id.is_none() && !positionals.is_empty() {
+        issue_id = Some(positionals.remove(0));
+    }
+    if status_code.is_none() && !positionals.is_empty() {
+        status_code = Some(positionals.remove(0));
+    }
+
+    let Some(id) = issue_id else {
+        let _ = writeln!(stderr, "chinwag board {sub}: missing <TICKET_ID>");
+        return 2;
+    };
+    if !is_canonical_chwg_ticket_id(&id) {
+        let _ = writeln!(
+            stderr,
+            "H_board rejected [INV-ENTITY-SEP-01]: ticket `{id}` must match ^CHWG-[0-9]{{4}}$"
+        );
+        return EXIT_H_BOARD_REJECT;
+    }
+
+    let target_status = status_code
+        .as_deref()
+        .and_then(BoardStatus::from_code)
+        .unwrap_or(BoardStatus::InFlight);
+
+    let issue_path = issues_dir.join(format!("{id}.md"));
+    let mut issue = if issue_path.is_file()
+        && let Ok(raw) = fs::read_to_string(&issue_path)
+        && let Ok(existing) = AtomicTaskIssue::from_markdown(&raw)
+    {
+        existing
+    } else {
+        AtomicTaskIssue::new_default(&id, &title, tier)
+    };
+
+    if issue.status == BoardStatus::ShippedVerified && target_status != BoardStatus::ShippedVerified
+    {
+        let _ = writeln!(
+            stderr,
+            "chinwag board {sub}: monotonic 05_SHIPPED_VERIFIED protection prevents downgrading {id}"
+        );
+        return 2;
+    }
+    issue.status = target_status;
+    if !surfaces.is_empty() {
+        issue.file_scope = surfaces.join(", ");
+    }
+    if let Some(ref actor) = from_actor {
+        issue.author_instance = Some(actor.clone());
+    }
+    if let Err(e) = fs::write(&issue_path, issue.to_markdown()) {
+        let _ = writeln!(stderr, "chinwag board {sub}: {e}");
+        return 1;
+    }
+
+    if let Some(ref actor) = from_actor {
+        let _ = upsert_agent_thread_board_card(
+            &repo_root,
+            &id,
+            actor,
+            None,
+            &issue.title,
+            target_status == BoardStatus::ShippedVerified,
+            None,
+            if sub == "add" {
+                "board_add"
+            } else {
+                "board_move"
+            },
+        );
+    }
+
+    // Automatic INV-LIVE-THREAD-WORKTREE-BEACON-01 broadcast over the Chinwag bus when adding or moving to 03_IN_FLIGHT
+    if target_status == BoardStatus::InFlight
+        && let Some(ref actor) = from_actor
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "bus",
+            "beacon",
+            "--repo",
+            &repo_root.to_string_lossy(),
+            "--from",
+            actor,
+            "--task",
+            &id,
+        ]);
+        if let Some(ref wt) = worktree {
+            cmd.args(["--worktree", wt]);
+        }
+        if let Some(ref br) = branch {
+            cmd.args(["--branch", br]);
+        }
+        if !issue.file_scope.trim().is_empty() {
+            cmd.args(["--surfaces", &issue.file_scope]);
+        }
+        let _ = cmd.output();
+    }
+
+    let payload = json!({
+        "ok": true,
+        "command": format!("chinwag board {sub}"),
+        "issue_id": id,
+        "status": issue.status.as_code(),
+        "column_header": issue.status.column_header(),
+        "invariants": [
+            "INV-ENTITY-SEP-01",
+            "INV-LIVE-THREAD-WORKTREE-BEACON-01"
+        ]
+    });
+    if is_json {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        let _ = writeln!(
+            stdout,
+            "Updated {} -> {} ({})",
+            id,
+            issue.status.as_code(),
+            issue.status.column_header()
+        );
+    }
+    0
 }
 
 /// Entrypoint for `chinwag ci-report --issue <CHWG-ID> --status <pass|fail> ...` (`INV-CI-BOARD-MUTATION-01`).
@@ -5614,5 +6260,182 @@ mod tests {
         assert!(scan_zero_leak_text(&serialized).is_ok());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_22_entity_firewall_rejects_drey_rmm_multi_id_and_protects_shipped_verified() {
+        let repo_dir = temp_tasks_dir("entity-firewall-repo");
+        let tasks_dir = repo_dir.join(".chinwag/tasks");
+        let issues_dir = tasks_dir.join("issues");
+        fs::create_dir_all(&issues_dir).unwrap();
+
+        let mut shipped_issue =
+            AtomicTaskIssue::new_default("CHWG-0208", "Shipped Header Fix", DoraTier::M);
+        shipped_issue.status = BoardStatus::ShippedVerified;
+        shipped_issue.t_claim_ms = 1_794_370_620_000;
+        shipped_issue.t_ship_ms = 1_794_371_700_000;
+        shipped_issue.loc_changed = Some(180);
+        fs::write(issues_dir.join("CHWG-0208.md"), shipped_issue.to_markdown()).unwrap();
+        sync_board_cards_ledger(&tasks_dir, &[shipped_issue.clone()], None).unwrap();
+
+        // 1. Reject DREY-*, RMM-*, SEC-*, INV-*, CHWG-PM-DELIVERY-LOOP-01, and comma-separated multi-IDs
+        for bad_id in [
+            "DREY-AUDIT-2026-11-11",
+            "DREY-WALLET-SQUIRREL-AUDIT-01",
+            "RMM-DREY-REVIEW-01",
+            "RMM-INVESTIGATIONS-CARBON-HIGH",
+            "SEC-GLASSWORM-HOST-CHECK",
+            "INV-PR-MERGE-TRIBUNAL-01",
+            "CHWG-PM-DELIVERY-LOOP-01",
+            "CHWG-0209,CHWG-0207.3",
+            "CHWG-0203,CHWG-0205,CHWG-0227..0233",
+            "CHWG-9999",
+        ] {
+            let err = upsert_agent_thread_board_card(
+                &repo_dir,
+                bad_id,
+                "DEX",
+                None,
+                "Safe summary",
+                true,
+                None,
+                "memory_retain",
+            )
+            .expect_err(&format!("must reject {bad_id}"));
+            assert!(
+                err.contains("INV-ENTITY-SEP-01"),
+                "expected INV-ENTITY-SEP-01 for {bad_id}, got {err}"
+            );
+        }
+
+        // 2. Reject cross-entity body/summary strings even on a valid CHWG-0208 ID
+        for bad_summary in [
+            "Audit Drey Finance wallet",
+            "Rogue Machine Media LLC review",
+            "SquirrelSystems Robert R. Khan check",
+            "2Real token contract",
+        ] {
+            let err = upsert_agent_thread_board_card(
+                &repo_dir,
+                "CHWG-0208",
+                "DEX",
+                None,
+                bad_summary,
+                false,
+                None,
+                "memory_retain",
+            )
+            .expect_err(&format!("must reject summary `{bad_summary}`"));
+            assert!(err.contains("INV-ENTITY-SEP-01"));
+        }
+
+        // 3. Monotonic 05_SHIPPED_VERIFIED protection: mark_completed=false or stale sync cannot downgrade CHWG-0208
+        let card_after = upsert_agent_thread_board_card(
+            &repo_dir,
+            "CHWG-0208",
+            "DEX",
+            Some("INFRAJR"),
+            "Follow-up bus receipt",
+            false,
+            None,
+            "bus_send",
+        )
+        .unwrap();
+        assert_eq!(card_after.status, "05_SHIPPED_VERIFIED");
+
+        let mut stale_issue = shipped_issue.clone();
+        stale_issue.status = BoardStatus::InFlight;
+        let ledger_after = sync_board_cards_ledger(&tasks_dir, &[stale_issue], None).unwrap();
+        assert_eq!(ledger_after.cards.len(), 1);
+        assert_eq!(ledger_after.cards[0].id, "CHWG-0208");
+        assert_eq!(ledger_after.cards[0].status, "05_SHIPPED_VERIFIED");
+
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn test_23_discover_live_threads_surface_collision_and_crisis_alert_banner() {
+        let repo_dir = temp_tasks_dir("beacon-crisis-repo");
+        let bus_dir = repo_dir.join(".chinwag/bus");
+        let issues_dir = repo_dir.join(".chinwag/tasks/issues");
+        fs::create_dir_all(&bus_dir).unwrap();
+        fs::create_dir_all(&issues_dir).unwrap();
+
+        let lines = [
+            json!({
+                "id": "bus-1",
+                "ts_unix": 1_794_380_000_u64,
+                "sender": "GEMINI-PM#f3ef0a87-893f-45d3-a15e-10a9f7e558cc",
+                "to": "DEX#6df4d436df6c01617dcd2f4e404673fc,INFRAJR#0049dd19946d89fd047810fec6676b05",
+                "room": "#mgmt",
+                "body": "Delegate CHWG-0234"
+            })
+            .to_string(),
+            json!({
+                "id": "bus-2",
+                "ts_unix": 1_794_380_100_u64,
+                "sender": "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",
+                "to": "QA#81126a23-dd44-4e64-8450-bf1a6c8e3c7b",
+                "room": "#eng",
+                "body": "Ready for QA"
+            })
+            .to_string(),
+        ];
+        fs::write(bus_dir.join("messages.jsonl"), lines.join("\n")).unwrap();
+
+        let live = discover_live_thread_instances(
+            &repo_dir,
+            Some("DEX#6df4d436df6c01617dcd2f4e404673fc"),
+        );
+        assert_eq!(
+            live,
+            vec![
+                "GEMINI-PM#f3ef0a87-893f-45d3-a15e-10a9f7e558cc".to_string(),
+                "INFRAJR#0049dd19946d89fd047810fec6676b05".to_string(),
+                "QA#81126a23-dd44-4e64-8450-bf1a6c8e3c7b".to_string(),
+                "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA".to_string(),
+            ]
+        );
+
+        let mut other_issue =
+            AtomicTaskIssue::new_default("CHWG-0230", "Other In-Flight Work", DoraTier::M);
+        other_issue.status = BoardStatus::InFlight;
+        other_issue.author_instance = Some("WORKHORSE#AaFG0NdpegKhpXXEB_-qPA".to_string());
+        other_issue.file_scope = "crates/chinwag-cli/src/board/**".to_string();
+        fs::write(issues_dir.join("CHWG-0230.md"), other_issue.to_markdown()).unwrap();
+
+        let collisions = detect_in_flight_surface_collisions(
+            &repo_dir,
+            "CHWG-0234",
+            "DEX#6df4d436df6c01617dcd2f4e404673fc",
+            &["crates/chinwag-cli/src/board/mod.rs".to_string()],
+        );
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].other_ticket_id, "CHWG-0230");
+        assert_eq!(collisions[0].other_owner, "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA");
+
+        write_active_crisis(
+            &repo_dir,
+            &ActiveCrisisRecord {
+                schema: "chinwag.bus.crisis.v1".to_string(),
+                invariant: "INV-CRISIS-ALL-STOP-BROADCAST-01".to_string(),
+                active: true,
+                sender: "GEMINI-PM#f3ef0a87-893f-45d3-a15e-10a9f7e558cc".to_string(),
+                task_id: Some("CHWG-0234".to_string()),
+                message: "Halt unguarded board sync".to_string(),
+                ts_unix: 1_794_380_200,
+                ts_iso: "2026-11-11T06:15:00-0600 CST".to_string(),
+                notified_threads: live,
+            },
+        )
+        .unwrap();
+
+        let mut stderr = Vec::new();
+        emit_active_crisis_alert_if_any(&repo_dir, &mut stderr);
+        let alert = String::from_utf8(stderr).unwrap();
+        assert!(alert.contains("INV-CRISIS-ALL-STOP-BROADCAST-01"));
+        assert!(alert.contains("Halt unguarded board sync"));
+
+        let _ = fs::remove_dir_all(&repo_dir);
     }
 }

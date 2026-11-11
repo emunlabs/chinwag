@@ -139,6 +139,20 @@
     "system2_escalated": false,
     "evaluated_at_ms": 1794382346153
   },
+  "CHWG-0198:05_SHIPPED_VERIFIED:220": {
+    "issue_id": "CHWG-0198",
+    "dora_tier_guess": "M",
+    "clef_max_trigger": 0.2076,
+    "clef_redaction_clean_score": 0.8959,
+    "clairic_loc_p10": 210.0,
+    "clairic_loc_median": 225.0,
+    "clairic_loc_p90": 230.0,
+    "clairic_burn_usd_median": 2.04,
+    "clairic_minutes_median": 43.0,
+    "clairic_ci_fail_prob_median": 0.01,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794397783132
+  },
   "CHWG-0199:04_TRIBUNAL_GATE:640": {
     "issue_id": "CHWG-0199",
     "dora_tier_guess": "L",
@@ -194,6 +208,20 @@
     "clairic_ci_fail_prob_median": 0.21,
     "system2_escalated": false,
     "evaluated_at_ms": 1794382346158
+  },
+  "CHWG-0203:03_IN_FLIGHT:1680": {
+    "issue_id": "CHWG-0203",
+    "dora_tier_guess": "XL",
+    "clef_max_trigger": 0.5532,
+    "clef_redaction_clean_score": 0.8157,
+    "clairic_loc_p10": 1100.0,
+    "clairic_loc_median": 1655.0,
+    "clairic_loc_p90": 1720.0,
+    "clairic_burn_usd_median": 10.16,
+    "clairic_minutes_median": 140.0,
+    "clairic_ci_fail_prob_median": 0.2,
+    "system2_escalated": true,
+    "evaluated_at_ms": 1794399007892
   },
   "CHWG-0204:02_SCOPED_BENCHMARKED:380": {
     "issue_id": "CHWG-0204",
@@ -251,6 +279,20 @@
     "system2_escalated": false,
     "evaluated_at_ms": 1794382346164
   },
+  "CHWG-0207:05_SHIPPED_VERIFIED:480": {
+    "issue_id": "CHWG-0207",
+    "dora_tier_guess": "L",
+    "clef_max_trigger": 0.3764,
+    "clef_redaction_clean_score": 0.8366,
+    "clairic_loc_p10": 400.0,
+    "clairic_loc_median": 480.0,
+    "clairic_loc_p90": 490.0,
+    "clairic_burn_usd_median": 3.36,
+    "clairic_minutes_median": 83.0,
+    "clairic_ci_fail_prob_median": 0.11,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794397784873
+  },
   "CHWG-0208:03_IN_FLIGHT:560": {
     "issue_id": "CHWG-0208",
     "dora_tier_guess": "L",
@@ -264,6 +306,20 @@
     "clairic_ci_fail_prob_median": 0.16,
     "system2_escalated": false,
     "evaluated_at_ms": 1794382346166
+  },
+  "CHWG-0208:05_SHIPPED_VERIFIED:560": {
+    "issue_id": "CHWG-0208",
+    "dora_tier_guess": "L",
+    "clef_max_trigger": 0.5537,
+    "clef_redaction_clean_score": 0.82,
+    "clairic_loc_p10": 520.0,
+    "clairic_loc_median": 560.0,
+    "clairic_loc_p90": 580.0,
+    "clairic_burn_usd_median": 3.69,
+    "clairic_minutes_median": 104.0,
+    "clairic_ci_fail_prob_median": 0.14,
+    "system2_escalated": true,
+    "evaluated_at_ms": 1794397786060
   },
   "CHWG-0209:02_SCOPED_BENCHMARKED:720": {
     "issue_id": "CHWG-0209",
@@ -446,5 +502,19 @@
     "clairic_ci_fail_prob_median": 0.08,
     "system2_escalated": false,
     "evaluated_at_ms": 1794382346200
+  },
+  "CHWG-0234:05_SHIPPED_VERIFIED:165": {
+    "issue_id": "CHWG-0234",
+    "dora_tier_guess": "M",
+    "clef_max_trigger": 0.3178,
+    "clef_redaction_clean_score": 0.8251,
+    "clairic_loc_p10": 150.0,
+    "clairic_loc_median": 165.0,
+    "clairic_loc_p90": 175.0,
+    "clairic_burn_usd_median": 2.26,
+    "clairic_minutes_median": 88.0,
+    "clairic_ci_fail_prob_median": 0.11,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794397787592
   }
 }
