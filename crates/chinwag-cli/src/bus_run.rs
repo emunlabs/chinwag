@@ -1902,6 +1902,8 @@ fn print_bus_help(stdout: &mut dyn Write) -> u8 {
         r#"Usage:
   chinwag bus instance
   chinwag bus status [--json]
+  chinwag bus recovery diagnose --deployment ABSOLUTE_RECORD_JSON [--offline] --json
+  chinwag bus recovery sop --json
   chinwag bus network-status [--repo <path>] --json
   chinwag bus receipt --id <ORIGINAL-ID> --digest <SHA256> [--repo <path>] --json
   chinwag bus daemon [--port <44330>] [--repo <path>] [--no-governors]
@@ -1978,6 +1980,9 @@ pub(crate) fn invoke_admitted_bus_task(
 }
 
 pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    if args.first().map(String::as_str) == Some("recovery") {
+        return chinwag_cli::bus_recovery_run::run_recovery_cli(&args[1..], stdout, stderr);
+    }
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     if sub == "--help" || sub == "-h" || sub == "help" {
         return print_bus_help(stdout);
