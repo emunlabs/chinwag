@@ -11,7 +11,10 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const uiDir = path.join(repoRoot, "crates/chinwag-cli/assets/ui-v4");
 const indexHtml = fs.readFileSync(path.join(uiDir, "index.html"), "utf8");
+const themeBootJs = fs.readFileSync(path.join(uiDir, "theme-boot.js"), "utf8");
 const stylesCss = fs.readFileSync(path.join(uiDir, "styles.css"), "utf8");
+const motionCss = fs.readFileSync(path.join(uiDir, "motion.css"), "utf8");
+const motionJs = fs.readFileSync(path.join(uiDir, "motion.js"), "utf8");
 const appJs = fs.readFileSync(path.join(uiDir, "app.js"), "utf8");
 const workbenchRs = fs.readFileSync(
   path.join(repoRoot, "crates/chinwag-cli/src/ui_workbench_run.rs"),
@@ -73,11 +76,39 @@ function assertVerifiedChinwagRoutes(surface, text) {
 
 for (const [name, content] of [
   ["index.html", indexHtml],
+  ["theme-boot.js", themeBootJs],
   ["styles.css", stylesCss],
+  ["motion.css", motionCss],
+  ["motion.js", motionJs],
   ["app.js", appJs],
 ]) {
   assertZeroCustomerJargon(name, content);
   assertVerifiedChinwagRoutes(name, content);
+}
+
+// CHWG-0254 Phase 1 static & zero-voice-stub contracts
+assert.equal(
+  themeBootJs.includes('localStorage.getItem("chinwag.ui.rail")') &&
+    themeBootJs.includes("document.documentElement.dataset.rail"),
+  true,
+  "theme-boot.js must restore chinwag.ui.rail into document.documentElement.dataset.rail pre-paint",
+);
+for (const requiredId of [
+  'id="d2-rail"',
+  'id="d2-track"',
+  'id="d2-spine"',
+  'id="d2-drawer-scrim"',
+  'id="btn-d2-drawer"',
+  'id="app-body"',
+]) {
+  assert.equal(indexHtml.includes(requiredId), true, `index.html missing ${requiredId}`);
+}
+for (const phase2VoiceStub of ["d2-btn-mic", "d2-voice", "voice-call", "Start voice", "Mute mic"]) {
+  assert.equal(
+    indexHtml.includes(phase2VoiceStub) || appJs.includes(phase2VoiceStub),
+    false,
+    `CHWG-0254 Phase 1 must contain zero Phase 2 Duplex Voice stubs ('${phase2VoiceStub}')`,
+  );
 }
 
 // Verify Rust server URLs & 4-pack SKU -> wizard slug parity
@@ -161,7 +192,29 @@ assert.equal(
   "styles.css desktop .menu-btn hide rule must follow .btn-secondary and precede mobile media override",
 );
 
+// CHWG-0254 CSS container-query, 1px shared spine, and no-rewrap .d2-track contracts
+for (const cssSnippet of [
+  "container: main / inline-size;",
+  "@container main (min-width: 1120px)",
+  "@container main (max-width: 1119.98px)",
+  "max-width: calc(100vw - var(--rail-current) - 48px);",
+  "left: calc(var(--rail-current) - 1px);",
+  "contain: layout paint;",
+]) {
+  assert.equal(
+    stylesCss.includes(cssSnippet),
+    true,
+    `styles.css missing CHWG-0254 layout contract '${cssSnippet}'`,
+  );
+}
+
 // 3. Live Node VM DOM & Behavioral Harness against app.js
+function attrToDatasetKey(attr) {
+  return attr
+    .slice(5)
+    .replace(/-([a-z])/g, (_m, ch) => ch.toUpperCase());
+}
+
 class StubNode {
   constructor(tagName) {
     this.tagName = String(tagName || "DIV").toUpperCase();
@@ -181,6 +234,9 @@ class StubNode {
   }
   get firstChild() {
     return this.children.length > 0 ? this.children[0] : null;
+  }
+  get childElementCount() {
+    return this.children.filter((c) => c.tagName !== "__TEXT__").length;
   }
   get isConnected() {
     return true;
@@ -230,14 +286,23 @@ class StubNode {
     const sv = String(v);
     if (k === "id") this.id = sv;
     if (k === "class") this.className = sv;
+    if (k.startsWith("data-")) this.dataset[attrToDatasetKey(k)] = sv;
     this.attributes.set(k, sv);
   }
   getAttribute(k) {
     if (k === "id" && this.id) return this.id;
     if (k === "class" && this.className) return this.className;
-    return this.attributes.has(k) ? this.attributes.get(k) : null;
+    if (this.attributes.has(k)) return this.attributes.get(k);
+    if (k.startsWith("data-")) {
+      const dk = attrToDatasetKey(k);
+      if (Object.prototype.hasOwnProperty.call(this.dataset, dk)) return String(this.dataset[dk]);
+    }
+    return null;
   }
   removeAttribute(k) {
+    if (k === "id") this.id = "";
+    if (k === "class") this.className = "";
+    if (k.startsWith("data-")) delete this.dataset[attrToDatasetKey(k)];
     this.attributes.delete(k);
   }
   addEventListener(type, fn) {
@@ -263,8 +328,10 @@ class StubNode {
     if (s === '.popover[data-state="closing"]') {
       return this.className.split(/\s+/).includes("popover") && this.dataset.state === "closing";
     }
+    if (s.startsWith("#")) return this.id === s.slice(1);
     if (s.startsWith(".")) return this.className.split(/\s+/).includes(s.slice(1));
     if (s === "[href]") return this.attributes.has("href");
+    if (s === '[role="switch"]') return this.getAttribute("role") === "switch";
     if (s === "button.btn-primary") {
       return this.tagName === "BUTTON" && this.className.split(/\s+/).includes("btn-primary");
     }
@@ -289,25 +356,46 @@ class StubNode {
 }
 
 const byId = new Map();
-function mountEl(tag, id, hidden = false) {
+function mountEl(tag, id, hidden = false, parent = null) {
   const n = new StubNode(tag);
   n.id = id;
   n.hidden = hidden;
   byId.set(id, n);
+  if (parent) parent.appendChild(n);
   return n;
 }
 
 const docEl = new StubNode("html");
 docEl.setAttribute("data-theme", "stone");
-const btnPrivacy = mountEl("button", "btn-privacy");
-const btnMobileMenu = mountEl("button", "btn-mobile-menu");
-const btnInvite = mountEl("button", "btn-invite");
+const bodyEl = mountEl("body", "doc-body", false, docEl);
+const btnPrivacy = mountEl("button", "btn-privacy", false, bodyEl);
+const btnMobileMenu = mountEl("button", "btn-mobile-menu", false, bodyEl);
+const btnD2Drawer = mountEl("button", "btn-d2-drawer", false, bodyEl);
+const btnInvite = mountEl("button", "btn-invite", false, bodyEl);
 btnInvite._computedDisplay = "none";
-const popoverLayer = mountEl("div", "popover-layer", true);
-mountEl("div", "modal-scrim", true);
-const modalLayer = mountEl("div", "modal-layer", true);
-mountEl("div", "toast-region", false);
-mountEl("div", "sr-announcer", false);
+const appBody = mountEl("div", "app-body", false, bodyEl);
+const d2DrawerScrim = mountEl("div", "d2-drawer-scrim", true, appBody);
+const d2Rail = mountEl("aside", "d2-rail", false, appBody);
+const d2Track = mountEl("div", "d2-track", false, d2Rail);
+const d2Spine = mountEl("div", "d2-spine", false, d2Rail);
+const mainEl = mountEl("main", "main", false, appBody);
+const viewRoot = mountEl("div", "view-root", false, mainEl);
+const askPmInput = mountEl("input", "ask-pm-input", false, viewRoot);
+const sheetPrimaryAction = mountEl("button", "sheet-primary-action", false, viewRoot);
+const popoverLayer = mountEl("div", "popover-layer", true, bodyEl);
+mountEl("div", "modal-scrim", true, bodyEl);
+const modalLayer = mountEl("div", "modal-layer", true, bodyEl);
+mountEl("div", "toast-region", false, bodyEl);
+mountEl("div", "sr-announcer", false, bodyEl);
+
+function findByIdInTree(root, targetId) {
+  if (root.id === targetId) return root;
+  for (const ch of root.children) {
+    const hit = findByIdInTree(ch, targetId);
+    if (hit) return hit;
+  }
+  return null;
+}
 
 const stubDocument = {
   readyState: "loading",
@@ -322,13 +410,14 @@ const stubDocument = {
     t._text = String(txt ?? "");
     return t;
   },
-  getElementById: (id) => byId.get(id) || null,
-  querySelector: () => null,
-  querySelectorAll: () => [],
+  getElementById: (id) => findByIdInTree(docEl, id) || byId.get(id) || null,
+  querySelector: (sel) => docEl.querySelector(sel),
+  querySelectorAll: (sel) => docEl.querySelectorAll(sel),
   addEventListener() {},
 };
 
 const stubWindow = {
+  innerWidth: 1440,
   location: { hash: "#inbox" },
   addEventListener() {},
   setInterval: () => 1,
@@ -343,16 +432,63 @@ const transformedSrc = appJs
     `const Motion = new Proxy({
       settled: () => new Promise((r) => setTimeout(r, 25)),
       guardAction: async (_btn, fn) => ({ value: await fn(), release: () => {} }),
+      isArming: () => false,
+      animateRailToggle: (_rail, _track, _spine, _main, _expand, applyStateFn) => {
+        if (typeof applyStateFn === "function") applyStateFn();
+        return Promise.resolve();
+      },
+      dipSwap: (_node, swapFn) => {
+        if (typeof swapFn === "function") swapFn();
+        return Promise.resolve();
+      },
+      resolveBanner: async (_node, settleFn) => {
+        if (typeof settleFn === "function") settleFn();
+      },
+      flashDeliveryCard: (card) => {
+        if (card && card.dataset) card.dataset.handoffFlash = "true";
+      },
+      createProportionalStreamer: ({ onTick, onFinish }) => {
+        let buf = "";
+        let timer = null;
+        return {
+          push(txt) {
+            buf = String(txt ?? "");
+            if (typeof onTick === "function") onTick(buf.slice(0, Math.max(4, Math.ceil(buf.length / 8))));
+          },
+          markDone() {
+            timer = setTimeout(() => {
+              if (typeof onTick === "function") onTick(buf);
+              if (typeof onFinish === "function") onFinish();
+            }, 30);
+          },
+          cancel() {
+            if (timer) clearTimeout(timer);
+          },
+        };
+      },
       createToaster: () => ({ show() {}, dismiss() {} }),
-      createElapsedClock: () => ({ bind() {}, destroy() {} }),
+      createElapsedClock: () => ({ bind() {}, poke() {}, destroy() {} }),
       bindIndicator: () => ({ update() {}, destroy() {} }),
       observeLoop: () => {},
       switchTheme: (next) => stubDocument.documentElement.setAttribute("data-theme", next),
-    }, { get(t, k) { return k in t ? t[k] : () => ({ update() {}, destroy() {}, show() {}, dismiss() {} }); } });`,
+    }, { get(t, k) { return k in t ? t[k] : () => ({ update() {}, destroy() {}, show() {}, dismiss() {}, open() {}, close: async () => {}, poke() {} }); } });`,
   )
   .replace(/^export\s+/gm, "");
 
 let mockWorkflowHandler = async (body) => ({ ok: true, workflow: body });
+let mockD2MessageHandler = async (body) => ({
+  ok: true,
+  entry: {
+    id: "qa-live-1",
+    kind: "qa_card",
+    seq: 9,
+    author: "Delivery-2",
+    body: `Scoped reply for: ${body.prompt}`,
+    sources: [{ id: "src-inbox", label: "Inbox · 1 ready diff", hash: "#inbox" }],
+  },
+});
+let d2CancelCalls = [];
+
 const sandbox = {
   console,
   setTimeout,
@@ -401,13 +537,21 @@ const sandbox = {
         return { ok: false, status: 500, json: async () => ({ ok: false, error: err.message }) };
       }
     }
+    if (url === "/api/v1/delivery2/message") {
+      const res = await mockD2MessageHandler(body);
+      return { ok: true, status: 200, json: async () => res };
+    }
+    if (url === "/api/v1/delivery2/cancel") {
+      d2CancelCalls.push(body);
+      return { ok: true, status: 200, json: async () => ({ ok: true, cancelled: true, credits_charged: 0 }) };
+    }
     return { ok: true, status: 202, json: async () => ({ ok: true, telemetry_enabled: true }) };
   },
 };
 
 vm.createContext(sandbox);
 vm.runInContext(
-  `${transformedSrc}\nglobalThis.__test = { state, normalizeBootstrap, saveWorkflowSettings, openPrivacyPopover, openMobileMenuPopover, openInviteModal, closePopover, closeModal, wizardPackSlugForSku };`,
+  `${transformedSrc}\nglobalThis.__test = { state, normalizeBootstrap, saveWorkflowSettings, openPrivacyPopover, openMobileMenuPopover, openInviteModal, closePopover, closeModal, wizardPackSlugForSku, renderDelivery2Panel, toggleDelivery2Rail, setDelivery2RailExpanded, openD2Popover, closeD2Popover, submitDelivery2Prompt, cancelDelivery2Turn, handleGlobalKeydown, applyRouteFromLocation, bounceToDelivery2Run };`,
   sandbox,
 );
 
@@ -485,10 +629,204 @@ mockWorkflowHandler = async () => {
 await assert.rejects(() => T.saveWorkflowSettings({ review_tier_credits: 200 }));
 assert.equal(T.state.data.agents.review_tier_credits, 100);
 
+// Suite F: CHWG-0254 Delivery-2 4-zone render, 12-step run card, Paused · 0 Cr HITL card,
+// Verified sources, Saved memory card, + Connections 2-axis popover, and generation-guarded dismiss
+T.state.data = T.normalizeBootstrap({});
+T.renderDelivery2Panel();
+
+assert.equal(d2Track.querySelector(".d2-title").textContent, "Delivery-2");
+assert.equal(d2Track.querySelectorAll(".d2-sync-pill").length, 4);
+assert.equal(d2Track.querySelectorAll(".d2-digest-row").length, 3);
+assert.equal(d2Track.querySelectorAll(".d2-seg").length, 12);
+assert.equal(d2Spine.querySelectorAll(".d2-spine-seg").length, 12);
+assert.equal(d2Spine.querySelectorAll(".d2-spine-dot").length, 4);
+assert.equal(
+  d2Track.querySelectorAll(".d2-zero-cr-pill").some((n) => n.textContent === "Paused · 0 Cr"),
+  true,
+  "HITL approval card must display Paused · 0 Cr badge",
+);
+assert.equal(
+  d2Track.querySelectorAll("button").some((b) => b.textContent.includes("Verified sources")),
+  true,
+  "Grounded Q&A card must render collapsed Verified sources disclosure",
+);
+assert.equal(
+  d2Track.querySelector(".d2-mem-card").textContent.includes("Saved: "),
+  true,
+  "Memory card must render Saved: 1-line notice",
+);
+
+await T.openD2Popover("connections", "linear");
+const connPop = stubDocument.getElementById("d2-connections-popover");
+assert.ok(connPop, "+ Connections popover must mount");
+assert.equal(
+  connPop.querySelectorAll(".d2-conn-auth").some((n) =>
+    n.textContent.includes("Connected · ambient status cards only"),
+  ),
+  true,
+  "Slack row in + Connections must enforce INV-SLACK-NOT-DELIVERY2-01 ambient status copy",
+);
+assert.equal(
+  connPop.querySelectorAll("button").some((b) => b.textContent.includes("Connect")),
+  true,
+  "Unlinked Linear surface must expose Connect button",
+);
+assert.deepEqual(
+  connPop.querySelectorAll("a").map((a) => a.getAttribute("href")),
+  ["https://chinwag.sh/security", "https://chinwag.sh/pricing?talk=1&source=local_ui#founders"],
+);
+
+// Generation-guarded closeD2Popover() race: start animated close, reopen history 5ms later -> must survive
+const staleD2Close = T.closeD2Popover();
+await sleep(5);
+await T.openD2Popover("history");
+await staleD2Close;
+await sleep(35);
+assert.ok(
+  stubDocument.getElementById("d2-history-popover"),
+  "stale closeD2Popover() timer must never wipe newly opened Recent threads popover",
+);
+await T.closeD2Popover({ immediate: true });
+
+// Suite G: Keyboard shortcuts — Cmd+B toggle + persistence, Cmd+J expand+focus, untouched Cmd+K, region-scoped Cmd+Enter
+stubWindow.innerWidth = 1440;
+await T.setDelivery2RailExpanded(true, { persist: true, animate: false });
+assert.equal(docEl.getAttribute("data-rail"), "expanded");
+
+T.handleGlobalKeydown({
+  key: "b",
+  metaKey: true,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  target: bodyEl,
+  preventDefault() {},
+});
+assert.equal(docEl.getAttribute("data-rail"), "collapsed");
+assert.equal(sandbox.localStorage.getItem("chinwag.ui.rail"), "collapsed");
+
+T.handleGlobalKeydown({
+  key: "j",
+  metaKey: true,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  target: bodyEl,
+  preventDefault() {},
+});
+await sleep(10);
+assert.equal(docEl.getAttribute("data-rail"), "expanded");
+assert.equal(stubDocument.activeElement.id, "d2-composer-input");
+
+T.handleGlobalKeydown({
+  key: "k",
+  metaKey: true,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  target: bodyEl,
+  preventDefault() {},
+});
+await sleep(10);
+assert.equal(stubDocument.activeElement, askPmInput, "Cmd+K must remain 100% dedicated to Inbox #ask-pm-input");
+
+// Region-scoped Cmd+Enter: inside #d2-rail MUST submit only to Delivery-2 and NEVER click #sheet-primary-action
+let sheetMergeClicks = 0;
+sheetPrimaryAction.onclick = () => {
+  sheetMergeClicks += 1;
+};
+T.state.openItemId = "item-ready-1";
+const d2Input = stubDocument.getElementById("d2-composer-input");
+d2Input.value = "What did I miss?";
+d2Input.focus();
+let submittedPrompts = [];
+mockD2MessageHandler = async (body) => {
+  submittedPrompts.push(body.prompt);
+  return {
+    ok: true,
+    entry: { id: "qa-2", kind: "qa_card", seq: 10, author: "Delivery-2", body: "Grounded summary ready.", sources: [] },
+  };
+};
+T.handleGlobalKeydown({
+  key: "Enter",
+  metaKey: true,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  target: d2Input,
+  preventDefault() {},
+});
+await sleep(60);
+assert.deepEqual(submittedPrompts, ["What did I miss?"]);
+assert.equal(sheetMergeClicks, 0, "Cmd+Enter inside #d2-rail must NEVER trigger Inbox sheet merge");
+
+// Outside #d2-rail, Cmd+Enter triggers #sheet-primary-action as expected
+askPmInput.focus();
+T.handleGlobalKeydown({
+  key: "Enter",
+  metaKey: true,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  target: askPmInput,
+  preventDefault() {},
+});
+assert.equal(sheetMergeClicks, 1);
+T.state.openItemId = null;
+
+// Suite H: Enabled Stop button (#d2-btn-stop) + Cmd+. active reply cancellation (fixes D1 disabled Stop bug)
+let resolveInFlight;
+mockD2MessageHandler = () =>
+  new Promise((resolve) => {
+    resolveInFlight = resolve;
+  });
+const inFlightPromise = T.submitDelivery2Prompt("Scope retry backoff tests");
+await sleep(5);
+const stopBtn = stubDocument.getElementById("d2-btn-stop");
+assert.ok(stopBtn, "Active Delivery-2 turn must mount #d2-btn-stop");
+assert.notEqual(stopBtn.getAttribute("aria-disabled"), "true", "#d2-btn-stop must be enabled during active reply");
+
+d2CancelCalls = [];
+T.handleGlobalKeydown({
+  key: ".",
+  metaKey: true,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  target: d2Input,
+  preventDefault() {},
+});
+await sleep(15);
+assert.equal(d2CancelCalls.length, 1, "Cmd+. must POST /api/v1/delivery2/cancel");
+assert.ok(stubDocument.getElementById("d2-btn-send"), "Cancelling turn must restore #d2-btn-send immediately");
+resolveInFlight({ ok: true });
+await inFlightPromise;
+
+// Suite I: Slack #run=<id>&focus=delivery2 deep-link bounce + narrow-viewport overlay sheet auto-collapse/restore
+await T.setDelivery2RailExpanded(false, { persist: true, animate: false });
+assert.equal(docEl.getAttribute("data-rail"), "collapsed");
+stubWindow.location.hash = "#run=run-local-1&focus=delivery2";
+T.applyRouteFromLocation();
+assert.equal(docEl.getAttribute("data-rail"), "expanded", "Deep-link bounce must expand Delivery-2 rail");
+const bouncedCard = d2Track.querySelector(".d2-run-card");
+assert.ok(bouncedCard && bouncedCard.dataset.handoffFlash === "true", "Deep-link bounce must flash target run card");
+assert.equal(stubDocument.activeElement.id, "d2-composer-input", "Deep-link bounce must focus #d2-composer-input");
+
+// At 1280px viewport (1280 - 320 = 960 < 1120), opening #walkthrough overlay sheet auto-collapses rail and restores on #inbox
+stubWindow.innerWidth = 1280;
+await T.setDelivery2RailExpanded(true, { persist: true, animate: false });
+stubWindow.location.hash = "#walkthrough";
+T.applyRouteFromLocation();
+assert.equal(docEl.getAttribute("data-rail"), "collapsed", "Overlay review sheet on <1120px #main must auto-collapse rail");
+stubWindow.location.hash = "#inbox";
+T.applyRouteFromLocation();
+assert.equal(docEl.getAttribute("data-rail"), "expanded", "Closing overlay review sheet must restore expanded rail");
+stubWindow.innerWidth = 1440;
+
 console.log(
   JSON.stringify({
     ok: true,
     script: "verify-ui-v4-contracts.mjs",
-    suites_passed: 5,
+    suites_passed: 9,
   }),
 );

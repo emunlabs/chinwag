@@ -20,6 +20,12 @@
 
   <header class="app-header" id="app-header" role="banner">
     <div class="hdr-left">
+      <button class="btn-icon d2-mobile-trigger" id="btn-d2-drawer" type="button" aria-controls="d2-rail" aria-expanded="false" aria-label="Open Delivery-2 (⌘B)" title="Open Delivery-2 (⌘B)">
+        <svg class="icon-svg" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="2" y="2.5" width="12" height="11" rx="2"></rect>
+          <path d="M6 2.5v11"></path>
+        </svg>
+      </button>
       <a class="wordmark" href="#inbox" aria-label="chinwag, go to Inbox">chinwag</a>
       <button class="repo-pill" id="repo-pill" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Change repository">
         <span class="repo" id="repo-pill-name">Select repository</span>
@@ -79,10 +85,18 @@
     <span class="tab-ink" aria-hidden="true"></span>
   </nav>
 
-  <main id="main" class="app-main" tabindex="-1">
-    <div id="session-alert-host"></div>
-    <div id="view-root"></div>
-  </main>
+  <div class="app-body" id="app-body">
+    <div class="d2-drawer-scrim" id="d2-drawer-scrim" hidden></div>
+    <aside id="d2-rail" class="d2-rail" aria-label="Delivery-2">
+      <div id="d2-track" class="d2-track"></div>
+      <div id="d2-spine" class="d2-spine" aria-label="Delivery-2 quick status"></div>
+    </aside>
+
+    <main id="main" class="app-main" tabindex="-1">
+      <div id="session-alert-host"></div>
+      <div id="view-root"></div>
+    </main>
+  </div>
 
   <div class="popover-layer" id="popover-layer" hidden></div>
   <div class="modal-scrim" id="modal-scrim" hidden></div>

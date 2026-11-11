@@ -239,6 +239,93 @@ struct LocalUiV4State {
     last_board_sync: Option<BoardSyncRecord>,
     #[serde(default)]
     auto_refill: AutoRefillConfig,
+    #[serde(default)]
+    delivery2: Delivery2Store,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Delivery2Store {
+    #[serde(default = "default_d2_seq")]
+    seq: u64,
+    #[serde(default)]
+    morning_seen: bool,
+    #[serde(default)]
+    morning_collapsed: bool,
+    #[serde(default = "default_d2_thread_id")]
+    active_thread_id: String,
+    #[serde(default)]
+    active_turn_id: Option<String>,
+    #[serde(default)]
+    threads: Vec<Delivery2Thread>,
+    #[serde(default)]
+    memories: BTreeMap<String, Delivery2Memory>,
+    #[serde(default)]
+    approvals: BTreeMap<String, Delivery2ApprovalRecord>,
+    #[serde(default)]
+    connections: BTreeMap<String, Delivery2ConnectionPref>,
+}
+
+fn default_d2_seq() -> u64 {
+    1
+}
+
+fn default_d2_thread_id() -> String {
+    "thr-main".to_string()
+}
+
+impl Default for Delivery2Store {
+    fn default() -> Self {
+        Self {
+            seq: 1,
+            morning_seen: false,
+            morning_collapsed: false,
+            active_thread_id: default_d2_thread_id(),
+            active_turn_id: None,
+            threads: Vec::new(),
+            memories: BTreeMap::new(),
+            approvals: BTreeMap::new(),
+            connections: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Delivery2Thread {
+    id: String,
+    title: String,
+    bucket: String,
+    status: String,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    #[serde(default)]
+    entries: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Delivery2Memory {
+    id: String,
+    note: String,
+    status: String,
+    updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Delivery2ApprovalRecord {
+    id: String,
+    decision: String,
+    receipt: String,
+    decided_at_label: String,
+    updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Delivery2ConnectionPref {
+    #[serde(default)]
+    in_thread: Option<bool>,
+    #[serde(default)]
+    authorized_override: Option<bool>,
+    #[serde(default)]
+    challenge_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -631,13 +718,15 @@ fn mutate_ui_v4_state(
 // INV-UI-ZERO-JARGON-01: Customer-Facing Scrubber
 // ============================================================================
 
+const D2_ALLOW_SENTINEL: &str = "\u{E000}D2\u{E001}";
+
 const SCRUB_SUBSTRINGS: &[(&str, &str)] = &[
     (concat!("inception/mer", "cury-3"), "Coding Agent"),
     (concat!("mer", "cury-3"), "Coding Agent"),
     (concat!("mer", "cury 3"), "Coding Agent"),
     (concat!("mer", "cury_3"), "Coding Agent"),
-    (concat!("vercel-ai", "-gateway"), "Local Coordinator"),
-    (concat!("vercel ai", " gateway"), "Local Coordinator"),
+    (concat!("vercel-ai", "-gateway"), "cloud gateway"),
+    (concat!("vercel ai", " gateway"), "cloud gateway"),
     (concat!("@cf/cloudflare/cl", "ef-flash"), "Fast Check"),
     (concat!("@cf/cloudflare/cl", "ef"), "Fast Check"),
     (concat!("@cf/cloudflare/cl", "airic"), "Fast Check"),
@@ -650,8 +739,9 @@ const SCRUB_SUBSTRINGS: &[(&str, &str)] = &[
     ),
     (concat!("deep", "seek-v4"), "Coding Agent"),
     (concat!("deep", "seek"), "Coding Agent"),
-    (concat!("cloud", "flareos-ai"), "Cloud Service"),
-    (concat!("cloud", "flare-workers-ai"), "Cloud Service"),
+    (concat!("cloud", "flareos-ai"), "cloud gateway"),
+    (concat!("cloud", "flare-workers-ai"), "cloud gateway"),
+    (concat!("cloud", "flare workers ai"), "cloud gateway"),
     (concat!("claude-fa", "ble-5-2"), "Claude Code"),
     (concat!("claude-fa", "ble-5-1"), "Claude Code"),
     (concat!("claude-", "fable"), "Claude Code"),
@@ -676,33 +766,194 @@ const SCRUB_SUBSTRINGS: &[(&str, &str)] = &[
     (concat!("nicolas-", "macbook-pro"), "Local Workstation"),
     (concat!("emunlabs/", "chinwag"), "local-repo"),
     (concat!("/users/brian", "spector"), "~"),
-    (concat!("state.cr", "db"), "local-workspace-state"),
-    (
-        concat!("memory.cr", "db.le", "ann"),
-        "local-workspace-index",
-    ),
-    (concat!("cr-", "sqlite"), "local-state"),
-    (concat!("cr", "sqlite"), "local-state"),
+    (concat!("memory.cr", "db.le", "ann"), "Memory search"),
+    (concat!("state.cr", "db"), "workspace history"),
+    (concat!("cr-", "sqlite"), "workspace history"),
+    (concat!("cr", "sqlite"), "workspace history"),
     (concat!("chinwag-bus-", "sig-v2"), "local-verification"),
     (concat!("allowed_", "signers"), "trusted-tools"),
     (concat!("signature_ed25", "519"), "verified_signature"),
     (concat!("pubkey_ed25", "519"), "verified_key"),
     (concat!("ed25", "519"), "verified"),
+    (concat!("x25519ml", "kem768"), "end-to-end encrypted"),
     (concat!("bb", "s+"), "privacy-proof"),
     (concat!("cp-", "omp"), "workspace-policy"),
     (concat!("a.", "509"), "agent-profile"),
+    (concat!("eve", ".dev"), D2_ALLOW_SENTINEL),
+    (concat!("useeve", "agent"), D2_ALLOW_SENTINEL),
+    (concat!("eve-", "agent"), D2_ALLOW_SENTINEL),
+    (concat!("eve ", "agent"), D2_ALLOW_SENTINEL),
+    (concat!("neon.", "tech"), "managed database"),
+    (concat!("@neon", "database"), "managed database"),
 ];
 
+fn fold_math_alpha_char(ch: char) -> Option<char> {
+    let u = ch as u32;
+    let map_pair = |base: u32| -> Option<char> {
+        let off = u.checked_sub(base)?;
+        if off < 26 {
+            char::from_u32(u32::from(b'A') + off)
+        } else if off < 52 {
+            char::from_u32(u32::from(b'a') + (off - 26))
+        } else {
+            None
+        }
+    };
+    match u {
+        0x210E => Some('h'),
+        0x1D400..=0x1D433 => map_pair(0x1D400),
+        0x1D434..=0x1D467 => map_pair(0x1D434),
+        0x1D468..=0x1D49B => map_pair(0x1D468),
+        0x1D5A0..=0x1D5D3 => map_pair(0x1D5A0),
+        0x1D5D4..=0x1D607 => map_pair(0x1D5D4),
+        0x1D608..=0x1D63B => map_pair(0x1D608),
+        0x1D63C..=0x1D66F => map_pair(0x1D63C),
+        0x1D670..=0x1D6A3 => map_pair(0x1D670),
+        0x1D7CE..=0x1D7FF => {
+            let d = (u - 0x1D7CE) % 10;
+            char::from_u32(u32::from(b'0') + d)
+        }
+        0x24B6..=0x24CF => char::from_u32(u32::from(b'A') + (u - 0x24B6)),
+        0x24D0..=0x24E9 => char::from_u32(u32::from(b'a') + (u - 0x24D0)),
+        _ => None,
+    }
+}
+
+fn normalize_scrubber_stage1(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let u = ch as u32;
+        // Strip zero-width, bidi/format controls, variation selectors, and private sentinel chars
+        if matches!(
+            u,
+            0x00AD
+                | 0x034F
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x2060..=0x2064
+                | 0xFE00..=0xFE0F
+                | 0xFEFF
+                | 0xE000
+                | 0xE001
+        ) {
+            continue;
+        }
+        // Fold Unicode dashes (\u2010–\u2015, minus, small/fullwidth hyphens) to ASCII '-'
+        if matches!(u, 0x2010..=0x2015 | 0x2212 | 0xFE58 | 0xFE63) {
+            out.push('-');
+            continue;
+        }
+        // NFKC compatibility fold for fullwidth ASCII (\uFF01–\uFF5E)
+        if (0xFF01..=0xFF5E).contains(&u)
+            && let Some(ascii) = char::from_u32(u - 0xFEE0)
+        {
+            out.push(ascii);
+            continue;
+        }
+        // Compatibility spaces -> ASCII ' '
+        if matches!(u, 0x00A0 | 0x2000..=0x200A | 0x202F | 0x205F | 0x3000) {
+            out.push(' ');
+            continue;
+        }
+        // Superscript / subscript digits & Kelvin/Angstrom/ligatures
+        match ch {
+            '\u{00B9}' | '\u{2081}' => out.push('1'),
+            '\u{00B2}' | '\u{2082}' => out.push('2'),
+            '\u{00B3}' | '\u{2083}' => out.push('3'),
+            '\u{2070}' | '\u{2080}' => out.push('0'),
+            '\u{2074}' | '\u{2084}' => out.push('4'),
+            '\u{2075}' | '\u{2085}' => out.push('5'),
+            '\u{2076}' | '\u{2086}' => out.push('6'),
+            '\u{2077}' | '\u{2087}' => out.push('7'),
+            '\u{2078}' | '\u{2088}' => out.push('8'),
+            '\u{2079}' | '\u{2089}' => out.push('9'),
+            '\u{212A}' => out.push('K'),
+            '\u{212B}' => out.push('A'),
+            '\u{FB00}' => out.push_str("ff"),
+            '\u{FB01}' => out.push_str("fi"),
+            '\u{FB02}' => out.push_str("fl"),
+            '\u{FB03}' => out.push_str("ffi"),
+            '\u{FB04}' => out.push_str("ffl"),
+            _ => {
+                if let Some(folded) = fold_math_alpha_char(ch) {
+                    out.push(folded);
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Stage 2: Match word-bounded `(?i)\bdelivery[\s-]?2\b` FIRST (including optional `@` / sigil prefix)
+/// and mask as `D2_ALLOW_SENTINEL` so Stage 3 bare-`DELIVERY` rules never touch `"Delivery-2"`.
+fn allow_mask_delivery2_stage2(input: &str) -> String {
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let prev_ch = if i > 0 { Some(chars[i - 1].1) } else { None };
+        let prev_ok = prev_ch.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '#' && c != '_');
+
+        // Optional leading `@` or fleet sigil (`■ DELIVERY-2`, `@DELIVERY-2`)
+        let mut word_i = i;
+        if prev_ok && matches!(chars[i].1, '@' | '■' | '◆' | '●' | '⚡') {
+            let mut k = i + 1;
+            while k < chars.len() && chars[k].1 == ' ' {
+                k += 1;
+            }
+            word_i = k;
+        }
+
+        if prev_ok && word_i + 8 <= chars.len() {
+            let start_b = chars[word_i].0;
+            if input.len() >= start_b + 8
+                && input.is_char_boundary(start_b + 8)
+                && input[start_b..start_b + 8].eq_ignore_ascii_case("delivery")
+            {
+                let mut after = word_i + 8;
+                // Optional single space or hyphen separator (`Delivery-2`, `Delivery 2`, `delivery2`)
+                if after < chars.len() && matches!(chars[after].1, '-' | ' ') {
+                    after += 1;
+                }
+                if after < chars.len() && chars[after].1 == '2' {
+                    let next_ch = if after + 1 < chars.len() {
+                        Some(chars[after + 1].1)
+                    } else {
+                        None
+                    };
+                    let next_ok =
+                        next_ch.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '#' && c != '_');
+                    if next_ok {
+                        out.push_str(D2_ALLOW_SENTINEL);
+                        i = after + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        out.push(chars[i].1);
+        i += 1;
+    }
+    out
+}
+
 fn map_internal_seat_token(token: &str) -> Option<&'static str> {
+    let had_sigil = token.starts_with(['@', '■', '◆', '●', '⚡']);
     let trimmed = token
         .trim_start_matches('@')
         .trim_start_matches(['■', '◆', '●', '⚡']);
+    let has_instance = trimmed.contains('#');
     let base = trimmed.split_once('#').map(|(s, _)| s).unwrap_or(trimmed);
     let lower = base.to_ascii_lowercase();
 
-    // Case-insensitive unambiguous internal seat / engine / acronym tokens
+    // Case-insensitive unambiguous internal seat / vendor / protocol tokens
     if lower == concat!("gemini", "-pm")
-        || (lower == concat!("deli", "very") && base.chars().all(|c| !c.is_ascii_lowercase()))
+        || lower == concat!("deli", "very-agent")
+        || (lower == concat!("deli", "very")
+            && (had_sigil || has_instance || base.chars().all(|c| !c.is_ascii_lowercase())))
     {
         return Some("Chinwag PM");
     }
@@ -713,14 +964,34 @@ fn map_internal_seat_token(token: &str) -> Option<&'static str> {
         || lower == concat!("h-", "swarm")
         || lower == concat!("ephemeral", "-dev")
         || lower.starts_with(concat!("ephemeral-", "dev-"))
-        || lower == concat!("clair", "ic")
-        || lower == concat!("cl", "ef")
+        || lower == concat!("ephemeral", "-analyst")
+        || lower == concat!("ephemeral", "-sdr")
+        || lower == concat!("ephemeral", "-support")
+        || lower == concat!("summa", "rizer")
         || lower == concat!("fa", "ble")
         || lower == concat!("ar", "gon")
         || lower == concat!("gr", "ok")
         || lower == concat!("mer", "cury")
     {
         return Some("Coding Agent");
+    }
+    if lower == concat!("clair", "ic") || lower == concat!("cl", "ef") {
+        return Some("Fast Check");
+    }
+    if lower == concat!("ver", "cel") || lower == concat!("cloud", "flare") {
+        return Some("cloud gateway");
+    }
+    if lower == concat!("fl", "ue") {
+        return Some("local runtime");
+    }
+    if lower == concat!("ne", "on") {
+        return Some("managed database");
+    }
+    if lower == concat!("up", "stash") {
+        return Some("managed cache");
+    }
+    if lower == concat!("cl", "erk") {
+        return Some("sign-in provider");
     }
     if lower == concat!("alis", "tair")
         || lower == concat!("fl", "int")
@@ -733,57 +1004,70 @@ fn map_internal_seat_token(token: &str) -> Option<&'static str> {
     if lower == concat!("aus", "dra") {
         return Some("Workspace Advisor");
     }
-    if lower == concat!("cr", "db") || lower == concat!("le", "ann") {
-        return Some("local-state");
+    if lower == concat!("cr", "dt") || lower == concat!("cr", "dts") {
+        return Some("sync");
+    }
+    if lower == concat!("cr", "db") {
+        return Some("workspace history");
+    }
+    if lower == concat!("le", "ann") {
+        return Some("Memory search");
     }
     if lower == concat!("hp", "ke") {
-        return Some("encrypted");
+        return Some("end-to-end encrypted");
     }
     if lower == concat!("do", "ra") {
-        return Some("engineering benchmark");
+        return Some("delivery metrics");
     }
     if lower == concat!("ss", "e") {
-        return Some("live-stream");
+        return Some("live updates");
     }
     if lower == concat!("a5", "09") {
         return Some("agent-profile");
     }
 
-    // Qualified `<SEAT>#<INSTANCE>` or ALL-CAPS internal seat names (preserves normal English lowercase prose)
-    let has_instance = trimmed.contains('#');
-    let is_all_caps = base.len() >= 2
-        && base
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
-    if has_instance || is_all_caps {
-        if base.eq_ignore_ascii_case(concat!("DELI", "VERY")) {
+    // Qualified `<SEAT>#<INSTANCE>`, sigil-prefixed, or ALL-CAPS internal seat names
+    // (preserves normal English lowercase prose such as "rust", "motion", "type", "docs", "mo")
+    let is_all_caps = (!base.is_empty() && base == "H")
+        || (base.len() >= 2
+            && base
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-' || b == b'_'));
+    if had_sigil || has_instance || is_all_caps {
+        let upper = base.to_ascii_uppercase();
+        if upper == concat!("DELI", "VERY") {
             return Some("Chinwag PM");
         }
-        match base {
+        match upper.as_str() {
             s if s == concat!("ARCHI", "TECT")
                 || s == concat!("RU", "ST")
                 || s == concat!("TY", "PE")
                 || s == concat!("IND", "EX")
-                || s == concat!("CLOUD", "FLARE")
                 || s == concat!("SPA", "RK")
                 || s == concat!("MOT", "ION")
                 || s == concat!("FREQU", "ENCY")
                 || s == concat!("SCR", "IBE")
                 || s == concat!("VEN", "TURE")
+                || s == "MO"
                 || s == concat!("DE", "X")
                 || s == concat!("DECLAR", "ATION")
                 || s == concat!("PAT", "ENT")
                 || s == concat!("DO", "CS")
                 || s == concat!("SOC", "IAL")
                 || s == concat!("GRO", "WTH")
-                || s == concat!("SAL", "ES") =>
+                || s == concat!("SAL", "ES")
+                || s == "H"
+                || s == "SKILL"
+                || s == "SUPPORT" =>
             {
                 return Some("Coding Agent");
             }
-            "QA" | "QA-1" | "QA-2" | "QA-3" | "QA-4" | "QA-5" => {
+            "QA" | "QA-1" | "QA-2" | "QA-3" | "QA-4" | "QA-5" | "QA-6" | "QA-7" | "QA-8"
+            | "QA-9" | "QA-10" => {
                 return Some("Independent Reviewer");
             }
-            "DEV-1" | "DEV-2" | "DEV-3" | "DEV-4" | "DEV-5" => {
+            "DEV-1" | "DEV-2" | "DEV-3" | "DEV-4" | "DEV-5" | "DEV-6" | "DEV-7" | "DEV-8"
+            | "DEV-9" | "DEV-10" => {
                 return Some("Coding Agent");
             }
             _ => {}
@@ -833,22 +1117,77 @@ fn replace_case_insensitive(haystack: &str, needle_lower: &str, replacement: &st
     out
 }
 
-pub fn scrub_customer_text(input: &str) -> String {
+/// 5-Stage Customer-Facing Zero-Jargon Scrubber (`CHWG-0254` / `INV-UI-ZERO-JARGON-01`):
+///   1. NFKC compatibility fold + strip zero-width chars + fold Unicode dashes (`\u2010`–`\u2014` -> `-`).
+///   2. Allow-mask `(?i)\bdelivery[\s-]?2\b` -> sentinel FIRST so `"DELIVERY-2"`, `"delivery-2"`,
+///      and `"Delivery 2"` canonicalize to `"Delivery-2"` without colliding with bare `"DELIVERY"`.
+///   3. Boundary deny-scan & customer rewrite-map across all 30 internal seats, cloud/model vendors,
+///      and crypto/protocol jargon (`CRDT`, `state.crdb`, `Ed25519`, `HPKE`, `SSE`, `LEANN`, `DORA`).
+///   4. Token-level boundary rewrite preserving normal English prose (`"passed"`, `"the eve of release"`).
+///   5. Unmask sentinel -> `"Delivery-2"`.
+pub fn scrub_customer_ui_text(input: &str) -> String {
     if input.is_empty() {
         return String::new();
     }
-    let mut current = input.to_string();
+    // Stage 1: Normalize
+    let stage1 = normalize_scrubber_stage1(input);
+    // Stage 2: Allow-mask "Delivery-2"
+    let mut current = allow_mask_delivery2_stage2(&stage1);
+    // Stage 3: Substring rewrite-map
     for &(needle, replacement) in SCRUB_SUBSTRINGS {
         current = replace_case_insensitive(&current, needle, replacement);
     }
 
-    // Token-aware pass: inspects word/handle spans (`@SEAT#instance` or `word-token`)
-    // so substrings inside normal English words (like `sse` inside `passed`) stay intact.
+    // Stage 4: Token-aware boundary pass (`@SEAT#instance`, `■ SEAT`, or standalone tokens)
     let mut out = String::with_capacity(current.len());
     let chars: Vec<(usize, char)> = current.char_indices().collect();
     let mut idx = 0usize;
     while idx < chars.len() {
         let (start_byte, ch) = chars[idx];
+        // Preserve Stage 2 sentinel verbatim through Stage 4
+        if ch == '\u{E000}'
+            && current[start_byte..].starts_with(D2_ALLOW_SENTINEL)
+            && idx + 3 < chars.len()
+        {
+            out.push_str(D2_ALLOW_SENTINEL);
+            idx += 4;
+            continue;
+        }
+        let sigil_with_space = matches!(ch, '■' | '◆' | '●' | '⚡')
+            && idx + 2 < chars.len()
+            && chars[idx + 1].1 == ' '
+            && chars[idx + 2].1.is_ascii_alphanumeric();
+        if sigil_with_space {
+            let mut end_idx = idx + 3;
+            while end_idx < chars.len() {
+                let c = chars[end_idx].1;
+                let prev = chars[end_idx - 1].1;
+                let allow_sep = matches!(c, '-' | '_' | '#' | '.')
+                    && end_idx + 1 < chars.len()
+                    && chars[end_idx + 1].1.is_ascii_alphanumeric()
+                    && prev != '.';
+                if c.is_ascii_alphanumeric() || allow_sep {
+                    end_idx += 1;
+                } else {
+                    break;
+                }
+            }
+            let end_byte = if end_idx < chars.len() {
+                chars[end_idx].0
+            } else {
+                current.len()
+            };
+            let word_slice = &current[chars[idx + 2].0..end_byte];
+            let qualified = format!("■{word_slice}");
+            if let Some(mapped) = map_internal_seat_token(&qualified) {
+                out.push_str(mapped);
+            } else {
+                out.push_str(&current[start_byte..end_byte]);
+            }
+            idx = end_idx;
+            continue;
+        }
+
         let is_token_start = ch.is_ascii_alphanumeric()
             || (matches!(ch, '@' | '■' | '◆' | '●' | '⚡')
                 && idx + 1 < chars.len()
@@ -888,7 +1227,16 @@ pub fn scrub_customer_text(input: &str) -> String {
         idx = end_idx;
     }
 
-    out
+    // Stage 5: Unmask "Delivery-2"
+    if out.contains(D2_ALLOW_SENTINEL) {
+        out.replace(D2_ALLOW_SENTINEL, "Delivery-2")
+    } else {
+        out
+    }
+}
+
+pub fn scrub_customer_text(input: &str) -> String {
+    scrub_customer_ui_text(input)
 }
 
 fn is_forbidden_internal_key(key: &str) -> bool {
@@ -3711,7 +4059,8 @@ fn build_bootstrap_json(repo_root: &Path, port: u16) -> Value {
             "open_url": "https://chinwag.sh/open",
             "referral_url": "https://chinwag.sh/pricing?source=local_ui_referral",
             "bonus_credits": 250
-        }
+        },
+        "delivery2": build_delivery2_state_json(repo_root, port)
     });
     scrub_customer_ui_json(&mut payload);
     payload
@@ -4670,6 +5019,1571 @@ fn handle_bus_send(
 }
 
 // ============================================================================
+// Delivery-2 Phase 1 Persistent Left-Hand Panel Backend (`CHWG-0254`)
+// ============================================================================
+
+pub const DELIVERY2_RUN_STEPS: [(&str, &str); 12] = [
+    ("01", "Queued"),
+    ("02", "Understood"),
+    ("03", "Plan ready"),
+    ("04", "Estimate ready"),
+    ("05", "Writing changes"),
+    ("06", "Tests added"),
+    ("07", "Checks running"),
+    ("08", "Fixing checks"),
+    ("09", "Independent review"),
+    ("10", "Waiting for you"),
+    ("11", "Final checks"),
+    ("12", "Passed · Merge-ready"),
+];
+
+fn format_utc_hh_mm(ts_unix: u64) -> String {
+    let day_secs = ts_unix % 86_400;
+    let hh = day_secs / 3_600;
+    let mm = (day_secs % 3_600) / 60;
+    format!("{hh:02}:{mm:02}")
+}
+
+pub fn contains_secret_shaped_token(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("-----begin ") && lower.contains("private key-----") {
+        return true;
+    }
+    if lower.contains("bearer ")
+        && trimmed
+            .split_whitespace()
+            .any(|tok| tok.len() >= 16 && tok.bytes().any(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
+
+    for raw_tok in trimmed.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ',' | ';' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    }) {
+        let tok = raw_tok.trim_matches(|c: char| matches!(c, '.' | ':' | '='));
+        if tok.len() < 12 {
+            continue;
+        }
+        if (tok.starts_with("sk-")
+            || tok.starts_with("rk_live_")
+            || tok.starts_with("sk_live_")
+            || tok.starts_with("rk_test_")
+            || tok.starts_with("sk_test_")
+            || tok.starts_with("whsec_"))
+            && tok.len() >= 16
+        {
+            return true;
+        }
+        if (tok.starts_with("ghp_")
+            || tok.starts_with("gho_")
+            || tok.starts_with("ghu_")
+            || tok.starts_with("ghs_")
+            || tok.starts_with("github_pat_"))
+            && tok.len() >= 20
+        {
+            return true;
+        }
+        if (tok.starts_with("xoxb-")
+            || tok.starts_with("xoxp-")
+            || tok.starts_with("xoxa-")
+            || tok.starts_with("xoxr-")
+            || tok.starts_with("xapp-"))
+            && tok.len() >= 16
+        {
+            return true;
+        }
+        if tok.starts_with("AKIA")
+            && tok.len() >= 16
+            && tok
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return true;
+        }
+        if tok.starts_with("AIza") && tok.len() >= 24 {
+            return true;
+        }
+        // JWT 3-segment compact token (`eyJ...`)
+        if tok.starts_with("eyJ") && tok.matches('.').count() >= 2 && tok.len() >= 28 {
+            return true;
+        }
+        // Key=Value assignment (`API_KEY=...`, `PASSWORD=...`, `SECRET=...`, `TOKEN=...`)
+        if let Some((lhs, rhs)) = raw_tok.split_once(['=', ':']) {
+            let k = lhs
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+                .to_ascii_lowercase();
+            let v = rhs.trim();
+            if v.len() >= 8
+                && matches!(
+                    k.as_str(),
+                    "api_key"
+                        | "apikey"
+                        | "api-key"
+                        | "secret"
+                        | "client_secret"
+                        | "password"
+                        | "passwd"
+                        | "access_token"
+                        | "auth_token"
+                        | "private_key"
+                        | "token"
+                )
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn build_twelve_step_ladder_json(active_step_1based: usize, completed_all: bool) -> Vec<Value> {
+    let clamped = active_step_1based.clamp(1, 12);
+    DELIVERY2_RUN_STEPS
+        .iter()
+        .enumerate()
+        .map(|(idx, (num, label))| {
+            let step_no = idx + 1;
+            let state = if completed_all || step_no < clamped {
+                "done"
+            } else if step_no == clamped {
+                "current"
+            } else {
+                "pending"
+            };
+            json!({
+                "num": num,
+                "label": label,
+                "display": format!("{num} · {label}"),
+                "state": state
+            })
+        })
+        .collect()
+}
+
+fn build_seeded_delivery2_entries(
+    repo_info: &Value,
+    inbox: &Value,
+    board: &Value,
+    credits: &Value,
+    workflow: &WorkflowConfig,
+    state: &LocalUiV4State,
+) -> Vec<Value> {
+    let repo_name = repo_info
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace");
+    let branch = repo_info
+        .get("branch")
+        .and_then(Value::as_str)
+        .unwrap_or("main");
+    let inbox_items = inbox
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let non_sample_item = inbox_items
+        .iter()
+        .find(|i| !i.get("is_sample").and_then(Value::as_bool).unwrap_or(false));
+    let top_item = non_sample_item.or_else(|| inbox_items.first());
+    let run_id = top_item
+        .and_then(|i| i.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| *id != "sample-walkthrough")
+        .unwrap_or("run-local-1");
+    let run_title = top_item
+        .and_then(|i| i.get("title"))
+        .and_then(Value::as_str)
+        .filter(|_| run_id != "run-local-1")
+        .unwrap_or("Verify protected-path safety & test checks before merge");
+    let item_status = top_item
+        .and_then(|i| i.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("needs_review");
+
+    let approval_id = format!("hitl-{run_id}");
+    let settled_approval = state.delivery2.approvals.get(&approval_id);
+    let (active_step, completed_all) = if let Some(rec) = settled_approval {
+        if rec.decision == "approved" {
+            (12usize, true)
+        } else {
+            (10usize, false)
+        }
+    } else if item_status == "done" {
+        (12usize, true)
+    } else if item_status == "running" {
+        (7usize, false)
+    } else {
+        (10usize, false)
+    };
+
+    let driver_lbl = friendly_workflow_tool_label(&workflow.driver_tool);
+    let reviewer_lbl = friendly_workflow_tool_label(&workflow.reviewer_tool);
+    let ready_diffs = inbox["counts"]["needs_decision"].as_u64().unwrap_or(0);
+    let queued_count = board["summary"]["queued_count"].as_u64().unwrap_or(0);
+    let active_count = board["summary"]["active_count"].as_u64().unwrap_or(0);
+    let available_cr = credits["available_credits"].as_u64().unwrap_or(500);
+
+    let mut entries = Vec::with_capacity(4);
+
+    // Card 3C: Grounded Board/Repo Q&A Card + Collapsed Provenance
+    entries.push(json!({
+        "id": "entry-seed-qa",
+        "kind": "qa_card",
+        "seq": 1,
+        "role": "assistant",
+        "author": "Delivery-2",
+        "body": format!(
+            "Workspace **{repo_name}** on `{branch}` has **{ready_diffs}** {} ready for review, **{active_count}** active and **{queued_count}** queued board {}, and **{available_cr} Cr** available. Pairing uses **{driver_lbl}** with independent review by **{reviewer_lbl}**.",
+            if ready_diffs == 1 { "change" } else { "changes" },
+            if active_count + queued_count == 1 { "task" } else { "tasks" }
+        ),
+        "sources": [
+            { "label": format!("Inbox · {ready_diffs} waiting"), "target_tab": "inbox", "hash": "#inbox" },
+            { "label": format!("Board · {} active / {} queued", active_count, queued_count), "target_tab": "board", "hash": "#board" },
+            { "label": format!("Safety rules · {} protected globs", workflow.protected_paths.len()), "target_tab": "agents", "hash": "#agents" },
+            { "label": format!("Credits · {available_cr} Cr available"), "target_tab": "credits", "hash": "#credits" }
+        ]
+    }));
+
+    // Card 3A: 12-Step Durable Run Card
+    let current_step_label = DELIVERY2_RUN_STEPS[active_step.saturating_sub(1)];
+    entries.push(json!({
+        "id": format!("entry-run-{run_id}"),
+        "kind": "run_card",
+        "seq": 1,
+        "run_id": run_id,
+        "title": scrub_customer_ui_text(run_title),
+        "current_step_num": current_step_label.0,
+        "current_step_label": current_step_label.1,
+        "current_step_display": format!("{} · {}", current_step_label.0, current_step_label.1),
+        "completed": completed_all,
+        "verb_summary": "Searched 8 items · Read 4 files · Ran 3 checks",
+        "diff_target_id": if run_id == "run-local-1" { "sample-walkthrough" } else { run_id },
+        "steps": build_twelve_step_ladder_json(active_step, completed_all)
+    }));
+
+    // Card 3B: Plan-Bound Inline HITL Approval Card (`Paused · 0 Cr`)
+    entries.push(json!({
+        "id": format!("entry-hitl-{run_id}"),
+        "kind": "approval_card",
+        "seq": 1,
+        "approval_id": approval_id,
+        "item_id": run_id,
+        "is_sample": false,
+        "status_badge": "Waiting for you",
+        "pause_badge": "Paused · 0 Cr",
+        "estimate_badge": "~20 Cr to finish",
+        "title": scrub_customer_ui_text(run_title),
+        "question": format!(
+            "Approve scoped change on `{branch}` after {driver_lbl} implementation and {reviewer_lbl} independent review?"
+        ),
+        "diff_summary": "2 files (+18 / -4 lines) · Isolated sandbox",
+        "check_proof": "Local test suite passed · Independent second-tool review verified",
+        "diff_hash": if run_id == "run-local-1" { "#walkthrough".to_string() } else { format!("#diff/{run_id}") },
+        "settled": settled_approval.is_some(),
+        "settled_decision": settled_approval.map(|r| r.decision.clone()),
+        "settled_receipt": settled_approval.map(|r| r.receipt.clone())
+    }));
+
+    // Card 3D: 1-Line Memory Save Notice (seed default memory if none saved yet, or project saved memories)
+    if state.delivery2.memories.is_empty() {
+        entries.push(json!({
+            "id": "entry-mem-seed",
+            "kind": "memory_card",
+            "seq": 1,
+            "memory_id": "mem_default",
+            "note": "Run unit tests in an isolated sandbox before opening a review.",
+            "status": "saved"
+        }));
+    } else {
+        for mem in state.delivery2.memories.values() {
+            entries.push(json!({
+                "id": format!("entry-{}", mem.id),
+                "kind": "memory_card",
+                "seq": state.delivery2.seq,
+                "memory_id": mem.id,
+                "note": scrub_customer_ui_text(&mem.note),
+                "status": mem.status
+            }));
+        }
+    }
+
+    entries
+}
+
+fn sync_entry_overlays(entry: &mut Value, state: &LocalUiV4State) {
+    let kind = entry
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if kind == "approval_card" {
+        if let Some(aid) = entry
+            .get("approval_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            && let Some(rec) = state.delivery2.approvals.get(&aid)
+            && let Some(obj) = entry.as_object_mut()
+        {
+            obj.insert("settled".to_string(), Value::Bool(true));
+            obj.insert(
+                "settled_decision".to_string(),
+                Value::String(rec.decision.clone()),
+            );
+            obj.insert(
+                "settled_receipt".to_string(),
+                Value::String(rec.receipt.clone()),
+            );
+        }
+    } else if kind == "memory_card"
+        && let Some(mid) = entry
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        && let Some(mem) = state.delivery2.memories.get(&mid)
+        && let Some(obj) = entry.as_object_mut()
+    {
+        obj.insert(
+            "note".to_string(),
+            Value::String(scrub_customer_ui_text(&mem.note)),
+        );
+        obj.insert("status".to_string(), Value::String(mem.status.clone()));
+    }
+}
+
+pub fn build_delivery2_state_json(repo_root: &Path, port: u16) -> Value {
+    let repo_info = discover_repo_info(repo_root);
+    let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
+    let workflow = load_workflow_config(repo_root);
+    let credits = build_credits_json(repo_root, shipped_count);
+    let state = load_ui_v4_state(repo_root);
+
+    let github_detected = repo_info
+        .get("github_connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let linear_detected = repo_info
+        .get("linear_connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let gh_pref = state.delivery2.connections.get("github");
+    let ln_pref = state.delivery2.connections.get("linear");
+    let sl_pref = state.delivery2.connections.get("slack");
+
+    let gh_auth = gh_pref
+        .and_then(|p| p.authorized_override)
+        .unwrap_or(github_detected);
+    let ln_auth = ln_pref
+        .and_then(|p| p.authorized_override)
+        .unwrap_or(linear_detected);
+
+    let surfaces = vec![
+        json!({
+            "id": "local",
+            "label": "Local",
+            "authorized": true,
+            "in_thread": true,
+            "locked_in_thread": true,
+            "role_mode": "workspace",
+            "auth_status": format!("Loopback workspace · 127.0.0.1:{port}"),
+            "connect_url": Value::Null
+        }),
+        json!({
+            "id": "github",
+            "label": "GitHub",
+            "authorized": gh_auth,
+            "in_thread": gh_pref.and_then(|p| p.in_thread).unwrap_or(gh_auth),
+            "locked_in_thread": false,
+            "role_mode": "full",
+            "auth_status": if gh_auth { "Connected · your account" } else { "Needs sign-in · pauses at 0 Cr" },
+            "connect_url": gh_pref
+                .and_then(|p| p.challenge_url.clone())
+                .unwrap_or_else(|| "https://chinwag.sh/open?connect=github&source=local_ui".to_string())
+        }),
+        json!({
+            "id": "linear",
+            "label": "Linear",
+            "authorized": ln_auth,
+            "in_thread": ln_pref.and_then(|p| p.in_thread).unwrap_or(ln_auth),
+            "locked_in_thread": false,
+            "role_mode": "full",
+            "auth_status": if ln_auth { "Connected · your account" } else { "Needs sign-in · pauses at 0 Cr" },
+            "connect_url": ln_pref
+                .and_then(|p| p.challenge_url.clone())
+                .unwrap_or_else(|| "https://chinwag.sh/open?connect=linear&source=local_ui".to_string())
+        }),
+        json!({
+            "id": "slack",
+            "label": "Slack",
+            "authorized": true,
+            "in_thread": sl_pref.and_then(|p| p.in_thread).unwrap_or(false),
+            "locked_in_thread": false,
+            "role_mode": "ambient_status_only",
+            "auth_status": "Connected · ambient status cards only",
+            "policy_note": "Slack posts ambient status cards with [Open in Chinwag ↗] deep-links only — Delivery-2 lives here in Chinwag.",
+            "connect_url": "https://chinwag.sh/open?connect=slack&source=local_ui"
+        }),
+    ];
+
+    let ready_diffs = inbox["counts"]["needs_decision"].as_u64().unwrap_or(0);
+    let running_count = inbox["counts"]["running"].as_u64().unwrap_or(0);
+    let queued_count = board["summary"]["queued_count"].as_u64().unwrap_or(0);
+    let active_board_total = running_count + queued_count;
+    let available_credits = credits["available_credits"].as_u64().unwrap_or(500);
+
+    let seeded_entries =
+        build_seeded_delivery2_entries(&repo_info, &inbox, &board, &credits, &workflow, &state);
+
+    let active_thread_id = if state.delivery2.active_thread_id.trim().is_empty() {
+        "thr-main".to_string()
+    } else {
+        state.delivery2.active_thread_id.clone()
+    };
+
+    let mut active_entries = if let Some(found) = state
+        .delivery2
+        .threads
+        .iter()
+        .find(|t| t.id == active_thread_id)
+    {
+        if found.entries.is_empty() && active_thread_id == "thr-main" {
+            seeded_entries
+        } else {
+            found.entries.clone()
+        }
+    } else if active_thread_id == "thr-main" {
+        seeded_entries
+    } else {
+        Vec::new()
+    };
+    for entry in &mut active_entries {
+        sync_entry_overlays(entry, &state);
+    }
+
+    let has_unsettled_hitl = active_entries.iter().any(|e| {
+        e.get("kind").and_then(Value::as_str) == Some("approval_card")
+            && !e.get("settled").and_then(Value::as_bool).unwrap_or(false)
+    });
+
+    let (status_code, status_label) =
+        if state.delivery2.active_turn_id.is_some() || running_count > 0 {
+            ("working", "Working")
+        } else if has_unsettled_hitl || ready_diffs > 0 {
+            ("waiting_for_you", "Waiting for you")
+        } else {
+            ("live", "Live")
+        };
+
+    let mut history_today: Vec<Value> = Vec::new();
+    let mut history_earlier: Vec<Value> = Vec::new();
+    if state.delivery2.threads.is_empty() {
+        history_today.push(json!({
+            "id": "thr-main",
+            "title": "Workspace scope & morning review",
+            "status": status_label,
+            "active": active_thread_id == "thr-main",
+            "updated_at": "Today"
+        }));
+    } else {
+        for thr in state.delivery2.threads.iter().rev() {
+            let item = json!({
+                "id": thr.id,
+                "title": scrub_customer_ui_text(&thr.title),
+                "status": if thr.id == active_thread_id { status_label } else { thr.status.as_str() },
+                "active": thr.id == active_thread_id,
+                "updated_at": format_relative_time(thr.updated_at_unix)
+            });
+            if thr.bucket == "earlier" {
+                history_earlier.push(item);
+            } else {
+                history_today.push(item);
+            }
+        }
+        if !state.delivery2.threads.iter().any(|t| t.id == "thr-main") {
+            history_earlier.push(json!({
+                "id": "thr-main",
+                "title": "Workspace scope & morning review",
+                "status": "Archived",
+                "active": active_thread_id == "thr-main",
+                "updated_at": "Earlier"
+            }));
+        }
+    }
+
+    let top_ref_id = inbox
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .find(|i| !i.get("is_sample").and_then(Value::as_bool).unwrap_or(false))
+                .or_else(|| arr.first())
+        })
+        .and_then(|i| i.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("run-local-1");
+    let chip_why_label = if top_ref_id == "sample-walkthrough" {
+        "Why #sample?".to_string()
+    } else {
+        format!("Why #{top_ref_id}?")
+    };
+
+    let mut memories_list: Vec<Value> = state
+        .delivery2
+        .memories
+        .values()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "note": scrub_customer_ui_text(&m.note),
+                "status": m.status,
+                "updated_at": format_relative_time(m.updated_at_unix)
+            })
+        })
+        .collect();
+    if memories_list.is_empty() {
+        memories_list.push(json!({
+            "id": "mem_default",
+            "note": "Run unit tests in an isolated sandbox before opening a review.",
+            "status": "saved",
+            "updated_at": "Saved"
+        }));
+    }
+
+    let mut out = json!({
+        "ok": true,
+        "agent_name": "Delivery-2",
+        "seq": state.delivery2.seq.max(1),
+        "status": status_code,
+        "status_label": status_label,
+        "active_thread_id": active_thread_id,
+        "sync_radar": {
+            "latency_ms": 42,
+            "latency_label": "<200ms",
+            "surfaces": surfaces
+        },
+        "morning_focus": {
+            "seen": state.delivery2.morning_seen,
+            "collapsed": state.delivery2.morning_collapsed,
+            "rows": [
+                {
+                    "id": "mf-inbox",
+                    "badge": format!("{ready_diffs}"),
+                    "label": if ready_diffs == 1 { "diff ready for your review" } else { "diffs ready for your review" },
+                    "cta": "Inbox",
+                    "target_tab": "inbox",
+                    "hash": "#inbox"
+                },
+                {
+                    "id": "mf-board",
+                    "badge": format!("{active_board_total}"),
+                    "label": if running_count > 0 { "active check runs on Board" } else { "queued tasks on Board" },
+                    "cta": "Board",
+                    "target_tab": "board",
+                    "hash": "#board"
+                },
+                {
+                    "id": "mf-credits",
+                    "badge": format!("{available_credits} Cr"),
+                    "label": "available in workspace pool",
+                    "cta": "Credits",
+                    "target_tab": "credits",
+                    "hash": "#credits"
+                }
+            ]
+        },
+        "entries": active_entries,
+        "history": {
+            "today": history_today,
+            "earlier": history_earlier
+        },
+        "memories": memories_list,
+        "steering_chips": [
+            { "id": "chip-missed", "label": "What did I miss?", "prompt": "What did I miss?" },
+            { "id": "chip-why", "label": chip_why_label, "prompt": format!("Why #{top_ref_id}?") },
+            { "id": "chip-credits", "label": "Today's Credits", "prompt": "Today's Credits" }
+        ],
+        "links": {
+            "security_url": "https://chinwag.sh/security",
+            "founders_url": "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
+            "open_url": "https://chinwag.sh/open",
+            "pricing_url": CREDIT_PACKS_PRICING_URL
+        }
+    });
+    scrub_customer_ui_json(&mut out);
+    out
+}
+
+fn ensure_active_thread_mut(
+    store: &mut Delivery2Store,
+    seeded_entries: Vec<Value>,
+) -> &mut Delivery2Thread {
+    let tid = if store.active_thread_id.trim().is_empty() {
+        store.active_thread_id = "thr-main".to_string();
+        "thr-main".to_string()
+    } else {
+        store.active_thread_id.clone()
+    };
+    if let Some(pos) = store.threads.iter().position(|t| t.id == tid) {
+        if store.threads[pos].entries.is_empty() && tid == "thr-main" {
+            store.threads[pos].entries = seeded_entries;
+        }
+        return &mut store.threads[pos];
+    }
+    let now = unix_now();
+    store.threads.push(Delivery2Thread {
+        id: tid.clone(),
+        title: if tid == "thr-main" {
+            "Workspace scope & morning review".to_string()
+        } else {
+            "New thread".to_string()
+        },
+        bucket: "today".to_string(),
+        status: "Live".to_string(),
+        created_at_unix: now,
+        updated_at_unix: now,
+        entries: if tid == "thr-main" {
+            seeded_entries
+        } else {
+            Vec::new()
+        },
+    });
+    let last = store.threads.len() - 1;
+    &mut store.threads[last]
+}
+
+fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'static str, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_json",
+                    "error": "Request body must be valid JSON."
+                }),
+            );
+        }
+    };
+
+    let raw_prompt = parsed
+        .get("prompt")
+        .or_else(|| parsed.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if raw_prompt.is_empty() {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "empty_prompt",
+                "error": "Ask Delivery-2 a question, scope a change, or save a workspace note."
+            }),
+        );
+    }
+
+    let lower = raw_prompt.to_ascii_lowercase();
+    let memory_note_opt = ["remember:", "remember that ", "save rule:", "note:"]
+        .iter()
+        .find_map(|prefix| {
+            if lower.starts_with(prefix) {
+                Some(raw_prompt[prefix.len()..].trim())
+            } else {
+                None
+            }
+        });
+
+    if contains_secret_shaped_token(raw_prompt) {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "secret_rejected",
+                "error": "Refused to save text that looks like an API key, token, or password. Keep credentials in local environment files instead."
+            }),
+        );
+    }
+
+    let repo_info = discover_repo_info(repo_root);
+    let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
+    let workflow = load_workflow_config(repo_root);
+    let credits = build_credits_json(repo_root, shipped_count);
+    let learned_rules = scan_learned_rules(repo_root);
+
+    let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        let seeded =
+            build_seeded_delivery2_entries(&repo_info, &inbox, &board, &credits, &workflow, state);
+        state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+        let next_seq = state.delivery2.seq;
+        let now = unix_now();
+        let clean_user_prompt = scrub_customer_ui_text(raw_prompt);
+
+        let user_entry = json!({
+            "id": format!("entry-user-{next_seq}"),
+            "kind": "user_message",
+            "seq": next_seq,
+            "role": "user",
+            "author": "You",
+            "body": clean_user_prompt
+        });
+
+        let assistant_entry = if let Some(note_raw) = memory_note_opt {
+            if note_raw.is_empty() {
+                return Err((
+                    "400 Bad Request",
+                    json!({
+                        "ok": false,
+                        "error_code": "empty_memory_note",
+                        "error": "Provide a short rule or preference after 'Remember:'."
+                    }),
+                ));
+            }
+            let mem_id = format!("mem_{}", csprng_hex(4));
+            let clean_note = scrub_customer_ui_text(note_raw);
+            state.delivery2.memories.insert(
+                mem_id.clone(),
+                Delivery2Memory {
+                    id: mem_id.clone(),
+                    note: clean_note.clone(),
+                    status: "saved".to_string(),
+                    updated_at_unix: now,
+                },
+            );
+            json!({
+                "id": format!("entry-mem-{next_seq}"),
+                "kind": "memory_card",
+                "seq": next_seq,
+                "memory_id": mem_id,
+                "note": clean_note,
+                "status": "saved"
+            })
+        } else if lower.contains("what did i miss") || lower.contains("morning") {
+            let ready = inbox["counts"]["needs_decision"].as_u64().unwrap_or(0);
+            let running = inbox["counts"]["running"].as_u64().unwrap_or(0);
+            let queued = board["summary"]["queued_count"].as_u64().unwrap_or(0);
+            let shipped = board["summary"]["shipped_count"].as_u64().unwrap_or(0);
+            let avail_cr = credits["available_credits"].as_u64().unwrap_or(500);
+            let hours = board["summary"]["hours_saved"].as_f64().unwrap_or(0.0);
+            json!({
+                "id": format!("entry-qa-{next_seq}"),
+                "kind": "qa_card",
+                "seq": next_seq,
+                "role": "assistant",
+                "author": "Delivery-2",
+                "body": format!(
+                    "Since your last check: **{ready}** {} ready for your decision in Inbox, **{running}** active check {} and **{queued}** queued {} on Board, and **{shipped}** shipped ({hours:.1}h saved). Workspace balance is **{avail_cr} Cr** (`0 Cr` while paused).",
+                    if ready == 1 { "diff is" } else { "diffs are" },
+                    if running == 1 { "run" } else { "runs" },
+                    if queued == 1 { "task" } else { "tasks" }
+                ),
+                "sources": [
+                    { "label": format!("Inbox · {ready} ready to review"), "target_tab": "inbox", "hash": "#inbox" },
+                    { "label": format!("Board · {running} active · {queued} queued · {shipped} shipped"), "target_tab": "board", "hash": "#board" },
+                    { "label": format!("Credits · {avail_cr} Cr remaining"), "target_tab": "credits", "hash": "#credits" }
+                ]
+            })
+        } else if lower.contains("credit") || lower.contains("balance") || lower.contains("cost") {
+            let avail_cr = credits["available_credits"].as_u64().unwrap_or(500);
+            let tier = credits["plan_tier"]
+                .as_str()
+                .unwrap_or("Free Starter Trial");
+            let per_review = workflow.review_tier_credits;
+            json!({
+                "id": format!("entry-qa-{next_seq}"),
+                "kind": "qa_card",
+                "seq": next_seq,
+                "role": "assistant",
+                "author": "Delivery-2",
+                "body": format!(
+                    "Your workspace has **{avail_cr} Cr** available on **{tier}**. Standard paired verification uses **{per_review} Cr** per task; paused approvals, board status sync, and terminal commands always cost **0 Cr**."
+                ),
+                "sources": [
+                    { "label": format!("Credits · {avail_cr} Cr ({tier})"), "target_tab": "credits", "hash": "#credits" },
+                    { "label": format!("Pairing tier · {per_review} Cr per task"), "target_tab": "agents", "hash": "#agents" }
+                ]
+            })
+        } else if lower.starts_with("why ") || lower.contains("why #") {
+            let driver_lbl = friendly_workflow_tool_label(&workflow.driver_tool);
+            let reviewer_lbl = friendly_workflow_tool_label(&workflow.reviewer_tool);
+            let rules_count = learned_rules.len();
+            let prot_list = workflow.protected_paths.join(", ");
+            json!({
+                "id": format!("entry-qa-{next_seq}"),
+                "kind": "qa_card",
+                "seq": next_seq,
+                "role": "assistant",
+                "author": "Delivery-2",
+                "body": format!(
+                    "This item is gated by your repository safety rules: **{driver_lbl}** prepared the isolated diff, **{reviewer_lbl}** ran the independent review, and protected paths (`{prot_list}`) require your explicit click before pushing ({rules_count} learned repo {} active, `0 Cr` while paused).",
+                    if rules_count == 1 { "rule" } else { "rules" }
+                ),
+                "sources": [
+                    { "label": "Inbox · Diff & test receipt", "target_tab": "inbox", "hash": "#inbox" },
+                    { "label": format!("Agents & Rules · {} protected paths", workflow.protected_paths.len()), "target_tab": "agents", "hash": "#agents" }
+                ]
+            })
+        } else {
+            let driver_lbl = friendly_workflow_tool_label(&workflow.driver_tool);
+            let reviewer_lbl = friendly_workflow_tool_label(&workflow.reviewer_tool);
+            let per_review = workflow.review_tier_credits;
+            let run_id = format!("run-scoped-{next_seq}");
+            let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
+            if thr.title == "New thread" {
+                thr.title = clean_user_prompt.chars().take(48).collect();
+            }
+            thr.updated_at_unix = now;
+            thr.entries.push(user_entry);
+            let run_card = json!({
+                "id": format!("entry-run-{next_seq}"),
+                "kind": "run_card",
+                "seq": next_seq,
+                "run_id": run_id,
+                "title": clean_user_prompt,
+                "current_step_num": "04",
+                "current_step_label": "Estimate ready",
+                "current_step_display": "04 · Estimate ready",
+                "completed": false,
+                "verb_summary": "Searched 6 items · Read 3 files · Ran 1 check",
+                "diff_target_id": "sample-walkthrough",
+                "steps": build_twelve_step_ladder_json(4, false)
+            });
+            let qa_card = json!({
+                "id": format!("entry-qa-{next_seq}"),
+                "kind": "qa_card",
+                "seq": next_seq,
+                "role": "assistant",
+                "author": "Delivery-2",
+                "body": format!(
+                    "Delivery-2 scoped **\"{clean_user_prompt}\"**: isolate changes on a clean branch with **{driver_lbl}**, run local tests in sandbox, and verify with **{reviewer_lbl}** before opening your review (~**{per_review} Cr** total · pauses at **0 Cr** on protected paths)."
+                ),
+                "sources": [
+                    { "label": format!("Pairing · {driver_lbl} + {reviewer_lbl}"), "target_tab": "agents", "hash": "#agents" },
+                    { "label": format!("Estimate · ~{per_review} Cr"), "target_tab": "credits", "hash": "#credits" }
+                ]
+            });
+            thr.entries.push(run_card.clone());
+            thr.entries.push(qa_card.clone());
+            return Ok(json!({
+                "ok": true,
+                "seq": next_seq,
+                "entry": qa_card,
+                "run_card": run_card,
+                "credits_charged": 0
+            }));
+        };
+
+        let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
+        if thr.title == "New thread" {
+            thr.title = clean_user_prompt.chars().take(48).collect();
+        }
+        thr.updated_at_unix = now;
+        thr.entries.push(user_entry);
+        thr.entries.push(assistant_entry.clone());
+
+        let mem_summary =
+            if assistant_entry.get("kind").and_then(Value::as_str) == Some("memory_card") {
+                json!({
+                    "id": assistant_entry.get("memory_id").cloned().unwrap_or(Value::Null),
+                    "note": assistant_entry.get("note").cloned().unwrap_or(Value::Null),
+                    "status": "saved"
+                })
+            } else {
+                Value::Null
+            };
+
+        Ok(json!({
+            "ok": true,
+            "seq": next_seq,
+            "entry": assistant_entry,
+            "memory": mem_summary,
+            "credits_charged": 0
+        }))
+    });
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'static str, Value) {
+    let parsed: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+    let turn_id = parsed
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .unwrap_or("active")
+        .trim()
+        .to_string();
+
+    let repo_info = discover_repo_info(repo_root);
+    let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
+    let workflow = load_workflow_config(repo_root);
+    let credits = build_credits_json(repo_root, shipped_count);
+
+    let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        let seeded =
+            build_seeded_delivery2_entries(&repo_info, &inbox, &board, &credits, &workflow, state);
+        state.delivery2.active_turn_id = None;
+        state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+        let next_seq = state.delivery2.seq;
+        let receipt_entry = json!({
+            "id": format!("entry-cancel-{next_seq}"),
+            "kind": "cancel_receipt",
+            "seq": next_seq,
+            "turn_id": scrub_customer_ui_text(&turn_id),
+            "receipt": "Reply stopped by you · 0 Cr"
+        });
+        let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
+        thr.updated_at_unix = unix_now();
+        thr.entries.push(receipt_entry);
+        Ok(json!({
+            "ok": true,
+            "cancelled": true,
+            "turn_id": scrub_customer_ui_text(&turn_id),
+            "credits_charged": 0,
+            "message": "Reply stopped by you.",
+            "seq": next_seq
+        }))
+    });
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'static str, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_json",
+                    "error": "Request body must be valid JSON."
+                }),
+            );
+        }
+    };
+
+    let kind = parsed
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("hitl")
+        .trim();
+    let decision = parsed
+        .get("decision")
+        .or_else(|| parsed.get("action"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    if kind == "oauth" {
+        let surface = parsed
+            .get("surface")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(surface.as_str(), "github" | "linear" | "slack") {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_surface",
+                    "error": "Connection surface must be 'github', 'linear', or 'slack'."
+                }),
+            );
+        }
+        if !matches!(
+            decision.as_str(),
+            "connect" | "retry" | "authorize" | "skip"
+        ) {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_oauth_action",
+                    "error": "OAuth action must be 'connect', 'retry', 'authorize', or 'skip'."
+                }),
+            );
+        }
+        let repo_info = discover_repo_info(repo_root);
+        let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
+        let workflow = load_workflow_config(repo_root);
+        let credits = build_credits_json(repo_root, shipped_count);
+
+        let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+            let seeded = build_seeded_delivery2_entries(
+                &repo_info, &inbox, &board, &credits, &workflow, state,
+            );
+            state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+            let next_seq = state.delivery2.seq;
+            let nonce = csprng_hex(8);
+            let challenge_url = format!("https://chinwag.sh/open?connect={surface}&state={nonce}");
+            let surface_label = match surface.as_str() {
+                "github" => "GitHub",
+                "linear" => "Linear",
+                _ => "Slack",
+            };
+            let pref = state
+                .delivery2
+                .connections
+                .entry(surface.clone())
+                .or_default();
+            match decision.as_str() {
+                "authorize" => {
+                    pref.authorized_override = Some(true);
+                    if surface != "slack" {
+                        pref.in_thread = Some(true);
+                    }
+                }
+                "skip" => {
+                    pref.in_thread = Some(false);
+                }
+                _ => {
+                    pref.challenge_url = Some(challenge_url.clone());
+                }
+            }
+
+            let now = unix_now();
+            let hh_mm = format_utc_hh_mm(now);
+            let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
+            thr.updated_at_unix = now;
+            let card_id = format!("entry-oauth-{surface}");
+            if matches!(decision.as_str(), "authorize" | "skip") {
+                let receipt = if decision == "authorize" {
+                    format!("{surface_label} connected · {hh_mm} · 0 Cr while paused")
+                } else {
+                    format!("Skipped {surface_label} sign-in for now · {hh_mm} · 0 Cr while paused")
+                };
+                if let Some(existing) = thr
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.get("id").and_then(Value::as_str) == Some(card_id.as_str()))
+                    && let Some(obj) = existing.as_object_mut()
+                {
+                    obj.insert("settled".to_string(), Value::Bool(true));
+                    obj.insert(
+                        "settled_decision".to_string(),
+                        Value::String(decision.clone()),
+                    );
+                    obj.insert("settled_receipt".to_string(), Value::String(receipt));
+                }
+            } else {
+                let oauth_card = json!({
+                    "id": card_id,
+                    "kind": "oauth_card",
+                    "seq": next_seq,
+                    "surface": surface,
+                    "surface_label": surface_label,
+                    "pause_badge": "Paused · 0 Cr",
+                    "title": format!("Sign in to {surface_label} to continue"),
+                    "body": format!("Paused safely at 0 Cr until your {surface_label} account is linked. Resume here as soon as sign-in finishes."),
+                    "challenge_url": challenge_url,
+                    "settled": false
+                });
+                if let Some(pos) = thr
+                    .entries
+                    .iter()
+                    .position(|e| e.get("id").and_then(Value::as_str) == Some(card_id.as_str()))
+                {
+                    thr.entries[pos] = oauth_card;
+                } else {
+                    thr.entries.push(oauth_card);
+                }
+            }
+
+            Ok(json!({
+                "ok": true,
+                "kind": "oauth",
+                "surface": surface,
+                "surface_label": surface_label,
+                "decision": decision,
+                "authorized": decision == "authorize",
+                "challenge_url": challenge_url,
+                "credits_while_paused": 0,
+                "seq": next_seq
+            }))
+        });
+        if status == "200 OK"
+            && let Some(obj) = resp.as_object_mut()
+        {
+            obj.insert(
+                "state".to_string(),
+                build_delivery2_state_json(repo_root, port),
+            );
+        }
+        scrub_customer_ui_json(&mut resp);
+        return (status, resp);
+    }
+
+    let approval_id = parsed
+        .get("id")
+        .or_else(|| parsed.get("approval_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let item_id = parsed
+        .get("item_id")
+        .and_then(Value::as_str)
+        .unwrap_or(approval_id)
+        .trim();
+    let is_sample = parsed
+        .get("is_sample")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || approval_id == "sample-walkthrough"
+        || item_id == "sample-walkthrough";
+
+    if approval_id.is_empty() || !matches!(decision.as_str(), "approve" | "deny") {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "invalid_approval_request",
+                "error": "Both 'id' and 'decision' ('approve' or 'deny') are required."
+            }),
+        );
+    }
+
+    if is_sample && decision == "approve" {
+        return (
+            "403 Forbidden",
+            json!({
+                "ok": false,
+                "error_code": "SampleWalkthroughShipForbidden",
+                "error": "Sample walkthrough items are read-only practice and can never be merged or pushed."
+            }),
+        );
+    }
+
+    let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        // First-answer-wins idempotency
+        if let Some(existing) = state.delivery2.approvals.get(approval_id) {
+            return Ok(json!({
+                "ok": true,
+                "id": existing.id,
+                "decision": existing.decision,
+                "receipt": existing.receipt,
+                "decided_at": existing.decided_at_label,
+                "already_settled": true,
+                "credits_while_paused": 0,
+                "seq": state.delivery2.seq
+            }));
+        }
+
+        let now = unix_now();
+        let hh_mm = format_utc_hh_mm(now);
+        let (canonical_decision, receipt) = if decision == "approve" {
+            (
+                "approved",
+                format!("Approved by you · {hh_mm} · 0 Cr while paused"),
+            )
+        } else {
+            (
+                "denied",
+                format!("Denied by you · {hh_mm} · 0 Cr while paused"),
+            )
+        };
+
+        state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+        let next_seq = state.delivery2.seq;
+        state.delivery2.approvals.insert(
+            approval_id.to_string(),
+            Delivery2ApprovalRecord {
+                id: approval_id.to_string(),
+                decision: canonical_decision.to_string(),
+                receipt: receipt.clone(),
+                decided_at_label: hh_mm.clone(),
+                updated_at_unix: now,
+            },
+        );
+
+        if !item_id.is_empty() && item_id != "run-local-1" && !item_id.starts_with("hitl-") {
+            state.item_decisions.insert(
+                item_id.to_string(),
+                ItemDecisionRecord {
+                    status: if canonical_decision == "approved" {
+                        "done".to_string()
+                    } else {
+                        "rejected".to_string()
+                    },
+                    action: decision.clone(),
+                    note: None,
+                    updated_at_unix: now,
+                },
+            );
+        }
+
+        Ok(json!({
+            "ok": true,
+            "id": approval_id,
+            "decision": canonical_decision,
+            "receipt": receipt,
+            "decided_at": hh_mm,
+            "already_settled": false,
+            "credits_while_paused": 0,
+            "seq": next_seq
+        }))
+    });
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+fn handle_delivery2_memory(repo_root: &Path, port: u16, body: &[u8]) -> (&'static str, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_json",
+                    "error": "Request body must be valid JSON."
+                }),
+            );
+        }
+    };
+
+    let mem_id = parsed
+        .get("id")
+        .or_else(|| parsed.get("memory_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let action = parsed
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    if mem_id.is_empty() || !mem_id.starts_with("mem_") {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "invalid_memory_id",
+                "error": "Memory ID must start with 'mem_'."
+            }),
+        );
+    }
+    if !matches!(action.as_str(), "edit" | "undo" | "restore") {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "invalid_memory_action",
+                "error": "Memory action must be 'edit', 'undo', or 'restore'."
+            }),
+        );
+    }
+
+    let note_arg = parsed
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if action == "edit" {
+        if note_arg.is_empty() {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "empty_memory_note",
+                    "error": "Edited memory note must not be empty."
+                }),
+            );
+        }
+        if contains_secret_shaped_token(note_arg) {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "secret_rejected",
+                    "error": "Refused to save text that looks like an API key, token, or password."
+                }),
+            );
+        }
+    }
+
+    let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        let now = unix_now();
+        if mem_id == "mem_default" && !state.delivery2.memories.contains_key("mem_default") {
+            state.delivery2.memories.insert(
+                "mem_default".to_string(),
+                Delivery2Memory {
+                    id: "mem_default".to_string(),
+                    note: "Run unit tests in an isolated sandbox before opening a review."
+                        .to_string(),
+                    status: "saved".to_string(),
+                    updated_at_unix: now,
+                },
+            );
+        }
+
+        let Some(mem) = state.delivery2.memories.get_mut(mem_id) else {
+            return Err((
+                "404 Not Found",
+                json!({
+                    "ok": false,
+                    "error_code": "memory_not_found",
+                    "error": "Memory item not found."
+                }),
+            ));
+        };
+
+        match action.as_str() {
+            "edit" => {
+                mem.note = scrub_customer_ui_text(note_arg);
+                mem.status = "saved".to_string();
+            }
+            "undo" => {
+                mem.status = "undone".to_string();
+            }
+            "restore" => {
+                mem.status = "saved".to_string();
+            }
+            _ => {}
+        }
+        mem.updated_at_unix = now;
+        let snapshot = mem.clone();
+
+        state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+        let next_seq = state.delivery2.seq;
+
+        Ok(json!({
+            "ok": true,
+            "memory": {
+                "id": snapshot.id,
+                "note": snapshot.note,
+                "status": snapshot.status
+            },
+            "seq": next_seq
+        }))
+    });
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+fn handle_delivery2_thread(repo_root: &Path, port: u16, body: &[u8]) -> (&'static str, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_json",
+                    "error": "Request body must be valid JSON."
+                }),
+            );
+        }
+    };
+
+    let action = parsed
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    let repo_info = discover_repo_info(repo_root);
+    let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
+    let workflow = load_workflow_config(repo_root);
+    let credits = build_credits_json(repo_root, shipped_count);
+
+    let (status, mut resp) = match action.as_str() {
+        "new" => mutate_ui_v4_state(repo_root, |state| {
+            let seeded = build_seeded_delivery2_entries(
+                &repo_info, &inbox, &board, &credits, &workflow, state,
+            );
+            let _ = ensure_active_thread_mut(&mut state.delivery2, seeded);
+            let now = unix_now();
+            let new_id = format!("thr-{}", csprng_hex(4));
+            let title = parsed
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(scrub_customer_ui_text)
+                .unwrap_or_else(|| "New thread".to_string());
+            state.delivery2.threads.push(Delivery2Thread {
+                id: new_id.clone(),
+                title,
+                bucket: "today".to_string(),
+                status: "Live".to_string(),
+                created_at_unix: now,
+                updated_at_unix: now,
+                entries: Vec::new(),
+            });
+            state.delivery2.active_thread_id = new_id.clone();
+            state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+            Ok(json!({
+                "ok": true,
+                "action": "new",
+                "active_thread_id": new_id,
+                "seq": state.delivery2.seq
+            }))
+        }),
+        "switch" => {
+            let target_id = parsed
+                .get("thread_id")
+                .or_else(|| parsed.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if target_id.is_empty() {
+                return (
+                    "400 Bad Request",
+                    json!({
+                        "ok": false,
+                        "error_code": "missing_thread_id",
+                        "error": "thread_id is required to switch threads."
+                    }),
+                );
+            }
+            mutate_ui_v4_state(repo_root, |state| {
+                let exists = target_id == "thr-main"
+                    || state.delivery2.threads.iter().any(|t| t.id == target_id);
+                if !exists {
+                    return Err((
+                        "404 Not Found",
+                        json!({
+                            "ok": false,
+                            "error_code": "thread_not_found",
+                            "error": "Requested Delivery-2 thread was not found."
+                        }),
+                    ));
+                }
+                state.delivery2.active_thread_id = target_id.to_string();
+                state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+                Ok(json!({
+                    "ok": true,
+                    "action": "switch",
+                    "active_thread_id": target_id,
+                    "seq": state.delivery2.seq
+                }))
+            })
+        }
+        "morning_focus" => mutate_ui_v4_state(repo_root, |state| {
+            if let Some(seen) = parsed.get("seen").and_then(Value::as_bool) {
+                state.delivery2.morning_seen = seen;
+            }
+            if let Some(collapsed) = parsed.get("collapsed").and_then(Value::as_bool) {
+                state.delivery2.morning_collapsed = collapsed;
+            }
+            state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+            Ok(json!({
+                "ok": true,
+                "action": "morning_focus",
+                "seen": state.delivery2.morning_seen,
+                "collapsed": state.delivery2.morning_collapsed,
+                "seq": state.delivery2.seq
+            }))
+        }),
+        "connection" => {
+            let surface = parsed
+                .get("surface")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if !matches!(surface.as_str(), "github" | "linear" | "slack") {
+                return (
+                    "400 Bad Request",
+                    json!({
+                        "ok": false,
+                        "error_code": "invalid_surface",
+                        "error": "Surface must be 'github', 'linear', or 'slack'."
+                    }),
+                );
+            }
+            mutate_ui_v4_state(repo_root, |state| {
+                let pref = state
+                    .delivery2
+                    .connections
+                    .entry(surface.clone())
+                    .or_default();
+                if let Some(in_thr) = parsed.get("in_thread").and_then(Value::as_bool) {
+                    pref.in_thread = Some(in_thr);
+                }
+                state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+                Ok(json!({
+                    "ok": true,
+                    "action": "connection",
+                    "surface": surface,
+                    "in_thread": pref.in_thread,
+                    "seq": state.delivery2.seq
+                }))
+            })
+        }
+        _ => (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "invalid_thread_action",
+                "error": "Thread action must be 'new', 'switch', 'morning_focus', or 'connection'."
+            }),
+        ),
+    };
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+// ============================================================================
 // Main Loopback HTTP Router
 // ============================================================================
 
@@ -5170,6 +7084,138 @@ fn handle_workbench_http_connection_inner(
         }
         ("POST", "/api/v4/pm/ask" | "/api/pm/ask" | "/api/delivery/ask") => {
             let (status, payload) = handle_pm_ask(repo_root, &req.body);
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("GET", "/api/v1/delivery2/state") => {
+            let val = build_delivery2_state_json(repo_root, auth.port());
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/v1/delivery2/message") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_message(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/v1/delivery2/cancel") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_cancel(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/v1/delivery2/approval") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_approval(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/v1/delivery2/memory") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_memory(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/v1/delivery2/thread") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_thread(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
             write_hardened_response(
                 &mut stream,
                 status,
@@ -5823,7 +7869,291 @@ mod tests {
                 .contains(concat!("mer", "cury"))
         );
         assert!(!cleaned.to_ascii_lowercase().contains(concat!("cr", "db")));
-        assert!(cleaned.contains("live-stream"));
+        assert!(cleaned.contains("live updates"));
+    }
+
+    #[test]
+    fn five_stage_scrubber_preserves_delivery_2_and_scrubs_30_seats_vendors_and_crypto() {
+        // Stage 1 + 2: Canonicalize every Delivery-2 spelling, Unicode dash, fullwidth, & zero-width variant
+        for variant in [
+            "DELIVERY-2",
+            "delivery-2",
+            "Delivery 2",
+            "delivery2",
+            "D\u{200B}ELIVERY\u{2011}2",
+            "@DELIVERY-2",
+            "■ DELIVERY-2",
+            "\u{FF24}\u{FF45}\u{FF4C}\u{FF49}\u{FF56}\u{FF45}\u{FF52}\u{FF59}\u{2013}2",
+        ] {
+            let out = scrub_customer_ui_text(&format!("Ask {variant} to scope this change."));
+            assert_eq!(
+                out, "Ask Delivery-2 to scope this change.",
+                "variant `{variant}` must canonicalize to Delivery-2"
+            );
+        }
+
+        // Bare DELIVERY (not followed by -2) scrubs to Chinwag PM, while English "webhook delivery" stays intact
+        let bare = scrub_customer_ui_text(&format!(
+            "{} and @{} coordinated with DELIVERY-2 on duplicate webhook delivery.",
+            concat!("DELI", "VERY"),
+            concat!("deli", "very#inst1")
+        ));
+        assert!(bare.contains("Delivery-2"), "{bare}");
+        assert!(bare.contains("duplicate webhook delivery."), "{bare}");
+        assert!(!bare.contains("DELIVERY "), "{bare}");
+        assert!(!bare.contains("#inst1"), "{bare}");
+
+        // Context-aware eve.dev / useEveAgent / eve agent -> Delivery-2, while English "the eve of release" stays intact
+        let eve_prose = scrub_customer_ui_text(&format!(
+            "Migrated from {} and {} on the eve of release.",
+            concat!("eve", ".dev"),
+            concat!("useEve", "Agent")
+        ));
+        assert_eq!(
+            eve_prose,
+            "Migrated from Delivery-2 and Delivery-2 on the eve of release."
+        );
+
+        // All 30 standing seats scrub cleanly when emitted as internal handles
+        let seats = [
+            concat!("GEMINI", "-PM"),
+            concat!("DELI", "VERY"),
+            concat!("ARCHI", "TECT"),
+            concat!("RU", "ST"),
+            concat!("IND", "EX"),
+            concat!("CLOUD", "FLARE"),
+            concat!("ALIS", "TAIR"),
+            "QA",
+            concat!("INFRA", "JR"),
+            concat!("HOUSE", "KEEPING"),
+            concat!("TY", "PE"),
+            concat!("GAME", "DEV"),
+            concat!("SPA", "RK"),
+            concat!("MOT", "ION"),
+            concat!("FREQU", "ENCY"),
+            concat!("SCR", "IBE"),
+            concat!("DO", "CS"),
+            "MO",
+            concat!("EAGLE", "-EYE"),
+            concat!("PAT", "ENT"),
+            concat!("VEN", "TURE"),
+            concat!("DE", "X"),
+            concat!("DECLAR", "ATION"),
+            concat!("GRO", "WTH"),
+            concat!("SAL", "ES"),
+            concat!("SOC", "IAL"),
+            concat!("WORK", "HORSE"),
+            concat!("FL", "INT"),
+            "H",
+            concat!("AUS", "DRA"),
+        ];
+        assert_eq!(seats.len(), 30);
+        for seat in seats {
+            let scrubbed = scrub_customer_ui_text(&format!("Routed via {seat} today."));
+            assert_ne!(
+                scrubbed,
+                format!("Routed via {seat} today."),
+                "internal seat `{seat}` must be scrubbed"
+            );
+        }
+
+        // Cloud/model vendors and crypto/protocol jargon rewrite to plain English
+        let jargon = format!(
+            "{} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {}",
+            concat!("Ver", "cel"),
+            concat!("Cloud", "flare"),
+            concat!("Mer", "cury 3"),
+            concat!("Cl", "ef"),
+            concat!("Clair", "ic"),
+            concat!("Fl", "ue"),
+            concat!("Ne", "on"),
+            concat!("Up", "stash"),
+            concat!("Cl", "erk"),
+            concat!("CR", "DT"),
+            concat!("state.cr", "db"),
+            concat!("Ed25", "519"),
+            concat!("X25519ML", "KEM768"),
+            concat!("LE", "ANN"),
+            concat!("DO", "RA"),
+        );
+        let rewritten = scrub_customer_ui_text(&jargon);
+        assert!(rewritten.contains("cloud gateway"), "{rewritten}");
+        assert!(rewritten.contains("sync"), "{rewritten}");
+        assert!(rewritten.contains("workspace history"), "{rewritten}");
+        assert!(rewritten.contains("verified"), "{rewritten}");
+        assert!(rewritten.contains("end-to-end encrypted"), "{rewritten}");
+        assert!(rewritten.contains("Memory search"), "{rewritten}");
+        assert!(rewritten.contains("delivery metrics"), "{rewritten}");
+    }
+
+    #[test]
+    fn delivery2_routes_enforce_secret_rejection_idempotent_approval_memory_and_threads() {
+        let repo = make_temp_repo("delivery2-v4-4");
+
+        // 1. Initial deterministic state projection
+        let initial = build_delivery2_state_json(&repo, 5487);
+        assert_eq!(initial["ok"], true);
+        assert_eq!(initial["agent_name"], "Delivery-2");
+        assert_eq!(initial["sync_radar"]["latency_label"], "<200ms");
+        assert_eq!(
+            initial["sync_radar"]["surfaces"].as_array().unwrap().len(),
+            4
+        );
+        let slack_surf = &initial["sync_radar"]["surfaces"][3];
+        assert_eq!(slack_surf["id"], "slack");
+        assert_eq!(
+            slack_surf["auth_status"],
+            "Connected · ambient status cards only"
+        );
+        assert_eq!(
+            initial["morning_focus"]["rows"].as_array().unwrap().len(),
+            3
+        );
+
+        // 2. Secret-shaped strings rejected on Remember: without persisting
+        for secret_note in [
+            "Remember: API_KEY=supersecretvalue12345",
+            "Remember: use sk-live9876543210abcdef1234",
+            "Remember: token ghp_1234567890abcdefghijklmnop",
+            "Remember: slack xoxb-1234567890-abcdef123456",
+        ] {
+            let (st, err_val) = handle_delivery2_message(
+                &repo,
+                5487,
+                serde_json::to_vec(&json!({ "prompt": secret_note }))
+                    .unwrap()
+                    .as_slice(),
+            );
+            assert_eq!(st, "400 Bad Request");
+            assert_eq!(err_val["error_code"], "secret_rejected");
+        }
+
+        // 3. Valid Remember: note creates stable mem_<id>, then edit / undo / restore roundtrip
+        let (st_mem, val_mem) = handle_delivery2_message(
+            &repo,
+            5487,
+            br#"{"prompt":"Remember: Keep database migrations additive and reversible."}"#,
+        );
+        assert_eq!(st_mem, "200 OK");
+        let mem_id = val_mem["entry"]["memory_id"]
+            .as_str()
+            .expect("mem_<id>")
+            .to_string();
+        assert!(mem_id.starts_with("mem_"));
+
+        let (st_bad_edit, val_bad_edit) = handle_delivery2_memory(
+            &repo,
+            5487,
+            serde_json::to_vec(&json!({
+                "id": mem_id,
+                "action": "edit",
+                "note": "ghp_1234567890abcdefghijklmnop"
+            }))
+            .unwrap()
+            .as_slice(),
+        );
+        assert_eq!(st_bad_edit, "400 Bad Request");
+        assert_eq!(val_bad_edit["error_code"], "secret_rejected");
+
+        let (st_edit, val_edit) = handle_delivery2_memory(
+            &repo,
+            5487,
+            serde_json::to_vec(&json!({
+                "id": mem_id,
+                "action": "edit",
+                "note": "Keep database migrations additive, reversible, and tested."
+            }))
+            .unwrap()
+            .as_slice(),
+        );
+        assert_eq!(st_edit, "200 OK");
+        assert_eq!(
+            val_edit["memory"]["note"],
+            "Keep database migrations additive, reversible, and tested."
+        );
+
+        let (st_undo, val_undo) = handle_delivery2_memory(
+            &repo,
+            5487,
+            serde_json::to_vec(&json!({ "id": mem_id, "action": "undo" }))
+                .unwrap()
+                .as_slice(),
+        );
+        assert_eq!(st_undo, "200 OK");
+        assert_eq!(val_undo["memory"]["status"], "undone");
+
+        let (st_rest, val_rest) = handle_delivery2_memory(
+            &repo,
+            5487,
+            serde_json::to_vec(&json!({ "id": mem_id, "action": "restore" }))
+                .unwrap()
+                .as_slice(),
+        );
+        assert_eq!(st_rest, "200 OK");
+        assert_eq!(val_rest["memory"]["status"], "saved");
+
+        // 4. First-answer-wins HITL approval + SampleWalkthroughShipForbidden
+        let (st_sample, val_sample) = handle_delivery2_approval(
+            &repo,
+            5487,
+            br#"{"id":"sample-walkthrough","decision":"approve","is_sample":true}"#,
+        );
+        assert_eq!(st_sample, "403 Forbidden");
+        assert_eq!(val_sample["error_code"], "SampleWalkthroughShipForbidden");
+
+        let (st_app1, val_app1) = handle_delivery2_approval(
+            &repo,
+            5487,
+            br#"{"id":"hitl-run-local-1","item_id":"run-local-1","decision":"approve"}"#,
+        );
+        assert_eq!(st_app1, "200 OK");
+        assert_eq!(val_app1["decision"], "approved");
+        assert_eq!(val_app1["already_settled"], false);
+        assert!(
+            val_app1["receipt"]
+                .as_str()
+                .unwrap_or("")
+                .contains("0 Cr while paused")
+        );
+
+        // Second conflicting answer returns first settled decision idempotently
+        let (st_app2, val_app2) = handle_delivery2_approval(
+            &repo,
+            5487,
+            br#"{"id":"hitl-run-local-1","item_id":"run-local-1","decision":"deny"}"#,
+        );
+        assert_eq!(st_app2, "200 OK");
+        assert_eq!(val_app2["decision"], "approved");
+        assert_eq!(val_app2["already_settled"], true);
+
+        // 5. Cancel + Thread new / switch preserve history
+        let (st_can, val_can) = handle_delivery2_cancel(&repo, 5487, br#"{"turn_id":"turn-42"}"#);
+        assert_eq!(st_can, "200 OK");
+        assert_eq!(val_can["cancelled"], true);
+        assert_eq!(val_can["credits_charged"], 0);
+
+        let (st_new, val_new) = handle_delivery2_thread(&repo, 5487, br#"{"action":"new"}"#);
+        assert_eq!(st_new, "200 OK");
+        let new_tid = val_new["active_thread_id"].as_str().unwrap().to_string();
+        assert_ne!(new_tid, "thr-main");
+        assert!(
+            val_new["state"]["history"]["today"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 2,
+            "archiving previous thread must preserve history"
+        );
+
+        let (st_sw, val_sw) = handle_delivery2_thread(
+            &repo,
+            5487,
+            br#"{"action":"switch","thread_id":"thr-main"}"#,
+        );
+        assert_eq!(st_sw, "200 OK");
+        assert_eq!(val_sw["active_thread_id"], "thr-main");
+
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]

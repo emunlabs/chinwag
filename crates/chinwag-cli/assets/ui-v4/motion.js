@@ -414,3 +414,124 @@ export function createElapsedClock(format) {
     },
   };
 }
+
+// ── Delivery-2 Rail Toggle (single-frame grid snap + GPU clip/counter-translate) ─
+export function animateRailToggle(railEl, trackEl, spineEl, mainEl, nextExpanded, applyAttr) {
+  keepAnchored(
+    mainEl,
+    () => (hasDom ? document.getElementById("view-root") || document.scrollingElement || document.documentElement : null),
+    applyAttr,
+  );
+  if (!railEl || prefersReducedMotion()) return Promise.resolve();
+  const jobs = [];
+  if (trackEl && typeof trackEl.animate === "function") {
+    const frames = nextExpanded
+      ? [
+          { transform: "translate3d(-276px, 0, 0)", opacity: 0.72 },
+          { transform: "translate3d(0, 0, 0)", opacity: 1 },
+        ]
+      : [
+          { transform: "translate3d(276px, 0, 0)", opacity: 1 },
+          { transform: "translate3d(0, 0, 0)", opacity: 0 },
+        ];
+    jobs.push(done(play(trackEl, frames, "--dur-rail", "--ease-out-expo", "d2-rail-track")));
+  }
+  if (typeof railEl.animate === "function") {
+    const clipFrames = nextExpanded
+      ? [{ clipPath: "inset(0 276px 0 0)" }, { clipPath: "inset(0 0px 0 0)" }]
+      : [{ clipPath: "inset(0 -276px 0 0)" }, { clipPath: "inset(0 0px 0 0)" }];
+    jobs.push(done(play(railEl, clipFrames, "--dur-rail", "--ease-out-expo", "d2-rail-clip")));
+  }
+  if (spineEl && !nextExpanded && typeof spineEl.animate === "function") {
+    jobs.push(done(play(spineEl, [{ opacity: 0 }, { opacity: 1 }], "--dur-rail-fade", "--ease-standard", "d2-spine-in")));
+  }
+  return Promise.all(jobs);
+}
+
+// ── Delivery-2 Amber Deep-Link Bounce Ring (640ms) ─────────────────────────
+export function flashDeliveryCard(cardEl) {
+  if (!cardEl) return;
+  cardEl.scrollIntoView({ block: "nearest", behavior: "auto" });
+  if (prefersReducedMotion()) return;
+  cardEl.removeAttribute("data-handoff-flash");
+  requestAnimationFrame(() => {
+    cardEl.setAttribute("data-handoff-flash", "true");
+    setTimeout(() => cardEl.removeAttribute("data-handoff-flash"), tokenMs("--dur-flash") + 40);
+  });
+}
+
+// ── Proportional 1/8 Live Reply Streamer (60ms tick, 1200ms post-done cap) ─
+export function createProportionalStreamer({ onTick, onFinish } = {}) {
+  let targetText = "";
+  let shownLen = 0;
+  let tickTimer = 0;
+  let hardCapTimer = 0;
+  let doneMarked = false;
+  let finished = false;
+
+  const clearTimers = () => {
+    clearTimeout(tickTimer);
+    clearTimeout(hardCapTimer);
+    tickTimer = 0;
+    hardCapTimer = 0;
+  };
+
+  const commitAll = () => {
+    if (finished) return;
+    finished = true;
+    clearTimers();
+    shownLen = targetText.length;
+    if (typeof onTick === "function") onTick(targetText, true);
+    if (typeof onFinish === "function") onFinish(targetText);
+  };
+
+  const step = () => {
+    tickTimer = 0;
+    if (finished) return;
+    const remaining = targetText.length - shownLen;
+    if (remaining <= 0) {
+      if (doneMarked) commitAll();
+      return;
+    }
+    const delta = Math.max(4, Math.ceil(remaining / 8));
+    shownLen = Math.min(targetText.length, shownLen + delta);
+    const slice = targetText.slice(0, shownLen);
+    if (typeof onTick === "function") onTick(slice, shownLen >= targetText.length && doneMarked);
+    if (shownLen >= targetText.length && doneMarked) {
+      commitAll();
+      return;
+    }
+    tickTimer = setTimeout(step, 60);
+  };
+
+  return {
+    push(nextFullText) {
+      targetText = String(nextFullText ?? "");
+      if (prefersReducedMotion()) {
+        shownLen = targetText.length;
+        if (typeof onTick === "function") onTick(targetText, doneMarked);
+        if (doneMarked) commitAll();
+        return;
+      }
+      if (!tickTimer && !finished) {
+        step();
+      }
+    },
+    markDone() {
+      doneMarked = true;
+      if (prefersReducedMotion() || shownLen >= targetText.length) {
+        commitAll();
+        return;
+      }
+      clearTimeout(hardCapTimer);
+      hardCapTimer = setTimeout(commitAll, 1200);
+      if (!tickTimer) step();
+    },
+    cancel() {
+      if (finished) return;
+      finished = true;
+      clearTimers();
+    },
+    flushNow: commitAll,
+  };
+}

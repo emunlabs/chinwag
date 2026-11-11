@@ -1,0 +1,100 @@
+{
+  "tombstone_id": "tombstone-no-customer-architect-seat-in-ui-v1",
+  "ticket_id": "CHWG-0254",
+  "source_run_id": "CHWG-0254-ui-v4-4-delivery2-panel",
+  "forbidden_404_routes": [
+    "/contact",
+    "chinwag.sh/invite"
+  ],
+  "required_css_contracts": [
+    "container: main / inline-size",
+    "@container main (min-width: 1120px)",
+    "@container main (max-width: 1119.98px)",
+    "max-width: calc(100vw - var(--rail-current) - 48px)",
+    ".app-header::after 1px spine",
+    ".d2-track contain: layout paint"
+  ],
+  "fork_at_step": 1,
+  "steps": [
+    {
+      "step_index": 0,
+      "kind": "tool",
+      "request_jcs_sha256": "792e5525c96a11b49a82f94611c048410bb30faea3d6d431c15605b4a1786684",
+      "request_json": {
+        "check": "ui_v4_4_delivery2_panel_phase1",
+        "surface": "127.0.0.1:5487",
+        "ticket_id": "CHWG-0254"
+      },
+      "response_json": {
+        "ok": true,
+        "agent_name": "Delivery-2",
+        "phase": "phase1_zero_voice_stubs",
+        "rail_widths": {
+          "expanded_px": 320,
+          "spine_px": 44,
+          "container_split_min_px": 1120
+        },
+        "shortcuts": {
+          "toggle_rail": "Cmd+B",
+          "focus_composer": "Cmd+J",
+          "cancel_reply": "Cmd+.",
+          "inbox_queue_launcher": "Cmd+K",
+          "region_scoped_submit": "Cmd+Enter"
+        },
+        "slack_role_mode": "ambient_status_only",
+        "slack_auth_status": "Connected · ambient status cards only",
+        "hitl_pause_credits": 0,
+        "security_url": "https://chinwag.sh/security",
+        "founders_url": "https://chinwag.sh/pricing?talk=1&source=local_ui#founders"
+      },
+      "simulated_clock_ms": 1794436800000,
+      "simulated_uuid": "00000000-0000-4000-8000-000000000254",
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "cost_micro_usd": 0,
+      "shadow_kv_prefix_hash": null
+    }
+  ],
+  "expectations": [
+    {
+      "type": "json_path_equals",
+      "step_index": 0,
+      "json_path": "$.ok",
+      "expected": true
+    },
+    {
+      "type": "json_path_equals",
+      "step_index": 0,
+      "json_path": "$.agent_name",
+      "expected": "Delivery-2"
+    },
+    {
+      "type": "json_path_equals",
+      "step_index": 0,
+      "json_path": "$.slack_role_mode",
+      "expected": "ambient_status_only"
+    },
+    {
+      "type": "json_path_equals",
+      "step_index": 0,
+      "json_path": "$.hitl_pause_credits",
+      "expected": 0
+    },
+    {
+      "type": "forbidden_pattern",
+      "pattern": "/contact"
+    },
+    {
+      "type": "forbidden_pattern",
+      "pattern": "chinwag.sh/invite"
+    },
+    {
+      "type": "forbidden_pattern",
+      "pattern": "d2-btn-mic"
+    },
+    {
+      "type": "max_tool_calls",
+      "max_calls": 1
+    }
+  ]
+}
