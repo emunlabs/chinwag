@@ -5,17 +5,71 @@
   "project_number": 1,
   "project_title": "Chinwag Engineering Velocity & Agent Fleet",
   "project_url": "https://github.com/orgs/emunlabs/projects/1",
+  "public_board": false,
+  "private_repo": null,
+  "public_repo": null,
   "repository_id": "R_kgDOVU4K-Q",
   "repository_name_with_owner": "emunlabs/chinwag",
   "status_field_id": "PVTSSF_lADOFJPsXM4BrFUVzhpZlZQ",
   "status_option_ids": {
-    "Done": "98236657",
-    "In Progress": "47fc9ee4",
-    "Todo": "f75ad846"
+    "01 · 🌱 OPEN BOUNTY (+500 CR)": "25d0d056",
+    "02 · 📐 SCOPED & BENCHMARKED": "8dc79d38",
+    "03 · ⚡ IN FLIGHT — CLOCK LIVE": "03fb4f96",
+    "04 · ⚖️ TRIBUNAL & COPY GATE": "260b523a",
+    "05 · ✓ SHIPPED — Δ VERIFIED": "ef758215"
+  },
+  "custom_field_ids": {
+    "Active Seats": "PVTF_lADOFJPsXM4BrFUVzhpZnRA",
+    "Assignees": "PVTF_lADOFJPsXM4BrFUVzhpZlZM",
+    "Chinwag Cycle Time": "PVTF_lADOFJPsXM4BrFUVzhpZnQ0",
+    "Cryptographic Receipt": "PVTF_lADOFJPsXM4BrFUVzhpZnRI",
+    "DORA Baseline": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQw",
+    "Execution Mode": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQ8",
+    "Labels": "PVTF_lADOFJPsXM4BrFUVzhpZlZU",
+    "Linked pull requests": "PVTF_lADOFJPsXM4BrFUVzhpZlZY",
+    "Milestone": "PVTF_lADOFJPsXM4BrFUVzhpZlZg",
+    "Net Hours Saved": "PVTF_lADOFJPsXM4BrFUVzhpZnQ4",
+    "Repository": "PVTF_lADOFJPsXM4BrFUVzhpZlZo",
+    "Reviewers": "PVTF_lADOFJPsXM4BrFUVzhpZlZ4",
+    "Title": "PVTF_lADOFJPsXM4BrFUVzhpZlZI",
+    "Δ Speedup vs. DORA": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQs"
+  },
+  "custom_field_option_ids": {
+    "DORA Baseline": {
+      "Tier L · 50h Eng / 6.2d Cal (400–1,200 LOC)": "eab7a2d8",
+      "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)": "2a923a4a",
+      "Tier S · 8.5h Eng / 1.1d Cal (<=100 LOC)": "ca471cc2",
+      "Tier XL · 112h Eng / 14.0d Cal (1,200+ LOC)": "4a1d281f"
+    },
+    "Execution Mode": {
+      "⚡ Principal Solo · Direct Lease": "db481c08",
+      "🌐 Subagent Swarm · Cloud Fan-Out": "52abca64",
+      "🌱 Open Bounty · +500 Credits": "c24014d8",
+      "🔺 3-Seat Triad · Isolated JJ": "3b4b6d45",
+      "🤝 2-Seat Pair · Cross-Model": "9d02454f"
+    },
+    "Δ Speedup vs. DORA": {
+      "⏱️ Clock Running — In Flight": "523348bf",
+      "⚡ 100x+ Faster vs. DORA": "e87d784e",
+      "📐 Baseline Locked — Queued": "f5d1554c",
+      "🔥 10x–49x Faster vs. DORA": "b6e45ca4",
+      "🚀 50x–99x Faster vs. DORA": "c69416e4"
+    }
+  },
+  "system_field_ids": {
+    "CLOSED": "PVTF_lADOFJPsXM4BrFUVzhpZlag",
+    "CREATED": "PVTF_lADOFJPsXM4BrFUVzhpZlaQ",
+    "PARENT_ISSUE": "PVTF_lADOFJPsXM4BrFUVzhpZlaA",
+    "SUB_ISSUES_PROGRESS": "PVTF_lADOFJPsXM4BrFUVzhpZlaI",
+    "UPDATED": "PVTF_lADOFJPsXM4BrFUVzhpZlaY"
   },
   "synced_issue_node_ids": {
     "CHWG-0189": "I_kwDOVU4K-c8AAAABeK-k7Q",
     "CHWG-0190": "I_kwDOVU4K-c8AAAABeK-nKA"
+  },
+  "synced_issue_numbers": {
+    "CHWG-0189": 19,
+    "CHWG-0190": 20
   },
   "synced_issue_urls": {
     "CHWG-0189": "https://github.com/emunlabs/chinwag/issues/19",

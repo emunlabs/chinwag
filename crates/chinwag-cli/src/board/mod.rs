@@ -1387,6 +1387,12 @@ pub struct BoardConfigV1 {
     pub project_title: String,
     pub project_url: String,
     #[serde(default)]
+    pub public_board: bool,
+    #[serde(default)]
+    pub private_repo: Option<String>,
+    #[serde(default)]
+    pub public_repo: Option<String>,
+    #[serde(default)]
     pub repository_id: Option<String>,
     #[serde(default)]
     pub repository_name_with_owner: Option<String>,
@@ -1395,7 +1401,15 @@ pub struct BoardConfigV1 {
     #[serde(default)]
     pub status_option_ids: BTreeMap<String, String>,
     #[serde(default)]
+    pub custom_field_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub custom_field_option_ids: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub system_field_ids: BTreeMap<String, String>,
+    #[serde(default)]
     pub synced_issue_node_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub synced_issue_numbers: BTreeMap<String, u64>,
     #[serde(default)]
     pub synced_issue_urls: BTreeMap<String, String>,
     #[serde(default)]
@@ -1404,6 +1418,15 @@ pub struct BoardConfigV1 {
 
 impl Default for BoardConfigV1 {
     fn default() -> Self {
+        let mut system_field_ids = BTreeMap::new();
+        system_field_ids.insert("CREATED".to_string(), "CREATED".to_string());
+        system_field_ids.insert("UPDATED".to_string(), "UPDATED".to_string());
+        system_field_ids.insert("CLOSED".to_string(), "CLOSED".to_string());
+        system_field_ids.insert("PARENT_ISSUE".to_string(), "PARENT_ISSUE".to_string());
+        system_field_ids.insert(
+            "SUB_ISSUES_PROGRESS".to_string(),
+            "SUB_ISSUES_PROGRESS".to_string(),
+        );
         Self {
             schema: "chinwag.board.config.v1".to_string(),
             org: "emunlabs".to_string(),
@@ -1411,11 +1434,18 @@ impl Default for BoardConfigV1 {
             project_number: 1,
             project_title: "Chinwag Engineering Velocity & Agent Fleet".to_string(),
             project_url: "https://github.com/orgs/emunlabs/projects/1".to_string(),
+            public_board: false,
+            private_repo: Some("emunlabs/chinwag-private".to_string()),
+            public_repo: Some("emunlabs/chinwag".to_string()),
             repository_id: None,
             repository_name_with_owner: Some("emunlabs/chinwag".to_string()),
             status_field_id: None,
             status_option_ids: BTreeMap::new(),
+            custom_field_ids: BTreeMap::new(),
+            custom_field_option_ids: BTreeMap::new(),
+            system_field_ids,
             synced_issue_node_ids: BTreeMap::new(),
+            synced_issue_numbers: BTreeMap::new(),
             synced_issue_urls: BTreeMap::new(),
             synced_project_item_ids: BTreeMap::new(),
         }
@@ -1437,6 +1467,250 @@ impl BoardConfigV1 {
         fs::write(p, format!("{body}\n"))
             .map_err(|e| format!("failed to write board-config.json: {e}"))
     }
+}
+
+/// Build the canonical GitHub Projects v2 template schema (`.chinwag/templates/github-project-v2-schema.json`).
+#[must_use]
+pub fn build_github_project_v2_template_schema(cfg: &BoardConfigV1) -> Value {
+    json!({
+        "schema": "chinwag.github.project_v2.template.v1",
+        "version": "1.0.0",
+        "title": cfg.project_title,
+        "org": cfg.org,
+        "default_visibility": if cfg.public_board { "public" } else { "private" },
+        "public_board": cfg.public_board,
+        "private_repo": cfg.private_repo,
+        "public_repo": cfg.public_repo,
+        "invariants": [
+            "INV-DEFAULT-PRIVATE-BOARD-01",
+            "INV-CHINWAG-TASKS-REPO-01",
+            "INV-NO-DRAFT-ISSUES-01",
+            "INV-30CH-COLUMN-BUDGET-01",
+            "INV-NO-FAKE-DONE-01"
+        ],
+        "engines": {
+            "delivery_supervisor": "Chinwag Delivery-2",
+            "reflex_worker": "Chinwag Reflex-1",
+            "visual_tribunal": "Chinwag Vision-3"
+        },
+        "status_columns": [
+            {
+                "code": "01_OPEN_BOUNTY",
+                "name": BoardStatus::OpenBounty.column_header(),
+                "color": "GREEN",
+                "description": "Open engineering bounty (+500 Cr reward on verified merge)"
+            },
+            {
+                "code": "02_SCOPED_BENCHMARKED",
+                "name": BoardStatus::ScopedBenchmarked.column_header(),
+                "color": "BLUE",
+                "description": "DORA complexity tier locked and CP-OMP seat quorum assigned"
+            },
+            {
+                "code": "03_IN_FLIGHT",
+                "name": BoardStatus::InFlight.column_header(),
+                "color": "YELLOW",
+                "description": "Active execution in isolated JJ shadow workspace; wall-clock live"
+            },
+            {
+                "code": "04_TRIBUNAL_GATE",
+                "name": BoardStatus::TribunalGate.column_header(),
+                "color": "ORANGE",
+                "description": "H1-H5 + Pillar 12 SurfaceImpactManifestV1 + UI-Gate Tribunal (<200ms snap-back on failure)"
+            },
+            {
+                "code": "05_SHIPPED_VERIFIED",
+                "name": BoardStatus::ShippedVerified.column_header(),
+                "color": "GREEN",
+                "description": "All surfaces green, Ed25519 velocity proof stamped, GitHub issue closed, 168h SURV live"
+            }
+        ],
+        "custom_fields": [
+            {
+                "name": "Δ Speedup vs. DORA",
+                "data_type": "SINGLE_SELECT",
+                "options": [
+                    { "name": "⚡ 100x+ Faster vs. DORA", "color": "GREEN" },
+                    { "name": "🚀 25x–99x Faster vs. DORA", "color": "BLUE" },
+                    { "name": "🟢 10x–24x Faster vs. DORA", "color": "YELLOW" },
+                    { "name": "⏳ In Flight — Clock Running", "color": "GRAY" }
+                ]
+            },
+            {
+                "name": "DORA Baseline",
+                "data_type": "SINGLE_SELECT",
+                "options": [
+                    { "name": DoraTier::S.canonical_option_label(), "color": "GREEN" },
+                    { "name": DoraTier::M.canonical_option_label(), "color": "BLUE" },
+                    { "name": DoraTier::L.canonical_option_label(), "color": "PURPLE" },
+                    { "name": DoraTier::XL.canonical_option_label(), "color": "ORANGE" }
+                ]
+            },
+            {
+                "name": "Chinwag Cycle Time",
+                "data_type": "TEXT"
+            },
+            {
+                "name": "Net Hours Saved",
+                "data_type": "NUMBER"
+            },
+            {
+                "name": "Execution Mode",
+                "data_type": "SINGLE_SELECT",
+                "options": [
+                    { "name": "Solo Seat", "color": "BLUE" },
+                    { "name": "Pair (100 Cr)", "color": "GREEN" },
+                    { "name": "Triad (150 Cr)", "color": "PURPLE" },
+                    { "name": "Quad (200 Cr)", "color": "ORANGE" }
+                ]
+            },
+            {
+                "name": "Active Seats",
+                "data_type": "TEXT"
+            },
+            {
+                "name": "Cryptographic Receipt",
+                "data_type": "TEXT"
+            }
+        ],
+        "native_github_system_fields": [
+            {
+                "code": "CREATED",
+                "name": "Created",
+                "immutable_server_timestamp": true,
+                "description": "Immutable GitHub issue creation timestamp (t_open anchor)"
+            },
+            {
+                "code": "UPDATED",
+                "name": "Updated",
+                "immutable_server_timestamp": true,
+                "description": "Immutable GitHub server mutation timestamp"
+            },
+            {
+                "code": "CLOSED",
+                "name": "Closed",
+                "immutable_server_timestamp": true,
+                "description": "Immutable GitHub issue completion timestamp stamped when 05_SHIPPED_VERIFIED closes the issue"
+            },
+            {
+                "code": "PARENT_ISSUE",
+                "name": "Parent issue",
+                "immutable_server_timestamp": false,
+                "description": "Parent ticket linkage for cross-surface sub-tasks (#ID.1..#ID.4)"
+            },
+            {
+                "code": "SUB_ISSUES_PROGRESS",
+                "name": "Sub-issues progress",
+                "immutable_server_timestamp": false,
+                "description": "Native progress bar across #ID.1 Code, #ID.2 Docs, #ID.3 Site/Proxy, and #ID.4 QA/UI-Gate"
+            }
+        ],
+        "insights": {
+            "primary_chart": {
+                "title": "Cumulative Engineering Hours Saved by DORA Complexity Tier",
+                "chart_type": "STACKED_COLUMN",
+                "x_axis": "Status",
+                "y_axis": "SUM(Net Hours Saved)",
+                "group_by": "DORA Baseline"
+            },
+            "velocity_audit_chart": {
+                "title": "Verified Shipped Cards & Native GitHub Closed Timestamps",
+                "chart_type": "BAR",
+                "x_axis": "Δ Speedup vs. DORA",
+                "y_axis": "COUNT(Items)",
+                "group_by": "Execution Mode",
+                "timestamp_anchors": ["CREATED", "UPDATED", "CLOSED"]
+            }
+        }
+    })
+}
+
+/// Build the canonical Linear workspace template schema (`.chinwag/templates/linear-template.json`).
+#[must_use]
+pub fn build_linear_template_schema(cfg: &BoardConfigV1) -> Value {
+    json!({
+        "schema": "chinwag.linear.template.v1",
+        "version": "1.0.0",
+        "team_key": "CHWG",
+        "team_name": cfg.project_title,
+        "default_visibility": if cfg.public_board { "public" } else { "private" },
+        "public_board": cfg.public_board,
+        "invariants": [
+            "INV-DEFAULT-PRIVATE-BOARD-01",
+            "INV-CHINWAG-TASKS-REPO-01",
+            "INV-NO-FAKE-DONE-01"
+        ],
+        "engines": {
+            "delivery_supervisor": "Chinwag Delivery-2",
+            "reflex_worker": "Chinwag Reflex-1",
+            "visual_tribunal": "Chinwag Vision-3"
+        },
+        "workflow_states": [
+            { "code": "01_OPEN_BOUNTY", "name": BoardStatus::OpenBounty.column_header(), "type": "triage" },
+            { "code": "02_SCOPED_BENCHMARKED", "name": BoardStatus::ScopedBenchmarked.column_header(), "type": "unstarted" },
+            { "code": "03_IN_FLIGHT", "name": BoardStatus::InFlight.column_header(), "type": "started" },
+            { "code": "04_TRIBUNAL_GATE", "name": BoardStatus::TribunalGate.column_header(), "type": "started" },
+            { "code": "05_SHIPPED_VERIFIED", "name": BoardStatus::ShippedVerified.column_header(), "type": "completed" }
+        ],
+        "labels": [
+            "Tier S · 8.5h Eng",
+            "Tier M · 27h Eng",
+            "Tier L · 50h Eng",
+            "Tier XL · 112h Eng",
+            "⚡ 100x+ Faster vs. DORA",
+            "Pair (100 Cr)",
+            "Triad (150 Cr)",
+            "Quad (200 Cr)",
+            "SURV:PENDING_168H"
+        ]
+    })
+}
+
+/// Write `.chinwag/templates/github-project-v2-schema.json` and `.chinwag/templates/linear-template.json`.
+pub fn write_board_template_pack(
+    tasks_dir: &Path,
+    cfg: &BoardConfigV1,
+) -> Result<(PathBuf, PathBuf), String> {
+    let gh_schema = serde_json::to_string_pretty(&build_github_project_v2_template_schema(cfg))
+        .map_err(|e| format!("failed to serialize github-project-v2-schema.json: {e}"))?;
+    let lin_schema = serde_json::to_string_pretty(&build_linear_template_schema(cfg))
+        .map_err(|e| format!("failed to serialize linear-template.json: {e}"))?;
+
+    // Write into `.chinwag/templates/` (parent of `.chinwag/tasks`) and `tasks_dir/templates/`
+    let primary_dir = tasks_dir
+        .parent()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == ".chinwag")
+                .unwrap_or(false)
+        })
+        .map(|p| p.join("templates"))
+        .unwrap_or_else(|| tasks_dir.join("templates"));
+
+    fs::create_dir_all(&primary_dir)
+        .map_err(|e| format!("failed to create templates dir {}: {e}", primary_dir.display()))?;
+    let gh_path = primary_dir.join("github-project-v2-schema.json");
+    let lin_path = primary_dir.join("linear-template.json");
+    fs::write(&gh_path, format!("{gh_schema}\n"))
+        .map_err(|e| format!("failed to write {}: {e}", gh_path.display()))?;
+    fs::write(&lin_path, format!("{lin_schema}\n"))
+        .map_err(|e| format!("failed to write {}: {e}", lin_path.display()))?;
+
+    let local_templates = tasks_dir.join("templates");
+    if local_templates != primary_dir {
+        let _ = fs::create_dir_all(&local_templates);
+        let _ = fs::write(
+            local_templates.join("github-project-v2-schema.json"),
+            format!("{gh_schema}\n"),
+        );
+        let _ = fs::write(
+            local_templates.join("linear-template.json"),
+            format!("{lin_schema}\n"),
+        );
+    }
+
+    Ok((gh_path, lin_path))
 }
 
 /// Sub-task entry in `SurfaceImpactManifestV1` for card-move-driven cross-surface orchestration.
@@ -1622,6 +1896,18 @@ pub fn init_github_project_v2_live(
     org: &str,
     title: &str,
 ) -> Result<BoardConfigV1, String> {
+    init_github_project_v2_live_with_visibility(tasks_dir, org, title, false, None, None)
+}
+
+/// Live GitHub Projects v2 initialization with explicit visibility and repository bindings (`INV-DEFAULT-PRIVATE-BOARD-01`).
+pub fn init_github_project_v2_live_with_visibility(
+    tasks_dir: &Path,
+    org: &str,
+    title: &str,
+    public_board: bool,
+    private_repo: Option<&str>,
+    public_repo: Option<&str>,
+) -> Result<BoardConfigV1, String> {
     let query = r#"
 query($org: String!) {
   organization(login: $org) {
@@ -1632,6 +1918,7 @@ query($org: String!) {
         number
         title
         url
+        public
       }
     }
     repository(name: "chinwag") {
@@ -1728,16 +2015,30 @@ mutation($ownerId: ID!, $title: String!) {
         )
     };
 
-    // Query project fields to capture Status field and options
+    // Enforce project visibility (`public: false` by default per `INV-DEFAULT-PRIVATE-BOARD-01`, or `public: true` on `--public-board`)
+    let vis_mutation = format!(
+        "mutation($projectId: ID!) {{ updateProjectV2(input: {{ projectId: $projectId, public: {} }}) {{ projectV2 {{ id public }} }} }}",
+        if public_board { "true" } else { "false" }
+    );
+    let _ = execute_gh_graphql(&vis_mutation, &[("projectId", &project_id)]);
+
+    // Query existing project fields (both system and custom)
     let fields_q = r#"
 query($projectId: ID!) {
   node(id: $projectId) {
     ... on ProjectV2 {
-      fields(first: 20) {
+      fields(first: 40) {
         nodes {
+          __typename
+          ... on ProjectV2Field {
+            id
+            name
+            dataType
+          }
           ... on ProjectV2SingleSelectField {
             id
             name
+            dataType
             options {
               id
               name
@@ -1751,6 +2052,10 @@ query($projectId: ID!) {
 "#;
     let mut status_field_id = None;
     let mut status_option_ids = BTreeMap::new();
+    let mut custom_field_ids = BTreeMap::new();
+    let mut custom_field_option_ids: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut system_field_ids = BoardConfigV1::default().system_field_ids;
+
     if let Ok(f_resp) = execute_gh_graphql(fields_q, &[("projectId", &project_id)]) {
         if let Some(nodes) = f_resp
             .get("data")
@@ -1760,11 +2065,14 @@ query($projectId: ID!) {
             .and_then(|a| a.as_array())
         {
             for field in nodes {
-                if field.get("name").and_then(|n| n.as_str()) == Some("Status") {
-                    status_field_id = field
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+                let Some(fname) = field.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let Some(fid) = field.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if fname == "Status" {
+                    status_field_id = Some(fid.to_string());
                     if let Some(opts) = field.get("options").and_then(|o| o.as_array()) {
                         for opt in opts {
                             if let (Some(oid), Some(oname)) = (
@@ -1775,6 +2083,243 @@ query($projectId: ID!) {
                             }
                         }
                     }
+                } else if matches!(
+                    fname,
+                    "Created" | "Updated" | "Closed" | "Parent issue" | "Sub-issues progress"
+                ) {
+                    let key = match fname {
+                        "Created" => "CREATED",
+                        "Updated" => "UPDATED",
+                        "Closed" => "CLOSED",
+                        "Parent issue" => "PARENT_ISSUE",
+                        "Sub-issues progress" => "SUB_ISSUES_PROGRESS",
+                        _ => fname,
+                    };
+                    system_field_ids.insert(key.to_string(), fid.to_string());
+                } else {
+                    custom_field_ids.insert(fname.to_string(), fid.to_string());
+                    if let Some(opts) = field.get("options").and_then(|o| o.as_array()) {
+                        let mut omap = BTreeMap::new();
+                        for opt in opts {
+                            if let (Some(oid), Some(oname)) = (
+                                opt.get("id").and_then(|v| v.as_str()),
+                                opt.get("name").and_then(|v| v.as_str()),
+                            ) {
+                                omap.insert(oname.to_string(), oid.to_string());
+                            }
+                        }
+                        custom_field_option_ids.insert(fname.to_string(), omap);
+                    }
+                }
+            }
+        }
+    }
+
+    // Update Status field with our 5 canonical columns via updateProjectV2Field
+    if let Some(ref sfid) = status_field_id {
+        let update_status_q = format!(
+            r#"mutation($fieldId: ID!) {{
+  updateProjectV2Field(input: {{
+    fieldId: $fieldId,
+    name: "Status",
+    singleSelectOptions: [
+      {{ name: "{}", color: GREEN, description: "Open engineering bounty (+500 Cr)" }},
+      {{ name: "{}", color: BLUE, description: "DORA complexity tier locked & CP-OMP seat quorum assigned" }},
+      {{ name: "{}", color: YELLOW, description: "Active execution in isolated JJ shadow workspace" }},
+      {{ name: "{}", color: ORANGE, description: "H1-H5 + Pillar 12 SurfaceImpactManifestV1 + UI-Gate Tribunal" }},
+      {{ name: "{}", color: GREEN, description: "All surfaces green, Ed25519 velocity proof stamped, 168h SURV live" }}
+    ]
+  }}) {{
+    projectV2Field {{
+      ... on ProjectV2SingleSelectField {{
+        id
+        options {{
+          id
+          name
+        }}
+      }}
+    }}
+  }}
+}}"#,
+            BoardStatus::OpenBounty.column_header(),
+            BoardStatus::ScopedBenchmarked.column_header(),
+            BoardStatus::InFlight.column_header(),
+            BoardStatus::TribunalGate.column_header(),
+            BoardStatus::ShippedVerified.column_header(),
+        );
+        if let Ok(u_resp) = execute_gh_graphql(&update_status_q, &[("fieldId", sfid)]) {
+            if let Some(opts) = u_resp
+                .get("data")
+                .and_then(|d| d.get("updateProjectV2Field"))
+                .and_then(|u| u.get("projectV2Field"))
+                .and_then(|f| f.get("options"))
+                .and_then(|o| o.as_array())
+            {
+                status_option_ids.clear();
+                for opt in opts {
+                    if let (Some(oid), Some(oname)) = (
+                        opt.get("id").and_then(|v| v.as_str()),
+                        opt.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        status_option_ids.insert(oname.to_string(), oid.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Create any missing custom fields among the 7 canonical fields
+    let single_select_specs: Vec<(&str, Vec<(&str, &str, &str)>)> = vec![
+        (
+            "Δ Speedup vs. DORA",
+            vec![
+                (
+                    "⚡ 100x+ Faster vs. DORA",
+                    "GREEN",
+                    "100x+ speedup over DORA human active hours",
+                ),
+                (
+                    "🚀 25x–99x Faster vs. DORA",
+                    "BLUE",
+                    "25x to 99x speedup over DORA human active hours",
+                ),
+                (
+                    "🟢 10x–24x Faster vs. DORA",
+                    "YELLOW",
+                    "10x to 24x speedup over DORA human active hours",
+                ),
+                (
+                    "⏳ In Flight — Clock Running",
+                    "GRAY",
+                    "Execution wall-clock currently active",
+                ),
+            ],
+        ),
+        (
+            "DORA Baseline",
+            vec![
+                (
+                    DoraTier::S.canonical_option_label(),
+                    "GREEN",
+                    "Tier S baseline",
+                ),
+                (
+                    DoraTier::M.canonical_option_label(),
+                    "BLUE",
+                    "Tier M baseline",
+                ),
+                (
+                    DoraTier::L.canonical_option_label(),
+                    "PURPLE",
+                    "Tier L baseline",
+                ),
+                (
+                    DoraTier::XL.canonical_option_label(),
+                    "ORANGE",
+                    "Tier XL baseline",
+                ),
+            ],
+        ),
+        (
+            "Execution Mode",
+            vec![
+                ("Solo Seat", "BLUE", "Single standing seat"),
+                ("Pair (100 Cr)", "GREEN", "2-seat adversarial pair"),
+                ("Triad (150 Cr)", "PURPLE", "3-seat adversarial triad"),
+                ("Quad (200 Cr)", "ORANGE", "4-seat cross-surface quad"),
+            ],
+        ),
+    ];
+
+    for (fname, opts) in single_select_specs {
+        if !custom_field_ids.contains_key(fname) {
+            let opt_items: Vec<String> = opts
+                .iter()
+                .map(|(n, col, desc)| {
+                    format!(r#"{{ name: "{n}", color: {col}, description: "{desc}" }}"#)
+                })
+                .collect();
+            let create_ss_q = format!(
+                r#"mutation($projectId: ID!) {{
+  createProjectV2Field(input: {{
+    projectId: $projectId,
+    dataType: SINGLE_SELECT,
+    name: "{fname}",
+    singleSelectOptions: [{}]
+  }}) {{
+    projectV2Field {{
+      ... on ProjectV2SingleSelectField {{
+        id
+        name
+        options {{
+          id
+          name
+        }}
+      }}
+    }}
+  }}
+}}"#,
+                opt_items.join(", ")
+            );
+            if let Ok(c_resp) = execute_gh_graphql(&create_ss_q, &[("projectId", &project_id)]) {
+                if let Some(fnode) = c_resp
+                    .get("data")
+                    .and_then(|d| d.get("createProjectV2Field"))
+                    .and_then(|c| c.get("projectV2Field"))
+                {
+                    if let Some(fid) = fnode.get("id").and_then(|v| v.as_str()) {
+                        custom_field_ids.insert(fname.to_string(), fid.to_string());
+                    }
+                    if let Some(oarr) = fnode.get("options").and_then(|o| o.as_array()) {
+                        let mut omap = BTreeMap::new();
+                        for opt in oarr {
+                            if let (Some(oid), Some(oname)) = (
+                                opt.get("id").and_then(|v| v.as_str()),
+                                opt.get("name").and_then(|v| v.as_str()),
+                            ) {
+                                omap.insert(oname.to_string(), oid.to_string());
+                            }
+                        }
+                        custom_field_option_ids.insert(fname.to_string(), omap);
+                    }
+                }
+            }
+        }
+    }
+
+    for (fname, dtype) in [
+        ("Chinwag Cycle Time", "TEXT"),
+        ("Net Hours Saved", "NUMBER"),
+        ("Active Seats", "TEXT"),
+        ("Cryptographic Receipt", "TEXT"),
+    ] {
+        if !custom_field_ids.contains_key(fname) {
+            let create_scalar_q = format!(
+                r#"mutation($projectId: ID!) {{
+  createProjectV2Field(input: {{
+    projectId: $projectId,
+    dataType: {dtype},
+    name: "{fname}"
+  }}) {{
+    projectV2Field {{
+      ... on ProjectV2Field {{
+        id
+        name
+      }}
+    }}
+  }}
+}}"#
+            );
+            if let Ok(c_resp) = execute_gh_graphql(&create_scalar_q, &[("projectId", &project_id)])
+            {
+                if let Some(fid) = c_resp
+                    .get("data")
+                    .and_then(|d| d.get("createProjectV2Field"))
+                    .and_then(|c| c.get("projectV2Field"))
+                    .and_then(|f| f.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    custom_field_ids.insert(fname.to_string(), fid.to_string());
                 }
             }
         }
@@ -1786,24 +2331,188 @@ query($projectId: ID!) {
     cfg.project_number = project_number;
     cfg.project_title = project_title;
     cfg.project_url = project_url;
+    cfg.public_board = public_board;
+    if let Some(pr) = private_repo {
+        cfg.private_repo = Some(pr.to_string());
+    }
+    if let Some(pubr) = public_repo {
+        cfg.public_repo = Some(pubr.to_string());
+    }
     cfg.repository_id = repo_id;
     cfg.repository_name_with_owner = repo_name;
     cfg.status_field_id = status_field_id;
     cfg.status_option_ids = status_option_ids;
+    cfg.custom_field_ids = custom_field_ids;
+    cfg.custom_field_option_ids = custom_field_option_ids;
+    cfg.system_field_ids = system_field_ids;
     cfg.save(tasks_dir)?;
+    let _ = write_board_template_pack(tasks_dir, &cfg);
     Ok(cfg)
 }
 
+fn execution_mode_label_for_seats(seat_count: usize) -> &'static str {
+    match seat_count {
+        0 | 1 => "Solo Seat",
+        2 => "Pair (100 Cr)",
+        3 => "Triad (150 Cr)",
+        _ => "Quad (200 Cr)",
+    }
+}
+
+fn set_project_item_single_select(
+    project_id: &str,
+    item_id: &str,
+    field_id: &str,
+    option_id: &str,
+) {
+    let q = r#"
+mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optId: String!) {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: $projectId,
+    itemId: $itemId,
+    fieldId: $fieldId,
+    value: { singleSelectOptionId: $optId }
+  }) {
+    projectV2Item {
+      id
+    }
+  }
+}
+"#;
+    let _ = execute_gh_graphql(
+        q,
+        &[
+            ("projectId", project_id),
+            ("itemId", item_id),
+            ("fieldId", field_id),
+            ("optId", option_id),
+        ],
+    );
+}
+
+fn set_project_item_text(project_id: &str, item_id: &str, field_id: &str, text: &str) {
+    let q = r#"
+mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: $projectId,
+    itemId: $itemId,
+    fieldId: $fieldId,
+    value: { text: $text }
+  }) {
+    projectV2Item {
+      id
+    }
+  }
+}
+"#;
+    let _ = execute_gh_graphql(
+        q,
+        &[
+            ("projectId", project_id),
+            ("itemId", item_id),
+            ("fieldId", field_id),
+            ("text", text),
+        ],
+    );
+}
+
+fn set_project_item_number(project_id: &str, item_id: &str, field_id: &str, num: f64) {
+    let q = format!(
+        r#"mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!) {{
+  updateProjectV2ItemFieldValue(input: {{
+    projectId: $projectId,
+    itemId: $itemId,
+    fieldId: $fieldId,
+    value: {{ number: {num:.2} }}
+  }}) {{
+    projectV2Item {{
+      id
+    }}
+  }}
+}}"#
+    );
+    let _ = execute_gh_graphql(
+        &q,
+        &[
+            ("projectId", project_id),
+            ("itemId", item_id),
+            ("fieldId", field_id),
+        ],
+    );
+}
+
+fn close_github_issue_live(org: &str, issue_node_id: &str, issue_number: Option<u64>) {
+    if let Some(num) = issue_number {
+        let _ = std::process::Command::new("gh")
+            .args([
+                "issue",
+                "close",
+                &num.to_string(),
+                "--repo",
+                &format!("{org}/chinwag"),
+                "--reason",
+                "completed",
+            ])
+            .output();
+    }
+    let close_q = r#"
+mutation($issueId: ID!) {
+  closeIssue(input: { issueId: $issueId, stateReason: COMPLETED }) {
+    issue {
+      id
+      state
+      closedAt
+    }
+  }
+}
+"#;
+    let _ = execute_gh_graphql(close_q, &[("issueId", issue_node_id)]);
+}
+
+fn reopen_github_issue_live(org: &str, issue_node_id: &str, issue_number: Option<u64>) {
+    if let Some(num) = issue_number {
+        let _ = std::process::Command::new("gh")
+            .args([
+                "issue",
+                "reopen",
+                &num.to_string(),
+                "--repo",
+                &format!("{org}/chinwag"),
+            ])
+            .output();
+    }
+    let reopen_q = r#"
+mutation($issueId: ID!) {
+  reopenIssue(input: { issueId: $issueId }) {
+    issue {
+      id
+      state
+    }
+  }
+}
+"#;
+    let _ = execute_gh_graphql(reopen_q, &[("issueId", issue_node_id)]);
+}
+
 /// Live GitHub Projects v2 push (`chinwag board push --live`) — creates/updates real repository `Issue` items
-/// in `emunlabs/chinwag` and links them to the live `ProjectV2` via `addProjectV2ItemById` (NEVER `addProjectV2DraftIssue` per `INV-NO-DRAFT-ISSUES-01`).
+/// in `emunlabs/chinwag`, links them to the live `ProjectV2` via `addProjectV2ItemById` (NEVER `addProjectV2DraftIssue` per `INV-NO-DRAFT-ISSUES-01`),
+/// populates all 7 custom fields, and closes `05_SHIPPED_VERIFIED` issues so GitHub stamps the immutable `CLOSED` timestamp.
 pub fn push_github_project_v2_live(
     tasks_dir: &Path,
     issues: &[AtomicTaskIssue],
     org: &str,
 ) -> Result<Value, String> {
     let mut cfg = match BoardConfigV1::load(tasks_dir) {
-        Some(c) if c.project_id != "PVT_kwDOChinwag1" => c,
-        _ => init_github_project_v2_live(
+        Some(c) if c.project_id != "PVT_kwDOChinwag1" && !c.custom_field_ids.is_empty() => c,
+        Some(c) => init_github_project_v2_live_with_visibility(
+            tasks_dir,
+            org,
+            &c.project_title,
+            c.public_board,
+            c.private_repo.as_deref(),
+            c.public_repo.as_deref(),
+        )?,
+        None => init_github_project_v2_live(
             tasks_dir,
             org,
             "Chinwag Engineering Velocity & Agent Fleet",
@@ -1813,7 +2522,14 @@ pub fn push_github_project_v2_live(
     let repo_id = match cfg.repository_id.clone() {
         Some(id) => id,
         None => {
-            cfg = init_github_project_v2_live(&tasks_dir, org, &cfg.project_title)?;
+            cfg = init_github_project_v2_live_with_visibility(
+                tasks_dir,
+                org,
+                &cfg.project_title,
+                cfg.public_board,
+                cfg.private_repo.as_deref(),
+                cfg.public_repo.as_deref(),
+            )?;
             cfg.repository_id
                 .clone()
                 .ok_or_else(|| "missing repository_id for emunlabs/chinwag".to_string())?
@@ -1831,6 +2547,10 @@ query($org: String!) {
           number
           title
           url
+          state
+          createdAt
+          updatedAt
+          closedAt
         }
       }
     }
@@ -1838,7 +2558,7 @@ query($org: String!) {
 }
 "#;
     let list_resp = execute_gh_graphql(list_q, &[("org", org)])?;
-    let mut existing_by_prefix: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut existing_by_prefix: BTreeMap<String, (String, u64, String, String)> = BTreeMap::new();
     if let Some(nodes) = list_resp
         .get("data")
         .and_then(|d| d.get("organization"))
@@ -1848,14 +2568,21 @@ query($org: String!) {
         .and_then(|n| n.as_array())
     {
         for node in nodes {
-            if let (Some(id), Some(title), Some(url)) = (
+            if let (Some(id), Some(num), Some(title), Some(url)) = (
                 node.get("id").and_then(|v| v.as_str()),
+                node.get("number").and_then(|v| v.as_u64()),
                 node.get("title").and_then(|v| v.as_str()),
                 node.get("url").and_then(|v| v.as_str()),
             ) {
+                let state = node
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("OPEN")
+                    .to_string();
                 if let Some(end) = title.strip_prefix('[').and_then(|s| s.find(']')) {
                     let key = &title[1..1 + end];
-                    existing_by_prefix.insert(key.to_string(), (id.to_string(), url.to_string()));
+                    existing_by_prefix
+                        .insert(key.to_string(), (id.to_string(), num, url.to_string(), state));
                 }
             }
         }
@@ -1924,71 +2651,83 @@ query($org: String!) {
             issue.body.trim()
         );
 
-        let (issue_node_id, issue_url) = if let Some((existing_id, existing_url)) = cfg
-            .synced_issue_node_ids
-            .get(&issue.id)
-            .cloned()
-            .zip(cfg.synced_issue_urls.get(&issue.id).cloned())
-            .or_else(|| existing_by_prefix.get(&issue.id).cloned())
-        {
-            let update_q = r#"
+        let (issue_node_id, issue_number, issue_url, prior_state) =
+            if let Some((existing_id, existing_num, existing_url, existing_state)) =
+                existing_by_prefix.get(&issue.id).cloned().or_else(|| {
+                    cfg.synced_issue_node_ids.get(&issue.id).cloned().and_then(|id| {
+                        let url = cfg.synced_issue_urls.get(&issue.id)?.clone();
+                        let num = cfg.synced_issue_numbers.get(&issue.id).copied().unwrap_or(0);
+                        Some((id, num, url, "OPEN".to_string()))
+                    })
+                })
+            {
+                let update_q = r#"
 mutation($issueId: ID!, $title: String!, $body: String!) {
   updateIssue(input: { id: $issueId, title: $title, body: $body }) {
     issue {
       id
+      number
       url
+      state
     }
   }
 }
 "#;
-            let _ = execute_gh_graphql(
-                update_q,
-                &[
-                    ("issueId", &existing_id),
-                    ("title", &gh_title),
-                    ("body", &gh_body),
-                ],
-            );
-            (existing_id, existing_url)
-        } else {
-            let create_issue_q = r#"
+                let _ = execute_gh_graphql(
+                    update_q,
+                    &[
+                        ("issueId", &existing_id),
+                        ("title", &gh_title),
+                        ("body", &gh_body),
+                    ],
+                );
+                (existing_id, existing_num, existing_url, existing_state)
+            } else {
+                let create_issue_q = r#"
 mutation($repoId: ID!, $title: String!, $body: String!) {
   createIssue(input: { repositoryId: $repoId, title: $title, body: $body }) {
     issue {
       id
       number
       url
+      state
     }
   }
 }
 "#;
-            let created = execute_gh_graphql(
-                create_issue_q,
-                &[
-                    ("repoId", &repo_id),
-                    ("title", &gh_title),
-                    ("body", &gh_body),
-                ],
-            )?;
-            let iss = created
-                .get("data")
-                .and_then(|d| d.get("createIssue"))
-                .and_then(|c| c.get("issue"))
-                .ok_or_else(|| format!("createIssue failed for {}", issue.id))?;
-            (
-                iss.get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                iss.get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-            )
-        };
+                let created = execute_gh_graphql(
+                    create_issue_q,
+                    &[
+                        ("repoId", &repo_id),
+                        ("title", &gh_title),
+                        ("body", &gh_body),
+                    ],
+                )?;
+                let iss = created
+                    .get("data")
+                    .and_then(|d| d.get("createIssue"))
+                    .and_then(|c| c.get("issue"))
+                    .ok_or_else(|| format!("createIssue failed for {}", issue.id))?;
+                (
+                    iss.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    iss.get("number").and_then(|v| v.as_u64()).unwrap_or(0),
+                    iss.get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    "OPEN".to_string(),
+                )
+            };
 
         cfg.synced_issue_node_ids
             .insert(issue.id.clone(), issue_node_id.clone());
+        if issue_number > 0 {
+            cfg.synced_issue_numbers
+                .insert(issue.id.clone(), issue_number);
+        }
         cfg.synced_issue_urls
             .insert(issue.id.clone(), issue_url.clone());
 
@@ -2022,44 +2761,137 @@ mutation($projectId: ID!, $contentId: ID!) {
                 .insert(issue.id.clone(), item_id.clone());
         }
 
-        // Update ProjectV2 Status field option if available
-        if let (Some(field_id), false) = (cfg.status_field_id.as_ref(), item_id.is_empty()) {
-            let target_opt_name = match issue.status {
-                BoardStatus::OpenBounty | BoardStatus::ScopedBenchmarked => "Todo",
-                BoardStatus::InFlight | BoardStatus::TribunalGate => "In Progress",
-                BoardStatus::ShippedVerified => "Done",
+        // Populate Status + all 7 canonical custom fields on the ProjectV2Item
+        if !item_id.is_empty() {
+            let proof = compute_velocity_proof(
+                issue.dora_tier,
+                issue.loc_changed,
+                issue.t_claim_ms,
+                issue.t_ship_ms,
+            );
+            let active_seats_label = if issue.assigned_seats.is_empty() {
+                "@DELIVERY".to_string()
+            } else {
+                issue
+                    .assigned_seats
+                    .iter()
+                    .map(|s| format!("@{}", s.trim_start_matches('@')))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
             };
-            if let Some(opt_id) = cfg.status_option_ids.get(target_opt_name) {
-                let status_q = r#"
-mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optId: String!) {
-  updateProjectV2ItemFieldValue(input: {
-    projectId: $projectId,
-    itemId: $itemId,
-    fieldId: $fieldId,
-    value: { singleSelectOptionId: $optId }
-  }) {
-    projectV2Item {
-      id
-    }
-  }
-}
-"#;
-                let _ = execute_gh_graphql(
-                    status_q,
-                    &[
-                        ("projectId", &cfg.project_id),
-                        ("itemId", &item_id),
-                        ("fieldId", field_id),
-                        ("optId", opt_id),
-                    ],
-                );
+            let exec_mode_label = execution_mode_label_for_seats(issue.assigned_seats.len());
+            let receipt_label = issue
+                .last_ci_gate_badge
+                .clone()
+                .unwrap_or_else(|| "⏳ Awaiting Tribunal".to_string());
+
+            // 0. Status column
+            if let Some(ref field_id) = cfg.status_field_id {
+                let canonical_col = issue.status.column_header();
+                let fallback_col = match issue.status {
+                    BoardStatus::OpenBounty | BoardStatus::ScopedBenchmarked => "Todo",
+                    BoardStatus::InFlight | BoardStatus::TribunalGate => "In Progress",
+                    BoardStatus::ShippedVerified => "Done",
+                };
+                if let Some(opt_id) = cfg
+                    .status_option_ids
+                    .get(canonical_col)
+                    .or_else(|| cfg.status_option_ids.get(fallback_col))
+                {
+                    set_project_item_single_select(&cfg.project_id, &item_id, field_id, opt_id);
+                }
+            }
+
+            // 1. Δ Speedup vs. DORA
+            if let (Some(fid), Some(omap)) = (
+                cfg.custom_field_ids.get("Δ Speedup vs. DORA"),
+                cfg.custom_field_option_ids.get("Δ Speedup vs. DORA"),
+            ) {
+                let target_pill = if issue.status == BoardStatus::ShippedVerified {
+                    proof.speedup_pill.as_str()
+                } else {
+                    "⏳ In Flight — Clock Running"
+                };
+                if let Some(oid) = omap
+                    .get(target_pill)
+                    .or_else(|| omap.get("⚡ 100x+ Faster vs. DORA"))
+                {
+                    set_project_item_single_select(&cfg.project_id, &item_id, fid, oid);
+                }
+            }
+
+            // 2. DORA Baseline
+            if let (Some(fid), Some(omap)) = (
+                cfg.custom_field_ids.get("DORA Baseline"),
+                cfg.custom_field_option_ids.get("DORA Baseline"),
+            ) {
+                if let Some(oid) = omap.get(issue.dora_tier.canonical_option_label()) {
+                    set_project_item_single_select(&cfg.project_id, &item_id, fid, oid);
+                }
+            }
+
+            // 3. Chinwag Cycle Time
+            if let Some(fid) = cfg.custom_field_ids.get("Chinwag Cycle Time") {
+                set_project_item_text(&cfg.project_id, &item_id, fid, &proof.cycle_time_label);
+            }
+
+            // 4. Net Hours Saved
+            if let Some(fid) = cfg.custom_field_ids.get("Net Hours Saved") {
+                set_project_item_number(&cfg.project_id, &item_id, fid, proof.net_hours_saved);
+            }
+
+            // 5. Execution Mode
+            if let (Some(fid), Some(omap)) = (
+                cfg.custom_field_ids.get("Execution Mode"),
+                cfg.custom_field_option_ids.get("Execution Mode"),
+            ) {
+                let alt_label = match issue.assigned_seats.len() {
+                    0 | 1 => "⚡ Principal Solo · Direct Lease",
+                    2 => "🤝 2-Seat Pair · Cross-Model",
+                    3 => "🔺 3-Seat Triad · Isolated JJ",
+                    _ => "🌐 Subagent Swarm · Cloud Fan-Out",
+                };
+                if let Some(oid) = omap.get(exec_mode_label).or_else(|| omap.get(alt_label)) {
+                    set_project_item_single_select(&cfg.project_id, &item_id, fid, oid);
+                }
+            }
+
+            // 6. Active Seats
+            if let Some(fid) = cfg.custom_field_ids.get("Active Seats") {
+                set_project_item_text(&cfg.project_id, &item_id, fid, &active_seats_label);
+            }
+
+            // 7. Cryptographic Receipt
+            if let Some(fid) = cfg.custom_field_ids.get("Cryptographic Receipt") {
+                set_project_item_text(&cfg.project_id, &item_id, fid, &receipt_label);
             }
         }
+
+        // Close or reopen the backing GitHub issue so native `Closed` (`CLOSED`) timestamp is server-anchored
+        let issue_state = if issue.status == BoardStatus::ShippedVerified {
+            close_github_issue_live(
+                org,
+                &issue_node_id,
+                (issue_number > 0).then_some(issue_number),
+            );
+            "CLOSED"
+        } else {
+            if prior_state.eq_ignore_ascii_case("CLOSED") {
+                reopen_github_issue_live(
+                    org,
+                    &issue_node_id,
+                    (issue_number > 0).then_some(issue_number),
+                );
+            }
+            "OPEN"
+        };
 
         synced_items.push(json!({
             "issue_id": issue.id,
             "github_issue_node_id": issue_node_id,
+            "github_issue_number": issue_number,
             "github_issue_url": issue_url,
+            "github_issue_state": issue_state,
             "project_item_id": item_id,
             "board_status": issue.status.as_code(),
             "column_header": issue.status.column_header(),
@@ -2080,6 +2912,7 @@ mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optId: String!) {
         "project_number": cfg.project_number,
         "project_title": cfg.project_title,
         "project_url": cfg.project_url,
+        "public_board": cfg.public_board,
         "linear_api_key_configured": linear_live,
         "synced_items": synced_items,
     }))
@@ -2102,6 +2935,7 @@ query($org: String!, $number: Int!) {
       number
       title
       url
+      public
       items(first: 50) {
         nodes {
           id
@@ -2112,6 +2946,9 @@ query($org: String!, $number: Int!) {
               title
               url
               state
+              createdAt
+              updatedAt
+              closedAt
             }
           }
         }
@@ -2140,9 +2977,9 @@ query($org: String!, $number: Int!) {
 ///
 /// - Inspects `.chinwag/tasks/issues/*.md` (and pulls live card column state when `--live` is passed).
 /// - Computes `SurfaceImpactManifestV1` for each active issue (`02_SCOPED_BENCHMARKED`, `03_IN_FLIGHT`, `04_TRIBUNAL_GATE`).
-/// - For any card in `04_TRIBUNAL_GATE`, runs the Proof-of-Green & Cross-Surface check:
+/// - For any card in `04_TRIBUNAL_GATE` (or an unverified card in `05_SHIPPED_VERIFIED`), runs the Proof-of-Green & Cross-Surface check:
 ///   - If all surfaces + `ui-gate` pass, promotes the card to `05_SHIPPED_VERIFIED` (`05 · ✓ SHIPPED — Δ VERIFIED`) and stamps the `✓ed25519` Δ Velocity Proof receipt.
-///   - If any check fails, snaps the card back to `03_IN_FLIGHT` within `<200ms` (`INV-NO-FAKE-DONE-01`) and emits the `@DELIVERY` (`Mercury 3`) + author wakeup plan.
+///   - If any check fails, snaps the card back to `03_IN_FLIGHT` within `<200ms` (`INV-NO-FAKE-DONE-01`), reopens any prematurely closed GitHub issue, and emits the `@DELIVERY` (`Mercury 3`) + author wakeup plan.
 pub fn run_board_sync_loop(
     args: &[String],
     stdout: &mut dyn Write,
@@ -2228,7 +3065,12 @@ pub fn run_board_sync_loop(
             manifests.push(manifest.clone());
         }
 
-        if issue.status == BoardStatus::TribunalGate {
+        let requires_tribunal_check = issue.status == BoardStatus::TribunalGate
+            || (issue.status == BoardStatus::ShippedVerified
+                && (!manifest.all_surfaces_synced || !manifest.ui_gate_passed));
+
+        if requires_tribunal_check {
+            let prior_status_code = issue.status.as_code().to_string();
             if manifest.all_surfaces_synced && manifest.ui_gate_passed {
                 let claimed_tier = issue.dora_tier;
                 let (effective_tier, tier_downgraded) =
@@ -2266,7 +3108,7 @@ pub fn run_board_sync_loop(
 
                 tribunal_promotions.push(json!({
                     "issue_id": issue.id,
-                    "from_status": "04_TRIBUNAL_GATE",
+                    "from_status": prior_status_code,
                     "to_status": issue.status.as_code(),
                     "column_header": issue.status.column_header(),
                     "tier_downgraded": tier_downgraded,
@@ -2296,9 +3138,18 @@ pub fn run_board_sync_loop(
                 ));
                 let _ = fs::write(&path, issue.to_markdown());
 
+                if live {
+                    if let Some(cfg) = BoardConfigV1::load(&tasks_dir) {
+                        if let Some(node_id) = cfg.synced_issue_node_ids.get(&issue.id) {
+                            let num = cfg.synced_issue_numbers.get(&issue.id).copied();
+                            reopen_github_issue_live(&org, node_id, num);
+                        }
+                    }
+                }
+
                 tribunal_snapbacks.push(json!({
                     "issue_id": issue.id,
-                    "from_status": "04_TRIBUNAL_GATE",
+                    "from_status": prior_status_code,
                     "to_status": issue.status.as_code(),
                     "column_header": issue.status.column_header(),
                     "snapback_elapsed_ms": snapback_elapsed_ms,
@@ -2362,7 +3213,7 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
     if sub == "--help" || sub == "-h" || sub == "help" {
         let _ = writeln!(
             stdout,
-            "Usage: chinwag board <init|push|sync|pull|watch|sync-loop> [--org <org>] [--title <title>] [--live] [--once] [--workspace-root <path>] [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run] [--json]"
+            "Usage: chinwag board <init|push|sync|pull|watch|sync-loop> [--org <org>] [--title <title>] [--private] [--public-board] [--private-repo <org/repo>] [--public-repo <org/repo>] [--live] [--once] [--workspace-root <path>] [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run] [--json]"
         );
         return 0;
     }
@@ -2386,6 +3237,9 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
     let mut dry_run = false;
     let mut from_ci = false;
     let mut live = false;
+    let mut public_board = false;
+    let mut private_repo: Option<String> = None;
+    let mut public_repo: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -2397,6 +3251,22 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             "--title" if i + 1 < args.len() => {
                 title = args[i + 1].clone();
                 i += 2;
+            }
+            "--private-repo" if i + 1 < args.len() => {
+                private_repo = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--public-repo" if i + 1 < args.len() => {
+                public_repo = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--private" => {
+                public_board = false;
+                i += 1;
+            }
+            "--public-board" => {
+                public_board = true;
+                i += 1;
             }
             "--project-number" if i + 1 < args.len() => {
                 project_number = args[i + 1].parse::<u64>().ok();
@@ -2445,34 +3315,6 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         }
     }
 
-    if sub == "init" && live {
-        match init_github_project_v2_live(&tasks_dir, &org, &title) {
-            Ok(cfg) => {
-                let payload = json!({
-                    "ok": true,
-                    "command": "chinwag board init",
-                    "live": true,
-                    "board_config": cfg,
-                    "invariants": [
-                        "INV-CHINWAG-TASKS-REPO-01",
-                        "INV-NO-DRAFT-ISSUES-01",
-                        "INV-30CH-COLUMN-BUDGET-01"
-                    ]
-                });
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                );
-                return 0;
-            }
-            Err(e) => {
-                let _ = writeln!(stderr, "chinwag board init --live failed: {e}");
-                return 1;
-            }
-        }
-    }
-
     let mut issue_paths = Vec::new();
     if let Ok(entries) = fs::read_dir(&issues_dir) {
         for entry in entries.flatten() {
@@ -2509,6 +3351,28 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             }
         };
 
+        if public_board
+            && issue
+                .assigned_seats
+                .iter()
+                .any(|s| PRIVATE_LOCKED_SEATS.iter().any(|p| p.eq_ignore_ascii_case(s)))
+        {
+            let err_payload = json!({
+                "ok": false,
+                "exit_code": EXIT_H_BOARD_REJECT,
+                "invariant": "INV-DEFAULT-PRIVATE-BOARD-01",
+                "issue_id": issue.id,
+                "reason": "cannot enable --public-board when private-locked advisory seats (PATENT, EAGLE-EYE, ALISTAIR, AUSDRA, VENTURE, MO) are present"
+            });
+            let _ = writeln!(
+                stderr,
+                "H_board GATE REJECTED (exit 78) [INV-DEFAULT-PRIVATE-BOARD-01] on {}: private-locked seat present",
+                issue.id
+            );
+            let _ = writeln!(stdout, "{err_payload}");
+            return EXIT_H_BOARD_REJECT;
+        }
+
         if let Err(violation) = validate_h_board_issue(&issue, &raw) {
             let err_payload = json!({
                 "ok": false,
@@ -2535,6 +3399,100 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         }
 
         validated_issues.push(issue);
+    }
+
+    if sub == "init" {
+        if live {
+            match init_github_project_v2_live_with_visibility(
+                &tasks_dir,
+                &org,
+                &title,
+                public_board,
+                private_repo.as_deref(),
+                public_repo.as_deref(),
+            ) {
+                Ok(cfg) => {
+                    let (gh_tpl, lin_tpl) = write_board_template_pack(&tasks_dir, &cfg)
+                        .unwrap_or_else(|_| {
+                            (
+                                tasks_dir.join("templates/github-project-v2-schema.json"),
+                                tasks_dir.join("templates/linear-template.json"),
+                            )
+                        });
+                    let payload = json!({
+                        "ok": true,
+                        "command": "chinwag board init",
+                        "live": true,
+                        "public_board": cfg.public_board,
+                        "default_visibility": if cfg.public_board { "public" } else { "private" },
+                        "board_config": cfg,
+                        "templates": {
+                            "github_project_v2_schema": gh_tpl.to_string_lossy(),
+                            "linear_template": lin_tpl.to_string_lossy(),
+                        },
+                        "invariants": [
+                            "INV-DEFAULT-PRIVATE-BOARD-01",
+                            "INV-CHINWAG-TASKS-REPO-01",
+                            "INV-NO-DRAFT-ISSUES-01",
+                            "INV-30CH-COLUMN-BUDGET-01"
+                        ]
+                    });
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    );
+                    return 0;
+                }
+                Err(e) => {
+                    let _ = writeln!(stderr, "chinwag board init --live failed: {e}");
+                    return 1;
+                }
+            }
+        } else {
+            let mut cfg = BoardConfigV1::load(&tasks_dir).unwrap_or_default();
+            cfg.org = org.clone();
+            cfg.project_title = title.clone();
+            cfg.public_board = public_board;
+            if let Some(pr) = private_repo {
+                cfg.private_repo = Some(pr);
+            }
+            if let Some(pubr) = public_repo {
+                cfg.public_repo = Some(pubr);
+            }
+            let _ = cfg.save(&tasks_dir);
+            let (gh_tpl, lin_tpl) = match write_board_template_pack(&tasks_dir, &cfg) {
+                Ok(paths) => paths,
+                Err(e) => {
+                    let _ = writeln!(stderr, "chinwag board init failed to write templates: {e}");
+                    return 1;
+                }
+            };
+            let payload = json!({
+                "ok": true,
+                "command": "chinwag board init",
+                "live": false,
+                "public_board": cfg.public_board,
+                "default_visibility": if cfg.public_board { "public" } else { "private" },
+                "board_config": cfg,
+                "templates": {
+                    "github_project_v2_schema": gh_tpl.to_string_lossy(),
+                    "linear_template": lin_tpl.to_string_lossy(),
+                },
+                "invariants": [
+                    "INV-DEFAULT-PRIVATE-BOARD-01",
+                    "INV-CHINWAG-TASKS-REPO-01",
+                    "INV-NO-DRAFT-ISSUES-01",
+                    "INV-30CH-COLUMN-BUDGET-01"
+                ]
+            });
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+            return 0;
+        }
     }
 
     let mut payload =
@@ -3455,5 +4413,107 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_17_board_init_defaults_to_private_visibility_and_writes_template_pack() {
+        let dir = temp_tasks_dir("board-init-private");
+        let issues_dir = dir.join("issues");
+        fs::create_dir_all(&issues_dir).unwrap();
+
+        let cfg_default = BoardConfigV1::default();
+        assert!(!cfg_default.public_board);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_board_cli(
+            &[
+                "init".to_string(),
+                "--tasks-dir".to_string(),
+                dir.to_string_lossy().to_string(),
+                "--org".to_string(),
+                "emunlabs".to_string(),
+                "--json".to_string(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        let resp: Value = serde_json::from_slice(&out).expect("parse board init JSON");
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["public_board"], false);
+        assert_eq!(resp["default_visibility"], "private");
+
+        let gh_tpl_path = dir.join("templates/github-project-v2-schema.json");
+        let lin_tpl_path = dir.join("templates/linear-template.json");
+        assert!(gh_tpl_path.is_file());
+        assert!(lin_tpl_path.is_file());
+
+        let gh_raw = fs::read_to_string(&gh_tpl_path).unwrap();
+        let lin_raw = fs::read_to_string(&lin_tpl_path).unwrap();
+        assert!(!gh_raw.to_ascii_lowercase().contains("deepseek"));
+        assert!(!lin_raw.to_ascii_lowercase().contains("deepseek"));
+
+        // Verify H_board rejects --public-board when a private-locked seat is present
+        let mut locked_issue =
+            AtomicTaskIssue::new_default("CHWG-0401", "Patent Review", DoraTier::M);
+        locked_issue.assigned_seats = vec!["PATENT".to_string()];
+        fs::write(issues_dir.join("CHWG-0401.md"), locked_issue.to_markdown()).unwrap();
+
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        let code2 = run_board_cli(
+            &[
+                "init".to_string(),
+                "--tasks-dir".to_string(),
+                dir.to_string_lossy().to_string(),
+                "--public-board".to_string(),
+                "--json".to_string(),
+            ],
+            &mut out2,
+            &mut err2,
+        );
+        assert_eq!(code2, EXIT_H_BOARD_REJECT);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_18_board_schema_includes_native_github_created_updated_closed_timestamps_and_insights()
+    {
+        let cfg = BoardConfigV1::default();
+        assert!(cfg.system_field_ids.contains_key("CREATED"));
+        assert!(cfg.system_field_ids.contains_key("UPDATED"));
+        assert!(cfg.system_field_ids.contains_key("CLOSED"));
+        assert!(cfg.system_field_ids.contains_key("PARENT_ISSUE"));
+        assert!(cfg.system_field_ids.contains_key("SUB_ISSUES_PROGRESS"));
+
+        let schema = build_github_project_v2_template_schema(&cfg);
+        assert_eq!(schema["schema"], "chinwag.github.project_v2.template.v1");
+        assert_eq!(schema["default_visibility"], "private");
+        assert_eq!(schema["status_columns"].as_array().unwrap().len(), 5);
+        assert_eq!(schema["custom_fields"].as_array().unwrap().len(), 7);
+
+        let sys_codes: Vec<&str> = schema["native_github_system_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["code"].as_str())
+            .collect();
+        assert!(sys_codes.contains(&"CREATED"));
+        assert!(sys_codes.contains(&"UPDATED"));
+        assert!(sys_codes.contains(&"CLOSED"));
+        assert!(sys_codes.contains(&"PARENT_ISSUE"));
+        assert!(sys_codes.contains(&"SUB_ISSUES_PROGRESS"));
+
+        assert_eq!(
+            schema["insights"]["primary_chart"]["y_axis"],
+            "SUM(Net Hours Saved)"
+        );
+        assert_eq!(
+            schema["insights"]["primary_chart"]["group_by"],
+            "DORA Baseline"
+        );
+        assert_eq!(schema["insights"]["primary_chart"]["x_axis"], "Status");
     }
 }
