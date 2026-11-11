@@ -29,6 +29,70 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}"
 if [[ -d "${HOME}/.chinwag-native-inputs" ]]; then
   export CHINWAG_PRIVATE_CRSQL_INPUTS="${CHINWAG_PRIVATE_CRSQL_INPUTS:-$HOME/.chinwag-native-inputs}"
 fi
+ensure_owned_nosymlink_dir() {
+  local target_dir="$1"
+  python3 - "$HOME" "$target_dir" <<'PY'
+import os
+import stat
+import sys
+
+home_dir = sys.argv[1]
+target_dir = sys.argv[2]
+
+if not os.path.isabs(home_dir) or not os.path.isabs(target_dir):
+    raise SystemExit("FAIL: HOME and test root must be absolute paths")
+
+uid = os.getuid()
+
+def check_existing_prefix(path: str, must_own: bool) -> None:
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise SystemExit(f"FAIL: refusing symlink component in test root path: {path}")
+    if not stat.S_ISDIR(st.st_mode):
+        raise SystemExit(f"FAIL: non-directory component in test root path: {path}")
+    if (st.st_mode & 0o002) != 0:
+        raise SystemExit(f"FAIL: refusing world-writable ancestor in test root path: {path}")
+    if must_own and st.st_uid != uid:
+        raise SystemExit(f"FAIL: directory {path} is owned by uid {st.st_uid}, expected {uid}")
+
+parts = [p for p in target_dir.split("/") if p]
+cur = "/"
+check_existing_prefix(cur, must_own=False)
+home_norm = home_dir.rstrip("/") or "/"
+
+for part in parts:
+    cur = os.path.join(cur, part)
+    in_home_subtree = (cur == home_norm) or cur.startswith(home_norm + "/")
+    if os.path.lexists(cur):
+        check_existing_prefix(cur, must_own=in_home_subtree)
+    else:
+        if not in_home_subtree:
+            raise SystemExit(f"FAIL: refusing to create directory outside HOME: {cur}")
+        os.mkdir(cur, 0o700)
+        check_existing_prefix(cur, must_own=True)
+
+check_existing_prefix(target_dir, must_own=True)
+fd = os.open(target_dir, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    st_fd = os.fstat(fd)
+    if not stat.S_ISDIR(st_fd.st_mode) or st_fd.st_uid != uid:
+        raise SystemExit(f"FAIL: opened test root {target_dir} failed ownership/type check")
+    os.fchmod(fd, 0o700)
+finally:
+    os.close(fd)
+PY
+}
+
+if [[ -z "${CHINWAG_RECOVERY_TEST_ROOT:-}" ]]; then
+  DEFAULT_RECOVERY_ROOT="${HOME}/.cache/chinwag-recovery-test-root"
+  ensure_owned_nosymlink_dir "$DEFAULT_RECOVERY_ROOT"
+  export CHINWAG_RECOVERY_TEST_ROOT="$DEFAULT_RECOVERY_ROOT"
+fi
+if [[ "${TMPDIR:-/tmp}" == /tmp* || "${TMPDIR:-}" == /var/* || "${TMPDIR:-}" == /private/* ]]; then
+  DEFAULT_TEST_TMP="${HOME}/.cache/chinwag-test-tmp"
+  ensure_owned_nosymlink_dir "$DEFAULT_TEST_TMP"
+  export TMPDIR="$DEFAULT_TEST_TMP"
+fi
 
 # Monotonic Ratchet Floors (NEVER lower these numbers; only ratchet UP as WORKHORSE adds tests)
 RATCHET_WORKHORSE_COMBINED_FLOOR="${RATCHET_WORKHORSE_COMBINED_FLOOR:-320}"

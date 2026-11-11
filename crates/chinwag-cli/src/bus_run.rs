@@ -687,6 +687,7 @@ pub fn discover_non_loopback_ipv4() -> Vec<String> {
             && let Ok(ipv4) = ip_tok.parse::<std::net::Ipv4Addr>()
             && !ipv4.is_loopback()
             && !ipv4.is_unspecified()
+            && !ipv4.is_link_local()
             && !ips.iter().any(|existing| existing == ip_tok)
         {
             ips.push(ip_tok.to_string());
