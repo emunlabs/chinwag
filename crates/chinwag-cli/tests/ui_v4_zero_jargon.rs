@@ -684,6 +684,10 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
         json!([]),
         "removing final protected path must persist empty [] across bootstrap"
     );
+    assert!(
+        boot_empty_paths_json["agents"]["protected_paths"].is_null(),
+        "server bootstrap must not emit a conflicting top-level agents.protected_paths field"
+    );
 
     let (bad_credits_hdr, bad_credits_val) =
         post_json("/api/v4/workflow", json!({ "review_tier_credits": 75 }));
@@ -1055,6 +1059,41 @@ vm.runInContext(
   await T.saveWorkflowSettings({ auto_test_before_review: false });
   assert.strictEqual(lastPersistedPayload.review_tier_credits, 200);
   assert.deepStrictEqual(lastPersistedPayload.protected_paths, []);
+
+  // 5b. Delayed bootstrap GET started DURING an active save (hadInFlightAtStart = true) where the save completes BEFORE the GET returns
+  T.state.data = T.normalizeBootstrap({ agents: { workflow: { review_tier_credits: 100, protected_paths: ["old/**"] } } });
+  T.state.committedWorkflow = null;
+  let releaseSaveDuringGet;
+  const saveDuringGetGate = new Promise((resolve) => { releaseSaveDuringGet = resolve; });
+  let releaseGetDuringSave;
+  const getDuringSaveGate = new Promise((resolve) => { releaseGetDuringSave = resolve; });
+  mockWorkflowHandler = async (body) => {
+    await saveDuringGetGate;
+    lastPersistedPayload = body;
+    return { ok: true, workflow: body };
+  };
+  mockBootstrapHandler = async () => {
+    await getDuringSaveGate;
+    return { agents: { workflow: { review_tier_credits: 100, protected_paths: ["old/**"] } } };
+  };
+  const inFlightSavePromise = T.saveWorkflowSettings({ review_tier_credits: 200, protected_paths: ["fresh/**"] });
+  assert.strictEqual(T.state.workflowSaveInFlight, 1);
+  const refreshDuringSavePromise = T.refreshBootstrapQuietly();
+  releaseSaveDuringGet();
+  await inFlightSavePromise;
+  assert.strictEqual(T.state.workflowSaveInFlight, 0);
+  releaseGetDuringSave();
+  await refreshDuringSavePromise;
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 200, "GET started during active save must not revert 200 Cr after save completes");
+  assert.strictEqual(T.state.committedWorkflow.review_tier_credits, 200);
+  assert.deepStrictEqual([...T.state.data.agents.protected_paths], ["fresh/**"]);
+  mockWorkflowHandler = async (body) => {
+    lastPersistedPayload = body;
+    return { ok: true, workflow: body };
+  };
+  await T.saveWorkflowSettings({ independent_review: true });
+  assert.strictEqual(lastPersistedPayload.review_tier_credits, 200);
+  assert.deepStrictEqual(lastPersistedPayload.protected_paths, ["fresh/**"]);
 
   // 6. queueEngineeringTaskFromLauncher uses server-scrubbed title and deduplicates by task id
   mockBoardTaskHandler = async () => ({

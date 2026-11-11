@@ -5175,10 +5175,15 @@ let streamRetryTimer = 0;
 
 async function refreshBootstrapQuietly() {
   try {
+    const hadInFlightAtStart = (state.workflowSaveInFlight || 0) > 0;
     const startSaveSeq = state.workflowSaveSeq || 0;
     const raw = await apiRequest("GET", "/api/v4/bootstrap");
     const fresh = normalizeBootstrap(raw);
-    if (state.workflowSaveInFlight > 0 || (state.workflowSaveSeq || 0) !== startSaveSeq) {
+    if (
+      hadInFlightAtStart ||
+      (state.workflowSaveInFlight || 0) > 0 ||
+      (state.workflowSaveSeq || 0) !== startSaveSeq
+    ) {
       applyWorkflowSnapshot(fresh.agents, snapshotWorkflowState(state.data.agents));
     } else {
       state.committedWorkflow = snapshotWorkflowState(fresh.agents);

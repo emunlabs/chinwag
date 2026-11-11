@@ -1803,6 +1803,134 @@ pub fn ensure_distinct_workflow_slots(
     cfg.security_verifier_tool = slots[3].clone();
 }
 
+fn parse_inline_yaml_string_list(raw: &str) -> Option<Vec<String>> {
+    let inner = raw.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        let first = *chars.peek()?;
+        if first == ',' || first == '[' || first == ']' {
+            return None;
+        }
+        let item = if first == '"' {
+            chars.next();
+            let mut buf = String::new();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    let esc = chars.next()?;
+                    match esc {
+                        '"' | '\\' | '/' => buf.push(esc),
+                        't' => buf.push('\t'),
+                        _ => return None,
+                    }
+                } else if c == '"' {
+                    closed = true;
+                    break;
+                } else if c.is_control() {
+                    return None;
+                } else {
+                    buf.push(c);
+                }
+            }
+            if !closed {
+                return None;
+            }
+            while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                chars.next();
+            }
+            match chars.peek() {
+                None => {}
+                Some(',') => {
+                    chars.next();
+                    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                        chars.next();
+                    }
+                    chars.peek()?;
+                }
+                Some(_) => return None,
+            }
+            buf
+        } else if first == '\'' {
+            chars.next();
+            let mut buf = String::new();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                if c == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        buf.push('\'');
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else if c.is_control() {
+                    return None;
+                } else {
+                    buf.push(c);
+                }
+            }
+            if !closed {
+                return None;
+            }
+            while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                chars.next();
+            }
+            match chars.peek() {
+                None => {}
+                Some(',') => {
+                    chars.next();
+                    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                        chars.next();
+                    }
+                    chars.peek()?;
+                }
+                Some(_) => return None,
+            }
+            buf
+        } else {
+            let mut buf = String::new();
+            let mut saw_comma = false;
+            for c in chars.by_ref() {
+                if c == ',' {
+                    saw_comma = true;
+                    break;
+                }
+                if c == '"' || c == '\'' || c == '[' || c == ']' || c == '#' || c.is_control() {
+                    return None;
+                }
+                buf.push(c);
+            }
+            if saw_comma {
+                while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                    chars.next();
+                }
+                chars.peek()?;
+            }
+            buf.trim().to_string()
+        };
+
+        let trimmed_item = item.trim();
+        if trimmed_item.is_empty()
+            || trimmed_item.split('/').any(|seg| seg == "..")
+            || trimmed_item.split('\\').any(|seg| seg == "..")
+        {
+            return None;
+        }
+        out.push(trimmed_item.to_string());
+        if chars.peek().is_none() {
+            break;
+        }
+    }
+    Some(out)
+}
+
 pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
     let mut cfg = WorkflowConfig::default();
     let Ok(Some(raw)) =
@@ -1903,23 +2031,14 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
                     saw_protected_paths_key = true;
                     parsed_paths.clear();
                     in_protected_paths = true;
-                } else if raw_after_colon == "[]" {
+                } else if let Some(inline_items) = parse_inline_yaml_string_list(raw_after_colon) {
                     saw_protected_paths_key = true;
+                    parsed_paths = inline_items;
+                    in_protected_paths = false;
+                } else {
+                    saw_protected_paths_key = false;
                     parsed_paths.clear();
                     in_protected_paths = false;
-                } else if let Some(inner) = raw_after_colon
-                    .strip_prefix('[')
-                    .and_then(|s| s.strip_suffix(']'))
-                {
-                    saw_protected_paths_key = true;
-                    parsed_paths.clear();
-                    in_protected_paths = false;
-                    for entry in inner.split(',') {
-                        let clean = entry.trim().trim_matches('"').trim_matches('\'').trim();
-                        if !clean.is_empty() {
-                            parsed_paths.push(clean.to_string());
-                        }
-                    }
                 }
             }
             _ => {}
@@ -6390,29 +6509,46 @@ mod tests {
             reloaded.protected_paths
         );
 
-        // Hand-edited inline YAML flow array parses cleanly without dropping to empty
+        // Hand-edited inline YAML flow array parses cleanly (including quoted commas) without dropping to empty
         fs::write(
             repo.join(".chinwag/workflow.yaml"),
-            "version: 1\nprotected_paths: [\".env*\", \"secrets/**\"]\n",
+            "version: 1\nprotected_paths: [\".env*\", \"secrets/**\", \"config/a,b/**\", 'dir''s/**']\n",
         )
         .unwrap();
         let inline_loaded = load_workflow_config(&repo);
         assert_eq!(
             inline_loaded.protected_paths,
-            vec![".env*".to_string(), "secrets/**".to_string()]
+            vec![
+                ".env*".to_string(),
+                "secrets/**".to_string(),
+                "config/a,b/**".to_string(),
+                "dir's/**".to_string()
+            ]
         );
 
-        // Unparseable scalar after `protected_paths:` fails safe to default protected paths
-        fs::write(
-            repo.join(".chinwag/workflow.yaml"),
-            "version: 1\nprotected_paths: malformed_scalar\n",
-        )
-        .unwrap();
-        let malformed_loaded = load_workflow_config(&repo);
-        assert_eq!(
-            malformed_loaded.protected_paths,
-            WorkflowConfig::default().protected_paths
-        );
+        // Malformed inline lists (`[,]`, trailing comma, unclosed quote, empty string, traversal `..`)
+        // and unparseable scalars all fail safe to default protected paths (never fail open to `[]`).
+        for bad_line in [
+            "protected_paths: malformed_scalar",
+            "protected_paths: [,]",
+            "protected_paths: [\".env*\",]",
+            "protected_paths: [,\"secrets/**\"]",
+            "protected_paths: [\"unclosed]",
+            "protected_paths: [\"\"]",
+            "protected_paths: [\"../outside\"]",
+        ] {
+            fs::write(
+                repo.join(".chinwag/workflow.yaml"),
+                format!("version: 1\n{bad_line}\n"),
+            )
+            .unwrap();
+            let malformed_loaded = load_workflow_config(&repo);
+            assert_eq!(
+                malformed_loaded.protected_paths,
+                WorkflowConfig::default().protected_paths,
+                "malformed protected_paths line `{bad_line}` must fail safe to defaults"
+            );
+        }
 
         // Negative-path validation for out-of-domain credits, invalid review_mode, and empty task title
         let (st_bad_cr, val_bad_cr) =
