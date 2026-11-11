@@ -139,6 +139,20 @@
     "system2_escalated": false,
     "evaluated_at_ms": 1794369893162
   },
+  "CHWG-0198:05_SHIPPED_VERIFIED:220": {
+    "issue_id": "CHWG-0198",
+    "dora_tier_guess": "M",
+    "clef_max_trigger": 0.1529,
+    "clef_redaction_clean_score": 0.9166,
+    "clairic_loc_p10": 210.0,
+    "clairic_loc_median": 225.0,
+    "clairic_loc_p90": 230.0,
+    "clairic_burn_usd_median": 2.62,
+    "clairic_minutes_median": 74.0,
+    "clairic_ci_fail_prob_median": 0.12,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794370326927
+  },
   "CHWG-0199:04_TRIBUNAL_GATE:640": {
     "issue_id": "CHWG-0199",
     "dora_tier_guess": "L",
@@ -152,6 +166,20 @@
     "clairic_ci_fail_prob_median": 0.16,
     "system2_escalated": false,
     "evaluated_at_ms": 1794369895240
+  },
+  "CHWG-0199:05_SHIPPED_VERIFIED:640": {
+    "issue_id": "CHWG-0199",
+    "dora_tier_guess": "L",
+    "clef_max_trigger": 0.4709,
+    "clef_redaction_clean_score": 0.7833,
+    "clairic_loc_p10": 615.0,
+    "clairic_loc_median": 640.0,
+    "clairic_loc_p90": 665.0,
+    "clairic_burn_usd_median": 4.23,
+    "clairic_minutes_median": 98.0,
+    "clairic_ci_fail_prob_median": 0.15,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794370328721
   },
   "CHWG-0200:03_IN_FLIGHT:590": {
     "issue_id": "CHWG-0200",
@@ -237,6 +265,20 @@
     "system2_escalated": false,
     "evaluated_at_ms": 1794369907282
   },
+  "CHWG-0205:05_SHIPPED_VERIFIED:260": {
+    "issue_id": "CHWG-0205",
+    "dora_tier_guess": "M",
+    "clef_max_trigger": 0.271,
+    "clef_redaction_clean_score": 0.8696,
+    "clairic_loc_p10": 195.0,
+    "clairic_loc_median": 260.0,
+    "clairic_loc_p90": 275.0,
+    "clairic_burn_usd_median": 2.52,
+    "clairic_minutes_median": 82.0,
+    "clairic_ci_fail_prob_median": 0.11,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794370330241
+  },
   "CHWG-0206:03_IN_FLIGHT:520": {
     "issue_id": "CHWG-0206",
     "dora_tier_guess": "L",
@@ -251,6 +293,20 @@
     "system2_escalated": false,
     "evaluated_at_ms": 1794369909008
   },
+  "CHWG-0206:05_SHIPPED_VERIFIED:520": {
+    "issue_id": "CHWG-0206",
+    "dora_tier_guess": "L",
+    "clef_max_trigger": 0.4967,
+    "clef_redaction_clean_score": 0.8685,
+    "clairic_loc_p10": 495.0,
+    "clairic_loc_median": 525.0,
+    "clairic_loc_p90": 555.0,
+    "clairic_burn_usd_median": 4.2,
+    "clairic_minutes_median": 113.0,
+    "clairic_ci_fail_prob_median": 0.16,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794370332061
+  },
   "CHWG-0207:03_IN_FLIGHT:85": {
     "issue_id": "CHWG-0207",
     "dora_tier_guess": "S",
@@ -264,5 +320,19 @@
     "clairic_ci_fail_prob_median": 0.08,
     "system2_escalated": false,
     "evaluated_at_ms": 1794369911329
+  },
+  "CHWG-0207:05_SHIPPED_VERIFIED:85": {
+    "issue_id": "CHWG-0207",
+    "dora_tier_guess": "S",
+    "clef_max_trigger": 0.2294,
+    "clef_redaction_clean_score": 0.8366,
+    "clairic_loc_p10": 80.0,
+    "clairic_loc_median": 85.0,
+    "clairic_loc_p90": 90.0,
+    "clairic_burn_usd_median": 1.78,
+    "clairic_minutes_median": 56.0,
+    "clairic_ci_fail_prob_median": 0.1,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794370333636
   }
 }

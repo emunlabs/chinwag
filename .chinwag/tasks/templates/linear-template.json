@@ -3,8 +3,26 @@
   "version": "1.0.0",
   "team_key": "CHWG",
   "team_name": "Chinwag Engineering Velocity & Agent Fleet",
-  "default_visibility": "private",
-  "public_board": false,
+  "default_visibility": "public",
+  "public_board": true,
+  "default_view_layout": "board",
+  "views": [
+    {
+      "number": 1,
+      "code": "01_KANBAN_EXECUTION_BOARD",
+      "name": "01 · Kanban Execution Board",
+      "layout": "board",
+      "group_by": "workflow_state",
+      "show_sub_issues": true
+    },
+    {
+      "number": 2,
+      "code": "02_VELOCITY_AND_DORA_LEDGER",
+      "name": "02 · Velocity & DORA Ledger",
+      "layout": "list",
+      "group_by": "workflow_state"
+    }
+  ],
   "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
   "invariants": [
     "INV-DEFAULT-PRIVATE-BOARD-01",
