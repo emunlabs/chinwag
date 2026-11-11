@@ -1,0 +1,234 @@
+/* /assets/v4/motion.css
+   Owns every motion token, transition, and keyframe in the local app.
+   Law: layout changes animate transform and opacity only. Nothing loops at rest. */
+
+/* ── 1 · Tokens ─────────────────────────────────────────────────────────── */
+:root {
+  --ease-out-expo: cubic-bezier(0.22, 1, 0.36, 1);   /* travel */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);       /* state  */
+  --ease-in-crisp: cubic-bezier(0.4, 0, 1, 1);       /* exit   */
+
+  --dur-instant: 90ms;
+  --dur-fast:    150ms;
+  --dur-banner:  190ms;
+  --dur-sheet:   220ms;
+  --dur-confirm: 320ms;
+
+  /* Aliases for the visual-system hooks. One number, one place. */
+  --dur-1: var(--dur-instant);
+  --dur-2: var(--dur-fast);
+  --dur-3: var(--dur-banner);
+  --dur-4: var(--dur-sheet);
+
+  --dur-sheet-exit: 170ms;
+  --dur-swap:       110ms;
+  --dur-dip-out:    80ms;
+  --dur-dip-in:     110ms;   /* dip-out + dip-in = --dur-banner */
+  --dur-row:        220ms;   /* --dur-instant + --dur-row-in */
+  --dur-row-in:     130ms;
+  --dur-depart:     100ms;   /* --dur-depart + --dur-row = --dur-confirm */
+  --dur-flash:      640ms;
+  --dur-heartbeat:  2200ms;
+  --dur-spin:       800ms;
+
+  --move-sheet-x: 24px;
+  --move-sheet-y: 16px;
+  --move-modal-y: 8px;
+  --move-toast-y: 8px;
+  --move-pop-y:   -4px;
+  --press-scale:  0.98;
+}
+
+/* ── 2 · Press, tint, lock ──────────────────────────────────────────────── */
+.btn-primary, .btn-secondary, .btn-ghost, .btn-icon, .chip, .segmented button, nav a, .credit-pill {
+  transition:
+    background-color var(--dur-instant) var(--ease-standard),
+    border-color     var(--dur-instant) var(--ease-standard),
+    color            var(--dur-instant) var(--ease-standard),
+    transform        var(--dur-instant) var(--ease-standard);
+}
+.btn-primary:active:not([aria-disabled="true"]),
+.btn-secondary:active:not([aria-disabled="true"]),
+.btn-ghost:active:not([aria-disabled="true"]),
+.chip:active:not([aria-disabled="true"]) { transform: scale(var(--press-scale)); }
+
+/* Focus rings are never animated: outline is absent from every transition list above. */
+
+[data-busy] { cursor: progress; }
+.btn-primary[data-busy]   { background-color: var(--action-primary-bg);   color: var(--action-primary-ink); }
+.btn-secondary[data-busy] { background-color: var(--action-secondary-bg); color: var(--action-secondary-ink);
+                            border-color: var(--action-secondary-border); }
+[data-busy] > .btn-label  { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.btn-spinner {
+  display: none; inline-size: 14px; block-size: 14px; margin-inline-end: 6px; vertical-align: -2px;
+  border: 1.5px solid currentColor; border-inline-end-color: transparent; border-radius: 999px;
+  flex-shrink: 0;
+}
+[data-busy] > .btn-spinner {
+  display: inline-block; opacity: 0;
+  animation: spinner-in var(--dur-instant) linear 150ms 1 both,
+             spin var(--dur-spin) linear infinite;
+}
+@keyframes spinner-in { to { opacity: 1; } }
+@keyframes spin       { to { transform: rotate(360deg); } }
+
+/* Copy acknowledgement: glyph swap only, the label never changes width. */
+.btn-glyph { display: inline-grid; }
+.btn-glyph > * { grid-area: 1 / 1; transition: opacity var(--dur-instant) var(--ease-standard); }
+.btn-glyph > .glyph-done { opacity: 0; }
+[data-feedback="done"] .btn-glyph > .glyph-idle { opacity: 0; }
+[data-feedback="done"] .btn-glyph > .glyph-done { opacity: 1; }
+
+/* ── 3 · Review changes sheet ───────────────────────────────────────────── */
+.sheet-stage { overflow-x: clip; }   /* clips the 24px entrance offset; masks no layout overflow */
+
+.sheet[data-state="opening"],
+.sheet[data-state="open"] {
+  transform: none; opacity: 1;
+  transition: transform var(--dur-sheet) var(--ease-out-expo),
+              opacity   var(--dur-fast)  var(--ease-standard);
+}
+.sheet[data-state="opening"] { will-change: transform, opacity; }
+@starting-style {
+  .sheet[data-state="opening"] { transform: translate3d(var(--move-sheet-x), 0, 0); opacity: 0; }
+}
+.sheet[data-state="closing"] {
+  transform: translate3d(var(--move-sheet-x), 0, 0); opacity: 0; will-change: transform, opacity;
+  transition: transform var(--dur-sheet-exit) var(--ease-in-crisp),
+              opacity   var(--dur-sheet-exit) var(--ease-in-crisp);
+}
+@media (max-width: 719.98px) {
+  @starting-style {
+    .sheet[data-state="opening"] { transform: translate3d(0, var(--move-sheet-y), 0); opacity: 0; }
+  }
+  .sheet[data-state="closing"] { transform: translate3d(0, var(--move-sheet-y), 0); }
+}
+/* Cold deep link: the sheet is inserted with data-state="open". No starting style matches, so nothing plays. */
+
+.sheet-scrim[data-state="open"]    { opacity: 1; transition: opacity var(--dur-fast) var(--ease-standard); }
+.sheet-scrim[data-state="closing"] { opacity: 0; transition: opacity var(--dur-sheet-exit) var(--ease-in-crisp); }
+@starting-style { .sheet-scrim[data-state="open"] { opacity: 0; } }
+
+/* ── 4 · Modal, popover, toast, tooltip ─────────────────────────────────── */
+.modal[data-state="open"] {
+  transform: none; opacity: 1;
+  transition: transform var(--dur-sheet) var(--ease-out-expo), opacity var(--dur-fast) var(--ease-standard);
+}
+@starting-style { .modal[data-state="open"] { transform: translate3d(0, var(--move-modal-y), 0); opacity: 0; } }
+.modal[data-state="closing"] {
+  transform: translate3d(0, var(--move-modal-y), 0); opacity: 0;
+  transition: transform var(--dur-sheet-exit) var(--ease-in-crisp), opacity var(--dur-sheet-exit) var(--ease-in-crisp);
+}
+.modal-scrim[data-state="open"]    { opacity: 1; transition: opacity var(--dur-fast) var(--ease-standard); }
+.modal-scrim[data-state="closing"] { opacity: 0; transition: opacity var(--dur-sheet-exit) var(--ease-in-crisp); }
+@starting-style { .modal-scrim[data-state="open"] { opacity: 0; } }
+
+.popover[data-state="open"] {
+  transform: none; opacity: 1;
+  transition: transform var(--dur-fast) var(--ease-out-expo), opacity var(--dur-fast) var(--ease-standard);
+}
+@starting-style { .popover[data-state="open"] { transform: translate3d(0, var(--move-pop-y), 0); opacity: 0; } }
+.popover[data-state="closing"] { opacity: 0; transition: opacity var(--dur-instant) var(--ease-in-crisp); }
+
+@media (max-width: 719.98px) {
+  .popover[data-state="open"] { transition: transform var(--dur-sheet) var(--ease-out-expo), opacity var(--dur-fast) var(--ease-standard); }
+  @starting-style {
+    .popover[data-state="open"], .modal[data-state="open"] { transform: translate3d(0, var(--move-sheet-y), 0); opacity: 0; }
+  }
+  .popover[data-state="closing"], .modal[data-state="closing"] {
+    transform: translate3d(0, var(--move-sheet-y), 0); opacity: 0;
+    transition: transform var(--dur-sheet-exit) var(--ease-in-crisp), opacity var(--dur-sheet-exit) var(--ease-in-crisp);
+  }
+}
+
+.toast[data-state="shown"] {
+  transform: none; opacity: 1;
+  transition: transform var(--dur-banner) var(--ease-out-expo), opacity var(--dur-banner) var(--ease-standard);
+}
+@starting-style { .toast[data-state="shown"] { transform: translate3d(0, var(--move-toast-y), 0); opacity: 0; } }
+.toast[data-state="leaving"] { opacity: 0; transition: opacity var(--dur-fast) var(--ease-in-crisp); }
+
+.tooltip { opacity: 0; }
+.tooltip[data-state="open"] { opacity: 1; transition: opacity var(--dur-instant) var(--ease-standard) 500ms; }
+.tooltip[data-state="open"][data-from-focus] { transition-delay: 0ms; }
+
+/* ── 5 · Gliding indicators (top tabs, segmented filter) ────────────────── */
+nav.tabs, .tabrow, .segmented { position: relative; }
+.tab-ink, .seg-thumb {
+  position: absolute; left: 0; pointer-events: none;
+  inline-size: var(--ind-w, 0px);
+  transform: translate3d(var(--ind-x, 0px), 0, 0);
+  transform-origin: 0 50%;
+  visibility: hidden;
+}
+.tab-ink[data-placed], .seg-thumb[data-placed] { visibility: visible; }
+.tab-ink   { bottom: 0; block-size: 2px; background: var(--ink-primary); }
+.seg-thumb { top: 2px; bottom: 2px; border-radius: var(--r-sm); background: var(--bg-surface); box-shadow: var(--shadow-card); z-index: 0; }
+.segmented > button { position: relative; z-index: 1; }
+/* Once the indicator is placed it replaces the static per-item treatment. */
+[data-ind="on"] > a[aria-current="page"]::after { visibility: hidden; }
+.segmented[data-ind="on"] > button[aria-pressed="true"],
+.segmented[data-ind="on"] > button[aria-selected="true"] { background-color: transparent; box-shadow: none; }
+@media (max-width: 719.98px) { .seg-thumb { display: none; } }   /* wrapping chips: tint only */
+
+/* ── 6 · Arrival ring (deep link, sheet return, instant scroll target) ──── */
+[data-arrived] { position: relative; }
+[data-arrived]::after {
+  content: ""; position: absolute; inset: -1px; pointer-events: none;
+  border: 2px solid var(--ink-primary); border-radius: inherit; opacity: 0;
+  animation: arrive-ring var(--dur-flash) var(--ease-standard) 1 both;
+}
+@keyframes arrive-ring { from { opacity: 0.5; } to { opacity: 0; } }
+
+/* ── 7 · The one heartbeat: live dot, hold pulse, skeleton ──────────────── */
+.pill-status[data-live] .dot                 { animation: live-breathe     var(--dur-heartbeat) ease-in-out infinite; }
+.banner-warning .banner-head svg[data-pulse] { animation: hold-pulse       var(--dur-heartbeat) ease-in-out infinite; }
+.skeleton                                    { animation: skeleton-breathe var(--dur-heartbeat) ease-in-out infinite; }
+@keyframes live-breathe     { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+@keyframes hold-pulse       { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+@keyframes skeleton-breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+[data-offscreen] { animation-play-state: paused !important; }
+
+/* ── 8 · Small state changes ────────────────────────────────────────────── */
+[role="switch"] .knob { transition: transform var(--dur-fast) var(--ease-out-expo); }
+[role="switch"][aria-checked="true"] .knob { transform: translate3d(16px, 0, 0); }
+[aria-expanded] > .caret { transition: transform var(--dur-instant) var(--ease-standard); }
+[aria-expanded="false"] > .caret { transform: rotate(-90deg); }
+.badge[data-leaving] { opacity: 0; transition: opacity var(--dur-instant) var(--ease-in-crisp); }
+
+/* ── 9 · Theme switch: every color flips in one frame ───────────────────── */
+html[data-theme-switching],
+html[data-theme-switching] *,
+html[data-theme-switching] *::before,
+html[data-theme-switching] *::after { transition: none !important; }
+
+/* ── 10 · Reduced motion: instant states, zero travel, no loops ─────────── */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-instant: 0ms; --dur-fast: 0ms; --dur-banner: 0ms; --dur-sheet: 0ms; --dur-confirm: 0ms;
+    --dur-sheet-exit: 0ms; --dur-swap: 0ms; --dur-dip-out: 0ms; --dur-dip-in: 0ms;
+    --dur-row: 0ms; --dur-row-in: 0ms; --dur-depart: 0ms; --dur-flash: 0ms;
+    --move-sheet-x: 0px; --move-sheet-y: 0px; --move-modal-y: 0px; --move-toast-y: 0px; --move-pop-y: 0px;
+    --press-scale: 1;
+  }
+  *, *::before, *::after {
+    animation-duration: 0ms !important; animation-delay: 0ms !important; animation-iteration-count: 1 !important;
+    transition-duration: 0ms !important; transition-delay: 0ms !important; scroll-behavior: auto !important;
+  }
+  .pill-status[data-live] .dot,
+  .banner-warning .banner-head svg[data-pulse],
+  .skeleton { animation: none !important; opacity: 1; }
+  [data-busy] > .btn-spinner { animation: none !important; opacity: 1; }
+  [data-arrived]::after { animation: none !important; display: none; }
+  .tooltip[data-state="open"] { transition-delay: 0ms !important; }
+}
+
+/* ── 11 · Forced colors: redraw motion-owned fills with system colors ───── */
+@media (forced-colors: active) {
+  .tab-ink   { forced-color-adjust: none; background: Highlight; }
+  .seg-thumb { forced-color-adjust: none; background: Canvas; box-shadow: none; outline: 2px solid Highlight; outline-offset: -2px; }
+  [data-arrived]::after { border-color: Highlight; }
+  .btn-spinner { forced-color-adjust: none; border-color: ButtonText; border-inline-end-color: transparent; }
+  .sheet, .modal, .popover, .toast { border: 1px solid CanvasText; }
+}

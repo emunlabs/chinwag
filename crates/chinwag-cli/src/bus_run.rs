@@ -65,10 +65,20 @@ enum BusFrame {
         original_digest_sha256: String,
     },
     NetworkPosture,
-    JournalSubscribe { subscription_id: String, timeout_secs: u64 },
-    JournalUnsubscribe { subscription_id: String },
-    JournalChanged { observed_len: u64, observed_inode: u64, timeout_secs: u64,
-        #[serde(default)] subscription_id: Option<String> },
+    JournalSubscribe {
+        subscription_id: String,
+        timeout_secs: u64,
+    },
+    JournalUnsubscribe {
+        subscription_id: String,
+    },
+    JournalChanged {
+        observed_len: u64,
+        observed_inode: u64,
+        timeout_secs: u64,
+        #[serde(default)]
+        subscription_id: Option<String>,
+    },
     Ping,
 }
 
@@ -791,12 +801,21 @@ async fn query_local_daemon(daemon: &DaemonState, frame: &BusFrame) -> Result<Va
                 && value["original_digest_sha256"] == *original_digest_sha256
         }
         BusFrame::NetworkPosture => value["schema"] == "chinwag.network-posture.v1",
-        BusFrame::JournalSubscribe { subscription_id, .. } | BusFrame::JournalUnsubscribe { subscription_id } => {
-            value["schema"] == "chinwag.bus.journal-subscription.v1" && value["subscription_id"] == *subscription_id
+        BusFrame::JournalSubscribe {
+            subscription_id, ..
         }
-        BusFrame::JournalChanged { observed_len, observed_inode, .. } => {
+        | BusFrame::JournalUnsubscribe { subscription_id } => {
+            value["schema"] == "chinwag.bus.journal-subscription.v1"
+                && value["subscription_id"] == *subscription_id
+        }
+        BusFrame::JournalChanged {
+            observed_len,
+            observed_inode,
+            ..
+        } => {
             value["schema"] == "chinwag.bus.journal-change.v1"
-                && value["observed_len"] == *observed_len && value["observed_inode"] == *observed_inode
+                && value["observed_len"] == *observed_len
+                && value["observed_inode"] == *observed_inode
         }
         _ => false,
     };
@@ -818,7 +837,9 @@ async fn send_local_observation(send: &mut iroh::endpoint::SendStream, response:
 }
 
 async fn native_journal_change_hint<T: Clone>(
-    sender: &broadcast::Sender<T>, timeout: Duration, mark_changed: impl FnOnce() -> bool,
+    sender: &broadcast::Sender<T>,
+    timeout: Duration,
+    mark_changed: impl FnOnce() -> bool,
 ) -> bool {
     let mut arrivals = sender.subscribe();
     mark_changed() || tokio::time::timeout(timeout, arrivals.recv()).await.is_ok()
@@ -831,9 +852,13 @@ mod native_wait_hint_tests {
     async fn bus_wait_subscription_precedes_mark_and_native_timeout_has_no_cursor_lock() {
         let (sender, _) = broadcast::channel::<()>(1);
         // An arrival during the mark observation must already have a receiver.
-        assert!(native_journal_change_hint(&sender, Duration::from_secs(1), || {
-            assert_eq!(sender.send(()).unwrap(), 1); false
-        }).await);
+        assert!(
+            native_journal_change_hint(&sender, Duration::from_secs(1), || {
+                assert_eq!(sender.send(()).unwrap(), 1);
+                false
+            })
+            .await
+        );
         let started = Instant::now();
         assert!(!native_journal_change_hint(&sender, Duration::from_millis(40), || false).await);
         assert!(started.elapsed() >= Duration::from_millis(40));
@@ -883,7 +908,10 @@ async fn exchange_local_frame(
     lookup.set_endpoint_info(addr.clone());
 
     let client = bind_bus_endpoint(actor_secret, 0, lookup).await?;
-    let timeout = match frame { BusFrame::JournalChanged { timeout_secs, .. } => timeout_secs.saturating_add(8).min(3608), _ => 8 };
+    let timeout = match frame {
+        BusFrame::JournalChanged { timeout_secs, .. } => timeout_secs.saturating_add(8).min(3608),
+        _ => 8,
+    };
     let result = tokio::time::timeout(Duration::from_secs(timeout), async {
         let connection = client
             .connect(addr, BUS_ALPN)
@@ -1537,7 +1565,9 @@ async fn run_daemon_loop_inner(
     );
     let _ = stdout.flush();
 
-    let subscriptions = Arc::new(Mutex::new(chinwag_cli::bus_wait_subscription::Subscriptions::<BusMessage>::default()));
+    let subscriptions = Arc::new(Mutex::new(
+        chinwag_cli::bus_wait_subscription::Subscriptions::<BusMessage>::default(),
+    ));
     let (tx, unused_receiver) = broadcast::channel::<BusMessage>(256);
     // No consumer has subscribed through this daemon path. Keeping an unread
     // internal receiver would inflate subscribers_notified without delivery.
@@ -2072,8 +2102,12 @@ struct NativeWaitSubscription {
     active: std::cell::RefCell<Option<(DaemonState, String)>>,
 }
 fn wait_query(daemon: &DaemonState, frame: &BusFrame) -> Result<Value, String> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| "WAKE_UNSUPPORTED")?;
-    rt.block_on(query_local_daemon(daemon, frame)).map_err(|e| format!("WAKE_HOST_OFFLINE_OR_UNSUPPORTED: {e}"))
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "WAKE_UNSUPPORTED")?;
+    rt.block_on(query_local_daemon(daemon, frame))
+        .map_err(|e| format!("WAKE_HOST_OFFLINE_OR_UNSUPPORTED: {e}"))
 }
 impl NativeWaitSubscription {
     fn cancel(&self) {
@@ -2085,20 +2119,49 @@ impl NativeWaitSubscription {
         self.cancel();
         let daemon = read_daemon_state(repo).ok_or("WAKE_HOST_OFFLINE")?;
         let subscription_id = SecretKey::generate().public().to_string();
-        let value = wait_query(&daemon, &BusFrame::JournalSubscribe { subscription_id: subscription_id.clone(), timeout_secs })?;
-        if value["subscribed"] != true { return Err("WAKE_SUBSCRIPTION_REFUSED".into()); }
+        let value = wait_query(
+            &daemon,
+            &BusFrame::JournalSubscribe {
+                subscription_id: subscription_id.clone(),
+                timeout_secs,
+            },
+        )?;
+        if value["subscribed"] != true {
+            return Err("WAKE_SUBSCRIPTION_REFUSED".into());
+        }
         *self.active.borrow_mut() = Some((daemon, subscription_id));
         Ok(())
     }
-    fn changed(&self, observed_len: u64, observed_inode: u64, timeout_secs: u64) -> Result<bool, String> {
-        let (daemon, id) = self.active.borrow_mut().take().ok_or("WAKE_SUBSCRIPTION_MISSING")?;
-        let value = wait_query(&daemon, &BusFrame::JournalChanged {
-            observed_len, observed_inode, timeout_secs, subscription_id: Some(id),
-        })?;
-        value["changed"].as_bool().ok_or_else(|| "WAKE_UNSUPPORTED".into())
+    fn changed(
+        &self,
+        observed_len: u64,
+        observed_inode: u64,
+        timeout_secs: u64,
+    ) -> Result<bool, String> {
+        let (daemon, id) = self
+            .active
+            .borrow_mut()
+            .take()
+            .ok_or("WAKE_SUBSCRIPTION_MISSING")?;
+        let value = wait_query(
+            &daemon,
+            &BusFrame::JournalChanged {
+                observed_len,
+                observed_inode,
+                timeout_secs,
+                subscription_id: Some(id),
+            },
+        )?;
+        value["changed"]
+            .as_bool()
+            .ok_or_else(|| "WAKE_UNSUPPORTED".into())
     }
 }
-impl Drop for NativeWaitSubscription { fn drop(&mut self) { self.cancel(); } }
+impl Drop for NativeWaitSubscription {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
 
 pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     if args.first().map(String::as_str) == Some("recovery") {
@@ -2107,9 +2170,15 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     if matches!(sub, "wait" | "wait-ack" | "enroll-host" | "wait-reconcile") {
         let watcher = NativeWaitSubscription::default();
-        return chinwag_cli::bus_wait_cli::run(args, stdout, stderr,
+        return chinwag_cli::bus_wait_cli::run(
+            args,
+            stdout,
+            stderr,
             |repo, timeout| watcher.register(repo, timeout),
-            |_, observed_len, observed_inode, timeout_secs| watcher.changed(observed_len, observed_inode, timeout_secs));
+            |_, observed_len, observed_inode, timeout_secs| {
+                watcher.changed(observed_len, observed_inode, timeout_secs)
+            },
+        );
     }
     if sub == "--help" || sub == "-h" || sub == "help" {
         return print_bus_help(stdout);

@@ -110,8 +110,10 @@ pub(crate) fn upgrade_v1(native: &Connection) -> Result<()> {
 }
 
 fn register_crr(native: &Connection, table: &'static str) -> Result<()> {
-    if native.query(c"SELECT crsql_as_crr(?1)", &[Value::Text(table.into())])?
-        != vec![vec![Value::Text("OK".into())]]
+    if native.query(
+        c"SELECT crsql_as_crr('main', ?1)",
+        &[Value::Text(table.into())],
+    )? != vec![vec![Value::Text("OK".into())]]
     {
         return Err(Error::Contract("Unexpected qualified CRR registration"));
     }

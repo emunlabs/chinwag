@@ -328,7 +328,7 @@ fn initialize_schema(native: &Connection) -> Result<()> {
         for table in &schema::TABLES {
             native.query(table.ddl, &[])?;
             if native.query(
-                c"SELECT crsql_as_crr(?1)",
+                c"SELECT crsql_as_crr('main', ?1)",
                 &[Value::Text(table.name.into())],
             )? != vec![vec![Value::Text("OK".into())]]
             {
