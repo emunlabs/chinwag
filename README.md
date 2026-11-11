@@ -14,7 +14,7 @@
 **Chinwag (`chinwag`) is the local-first Multi-Agent Swarm Coordination Bus, Atomic File-Scope Lease Engine, Dual-Layer Native Memory Store, and Cryptographic Flight Recorder built in Rust (`#![forbid(unsafe_code)]`) by Emun Labs.**  
 Each AI coding agent conversation (`<SEAT>#<INSTANCE>`) signs with its seat's canonical `Ed25519` key, coordinates over a conflict-free local SQLite CRDT store (`.chinwag/state.crdb` + `.chinwag/memory.crdb.leann`), and seals a dual-recipient post-quantum HPKE (`X25519MLKEM768` + `ChaCha20-Poly1305`) flight capsule to every Git commit — all in a dependency-free native binary under `Apache-2.0`.
 
-[60-Second Quickstart](#-60-second-quickstart) · [The 6 Core Capabilities](#-the-6-core-capabilities) · [CLI Command Reference](#-cli-command-reference) · [Architecture & Crate Map](#-architecture--crate-map) · [Credit-Only Pricing (`OrgWallet`)](#-open-core-apache-20--organization-credit-pool-pricing) · [Apache 2.0 & Patent Grant](#-corporate-provenance-apache-20-license--defensive-patent-grant)
+[60-Second Quickstart](#-60-second-quickstart) · [The 7 Core Capabilities](#-the-7-core-capabilities) · [CLI Command Reference](#-cli-command-reference) · [Architecture & Crate Map](#-architecture--crate-map) · [Credit-Only Pricing (`OrgWallet`)](#-open-core-apache-20--organization-credit-pool-pricing) · [Apache 2.0 & Patent Grant](#-corporate-provenance-apache-20-license--defensive-patent-grant)
 
 </div>
 
@@ -41,7 +41,7 @@ Without a cryptographic coordination layer, running multiple agents against one 
 
 ---
 
-## 🔥 The 6 Core Capabilities
+## 🔥 The 7 Core Capabilities
 
 ### 1. Signed End-to-End Encrypted Agent Bus & `<SEAT>#<INSTANCE>` Non-Repudiation (`chinwag bus`)
 
@@ -124,7 +124,7 @@ chinwag memory stats --bank default
 ### 5. `1.4s` CI-to-Agent Wakeup, `<50 ms` Offline Tombstone Cassettes & Deterministic UI Gate (`chinwag ui-gate` & `chinwag-ci`)
 
 - **Deterministic DOM Geometry Gate (`chinwag ui-gate`):** Evaluates `176/176` machine-measured DOM bounding-box and kinetic scroll checks across 8 viewports and Midnight/Daylight themes (`INV-UI-BLEED`, `INV-UI-OVERLAP`, `INV-UI-CLIP`, `INV-UI-HIT-TEST`), plus optional `Vision-3` `16-surface` multimodal visual audits and autonomous CSS auto-patch.
-- **Companion [`chinwag-ci`](https://github.com/emunlabs/chinwag-ci) Runner:** Pure-Rust static CI binary (`wrap`, `verify-signer`, `test-regressions`, `diff-run`, `fork-run`, `ui-gate`, `omp-gate`, `policy-gate`, `attest-green`, `notify`, `selftest`) that scrubs secrets before encryption, coalesces 20-shard CI matrix storms into one `1.4s` agent wakeup, holds the warm CI container open for a signed live patch (`--hold-for-patch`), verifies `<5ms` `CP-OMP` orthogonal quorums and `<1ms` `WP-01..WP-15` policy rules, and replays `.chinwag/regressions/*.json` Tombstone cassettes offline in `<50 ms` at `$0` LLM spend.
+- **Companion [`chinwag-ci`](https://github.com/emunlabs/chinwag-ci) Runner:** Pure-Rust static CI binary (`wrap`, `verify-signer`, `test-regressions`, `diff-run`, `fork-run`, `ui-gate`, `omp-gate`, `policy-gate`, `surface-gate`, `attest-green`, `notify`, `selftest`) that scrubs secrets before encryption, coalesces 20-shard CI matrix storms into one `1.4s` agent wakeup, holds the warm CI container open for a signed live patch (`--hold-for-patch`), verifies `<5ms` `CP-OMP` orthogonal quorums, `<1ms` `WP-01..WP-15` policy rules, and `SurfaceImpactManifestV1` cross-surface completeness (`surface-gate`), and replays `.chinwag/regressions/*.json` Tombstone cassettes offline in `<50 ms` at `$0` LLM spend.
 
 ---
 
@@ -145,6 +145,14 @@ chinwag mcp-serve --repo "$PWD" --transport stdio
 
 ---
 
+### 7. Executable Tickets, Card-Move-Driven Cross-Surface Orchestration & 200ms Proof-of-Green Board Gate (`chinwag tasks` & `chinwag board`)
+
+- **5-Column Native Board Pairing (`chinwag tasks init` & `chinwag board init --github | --linear`):** Pairs **GitHub Projects v2** and **Linear** (`01 · 🌱 OPEN BOUNTY (+500 CR)` -> `02 · 📐 SCOPED & BENCHMARKED` -> `03 · ⚡ IN FLIGHT — CLOCK LIVE` -> `04 · 📐 VISUAL GEOMETRY & COPY GATE` -> `05 · ✓ SHIPPED — Δ VERIFIED`) directly with `Chinwag Delivery-2` (`100%` webhook-free `INV-ZERO-WEBHOOKS-01`).
+- **Card-Move-Driven `SurfaceImpactManifestV1` & Parallel Sub-Issue Fan-Out (`chinwag board watch | sync-loop`):** Moving a card on GitHub Projects v2 or Linear automatically triggers `Chinwag Delivery-2` to compute a deterministic cross-repository **`SurfaceImpactManifestV1`** (`code_cli`, `readme`, `docs_site`, `marketing_site`, `telemetry_proxy`, `ui_qa`) and fan out parallel sub-issues (`#ID.1` Code, `#ID.2` Docs & `README.md`, `#ID.3` Website & Telemetry, `#ID.4` Desktop `1440×900` & Mobile `390×844` `ui-gate`) in isolated worktrees.
+- **200ms Proof-of-Green Snap-Back (`INV-NO-FAKE-DONE-01`) & Auto-Merge to `origin/main`:** If an agent attempts to move a card to `04 · 📐 VISUAL GEOMETRY & COPY GATE` or `05 · ✓ SHIPPED — Δ VERIFIED` while any downstream surface (`chinwag-ci surface-gate` Pillar 12) or desktop/mobile viewport (`chinwag-ci ui-gate` `UiGateReceiptV1`) is missing or failing, Chinwag snaps the card back to `03 · ⚡ IN FLIGHT — CLOCK LIVE` within `200ms`. When all surfaces and viewports pass, promoting to `05 · ✓ SHIPPED — Δ VERIFIED` automatically merges the verified worktree branches into `origin/main` with a commit-pinned `✓ed25519` Δ Velocity Proof receipt.
+
+---
+
 ## 🛠️ CLI Command Reference (`chinwag`)
 
 Every subcommand below is compiled into the single `chinwag` binary (`crates/chinwag-cli`):
@@ -157,6 +165,9 @@ Usage:
   chinwag omp <status | plan> [--repo <path>] [--json]
   chinwag pair | triad | quad [options]
   chinwag verify --policy .chinwag/workflow.yaml [--json]
+  chinwag tasks <init | create | list | split> [options]
+  chinwag board <init | push | pull | watch | sync-loop> [options]
+  chinwag ci-report --issue <ID> --status <pass|fail> [--push-boards] [--delivery-licensed]
   chinwag bus <send | inbox | tail | status | instance | wait | recovery> [options]
   chinwag memory <recall | retain | tombstone | stats> [options]
   chinwag agent-dispatch --agent <SEAT> --sender <SEAT#INSTANCE> --item <TASK-ID> --crdb <path> --body <text>
@@ -221,7 +232,7 @@ flowchart TB
 
 | Crate / Component | Path | Target | Role in the Chinwag Architecture |
 | :--- | :--- | :--- | :--- |
-| **`chinwag-cli`** | [`crates/chinwag-cli`](crates/chinwag-cli) | `bin: chinwag` | Main CLI dispatcher (`init`, `status`, `delivery`, `omp`, `pair`, `triad`, `quad`, `verify`, `bus`, `memory`, `agent-dispatch`, `configure-editor`, `mcp-serve`, `ui-gate`, `a509`, `cwcard`). |
+| **`chinwag-cli`** | [`crates/chinwag-cli`](crates/chinwag-cli) | `bin: chinwag` | Main CLI dispatcher (`init`, `status`, `delivery`, `omp`, `pair`, `triad`, `quad`, `verify`, `tasks`, `board`, `ci-report`, `bus`, `memory`, `agent-dispatch`, `configure-editor`, `mcp-serve`, `ui-gate`, `a509`, `cwcard`). |
 | **`chinwag-mcp`** | [`crates/chinwag-mcp`](crates/chinwag-mcp) | `lib` | Bounded MCP server (`rmcp`) over `stdio` and authenticated loopback `HTTP`, serving `chinwag_read_thread`, `chinwag_pin_context`, and `chinwag_handoff`. |
 | **`chinwag-swarm`** | [`crates/chinwag-swarm`](crates/chinwag-swarm) | `lib` | Sovereign P2P transport built on `iroh 1.4.1` QUIC, `iroh-gossip`, `iroh-blobs` (`BLAKE3` 32 MiB cap), VPN-safe `LAN mDNS`, and `RelayPolicy::Own`. |
 | **`chinwag-claim`** | [`crates/chinwag-claim`](crates/chinwag-claim) | `lib` (`native` + `wasm`) | Pure `Ed25519`-signed task-claim requests, coordinator receipts (`SignedClaimReceipt`), and disjoint `--file-scope` glob policy checks. |
