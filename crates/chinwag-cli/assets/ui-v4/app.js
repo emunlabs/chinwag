@@ -890,7 +890,9 @@ const state = {
   d2ComposerError: null,
   d2Sending: false,
   d2ActiveTurnId: null,
+  d2ActiveTurnThreadId: null,
   d2CancelledTurnIds: new Set(),
+  d2CancelledTurns: new Map(),
   d2ActiveAbort: null,
   d2ActiveStreamer: null,
   d2StreamingEntryId: null,
@@ -1033,11 +1035,11 @@ function createDefaultDelivery2State() {
         {
           id: "github",
           label: "GitHub",
-          authorized: true,
-          in_thread: true,
+          authorized: false,
+          in_thread: false,
           locked_in_thread: false,
           role_mode: "full",
-          auth_status: "Connected · your account",
+          auth_status: "Needs sign-in · pauses at 0 Cr",
           connect_url: "https://chinwag.sh/open?connect=github&source=local_ui",
           policy_note: null,
         },
@@ -1055,11 +1057,11 @@ function createDefaultDelivery2State() {
         {
           id: "slack",
           label: "Slack",
-          authorized: true,
+          authorized: false,
           in_thread: false,
           locked_in_thread: false,
           role_mode: "ambient_status_only",
-          auth_status: "Connected · ambient status cards only",
+          auth_status: "Needs sign-in · pauses at 0 Cr",
           connect_url: "https://chinwag.sh/open?connect=slack&source=local_ui",
           policy_note:
             "Slack posts ambient status cards with [Open in Chinwag ↗] deep-links only — Delivery-2 lives here in Chinwag.",
@@ -1526,14 +1528,77 @@ function safeChinwagOutboundUrl(raw, fallback = "https://chinwag.sh/open") {
   if (
     tailLower.includes("://") ||
     tailLower.includes("//") ||
+    tailLower.includes("\\") ||
+    tailLower.includes("@") ||
     tailLower.includes("javascript:") ||
     tailLower.includes("data:") ||
-    tailLower.includes("%2f%2f") ||
+    tailLower.includes("%2f") ||
+    tailLower.includes("%5c") ||
+    tailLower.includes("%25") ||
     tailLower.includes("%3a")
   ) {
     return fallback;
   }
   return s;
+}
+
+function reconcileCancelledDelivery2State(d2) {
+  if (!d2 || typeof d2 !== "object" || !Array.isArray(d2.entries)) return d2;
+  const cancelledMap = state.d2CancelledTurns instanceof Map ? state.d2CancelledTurns : null;
+  const cancelledSet = state.d2CancelledTurnIds instanceof Set ? state.d2CancelledTurnIds : null;
+  if ((!cancelledMap || cancelledMap.size === 0) && (!cancelledSet || cancelledSet.size === 0)) {
+    return d2;
+  }
+  d2.entries = d2.entries
+    .filter((entry) => {
+      if (!entry || typeof entry !== "object") return false;
+      const tId = entry.turn_id ? String(entry.turn_id) : "";
+      if (entry.kind === "run_card" && tId) {
+        const rec = cancelledMap ? cancelledMap.get(tId) : null;
+        const isCancelled = Boolean(rec) || Boolean(cancelledSet && cancelledSet.has(tId));
+        if (isCancelled && (!rec || rec.truncatedLen === 0)) {
+          return false;
+        }
+      }
+      return true;
+    })
+    .map((entry) => {
+      const tId = entry.turn_id ? String(entry.turn_id) : "";
+      const recByTurn = tId && cancelledMap ? cancelledMap.get(tId) : null;
+      let recByEntry = null;
+      if (!recByTurn && cancelledMap && entry.id) {
+        for (const candidate of cancelledMap.values()) {
+          if (candidate && candidate.entryId && String(candidate.entryId) === String(entry.id)) {
+            recByEntry = candidate;
+            break;
+          }
+        }
+      }
+      const rec = recByTurn || recByEntry;
+      const isCancelled = Boolean(rec) || Boolean(tId && cancelledSet && cancelledSet.has(tId));
+      if (!isCancelled || entry.kind !== "qa_card") return entry;
+      const maxChars = rec && typeof rec.truncatedLen === "number" ? rec.truncatedLen : 0;
+      let clampedBody = "[Stopped]";
+      if (maxChars > 0) {
+        if (rec && rec.partialBody && rec.partialBody.trim()) {
+          clampedBody = rec.partialBody;
+        } else {
+          const sliced = healUnclosedInlineMarkdown(
+            Array.from(String(entry.body || ""))
+              .slice(0, maxChars)
+              .join(""),
+          );
+          if (sliced.trim()) clampedBody = sliced;
+        }
+      }
+      return {
+        ...entry,
+        body: clampedBody,
+        stopped: true,
+        sources: maxChars === 0 ? [] : Array.isArray(entry.sources) ? entry.sources : [],
+      };
+    });
+  return d2;
 }
 
 function normalizeDelivery2State(rawD2, baseData = null) {
@@ -1591,18 +1656,36 @@ function normalizeDelivery2State(rawD2, baseData = null) {
             const fb = def.sync_radar.surfaces[idx] || def.sync_radar.surfaces[0];
             const id = String(s.id || fb.id);
             const fallbackUrl = fb.connect_url || "https://chinwag.sh/open";
+            const authorized =
+              id === "local" ? true : typeof s.authorized === "boolean" ? s.authorized : fb.authorized;
+            const inThread =
+              id === "local"
+                ? true
+                : !authorized || id === "slack"
+                  ? false
+                  : typeof s.in_thread === "boolean"
+                    ? s.in_thread
+                    : fb.in_thread;
+            const authStatus =
+              id === "local"
+                ? String(s.auth_status || fb.auth_status)
+                : !authorized
+                  ? "Needs sign-in · pauses at 0 Cr"
+                  : id === "slack"
+                    ? "Connected · ambient status cards only"
+                    : String(
+                        s.auth_status && !String(s.auth_status).startsWith("Needs sign-in")
+                          ? s.auth_status
+                          : "Connected · your account",
+                      );
             return {
               id,
               label: String(s.label || fb.label),
-              authorized: typeof s.authorized === "boolean" ? s.authorized : fb.authorized,
-              in_thread: typeof s.in_thread === "boolean" ? s.in_thread : fb.in_thread,
+              authorized,
+              in_thread: inThread,
               locked_in_thread: Boolean(s.locked_in_thread ?? fb.locked_in_thread),
               role_mode: String(s.role_mode || fb.role_mode),
-              auth_status: String(
-                id === "slack"
-                  ? "Connected · ambient status cards only"
-                  : s.auth_status || fb.auth_status,
-              ),
+              auth_status: authStatus,
               connect_url:
                 id === "local"
                   ? null
@@ -1682,6 +1765,7 @@ function normalizeDelivery2State(rawD2, baseData = null) {
     };
   }
 
+  reconcileCancelledDelivery2State(out);
   return out;
 }
 
@@ -5946,10 +6030,14 @@ async function submitDelivery2Prompt(rawPrompt) {
   if (!prompt || state.d2Sending) return false;
 
   const turnId = `turn-${uuidv4().slice(0, 8)}`;
+  const turnThreadId = String(
+    (state.data && state.data.delivery2 && state.data.delivery2.active_thread_id) || "thr-main",
+  );
   const abortCtrl = typeof AbortController !== "undefined" ? new AbortController() : null;
   state.d2ComposerError = null;
   state.d2Sending = true;
   state.d2ActiveTurnId = turnId;
+  state.d2ActiveTurnThreadId = turnThreadId;
   state.d2ActiveAbort = abortCtrl;
   renderDelivery2Panel();
 
@@ -5957,7 +6045,7 @@ async function submitDelivery2Prompt(rawPrompt) {
     const res = await apiRequest(
       "POST",
       "/api/v1/delivery2/message",
-      { prompt, turn_id: turnId },
+      { prompt, turn_id: turnId, thread_id: turnThreadId },
       abortCtrl ? { signal: abortCtrl.signal } : null,
     );
     if (
@@ -5996,6 +6084,7 @@ async function submitDelivery2Prompt(rawPrompt) {
           if (state.d2ActiveTurnId === turnId) {
             state.d2Sending = false;
             state.d2ActiveTurnId = null;
+            state.d2ActiveTurnThreadId = null;
           }
           state.d2ActiveStreamer = null;
           state.d2StreamingEntryId = null;
@@ -6011,12 +6100,14 @@ async function submitDelivery2Prompt(rawPrompt) {
       } else {
         state.d2Sending = false;
         state.d2ActiveTurnId = null;
+        state.d2ActiveTurnThreadId = null;
         state.d2StreamingEntryId = null;
         renderDelivery2Panel();
       }
     } else {
       state.d2Sending = false;
       state.d2ActiveTurnId = null;
+      state.d2ActiveTurnThreadId = null;
       renderDelivery2Panel();
     }
 
@@ -6031,6 +6122,7 @@ async function submitDelivery2Prompt(rawPrompt) {
     }
     state.d2Sending = false;
     state.d2ActiveTurnId = null;
+    state.d2ActiveTurnThreadId = null;
     state.d2ActiveAbort = null;
     const msg = err && err.message ? err.message : "Delivery-2 could not process that message.";
     state.d2ComposerError = msg;
@@ -6043,20 +6135,39 @@ async function submitDelivery2Prompt(rawPrompt) {
 async function cancelDelivery2Turn() {
   if (!state.d2Sending && !state.d2ActiveStreamer) return false;
   const turnId = state.d2ActiveTurnId || "active";
+  const turnThreadId = String(
+    state.d2ActiveTurnThreadId ||
+      (state.data && state.data.delivery2 && state.data.delivery2.active_thread_id) ||
+      "thr-main",
+  );
   const stoppedEntryId = state.d2StreamingEntryId || null;
   const partialText = String(state.d2StreamingText || "");
+  const healedPartial = healUnclosedInlineMarkdown(partialText);
   const truncatedLen = stoppedEntryId ? Array.from(partialText).length : 0;
 
-  if (turnId && turnId !== "active" && state.d2CancelledTurnIds) {
-    state.d2CancelledTurnIds.add(turnId);
-    if (state.d2CancelledTurnIds.size > 64) {
-      const oldest = state.d2CancelledTurnIds.values().next().value;
-      if (oldest) state.d2CancelledTurnIds.delete(oldest);
+  if (turnId && turnId !== "active") {
+    if (state.d2CancelledTurnIds) {
+      state.d2CancelledTurnIds.add(turnId);
+      if (state.d2CancelledTurnIds.size > 64) {
+        const oldest = state.d2CancelledTurnIds.values().next().value;
+        if (oldest) {
+          state.d2CancelledTurnIds.delete(oldest);
+          if (state.d2CancelledTurns instanceof Map) state.d2CancelledTurns.delete(oldest);
+        }
+      }
+    }
+    if (state.d2CancelledTurns instanceof Map) {
+      state.d2CancelledTurns.set(turnId, {
+        truncatedLen,
+        partialBody: stoppedEntryId && healedPartial.trim() ? healedPartial : "",
+        entryId: stoppedEntryId,
+      });
     }
   }
 
   state.d2Sending = false;
   state.d2ActiveTurnId = null;
+  state.d2ActiveTurnThreadId = null;
   if (state.d2ActiveAbort && typeof state.d2ActiveAbort.abort === "function") {
     try {
       state.d2ActiveAbort.abort();
@@ -6068,22 +6179,8 @@ async function cancelDelivery2Turn() {
   }
   state.d2ActiveStreamer = null;
 
-  if (state.data && state.data.delivery2 && Array.isArray(state.data.delivery2.entries)) {
-    const healedPartial = healUnclosedInlineMarkdown(partialText);
-    const clampedBody = stoppedEntryId && healedPartial.trim() ? healedPartial : "[Stopped]";
-    const targetEntry = state.data.delivery2.entries.find(
-      (e) =>
-        e &&
-        ((stoppedEntryId && String(e.id) === String(stoppedEntryId)) ||
-          (!stoppedEntryId && turnId !== "active" && e.kind === "qa_card" && e.turn_id === turnId)),
-    );
-    if (targetEntry) {
-      targetEntry.body = clampedBody;
-      targetEntry.stopped = true;
-      if (!stoppedEntryId || truncatedLen === 0) {
-        targetEntry.sources = [];
-      }
-    }
+  if (state.data && state.data.delivery2) {
+    reconcileCancelledDelivery2State(state.data.delivery2);
   }
 
   state.d2StreamingEntryId = null;
@@ -6094,6 +6191,7 @@ async function cancelDelivery2Turn() {
     const cancelPayload = {
       turn_id: turnId,
       truncated_len: truncatedLen,
+      thread_id: turnThreadId,
     };
     if (stoppedEntryId) {
       cancelPayload.entry_id = stoppedEntryId;
@@ -7514,6 +7612,7 @@ async function refreshBootstrapQuietly() {
     if (state.d2Loaded && livePrevD2 && incomingSeq < livePrevSeq) {
       fresh.delivery2 = livePrevD2;
     } else {
+      reconcileCancelledDelivery2State(fresh.delivery2);
       state.d2LastCursorSeq = Math.max(livePrevSeq, incomingSeq);
       state.d2Loaded = true;
     }

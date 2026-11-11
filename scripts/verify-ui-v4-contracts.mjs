@@ -720,15 +720,69 @@ assert.equal(
   "Memory card must render Saved: 1-line notice",
 );
 
+// 1. Cold/unverified bootstrap fails closed (`authorized: false`, `"Needs sign-in · pauses at 0 Cr"`) on github, linear, and slack (`ALISTAIR-R3-1`)
+for (const sid of ["github", "linear", "slack"]) {
+  const coldSurf = T.state.data.delivery2.sync_radar.surfaces.find((s) => s.id === sid);
+  assert.ok(coldSurf, `cold bootstrap must include ${sid}`);
+  assert.equal(coldSurf.authorized, false, `cold bootstrap ${sid} must fail closed (authorized: false)`);
+  assert.equal(coldSurf.in_thread, false, `cold bootstrap ${sid} must fail closed (in_thread: false)`);
+  assert.equal(coldSurf.auth_status, "Needs sign-in · pauses at 0 Cr", `cold bootstrap ${sid} must show Needs sign-in`);
+}
+
 await T.openD2Popover("connections", "linear");
-const connPop = stubDocument.getElementById("d2-connections-popover");
+let connPop = stubDocument.getElementById("d2-connections-popover");
 assert.ok(connPop, "+ Connections popover must mount");
 assert.equal(
   Array.from(connPop.querySelectorAll(".d2-conn-auth")).some((n) =>
     n.textContent.includes("Connected · ambient status cards only"),
   ),
+  false,
+  "Unauthorized Slack must NOT claim Connected · ambient status cards only",
+);
+assert.equal(
+  Array.from(connPop.querySelectorAll("button")).filter((b) => b.textContent.includes("Connect")).length,
+  3,
+  "Unlinked GitHub, Linear, and Slack surfaces must all expose Connect buttons when unauthorized",
+);
+await T.closeD2Popover({ immediate: true });
+
+// 2. When verified receipts authorize GitHub + Slack (`authorized: true`), Slack enforces `Connected · ambient status cards only` (`INV-SLACK-NOT-DELIVERY2-01`)
+T.state.data = T.normalizeBootstrap({
+  delivery2: {
+    seq: 1,
+    sync_radar: {
+      latency_ms: 18,
+      latency_label: "<200ms",
+      surfaces: [
+        { id: "local", label: "Local", authorized: true, in_thread: true, locked_in_thread: true, role_mode: "workspace" },
+        { id: "github", label: "GitHub", authorized: true, in_thread: true, locked_in_thread: false, role_mode: "full" },
+        { id: "linear", label: "Linear", authorized: false, in_thread: false, locked_in_thread: false, role_mode: "full" },
+        {
+          id: "slack",
+          label: "Slack",
+          authorized: true,
+          in_thread: true, // hostile payload trying to force Slack in_thread -> must clamp to false
+          locked_in_thread: false,
+          role_mode: "ambient_status_only",
+        },
+      ],
+    },
+  },
+});
+assert.equal(
+  T.state.data.delivery2.sync_radar.surfaces.find((s) => s.id === "slack").in_thread,
+  false,
+  "Slack in_thread must always clamp to false even when authorized",
+);
+await T.openD2Popover("connections", "linear");
+connPop = stubDocument.getElementById("d2-connections-popover");
+assert.ok(connPop, "+ Connections popover must mount after verified surfaces");
+assert.equal(
+  Array.from(connPop.querySelectorAll(".d2-conn-auth")).some((n) =>
+    n.textContent.includes("Connected · ambient status cards only"),
+  ),
   true,
-  "Slack row in + Connections must enforce INV-SLACK-NOT-DELIVERY2-01 ambient status copy",
+  "Authorized Slack row in + Connections must enforce INV-SLACK-NOT-DELIVERY2-01 ambient status copy",
 );
 assert.equal(
   Array.from(connPop.querySelectorAll("button")).some((b) => b.textContent.includes("Connect")),
@@ -1258,16 +1312,107 @@ assert.equal(
   false,
   "Late /message response for cancelled turn must NEVER reveal unseen answer text",
 );
+const cancelledTurnIdK2 = d2CancelCalls[0].turn_id;
+assert.equal(d2CancelCalls[0].thread_id, "thr-main", "Cancel payload must carry owning thread_id");
+// Simulate delayed /api/v1/delivery2/state?since_seq= AND delayed /api/v4/bootstrap arriving before /cancel settles on server (`ARCHITECT-R3-1`)
+T.applyDelivery2ServerPayload({
+  seq: 23,
+  status: "live",
+  entries: [
+    { id: "run-late-prestop", kind: "run_card", seq: 23, turn_id: cancelledTurnIdK2, title: "Unseen run card" },
+    {
+      id: "qa-late-prestop",
+      kind: "qa_card",
+      seq: 23,
+      turn_id: cancelledTurnIdK2,
+      author: "Delivery-2",
+      body: "UNSEEN SNAPSHOT POLL BODY THAT MUST BE CLAMPED",
+      sources: [{ id: "src-late", label: "Inbox", hash: "#inbox" }],
+    },
+  ],
+});
+T.renderDelivery2Panel();
+assert.equal(
+  d2Track.textContent.includes("UNSEEN SNAPSHOT POLL BODY"),
+  false,
+  "Delayed /state snapshot poll must NEVER reveal unseen answer for cancelled turn",
+);
+assert.equal(
+  T.state.data.delivery2.entries.some((e) => e.id === "run-late-prestop"),
+  false,
+  "Unseen run_card for pre-receipt cancelled turn must be stripped on client reconciliation",
+);
+assert.equal(
+  T.state.data.delivery2.entries.find((e) => e.id === "qa-late-prestop").body,
+  "[Stopped]",
+  "Cancelled qa_card arriving via snapshot poll must clamp to [Stopped]",
+);
+
+// Also test ARCHITECT-R3-1 exact delayed /api/v4/bootstrap interleaving while BOTH /message and /cancel are held on the wire!
+let releaseHeldBootK2;
+mockBootstrapPayload = () =>
+  new Promise((resolve) => {
+    releaseHeldBootK2 = resolve;
+  });
+let releaseHeldMsgK2;
+mockD2MessageHandler = () =>
+  new Promise((resolve) => {
+    releaseHeldMsgK2 = resolve;
+  });
+const heldBootPromise = T.refreshBootstrapQuietly();
+const heldMsgPromise = T.submitDelivery2Prompt("Second question stopped while bootstrap and cancel are held");
+await sleep(5);
+const heldTurnId = T.state.d2ActiveTurnId;
+assert.ok(String(heldTurnId || "").startsWith("turn-"), "Active turn ID must be recorded before Stop");
+const cancelPromiseK2 = T.cancelDelivery2Turn();
+await sleep(5);
+releaseHeldBootK2({
+  delivery2: {
+    seq: 24,
+    status: "live",
+    entries: [
+      { id: "run-boot-101", kind: "run_card", seq: 24, turn_id: heldTurnId, title: "Unseen boot run card" },
+      {
+        id: "qa-boot-101",
+        kind: "qa_card",
+        seq: 24,
+        turn_id: heldTurnId,
+        author: "Delivery-2",
+        body: "UNSEEN BOOTSTRAP ANSWER WHILE CANCEL IN FLIGHT",
+        sources: [{ id: "src-101", label: "Inbox", hash: "#inbox" }],
+      },
+    ],
+  },
+});
+await heldBootPromise;
+await cancelPromiseK2;
+releaseHeldMsgK2({ ok: true });
+await heldMsgPromise;
+assert.equal(
+  d2Track.textContent.includes("UNSEEN BOOTSTRAP ANSWER"),
+  false,
+  "Delayed /api/v4/bootstrap must NEVER render unseen answer of a stopped turn",
+);
+assert.equal(
+  T.state.data.delivery2.entries.some((e) => e.id === "run-boot-101"),
+  false,
+  "Delayed /api/v4/bootstrap unseen run_card for stopped turn must be stripped",
+);
+assert.equal(
+  T.state.data.delivery2.entries.find((e) => e.id === "qa-boot-101").body,
+  "[Stopped]",
+  "Delayed /api/v4/bootstrap qa_card for stopped turn must clamp to [Stopped]",
+);
 
 // K3: Collapsed .d2-disclosure-body sets .inert=true + aria-hidden="true" and clears both on expand
 T.applyDelivery2ServerPayload({
-  seq: 24,
+  seq: 25,
   status: "live",
   entries: [
     {
       id: "qa-disc-k3",
       kind: "qa_card",
-      seq: 24,
+      seq: 25,
       author: "Delivery-2",
       body: "Grounded answer.",
       sources: [{ id: "src-k3", label: "Inbox · #42", hash: "#inbox" }],
@@ -1354,15 +1499,22 @@ for (const fn of finishWaveB) fn();
 await pCollapse;
 assert.equal(mRail.dataset.railAnimating, undefined, "Active animation B finishing clears dataset.railAnimating");
 
-// K5: Open-redirect query/fragment schemes on https://chinwag.sh/open are neutralized
-assert.equal(
-  T.safeChinwagOutboundUrl("https://chinwag.sh/open?next=https://evil.example/phish"),
-  "https://chinwag.sh/open",
-);
-assert.equal(
-  T.safeChinwagOutboundUrl("https://chinwag.sh/pricing?redirect=//evil.example"),
-  "https://chinwag.sh/open",
-);
+// K5: Open-redirect query/fragment schemes + WHATWG backslash/userinfo/encoded-slash tricks are neutralized (`ALISTAIR-R3-3`)
+for (const badUrl of [
+  "https://chinwag.sh/open?next=https://evil.example/phish",
+  "https://chinwag.sh/pricing?redirect=//evil.example",
+  "https://chinwag.sh/open?next=/\\evil.example",
+  "https://chinwag.sh/open?next=%2f/evil.example",
+  "https://chinwag.sh/open?next=%5cevil.example",
+  "https://chinwag.sh/open?next=%252f%252fevil.example",
+  "https://chinwag.sh/open?user=foo@evil.example",
+]) {
+  assert.equal(
+    T.safeChinwagOutboundUrl(badUrl),
+    "https://chinwag.sh/open",
+    `safeChinwagOutboundUrl must neutralize ${badUrl}`,
+  );
+}
 
 console.log(
   JSON.stringify({

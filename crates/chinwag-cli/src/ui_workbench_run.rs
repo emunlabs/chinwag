@@ -258,6 +258,8 @@ struct Delivery2Store {
     #[serde(default)]
     cancelled_turn_ids: Vec<String>,
     #[serde(default)]
+    cancelled_turn_clamps: BTreeMap<String, usize>,
+    #[serde(default)]
     threads: Vec<Delivery2Thread>,
     #[serde(default)]
     memories: BTreeMap<String, Delivery2Memory>,
@@ -284,6 +286,7 @@ impl Default for Delivery2Store {
             active_thread_id: default_d2_thread_id(),
             active_turn_id: None,
             cancelled_turn_ids: Vec::new(),
+            cancelled_turn_clamps: BTreeMap::new(),
             threads: Vec::new(),
             memories: BTreeMap::new(),
             approvals: BTreeMap::new(),
@@ -949,20 +952,44 @@ fn allow_mask_delivery2_stage2(input: &str) -> String {
                 && input[start_b..start_b + 8].eq_ignore_ascii_case("delivery")
             {
                 let mut after = word_i + 8;
-                // Optional single space or hyphen separator (`Delivery-2`, `Delivery 2`, `delivery2`)
-                if after < chars.len() && matches!(chars[after].1, '-' | ' ') {
+                // Optional single space, hyphen, or underscore separator (`Delivery-2`, `Delivery 2`, `DELIVERY_2`, `delivery2`)
+                if after < chars.len() && matches!(chars[after].1, '-' | ' ' | '_') {
                     after += 1;
                 }
                 if after < chars.len() && chars[after].1 == '2' {
-                    let next_ch = if after + 1 < chars.len() {
-                        Some(chars[after + 1].1)
+                    let mut end_idx = after + 1;
+                    // Also consume optional `#<instance>` suffix (`@DELIVERY-2#inst9`, `■ DELIVERY-2#1`)
+                    if end_idx + 1 < chars.len()
+                        && chars[end_idx].1 == '#'
+                        && (chars[end_idx + 1].1.is_ascii_alphanumeric()
+                            || matches!(chars[end_idx + 1].1, '_' | '-'))
+                    {
+                        end_idx += 1;
+                        while end_idx < chars.len() {
+                            let ic = chars[end_idx].1;
+                            let is_dot_mid_inst = ic == '.'
+                                && end_idx + 1 < chars.len()
+                                && (chars[end_idx + 1].1.is_ascii_alphanumeric()
+                                    || matches!(chars[end_idx + 1].1, '_' | '-'));
+                            if ic.is_ascii_alphanumeric()
+                                || matches!(ic, '_' | '-')
+                                || is_dot_mid_inst
+                            {
+                                end_idx += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let next_ch = if end_idx < chars.len() {
+                        Some(chars[end_idx].1)
                     } else {
                         None
                     };
                     let next_ok = next_ch.is_none_or(|c| !is_word_char(c));
                     if next_ok {
                         out.push_str(D2_ALLOW_SENTINEL);
-                        i = after + 1;
+                        i = end_idx;
                         continue;
                     }
                 }
@@ -1070,6 +1097,11 @@ fn map_internal_seat_token(token: &str) -> Option<&'static str> {
     }
     if lower == concat!("fl", "ue.sh") || lower == concat!("fl", "ue.dev") {
         return Some("local runtime");
+    }
+
+    // Preserve canonical customer-facing `Delivery-2` even if Stage 4 sees an isolated/qualified token
+    if lower == concat!("deli", "very-2") || lower == concat!("deli", "very_2") {
+        return Some("Delivery-2");
     }
 
     // Case-insensitive unambiguous internal seat / vendor / protocol tokens
@@ -5310,14 +5342,18 @@ pub fn sanitize_chinwag_outbound_url(raw: &str, fallback: &str) -> String {
     if !allowed_prefix {
         return fallback.to_string();
     }
-    // Reject embedded redirect URLs or scheme injections inside query/fragment parameters.
+    // Reject embedded redirect URLs, WHATWG backslash/userinfo tricks, or percent-encoded scheme/slash injections.
     if let Some(tail) = s.get("https://chinwag.sh/".len()..) {
         let tail_lower = tail.to_ascii_lowercase();
         if tail_lower.contains("://")
             || tail_lower.contains("//")
+            || tail_lower.contains('\\')
+            || tail_lower.contains('@')
             || tail_lower.contains("javascript:")
             || tail_lower.contains("data:")
-            || tail_lower.contains("%2f%2f")
+            || tail_lower.contains("%2f")
+            || tail_lower.contains("%5c")
+            || tail_lower.contains("%25")
             || tail_lower.contains("%3a")
         {
             return fallback.to_string();
@@ -5327,7 +5363,8 @@ pub fn sanitize_chinwag_outbound_url(raw: &str, fallback: &str) -> String {
 }
 
 /// Verify an authenticated workspace OAuth receipt under `.chinwag/<surface>-oauth.json`
-/// or `.chinwag/<surface>.json` (strict regular file, zero symlinks, zero tool/remote-hint bypass).
+/// or `.chinwag/<surface>.json` using descriptor-anchored `O_NOFOLLOW` traversal
+/// (rejects symlinked `.chinwag` directories, symlinked leaf files, and TOCTOU swaps).
 fn has_verified_workspace_oauth_receipt(
     repo_root: &Path,
     surface: &str,
@@ -5336,23 +5373,14 @@ fn has_verified_workspace_oauth_receipt(
     if !matches!(surface, "github" | "linear" | "slack") {
         return false;
     }
-    let candidates = [
-        repo_root
-            .join(".chinwag")
-            .join(format!("{surface}-oauth.json")),
-        repo_root.join(".chinwag").join(format!("{surface}.json")),
-    ];
-    for candidate in candidates {
-        let Ok(meta) = fs::symlink_metadata(&candidate) else {
+    let leaf_names = [format!("{surface}-oauth.json"), format!("{surface}.json")];
+    for leaf_name in leaf_names {
+        let Ok(Some(raw_json)) =
+            read_repo_file_nofollow(repo_root, &[".chinwag"], &leaf_name, 65_536)
+        else {
             continue;
         };
-        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 65_536 {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&candidate) else {
-            continue;
-        };
-        let Ok(val) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(val) = serde_json::from_str::<Value>(&raw_json) else {
             continue;
         };
         if val.get("verified").and_then(Value::as_bool) != Some(true) {
@@ -5464,25 +5492,10 @@ fn is_non_secret_placeholder_value(v_lower: &str) -> bool {
 }
 
 pub fn contains_secret_shaped_token(raw: &str) -> bool {
-    // Strip zero-width, bidi, and compatibility format characters first so `sk-\u{200B}proj-...` cannot evade scanning.
-    let cleaned: String = raw
-        .chars()
-        .filter(|&ch| {
-            let u = ch as u32;
-            !matches!(
-                u,
-                0x00AD
-                    | 0x034F
-                    | 0x061C
-                    | 0x180E
-                    | 0x200B..=0x200F
-                    | 0x202A..=0x202E
-                    | 0x2060..=0x206F
-                    | 0xFE00..=0xFE0F
-                    | 0xFEFF
-            )
-        })
-        .collect();
+    // Canonicalize via Stage 1 normalization FIRST (stripping zero-width/bidi/format chars AND folding
+    // fullwidth ASCII like `API＿KEY` / `＝`, Unicode dashes like `sk−proj`, and Math Alphanumerics)
+    // so secret validation inspects the exact representation that persistence stores.
+    let cleaned = normalize_scrubber_stage1(raw);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return false;
@@ -6091,6 +6104,31 @@ fn sync_entry_overlays(entry: &mut Value, state: &LocalUiV4State) {
                 "https://chinwag.sh/open",
             )),
         );
+    } else if kind == "qa_card"
+        && let Some(tid) = entry
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        && let Some(&max_chars) = state.delivery2.cancelled_turn_clamps.get(&tid)
+        && let Some(obj) = entry.as_object_mut()
+    {
+        let clamped: String = obj
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(max_chars)
+            .collect();
+        let final_body = if max_chars == 0 || clamped.trim().is_empty() {
+            "[Stopped]".to_string()
+        } else {
+            clamped
+        };
+        obj.insert("body".to_string(), Value::String(final_body));
+        obj.insert("stopped".to_string(), Value::Bool(true));
+        if max_chars == 0 {
+            obj.insert("sources".to_string(), json!([]));
+        }
     }
 }
 
@@ -6214,6 +6252,12 @@ pub fn build_delivery2_state_json_with_cursor(
     } else {
         Vec::new()
     };
+    active_entries.retain(|e| {
+        !(e.get("kind").and_then(Value::as_str) == Some("run_card")
+            && e.get("turn_id")
+                .and_then(Value::as_str)
+                .is_some_and(|tid| state.delivery2.cancelled_turn_clamps.get(tid) == Some(&0)))
+    });
     for entry in &mut active_entries {
         sync_entry_overlays(entry, &state);
     }
@@ -6436,6 +6480,22 @@ fn ensure_active_thread_mut(
     &mut store.threads[last]
 }
 
+fn ensure_named_or_active_thread_mut<'a>(
+    store: &'a mut Delivery2Store,
+    requested_thread_id: Option<&str>,
+    seeded_entries: Vec<Value>,
+) -> &'a mut Delivery2Thread {
+    if let Some(req_tid) = requested_thread_id.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(pos) = store.threads.iter().position(|t| t.id == req_tid)
+    {
+        if store.threads[pos].entries.is_empty() && req_tid == "thr-main" {
+            store.threads[pos].entries = seeded_entries;
+        }
+        return &mut store.threads[pos];
+    }
+    ensure_active_thread_mut(store, seeded_entries)
+}
+
 fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'static str, Value) {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -6473,6 +6533,12 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "active")
+        .map(scrub_customer_ui_text);
+    let requested_thread_id = parsed
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(scrub_customer_ui_text);
 
     let lower = raw_prompt.to_ascii_lowercase();
@@ -6535,7 +6601,11 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
                 "stopped": true,
                 "sources": []
             });
-            let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
+            let thr = ensure_named_or_active_thread_mut(
+                &mut state.delivery2,
+                requested_thread_id.as_deref(),
+                seeded,
+            );
             if thr.title == "New thread" {
                 thr.title = clean_user_prompt.chars().take(48).collect();
             }
@@ -6789,7 +6859,11 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
             let reviewer_lbl = friendly_workflow_tool_label(&workflow.reviewer_tool);
             let per_review = workflow.review_tier_credits;
             let run_id = format!("run-scoped-{next_seq}");
-            let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
+            let thr = ensure_named_or_active_thread_mut(
+                &mut state.delivery2,
+                requested_thread_id.as_deref(),
+                seeded,
+            );
             if thr.title == "New thread" {
                 thr.title = clean_user_prompt.chars().take(48).collect();
             }
@@ -6848,7 +6922,11 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
             obj.insert("turn_id".to_string(), Value::String(tid.clone()));
         }
 
-        let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
+        let thr = ensure_named_or_active_thread_mut(
+            &mut state.delivery2,
+            requested_thread_id.as_deref(),
+            seeded,
+        );
         if thr.title == "New thread" {
             thr.title = clean_user_prompt.chars().take(48).collect();
         }
@@ -6906,6 +6984,12 @@ fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
         .get("truncated_len")
         .and_then(Value::as_u64)
         .map(|n| n as usize);
+    let requested_thread_id = parsed
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(scrub_customer_ui_text);
 
     let repo_info = discover_repo_info(repo_root);
     let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
@@ -6916,21 +7000,37 @@ fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
         let seeded =
             build_seeded_delivery2_entries(&repo_info, &inbox, &board, &credits, &workflow, state);
         let clean_turn_id = scrub_customer_ui_text(&turn_id);
-        if !clean_turn_id.is_empty()
-            && clean_turn_id != "active"
-            && !state
+        let effective_max_chars = if let Some(mc) = truncated_len_opt {
+            Some(mc)
+        } else if entry_id_opt.is_none() && !clean_turn_id.is_empty() && clean_turn_id != "active" {
+            Some(0)
+        } else {
+            None
+        };
+
+        if !clean_turn_id.is_empty() && clean_turn_id != "active" {
+            if let Some(mc) = effective_max_chars {
+                state
+                    .delivery2
+                    .cancelled_turn_clamps
+                    .insert(clean_turn_id.clone(), mc);
+            }
+            if !state
                 .delivery2
                 .cancelled_turn_ids
                 .iter()
                 .any(|c| c == &clean_turn_id)
-        {
-            state
-                .delivery2
-                .cancelled_turn_ids
-                .push(clean_turn_id.clone());
-            if state.delivery2.cancelled_turn_ids.len() > 64 {
-                let drop_n = state.delivery2.cancelled_turn_ids.len() - 64;
-                state.delivery2.cancelled_turn_ids.drain(..drop_n);
+            {
+                state
+                    .delivery2
+                    .cancelled_turn_ids
+                    .push(clean_turn_id.clone());
+                if state.delivery2.cancelled_turn_ids.len() > 64 {
+                    let drop_n = state.delivery2.cancelled_turn_ids.len() - 64;
+                    for evicted in state.delivery2.cancelled_turn_ids.drain(..drop_n) {
+                        state.delivery2.cancelled_turn_clamps.remove(&evicted);
+                    }
+                }
             }
         }
 
@@ -6944,17 +7044,28 @@ fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
             "turn_id": clean_turn_id,
             "receipt": "Reply stopped by you · 0 Cr"
         });
-        let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
-        thr.updated_at_unix = unix_now();
 
-        // Clamp persisted assistant card to the exact displayed prefix, including pre-receipt Stop (`truncated_len == 0` or matched by `turn_id`).
-        let effective_max_chars = if let Some(mc) = truncated_len_opt {
-            Some(mc)
-        } else if entry_id_opt.is_none() && !clean_turn_id.is_empty() && clean_turn_id != "active" {
-            Some(0)
+        // Resolve the stopped turn's OWNING thread across all threads (even if another tab switched `active_thread_id`).
+        let owning_thread_idx = state.delivery2.threads.iter().position(|t| {
+            t.entries.iter().any(|e| {
+                (entry_id_opt
+                    .as_deref()
+                    .is_some_and(|eid| e.get("id").and_then(Value::as_str) == Some(eid)))
+                    || (!clean_turn_id.is_empty()
+                        && clean_turn_id != "active"
+                        && e.get("turn_id").and_then(Value::as_str) == Some(clean_turn_id.as_str()))
+            })
+        });
+        let thr = if let Some(idx) = owning_thread_idx {
+            &mut state.delivery2.threads[idx]
         } else {
-            None
+            ensure_named_or_active_thread_mut(
+                &mut state.delivery2,
+                requested_thread_id.as_deref(),
+                seeded,
+            )
         };
+        thr.updated_at_unix = unix_now();
 
         if let Some(max_chars) = effective_max_chars {
             if max_chars == 0 && !clean_turn_id.is_empty() && clean_turn_id != "active" {
@@ -10318,9 +10429,15 @@ mod tests {
         // preserves U+FE58 (FLINT-2), preserves "retrieve agent" / "achieve agent" / "believe.dev" (ALISTAIR-3),
         // and strips bidi/format chars + Math Script/Double-Struck + dotted/underscore vendor/seat tokens!
         let preserved = scrub_customer_ui_text(
-            "Ask DELIVERY-2 and delivery 2 to retrieve agent logs, achieve agent parity on believe.dev, and check x Delivery-2 y \u{FE58}",
+            "Ask DELIVERY-2, @DELIVERY-2#inst9, ■ DELIVERY-2#1, DELIVERY_2, and delivery 2 to retrieve agent logs, achieve agent parity on believe.dev, and check x Delivery-2 y \u{FE58}",
         );
-        assert!(preserved.contains("Ask Delivery-2 and Delivery-2"));
+        assert!(
+            preserved
+                .starts_with("Ask Delivery-2, Delivery-2, Delivery-2, Delivery-2, and Delivery-2"),
+            "unexpected Delivery-2 mask normalization: '{preserved}'"
+        );
+        assert!(!preserved.contains("#inst9"));
+        assert!(!preserved.contains("PM_2"));
         assert!(preserved.contains("retrieve agent logs"));
         assert!(preserved.contains("achieve agent parity on believe.dev"));
         assert!(preserved.contains("check x Delivery-2 y \u{FE58}"));
@@ -10383,6 +10500,19 @@ mod tests {
             ),
             "https://chinwag.sh/pricing"
         );
+        for bad_redirect in [
+            "https://chinwag.sh/open?next=/\\evil.example",
+            "https://chinwag.sh/open?next=%2f/evil.example",
+            "https://chinwag.sh/open?next=%5cevil.example",
+            "https://chinwag.sh/open?next=%252f%252fevil.example",
+            "https://chinwag.sh/open?user=foo@evil.example",
+        ] {
+            assert_eq!(
+                sanitize_chinwag_outbound_url(bad_redirect, "https://chinwag.sh/open"),
+                "https://chinwag.sh/open",
+                "expected open-redirect rejection for {bad_redirect}"
+            );
+        }
         assert_eq!(
             sanitize_chinwag_outbound_url(
                 "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
@@ -10403,8 +10533,13 @@ mod tests {
             "Remember: {}{}{}",
             "sk-", "\u{200B}proj-", "1234567890abcdef"
         );
+        let fw_openai_sample = format!(
+            "Remember: {}{}{}",
+            "sk\u{2212}", "proj\u{2212}", "1234567890abcdef"
+        );
         for secret_sample in [
             r#"Remember: API_KEY="supersecretvalue12345""#,
+            "Remember: API\u{FF3F}KEY=custom_gateway_secret_9988",
             "Remember: api_key: supersecretvalue12345",
             "Remember: password = supersecretpassword99",
             "Remember: OPENAI_API_KEY=custom_gateway_secret_9988",
@@ -10420,6 +10555,7 @@ mod tests {
             stripe_live_sample.as_str(),
             slack_bot_sample.as_str(),
             zw_openai_sample.as_str(),
+            fw_openai_sample.as_str(),
             "https://example.com/js?key=AIzaSyA12345678901234567890",
             "session=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature",
             "Remember: Authorization: Bearer abcdefghijklmnopqrstuvwxyzABCDEF",
@@ -10606,5 +10742,55 @@ mod tests {
         assert_eq!(st_reapprove, "200 OK");
         assert_eq!(val_reapprove["already_settled"], false);
         assert_eq!(val_reapprove["decision"], "approved");
+
+        // (d) ARCHITECT-R3-2: Cross-thread Stop — if another tab switches `active_thread_id` away from `thr-main`
+        // before `/cancel` arrives, `handle_delivery2_cancel` clamps the stopped turn in its OWNING thread (`thr-main`)!
+        let (st_xmsg, _) = handle_delivery2_message(
+            &repo,
+            5487,
+            br#"{"prompt":"What did I miss?","turn_id":"turn-xthread-1","thread_id":"thr-main"}"#,
+        );
+        assert_eq!(st_xmsg, "200 OK");
+        let (st_new_thr, _) =
+            handle_delivery2_thread(&repo, 5487, br#"{"action":"new","title":"Second thread"}"#);
+        assert_eq!(st_new_thr, "200 OK");
+        let (st_xcancel, _) = handle_delivery2_cancel(
+            &repo,
+            5487,
+            br#"{"turn_id":"turn-xthread-1","truncated_len":0,"thread_id":"thr-main"}"#,
+        );
+        assert_eq!(st_xcancel, "200 OK");
+        let (st_sw_back, val_sw_back) = handle_delivery2_thread(
+            &repo,
+            5487,
+            br#"{"action":"switch","thread_id":"thr-main"}"#,
+        );
+        assert_eq!(st_sw_back, "200 OK");
+        let xstopped_entry = val_sw_back["state"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["turn_id"] == "turn-xthread-1")
+            .expect("cross-thread cancelled turn qa_card");
+        assert_eq!(xstopped_entry["body"], "[Stopped]");
+        assert_eq!(xstopped_entry["sources"], json!([]));
+
+        // (e) ALISTAIR-R3-2: Descriptor-anchored `O_NOFOLLOW` OAuth receipt check rejects symlinked `.chinwag` directory!
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(
+                outside.path().join("linear.json"),
+                r#"{"verified":true,"account":"forged-outside-user","surface":"linear"}"#,
+            )
+            .unwrap();
+            let sym_repo_dir = tempfile::tempdir().unwrap();
+            let sym_repo = fs::canonicalize(sym_repo_dir.path()).unwrap();
+            std::os::unix::fs::symlink(outside.path(), sym_repo.join(".chinwag")).unwrap();
+            assert!(
+                !has_verified_workspace_oauth_receipt(&sym_repo, "linear", None),
+                "symlinked .chinwag directory must be rejected by O_NOFOLLOW receipt check"
+            );
+        }
     }
 }
