@@ -1,4 +1,5 @@
 //! The protocol core is native-testable. Cloudflare bindings compile only for WASM.
+pub mod http_probe;
 pub mod protocol;
 pub mod session;
 

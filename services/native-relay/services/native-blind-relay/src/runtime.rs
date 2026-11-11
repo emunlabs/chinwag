@@ -45,6 +45,22 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.method() == Method::Get && req.path() == "/health" {
         return Response::ok("native-blind-relay-v1");
     }
+    if let Some(probe) = crate::http_probe::response(
+        req.method() == Method::Get,
+        &req.path(),
+        req.headers().get("X-Iroh-Challenge")?.as_deref(),
+    ) {
+        let mut response = Response::empty()?.with_status(probe.status);
+        if probe.allow_origin {
+            response
+                .headers_mut()
+                .set("Access-Control-Allow-Origin", "*")?;
+        }
+        if let Some(value) = probe.challenge_response {
+            response.headers_mut().set("X-Iroh-Response", &value)?;
+        }
+        return Ok(response);
+    }
     if !upgrade_request(&req) {
         return Response::error("relay upgrade required", 400);
     }
