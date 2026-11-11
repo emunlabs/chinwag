@@ -4341,8 +4341,9 @@ pub fn emit_active_crisis_alert_from_cwd(stderr: &mut dyn Write) {
 
 fn collect_qualified_thread_address(
     raw: &str,
+    ts: u64,
     excluded_norm: Option<&str>,
-    seen: &mut BTreeMap<String, String>,
+    seen: &mut BTreeMap<String, (u64, String)>,
 ) {
     for part in raw.split(',') {
         let clean = part
@@ -4354,20 +4355,25 @@ fn collect_qualified_thread_address(
         }
         if let Ok(addr) = crate::agent_instance::ActorAddress::parse(clean)
             && !addr.is_human()
-            && addr.instance().is_some()
+            && let Some(inst) = addr.instance()
+            && inst.len() >= 16
         {
             let full = addr.to_string();
             let key = full.to_ascii_uppercase();
             if excluded_norm.is_some_and(|ex| ex.eq_ignore_ascii_case(&full)) {
                 continue;
             }
-            seen.entry(key).or_insert(full);
+            let entry = seen.entry(key).or_insert_with(|| (ts, full.clone()));
+            if ts >= entry.0 {
+                entry.0 = ts;
+                entry.1 = full;
+            }
         }
     }
 }
 
 /// Discovers all live `<SEAT>#<INSTANCE>` thread instances across all models by scanning
-/// `.chinwag/bus/messages.jsonl` (last 120 minutes / tail 500 messages) + `.chinwag/state.crdb`
+/// `.chinwag/bus/messages.jsonl` (last 120 minutes / tail 500 messages)
 /// (`INV-LIVE-THREAD-WORKTREE-BEACON-01` & `INV-CRISIS-ALL-STOP-BROADCAST-01`).
 pub fn discover_live_thread_instances(
     repo_root: &Path,
@@ -4385,7 +4391,7 @@ pub fn discover_live_thread_instances(
         })
         .or_else(|| exclude_actor.map(|s| s.trim().trim_start_matches('@').to_string()));
 
-    let mut seen = BTreeMap::<String, String>::new();
+    let mut seen = BTreeMap::<String, (u64, String)>::new();
     let messages_path = repo_root
         .join(".chinwag")
         .join("bus")
@@ -4417,10 +4423,11 @@ pub fn discover_live_thread_instances(
         let cutoff = max_ts.saturating_sub(7200);
         for (ts, sender, to) in parsed_rows {
             if ts == 0 || ts >= cutoff {
-                collect_qualified_thread_address(&sender, excluded_norm.as_deref(), &mut seen);
+                collect_qualified_thread_address(&sender, ts, excluded_norm.as_deref(), &mut seen);
                 if let Some(ref recipients) = to {
                     collect_qualified_thread_address(
                         recipients,
+                        ts,
                         excluded_norm.as_deref(),
                         &mut seen,
                     );
@@ -4429,22 +4436,14 @@ pub fn discover_live_thread_instances(
         }
     }
 
-    // Also scan .chinwag/state.crdb if present for recent <SEAT>#<INSTANCE> tokens
-    let crdb_path = repo_root.join(".chinwag").join("state.crdb");
-    if crdb_path.is_file()
-        && let Ok(bytes) = fs::read(&crdb_path)
-    {
-        let text = String::from_utf8_lossy(&bytes);
-        for token in text.split(|c: char| {
-            !(c.is_ascii_alphanumeric() || c == '#' || c == '-' || c == '_' || c == '.')
-        }) {
-            if token.contains('#') && token.len() <= 160 {
-                collect_qualified_thread_address(token, excluded_norm.as_deref(), &mut seen);
-            }
-        }
-    }
-
-    seen.into_values().collect()
+    let mut items: Vec<(u64, String)> = seen.into_values().collect();
+    // Cap at 32 most-recently active instances so parse_recipients (max 32) always succeeds,
+    // then sort alphabetically for deterministic multicast order.
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    items.truncate(32);
+    let mut out: Vec<String> = items.into_iter().map(|(_, addr)| addr).collect();
+    out.sort();
+    out
 }
 
 fn globs_overlap(a: &str, b: &str) -> bool {
