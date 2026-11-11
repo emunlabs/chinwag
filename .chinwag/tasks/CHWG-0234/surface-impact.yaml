@@ -2,10 +2,11 @@ schema: chinwag.surface.impact.manifest.v1
 ticket_id: CHWG-0234
 adr_owner: ARCHITECT
 max_pr_age_secs: 3600
-min_cassettes_count: 0
+min_cassettes_count: 1
 expected_behaviors:
   - "CHWG-0234: strict ^CHWG-[0-9]{4}$ ticket ID filter and INV-ENTITY-SEP-01 entity firewall on board-cards.json"
   - "CHWG-0234: monotonic 05_SHIPPED_VERIFIED protection against retrograde status overwrite"
+  - "CHWG-0249: zero 404 outbound routes (/contact, chinwag.sh/invite), deterministic popover/modal sequence guards, and desktop .select/.pill-fn/.menu-btn CSS contracts"
   - "INV-PR-MAX-TTL-60M-01: unmerged PRs cannot exceed 3600s (60m) without fresh rebase and CiGreenReceiptV1"
   - "INV-CI-BEHAVIORAL-RATCHET-01: compounding expected-behavior contract and <50ms cassette/UI invariant ratchet per PR"
 required_surfaces:

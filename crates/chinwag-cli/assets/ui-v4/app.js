@@ -866,7 +866,7 @@ function createEmptyData() {
       plan_tier: "Free Starter Trial",
       pack_expiry_notice:
         "500 free starter credits (valid 90 days) · $0 per teammate seat · Paid credit packs remain valid for 12 months from purchase.",
-      pricing_url: "https://chinwag.sh/pricing.html#credit-packs",
+      pricing_url: "https://chinwag.sh/pricing",
       tranches: [],
       catalog: CATALOG_PACKS.map((p) => ({ ...p })),
       auto_refill: {
@@ -882,10 +882,11 @@ function createEmptyData() {
       port: Number(SERVER_PORT) || 5487,
       code_leaves_machine: false,
       summary: "Source code, diffs, file paths, and prompts stay on this machine.",
+      ciso_review_url: "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
     },
     invite: {
       join_command: "npx chinwag join",
-      referral_url: "https://chinwag.sh/invite",
+      referral_url: "https://chinwag.sh/pricing?source=local_ui_referral",
       bonus_credits: 250,
     },
   };
@@ -1216,6 +1217,9 @@ function normalizeBootstrap(raw) {
     next.privacy.port = Number(raw.privacy.port) || next.privacy.port;
     next.privacy.code_leaves_machine = Boolean(raw.privacy.code_leaves_machine);
     if (!isAbsent(raw.privacy.summary)) next.privacy.summary = String(raw.privacy.summary);
+    if (!isAbsent(raw.privacy.ciso_review_url)) {
+      next.privacy.ciso_review_url = String(raw.privacy.ciso_review_url);
+    }
     if (typeof raw.privacy.telemetry_enabled === "boolean") {
       next.privacy.telemetry_enabled = raw.privacy.telemetry_enabled;
       setTelemetryOptOut(!raw.privacy.telemetry_enabled);
@@ -1375,6 +1379,8 @@ let desktopTabsIndicator = { update() {}, destroy() {} };
 let mobileTabsIndicator = { update() {}, destroy() {} };
 let activePopoverTrigger = null;
 let activeModalTrigger = null;
+let popoverSeq = 0;
+let modalSeq = 0;
 let lowCreditBannerTracked = false;
 
 function announce(text) {
@@ -1559,32 +1565,49 @@ function syncHeaderChrome() {
 
 // ── Popovers ──
 
-async function closePopover() {
+async function closePopover(options = {}) {
+  const opts = options && typeof options === "object" && !("target" in options) ? options : {};
+  const immediate = Boolean(opts.immediate);
+  const restoreFocus = opts.restoreFocus !== undefined ? Boolean(opts.restoreFocus) : !immediate;
   const layer = dom.popoverLayer();
   if (!layer || layer.hidden) return;
+  const seq = ++popoverSeq;
+  const prevTrigger = activePopoverTrigger;
+  activePopoverTrigger = null;
+  if (prevTrigger) {
+    prevTrigger.setAttribute("aria-expanded", "false");
+  }
   const pop = layer.querySelector(".popover");
-  if (pop) {
+  if (!immediate && pop) {
     pop.dataset.state = "closing";
     await Motion.settled(pop);
+    if (seq !== popoverSeq) return;
   }
   clearNode(layer);
   layer.hidden = true;
-  if (activePopoverTrigger) {
-    activePopoverTrigger.setAttribute("aria-expanded", "false");
-    if (activePopoverTrigger.isConnected) activePopoverTrigger.focus({ preventScroll: true });
-    activePopoverTrigger = null;
+  if (restoreFocus && prevTrigger && prevTrigger.isConnected) {
+    prevTrigger.focus({ preventScroll: true });
   }
 }
 
-function openPopover(triggerEl, buildContent, variantClass = "") {
+function openPopover(triggerEl, buildContent, variantClass = "", options = {}) {
   const layer = dom.popoverLayer();
   if (!layer) return;
-  if (activePopoverTrigger === triggerEl && !layer.hidden) {
+  const opts = options && typeof options === "object" ? options : {};
+  if (
+    !opts.forceOpen &&
+    activePopoverTrigger === triggerEl &&
+    !layer.hidden &&
+    !layer.querySelector('.popover[data-state="closing"]')
+  ) {
     closePopover();
     return;
   }
+  ++popoverSeq;
   clearNode(layer);
-  if (activePopoverTrigger) activePopoverTrigger.setAttribute("aria-expanded", "false");
+  if (activePopoverTrigger && activePopoverTrigger !== triggerEl) {
+    activePopoverTrigger.setAttribute("aria-expanded", "false");
+  }
   activePopoverTrigger = triggerEl || null;
   if (activePopoverTrigger) activePopoverTrigger.setAttribute("aria-expanded", "true");
 
@@ -1597,7 +1620,7 @@ function openPopover(triggerEl, buildContent, variantClass = "") {
       "aria-modal": "false",
       dataset: { state: "open" },
     },
-    buildContent(() => closePopover()),
+    buildContent((closeOpts) => closePopover(closeOpts)),
   );
   layer.append(scrim, pop);
   layer.hidden = false;
@@ -1641,72 +1664,104 @@ function openRepoPopover(triggerEl) {
   );
 }
 
-function openPrivacyPopover(triggerEl) {
+function openPrivacyPopover(triggerEl, options = {}) {
   const priv = state.data.privacy;
+  const cisoUrl = priv.ciso_review_url || "https://chinwag.sh/pricing?talk=1&source=local_ui#founders";
   trackUiEvent("ui_privacy_popover_opened", {
     telemetry_state: isTelemetryOptedOut() ? "opted_out_ui" : "enabled",
   });
-  openPopover(triggerEl, (close) => {
-    const analyticsEnabled = !isTelemetryOptedOut();
-    return [
-      el(
-        "div",
-        { className: "modal-head" },
-        el("h2", { className: "t-16 w600" }, "Local privacy"),
-        el("button", { type: "button", className: "btn-icon", "aria-label": "Close", onClick: close }, ICONS.close()),
-      ),
-      el(
-        "div",
-        { className: "section-head" },
-        statusPill(`Loopback only · ${priv.bind_addr}:${priv.port}`, "success"),
-        el("p", { className: "t-13 secondary" }, priv.summary),
-      ),
-      el("hr"),
-      el(
-        "div",
-        { className: "pairing-head" },
+  openPopover(
+    triggerEl,
+    (close) => {
+      const analyticsEnabled = !isTelemetryOptedOut();
+      return [
+        el(
+          "div",
+          { className: "modal-head" },
+          el("h2", { className: "t-16 w600" }, "Local privacy"),
+          el("button", { type: "button", className: "btn-icon", "aria-label": "Close", onClick: () => close() }, ICONS.close()),
+        ),
         el(
           "div",
           { className: "section-head" },
-          el("div", { className: "t-13 w500" }, "Anonymous product analytics"),
-          el("p", { className: "t-12 muted" }, "Counts and screen events only — never code, file names, or prompts."),
+          statusPill(`Loopback only · ${priv.bind_addr}:${priv.port}`, "success"),
+          el("p", { className: "t-13 secondary" }, priv.summary),
         ),
-        switchControl({
-          checked: analyticsEnabled,
-          label: "Send anonymous product analytics",
-          onToggle: async (enabled) => {
-            const optOut = !enabled;
-            setTelemetryOptOut(optOut);
-            try {
-              const res = await apiRequest("POST", "/api/v4/telemetry/preferences", {
-                action: "set_enabled",
-                enabled: Boolean(enabled),
-              });
-              const effectiveEnabled =
-                res && typeof res.telemetry_enabled === "boolean"
-                  ? res.telemetry_enabled
-                  : Boolean(enabled);
-              setTelemetryOptOut(!effectiveEnabled);
-              if (!optOut && effectiveEnabled) {
-                trackUiEvent("ui_telemetry_opt_out_changed", {
-                  opt_out_enabled: false,
-                  preference_action: "opt_in",
-                  telemetry_state: "enabled",
+        el("hr"),
+        el(
+          "div",
+          { className: "pairing-head" },
+          el(
+            "div",
+            { className: "section-head" },
+            el("div", { className: "t-13 w500" }, "Anonymous product analytics"),
+            el("p", { className: "t-12 muted" }, "Counts and screen events only — never code, file names, or prompts."),
+          ),
+          switchControl({
+            checked: analyticsEnabled,
+            label: "Send anonymous product analytics",
+            onToggle: async (enabled) => {
+              const optOut = !enabled;
+              setTelemetryOptOut(optOut);
+              try {
+                const res = await apiRequest("POST", "/api/v4/telemetry/preferences", {
+                  action: "set_enabled",
+                  enabled: Boolean(enabled),
                 });
+                const effectiveEnabled =
+                  res && typeof res.telemetry_enabled === "boolean"
+                    ? res.telemetry_enabled
+                    : Boolean(enabled);
+                setTelemetryOptOut(!effectiveEnabled);
+                if (!optOut && effectiveEnabled) {
+                  trackUiEvent("ui_telemetry_opt_out_changed", {
+                    opt_out_enabled: false,
+                    preference_action: "opt_in",
+                    telemetry_state: "enabled",
+                  });
+                }
+                toaster.show(
+                  !effectiveEnabled
+                    ? "Anonymous analytics turned off"
+                    : "Anonymous analytics turned on",
+                );
+              } catch (e) {
+                toaster.show("Could not update analytics preference");
               }
-              toaster.show(
-                !effectiveEnabled
-                  ? "Anonymous analytics turned off"
-                  : "Anonymous analytics turned on",
-              );
-            } catch (e) {
-              toaster.show("Could not update analytics preference");
-            }
-          },
-        }),
-      ),
-    ];
-  });
+            },
+          }),
+        ),
+        el("hr"),
+        el(
+          "div",
+          { className: "popover-links" },
+          el(
+            "a",
+            {
+              href: "https://chinwag.sh/security",
+              target: "_blank",
+              rel: "noopener noreferrer",
+              className: "popover-link",
+            },
+            "Security & privacy overview ↗",
+          ),
+          el(
+            "a",
+            {
+              href: cisoUrl,
+              target: "_blank",
+              rel: "noopener noreferrer",
+              className: "popover-link",
+              onClick: () => trackUiEvent("ui_founders_talk_clicked", { trigger_surface: "global_header" }),
+            },
+            "Request security review ↗",
+          ),
+        ),
+      ];
+    },
+    "",
+    options,
+  );
 }
 
 function openMobileMenuPopover(triggerEl) {
@@ -1715,14 +1770,14 @@ function openMobileMenuPopover(triggerEl) {
       "div",
       { className: "modal-head" },
       el("h2", { className: "t-16 w600" }, "Menu"),
-      el("button", { type: "button", className: "btn-icon", "aria-label": "Close", onClick: close }, ICONS.close()),
+      el("button", { type: "button", className: "btn-icon", "aria-label": "Close", onClick: () => close() }, ICONS.close()),
     ),
     actionBtn({
       label: "Invite teammate · +250 Cr",
       variant: "secondary",
       onClick: () => {
-        close();
-        openInviteModal("global_header");
+        closePopover({ immediate: true });
+        openInviteModal("global_header", triggerEl);
       },
     }),
     actionBtn({
@@ -1737,8 +1792,8 @@ function openMobileMenuPopover(triggerEl) {
       label: "Local privacy & analytics",
       variant: "secondary",
       onClick: () => {
-        close();
-        openPrivacyPopover(triggerEl);
+        closePopover({ immediate: true });
+        openPrivacyPopover(triggerEl, { forceOpen: true });
       },
     }),
   ]);
@@ -1788,32 +1843,41 @@ function openBaselinePopover(triggerEl) {
 
 // ── Modals ──
 
-async function closeModal() {
+async function closeModal(options = {}) {
+  const opts = options && typeof options === "object" && !("target" in options) ? options : {};
+  const immediate = Boolean(opts.immediate);
+  const restoreFocus = opts.restoreFocus !== undefined ? Boolean(opts.restoreFocus) : !immediate;
   const layer = dom.modalLayer();
   const scrim = dom.modalScrim();
   if (!layer || layer.hidden) return;
+  const seq = ++modalSeq;
+  const prevTrigger = activeModalTrigger;
+  activeModalTrigger = null;
   const modal = layer.querySelector(".modal");
-  if (modal) modal.dataset.state = "closing";
-  if (scrim) scrim.dataset.state = "closing";
-  await Promise.all([modal ? Motion.settled(modal) : null, scrim ? Motion.settled(scrim) : null]);
+  if (!immediate) {
+    if (modal) modal.dataset.state = "closing";
+    if (scrim) scrim.dataset.state = "closing";
+    await Promise.all([modal ? Motion.settled(modal) : null, scrim ? Motion.settled(scrim) : null]);
+    if (seq !== modalSeq) return;
+  }
   clearNode(layer);
   layer.hidden = true;
   if (scrim) {
     scrim.hidden = true;
     delete scrim.dataset.state;
   }
-  if (activeModalTrigger && activeModalTrigger.isConnected) {
-    activeModalTrigger.focus({ preventScroll: true });
+  if (restoreFocus && prevTrigger && prevTrigger.isConnected) {
+    prevTrigger.focus({ preventScroll: true });
   }
-  activeModalTrigger = null;
 }
 
 function openModal(triggerEl, buildModal, large = false) {
-  closePopover();
+  closePopover({ immediate: true });
   const layer = dom.modalLayer();
   const scrim = dom.modalScrim();
   if (!layer || !scrim) return;
-  activeModalTrigger = triggerEl || document.activeElement;
+  ++modalSeq;
+  activeModalTrigger = triggerEl || (typeof document !== "undefined" ? document.activeElement : null);
   clearNode(layer);
   scrim.hidden = false;
   scrim.dataset.state = "open";
@@ -1827,7 +1891,7 @@ function openModal(triggerEl, buildModal, large = false) {
       "aria-modal": "true",
       dataset: { state: "open" },
     },
-    buildModal(() => closeModal()),
+    buildModal((closeOpts) => closeModal(closeOpts)),
   );
   layer.appendChild(modal);
   layer.hidden = false;
@@ -1835,10 +1899,22 @@ function openModal(triggerEl, buildModal, large = false) {
   if (focusTarget) focusTarget.focus({ preventScroll: true });
 }
 
-function openInviteModal(triggerSurface = "global_header") {
+function resolveInviteReturnTrigger(fallbackTriggerEl = null) {
+  const inviteBtn = dom.btnInvite();
+  if (inviteBtn && typeof window !== "undefined" && typeof window.getComputedStyle === "function") {
+    if (window.getComputedStyle(inviteBtn).display !== "none") {
+      return inviteBtn;
+    }
+  } else if (inviteBtn && !fallbackTriggerEl) {
+    return inviteBtn;
+  }
+  return fallbackTriggerEl || dom.btnMobileMenu() || inviteBtn;
+}
+
+function openInviteModal(triggerSurface = "global_header", fallbackTriggerEl = null) {
   const inv = state.data.invite;
   trackUiEvent("ui_invite_modal_opened", { trigger_surface: triggerSurface });
-  openModal(dom.btnInvite(), (close) => {
+  openModal(resolveInviteReturnTrigger(fallbackTriggerEl), (close) => {
     let tab = "team";
     const panelTeam = el(
       "div",
@@ -4591,6 +4667,21 @@ function renderAgentsView(root) {
 
 // ── 9 · View 4: Credits (12-Month Expiry, Burn Order & Auto-Refill) ──────────
 
+function wizardPackSlugForSku(sku) {
+  switch (String(sku || "").toLowerCase()) {
+    case "pack_50":
+      return "developer";
+    case "pack_160":
+      return "growth";
+    case "pack_560":
+      return "scale";
+    case "pack_1000":
+      return "volume";
+    default:
+      return "growth";
+  }
+}
+
 async function startCheckoutFlow(btn, groupEl, packSku, triggerSurface = "credits_tab") {
   const pack = state.data.credits.catalog.find((p) => p.sku === packSku) || CATALOG_PACKS[0];
   const attemptId = uuidv4();
@@ -4610,9 +4701,10 @@ async function startCheckoutFlow(btn, groupEl, packSku, triggerSurface = "credit
     );
     if (!out) return;
     out.release();
+    const wizardSlug = wizardPackSlugForSku(pack.sku);
     const url =
       (out.value && out.value.checkout_url) ||
-      `https://chinwag.sh/pricing.html?pack=${encodeURIComponent(pack.sku)}&source=local_ui&attempt_id=${attemptId}#credit-packs`;
+      `https://chinwag.sh/pricing?pack=${encodeURIComponent(wizardSlug)}&source=local_ui&attempt=${encodeURIComponent(attemptId)}`;
     const win = typeof window !== "undefined" ? window.open(url, "_blank", "noopener,noreferrer") : null;
     if (!win) {
       toaster.show(`Checkout ready — open ${url}`);
@@ -4790,7 +4882,7 @@ function renderCreditsView(root) {
         el(
           "a",
           {
-            href: cred.pricing_url || "https://chinwag.sh/pricing.html#credit-packs",
+            href: cred.pricing_url || "https://chinwag.sh/pricing",
             target: "_blank",
             rel: "noopener noreferrer",
             className: "btn-secondary btn-sm",
@@ -4973,7 +5065,7 @@ function renderCreditsView(root) {
       el(
         "a",
         {
-          href: "https://chinwag.sh/contact?source=local_ui",
+          href: "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
           target: "_blank",
           rel: "noopener noreferrer",
           className: "btn-secondary btn-sm",
@@ -5022,6 +5114,10 @@ let pendingNavTrigger = "hash_change";
 
 function applyRouteFromLocation(trigger = pendingNavTrigger) {
   pendingNavTrigger = "hash_change";
+  const popLayer = dom.popoverLayer();
+  if (popLayer && !popLayer.hidden) {
+    closePopover({ immediate: true });
+  }
   const parsed = parseHashRoute(typeof window !== "undefined" ? window.location.hash : "#inbox");
   const prevView = state.view;
   const viewChanged = state.booted && prevView !== parsed.view;
@@ -5287,6 +5383,18 @@ async function boot() {
   syncThemeButton();
 
   // Wire header controls
+  const appHeader = typeof document !== "undefined" ? document.getElementById("app-header") : null;
+  if (appHeader) {
+    appHeader.addEventListener("click", (ev) => {
+      const popLayer = dom.popoverLayer();
+      if (!popLayer || popLayer.hidden) return;
+      const target = ev.target && typeof ev.target.closest === "function" ? ev.target : null;
+      if (!target || !target.closest("button, a")) {
+        closePopover();
+      }
+    });
+  }
+
   const repoPill = dom.repoPill();
   if (repoPill) repoPill.addEventListener("click", () => openRepoPopover(repoPill));
 
