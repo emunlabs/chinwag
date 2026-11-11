@@ -417,12 +417,19 @@ export function createElapsedClock(format) {
 
 // ── Delivery-2 Rail Toggle (single-frame grid snap + GPU clip/counter-translate) ─
 export function animateRailToggle(railEl, trackEl, spineEl, mainEl, nextExpanded, applyAttr) {
+  const canAnimate = Boolean(railEl && !prefersReducedMotion());
+  if (canAnimate && railEl.dataset) {
+    railEl.dataset.railAnimating = nextExpanded ? "expanding" : "collapsing";
+  }
   keepAnchored(
     mainEl,
     () => (hasDom ? document.getElementById("view-root") || document.scrollingElement || document.documentElement : null),
     applyAttr,
   );
-  if (!railEl || prefersReducedMotion()) return Promise.resolve();
+  if (!canAnimate) {
+    if (railEl && railEl.dataset) delete railEl.dataset.railAnimating;
+    return Promise.resolve();
+  }
   const jobs = [];
   if (trackEl && typeof trackEl.animate === "function") {
     const frames = nextExpanded
@@ -431,21 +438,21 @@ export function animateRailToggle(railEl, trackEl, spineEl, mainEl, nextExpanded
           { transform: "translate3d(0, 0, 0)", opacity: 1 },
         ]
       : [
-          { transform: "translate3d(276px, 0, 0)", opacity: 1 },
-          { transform: "translate3d(0, 0, 0)", opacity: 0 },
+          { transform: "translate3d(0, 0, 0)", opacity: 1 },
+          { transform: "translate3d(-276px, 0, 0)", opacity: 0 },
         ];
     jobs.push(done(play(trackEl, frames, "--dur-rail", "--ease-out-expo", "d2-rail-track")));
   }
-  if (typeof railEl.animate === "function") {
-    const clipFrames = nextExpanded
-      ? [{ clipPath: "inset(0 276px 0 0)" }, { clipPath: "inset(0 0px 0 0)" }]
-      : [{ clipPath: "inset(0 -276px 0 0)" }, { clipPath: "inset(0 0px 0 0)" }];
+  if (nextExpanded && typeof railEl.animate === "function") {
+    const clipFrames = [{ clipPath: "inset(0 276px 0 0)" }, { clipPath: "inset(0 0px 0 0)" }];
     jobs.push(done(play(railEl, clipFrames, "--dur-rail", "--ease-out-expo", "d2-rail-clip")));
   }
   if (spineEl && !nextExpanded && typeof spineEl.animate === "function") {
     jobs.push(done(play(spineEl, [{ opacity: 0 }, { opacity: 1 }], "--dur-rail-fade", "--ease-standard", "d2-spine-in")));
   }
-  return Promise.all(jobs);
+  return Promise.all(jobs).finally(() => {
+    if (railEl && railEl.dataset) delete railEl.dataset.railAnimating;
+  });
 }
 
 // ── Delivery-2 Amber Deep-Link Bounce Ring (640ms) ─────────────────────────

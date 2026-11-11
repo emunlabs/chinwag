@@ -95,6 +95,7 @@ assert.equal(
 );
 for (const requiredId of [
   'id="d2-rail"',
+  'id="d2-rail-toggle-fixed"',
   'id="d2-track"',
   'id="d2-spine"',
   'id="d2-drawer-scrim"',
@@ -103,6 +104,11 @@ for (const requiredId of [
 ]) {
   assert.equal(indexHtml.includes(requiredId), true, `index.html missing ${requiredId}`);
 }
+assert.equal(
+  appJs.includes("Mark connected"),
+  false,
+  "app.js must not expose client-side 'Mark connected' OAuth self-assertion bypass",
+);
 for (const phase2VoiceStub of ["d2-btn-mic", "d2-voice", "voice-call", "Start voice", "Mute mic"]) {
   assert.equal(
     indexHtml.includes(phase2VoiceStub) || appJs.includes(phase2VoiceStub),
@@ -192,7 +198,7 @@ assert.equal(
   "styles.css desktop .menu-btn hide rule must follow .btn-secondary and precede mobile media override",
 );
 
-// CHWG-0254 CSS container-query, 1px shared spine, and no-rewrap .d2-track contracts
+// CHWG-0254 CSS container-query, 1px shared spine, outgoing collapse layer, and no-rewrap .d2-track contracts
 for (const cssSnippet of [
   "container: main / inline-size;",
   "@container main (min-width: 1120px)",
@@ -200,6 +206,8 @@ for (const cssSnippet of [
   "max-width: calc(100vw - var(--rail-current) - 48px);",
   "left: calc(var(--rail-current) - 1px);",
   "contain: layout paint;",
+  '.d2-rail[data-rail-animating="collapsing"] .d2-track',
+  ".d2-rail-toggle-fixed",
 ]) {
   assert.equal(
     stylesCss.includes(cssSnippet),
@@ -215,6 +223,27 @@ function attrToDatasetKey(attr) {
     .replace(/-([a-z])/g, (_m, ch) => ch.toUpperCase());
 }
 
+// Browser-faithful NodeList stub: iterable + indexed + .length + .item + .forEach,
+// intentionally WITHOUT Array.prototype.{find,filter,map,some} so native NodeList misuse fails immediately!
+class StubNodeList {
+  constructor(items) {
+    this._items = items;
+    this.length = items.length;
+    for (let i = 0; i < items.length; i += 1) {
+      this[i] = items[i];
+    }
+  }
+  item(i) {
+    return this._items[i] || null;
+  }
+  forEach(cb, thisArg) {
+    this._items.forEach(cb, thisArg);
+  }
+  [Symbol.iterator]() {
+    return this._items[Symbol.iterator]();
+  }
+}
+
 class StubNode {
   constructor(tagName) {
     this.tagName = String(tagName || "DIV").toUpperCase();
@@ -226,6 +255,8 @@ class StubNode {
     this.className = "";
     this.id = "";
     this.hidden = false;
+    this.disabled = false;
+    this.inert = false;
     this.checked = false;
     this.selected = false;
     this.value = "";
@@ -347,11 +378,11 @@ class StubNode {
       }
     };
     visit(this);
-    return results;
+    return new StubNodeList(results);
   }
   querySelector(selector) {
     const all = this.querySelectorAll(selector);
-    return all.length > 0 ? all[0] : null;
+    return all.length > 0 ? all.item(0) : null;
   }
 }
 
@@ -376,6 +407,7 @@ btnInvite._computedDisplay = "none";
 const appBody = mountEl("div", "app-body", false, bodyEl);
 const d2DrawerScrim = mountEl("div", "d2-drawer-scrim", true, appBody);
 const d2Rail = mountEl("aside", "d2-rail", false, appBody);
+const d2RailToggleFixed = mountEl("button", "d2-rail-toggle-fixed", false, d2Rail);
 const d2Track = mountEl("div", "d2-track", false, d2Rail);
 const d2Spine = mountEl("div", "d2-spine", false, d2Rail);
 const mainEl = mountEl("main", "main", false, appBody);
@@ -433,13 +465,16 @@ const transformedSrc = appJs
       settled: () => new Promise((r) => setTimeout(r, 25)),
       guardAction: async (_btn, fn) => ({ value: await fn(), release: () => {} }),
       isArming: () => false,
-      animateRailToggle: (_rail, _track, _spine, _main, _expand, applyStateFn) => {
+      animateRailToggle: (rail, _track, _spine, _main, expand, applyStateFn) => {
+        if (rail && rail.dataset) rail.dataset.railAnimating = expand ? "expanding" : "collapsing";
         if (typeof applyStateFn === "function") applyStateFn();
-        return Promise.resolve();
+        return new Promise((r) => setTimeout(r, 15)).finally(() => {
+          if (rail && rail.dataset) delete rail.dataset.railAnimating;
+        });
       },
-      dipSwap: (_node, swapFn) => {
+      dipSwap: async (_node, swapFn) => {
+        await new Promise((r) => setTimeout(r, 15));
         if (typeof swapFn === "function") swapFn();
-        return Promise.resolve();
       },
       resolveBanner: async (_node, settleFn) => {
         if (typeof settleFn === "function") settleFn();
@@ -488,6 +523,17 @@ let mockD2MessageHandler = async (body) => ({
   },
 });
 let d2CancelCalls = [];
+let d2ApprovalCalls = [];
+let d2MemoryCalls = [];
+let d2StateCalls = [];
+let mockBootstrapPayload = {};
+let mockD2StateHandler = async () => ({
+  ok: true,
+  seq: 3,
+  cursor_seq: 3,
+  unchanged: true,
+  delta_entries: [],
+});
 
 const sandbox = {
   console,
@@ -529,6 +575,9 @@ const sandbox = {
   CSRF_TOKEN: "test-csrf",
   fetch: async (url, opts = {}) => {
     const body = opts.body ? JSON.parse(opts.body) : {};
+    if (url === "/api/v4/bootstrap") {
+      return { ok: true, status: 200, json: async () => mockBootstrapPayload };
+    }
     if (url === "/api/v4/workflow") {
       try {
         const res = await mockWorkflowHandler(body);
@@ -536,6 +585,11 @@ const sandbox = {
       } catch (err) {
         return { ok: false, status: 500, json: async () => ({ ok: false, error: err.message }) };
       }
+    }
+    if (url.startsWith("/api/v1/delivery2/state")) {
+      d2StateCalls.push(url);
+      const res = await mockD2StateHandler(url);
+      return { ok: true, status: 200, json: async () => res };
     }
     if (url === "/api/v1/delivery2/message") {
       const res = await mockD2MessageHandler(body);
@@ -545,13 +599,21 @@ const sandbox = {
       d2CancelCalls.push(body);
       return { ok: true, status: 200, json: async () => ({ ok: true, cancelled: true, credits_charged: 0 }) };
     }
+    if (url === "/api/v1/delivery2/approval") {
+      d2ApprovalCalls.push(body);
+      return { ok: true, status: 200, json: async () => ({ ok: true, decision: body.decision, authorized: true }) };
+    }
+    if (url === "/api/v1/delivery2/memory") {
+      d2MemoryCalls.push(body);
+      return { ok: true, status: 200, json: async () => ({ ok: true, memory: { id: body.id, note: body.note || "", status: "saved" } }) };
+    }
     return { ok: true, status: 202, json: async () => ({ ok: true, telemetry_enabled: true }) };
   },
 };
 
 vm.createContext(sandbox);
 vm.runInContext(
-  `${transformedSrc}\nglobalThis.__test = { state, normalizeBootstrap, saveWorkflowSettings, openPrivacyPopover, openMobileMenuPopover, openInviteModal, closePopover, closeModal, wizardPackSlugForSku, renderDelivery2Panel, toggleDelivery2Rail, setDelivery2RailExpanded, openD2Popover, closeD2Popover, submitDelivery2Prompt, cancelDelivery2Turn, handleGlobalKeydown, applyRouteFromLocation, bounceToDelivery2Run };`,
+  `${transformedSrc}\nglobalThis.__test = { state, normalizeBootstrap, safeChinwagOutboundUrl, applyDelivery2ServerPayload, resumeDelivery2FromCursor, refreshBootstrapQuietly, syncDelivery2DrawerDom, syncRailForOverlaySheet, saveWorkflowSettings, openPrivacyPopover, openMobileMenuPopover, openInviteModal, closePopover, closeModal, wizardPackSlugForSku, renderDelivery2Panel, toggleDelivery2Rail, setDelivery2RailExpanded, openD2Popover, closeD2Popover, submitDelivery2Prompt, cancelDelivery2Turn, handleGlobalKeydown, applyRouteFromLocation, bounceToDelivery2Run };`,
   sandbox,
 );
 
@@ -566,7 +628,7 @@ btnPrivacy.click();
 assert.equal(popoverLayer.hidden, false);
 assert.equal(popoverLayer.querySelector("h2").textContent, "Local privacy");
 assert.deepEqual(
-  popoverLayer.querySelectorAll("a").map((a) => a.getAttribute("href")),
+  Array.from(popoverLayer.querySelectorAll("a")).map((a) => a.getAttribute("href")),
   ["https://chinwag.sh/security", "https://chinwag.sh/pricing?talk=1&source=local_ui#founders"],
 );
 const staleClose = T.closePopover();
@@ -585,9 +647,9 @@ assert.equal(stubDocument.activeElement, btnPrivacy);
 
 // Suite C: Mobile Menu -> Local privacy & analytics handoff
 btnMobileMenu.click();
-const menuPrivacyBtn = popoverLayer
-  .querySelectorAll("button")
-  .find((b) => b.textContent.includes("Local privacy & analytics"));
+const menuPrivacyBtn = Array.from(popoverLayer.querySelectorAll("button")).find((b) =>
+  b.textContent.includes("Local privacy & analytics"),
+);
 assert.ok(menuPrivacyBtn);
 menuPrivacyBtn.click();
 assert.equal(popoverLayer.hidden, false);
@@ -598,15 +660,15 @@ assert.equal(popoverLayer.hidden, false);
 // Suite D: Mobile Menu -> Invite handoff + repeated closeModal() 5ms apart restores focus to #btn-mobile-menu
 await T.closePopover({ immediate: true });
 btnMobileMenu.click();
-const menuInviteBtn = popoverLayer
-  .querySelectorAll("button")
-  .find((b) => b.textContent.includes("Invite teammate"));
+const menuInviteBtn = Array.from(popoverLayer.querySelectorAll("button")).find((b) =>
+  b.textContent.includes("Invite teammate"),
+);
 assert.ok(menuInviteBtn);
 menuInviteBtn.click();
 assert.equal(popoverLayer.hidden, true);
 assert.equal(modalLayer.hidden, false);
 assert.equal(
-  modalLayer.querySelectorAll(".copy-field").some((n) =>
+  Array.from(modalLayer.querySelectorAll(".copy-field")).some((n) =>
     n.textContent.includes("https://chinwag.sh/pricing?source=local_ui_referral"),
   ),
   true,
@@ -641,12 +703,12 @@ assert.equal(d2Track.querySelectorAll(".d2-seg").length, 12);
 assert.equal(d2Spine.querySelectorAll(".d2-spine-seg").length, 12);
 assert.equal(d2Spine.querySelectorAll(".d2-spine-dot").length, 4);
 assert.equal(
-  d2Track.querySelectorAll(".d2-zero-cr-pill").some((n) => n.textContent === "Paused · 0 Cr"),
+  Array.from(d2Track.querySelectorAll(".d2-zero-cr-pill")).some((n) => n.textContent === "Paused · 0 Cr"),
   true,
   "HITL approval card must display Paused · 0 Cr badge",
 );
 assert.equal(
-  d2Track.querySelectorAll("button").some((b) => b.textContent.includes("Verified sources")),
+  Array.from(d2Track.querySelectorAll("button")).some((b) => b.textContent.includes("Verified sources")),
   true,
   "Grounded Q&A card must render collapsed Verified sources disclosure",
 );
@@ -660,19 +722,19 @@ await T.openD2Popover("connections", "linear");
 const connPop = stubDocument.getElementById("d2-connections-popover");
 assert.ok(connPop, "+ Connections popover must mount");
 assert.equal(
-  connPop.querySelectorAll(".d2-conn-auth").some((n) =>
+  Array.from(connPop.querySelectorAll(".d2-conn-auth")).some((n) =>
     n.textContent.includes("Connected · ambient status cards only"),
   ),
   true,
   "Slack row in + Connections must enforce INV-SLACK-NOT-DELIVERY2-01 ambient status copy",
 );
 assert.equal(
-  connPop.querySelectorAll("button").some((b) => b.textContent.includes("Connect")),
+  Array.from(connPop.querySelectorAll("button")).some((b) => b.textContent.includes("Connect")),
   true,
   "Unlinked Linear surface must expose Connect button",
 );
 assert.deepEqual(
-  connPop.querySelectorAll("a").map((a) => a.getAttribute("href")),
+  Array.from(connPop.querySelectorAll("a")).map((a) => a.getAttribute("href")),
   ["https://chinwag.sh/security", "https://chinwag.sh/pricing?talk=1&source=local_ui#founders"],
 );
 
@@ -823,10 +885,282 @@ T.applyRouteFromLocation();
 assert.equal(docEl.getAttribute("data-rail"), "expanded", "Closing overlay review sheet must restore expanded rail");
 stubWindow.innerWidth = 1440;
 
+// Suite J: Round-2 Tribunal Regression Ratchets (ALISTAIR-1/4 + ARCHITECT-1/3/4/5/6/9/10/11/12)
+// J1: Outbound URL allowlist neutralizes javascript: and external OAuth phishing links
+assert.equal(T.safeChinwagOutboundUrl("javascript:alert(1)"), "https://chinwag.sh/open");
+assert.equal(T.safeChinwagOutboundUrl("https://evil.example/oauth-phish"), "https://chinwag.sh/open");
+assert.equal(
+  T.safeChinwagOutboundUrl("https://chinwag.sh/open?connect=linear&state=deadbeef"),
+  "https://chinwag.sh/open?connect=linear&state=deadbeef",
+);
+const tamperedBoot = T.normalizeBootstrap({
+  delivery2: {
+    seq: 2,
+    links: {
+      security_url: "javascript:evil()",
+      founders_url: "https://evil.example/founders",
+    },
+    entries: [
+      {
+        id: "entry-oauth-linear",
+        kind: "oauth_card",
+        seq: 2,
+        surface: "linear",
+        surface_label: "Linear",
+        oauth_state: "nonce-1234",
+        thread_id: "thr-main",
+        challenge_url: "javascript:phish()",
+        settled: false,
+      },
+      {
+        id: "entry-hitl-j",
+        kind: "approval_card",
+        seq: 2,
+        approval_id: "hitl-j1",
+        item_id: "j1",
+        question: "Approve change?",
+        settled: false,
+      },
+      {
+        id: "entry-mem-j",
+        kind: "memory_card",
+        seq: 2,
+        memory_id: "mem_j1",
+        note: "Always run clippy.",
+        status: "saved",
+      },
+    ],
+  },
+});
+assert.equal(tamperedBoot.delivery2.links.security_url, "https://chinwag.sh/security");
+assert.equal(
+  tamperedBoot.delivery2.links.founders_url,
+  "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
+);
+assert.equal(tamperedBoot.delivery2.entries[0].challenge_url, "https://chinwag.sh/open");
+
+// J2: OAuth card renders "Re-check connection" and sends decision="verify" with oauth_state + thread_id
+T.state.d2Loaded = false;
+T.state.d2LastCursorSeq = 0;
+T.applyDelivery2ServerPayload(tamperedBoot.delivery2, { forceInitial: true });
+T.renderDelivery2Panel();
+const oauthCard = d2Track.querySelector(".d2-oauth-card");
+assert.ok(oauthCard, "oauth_card must render");
+assert.equal(oauthCard.querySelector("a").getAttribute("href"), "https://chinwag.sh/open");
+const recheckBtn = Array.from(oauthCard.querySelectorAll("button")).find((b) =>
+  b.textContent.includes("Re-check connection"),
+);
+assert.ok(recheckBtn, "oauth_card must render Re-check connection button");
+d2ApprovalCalls = [];
+recheckBtn.click();
+await sleep(25);
+assert.equal(d2ApprovalCalls.length, 1);
+assert.deepEqual(d2ApprovalCalls[0], {
+  kind: "oauth",
+  surface: "linear",
+  decision: "verify",
+  oauth_state: "nonce-1234",
+  thread_id: "thr-main",
+});
+
+// J3: Async dipSwap on memory Edit focuses live .d2-mem-edit-input, and Cmd+Enter in memory editor NEVER approves HITL
+T.applyDelivery2ServerPayload(tamperedBoot.delivery2, { forceInitial: true });
+T.renderDelivery2Panel();
+const memCard = d2Track.querySelector(".d2-mem-card");
+const editMemBtn = Array.from(memCard.querySelectorAll("button")).find((b) => b.textContent === "Edit");
+assert.ok(editMemBtn, "Memory card must expose Edit button");
+editMemBtn.click();
+await sleep(30);
+const liveMemInput = d2Track.querySelector(".d2-mem-edit-input");
+assert.ok(liveMemInput, "Memory editor input must mount after async dipSwap");
+assert.equal(
+  stubDocument.activeElement,
+  liveMemInput,
+  "Async dipSwap memory Edit must focus the live replacement .d2-mem-edit-input",
+);
+
+d2ApprovalCalls = [];
+d2MemoryCalls = [];
+let keyEvDefaultPrevented = false;
+let keyEvStopped = false;
+const memEnterEv = {
+  key: "Enter",
+  metaKey: true,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  target: liveMemInput,
+  get defaultPrevented() {
+    return keyEvDefaultPrevented;
+  },
+  preventDefault() {
+    keyEvDefaultPrevented = true;
+  },
+  stopPropagation() {
+    keyEvStopped = true;
+  },
+};
+for (const fn of liveMemInput.listeners.get("keydown") || []) fn(memEnterEv);
+if (!keyEvStopped) {
+  T.handleGlobalKeydown(memEnterEv);
+}
+// Even if global keydown were called directly with defaultPrevented=true, it must no-op:
+T.handleGlobalKeydown(memEnterEv);
+await sleep(20);
+assert.equal(d2MemoryCalls.length, 1, "Cmd+Enter in memory editor must save memory note once");
+assert.equal(d2ApprovalCalls.length, 0, "Cmd+Enter in memory editor must NEVER approve a pending HITL card");
+
+// J4: Monotonic seq rejects stale server/bootstrap payloads & cursor resume queries ?since_seq=
+T.applyDelivery2ServerPayload({
+  seq: 5,
+  status: "live",
+  status_label: "Live",
+  entries: [
+    {
+      id: "entry-hitl-j",
+      kind: "approval_card",
+      seq: 5,
+      approval_id: "hitl-j1",
+      settled: true,
+      settled_decision: "approved",
+      settled_receipt: "Approved by you · 0 Cr while paused",
+    },
+  ],
+});
+assert.equal(T.state.d2LastCursorSeq, 5);
+assert.equal(
+  T.applyDelivery2ServerPayload({
+    seq: 3,
+    status: "waiting_for_you",
+    status_label: "Waiting for you",
+    entries: [{ id: "entry-hitl-j", kind: "approval_card", seq: 3, settled: false }],
+  }),
+  false,
+  "Stale mutation payload with lower seq must be rejected",
+);
+assert.equal(T.state.data.delivery2.entries[0].settled, true);
+
+mockBootstrapPayload = {
+  delivery2: {
+    seq: 2,
+    status: "waiting_for_you",
+    entries: [{ id: "entry-hitl-j", kind: "approval_card", seq: 2, settled: false }],
+  },
+};
+await T.refreshBootstrapQuietly();
+assert.equal(T.state.data.delivery2.seq, 5, "refreshBootstrapQuietly must preserve newer Delivery-2 seq=5");
+assert.equal(T.state.data.delivery2.entries[0].settled, true);
+
+d2StateCalls = [];
+mockD2StateHandler = async () => ({
+  ok: true,
+  seq: 6,
+  cursor_seq: 6,
+  unchanged: false,
+  entries: [{ id: "entry-qa-6", kind: "qa_card", seq: 6, body: "Resumed from cursor." }],
+});
+await T.resumeDelivery2FromCursor();
+assert.equal(d2StateCalls[0], "/api/v1/delivery2/state?since_seq=5");
+assert.equal(T.state.d2LastCursorSeq, 6);
+
+// J5: Stop mid-reveal retains partial displayed text instead of flashing full unstreamed answer
+const fullLongBody =
+  "First partial sentence visible before stop — THIS TRAILING SECRET REMAINDER MUST NEVER APPEAR AFTER STOP.";
+mockD2MessageHandler = async () => ({
+  ok: true,
+  entry: {
+    id: "qa-stop-partial",
+    kind: "qa_card",
+    seq: 7,
+    author: "Delivery-2",
+    body: fullLongBody,
+    sources: [],
+  },
+  state: {
+    seq: 7,
+    entries: [
+      {
+        id: "qa-stop-partial",
+        kind: "qa_card",
+        seq: 7,
+        author: "Delivery-2",
+        body: fullLongBody,
+        sources: [],
+      },
+    ],
+  },
+});
+d2CancelCalls = [];
+await T.submitDelivery2Prompt("Explain long architecture flow");
+// Streamer pushed first 1/8 slice synchronously; cancel BEFORE 30ms markDone timer fires!
+await T.cancelDelivery2Turn();
+const renderedPartial = stubDocument.getElementById("d2-qa-body-qa-stop-partial");
+assert.ok(renderedPartial, "Stopped QA card must remain mounted");
+assert.equal(
+  renderedPartial.textContent.includes("THIS TRAILING SECRET REMAINDER"),
+  false,
+  "Stopping mid-stream must retain only the displayed partial prefix, never revealing the full body",
+);
+assert.equal(d2CancelCalls[0].entry_id, "qa-stop-partial");
+assert.ok(Number.isFinite(d2CancelCalls[0].truncated_len) && d2CancelCalls[0].truncated_len < fullLongBody.length);
+
+// J6: Resizing an open review sheet from 1440px -> 1280px auto-collapses rail and restores at 1440px
+stubWindow.innerWidth = 1440;
+await T.setDelivery2RailExpanded(true, { persist: true, animate: false });
+T.state.openItemId = "item-open-resize";
+T.syncRailForOverlaySheet();
+assert.equal(docEl.getAttribute("data-rail"), "expanded", "At 1440px split review keeps rail expanded");
+stubWindow.innerWidth = 1280;
+T.syncRailForOverlaySheet();
+assert.equal(docEl.getAttribute("data-rail"), "collapsed", "Resizing open sheet to 1280px must auto-collapse rail");
+stubWindow.innerWidth = 1440;
+T.syncRailForOverlaySheet();
+assert.equal(docEl.getAttribute("data-rail"), "expanded", "Resizing back to 1440px must restore pre-sheet expanded rail");
+T.state.openItemId = null;
+
+// J7: < 960px closed mobile drawer is inert + aria-hidden, traps Tab on StubNodeList when open, and restores focus on close
+stubWindow.innerWidth = 390;
+T.state.d2DrawerOpen = false;
+T.syncDelivery2DrawerDom();
+assert.equal(d2Rail.inert, true, "Closed <960px mobile drawer must set rail.inert = true");
+assert.equal(d2Rail.getAttribute("aria-hidden"), "true");
+
+btnD2Drawer.focus();
+await T.setDelivery2RailExpanded(true, { persist: false, animate: false });
+assert.equal(d2Rail.inert, false, "Open <960px mobile drawer must clear rail.inert");
+assert.equal(d2Rail.getAttribute("aria-hidden"), null);
+await sleep(10);
+
+const drawerButtons = Array.from(d2Track.querySelectorAll("button, a, textarea, input"));
+assert.ok(drawerButtons.length >= 2);
+const lastDrawerFocusable = drawerButtons[drawerButtons.length - 1];
+lastDrawerFocusable.focus();
+let tabPrevented = false;
+T.handleGlobalKeydown({
+  key: "Tab",
+  metaKey: false,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  target: lastDrawerFocusable,
+  defaultPrevented: false,
+  preventDefault() {
+    tabPrevented = true;
+  },
+});
+assert.equal(tabPrevented, true, "Tab on last drawer control must wrap focus inside drawer without NodeList TypeError");
+assert.equal(stubDocument.activeElement, drawerButtons[0]);
+
+await T.setDelivery2RailExpanded(false, { persist: false, animate: false });
+assert.equal(d2Rail.inert, true);
+assert.equal(stubDocument.activeElement, btnD2Drawer, "Closing mobile drawer must restore focus to trigger");
+stubWindow.innerWidth = 1440;
+T.syncDelivery2DrawerDom();
+
 console.log(
   JSON.stringify({
     ok: true,
     script: "verify-ui-v4-contracts.mjs",
-    suites_passed: 9,
+    suites_passed: 10,
   }),
 );

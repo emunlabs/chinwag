@@ -3205,9 +3205,45 @@ col.diff-col-split-code {
   html[data-rail="collapsed"] .d2-spine {
     display: flex;
   }
+  /* Keep outgoing fixed-width 320px track visible until collapse animation settles */
+  .d2-rail[data-rail-animating="collapsing"] {
+    overflow: visible;
+    clip-path: inset(0 -276px 0 0);
+  }
+  .d2-rail[data-rail-animating="collapsing"] .d2-track {
+    display: grid !important;
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: calc(var(--rail-w) - 1px);
+    min-width: calc(var(--rail-w) - 1px);
+    z-index: 4;
+    pointer-events: none;
+  }
+  /* Stationary [≡] toggle anchored directly in .d2-rail at x = 22px (9 + 13) outside translated .d2-track */
+  .d2-rail-toggle-fixed {
+    position: absolute;
+    top: 8px;
+    left: 9px;
+    z-index: 12;
+  }
+  #d2-head-toggle,
+  #d2-spine-toggle {
+    display: none;
+  }
+  .d2-head {
+    padding-left: 41px;
+  }
+  .d2-spine-top {
+    padding-top: 36px;
+  }
 }
 
 @media (max-width: 959.98px) {
+  .d2-rail-toggle-fixed {
+    display: none !important;
+  }
   .d2-rail {
     position: fixed;
     top: 0;

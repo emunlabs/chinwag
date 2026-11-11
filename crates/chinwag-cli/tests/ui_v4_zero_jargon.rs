@@ -1689,6 +1689,7 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
             temp_repo.to_str().unwrap(),
         ])
         .env("CHINWAG_NO_TELEMETRY", "1")
+        .env_remove("LINEAR_API_KEY")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1983,25 +1984,97 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
     );
     assert_verified_chinwag_sh_routes_and_no_404s("oauth connect", &oauth_conn_str);
     assert_eq!(oauth_conn_json["credits_while_paused"], 0);
+    let oauth_card = oauth_conn_json["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "entry-oauth-linear")
+        .expect("entry-oauth-linear card mounted");
+    let oauth_nonce = oauth_card["oauth_state"]
+        .as_str()
+        .expect("oauth_state nonce on oauth_card")
+        .to_string();
 
-    let (oauth_auth_hdr, _, oauth_auth_json) = post_json(
+    // Legacy self-asserted 'authorize' bypass must be rejected (400 invalid_oauth_action)
+    let (oauth_legacy_hdr, _, oauth_legacy_json) = post_json(
         "/api/v1/delivery2/approval",
         json!({ "kind": "oauth", "surface": "linear", "decision": "authorize" }),
     );
     assert!(
-        oauth_auth_hdr.starts_with("HTTP/1.1 200 OK"),
-        "{oauth_auth_hdr}"
+        oauth_legacy_hdr.starts_with("HTTP/1.1 400 Bad Request"),
+        "{oauth_legacy_hdr}"
     );
-    assert_eq!(oauth_auth_json["authorized"], true);
+    assert_eq!(oauth_legacy_json["error_code"], "invalid_oauth_action");
 
-    // 7. POST /api/v1/delivery2/cancel + POST /api/v1/delivery2/thread (new, switch, morning_focus, connection)
+    // 'verify' while Linear is not yet configured must fail closed (409 oauth_not_verified)
+    let (oauth_unlinked_hdr, _, oauth_unlinked_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "kind": "oauth",
+            "surface": "linear",
+            "decision": "verify",
+            "oauth_state": oauth_nonce,
+            "thread_id": "thr-main"
+        }),
+    );
+    assert!(
+        oauth_unlinked_hdr.starts_with("HTTP/1.1 409 Conflict"),
+        "{oauth_unlinked_hdr}"
+    );
+    assert_eq!(oauth_unlinked_json["error_code"], "oauth_not_verified");
+    assert_eq!(oauth_unlinked_json["authorized"], false);
+
+    // Once the workspace actually has verified Linear configuration, 'verify' with bound state+thread succeeds!
+    fs::write(temp_repo.join(".chinwag/linear.json"), r#"{"team":"ENG"}"#).unwrap();
+
+    let (oauth_verify_hdr, _, oauth_verify_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "kind": "oauth",
+            "surface": "linear",
+            "decision": "verify",
+            "oauth_state": oauth_nonce,
+            "thread_id": "thr-main"
+        }),
+    );
+    assert!(
+        oauth_verify_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{oauth_verify_hdr}"
+    );
+    assert_eq!(oauth_verify_json["authorized"], true);
+    assert_eq!(oauth_verify_json["decision"], "verified");
+
+    // 7. POST /api/v1/delivery2/cancel (clamping partial reply) + cursor ?since_seq= + /api/v1/delivery2/thread
+    let (_, _, long_msg_json) = post_json(
+        "/api/v1/delivery2/message",
+        json!({ "prompt": "What did I miss?", "turn_id": "turn-live-99" }),
+    );
+    let stop_eid = long_msg_json["entry"]["id"].as_str().unwrap().to_string();
     let (cancel_hdr, _, cancel_json) = post_json(
         "/api/v1/delivery2/cancel",
-        json!({ "turn_id": "turn-live-99" }),
+        json!({ "turn_id": "turn-live-99", "entry_id": stop_eid, "truncated_len": 12 }),
     );
     assert!(cancel_hdr.starts_with("HTTP/1.1 200 OK"), "{cancel_hdr}");
     assert_eq!(cancel_json["cancelled"], true);
     assert_eq!(cancel_json["credits_charged"], 0);
+    let stopped_entry = cancel_json["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == stop_eid)
+        .expect("stopped qa_card persisted");
+    assert_eq!(
+        stopped_entry["body"].as_str().unwrap().chars().count(),
+        12,
+        "cancel truncated_len must clamp persisted qa_card body to displayed prefix"
+    );
+
+    let cursor_now = cancel_json["seq"].as_u64().unwrap();
+    let (cur_hdr, _, cur_json) =
+        get_auth_json(&format!("/api/v1/delivery2/state?since_seq={cursor_now}"));
+    assert!(cur_hdr.starts_with("HTTP/1.1 200 OK"), "{cur_hdr}");
+    assert_eq!(cur_json["unchanged"], true);
+    assert_eq!(cur_json["delta_entries"], json!([]));
 
     let (thr_new_hdr, _, thr_new_json) =
         post_json("/api/v1/delivery2/thread", json!({ "action": "new" }));

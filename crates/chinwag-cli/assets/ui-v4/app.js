@@ -883,6 +883,7 @@ const state = {
   d2PopoverSeq: 0,
   d2FocusedSurface: null,
   d2DrawerOpen: false,
+  d2DrawerTriggerEl: null,
   d2AutoCollapsedForSheet: false,
   d2PreSheetRail: null,
   d2ComposerDraft: "",
@@ -894,6 +895,7 @@ const state = {
   d2StreamingEntryId: null,
   d2StreamingText: "",
   d2LastCursorSeq: 0,
+  d2Loaded: false,
   d2ExpandedSteps: new Set(),
   d2ExpandedSources: new Set(),
   d2EditingMemId: null,
@@ -1112,9 +1114,9 @@ function createDefaultDelivery2State() {
         pause_badge: "Paused · 0 Cr",
         estimate_badge: "~20 Cr to finish",
         title: "Verify protected-path safety & test checks before merge",
-        question: "Approve scoped change on `main` after Claude Code implementation and Codex CLI independent review?",
-        diff_summary: "2 files (+18 / -4 lines) · Isolated sandbox",
-        check_proof: "Local test suite passed · Independent second-tool review verified",
+        question: "Review workspace guardrails on `main` (open View diff → for safe sample preview)?",
+        diff_summary: "No local diff recorded yet · Sample preview available",
+        check_proof: "Automated test receipt not yet recorded · Independent review not yet recorded",
         diff_hash: "#walkthrough",
         settled: false,
         settled_decision: null,
@@ -1508,6 +1510,22 @@ function normalizeBootstrap(raw) {
   return next;
 }
 
+function safeChinwagOutboundUrl(raw, fallback = "https://chinwag.sh/open") {
+  const s = String(raw ?? "").trim();
+  if (!s || /[\u0000-\u001F\u007F\s]/.test(s)) return fallback;
+  if (
+    s === "https://chinwag.sh/security" ||
+    s === "https://chinwag.sh/pricing" ||
+    s.startsWith("https://chinwag.sh/pricing?") ||
+    s.startsWith("https://chinwag.sh/pricing#") ||
+    s === "https://chinwag.sh/open" ||
+    s.startsWith("https://chinwag.sh/open?")
+  ) {
+    return s;
+  }
+  return fallback;
+}
+
 function normalizeDelivery2State(rawD2, baseData = null) {
   const def = createDefaultDelivery2State();
   if (baseData && baseData.inbox && baseData.board && baseData.credits) {
@@ -1556,12 +1574,13 @@ function normalizeDelivery2State(rawD2, baseData = null) {
   if (rawD2.sync_radar && typeof rawD2.sync_radar === "object") {
     const sr = rawD2.sync_radar;
     out.sync_radar = {
-      latency_ms: Number(sr.latency_ms) || 42,
+      latency_ms: Number(sr.latency_ms) || 1,
       latency_label: !isAbsent(sr.latency_label) ? String(sr.latency_label) : "<200ms",
       surfaces: Array.isArray(sr.surfaces) && sr.surfaces.length === 4
         ? sr.surfaces.map((s, idx) => {
             const fb = def.sync_radar.surfaces[idx] || def.sync_radar.surfaces[0];
             const id = String(s.id || fb.id);
+            const fallbackUrl = fb.connect_url || "https://chinwag.sh/open";
             return {
               id,
               label: String(s.label || fb.label),
@@ -1574,7 +1593,10 @@ function normalizeDelivery2State(rawD2, baseData = null) {
                   ? "Connected · ambient status cards only"
                   : s.auth_status || fb.auth_status,
               ),
-              connect_url: !isAbsent(s.connect_url) ? String(s.connect_url) : fb.connect_url,
+              connect_url:
+                id === "local"
+                  ? null
+                  : safeChinwagOutboundUrl(!isAbsent(s.connect_url) ? s.connect_url : fallbackUrl, fallbackUrl),
               policy_note: !isAbsent(s.policy_note) ? String(s.policy_note) : fb.policy_note,
             };
           })
@@ -1605,12 +1627,21 @@ function normalizeDelivery2State(rawD2, baseData = null) {
   }
 
   if (Array.isArray(rawD2.entries)) {
-    out.entries = rawD2.entries.filter((e) => e && typeof e === "object").map((e, i) => ({
-      ...e,
-      id: String(e.id || `entry-${i}`),
-      kind: String(e.kind || "qa_card"),
-      seq: Math.max(1, Number(e.seq) || 1),
-    }));
+    out.entries = rawD2.entries.filter((e) => e && typeof e === "object").map((e, i) => {
+      const normalizedEntry = {
+        ...e,
+        id: String(e.id || `entry-${i}`),
+        kind: String(e.kind || "qa_card"),
+        seq: Math.max(1, Number(e.seq) || 1),
+      };
+      if (normalizedEntry.kind === "oauth_card") {
+        normalizedEntry.challenge_url = safeChinwagOutboundUrl(
+          e.challenge_url,
+          "https://chinwag.sh/open",
+        );
+      }
+      return normalizedEntry;
+    });
   }
 
   if (rawD2.history && typeof rawD2.history === "object") {
@@ -1634,10 +1665,10 @@ function normalizeDelivery2State(rawD2, baseData = null) {
 
   if (rawD2.links && typeof rawD2.links === "object") {
     out.links = {
-      security_url: String(rawD2.links.security_url || def.links.security_url),
-      founders_url: String(rawD2.links.founders_url || def.links.founders_url),
-      open_url: String(rawD2.links.open_url || def.links.open_url),
-      pricing_url: String(rawD2.links.pricing_url || def.links.pricing_url),
+      security_url: safeChinwagOutboundUrl(rawD2.links.security_url, def.links.security_url),
+      founders_url: safeChinwagOutboundUrl(rawD2.links.founders_url, def.links.founders_url),
+      open_url: safeChinwagOutboundUrl(rawD2.links.open_url, def.links.open_url),
+      pricing_url: safeChinwagOutboundUrl(rawD2.links.pricing_url, def.links.pricing_url),
     };
   }
 
@@ -1774,6 +1805,7 @@ const dom = {
   btnD2Drawer: () => document.getElementById("btn-d2-drawer"),
   d2DrawerScrim: () => document.getElementById("d2-drawer-scrim"),
   d2Rail: () => document.getElementById("d2-rail"),
+  d2RailToggleFixed: () => document.getElementById("d2-rail-toggle-fixed"),
   d2Track: () => document.getElementById("d2-track"),
   d2Spine: () => document.getElementById("d2-spine"),
   d2ComposerInput: () => document.getElementById("d2-composer-input"),
@@ -5528,7 +5560,9 @@ function syncDelivery2DrawerDom() {
   if (typeof document === "undefined" || !document.documentElement) return;
   const scrim = dom.d2DrawerScrim();
   const btn = dom.btnD2Drawer();
-  const open = Boolean(state.d2DrawerOpen && isNarrowDrawerViewport());
+  const rail = dom.d2Rail();
+  const narrow = isNarrowDrawerViewport();
+  const open = Boolean(state.d2DrawerOpen && narrow);
   if (open) {
     document.documentElement.setAttribute("data-d2-drawer", "open");
   } else {
@@ -5536,11 +5570,26 @@ function syncDelivery2DrawerDom() {
   }
   if (scrim) scrim.hidden = !open;
   if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+  if (rail) {
+    if (narrow && !open) {
+      rail.inert = true;
+      rail.setAttribute("aria-hidden", "true");
+    } else {
+      rail.inert = false;
+      rail.removeAttribute("aria-hidden");
+    }
+  }
 }
 
 function setDelivery2RailExpanded(nextExpanded, { persist = true, animate = true } = {}) {
   const expand = Boolean(nextExpanded);
   if (isNarrowDrawerViewport()) {
+    if (expand && !state.d2DrawerOpen) {
+      state.d2DrawerTriggerEl =
+        typeof document !== "undefined" && document.activeElement
+          ? document.activeElement
+          : dom.btnD2Drawer();
+    }
     state.d2DrawerOpen = expand;
     if (!expand && state.d2Popover) {
       state.d2Popover = null;
@@ -5554,8 +5603,11 @@ function setDelivery2RailExpanded(nextExpanded, { persist = true, animate = true
         if (input) input.focus();
       });
     } else {
-      const btn = dom.btnD2Drawer();
-      if (btn) btn.focus();
+      const restoreEl = state.d2DrawerTriggerEl || dom.btnD2Drawer();
+      state.d2DrawerTriggerEl = null;
+      if (restoreEl && typeof restoreEl.focus === "function") {
+        restoreEl.focus();
+      }
     }
     return Promise.resolve();
   }
@@ -5610,7 +5662,7 @@ function syncRailForOverlaySheet() {
     state.d2PreSheetRail = "expanded";
     state.d2AutoCollapsedForSheet = true;
     setDelivery2RailExpanded(false, { persist: false, animate: true });
-  } else if (!state.openItemId && state.d2AutoCollapsedForSheet) {
+  } else if (state.d2AutoCollapsedForSheet && (!state.openItemId || mainWithExpandedRail >= 1120)) {
     const shouldRestore = state.d2PreSheetRail === "expanded";
     state.d2AutoCollapsedForSheet = false;
     state.d2PreSheetRail = null;
@@ -5675,10 +5727,49 @@ async function closeD2Popover(options = {}) {
   }
 }
 
-function applyDelivery2ServerPayload(rawD2) {
-  if (!rawD2 || typeof rawD2 !== "object") return;
-  state.data.delivery2 = normalizeDelivery2State(rawD2, state.data);
-  state.d2LastCursorSeq = Math.max(state.d2LastCursorSeq || 0, state.data.delivery2.seq || 1);
+function applyDelivery2ServerPayload(rawD2, { forceInitial = false } = {}) {
+  if (!rawD2 || typeof rawD2 !== "object") return false;
+  const normalized = normalizeDelivery2State(rawD2, state.data);
+  const incomingSeq = Math.max(1, Number(normalized.seq) || 1);
+  const currentSeq = Number(state.d2LastCursorSeq) || 0;
+  if (state.d2Loaded && !forceInitial && incomingSeq < currentSeq) {
+    return false;
+  }
+  state.data.delivery2 = normalized;
+  state.d2LastCursorSeq = Math.max(currentSeq, incomingSeq);
+  state.d2Loaded = true;
+  return true;
+}
+
+async function resumeDelivery2FromCursor() {
+  const sinceSeq = Math.max(0, Number(state.d2LastCursorSeq) || 0);
+  try {
+    const raw = await apiRequest(
+      "GET",
+      `/api/v1/delivery2/state?since_seq=${encodeURIComponent(String(sinceSeq))}`,
+    );
+    if (!raw || typeof raw !== "object") return false;
+    const incomingSeq = Math.max(1, Number(raw.seq ?? raw.cursor_seq) || 1);
+    if (raw.unchanged && state.d2Loaded && incomingSeq === sinceSeq) {
+      if (raw.sync_radar && state.data.delivery2) {
+        const norm = normalizeDelivery2State(raw, state.data);
+        state.data.delivery2.sync_radar = norm.sync_radar;
+        state.data.delivery2.status = norm.status;
+        state.data.delivery2.status_label = norm.status_label;
+        if (!state.d2Sending && !state.d2EditingMemId) {
+          renderDelivery2Panel();
+        }
+      }
+      return true;
+    }
+    const applied = applyDelivery2ServerPayload(raw);
+    if (applied && !state.d2Sending && !state.d2EditingMemId) {
+      renderDelivery2Panel();
+    }
+    return applied;
+  } catch (e) {
+    return false;
+  }
 }
 
 async function startNewDelivery2Thread() {
@@ -5736,13 +5827,18 @@ async function toggleSurfaceInThread(surfaceId, nextInThread) {
   renderDelivery2Panel();
 }
 
-async function triggerSurfaceOAuthFlow(surfaceId, decision = "connect", cardNode = null) {
+async function triggerSurfaceOAuthFlow(surfaceId, decision = "connect", cardNode = null, oauthMeta = null) {
   try {
-    const res = await apiRequest("POST", "/api/v1/delivery2/approval", {
+    const reqBody = {
       kind: "oauth",
       surface: surfaceId,
       decision,
-    });
+    };
+    if (oauthMeta && typeof oauthMeta === "object") {
+      if (!isAbsent(oauthMeta.oauth_state)) reqBody.oauth_state = String(oauthMeta.oauth_state);
+      if (!isAbsent(oauthMeta.thread_id)) reqBody.thread_id = String(oauthMeta.thread_id);
+    }
+    const res = await apiRequest("POST", "/api/v1/delivery2/approval", reqBody);
     if (res && res.state) applyDelivery2ServerPayload(res.state);
     if (decision === "connect" || decision === "retry") {
       state.d2Popover = null;
@@ -5754,11 +5850,11 @@ async function triggerSurfaceOAuthFlow(surfaceId, decision = "connect", cardNode
       }
       return;
     }
-    if (cardNode && (decision === "authorize" || decision === "skip")) {
+    if (cardNode && (decision === "verify" || decision === "skip")) {
       const label = res && res.surface_label ? res.surface_label : surfaceId;
       const receiptText =
-        decision === "authorize"
-          ? `${label} connected · 0 Cr while paused`
+        decision === "verify"
+          ? `${label} verified · 0 Cr while paused`
           : `Skipped ${label} sign-in for now · 0 Cr while paused`;
       await Motion.resolveBanner(cardNode, () => {
         clearNode(cardNode);
@@ -5768,7 +5864,7 @@ async function triggerSurfaceOAuthFlow(surfaceId, decision = "connect", cardNode
     }
     renderDelivery2Panel();
   } catch (err) {
-    toaster.show(err && err.message ? err.message : "Connection update failed.");
+    toaster.show(err && err.message ? err.message : "Connection verification failed.");
   }
 }
 
@@ -5926,6 +6022,10 @@ async function submitDelivery2Prompt(rawPrompt) {
 async function cancelDelivery2Turn() {
   if (!state.d2Sending && !state.d2ActiveStreamer) return false;
   const turnId = state.d2ActiveTurnId || "active";
+  const stoppedEntryId = state.d2StreamingEntryId || null;
+  const partialText = String(state.d2StreamingText || "");
+  const truncatedLen = stoppedEntryId ? Array.from(partialText).length : null;
+
   state.d2Sending = false;
   state.d2ActiveTurnId = null;
   if (state.d2ActiveAbort && typeof state.d2ActiveAbort.abort === "function") {
@@ -5938,12 +6038,30 @@ async function cancelDelivery2Turn() {
     state.d2ActiveStreamer.cancel();
   }
   state.d2ActiveStreamer = null;
+
+  if (stoppedEntryId && state.data && state.data.delivery2 && Array.isArray(state.data.delivery2.entries)) {
+    const healedPartial = healUnclosedInlineMarkdown(partialText);
+    const clampedBody = healedPartial.trim() ? healedPartial : "[Stopped]";
+    const targetEntry = state.data.delivery2.entries.find(
+      (e) => e && String(e.id) === String(stoppedEntryId),
+    );
+    if (targetEntry) {
+      targetEntry.body = clampedBody;
+      targetEntry.stopped = true;
+    }
+  }
+
   state.d2StreamingEntryId = null;
   state.d2StreamingText = "";
   renderDelivery2Panel();
 
   try {
-    const res = await apiRequest("POST", "/api/v1/delivery2/cancel", { turn_id: turnId });
+    const cancelPayload = { turn_id: turnId };
+    if (stoppedEntryId) {
+      cancelPayload.entry_id = stoppedEntryId;
+      cancelPayload.truncated_len = truncatedLen;
+    }
+    const res = await apiRequest("POST", "/api/v1/delivery2/cancel", cancelPayload);
     if (res && res.state) applyDelivery2ServerPayload(res.state);
     renderDelivery2Panel();
   } catch (err) {
@@ -6058,7 +6176,10 @@ function buildDelivery2ConnectionsPopover(d2) {
       el(
         "a",
         {
-          href: d2.links.security_url,
+          href: safeChinwagOutboundUrl(
+            d2.links && d2.links.security_url,
+            "https://chinwag.sh/security",
+          ),
           target: "_blank",
           rel: "noopener noreferrer",
           className: "d2-conn-link",
@@ -6068,7 +6189,10 @@ function buildDelivery2ConnectionsPopover(d2) {
       el(
         "a",
         {
-          href: d2.links.founders_url,
+          href: safeChinwagOutboundUrl(
+            d2.links && d2.links.founders_url,
+            "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
+          ),
           target: "_blank",
           rel: "noopener noreferrer",
           className: "d2-conn-link",
@@ -6268,13 +6392,22 @@ function renderDelivery2Entry(entry) {
       return cardNode;
     }
 
+    const safeChallengeUrl = safeChinwagOutboundUrl(
+      entry.challenge_url,
+      "https://chinwag.sh/open",
+    );
+    const activeThreadId =
+      entry.thread_id ||
+      (state.data && state.data.delivery2 && state.data.delivery2.active_thread_id) ||
+      "thr-main";
+
     const actions = el(
       "div",
       { className: "d2-hitl-actions" },
       el(
         "a",
         {
-          href: entry.challenge_url || "https://chinwag.sh/open",
+          href: safeChallengeUrl,
           target: "_blank",
           rel: "noopener noreferrer",
           className: "btn-primary btn-sm",
@@ -6282,10 +6415,14 @@ function renderDelivery2Entry(entry) {
         el("span", { className: "btn-label" }, `Connect ${entry.surface_label || "account"} ↗`),
       ),
       actionBtn({
-        label: "Mark connected",
+        label: "Re-check connection",
         variant: "secondary",
         size: "sm",
-        onClick: () => triggerSurfaceOAuthFlow(entry.surface, "authorize", cardNode),
+        onClick: () =>
+          triggerSurfaceOAuthFlow(entry.surface, "verify", cardNode, {
+            oauth_state: entry.oauth_state || "",
+            thread_id: activeThreadId,
+          }),
       }),
       actionBtn({
         label: "Skip",
@@ -6321,15 +6458,18 @@ function renderDelivery2Entry(entry) {
         className: "input d2-mem-edit-input",
         value: state.d2EditingMemDraft,
         "aria-label": "Edit saved memory note",
+        dataset: { memEditInput: memId },
         onInput: (ev) => {
           state.d2EditingMemDraft = ev.target.value;
         },
         onKeydown: (ev) => {
           if (ev.key === "Enter") {
             ev.preventDefault();
+            if (typeof ev.stopPropagation === "function") ev.stopPropagation();
             mutateDelivery2Memory(memId, "edit", state.d2EditingMemDraft);
           } else if (ev.key === "Escape") {
             ev.preventDefault();
+            if (typeof ev.stopPropagation === "function") ev.stopPropagation();
             state.d2EditingMemId = null;
             state.d2EditingMemDraft = "";
             renderDelivery2Panel();
@@ -6404,18 +6544,23 @@ function renderDelivery2Entry(entry) {
             {
               type: "button",
               className: "d2-micro-btn",
-              onClick: () => {
-                Motion.dipSwap(cardNode, () => {
+              onClick: async () => {
+                await Motion.dipSwap(cardNode, () => {
                   state.d2EditingMemId = memId;
                   state.d2EditingMemDraft = String(entry.note || "");
                   renderDelivery2Panel();
                 });
-                requestAnimationFrame(() => {
-                  const inp = cardNode.parentNode
-                    ? cardNode.parentNode.querySelector(".d2-mem-edit-input")
-                    : null;
-                  if (inp) inp.focus();
-                });
+                const track = dom.d2Track();
+                if (track) {
+                  const inputs = Array.from(track.querySelectorAll(".d2-mem-edit-input"));
+                  const inp =
+                    inputs.find((n) => n.dataset && n.dataset.memEditInput === memId) ||
+                    inputs[0] ||
+                    null;
+                  if (inp && typeof inp.focus === "function") {
+                    inp.focus();
+                  }
+                }
               },
             },
             "Edit",
@@ -6505,6 +6650,19 @@ function renderDelivery2Entry(entry) {
 function renderDelivery2Panel() {
   const track = dom.d2Track();
   const spine = dom.d2Spine();
+  const fixedToggle = dom.d2RailToggleFixed();
+  if (fixedToggle) {
+    const expandedNow = isDelivery2RailExpanded();
+    fixedToggle.setAttribute("aria-expanded", expandedNow ? "true" : "false");
+    fixedToggle.setAttribute(
+      "aria-label",
+      expandedNow ? "Collapse Delivery-2 panel (⌘B)" : "Expand Delivery-2 panel (⌘B)",
+    );
+    fixedToggle.setAttribute(
+      "title",
+      expandedNow ? "Collapse Delivery-2 (⌘B)" : "Expand Delivery-2 (⌘B)",
+    );
+  }
   if (!track && !spine) return;
 
   const d2 = state.data.delivery2 || createDefaultDelivery2State();
@@ -6923,7 +7081,7 @@ function bounceToDelivery2Run(runId = null) {
   const track = dom.d2Track();
   let targetCard = null;
   if (track) {
-    const cards = track.querySelectorAll(".d2-card");
+    const cards = Array.from(track.querySelectorAll(".d2-card"));
     if (runId) {
       targetCard = cards.find((c) => c.dataset && c.dataset.runId === runId) || null;
     }
@@ -7057,27 +7215,54 @@ function isEditableTarget(target) {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || Boolean(target.isContentEditable);
 }
 
+function findAncestorWithClass(node, cls) {
+  let cur = node;
+  while (cur) {
+    if (cur.className && typeof cur.className === "string") {
+      const parts = cur.className.split(/\s+/);
+      if (parts.includes(cls)) return cur;
+    }
+    cur = cur.parentNode || null;
+  }
+  return null;
+}
+
+function isFocusableInD2Drawer(node, rootTrack) {
+  if (!node || node.hidden || node.disabled) return false;
+  if (node.getAttribute("aria-disabled") === "true") return false;
+  if (node.getAttribute("aria-hidden") === "true") return false;
+  if (node.getAttribute("tabindex") === "-1") return false;
+  let cur = node.parentNode || null;
+  while (cur && cur !== rootTrack) {
+    if (cur.hidden || cur.getAttribute("aria-hidden") === "true") return false;
+    if (cur.dataset && cur.dataset.open === "false") return false;
+    cur = cur.parentNode || null;
+  }
+  return true;
+}
+
 function handleGlobalKeydown(ev) {
+  if (ev.defaultPrevented) return;
   const mod = Boolean(ev.metaKey || ev.ctrlKey);
   const activeNode = ev.target || (typeof document !== "undefined" ? document.activeElement : null);
 
   // Focus trap when < 960px Delivery-2 drawer is open
   if (ev.key === "Tab" && state.d2DrawerOpen && isNarrowDrawerViewport()) {
-    const rail = dom.d2Rail();
-    if (rail) {
-      const focusables = rail
-        .querySelectorAll("button, a, textarea, input")
-        .filter((n) => !n.hidden && n.getAttribute("aria-disabled") !== "true");
+    const track = dom.d2Track();
+    if (track) {
+      const focusables = Array.from(
+        track.querySelectorAll("button, a, textarea, input, select"),
+      ).filter((n) => isFocusableInD2Drawer(n, track));
       if (focusables.length > 0) {
         const first = focusables[0];
         const last = focusables[focusables.length - 1];
         const cur = typeof document !== "undefined" ? document.activeElement : null;
-        if (ev.shiftKey && (cur === first || !isNodeInsideD2Rail(cur))) {
+        if (ev.shiftKey && (cur === first || !focusables.includes(cur))) {
           ev.preventDefault();
           last.focus();
           return;
         }
-        if (!ev.shiftKey && (cur === last || !isNodeInsideD2Rail(cur))) {
+        if (!ev.shiftKey && (cur === last || !focusables.includes(cur))) {
           ev.preventDefault();
           first.focus();
           return;
@@ -7125,17 +7310,24 @@ function handleGlobalKeydown(ev) {
   // Cmd/Ctrl + Enter -> Region-scoped! Inside #d2-rail acts ONLY on Delivery-2, never Inbox sheet merge.
   if (mod && ev.key === "Enter") {
     if (isNodeInsideD2Rail(activeNode)) {
-      ev.preventDefault();
-      const d2Input = dom.d2ComposerInput();
-      const draft = d2Input ? String(d2Input.value || "").trim() : String(state.d2ComposerDraft || "").trim();
-      if (draft) {
-        submitDelivery2Prompt(draft);
+      if (activeNode && activeNode.id === "d2-composer-input") {
+        ev.preventDefault();
+        const draft = String(activeNode.value || state.d2ComposerDraft || "").trim();
+        if (draft) {
+          submitDelivery2Prompt(draft);
+        }
         return;
       }
-      const track = dom.d2Track();
-      const hitlBtn = track ? track.querySelector(".d2-hitl-primary") : null;
-      if (hitlBtn && hitlBtn.getAttribute("aria-disabled") !== "true" && !Motion.isArming(hitlBtn)) {
-        hitlBtn.click();
+      if (isEditableTarget(activeNode)) {
+        return;
+      }
+      const hitlCard = findAncestorWithClass(activeNode, "d2-hitl-card");
+      if (hitlCard) {
+        const hitlBtn = hitlCard.querySelector(".d2-hitl-primary");
+        if (hitlBtn && hitlBtn.getAttribute("aria-disabled") !== "true" && !Motion.isArming(hitlBtn)) {
+          ev.preventDefault();
+          hitlBtn.click();
+        }
       }
       return;
     }
@@ -7252,6 +7444,8 @@ async function refreshBootstrapQuietly() {
   try {
     const hadInFlightAtStart = (state.workflowSaveInFlight || 0) > 0;
     const startSaveSeq = state.workflowSaveSeq || 0;
+    const prevD2 = state.data ? state.data.delivery2 : null;
+    const prevSeq = Number(state.d2LastCursorSeq) || 0;
     const raw = await apiRequest("GET", "/api/v4/bootstrap");
     const fresh = normalizeBootstrap(raw);
     if (
@@ -7263,8 +7457,14 @@ async function refreshBootstrapQuietly() {
     } else {
       state.committedWorkflow = snapshotWorkflowState(fresh.agents);
     }
+    const incomingSeq = Math.max(1, Number(fresh.delivery2 && fresh.delivery2.seq) || 1);
+    if (state.d2Loaded && prevD2 && incomingSeq < prevSeq) {
+      fresh.delivery2 = prevD2;
+    } else {
+      state.d2LastCursorSeq = Math.max(prevSeq, incomingSeq);
+      state.d2Loaded = true;
+    }
     state.data = fresh;
-    state.d2LastCursorSeq = Math.max(state.d2LastCursorSeq || 0, fresh.delivery2.seq || 1);
     state.bootstrapOk = true;
     syncHeaderChrome();
     if (!state.d2Sending && !state.d2EditingMemId) {
@@ -7281,7 +7481,7 @@ function startPollingFallback() {
   state.transportMode = "poll_fallback";
   pollIntervalId = window.setInterval(() => {
     if (!document.hidden) {
-      refreshBootstrapQuietly().then((ok) => {
+      Promise.all([resumeDelivery2FromCursor(), refreshBootstrapQuietly()]).then(([, ok]) => {
         if (ok && !state.openItemId && state.view === "inbox") {
           renderCurrentView();
         }
@@ -7315,7 +7515,7 @@ async function connectLiveStream(attempt = 1) {
       if (streamRefreshInFlight) return;
       streamRefreshInFlight = true;
       try {
-        const ok = await refreshBootstrapQuietly();
+        const [, ok] = await Promise.all([resumeDelivery2FromCursor(), refreshBootstrapQuietly()]);
         if (ok && !state.openItemId && (state.view === "inbox" || state.view === "board")) {
           renderCurrentView();
         }
@@ -7323,6 +7523,11 @@ async function connectLiveStream(attempt = 1) {
         streamRefreshInFlight = false;
       }
     };
+    es.addEventListener("open", () => {
+      if (state.reconnectCount > 0) {
+        resumeDelivery2FromCursor();
+      }
+    });
     es.addEventListener("message", handleStreamNotification);
     es.addEventListener("bus_update", handleStreamNotification);
 
@@ -7396,10 +7601,19 @@ async function boot() {
   const btnD2Drawer = dom.btnD2Drawer();
   if (btnD2Drawer) btnD2Drawer.addEventListener("click", () => toggleDelivery2Rail("mobile_drawer_btn"));
 
+  const fixedRailBtn = dom.d2RailToggleFixed();
+  if (fixedRailBtn) {
+    clearNode(fixedRailBtn);
+    fixedRailBtn.appendChild(ICONS.rail());
+    fixedRailBtn.addEventListener("click", () => toggleDelivery2Rail("fixed_rail_toggle"));
+  }
+
   const d2Scrim = dom.d2DrawerScrim();
   if (d2Scrim) {
     d2Scrim.addEventListener("click", () => setDelivery2RailExpanded(false, { persist: false, animate: true }));
   }
+
+  syncDelivery2DrawerDom();
 
   document.addEventListener("click", (ev) => {
     if (!state.d2Popover) return;
@@ -7422,6 +7636,13 @@ async function boot() {
 
   window.addEventListener("resize", () => {
     syncDelivery2DrawerDom();
+    syncRailForOverlaySheet();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.booted) {
+      resumeDelivery2FromCursor();
+    }
   });
 
   const creditPill = dom.creditPill();
