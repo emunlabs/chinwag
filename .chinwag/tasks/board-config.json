@@ -6,9 +6,10 @@
   "project_title": "Chinwag Engineering Velocity & Agent Fleet",
   "project_url": "https://github.com/orgs/emunlabs/projects/1",
   "public_board": true,
-  "private_repo": null,
-  "public_repo": null,
+  "private_repo": "emunlabs/chinwag-tasks",
+  "public_repo": "emunlabs/chinwag",
   "repository_id": "R_kgDOVU4K-Q",
+  "private_repository_id": "R_kgDOVl5R3Q",
   "repository_name_with_owner": "emunlabs/chinwag",
   "status_field_id": "PVTSSF_lADOFJPsXM4BrFUVzhpZlZQ",
   "status_option_ids": {
@@ -22,6 +23,8 @@
     "Active Seats": "PVTF_lADOFJPsXM4BrFUVzhpZnRA",
     "Assignees": "PVTF_lADOFJPsXM4BrFUVzhpZlZM",
     "Chinwag Cycle Time": "PVTF_lADOFJPsXM4BrFUVzhpZnQ0",
+    "Closed": "PVTF_lADOFJPsXM4BrFUVzhpZlag",
+    "Created": "PVTF_lADOFJPsXM4BrFUVzhpZlaQ",
     "Cryptographic Receipt": "PVTF_lADOFJPsXM4BrFUVzhpZnRI",
     "DORA Baseline": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQw",
     "Execution Mode": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQ8",
@@ -29,9 +32,12 @@
     "Linked pull requests": "PVTF_lADOFJPsXM4BrFUVzhpZlZY",
     "Milestone": "PVTF_lADOFJPsXM4BrFUVzhpZlZg",
     "Net Hours Saved": "PVTF_lADOFJPsXM4BrFUVzhpZnQ4",
+    "Parent issue": "PVTF_lADOFJPsXM4BrFUVzhpZlaA",
     "Repository": "PVTF_lADOFJPsXM4BrFUVzhpZlZo",
     "Reviewers": "PVTF_lADOFJPsXM4BrFUVzhpZlZ4",
+    "Sub-issues progress": "PVTF_lADOFJPsXM4BrFUVzhpZlaI",
     "Title": "PVTF_lADOFJPsXM4BrFUVzhpZlZI",
+    "Updated": "PVTF_lADOFJPsXM4BrFUVzhpZlaY",
     "Δ Speedup vs. DORA": "PVTSSF_lADOFJPsXM4BrFUVzhpZnQs"
   },
   "custom_field_option_ids": {
@@ -63,14 +69,6 @@
     "SUB_ISSUES_PROGRESS": "PVTF_lADOFJPsXM4BrFUVzhpZlaI",
     "UPDATED": "PVTF_lADOFJPsXM4BrFUVzhpZlaY"
   },
-  "view_ids": {
-    "01_KANBAN_EXECUTION_BOARD": "PVTV_lADOFJPsXM4BrFUVzgMgEWo",
-    "02_VELOCITY_AND_DORA_LEDGER": "PVTV_lADOFJPsXM4BrFUVzgMgI98"
-  },
-  "view_layouts": {
-    "01_KANBAN_EXECUTION_BOARD": "BOARD_LAYOUT",
-    "02_VELOCITY_AND_DORA_LEDGER": "TABLE_LAYOUT"
-  },
   "synced_issue_node_ids": {
     "CHWG-0189": "I_kwDOVU4K-c8AAAABeK-k7Q",
     "CHWG-0190": "I_kwDOVU4K-c8AAAABeK-nKA",
@@ -92,6 +90,28 @@
     "CHWG-0206": "I_kwDOVU4K-c8AAAABeMaVZA",
     "CHWG-0207": "I_kwDOVU4K-c8AAAABeMacyA",
     "CHWG-0208": "I_kwDOVU4K-c8AAAABeMakqw"
+  },
+  "synced_issue_repos": {
+    "CHWG-0189": "emunlabs/chinwag",
+    "CHWG-0190": "emunlabs/chinwag",
+    "CHWG-0191": "emunlabs/chinwag",
+    "CHWG-0192": "emunlabs/chinwag",
+    "CHWG-0193": "emunlabs/chinwag",
+    "CHWG-0194": "emunlabs/chinwag",
+    "CHWG-0195": "emunlabs/chinwag",
+    "CHWG-0196": "emunlabs/chinwag",
+    "CHWG-0197": "emunlabs/chinwag",
+    "CHWG-0198": "emunlabs/chinwag",
+    "CHWG-0199": "emunlabs/chinwag",
+    "CHWG-0200": "emunlabs/chinwag",
+    "CHWG-0201": "emunlabs/chinwag",
+    "CHWG-0202": "emunlabs/chinwag",
+    "CHWG-0203": "emunlabs/chinwag",
+    "CHWG-0204": "emunlabs/chinwag",
+    "CHWG-0205": "emunlabs/chinwag",
+    "CHWG-0206": "emunlabs/chinwag",
+    "CHWG-0207": "emunlabs/chinwag",
+    "CHWG-0208": "emunlabs/chinwag"
   },
   "synced_issue_numbers": {
     "CHWG-0189": 19,
