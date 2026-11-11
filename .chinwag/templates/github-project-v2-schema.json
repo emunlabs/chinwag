@@ -3,10 +3,79 @@
   "version": "1.0.0",
   "title": "Chinwag Engineering Velocity & Agent Fleet",
   "org": "emunlabs",
-  "default_visibility": "private",
-  "public_board": false,
+  "default_visibility": "public",
+  "public_board": true,
   "private_repo": null,
   "public_repo": null,
+  "default_view_layout": "BOARD_LAYOUT",
+  "views": [
+    {
+      "number": 1,
+      "code": "01_KANBAN_EXECUTION_BOARD",
+      "name": "01 · Kanban Execution Board",
+      "layout": "BOARD_LAYOUT",
+      "group_by": "Status",
+      "vertical_group_by": null,
+      "sort_by": [
+        {
+          "field": "Status",
+          "direction": "ASC"
+        },
+        {
+          "field": "Net Hours Saved",
+          "direction": "DESC"
+        }
+      ],
+      "visible_fields": [
+        "Title",
+        "Assignees",
+        "Status",
+        "Labels",
+        "Sub-issues progress",
+        "DORA Baseline",
+        "Chinwag Cycle Time",
+        "Δ Speedup vs. DORA",
+        "Net Hours Saved",
+        "Execution Mode",
+        "Active Seats",
+        "Cryptographic Receipt"
+      ]
+    },
+    {
+      "number": 2,
+      "code": "02_VELOCITY_AND_DORA_LEDGER",
+      "name": "02 · Velocity & DORA Ledger",
+      "layout": "TABLE_LAYOUT",
+      "group_by": "Status",
+      "sort_by": [
+        {
+          "field": "Status",
+          "direction": "ASC"
+        },
+        {
+          "field": "Updated",
+          "direction": "DESC"
+        }
+      ],
+      "visible_fields": [
+        "Title",
+        "Assignees",
+        "Status",
+        "DORA Baseline",
+        "Chinwag Cycle Time",
+        "Δ Speedup vs. DORA",
+        "Net Hours Saved",
+        "Execution Mode",
+        "Active Seats",
+        "Cryptographic Receipt",
+        "Created",
+        "Updated",
+        "Closed",
+        "Parent issue",
+        "Sub-issues progress"
+      ]
+    }
+  ],
   "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
   "invariants": [
     "INV-DEFAULT-PRIVATE-BOARD-01",

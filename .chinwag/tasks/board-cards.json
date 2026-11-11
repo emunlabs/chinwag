@@ -2,11 +2,11 @@
   "schema": "chinwag.board.cards.v1",
   "project_id": "PVT_kwDOFJPsXM4BrFUV",
   "project_url": "https://github.com/orgs/emunlabs/projects/1",
-  "total_cards": 16,
+  "total_cards": 19,
   "shipped_cards": 9,
-  "total_dora_baseline_hours": 852.5,
-  "total_chinwag_cycle_hours": 4.9,
-  "total_net_hours_saved": 847.6,
+  "total_dora_baseline_hours": 938.0,
+  "total_chinwag_cycle_hours": 5.89,
+  "total_net_hours_saved": 932.11,
   "cards": [
     {
       "id": "CHWG-0189",
@@ -35,7 +35,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 19,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/19",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHrxhs"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHrxhs",
+      "decision_gate": {
+        "issue_id": "CHWG-0189",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369874231
+      }
     },
     {
       "id": "CHWG-0190",
@@ -63,7 +77,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 20,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/20",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHrxjc"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHrxjc",
+      "decision_gate": {
+        "issue_id": "CHWG-0190",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369876359
+      }
     },
     {
       "id": "CHWG-0191",
@@ -90,7 +118,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 21,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/21",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsqaU"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsqaU",
+      "decision_gate": {
+        "issue_id": "CHWG-0191",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369878488
+      }
     },
     {
       "id": "CHWG-0192",
@@ -117,7 +159,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 22,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/22",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsqk4"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsqk4",
+      "decision_gate": {
+        "issue_id": "CHWG-0192",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369880236
+      }
     },
     {
       "id": "CHWG-0193",
@@ -143,7 +199,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 23,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/23",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsqvw"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsqvw",
+      "decision_gate": {
+        "issue_id": "CHWG-0193",
+        "dora_tier_guess": "M",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 60.0,
+        "clairic_loc_median": 210.0,
+        "clairic_loc_p90": 440.0,
+        "clairic_burn_usd_median": 3.85,
+        "clairic_minutes_median": 55.0,
+        "clairic_ci_fail_prob_median": 0.12,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369882247
+      }
     },
     {
       "id": "CHWG-0194",
@@ -170,7 +240,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 24,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/24",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsq68"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsq68",
+      "decision_gate": {
+        "issue_id": "CHWG-0194",
+        "dora_tier_guess": "M",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 60.0,
+        "clairic_loc_median": 210.0,
+        "clairic_loc_p90": 440.0,
+        "clairic_burn_usd_median": 3.85,
+        "clairic_minutes_median": 55.0,
+        "clairic_ci_fail_prob_median": 0.12,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369884231
+      }
     },
     {
       "id": "CHWG-0195",
@@ -198,7 +282,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 25,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/25",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsrFw"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsrFw",
+      "decision_gate": {
+        "issue_id": "CHWG-0195",
+        "dora_tier_guess": "XL",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 420.0,
+        "clairic_loc_median": 1250.0,
+        "clairic_loc_p90": 2400.0,
+        "clairic_burn_usd_median": 14.2,
+        "clairic_minutes_median": 145.0,
+        "clairic_ci_fail_prob_median": 0.21,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369886169
+      }
     },
     {
       "id": "CHWG-0196",
@@ -225,7 +323,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 26,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/26",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsrTA"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsrTA",
+      "decision_gate": {
+        "issue_id": "CHWG-0196",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369887901
+      }
     },
     {
       "id": "CHWG-0197",
@@ -253,7 +365,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 27,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/27",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsre0"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsre0",
+      "decision_gate": {
+        "issue_id": "CHWG-0197",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369890647
+      }
     },
     {
       "id": "CHWG-0198",
@@ -282,7 +408,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 28,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/28",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsrqw"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsrqw",
+      "decision_gate": {
+        "issue_id": "CHWG-0198",
+        "dora_tier_guess": "M",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 60.0,
+        "clairic_loc_median": 210.0,
+        "clairic_loc_p90": 440.0,
+        "clairic_burn_usd_median": 3.85,
+        "clairic_minutes_median": 55.0,
+        "clairic_ci_fail_prob_median": 0.12,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369893162
+      }
     },
     {
       "id": "CHWG-0199",
@@ -310,7 +450,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 29,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/29",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsrx8"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsrx8",
+      "decision_gate": {
+        "issue_id": "CHWG-0199",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.1287,
+        "clef_redaction_clean_score": 0.453,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369895240
+      }
     },
     {
       "id": "CHWG-0200",
@@ -337,7 +491,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 30,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/30",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsr4o"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHsr4o",
+      "decision_gate": {
+        "issue_id": "CHWG-0200",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369896990
+      }
     },
     {
       "id": "CHWG-0201",
@@ -362,7 +530,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 31,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/31",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHssAI"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHssAI",
+      "decision_gate": {
+        "issue_id": "CHWG-0201",
+        "dora_tier_guess": "S",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 20.0,
+        "clairic_loc_median": 65.0,
+        "clairic_loc_p90": 140.0,
+        "clairic_burn_usd_median": 1.4,
+        "clairic_minutes_median": 22.0,
+        "clairic_ci_fail_prob_median": 0.08,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369898873
+      }
     },
     {
       "id": "CHWG-0202",
@@ -390,7 +572,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 32,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/32",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHs6j4"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHs6j4",
+      "decision_gate": {
+        "issue_id": "CHWG-0202",
+        "dora_tier_guess": "XL",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 420.0,
+        "clairic_loc_median": 1250.0,
+        "clairic_loc_p90": 2400.0,
+        "clairic_burn_usd_median": 14.2,
+        "clairic_minutes_median": 145.0,
+        "clairic_ci_fail_prob_median": 0.21,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369901109
+      }
     },
     {
       "id": "CHWG-0203",
@@ -422,7 +618,21 @@
       "trigger_source": "board_push",
       "github_issue_number": 33,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/33",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHtNw4"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHtNw4",
+      "decision_gate": {
+        "issue_id": "CHWG-0203",
+        "dora_tier_guess": "XL",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 420.0,
+        "clairic_loc_median": 1250.0,
+        "clairic_loc_p90": 2400.0,
+        "clairic_burn_usd_median": 14.2,
+        "clairic_minutes_median": 145.0,
+        "clairic_ci_fail_prob_median": 0.21,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369903259
+      }
     },
     {
       "id": "CHWG-0204",
@@ -450,7 +660,152 @@
       "trigger_source": "board_push",
       "github_issue_number": 34,
       "github_issue_url": "https://github.com/emunlabs/chinwag/issues/34",
-      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHs63c"
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHs63c",
+      "decision_gate": {
+        "issue_id": "CHWG-0204",
+        "dora_tier_guess": "M",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 60.0,
+        "clairic_loc_median": 210.0,
+        "clairic_loc_p90": 440.0,
+        "clairic_burn_usd_median": 3.85,
+        "clairic_minutes_median": 55.0,
+        "clairic_ci_fail_prob_median": 0.12,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369905566
+      }
+    },
+    {
+      "id": "CHWG-0205",
+      "ticket_code": null,
+      "title": "CHWG-0205: GitHub Projects v2 Kanban Board View (BOARD_LAYOUT) & Turnkey Dual-View .json Schema Templates",
+      "status": "03_IN_FLIGHT",
+      "column_header": "03 · ⚡ IN FLIGHT — CLOCK LIVE",
+      "dora_tier": "M",
+      "dora_baseline": "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)",
+      "baseline_hours": 27.0,
+      "chinwag_cycle_time": "In Flight · 19m 40s · 260 LOC",
+      "delta_speedup_vs_dora": "⏱️ Clock Running — In Flight",
+      "net_hours_saved": 26.67,
+      "execution_mode": "🌐 Subagent Swarm · Cloud Fan-Out",
+      "active_seats": "■ DEX · ■ INFRAJR · ■ TYPE · ■ MOTION · ■ DOCS · ■ QA",
+      "assigned_seats": [
+        "DEX",
+        "INFRAJR",
+        "TYPE",
+        "MOTION",
+        "DOCS",
+        "QA"
+      ],
+      "cryptographic_receipt": "⚡ In Flight — Dual-View Kanban & Table Schema",
+      "t_claim_ms": 1794368900000,
+      "t_ship_ms": 0,
+      "trigger_source": "board_push",
+      "github_issue_number": 35,
+      "github_issue_url": "https://github.com/emunlabs/chinwag/issues/35",
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHtPsI",
+      "decision_gate": {
+        "issue_id": "CHWG-0205",
+        "dora_tier_guess": "M",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 60.0,
+        "clairic_loc_median": 210.0,
+        "clairic_loc_p90": 440.0,
+        "clairic_burn_usd_median": 3.85,
+        "clairic_minutes_median": 55.0,
+        "clairic_ci_fail_prob_median": 0.12,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369907282
+      }
+    },
+    {
+      "id": "CHWG-0206",
+      "ticket_code": null,
+      "title": "CHWG-0206: Autonomous Delivery Decision Gate & Scrum Master Transition — Calibrated Risk/Interval Scoring on Every Board Transition",
+      "status": "03_IN_FLIGHT",
+      "column_header": "03 · ⚡ IN FLIGHT — CLOCK LIVE",
+      "dora_tier": "L",
+      "dora_baseline": "Tier L · 50h Eng / 6.2d Cal (400–1,200 LOC)",
+      "baseline_hours": 50.0,
+      "chinwag_cycle_time": "In Flight · 19m 40s · 520 LOC",
+      "delta_speedup_vs_dora": "⏱️ Clock Running — In Flight",
+      "net_hours_saved": 49.67,
+      "execution_mode": "🌐 Subagent Swarm · Cloud Fan-Out",
+      "active_seats": "■ ARCHITECT · ■ RUST · ■ DEX · ■ INFRAJR · ■ DOCS · ■ QA",
+      "assigned_seats": [
+        "ARCHITECT",
+        "RUST",
+        "DEX",
+        "INFRAJR",
+        "DOCS",
+        "QA"
+      ],
+      "cryptographic_receipt": "⚡ In Flight — Calibrated Decision Gate Scoring",
+      "t_claim_ms": 1794368950000,
+      "t_ship_ms": 0,
+      "trigger_source": "board_push",
+      "github_issue_number": 36,
+      "github_issue_url": "https://github.com/emunlabs/chinwag/issues/36",
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHtPyY",
+      "decision_gate": {
+        "issue_id": "CHWG-0206",
+        "dora_tier_guess": "L",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 180.0,
+        "clairic_loc_median": 560.0,
+        "clairic_loc_p90": 1150.0,
+        "clairic_burn_usd_median": 7.5,
+        "clairic_minutes_median": 95.0,
+        "clairic_ci_fail_prob_median": 0.16,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369909008
+      }
+    },
+    {
+      "id": "CHWG-0207",
+      "ticket_code": null,
+      "title": "CHWG-0207: Fix /delivery .dt-codebox-bar 3-Tab Header Alignment & Remove Cryptic 0 Cr Board Sync Badge",
+      "status": "03_IN_FLIGHT",
+      "column_header": "03 · ⚡ IN FLIGHT — CLOCK LIVE",
+      "dora_tier": "S",
+      "dora_baseline": "Tier S · 8.5h Eng / 1.1d Cal (<=100 LOC)",
+      "baseline_hours": 8.5,
+      "chinwag_cycle_time": "In Flight · 19m 40s · 85 LOC",
+      "delta_speedup_vs_dora": "⏱️ Clock Running — In Flight",
+      "net_hours_saved": 8.17,
+      "execution_mode": "🌐 Subagent Swarm · Cloud Fan-Out",
+      "active_seats": "■ TYPE · ■ MOTION · ■ DEX · ■ INFRAJR · ■ QA",
+      "assigned_seats": [
+        "TYPE",
+        "MOTION",
+        "DEX",
+        "INFRAJR",
+        "QA"
+      ],
+      "cryptographic_receipt": "⚡ In Flight — /delivery 3-Tab Single-Row Header Fix",
+      "t_claim_ms": 1794369000000,
+      "t_ship_ms": 0,
+      "trigger_source": "board_push",
+      "github_issue_number": 37,
+      "github_issue_url": "https://github.com/emunlabs/chinwag/issues/37",
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHtP5g",
+      "decision_gate": {
+        "issue_id": "CHWG-0207",
+        "dora_tier_guess": "S",
+        "clef_max_trigger": 0.3475,
+        "clef_redaction_clean_score": 0.7649,
+        "clairic_loc_p10": 20.0,
+        "clairic_loc_median": 65.0,
+        "clairic_loc_p90": 140.0,
+        "clairic_burn_usd_median": 1.4,
+        "clairic_minutes_median": 22.0,
+        "clairic_ci_fail_prob_median": 0.08,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794369911329
+      }
     }
   ]
 }

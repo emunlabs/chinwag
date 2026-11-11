@@ -1,0 +1,42 @@
+{
+  "schema": "chinwag.surface-impact.v1",
+  "ticket_id": "CHWG-0207",
+  "title": "CHWG-0207: Fix /delivery .dt-codebox-bar 3-Tab Header Alignment & Remove Cryptic 0 Cr Board Sync Badge",
+  "dora_tier": "S",
+  "dora_baseline_hours": 8.5,
+  "surfaces": {
+    "code_cli": {
+      "status": "n/a",
+      "paths": []
+    },
+    "readme": {
+      "status": "n/a",
+      "paths": []
+    },
+    "docs_site": {
+      "status": "n/a",
+      "paths": []
+    },
+    "marketing_site": {
+      "status": "required",
+      "paths": [
+        "scripts/site-v1/pages/delivery.html",
+        "css/site.css"
+      ]
+    },
+    "telemetry_proxy": {
+      "status": "required",
+      "paths": [
+        "src/posthog-proxy.mjs",
+        "test/edge-proxy.test.mjs"
+      ]
+    },
+    "ui_qa": {
+      "status": "required",
+      "viewports": [
+        "1440x900",
+        "390x844"
+      ]
+    }
+  }
+}

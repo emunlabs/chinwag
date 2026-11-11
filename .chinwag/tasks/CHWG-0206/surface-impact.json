@@ -1,0 +1,49 @@
+{
+  "schema": "chinwag.surface-impact.v1",
+  "ticket_id": "CHWG-0206",
+  "title": "CHWG-0206: Autonomous Delivery Decision Gate & Scrum Master Transition — Calibrated Risk/Interval Scoring on Every Board Transition",
+  "dora_tier": "L",
+  "dora_baseline_hours": 50.0,
+  "surfaces": {
+    "code_cli": {
+      "status": "required",
+      "paths": [
+        "crates/chinwag-cli/src/board/mod.rs",
+        ".chinwag/tasks/board-cards.json",
+        ".chinwag/tasks/decision-gate-cache.json"
+      ]
+    },
+    "readme": {
+      "status": "required",
+      "paths": [
+        "README.md"
+      ]
+    },
+    "docs_site": {
+      "status": "required",
+      "paths": [
+        "src/worker.mjs"
+      ]
+    },
+    "marketing_site": {
+      "status": "required",
+      "paths": [
+        "scripts/site-v1/pages/delivery.html"
+      ]
+    },
+    "telemetry_proxy": {
+      "status": "required",
+      "paths": [
+        "src/posthog-proxy.mjs",
+        "test/edge-proxy.test.mjs"
+      ]
+    },
+    "ui_qa": {
+      "status": "required",
+      "viewports": [
+        "1440x900",
+        "390x844"
+      ]
+    }
+  }
+}

@@ -1427,6 +1427,10 @@ pub struct BoardConfigV1 {
     #[serde(default)]
     pub system_field_ids: BTreeMap<String, String>,
     #[serde(default)]
+    pub view_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub view_layouts: BTreeMap<String, String>,
+    #[serde(default)]
     pub synced_issue_node_ids: BTreeMap<String, String>,
     #[serde(default)]
     pub synced_issue_numbers: BTreeMap<String, u64>,
@@ -1464,6 +1468,8 @@ impl Default for BoardConfigV1 {
             custom_field_ids: BTreeMap::new(),
             custom_field_option_ids: BTreeMap::new(),
             system_field_ids,
+            view_ids: BTreeMap::new(),
+            view_layouts: BTreeMap::new(),
             synced_issue_node_ids: BTreeMap::new(),
             synced_issue_numbers: BTreeMap::new(),
             synced_issue_urls: BTreeMap::new(),
@@ -1501,6 +1507,63 @@ pub fn build_github_project_v2_template_schema(cfg: &BoardConfigV1) -> Value {
         "public_board": cfg.public_board,
         "private_repo": cfg.private_repo,
         "public_repo": cfg.public_repo,
+        "default_view_layout": "BOARD_LAYOUT",
+        "views": [
+            {
+                "number": 1,
+                "code": "01_KANBAN_EXECUTION_BOARD",
+                "name": "01 · Kanban Execution Board",
+                "layout": "BOARD_LAYOUT",
+                "group_by": "Status",
+                "vertical_group_by": null,
+                "sort_by": [
+                    { "field": "Status", "direction": "ASC" },
+                    { "field": "Net Hours Saved", "direction": "DESC" }
+                ],
+                "visible_fields": [
+                    "Title",
+                    "Assignees",
+                    "Status",
+                    "Labels",
+                    "Sub-issues progress",
+                    "DORA Baseline",
+                    "Chinwag Cycle Time",
+                    "Δ Speedup vs. DORA",
+                    "Net Hours Saved",
+                    "Execution Mode",
+                    "Active Seats",
+                    "Cryptographic Receipt"
+                ]
+            },
+            {
+                "number": 2,
+                "code": "02_VELOCITY_AND_DORA_LEDGER",
+                "name": "02 · Velocity & DORA Ledger",
+                "layout": "TABLE_LAYOUT",
+                "group_by": "Status",
+                "sort_by": [
+                    { "field": "Status", "direction": "ASC" },
+                    { "field": "Updated", "direction": "DESC" }
+                ],
+                "visible_fields": [
+                    "Title",
+                    "Assignees",
+                    "Status",
+                    "DORA Baseline",
+                    "Chinwag Cycle Time",
+                    "Δ Speedup vs. DORA",
+                    "Net Hours Saved",
+                    "Execution Mode",
+                    "Active Seats",
+                    "Cryptographic Receipt",
+                    "Created",
+                    "Updated",
+                    "Closed",
+                    "Parent issue",
+                    "Sub-issues progress"
+                ]
+            }
+        ],
         "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
         "invariants": [
             "INV-DEFAULT-PRIVATE-BOARD-01",
@@ -1657,6 +1720,24 @@ pub fn build_linear_template_schema(cfg: &BoardConfigV1) -> Value {
         "team_name": cfg.project_title,
         "default_visibility": if cfg.public_board { "public" } else { "private" },
         "public_board": cfg.public_board,
+        "default_view_layout": "board",
+        "views": [
+            {
+                "number": 1,
+                "code": "01_KANBAN_EXECUTION_BOARD",
+                "name": "01 · Kanban Execution Board",
+                "layout": "board",
+                "group_by": "workflow_state",
+                "show_sub_issues": true
+            },
+            {
+                "number": 2,
+                "code": "02_VELOCITY_AND_DORA_LEDGER",
+                "name": "02 · Velocity & DORA Ledger",
+                "layout": "list",
+                "group_by": "workflow_state"
+            }
+        ],
         "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
         "invariants": [
             "INV-DEFAULT-PRIVATE-BOARD-01",
@@ -2388,6 +2469,13 @@ query($projectId: ID!) {
         }
     }
 
+    let (view_ids, view_layouts) = ensure_github_project_v2_views_live(
+        &project_id,
+        status_field_id.as_deref(),
+        &custom_field_ids,
+        &system_field_ids,
+    );
+
     let mut cfg = BoardConfigV1::load(tasks_dir).unwrap_or_default();
     cfg.org = org.to_string();
     cfg.project_id = project_id;
@@ -2408,9 +2496,155 @@ query($projectId: ID!) {
     cfg.custom_field_ids = custom_field_ids;
     cfg.custom_field_option_ids = custom_field_option_ids;
     cfg.system_field_ids = system_field_ids;
+    cfg.view_ids = view_ids;
+    cfg.view_layouts = view_layouts;
     cfg.save(tasks_dir)?;
     let _ = write_board_template_pack(tasks_dir, &cfg);
     Ok(cfg)
+}
+
+/// Ensures the GitHub Projects v2 board has View 1 provisioned as `"01 · Kanban Execution Board"` (`BOARD_LAYOUT`)
+/// and View 2 provisioned as `"02 · Velocity & DORA Ledger"` (`TABLE_LAYOUT`).
+pub fn ensure_github_project_v2_views_live(
+    project_id: &str,
+    _status_field_id: Option<&str>,
+    _custom_field_ids: &BTreeMap<String, String>,
+    _system_field_ids: &BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut view_ids = BTreeMap::new();
+    let mut view_layouts = BTreeMap::new();
+
+    let views_q = r#"
+query($projectId: ID!) {
+  node(id: $projectId) {
+    ... on ProjectV2 {
+      views(first: 20) {
+        nodes {
+          id
+          name
+          number
+          layout
+        }
+      }
+    }
+  }
+}
+"#;
+    let mut view1_id: Option<String> = None;
+    let mut view2_id: Option<String> = None;
+
+    if let Ok(v_resp) = execute_gh_graphql(views_q, &[("projectId", project_id)])
+        && let Some(nodes) = v_resp
+            .get("data")
+            .and_then(|d| d.get("node"))
+            .and_then(|n| n.get("views"))
+            .and_then(|v| v.get("nodes"))
+            .and_then(|a| a.as_array())
+    {
+        for node in nodes {
+            let vid = node
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let vname = node
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let vnum = node.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+            if vid.is_empty() {
+                continue;
+            }
+            if vnum == 1 || vname == "01 · Kanban Execution Board" {
+                view1_id = Some(vid);
+            } else if vnum == 2 || vname == "02 · Velocity & DORA Ledger" {
+                view2_id = Some(vid);
+            }
+        }
+    }
+
+    if let Some(ref vid1) = view1_id {
+        let update_v1_q = r#"
+mutation($viewId: ID!) {
+  updateProjectV2View(input: {
+    viewId: $viewId,
+    name: "01 · Kanban Execution Board",
+    layout: BOARD_LAYOUT
+  }) {
+    projectV2View {
+      id
+      name
+      layout
+    }
+  }
+}
+"#;
+        let _ = execute_gh_graphql(update_v1_q, &[("viewId", vid1)]);
+        view_ids.insert("01_KANBAN_EXECUTION_BOARD".to_string(), vid1.clone());
+        view_layouts.insert(
+            "01_KANBAN_EXECUTION_BOARD".to_string(),
+            "BOARD_LAYOUT".to_string(),
+        );
+    }
+
+    if let Some(ref vid2) = view2_id {
+        let update_v2_q = r#"
+mutation($viewId: ID!) {
+  updateProjectV2View(input: {
+    viewId: $viewId,
+    name: "02 · Velocity & DORA Ledger",
+    layout: TABLE_LAYOUT
+  }) {
+    projectV2View {
+      id
+      name
+      layout
+    }
+  }
+}
+"#;
+        let _ = execute_gh_graphql(update_v2_q, &[("viewId", vid2)]);
+        view_ids.insert("02_VELOCITY_AND_DORA_LEDGER".to_string(), vid2.clone());
+        view_layouts.insert(
+            "02_VELOCITY_AND_DORA_LEDGER".to_string(),
+            "TABLE_LAYOUT".to_string(),
+        );
+    } else {
+        let create_v2_q = r#"
+mutation($projectId: ID!) {
+  createProjectV2View(input: {
+    projectId: $projectId,
+    name: "02 · Velocity & DORA Ledger",
+    layout: TABLE_LAYOUT
+  }) {
+    projectV2View {
+      id
+      name
+      layout
+    }
+  }
+}
+"#;
+        if let Ok(c_resp) = execute_gh_graphql(create_v2_q, &[("projectId", project_id)])
+            && let Some(new_id) = c_resp
+                .get("data")
+                .and_then(|d| d.get("createProjectV2View"))
+                .and_then(|c| c.get("projectV2View"))
+                .and_then(|p| p.get("id"))
+                .and_then(|v| v.as_str())
+        {
+            view_ids.insert(
+                "02_VELOCITY_AND_DORA_LEDGER".to_string(),
+                new_id.to_string(),
+            );
+            view_layouts.insert(
+                "02_VELOCITY_AND_DORA_LEDGER".to_string(),
+                "TABLE_LAYOUT".to_string(),
+            );
+        }
+    }
+
+    (view_ids, view_layouts)
 }
 
 fn execution_mode_label_for_seats(seat_count: usize) -> &'static str {
@@ -2598,6 +2832,25 @@ pub fn push_github_project_v2_live(
                 .ok_or_else(|| "missing repository_id for emunlabs/chinwag".to_string())?
         }
     };
+
+    if cfg.view_ids.is_empty()
+        || cfg
+            .view_layouts
+            .get("01_KANBAN_EXECUTION_BOARD")
+            .map(|l| l != "BOARD_LAYOUT")
+            .unwrap_or(true)
+    {
+        let (v_ids, v_layouts) = ensure_github_project_v2_views_live(
+            &cfg.project_id,
+            cfg.status_field_id.as_deref(),
+            &cfg.custom_field_ids,
+            &cfg.system_field_ids,
+        );
+        if !v_ids.is_empty() {
+            cfg.view_ids = v_ids;
+            cfg.view_layouts = v_layouts;
+        }
+    }
 
     // Fetch existing repository issues so we never duplicate an issue
     let list_q = r#"
@@ -3284,6 +3537,9 @@ pub fn run_board_sync_loop(
         None
     };
 
+    let cfg = BoardConfigV1::load(&tasks_dir);
+    let _ = sync_board_cards_ledger(&tasks_dir, &updated_issues, cfg.as_ref());
+
     let elapsed_ms = start_instant.elapsed().as_millis() as u64;
     let payload = json!({
         "ok": true,
@@ -3645,6 +3901,205 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
     0
 }
 
+/// Calibrated decision-model risk and interval assessment (`CHWG-0206`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionGateAssessmentV1 {
+    pub issue_id: String,
+    pub dora_tier_guess: String,
+    pub clef_max_trigger: f64,
+    pub clef_redaction_clean_score: f64,
+    pub clairic_loc_p10: f64,
+    pub clairic_loc_median: f64,
+    pub clairic_loc_p90: f64,
+    pub clairic_burn_usd_median: f64,
+    pub clairic_minutes_median: f64,
+    pub clairic_ci_fail_prob_median: f64,
+    pub system2_escalated: bool,
+    pub evaluated_at_ms: u64,
+}
+
+/// Evaluates `DecisionGateAssessmentV1` for an `AtomicTaskIssue`, consulting `.chinwag/tasks/decision-gate-cache.json`
+/// first and invoking `/Users/brianspector/.local/bin/delivery-agent` (`clef` + `clairic`, escalating on `clef_max_trigger >= 0.50`)
+/// on cache miss when live board configuration is active.
+pub fn evaluate_issue_decision_gate(
+    tasks_dir: &Path,
+    issue: &AtomicTaskIssue,
+    commit_boundary: bool,
+) -> DecisionGateAssessmentV1 {
+    let cache_path = tasks_dir.join("decision-gate-cache.json");
+    let loc_val = issue.loc_changed.unwrap_or(180);
+    let cache_key = format!("{}:{}:{}", issue.id, issue.status.as_code(), loc_val);
+
+    let mut cache_map: BTreeMap<String, DecisionGateAssessmentV1> = fs::read_to_string(&cache_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+
+    if let Some(existing) = cache_map.get(&cache_key) {
+        return existing.clone();
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1_794_368_000_000);
+
+    let (default_p10, default_med, default_p90, default_usd, default_mins, default_fail_prob) =
+        match issue.dora_tier {
+            DoraTier::S => (20.0, 65.0, 140.0, 1.40, 22.0, 0.08),
+            DoraTier::M => (60.0, 210.0, 440.0, 3.85, 55.0, 0.12),
+            DoraTier::L => (180.0, 560.0, 1150.0, 7.50, 95.0, 0.16),
+            DoraTier::XL => (420.0, 1250.0, 2400.0, 14.20, 145.0, 0.21),
+        };
+
+    let mut assessment = DecisionGateAssessmentV1 {
+        issue_id: issue.id.clone(),
+        dora_tier_guess: issue.dora_tier.as_str().to_string(),
+        clef_max_trigger: 0.18,
+        clef_redaction_clean_score: 0.96,
+        clairic_loc_p10: default_p10,
+        clairic_loc_median: default_med,
+        clairic_loc_p90: default_p90,
+        clairic_burn_usd_median: default_usd,
+        clairic_minutes_median: default_mins,
+        clairic_ci_fail_prob_median: default_fail_prob,
+        system2_escalated: false,
+        evaluated_at_ms: now_ms,
+    };
+
+    let delivery_agent_bin = Path::new("/Users/brianspector/.local/bin/delivery-agent");
+    let live_enabled = (tasks_dir.join("board-config.json").exists()
+        || std::env::var("CHINWAG_DECISION_GATE_LIVE").as_deref() == Ok("1"))
+        && std::env::var("CHINWAG_DECISION_GATE_OFFLINE").as_deref() != Ok("1");
+
+    if delivery_agent_bin.is_file() && live_enabled {
+        let state_json = json!({
+            "issue_id": issue.id,
+            "title": issue.title,
+            "status": issue.status.as_code(),
+            "dora_tier": issue.dora_tier.as_str(),
+            "loc_changed": loc_val,
+            "assigned_seats": issue.assigned_seats,
+        })
+        .to_string();
+
+        let mut clef_cmd = std::process::Command::new(delivery_agent_bin);
+        clef_cmd.args(["clef", "--prompt", &state_json]);
+        if commit_boundary {
+            clef_cmd.arg("--commit-boundary");
+        }
+        if let Ok(out) = clef_cmd.output()
+            && out.status.success()
+            && let Ok(val) = serde_json::from_slice::<Value>(&out.stdout)
+        {
+            let answers = val
+                .get("result")
+                .and_then(|r| r.get("answers"))
+                .or_else(|| val.get("answers"));
+            if let Some(ans_obj) = answers.and_then(|a| a.as_object()) {
+                let mut max_trig: f64 = 0.0;
+                for (k, v) in ans_obj {
+                    let score = v
+                        .get("noul")
+                        .and_then(|n| n.as_f64())
+                        .or_else(|| v.as_f64());
+                    if let Some(s) = score {
+                        if k == "public_board_redaction_clean" {
+                            assessment.clef_redaction_clean_score =
+                                (s * 10000.0).round() / 10000.0;
+                        } else if s > max_trig {
+                            max_trig = s;
+                        }
+                    }
+                }
+                if max_trig > 0.0 {
+                    assessment.clef_max_trigger = (max_trig * 10000.0).round() / 10000.0;
+                }
+            }
+        }
+
+        let clairic_prompt = format!(
+            "{}: {} (Tier {} · {} LOC)",
+            issue.id,
+            issue.title,
+            issue.dora_tier.as_str(),
+            loc_val
+        );
+        if let Ok(out) = std::process::Command::new(delivery_agent_bin)
+            .args(["clairic", "--prompt", &clairic_prompt])
+            .output()
+            && out.status.success()
+            && let Ok(val) = serde_json::from_slice::<Value>(&out.stdout)
+        {
+            let answers = val
+                .get("result")
+                .and_then(|r| r.get("answers"))
+                .or_else(|| val.get("answers"));
+            if let Some(ans) = answers {
+                if let Some(loc_est) = ans.get("estimated_loc_diff") {
+                    if let Some(p10) = loc_est.get("p10").and_then(|v| v.as_f64()) {
+                        assessment.clairic_loc_p10 = (p10 * 100.0).round() / 100.0;
+                    }
+                    if let Some(med) = loc_est.get("median").and_then(|v| v.as_f64()) {
+                        assessment.clairic_loc_median = (med * 100.0).round() / 100.0;
+                    }
+                    if let Some(p90) = loc_est.get("p90").and_then(|v| v.as_f64()) {
+                        assessment.clairic_loc_p90 = (p90 * 100.0).round() / 100.0;
+                    }
+                }
+                if let Some(burn_med) = ans
+                    .get("estimated_token_burn_usd")
+                    .and_then(|b| b.get("median"))
+                    .and_then(|v| v.as_f64())
+                {
+                    assessment.clairic_burn_usd_median = (burn_med * 100.0).round() / 100.0;
+                }
+                if let Some(mins_med) = ans
+                    .get("estimated_minutes_to_merge")
+                    .and_then(|m| m.get("median"))
+                    .and_then(|v| v.as_f64())
+                {
+                    assessment.clairic_minutes_median = (mins_med * 100.0).round() / 100.0;
+                }
+                if let Some(fail_med) = ans
+                    .get("ci_failure_probability")
+                    .and_then(|c| c.get("median"))
+                    .and_then(|v| v.as_f64())
+                {
+                    assessment.clairic_ci_fail_prob_median = (fail_med * 10000.0).round() / 10000.0;
+                }
+                if let Some(guess) = ans
+                    .get("dora_complexity_tier")
+                    .and_then(|d| d.get("guess"))
+                    .and_then(|v| v.as_str())
+                {
+                    let clean_guess = guess.trim().to_ascii_uppercase();
+                    if matches!(clean_guess.as_str(), "S" | "M" | "L" | "XL") {
+                        assessment.dora_tier_guess = clean_guess;
+                    }
+                }
+            }
+        }
+
+        if assessment.clef_max_trigger >= 0.50 {
+            assessment.system2_escalated = true;
+            if std::env::var("CHINWAG_DECISION_GATE_WAKE_SYS2").as_deref() == Ok("1") {
+                let _ = std::process::Command::new(delivery_agent_bin)
+                    .args(["telemetry-gate", "--prompt", &state_json])
+                    .output();
+            }
+        }
+    }
+
+    cache_map.insert(cache_key, assessment.clone());
+    if let Ok(serialized) = serde_json::to_string_pretty(&cache_map) {
+        let _ = fs::create_dir_all(tasks_dir);
+        let _ = fs::write(&cache_path, format!("{serialized}\n"));
+    }
+
+    assessment
+}
+
 /// Canonical card entry in `.chinwag/tasks/board-cards.json` (`chinwag.board.cards.v1`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardCardEntryV1 {
@@ -3673,6 +4128,8 @@ pub struct BoardCardEntryV1 {
     pub github_issue_url: Option<String>,
     #[serde(default)]
     pub project_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_gate: Option<DecisionGateAssessmentV1>,
 }
 
 /// Persistent ledger of all board cards and cumulative `Net Hours Saved` (`.chinwag/tasks/board-cards.json`).
@@ -3743,6 +4200,7 @@ impl BoardCardsLedgerV1 {
 }
 
 fn card_entry_from_issue(
+    tasks_dir: &Path,
     issue: &AtomicTaskIssue,
     cfg: Option<&BoardConfigV1>,
     existing_trigger: Option<&str>,
@@ -3754,6 +4212,11 @@ fn card_entry_from_issue(
         issue.t_claim_ms,
         issue.t_ship_ms,
     );
+    let decision_gate = Some(evaluate_issue_decision_gate(
+        tasks_dir,
+        issue,
+        issue.status == BoardStatus::TribunalGate,
+    ));
     let assigned_seats: Vec<String> = issue
         .assigned_seats
         .iter()
@@ -3827,6 +4290,7 @@ fn card_entry_from_issue(
         github_issue_number: cfg.and_then(|c| c.synced_issue_numbers.get(&issue.id).copied()),
         github_issue_url: cfg.and_then(|c| c.synced_issue_urls.get(&issue.id).cloned()),
         project_item_id: cfg.and_then(|c| c.synced_project_item_ids.get(&issue.id).cloned()),
+        decision_gate,
     }
 }
 
@@ -3863,7 +4327,7 @@ pub fn sync_board_cards_ledger(
         let prior = existing_map.get(&issue.id);
         let trigger = prior.map(|p| p.trigger_source.as_str());
         let tcode = prior.and_then(|p| p.ticket_code.clone());
-        let entry = card_entry_from_issue(issue, cfg, trigger, tcode);
+        let entry = card_entry_from_issue(tasks_dir, issue, cfg, trigger, tcode);
         existing_map.insert(issue.id.clone(), entry);
     }
 
@@ -4074,6 +4538,7 @@ pub fn upsert_agent_thread_board_card(
             github_issue_number: None,
             github_issue_url: None,
             project_item_id: None,
+            decision_gate: None,
         }
     };
 
@@ -5175,5 +5640,43 @@ mod tests {
             assert_eq!(err.invariant, "INV-PUBLIC-BOARD-REDACTION-01");
             assert!(err.reason.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn test_21_dual_view_kanban_templates_and_decision_gate_assessment_cache() {
+        let cfg = BoardConfigV1::default();
+        let gh_schema = build_github_project_v2_template_schema(&cfg);
+        assert_eq!(gh_schema["default_view_layout"], "BOARD_LAYOUT");
+        let gh_views = gh_schema["views"].as_array().expect("gh views array");
+        assert_eq!(gh_views.len(), 2);
+        assert_eq!(gh_views[0]["code"], "01_KANBAN_EXECUTION_BOARD");
+        assert_eq!(gh_views[0]["layout"], "BOARD_LAYOUT");
+        assert_eq!(gh_views[1]["code"], "02_VELOCITY_AND_DORA_LEDGER");
+        assert_eq!(gh_views[1]["layout"], "TABLE_LAYOUT");
+
+        let lin_schema = build_linear_template_schema(&cfg);
+        assert_eq!(lin_schema["default_view_layout"], "board");
+        let lin_views = lin_schema["views"].as_array().expect("linear views array");
+        assert_eq!(lin_views.len(), 2);
+        assert_eq!(lin_views[0]["layout"], "board");
+        assert_eq!(lin_views[1]["layout"], "list");
+
+        let dir = temp_tasks_dir("decision-gate-cache");
+        let mut issue =
+            AtomicTaskIssue::new_default("CHWG-0206", "Decision Gate Calibration", DoraTier::L);
+        issue.loc_changed = Some(420);
+        let gate1 = evaluate_issue_decision_gate(&dir, &issue, false);
+        assert_eq!(gate1.issue_id, "CHWG-0206");
+        assert_eq!(gate1.dora_tier_guess, "L");
+        assert!(gate1.clairic_loc_p90 >= gate1.clairic_loc_median);
+        assert!(dir.join("decision-gate-cache.json").exists());
+
+        let gate2 = evaluate_issue_decision_gate(&dir, &issue, false);
+        assert_eq!(gate1, gate2);
+
+        let serialized = serde_json::to_string(&gate1).unwrap();
+        assert!(scan_zero_leak_text(&serialized).is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
