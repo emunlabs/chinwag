@@ -12,21 +12,70 @@
 
 use serde_json::json;
 use std::io::Write;
+use std::path::Path;
+use std::process::Command;
 
 pub const NOT_IMPLEMENTED: &str = "ui-gate not implemented; not gate evidence";
 
-pub fn run_ui_gate(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
-    if args.iter().any(|a| a == "--json") {
-        let refusal = json!({
-            "ok": false,
-            "command": "chinwag ui-gate",
-            "implemented": false,
-            "error": NOT_IMPLEMENTED,
-        });
-        let _ = writeln!(stdout, "{refusal}");
+fn resolve_chinwag_ci_bin() -> &'static str {
+    let canonical = "/Users/brianspector/.local/bin/chinwag-ci";
+    if Path::new(canonical).is_file() {
+        canonical
+    } else {
+        "chinwag-ci"
     }
-    let _ = writeln!(stderr, "chinwag: {NOT_IMPLEMENTED}");
-    1
+}
+
+pub fn run_ui_gate(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    let has_ci_ui_gate_flag = args.iter().any(|a| {
+        a == "--surface"
+            || a == "--audit-json"
+            || a.starts_with("--surface=")
+            || a.starts_with("--audit-json=")
+    });
+
+    if !has_ci_ui_gate_flag {
+        if args.iter().any(|a| a == "--json") {
+            let refusal = json!({
+                "ok": false,
+                "command": "chinwag ui-gate",
+                "implemented": false,
+                "error": NOT_IMPLEMENTED,
+            });
+            let _ = writeln!(stdout, "{refusal}");
+        }
+        let _ = writeln!(stderr, "chinwag: {NOT_IMPLEMENTED}");
+        return 1;
+    }
+
+    let bin = resolve_chinwag_ci_bin();
+    match Command::new(bin).arg("ui-gate").args(args).output() {
+        Ok(output) => {
+            let _ = stdout.write_all(&output.stdout);
+            let _ = stderr.write_all(&output.stderr);
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            if output.status.success()
+                && out_str.contains("\"UiGateReceiptV1\"")
+                && out_str.contains("\"passed\": true")
+            {
+                0
+            } else {
+                output.status.code().unwrap_or(1).clamp(1, 255) as u8
+            }
+        }
+        Err(e) => {
+            if args.iter().any(|a| a == "--json") {
+                let err_json = json!({
+                    "ok": false,
+                    "command": "chinwag ui-gate",
+                    "error": format!("failed to execute `{bin} ui-gate`: {e}"),
+                });
+                let _ = writeln!(stdout, "{err_json}");
+            }
+            let _ = writeln!(stderr, "chinwag: failed to execute `{bin} ui-gate`: {e}");
+            1
+        }
+    }
 }
 
 #[cfg(test)]
@@ -70,5 +119,45 @@ mod tests {
         assert_eq!(value["implemented"], false);
         assert_eq!(value["error"], NOT_IMPLEMENTED);
         assert!(value.get("gates").is_none() && value.get("actor").is_none());
+    }
+
+    #[test]
+    fn surface_flag_delegates_to_chinwag_ci_ui_gate_and_verifies_receipt() {
+        let dir = std::env::temp_dir().join(format!(
+            "chinwag-cli-uigate-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("index.html"),
+            "<!DOCTYPE html><html><body><h1>Credit-Only</h1></body></html>",
+        )
+        .unwrap();
+        let audit_path = dir.join("audit.json");
+        std::fs::write(
+            &audit_path,
+            r#"[{"path":"/","viewport":"desktop","status":200,"check":{"vw":1440,"scrollWidth":1440,"pageOverflow":false,"artifacts":[],"tableBroken":[]},"console":[],"pageerrors":[],"badRequests":[]}]"#,
+        )
+        .unwrap();
+
+        let (code, out, _err) = run(&[
+            "--surface",
+            "site",
+            "--repo",
+            dir.to_str().unwrap(),
+            "--audit-json",
+            audit_path.to_str().unwrap(),
+            "--ticket",
+            "CW-CI-UI-GATE-UPGRADE-V18",
+            "--json",
+        ]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(code, 0);
+        let value: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["schema"], "UiGateReceiptV1");
+        assert_eq!(value["passed"], true);
+        assert_eq!(value["surface"], "site");
     }
 }
