@@ -1,190 +1,214 @@
----
-title: "`chinwag`"
-description: "1. Chinwag PRDs & Specs — projects/Chinwag/prd-mkt/chinwag-github-readme-v0.1.0.md"
-category: "1. Chinwag PRDs & Specs"
-stage: "canonical-active"
-source_commit: "8123089ce0a26e94052babb94d946ef14d0ad462"
-status: "VERIFIED CURRENT"
----
 <div align="center">
 
 # `chinwag`
 
-### **Stop Your AI Agents From Stepping on Each Other.**  
+### **Sovereign Multi-Agent Engineering OS, Signed Agent Bus & Cryptographic Flight Recorder**
 #### *Prompts Are Suggestions. Invariants Are Law. Commits Are Evidence.*
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-2563eb.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust: 1.97.1](https://img.shields.io/badge/Rust-1.97.1_%28Edition_2024%29-f97316.svg)](https://www.rust-lang.org)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Stdio_%26_Loopback_HTTP-10b981.svg)](https://modelcontextprotocol.io)
 [![Transport: iroh P2P QUIC](https://img.shields.io/badge/P2P_Transport-iroh_1.4.1_QUIC_%2B_BLAKE3-8b5cf6.svg)](https://iroh.computer)
-[![Crypto: RFC 9180 HPKE](https://img.shields.io/badge/Vault-RFC_9180_HPKE_%2B_Ed25519-06b6d4.svg)](https://www.rfc-editor.org/rfc/rfc9180.html)
+[![Crypto: PQ-HPKE + Ed25519](https://img.shields.io/badge/Vault-X25519MLKEM768_%2B_Ed25519-06b6d4.svg)](https://www.rfc-editor.org/rfc/rfc9180.html)
 
-**Chinwag is the local-first Multi-Agent Swarm Coordination Bus, Atomic Lease Engine, and Cryptographic Flight Recorder built in Rust by Emun Labs.**  
-Each AI coding agent gets its own `Ed25519` signing identity, shares one conflict-free local SQLite memory (`.chinwag/state.crdb`), and seals a dual-recipient `RFC 9180` HPKE flight capsule to every Git commit — all in a single `7.47 MB` dependency-free binary under `Apache-2.0`.
+**Chinwag (`chinwag`) is the local-first Multi-Agent Swarm Coordination Bus, Atomic File-Scope Lease Engine, Dual-Layer Native Memory Store, and Cryptographic Flight Recorder built in Rust (`#![forbid(unsafe_code)]`) by Emun Labs.**  
+Each AI coding agent conversation (`<SEAT>#<INSTANCE>`) signs with its seat's canonical `Ed25519` key, coordinates over a conflict-free local SQLite CRDT store (`.chinwag/state.crdb` + `.chinwag/memory.crdb.leann`), and seals a dual-recipient post-quantum HPKE (`X25519MLKEM768` + `ChaCha20-Poly1305`) flight capsule to every Git commit — all in a dependency-free native binary under `Apache-2.0`.
 
-[60-Second Quickstart](#-60-second-quickstart) · [The 5 Killer Features](#-the-5-killer-features) · [Architecture & Crate Map](#-architecture--crate-map) · [Open-Core vs. Hosted Relay (Coming Soon)](#-open-core-apache-20-vs-hosted-relay-bootstrapchinwagsh--appchinwagsh--coming-soon) · [Verify Commit #1](#-dont-take-our-word-for-it--verify-the-genesis-commit)
+[60-Second Quickstart](#-60-second-quickstart) · [The 6 Core Capabilities](#-the-6-core-capabilities) · [CLI Command Reference](#-cli-command-reference) · [Architecture & Crate Map](#-architecture--crate-map) · [Credit-Only Pricing (`OrgWallet`)](#-open-core-apache-20--organization-credit-pool-pricing) · [Apache 2.0 & Patent Grant](#-corporate-provenance-apache-20-license--defensive-patent-grant)
 
 </div>
+
+> [!IMPORTANT]
+> **Gated Private Preview (`v0.1.x`):** Chinwag (`chinwag` & `chinwag-ci`), the Hosted Zero-Knowledge Blind Relay (`mesh.chinwag.sh`), and `docs.chinwag.sh` are currently in **gated Private Preview** as we onboard initial engineering organizations. While the `Apache-2.0` Rust source code is open for inspection and local cleanroom builds, cloud relay enrollment (`chinwag enroll --github`) and hosted `brew install` distribution require an active Private Preview organization token.
+>
+> **Request Private Preview access & 500 Free Starter Credits:** **[https://chinwag.sh/pricing#access](https://chinwag.sh/pricing#access)** (`$0` per human developer seat · `$0` per AI agent seat).
 
 ---
 
 ## ⚡ 5 Agents. 1 Repo. Total Chaos. — vs. The Chinwag Way
 
-Every serious engineer today runs more than one AI coding agent on the same repository: you plan architecture in **ChatGPT / Codex**, write backend systems in **Claude Code**, refactor UI in **Cursor**, and run deep reviews in **Grok 4.7** or **Gemini**.
+Every engineering team today runs multiple AI coding agents on the same repository: you plan architecture in **OpenAI Codex**, implement backend systems in **Claude Code**, refactor UI in **Cursor**, and run independent verification in **Google Gemini** or local **Apple Silicon MLX** models.
 
-Without a coordination layer, running multiple agents against one codebase breaks in five predictable ways:
+Without a cryptographic coordination layer, running multiple agents against one codebase breaks in five predictable ways:
 
-| Failure Mode | Running 5 Agents Blindly (Today) | Running on `chinwag` (**The Chinwag Way**) | `v0.1.0` → `v0.1.1` Status |
+| Failure Mode | Running Agents Blindly (Today) | Running on `chinwag` (**The Chinwag Way**) | `v0.1.x` Status |
 | :--- | :--- | :--- | :--- |
-| **1. Tool Switching & Context Compaction** | **Total Amnesia.** When Claude hits a 5-hour rate limit or compacts context, Codex has zero idea what was just tried or which dead ends (`tombstones`) already failed. | **Switch Agents. Keep the Thread.** Pin decisions, symbols, and dead-end tombstones in `.chinwag/state.crdb` (`chinwag_pin_context` → `chinwag_read_thread`). | ✅ **`v0.1.0-genesis`** (`~2,000 ms` poll; `<15 ms` event wake in `v0.1.1`) |
-| **2. Concurrent File Edits** | **Race Conditions & $40 Token Burn.** Two agents overwrite the same file or spend $40 in duplicate API tokens refactoring the same module on different machines. | **Atomic Path Leases (`chinwag-claim`).** Signed task claims, path/symbol globs, and expiring cryptographic leases prevent collisions across editors and Macs. | ✅ **`v0.1.0-genesis`** (`chinwag-claim` + `bootstrap.chinwag.sh` verified) |
-| **3. Repo Rules (`CLAUDE.md` / `.cursorrules`)** | **"Prompt Hope."** Static markdown reminders are routinely ignored after 20 minutes of context compaction, shipping non-compliant commits. | **Executable Repo Law (`verified_invariants`).** Rules are pinned to `file_path`, `symbol_hash`, and `source_commit` in `.chinwag/state.crdb` and checked at the commit gate. | 🟢 **Schema + Pins in `v0.1.0`** · Pre-commit gate in `v0.1.1` |
-| **4. Git Authorship & Security Audit** | **Zero Accountability.** AI commits are stamped with your personal Git identity or a generic bot token. No record of what prompt or tool receipt produced the diff. | **Dual-Recipient Flight Recorder (`refs/notes/emun-vault`).** Every agent signs commits with its own `Ed25519` key and attaches a `zstd` + `RFC 9180` HPKE encrypted black-box capsule bound to the exact commit SHA. | ✅ **`v0.1.0-genesis`** (Verified across MacBook Pro + Mac Studio) |
-| **5. Multi-Machine Plumbing** | **Docker & SaaS Lock-In.** Sharing agent state across a laptop and desktop workstation requires Postgres containers, Python venvs, or sending plaintext code to a cloud middleman. | **Sovereign P2P QUIC (`chinwag-swarm`).** Single `7.47 MB` binary with `iroh 1.4.1` QUIC, `LAN mDNS`, `BLAKE3` verified blobs (up to 32 MiB), and zero third-party `n0` relays. | ✅ **`v0.1.0-genesis`** (LAN mDNS + `bootstrap.chinwag.sh` room verified) |
+| **1. Tool Switching & Context Compaction** | **Total Amnesia.** When one agent hits a rate limit or compacts context, the next agent has zero idea what was just tried or which dead ends (`tombstones`) already failed. | **Dual-Layer Native Memory (`chinwag memory`).** Recall and retain verified learnings, invariants, and `DO_NOT_REPEAT` tombstones across `.chinwag/state.crdb` + `.chinwag/memory.crdb.leann` (`8.5 KB` CSR graph). | ✅ **Available in `v0.1.x`** |
+| **2. Concurrent File Edits** | **Race Conditions & Token Thrash.** Two agents overwrite the same file or burn API tokens refactoring the same module concurrently. | **Atomic Path Leases (`chinwag-claim`) & Isolated Shadow JJ Workspaces.** Signed path/symbol globs (`MAX_TTL_SECONDS = 120`) and isolated colocated Jujutsu (`jj`) workspaces prevent collisions across editors and workstations. | ✅ **Available in `v0.1.x`** |
+| **3. Repo Rules (`CLAUDE.md` / `.cursorrules`)** | **"Prompt Hope."** Static markdown reminders are routinely ignored after context compaction, shipping non-compliant commits. | **Executable Repo Law (`verified_invariants` & `WP-01..WP-15`).** Rules are pinned to `file_path`, `symbol_hash`, and `source_commit` in `.chinwag/state.crdb` and checked before lease grant and commit settlement. | ✅ **Available in `v0.1.x`** |
+| **4. Git Authorship & Security Audit** | **Zero Accountability.** AI commits are stamped with a personal Git identity or a generic bot token with no record of which agent thread produced the diff. | **Per-Thread `Ed25519` Non-Repudiation (`<SEAT>#<INSTANCE>`) & HPKE Flight Recorder.** Every agent conversation signs messages over the 7-field `chinwag-bus-sig-v2` payload and attaches an `RFC 9180` HPKE flight capsule (`refs/notes/emun-vault`). | ✅ **Available in `v0.1.x`** |
+| **5. CI Failures & Multi-Machine Plumbing** | **Webhook Exposure & Manual Copy-Paste.** Developers manually copy-paste 4,000-line CI logs back into their IDE or expose inbound webhook ports. | **1.4s CI-to-Agent Wakeup (`chinwag-ci wrap`) & Sovereign P2P QUIC (`chinwag-swarm`).** Direct `iroh 1.4.1` QUIC P2P (`0 Credits` on LAN/mesh) plus outbound-only `WSS :443` zero-knowledge relay wakeups. | ✅ **Available in `v0.1.x`** |
 
 ---
 
-## 🔥 The 5 Killer Features
+## 🔥 The 6 Core Capabilities
 
-### Killer Feature #1: Pre-Claim Architectural Invariant Gate (`verified_invariants` + `chinwag-claim`)
+### 1. Signed End-to-End Encrypted Agent Bus & `<SEAT>#<INSTANCE>` Non-Repudiation (`chinwag bus`)
 
-> **Why it matters:** Static `.cursorrules` and `CLAUDE.md` files are polite wishes that vanish the moment an agent's context window compacts. Chinwag turns architectural rules, module boundaries, and SPDX license headers into **stateful, commit-anchored invariants** stored in `.chinwag/state.crdb`. Agents must pin and acknowledge active invariants for a file scope before claiming a lease or settling a co-signed commit.
-
-- **Commit-Anchored Rule Pins (`context_pins`):** Anchor architectural decisions and mandatory invariants (such as `spdx-apache-2.0-emun-labs-header-v1`) directly to `file_path`, `symbol_hash`, and `source_commit`.
-- **Signed Task & Path Claims (`chinwag-claim`):** Pure `Ed25519`-signed claim requests and coordinator receipts with strict field/path validation (`native` + `WASM`), ensuring no two agents edit the same blast radius concurrently.
-- **Invariant Attestation (`verified_invariants`):** Records `(repo_id, branch_ref, source_commit, file_path, invariant, ci_run_id, ci_receipt_hash)` in `.chinwag/state.crdb` so downstream reviewers and `chinwag.sh · Mission Control` have mathematical proof that verification passed.
-
-```json
-// MCP Tool Call: chinwag_pin_context — Pin an architectural invariant to a file & commit SHA
-{
-  "name": "chinwag_pin_context",
-  "arguments": {
-    "id": "pin-spdx-apache-header-v1",
-    "thread_id": "thread-chinwag-core",
-    "file_path": "crates/chinwag-swarm/src/lib.rs",
-    "symbol_hash": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-    "source_commit": "8123089ce0a26e94052babb94d946ef14d0ad462",
-    "body": "INVARIANT [spdx-apache-2.0-emun-labs-header-v1]: All source files must retain the Emun Labs, Inc. Apache-2.0 header and forbid third-party n0 relays.",
-    "created_at_ms": 1793064000000
-  }
-}
-```
-
----
-
-### Killer Feature #2: Local-First CRDT Context Bus (`.chinwag/state.crdb`) + Zero-Config Multi-Mac P2P Swarm (`chinwag-swarm`)
-
-> **Why it matters:** When you switch from Claude Code on your MacBook Pro to Codex or Grok on your Mac Studio, your agents shouldn't lose their train of thought—and you shouldn't have to spin up Docker or expose plaintext repos to a cloud broker. Chinwag embeds a conflict-free replicated SQLite engine (`cr-sqlite`) and a sovereign `iroh 1.4.1` QUIC transport directly inside the binary.
-
-- **8-Table Embedded `cr-sqlite` Store (`CHWG` Schema v1):** Compiles `threads`, `messages`, `context_pins`, `tombstones` (dead-end approaches so the next agent never repeats a failed experiment), `verified_invariants`, `flight_checkpoints`, `agent_claims`, and `leases` directly into `.chinwag/state.crdb`.
-- **Sovereign `iroh 1.4.1` QUIC Transport:** Starts from `iroh`'s `Minimal` preset, binds the exact same OpenSSH `Ed25519` identity used by Git, **strips out all third-party `n0` relays and HTTP Pkarr services**, and enforces `RelayPolicy::Own`.
-- **LAN mDNS + `bootstrap.chinwag.sh` Room Discovery:** Automatically discovers peer Macs over local IPv4 interfaces (`mDNS` immune to VPN default-route hijacking) or coordinates across networks via our Rust/WASM Cloudflare Durable Object room coordinator (`bootstrap.chinwag.sh`), streaming gossip (`iroh-gossip`) and `BLAKE3`-verified blobs up to `32 MiB` (`iroh-blobs`).
+Every agent conversation establishes a complete, case-sensitive conversation instance address (`<SEAT>#<INSTANCE>`, `INV-THREAD-ID-01`) allocated via `chinwag bus instance`. Every bus message and dispatch is detached-signed with the seat's canonical `Ed25519` key (`~/.chinwag/signing/<seat>_ed25519`, verified against `.chinwag/allowed_signers`) over the 7-field `chinwag-bus-sig-v2` payload:
 
 ```sh
-# Initialize local Ed25519 signing identity, .chinwag/allowed_signers, and .chinwag/state.crdb
-git chinwag init
+# 1. Allocate a cryptographic conversation instance ID (128-bit CSPRNG / UUID)
+export CHINWAG_INSTANCE_ID="$(chinwag bus instance)"
+export CHINWAG_ACTOR="driver#$CHINWAG_INSTANCE_ID"
 
-# Run the two-Mac LAN mDNS / QUIC swarm pair probe across explicit local interfaces
-CHINWAG_LAN_IPV4="192.168.1.42" cargo run --package chinwag-swarm --example pair_probe
+# 2. Send a signed message over the local/mesh bus (and optionally --wake a child worker)
+chinwag bus send \
+  --repo "$PWD" \
+  --from "$CHINWAG_ACTOR" \
+  --room "#eng" \
+  --to "@reviewer" \
+  --task "CHWG-101" \
+  --wake \
+  "Verify 7-field Ed25519 signature and X25519MLKEM768 envelope"
+
+# 3. Inspect signature-verified inbox receipts, live room tail, and bus health
+chinwag bus inbox --repo "$PWD" --for "$CHINWAG_ACTOR" --limit 20 --json
+chinwag bus tail --repo "$PWD" --room "#all" --limit 20
+chinwag bus status --repo "$PWD"
 ```
 
 ---
 
-### Killer Feature #3: Dual-Recipient `RFC 9180` HPKE Flight Recorder (`refs/notes/emun-vault` / `chinwag-seed`)
+### 2. Cross-Model Pair & Triad Programming (`Shadow JJ` Workspaces + `chinwag-claim` Leases)
 
-> **Why it matters:** *"Every commit keeps its black box."* When 40%+ of your repository is written or reviewed by AI agents, `git blame` is no longer enough to understand what happened or verify provenance. Chinwag seals the prompt summary, tool receipts, peer attestation signatures, and source hashes into a tamper-evident cryptographic capsule attached directly to the Git commit via `refs/notes/emun-vault`.
+Pairing orthogonal model families (such as **OpenAI Codex**, **Anthropic Claude**, and **Google Gemini**) eliminates single-model blind spots and `$5–$15` Doom-Loop token thrash using `<4,000`-token commit-pinned review packets:
+- **Colocated Shadow Jujutsu (`jj`) Workspaces:** Provisions isolated working trees backed by the same `.git` object store with `0` `index.lock` collisions and `0ms` automatic rebase.
+- **Cryptographic File-Scope Leases (`chinwag-claim`):** Enforces mutually exclusive `--file-scope` globs (`SignedClaimReceipt`, `120s` bounded TTL) and atomic `<= 150 LOC` checkpoints (`INV-SMALL-JJ-DIFF-01`).
+- **Pre-Claim Architectural Gate (`verified_invariants`):** Verifies target `file_path` and `symbol_hash` against active repository invariants before granting a write lease.
 
-- **Fixed 256-Byte Header + `zstd` Payload ([`docs/seed-capsule-v1.md`](docs/seed-capsule-v1.md)):** Deterministic binary layout with strict size bounds and zero-copy header inspection.
-- **Dual-Recipient `RFC 9180` HPKE (`X25519` + `ChaCha20-Poly1305`):**
-  - **Key Slot 1 (Developer / Team Key):** Opened by the developer or engineering team (or published as a public verification key for open-source releases).
-  - **Key Slot 2 (Independent Verification Key):** Second independent `RFC 9180` recipient wrap allowing separate verification without sharing the primary developer key.
-- **Cryptographic Commit Binding (AAD):** The capsule is mathematically bound to the target Git commit OID. Flip a single byte of the capsule, or move the note to another commit SHA, and decryption immediately refuses to open.
+---
+
+### 3. Dual-Layer Native Memory & Commit-Anchored Tombstones (`chinwag memory`)
+
+Chinwag replaces external vector databases with an embedded two-tier memory architecture stored directly inside the repository (`.chinwag/state.crdb` SQLite CRDT + `.chinwag/memory.crdb.leann` `8.5 KB` Compressed Sparse Row graph):
 
 ```sh
-# Build the standalone capsule inspector and flight-recorder seed
-cargo build --bin chinwag-seed --locked
+# 1. Recall relevant architectural context, invariants, and tombstones before editing
+chinwag memory recall \
+  --bank default \
+  --query "authentication session lease" \
+  --file-scope "crates/**" \
+  --limit 10
 
-# Verify the Ed25519 co-signed Genesis commit and inspect its attached RFC 9180 HPKE vault note
-git verify-commit 8123089ce0a26e94052babb94d946ef14d0ad462
-git notes --ref=refs/notes/emun-vault show 8123089ce0a26e94052babb94d946ef14d0ad462 | head -c 256 | xxd
+# 2. Retain a verified engineering decision or handover summary
+chinwag memory retain \
+  --bank default \
+  --context "agent:driver|ticket:CHWG-101|decision" \
+  --content "Enforced Ed25519 verify-before-decrypt on all inbound bus envelopes" \
+  --file-scope "crates/chinwag-cli/**"
+
+# 3. Record a DO_NOT_REPEAT negative memory tombstone so no agent repeats a dead end
+chinwag memory tombstone \
+  --id "tombstone-no-unverified-webhook-v1" \
+  --file-scope "crates/**" \
+  --reason "Inbound webhooks require public ingress ports and expose plaintext headers" \
+  --alternative "Use outbound-only WSS :443 connections with K1+K2 dual-signed HPKE envelopes"
+
+# 4. Inspect memory bank statistics and CSR graph density
+chinwag memory stats --bank default
 ```
 
 ---
 
-### Killer Feature #4: Universal MCP Stdio & Loopback Server (`chinwag-mcp` + `chinwag-editor-config`)
+### 4. Zero-Knowledge Post-Quantum HPKE (`X25519MLKEM768`), Dual-Signed Envelopes & `A.509` Agent PKIX
 
-> **Why it matters:** *"It speaks MCP, so your agent already knows how to use it."* You don't need to rewrite your workflow or install brittle editor plugins. One command wires Chinwag's shared memory and verification tools directly into your AI coding assistants over bounded, memory-safe Model Context Protocol (`stdio` or authenticated loopback `HTTP`).
+- **Post-Quantum Wire Envelope (`CHWGHPKE` v2 · `SignedHpkeBlobV1`):** Combines `RFC 9180` HPKE with NIST FIPS 203 `ML-KEM-768` + `X25519` hybrid key encapsulation and `ChaCha20-Poly1305` authenticated encryption, plus dual-recipient commit capsules (`refs/notes/emun-vault` via `chinwag-seed`).
+- **Verify-Before-Decrypt (`K1 + K2` `Ed25519`):** Executes a `0.09ms` `verify_strict` signature check over `OriginSigV1` (developer/agent key `K1`) and `CloudRelayBlobSigV1` (relay counter-signature `K2`) *before* HPKE decapsulation or `zstd` decompression (`INV-VERIFY-BEFORE-DECRYPT-01`).
+- **`A.509` Sovereign Agent PKIX Passports (`chinwag a509`):** Cryptographic agent identity certificates (`Ed25519` + `BBS+` selective disclosure) binding model provider, policy floor, and seat authority.
+- **Strictly Local Loopback Viewer (`127.0.0.1:5487`):** All decryption occurs strictly on the developer workstation using keys stored in the local OS Keychain / `.chinwag/`, qualifying the hosted Blind Relay for the **Tier-1 Source-Code Subprocessor Exemption**.
 
-- **One-Command Editor Wiring (`chinwag configure-editor`):** Automatically generates repository-scoped MCP configurations with atomic file ownership checks for **Claude Code** (`.mcp.json`), **Codex** (`.codex/config.toml`), and **Cursor** (`.cursor/mcp.json`, with live 4-way **Cursor + Gemini** sub-15ms handoff landing in `v0.1.1`).
-- **Context & Handoff Tools (`chinwag-mcp`):** Exposes `chinwag_read_thread`, `chinwag_pin_context`, and `chinwag_handoff` with idempotent replay protection, strict 64 KiB field validation, and zero leaked file descriptors (`RepositoryAdmission` guard).
-- **Allowlisted Source Read & Locked Verification (`chinwag-seed` MCP modes):**
-  - `serve-read-mcp`: Exposes `read_file` restricted to an operator-supplied exact path allowlist with verified `SHA-256` digests (refusing unauthorized paths like `.grok/session`).
-  - `serve-verify-mcp`: Exposes zero-argument `run_cargo_test`, running locked offline `cargo check` + `cargo test` inside an isolated process group monitored by native macOS BSD kernel proc-table inspection (`chinwag-host-process`).
+---
+
+### 5. `1.4s` CI-to-Agent Wakeup, `<50 ms` Offline Tombstone Cassettes & Deterministic UI Gate (`chinwag ui-gate` & `chinwag-ci`)
+
+- **Deterministic DOM Geometry Gate (`chinwag ui-gate`):** Evaluates `176/176` machine-measured DOM bounding-box and kinetic scroll checks across 8 viewports and Midnight/Daylight themes (`INV-UI-BLEED`, `INV-UI-OVERLAP`, `INV-UI-CLIP`, `INV-UI-HIT-TEST`), plus optional `Vision-3` `16-surface` multimodal visual audits and autonomous CSS auto-patch.
+- **Companion [`chinwag-ci`](https://github.com/emunlabs/chinwag-ci) Runner:** Pure-Rust static CI binary (`wrap`, `verify-signer`, `test-regressions`, `diff-run`, `fork-run`, `ui-gate`, `attest-green`, `notify`, `selftest`) that scrubs secrets before encryption, coalesces 20-shard CI matrix storms into one `1.4s` agent wakeup, holds the warm CI container open for a signed live patch (`--hold-for-patch`), and replays `.chinwag/regressions/*.json` Tombstone cassettes offline in `<50 ms` at `$0` LLM spend.
+
+---
+
+### 6. Universal MCP Stdio & Loopback Server (`chinwag mcp-serve` + `chinwag configure-editor`)
+
+Wire Chinwag's shared memory, context pins, and handoff tools into **Claude Code**, **OpenAI Codex**, **Cursor**, or **Google Gemini** in one command:
 
 ```sh
-# Wire Claude Code or OpenAI Codex to the repository's Chinwag MCP server in one command
-git chinwag configure-editor --repo "$PWD" --editor claude-code
-git chinwag configure-editor --repo "$PWD" --editor codex
+# Generate atomic, repository-scoped MCP configuration for your coding agents
+chinwag configure-editor --repo "$PWD" --editor claude-code
+chinwag configure-editor --repo "$PWD" --editor codex
+chinwag configure-editor --repo "$PWD" --editor cursor
+chinwag configure-editor --repo "$PWD" --editor gemini
 
-# Or launch the repository MCP server directly over stdio (or authenticated loopback HTTP)
-git chinwag mcp-serve --repo "$PWD" --transport stdio
+# Launch the repository MCP server directly over stdio (or authenticated loopback HTTP)
+chinwag mcp-serve --repo "$PWD" --transport stdio
 ```
 
 ---
 
-### Killer Feature #5: `chinwag.sh · Mission Control` & Commit-Anchored Wiki (`v0.1.1`)
+## 🛠️ CLI Command Reference (`chinwag`)
 
-> **Why it matters:** Terminal logs aren't enough when you're orchestrating a fleet of autonomous agents across branches and machines. **`chinwag.sh · Mission Control`** (available locally on `:5487`, bundling into the `v0.1.1` CLI, and hosted at `app.chinwag.sh`) gives engineering leads a live visual command center over `.chinwag/state.crdb` and `refs/notes/emun-vault`.
+Every subcommand below is compiled into the single `chinwag` binary (`crates/chinwag-cli`):
 
-- **Visual Swarm Command Center:** Interactive **Gantt** (critical-path & dependency drawing), **Kanban**, **Calendar**, and **Agents · Swarm Chat** where you can register and orchestrate your own custom specialist agents (`+ Create Agent`) or auto-discover connected MCP sessions across Claude Code, Codex, Cursor, Gemini, and Grok.
-- **Commit-Anchored Provenance Wiki (`source_commit === HEAD`):** Every specification and architecture doc carries an anchored `source_commit` header. When code advances ahead of documentation, Mission Control automatically badges stale pages as `DRIFTED FROM HEAD`.
-- **Agent Cost & Lease Telemetry (`$ / Verified Commit`):** Tracks input, output, and cached token usage per commit across Claude Code, Codex, Cursor, Gemini, and Grok, and highlights duplicate agent runs prevented by atomic `chinwag-claim` leases.
+```text
+Usage:
+  chinwag init [--help]
+  chinwag status [--repo <path>]
+  chinwag bus <send | inbox | tail | status | instance> [options]
+  chinwag memory <recall | retain | tombstone | stats> [options]
+  chinwag agent-dispatch --agent <SEAT> --sender <SEAT#INSTANCE> --item <TASK-ID> --crdb <path> --body <text>
+  chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>
+  chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]
+  chinwag ui-gate [--url <http://localhost:PORT>] [--surfaces <N>] [--json]
+  chinwag ui [--desktop]
+  chinwag a509 [options]
+  chinwag cwcard [options]
+  chinwag --version | --help
+```
 
 ---
 
 ## 🏗️ Architecture & Crate Map
 
-All 12 workspace crates in `emunlabs/chinwag` enforce `#![forbid(unsafe_code)]` across the CLI and MCP layers, deterministic dependency pinning (`Cargo.lock`), `panic = "abort"`, and Rust `1.97.1` (Edition 2024).
+All workspace crates in `emunlabs/chinwag` enforce `#![forbid(unsafe_code)]` across the CLI and MCP layers, deterministic dependency pinning (`Cargo.lock`), `panic = "abort"`, and Rust `1.97.1` (Edition 2024).
 
 ```mermaid
 flowchart TB
-  subgraph Editors["AI Coding Agents (MCP Clients)"]
+  subgraph Editors["AI Coding Agents (MCP & CLI Clients)"]
     CC["Claude Code\n(.mcp.json)"]
     CX["OpenAI Codex\n(.codex/config.toml)"]
-    CU["Cursor / Windsurf\n(.cursor/mcp.json)"]
-    GK["Grok 4.7 / Gemini\n(Native MCP / CLI)"]
+    CU["Cursor\n(.cursor/mcp.json)"]
+    GM["Gemini CLI & Local MLX\n(Native MCP / CLI)"]
   end
 
-  subgraph CLI["chinwag Single-File Binary (7.47 MB · Apache-2.0)"]
-    C_CLI["chinwag-cli\n(chinwag / git-chinwag / gh-chinwag)"]
+  subgraph CLI["chinwag Single-File Binary (Apache-2.0)"]
+    C_CLI["chinwag-cli\n(init / status / bus / memory / agent-dispatch / ui-gate)"]
     C_CFG["chinwag-editor-config\n(Atomic Editor Wiring)"]
     C_MCP["chinwag-mcp\n(Stdio & Loopback HTTP Server)"]
     C_SESS["chinwag-snapshot-session &\nchinwag-snapshot-read-owner"]
-    C_SIGN["chinwag-signing\n(Ed25519 OpenSSH & allowed_signers)"]
-    C_PROC["chinwag-host-process\n(macOS Process-Group Inspector)"]
+    C_SIGN["chinwag-signing\n(Ed25519 <SEAT>#<INSTANCE> & allowed_signers)"]
+    C_PROC["chinwag-host-process\n(Process-Group Inspector)"]
   end
 
   subgraph Core["State, Claims, Swarm & Cryptographic Vault"]
-    CRDB[(".chinwag/state.crdb\n(Embedded cr-sqlite · 8 Tables)")]
+    CRDB[(".chinwag/state.crdb +\n.chinwag/memory.crdb.leann")]
     C_CLAIM["chinwag-claim\n(Signed Task & Path Lease Contracts)"]
     C_SWARM["chinwag-swarm\n(iroh 1.4.1 QUIC · LAN mDNS · BLAKE3)"]
-    C_SEED["chinwag-seed\n(RFC 9180 HPKE Dual-Key Capsule)"]
+    C_SEED["chinwag-seed\n(RFC 9180 HPKE Flight Capsule)"]
     VAULT[("refs/notes/emun-vault\n(256B Header + zstd HPKE Note)")]
   end
 
-  subgraph Cloud["Optional Hosted Control Plane (Proprietary · Coming Soon)"]
-    BOOT["bootstrap.chinwag.sh\n(Cloudflare DO Room Coordinator)"]
-    MC["chinwag.sh · Mission Control\n(Local :5487 & Hosted app.chinwag.sh)"]
+  subgraph Cloud["Zero-Knowledge Blind Relay & Local Loopback UI"]
+    BOOT["mesh.chinwag.sh / bootstrap.chinwag.sh\n(K1+K2 Dual-Signed Blind Relay)"]
+    MC["Local Loopback Viewer\n(http://127.0.0.1:5487)"]
   end
 
-  CC & CX & CU & GK <-->|"JSON-RPC 2.0 (stdio / HTTP)"| C_MCP
+  CC & CX & CU & GM <-->|"JSON-RPC 2.0 (stdio / HTTP) & CLI"| C_CLI & C_MCP
   C_CLI --> C_CFG & C_MCP & C_SIGN
   C_MCP --> C_SESS --> CRDB
   C_SEED --> C_PROC
   C_SEED -->|"Dual-Recipient Seal"| VAULT
   C_SWARM --> C_CLAIM
-  C_SWARM <-->|"Direct P2P QUIC (32 MiB BLAKE3)"| C_SWARM
-  C_SWARM <-->|"Signed Peer & Lease Receipts"| BOOT
+  C_SWARM <-->|"Direct P2P QUIC (0 Credits)"| C_SWARM
+  C_SWARM <-->|"SignedHpkeBlobV1 (WSS :443)"| BOOT
   CRDB & VAULT & BOOT --> MC
 ```
 
@@ -192,32 +216,26 @@ flowchart TB
 
 | Crate / Component | Path | Target | Role in the Chinwag Architecture |
 | :--- | :--- | :--- | :--- |
-| **`chinwag-cli`** | [`crates/chinwag-cli`](crates/chinwag-cli) | `bin: chinwag` | Main user-facing CLI & Git/GitHub plugin dispatcher (`chinwag`, `git-chinwag`, `gh-chinwag`, `git-emun`, `gh-emun`) for `init`, `mcp-serve`, and `configure-editor`. |
-| **`chinwag-mcp`** | [`crates/chinwag-mcp`](crates/chinwag-mcp) | `lib` | Bounded MCP server (`rmcp 3.7.0`) over `stdio` and authenticated loopback `HTTP`, serving `chinwag_read_thread`, `chinwag_pin_context`, and `chinwag_handoff`. |
-| **`chinwag-swarm`** | [`crates/chinwag-swarm`](crates/chinwag-swarm) | `lib` | Sovereign P2P transport built on `iroh 1.4.1` QUIC, `iroh-gossip`, `iroh-blobs` (`BLAKE3` 32 MiB cap), VPN-safe `LAN mDNS`, and `bootstrap.chinwag.sh` room client. |
-| **`chinwag-claim`** | [`crates/chinwag-claim`](crates/chinwag-claim) | `lib` (`native` + `wasm`) | Pure `Ed25519`-signed task-claim requests, coordinator receipts, and strict PR/file glob policy checks shared between the CLI and Cloudflare Durable Objects. |
+| **`chinwag-cli`** | [`crates/chinwag-cli`](crates/chinwag-cli) | `bin: chinwag` | Main CLI dispatcher (`init`, `status`, `bus`, `memory`, `agent-dispatch`, `configure-editor`, `mcp-serve`, `ui-gate`, `a509`, `cwcard`). |
+| **`chinwag-mcp`** | [`crates/chinwag-mcp`](crates/chinwag-mcp) | `lib` | Bounded MCP server (`rmcp`) over `stdio` and authenticated loopback `HTTP`, serving `chinwag_read_thread`, `chinwag_pin_context`, and `chinwag_handoff`. |
+| **`chinwag-swarm`** | [`crates/chinwag-swarm`](crates/chinwag-swarm) | `lib` | Sovereign P2P transport built on `iroh 1.4.1` QUIC, `iroh-gossip`, `iroh-blobs` (`BLAKE3` 32 MiB cap), VPN-safe `LAN mDNS`, and `RelayPolicy::Own`. |
+| **`chinwag-claim`** | [`crates/chinwag-claim`](crates/chinwag-claim) | `lib` (`native` + `wasm`) | Pure `Ed25519`-signed task-claim requests, coordinator receipts (`SignedClaimReceipt`), and disjoint `--file-scope` glob policy checks. |
 | **`chinwag-seed`** | [`crates/chinwag-seed`](crates/chinwag-seed) | `bin` + `lib` | `RFC 9180` HPKE (`X25519` + `ChaCha20-Poly1305` + `zstd`) 256-byte header flight-recorder capsule library, inspector, `serve-read-mcp`, and `serve-verify-mcp`. |
-| **`chinwag-signing`** | [`crates/chinwag-signing`](crates/chinwag-signing) | `lib` | OpenSSH `Ed25519` key generation, identity binding, email-privacy enforcement, and repository-scoped `.chinwag/allowed_signers` management. |
-| **`chinwag-editor-config`** | [`crates/chinwag-editor-config`](crates/chinwag-editor-config) | `lib` | Atomic, symlink-safe generator for `.mcp.json` (Claude Code), `.codex/config.toml` (Codex), and `.cursor/mcp.json` (Cursor). |
-| **`chinwag-host-process`** | [`crates/chinwag-host-process`](crates/chinwag-host-process) | `lib` (`macOS`) | Native BSD kernel process-group snapshot inspector (`libc` + `bindgen`) guaranteeing zero orphaned child processes after `run_cargo_test` timeouts or cancellations. |
-| **`chinwag-snapshot-session`** | [`crates/chinwag-snapshot-session`](crates/chinwag-snapshot-session) | `lib` | Statically embedded SQLite + `cr-sqlite` (`CHWG` Schema v1) transactional session engine owning the 8 coordination tables in `.chinwag/state.crdb`. |
+| **`chinwag-signing`** | [`crates/chinwag-signing`](crates/chinwag-signing) | `lib` | OpenSSH `Ed25519` key generation, `<SEAT>#<INSTANCE>` identity binding, and repository-scoped `.chinwag/allowed_signers` verification. |
+| **`chinwag-editor-config`** | [`crates/chinwag-editor-config`](crates/chinwag-editor-config) | `lib` | Atomic, symlink-safe generator for `.mcp.json` (Claude Code), `.codex/config.toml` (Codex), `.cursor/mcp.json` (Cursor), and Gemini CLI. |
+| **`chinwag-host-process`** | [`crates/chinwag-host-process`](crates/chinwag-host-process) | `lib` (`macOS`) | Native BSD kernel process-group snapshot inspector guaranteeing zero orphaned child processes after verification timeouts or cancellations. |
+| **`chinwag-snapshot-session`** | [`crates/chinwag-snapshot-session`](crates/chinwag-snapshot-session) | `lib` | Statically embedded SQLite + `cr-sqlite` (`CHWG` Schema v1) transactional session engine owning `.chinwag/state.crdb`. |
 | **`chinwag-snapshot-read-owner`** | [`crates/chinwag-snapshot-read-owner`](crates/chinwag-snapshot-read-owner) | `lib` | Capability-oriented directory descriptor admission guard (`rustix` `openat`/`fstat`) preventing TOCTOU symlink swaps on `.git` and `.chinwag`. |
 | **`confirmed-initial`** | [`crates/confirmed-initial`](crates/confirmed-initial) | `lib` | Atomic repository initialization coordinator uniting key generation, Git config, and initial `.chinwag/state.crdb` store creation with rollback safety. |
 | **`confirmed-initial-consumer`** | [`crates/confirmed-initial-consumer`](crates/confirmed-initial-consumer) | `lib` | Integration verification consumer validating end-to-end initialized store invariants and signing readiness. |
-| **`.chinwag/state.crdb`** | Repository `.chinwag/` | `cr-sqlite` WAL | Local conflict-free state bus (`threads`, `messages`, `context_pins`, `tombstones`, `verified_invariants`, `flight_checkpoints`, `agent_claims`, `leases`). |
-| **`chinwag.sh · Mission Control`** | Companion / `app.chinwag.sh` | Node 26 + SQLite | Visual Gantt, Kanban, Calendar, Agent Swarm Chat, Commit-Anchored Provenance Wiki, and Agent Token & Lease Telemetry (`:5487`). |
 
 ---
 
-## 🚀 60-Second Quickstart
+## 🚀 60-Second Quickstart (Local Cleanroom Build)
 
-### 1. Install or Build `chinwag`
+### 1. Build `chinwag` from Verified Source
 
 ```sh
-# Option A: Install via Homebrew (macOS Apple Silicon)
-brew install emunlabs/tap/chinwag
-
-# Option B: Build from verified source (requires Rust 1.97.1)
 git clone https://github.com/emunlabs/chinwag.git
 cd chinwag
 cargo build --release --bin chinwag --locked
@@ -231,14 +249,18 @@ Run `chinwag init` inside any Git repository to provision your repository-scoped
 # Initialize .chinwag/state.crdb and repository-scoped Ed25519 Git commit signing
 ./target/release/chinwag init
 
-# Wire Claude Code (.mcp.json) and OpenAI Codex (.codex/config.toml)
+# Wire Claude Code (.mcp.json), OpenAI Codex (.codex/config.toml), Cursor, or Gemini
 ./target/release/chinwag configure-editor --repo "$PWD" --editor claude-code
 ./target/release/chinwag configure-editor --repo "$PWD" --editor codex
+
+# Check repository and bus status
+./target/release/chinwag status
+./target/release/chinwag bus status --repo "$PWD"
 ```
 
-### 3. Run the Full Workspace Verification Suite
+### 3. Run the Offline Workspace Verification Suite
 
-Every crate, cryptographic vector, MCP stdio/HTTP lifecycle, and process-group cleanup invariant can be verified offline with zero external network dependencies:
+Every crate, cryptographic vector, MCP stdio/HTTP lifecycle, and process-group cleanup invariant verifies completely offline with zero external network dependencies:
 
 ```sh
 cargo test --workspace --locked
@@ -250,43 +272,27 @@ cargo build --bin chinwag-seed --locked
 
 ---
 
-## 🔬 Don't Take Our Word for It — Verify the Genesis Commit
+## 💎 Open-Core (`Apache-2.0`) & Organization Credit Pool Pricing (`INV-CREDIT-ONLY-PRICING-01`)
 
-`chinwag v0.1.0-genesis` wasn't typed by humans in VS Code. Over 72 hours and 381+ autonomous turns between a MacBook Pro (`AXEL` / ChatGPT Conductor) and a Mac Studio (`RANDO` / Grok 4.7 `xhigh`), two agents wrote and peer-reviewed all 235 source files, attested the final tree over `iroh` QUIC, co-signed Commit #1 (`8123089ce0a26e94052babb94d946ef14d0ad462`), and sealed its flight record in `refs/notes/emun-vault` (`8398cdd`).
+- **Local-First `Apache-2.0` Open Core (`0 Credits` / `$0` Forever):** The `chinwag` and `chinwag-ci` Rust binaries, local `.chinwag/state.crdb` + `.chinwag/memory.crdb.leann` memory, direct peer-to-peer `iroh` QUIC mesh (`0 Credits`), `Ed25519` commit signing, Stage 1 local `chinwag ui-gate` DOM geometry checks (`0 Credits`), and `<50 ms` offline Tombstone cassette replays (`chinwag-ci test-regressions`, `0 Credits`) are free forever under `Apache-2.0`.
+- **Zero Per-Seat or Per-Agent Fees (`$0 / seat`):** When your team uses the Hosted Zero-Knowledge Blind Relay (`mesh.chinwag.sh`) and cloud coordination functions, **we charge strictly per credit for each verified cryptographic function** drawn from **one shared Organization Credit Pool (`OrgWallet`)** — starting with a **500-credit Free Starter Grant** (`$0`, no credit card required) and **zero markup on your AI model tokens**:
 
-Verify the cryptographic chain on your own machine right now:
+| Verified Hosted Cryptographic Function | Credits (`OrgWallet`) | Developer Pack (`$50` / `6,250 Cr` · `$0.0080/cr`) | Growth Pack (`$160` / `25,000 Cr` · `$0.0064/cr`) | Org Volume Pack (`$1,000` / `200,000 Cr` · `$0.0050/cr`) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Local `chinwag` / P2P `iroh` QUIC / Green CI / `<50ms` Cassette Replay** | **`0 Credits`** | `$0.00` | `$0.00` | `$0.00` |
+| **1. One-way encrypted Blind Relay message** (`chinwag bus send`) | **`15 Credits`** | `$0.12` | `$0.096` | `$0.075` |
+| **2. Two-round `1:1` cross-model review handoff** (`chinwag handoff`) | **`50 Credits`** | `$0.40` | `$0.32` | `$0.25` |
+| **3. Failed CI root-cause wakeup & verified fix** (`chinwag-ci wrap` · 20 shards coalesced) | **`50 Credits`** | `$0.40` | `$0.32` | `$0.25` |
+| **4. Cross-model Pair sandbox** (`chinwag pair`) **or `Vision-3` 16-surface UI audit** | **`100 Credits`** | `$0.80` | `$0.64` | `$0.50` |
+| **5. Cross-model Triad sandbox** (`chinwag triad`) | **`150 Credits`** | `$1.20` | `$0.96` | `$0.75` |
+| **6. Cross-model Quad sandbox** (`chinwag quad`) **or UI audit + CSS auto-patch** | **`200 Credits`** | `$1.60` | `$1.28` | `$1.00` |
 
-```sh
-# 1. Verify the Ed25519 Git signature on Commit #1 against .chinwag/allowed_signers
-git config gpg.ssh.allowedSignersFile .chinwag/allowed_signers
-git verify-commit v0.1.0-genesis
-
-# 2. Inspect the sealed RFC 9180 HPKE capsule attached in refs/notes/emun-vault
-git notes --ref=refs/notes/emun-vault show v0.1.0-genesis | shasum -a 256
-```
-
----
-
-## 💎 Open-Core (`Apache-2.0`) vs. Hosted Relay (`bootstrap.chinwag.sh` / `app.chinwag.sh` — Coming Soon!)
-
-> **Our Open-Core Principle:** *The CLI does the work. The hosted relay keeps it running when you're not there.*  
-> The `chinwag` CLI, all 12 Rust crates, local `.chinwag/state.crdb`, `LAN mDNS` swarm discovery, `Ed25519` commit signing, and local `RFC 9180` HPKE flight capsules are **free forever under the Apache-2.0 license** and work completely offline without an account. We will never move a shipped open-source feature behind a paywall.
-
-> [!NOTE]
-> **Availability Status:** **Community (`Apache-2.0` Open Core)** is **Live Today (`v0.1.0-genesis`)**. Self-serve **Hosted Relay & Cloud Control Plane (`bootstrap.chinwag.sh` / `app.chinwag.sh`)** is **Coming Soon!** (currently running in private two-Mac dogfooding).
-
-When you need an **always-on coordinator across networks** or **team-wide atomic lease enforcement**, connect your CLI to **`bootstrap.chinwag.sh`** and **`app.chinwag.sh`**:
-
-| Tier | Status | Who It's For | **The Killer Feature** | What's Included |
-| :--- | :--- | :--- | :--- | :--- |
-| **Community (Open Core — `Apache-2.0`)** | ✅ **Live Now** *(`v0.1.0-genesis`)* | Individual multi-model devs on 1 Mac or same-room LAN (`mDNS`) | **"Zero-Collision Local Shared Brain (`state.crdb`)."** Up to 10 local agents share context pins, dead-end `tombstones`, and local file claims with zero cloud account required. | Full `chinwag` binary, local `.chinwag/state.crdb`, `Ed25519` Git commit signing, `LAN mDNS` discovery, local `refs/notes/emun-vault` capsules, self-hosted `RelayPolicy::Own` support. |
-| **Pro Hosted Relay (`bootstrap.chinwag.sh`)** | 🚧 **Coming Soon** | Power developers running 2+ Macs (MacBook Pro + Mac Studio) & cloud VMs | **"Your Macs Stay Connected When the Lid Closes."** One `chinwag login` connects your laptop, desktop Studio, and cloud devboxes across any firewall/NAT with zero DevOps. | Hosted `bootstrap.chinwag.sh` Durable Object room coordinator, managed `RelayPolicy::Own` NAT traversal relay, personal `app.chinwag.sh` Mission Control view. |
-| **Team Swarm Cloud (`app.chinwag.sh`)** | 🚧 **Coming Soon** | AI-native engineering teams + autonomous agent fleets | **"One Lease Authority for the Whole Team."** Stops two teammates' agents from burning API tokens on the same file/symbol across branches, and tracks duplicate runs avoided in `app.chinwag.sh`. | Shared organization rooms on `bootstrap.chinwag.sh`, team-wide atomic `chinwag-claim` leases & `verified_invariants`, Hosted Mission Control (`app.chinwag.sh`) with per-commit token telemetry. |
+👉 **[Request Private Preview Access & 500 Free Starter Credits →](https://chinwag.sh/pricing#access)**
 
 ---
 
-## 🏛️ Corporate Provenance & License
+## 🏛️ Corporate Provenance, Apache 2.0 License & Defensive Patent Grant
 
 - **Maintainer:** **Emun Labs, Inc.** · `1401 Lavaca St STE 81335, Austin, TX 78701`
-- **Open-Source License:** Licensed under the **Apache License, Version 2.0** (`SPDX-License-Identifier: Apache-2.0`). See [`LICENSE`](LICENSE) for full terms.
-- **Hosted Coordinator & Trademarks:** Server-side coordinator infrastructure (`bootstrap.chinwag.sh`, `app.chinwag.sh`) resides in the separate private `emunlabs/emun-enterprise-cloud` repository. `Chinwag`, `chinwag.sh`, and `Emun Labs` are trademarks of Emun Labs, Inc.
+- **Open-Source License (`Apache-2.0`):** `chinwag` and `chinwag-ci` are licensed under the **Apache License, Version 2.0** (`SPDX-License-Identifier: Apache-2.0`). See [`LICENSE`](LICENSE) for full terms.
+- **Section 3 Defensive Patent Grant (6 Patent-Pending Filings):** Under Section 3 of the Apache License 2.0, every user and contributor receives an express, perpetual, worldwide, no-charge, royalty-free patent license to make, use, sell, and distribute `chinwag` and `chinwag-ci` across Emun Labs' six patent-pending filings covering post-quantum dual-signed `SignedHpkeBlobV1` verify-before-decrypt relay envelopes, `A.509` sovereign agent PKIX passports, colocated Shadow `jj` cross-model Pair/Triad leases, `Vision-3` fiducial visual geometry gates, `<50 ms` deterministic Tombstone regression cassettes & Shadow-KV warm step forking, and `chinwag-acu` pairing-based split-key access control.
