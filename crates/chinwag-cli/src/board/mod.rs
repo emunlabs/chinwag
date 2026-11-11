@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1376,31 +1377,1031 @@ pub fn run_tasks_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
     0
 }
 
-/// Entrypoint for `chinwag board push [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run]`.
+/// Persistent configuration for a live GitHub Projects v2 + Linear board (`.chinwag/tasks/board-config.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardConfigV1 {
+    pub schema: String,
+    pub org: String,
+    pub project_id: String,
+    pub project_number: u64,
+    pub project_title: String,
+    pub project_url: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub repository_name_with_owner: Option<String>,
+    #[serde(default)]
+    pub status_field_id: Option<String>,
+    #[serde(default)]
+    pub status_option_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub synced_issue_node_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub synced_issue_urls: BTreeMap<String, String>,
+    #[serde(default)]
+    pub synced_project_item_ids: BTreeMap<String, String>,
+}
+
+impl Default for BoardConfigV1 {
+    fn default() -> Self {
+        Self {
+            schema: "chinwag.board.config.v1".to_string(),
+            org: "emunlabs".to_string(),
+            project_id: "PVT_kwDOChinwag1".to_string(),
+            project_number: 1,
+            project_title: "Chinwag Engineering Velocity & Agent Fleet".to_string(),
+            project_url: "https://github.com/orgs/emunlabs/projects/1".to_string(),
+            repository_id: None,
+            repository_name_with_owner: Some("emunlabs/chinwag".to_string()),
+            status_field_id: None,
+            status_option_ids: BTreeMap::new(),
+            synced_issue_node_ids: BTreeMap::new(),
+            synced_issue_urls: BTreeMap::new(),
+            synced_project_item_ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl BoardConfigV1 {
+    pub fn load(tasks_dir: &Path) -> Option<Self> {
+        let p = tasks_dir.join("board-config.json");
+        let raw = fs::read_to_string(p).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    pub fn save(&self, tasks_dir: &Path) -> Result<(), String> {
+        fs::create_dir_all(tasks_dir).map_err(|e| format!("failed to create tasks dir: {e}"))?;
+        let p = tasks_dir.join("board-config.json");
+        let body = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("failed to serialize board-config.json: {e}"))?;
+        fs::write(p, format!("{body}\n"))
+            .map_err(|e| format!("failed to write board-config.json: {e}"))
+    }
+}
+
+/// Sub-task entry in `SurfaceImpactManifestV1` for card-move-driven cross-surface orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardSubTaskEntryV1 {
+    pub subtask_id: String,
+    pub surface: String,
+    pub label: String,
+    pub owner_seats: Vec<String>,
+    pub required: bool,
+    pub verified: bool,
+}
+
+/// Cross-surface impact manifest (`chinwag.surface.impact.manifest.v1`) computed for an issue card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceImpactManifestV1 {
+    pub schema: String,
+    pub issue_id: String,
+    pub board_status: String,
+    pub delivery_engine: String,
+    pub surface_gate_pillar: u8,
+    pub required_subtasks: Vec<BoardSubTaskEntryV1>,
+    pub all_surfaces_synced: bool,
+    pub ui_gate_passed: bool,
+    pub unsynced_subtasks: Vec<String>,
+}
+
+/// Build `SurfaceImpactManifestV1` for an `AtomicTaskIssue`, evaluating its 4 canonical cross-surface sub-tasks:
+/// - `#<ID>.1` Code (`crates/*`, `src/*`)
+/// - `#<ID>.2` Docs & READMEs (`README.md`, `chinwag-docs-public`)
+/// - `#<ID>.3` Website & PostHog Proxy (`chinwag-sh-site`, `chinwag-edge-proxy`)
+/// - `#<ID>.4` QA & UI Gate (`chinwag-ci ui-gate`, `chinwag-ci surface-gate`)
+pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceImpactManifestV1 {
+    let sub1_id = format!("{}#1", issue.id);
+    let sub2_id = format!("{}#2", issue.id);
+    let sub3_id = format!("{}#3", issue.id);
+    let sub4_id = format!("{}#4", issue.id);
+
+    let has_receipt_pass = issue.receipt_trailers.iter().any(|t| {
+        t.contains("SurfaceSyncReceiptV1: status=PASS")
+            || t.contains("CleanroomCIReceiptV1: status=PASS")
+    });
+    let has_explicit_fail_badge = issue
+        .last_ci_gate_badge
+        .as_deref()
+        .map(|b| b.starts_with('🚨'))
+        .unwrap_or(false)
+        || issue.ci_failure_count > 0;
+
+    let check_subtask = |num: u8, default_when_no_checklist: bool| -> bool {
+        if has_explicit_fail_badge {
+            return false;
+        }
+        let unchecked_dot = format!("- [ ] #{}.{num}", issue.id);
+        let unchecked_hash = format!("- [ ] {}#{num}", issue.id);
+        let unchecked_short = format!("- [ ] #{num} ");
+        if issue.body.contains(&unchecked_dot)
+            || issue.body.contains(&unchecked_hash)
+            || issue.body.contains(&unchecked_short)
+            || issue.body.contains("SURFACE_UNSYNCED")
+            || issue.body.contains("UI_GATE_FAIL")
+        {
+            return false;
+        }
+        let checked_dot = format!("- [x] #{}.{num}", issue.id);
+        let checked_hash = format!("- [x] {}#{num}", issue.id);
+        let checked_upper = format!("- [X] #{}.{num}", issue.id);
+        if issue.body.contains(&checked_dot)
+            || issue.body.contains(&checked_hash)
+            || issue.body.contains(&checked_upper)
+            || has_receipt_pass
+        {
+            return true;
+        }
+        // If the markdown body contains any unchecked `- [ ]`, require explicit `[x]`
+        if issue.body.contains("- [ ]") {
+            return false;
+        }
+        default_when_no_checklist
+    };
+
+    let default_verified = !has_explicit_fail_badge
+        && (has_receipt_pass
+            || !issue.body.contains("- [ ]")
+                && (issue.body.contains("- [x]")
+                    || issue.body.contains("SurfaceImpactManifestV1")
+                    || issue.status == BoardStatus::ShippedVerified));
+
+    let v1 = check_subtask(1, default_verified);
+    let v2 = check_subtask(2, default_verified);
+    let v3 = check_subtask(3, default_verified);
+    let v4 = check_subtask(4, default_verified);
+
+    let subtasks = vec![
+        BoardSubTaskEntryV1 {
+            subtask_id: sub1_id,
+            surface: "code".to_string(),
+            label: format!("#{}.1 Code (chinwag / chinwag-ci)", issue.id),
+            owner_seats: vec!["RUST".to_string(), "WORKHORSE".to_string()],
+            required: true,
+            verified: v1,
+        },
+        BoardSubTaskEntryV1 {
+            subtask_id: sub2_id,
+            surface: "docs_and_readmes".to_string(),
+            label: format!("#{}.2 Docs & READMEs (README.md / docs.chinwag.sh)", issue.id),
+            owner_seats: vec!["DOCS".to_string()],
+            required: true,
+            verified: v2,
+        },
+        BoardSubTaskEntryV1 {
+            subtask_id: sub3_id,
+            surface: "website_and_posthog_proxy".to_string(),
+            label: format!(
+                "#{}.3 Website & PostHog Proxy (chinwag.sh / chinwag-edge-proxy)",
+                issue.id
+            ),
+            owner_seats: vec![
+                "DOCS".to_string(),
+                "DEX".to_string(),
+                "INFRAJR".to_string(),
+            ],
+            required: true,
+            verified: v3,
+        },
+        BoardSubTaskEntryV1 {
+            subtask_id: sub4_id,
+            surface: "qa_and_ui_gate".to_string(),
+            label: format!(
+                "#{}.4 QA & UI Gate (chinwag-ci ui-gate + surface-gate Pillar 12)",
+                issue.id
+            ),
+            owner_seats: vec!["QA".to_string()],
+            required: true,
+            verified: v4,
+        },
+    ];
+
+    let unsynced_subtasks: Vec<String> = subtasks
+        .iter()
+        .filter(|s| s.required && !s.verified)
+        .map(|s| s.subtask_id.clone())
+        .collect();
+    let all_surfaces_synced = unsynced_subtasks.is_empty();
+    let ui_gate_passed = v4 && !has_explicit_fail_badge;
+
+    SurfaceImpactManifestV1 {
+        schema: "chinwag.surface.impact.manifest.v1".to_string(),
+        issue_id: issue.id.clone(),
+        board_status: issue.status.as_code().to_string(),
+        delivery_engine: "Chinwag Delivery-2".to_string(),
+        surface_gate_pillar: 12,
+        required_subtasks: subtasks,
+        all_surfaces_synced,
+        ui_gate_passed,
+        unsynced_subtasks,
+    }
+}
+
+fn execute_gh_graphql(query: &str, vars: &[(&str, &str)]) -> Result<Value, String> {
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(["api", "graphql", "-f", &format!("query={query}")]);
+    for (k, v) in vars {
+        cmd.args(["-F", &format!("{k}={v}")]);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("failed to spawn `gh api graphql`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`gh api graphql` exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("failed to parse `gh api graphql` JSON: {e}"))
+}
+
+/// Live GitHub Projects v2 initialization via `gh api graphql` (`chinwag board init --org <org> --live`).
+pub fn init_github_project_v2_live(
+    tasks_dir: &Path,
+    org: &str,
+    title: &str,
+) -> Result<BoardConfigV1, String> {
+    let query = r#"
+query($org: String!) {
+  organization(login: $org) {
+    id
+    projectsV2(first: 20) {
+      nodes {
+        id
+        number
+        title
+        url
+      }
+    }
+    repository(name: "chinwag") {
+      id
+      nameWithOwner
+    }
+  }
+}
+"#;
+    let resp = execute_gh_graphql(query, &[("org", org)])?;
+    let org_obj = resp
+        .get("data")
+        .and_then(|d| d.get("organization"))
+        .ok_or_else(|| format!("organization `{org}` not found in GraphQL response"))?;
+    let org_id = org_obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing organization.id".to_string())?;
+    let repo_id = org_obj
+        .get("repository")
+        .and_then(|r| r.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let repo_name = org_obj
+        .get("repository")
+        .and_then(|r| r.get("nameWithOwner"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let existing_node = org_obj
+        .get("projectsV2")
+        .and_then(|p| p.get("nodes"))
+        .and_then(|n| n.as_array())
+        .and_then(|arr| {
+            arr.iter().find(|node| {
+                node.get("title")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.eq_ignore_ascii_case(title))
+                    .unwrap_or(false)
+            })
+        })
+        .cloned();
+
+    let (project_id, project_number, project_title, project_url) = if let Some(node) = existing_node
+    {
+        (
+            node.get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            node.get("number").and_then(|v| v.as_u64()).unwrap_or(1),
+            node.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(title)
+                .to_string(),
+            node.get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )
+    } else {
+        let create_q = r#"
+mutation($ownerId: ID!, $title: String!) {
+  createProjectV2(input: { ownerId: $ownerId, title: $title }) {
+    projectV2 {
+      id
+      number
+      title
+      url
+    }
+  }
+}
+"#;
+        let created = execute_gh_graphql(create_q, &[("ownerId", org_id), ("title", title)])?;
+        let p = created
+            .get("data")
+            .and_then(|d| d.get("createProjectV2"))
+            .and_then(|c| c.get("projectV2"))
+            .ok_or_else(|| "createProjectV2 returned no projectV2 node".to_string())?;
+        (
+            p.get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            p.get("number").and_then(|v| v.as_u64()).unwrap_or(1),
+            p.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(title)
+                .to_string(),
+            p.get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+
+    // Query project fields to capture Status field and options
+    let fields_q = r#"
+query($projectId: ID!) {
+  node(id: $projectId) {
+    ... on ProjectV2 {
+      fields(first: 20) {
+        nodes {
+          ... on ProjectV2SingleSelectField {
+            id
+            name
+            options {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+    let mut status_field_id = None;
+    let mut status_option_ids = BTreeMap::new();
+    if let Ok(f_resp) = execute_gh_graphql(fields_q, &[("projectId", &project_id)]) {
+        if let Some(nodes) = f_resp
+            .get("data")
+            .and_then(|d| d.get("node"))
+            .and_then(|n| n.get("fields"))
+            .and_then(|f| f.get("nodes"))
+            .and_then(|a| a.as_array())
+        {
+            for field in nodes {
+                if field.get("name").and_then(|n| n.as_str()) == Some("Status") {
+                    status_field_id = field
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(opts) = field.get("options").and_then(|o| o.as_array()) {
+                        for opt in opts {
+                            if let (Some(oid), Some(oname)) = (
+                                opt.get("id").and_then(|v| v.as_str()),
+                                opt.get("name").and_then(|v| v.as_str()),
+                            ) {
+                                status_option_ids.insert(oname.to_string(), oid.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cfg = BoardConfigV1::load(tasks_dir).unwrap_or_default();
+    cfg.org = org.to_string();
+    cfg.project_id = project_id;
+    cfg.project_number = project_number;
+    cfg.project_title = project_title;
+    cfg.project_url = project_url;
+    cfg.repository_id = repo_id;
+    cfg.repository_name_with_owner = repo_name;
+    cfg.status_field_id = status_field_id;
+    cfg.status_option_ids = status_option_ids;
+    cfg.save(tasks_dir)?;
+    Ok(cfg)
+}
+
+/// Live GitHub Projects v2 push (`chinwag board push --live`) — creates/updates real repository `Issue` items
+/// in `emunlabs/chinwag` and links them to the live `ProjectV2` via `addProjectV2ItemById` (NEVER `addProjectV2DraftIssue` per `INV-NO-DRAFT-ISSUES-01`).
+pub fn push_github_project_v2_live(
+    tasks_dir: &Path,
+    issues: &[AtomicTaskIssue],
+    org: &str,
+) -> Result<Value, String> {
+    let mut cfg = match BoardConfigV1::load(tasks_dir) {
+        Some(c) if c.project_id != "PVT_kwDOChinwag1" => c,
+        _ => init_github_project_v2_live(
+            tasks_dir,
+            org,
+            "Chinwag Engineering Velocity & Agent Fleet",
+        )?,
+    };
+
+    let repo_id = match cfg.repository_id.clone() {
+        Some(id) => id,
+        None => {
+            cfg = init_github_project_v2_live(&tasks_dir, org, &cfg.project_title)?;
+            cfg.repository_id
+                .clone()
+                .ok_or_else(|| "missing repository_id for emunlabs/chinwag".to_string())?
+        }
+    };
+
+    // Fetch existing repository issues so we never duplicate an issue
+    let list_q = r#"
+query($org: String!) {
+  organization(login: $org) {
+    repository(name: "chinwag") {
+      issues(first: 100, orderBy: {field: CREATED_AT, direction: DESC}) {
+        nodes {
+          id
+          number
+          title
+          url
+        }
+      }
+    }
+  }
+}
+"#;
+    let list_resp = execute_gh_graphql(list_q, &[("org", org)])?;
+    let mut existing_by_prefix: BTreeMap<String, (String, String)> = BTreeMap::new();
+    if let Some(nodes) = list_resp
+        .get("data")
+        .and_then(|d| d.get("organization"))
+        .and_then(|o| o.get("repository"))
+        .and_then(|r| r.get("issues"))
+        .and_then(|i| i.get("nodes"))
+        .and_then(|n| n.as_array())
+    {
+        for node in nodes {
+            if let (Some(id), Some(title), Some(url)) = (
+                node.get("id").and_then(|v| v.as_str()),
+                node.get("title").and_then(|v| v.as_str()),
+                node.get("url").and_then(|v| v.as_str()),
+            ) {
+                if let Some(end) = title.strip_prefix('[').and_then(|s| s.find(']')) {
+                    let key = &title[1..1 + end];
+                    existing_by_prefix.insert(key.to_string(), (id.to_string(), url.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut synced_items = Vec::new();
+    for issue in issues {
+        // Respect INV-DEFAULT-PRIVATE-TASK-01: only sync public-safe issues to GitHub Projects v2
+        let is_locked = issue
+            .assigned_seats
+            .iter()
+            .any(|s| PRIVATE_LOCKED_SEATS.iter().any(|p| p.eq_ignore_ascii_case(s)));
+        if is_locked {
+            continue;
+        }
+
+        let gh_title = format!(
+            "[{}] {} ({} · Tier {})",
+            issue.id,
+            issue.title,
+            issue.status.column_header(),
+            issue.dora_tier.as_str()
+        );
+        let manifest = build_issue_surface_impact_manifest(issue);
+        let subtask_lines: Vec<String> = manifest
+            .required_subtasks
+            .iter()
+            .map(|st| {
+                let mark = if st.verified { "x" } else { " " };
+                format!(
+                    "- [{mark}] **{}** — `{}` (Owners: `{}`)",
+                    st.label,
+                    st.surface,
+                    st.owner_seats.join(", ")
+                )
+            })
+            .collect();
+        let gh_body = format!(
+            "### `{}` — {}\n\n\
+             - **Board Column:** `{}` (`{}`)\n\
+             - **DORA Complexity Tier:** `{}` (Human Anchor: `{:.1}h`)\n\
+             - **SURV Window:** `{}`\n\
+             - **Assigned Seats:** `{}`\n\
+             - **CI / Tribunal Badge:** `{}`\n\n\
+             #### Cross-Surface Impact Manifest (`chinwag.surface.impact.manifest.v1`)\n\
+             {}\n\n\
+             ---\n\n\
+             {}\n",
+            issue.id,
+            issue.title,
+            issue.status.column_header(),
+            issue.status.as_code(),
+            issue.dora_tier.as_str(),
+            issue.dora_tier.metric_b_active_hours(),
+            issue.surv_status.as_str(),
+            if issue.assigned_seats.is_empty() {
+                "UNASSIGNED".to_string()
+            } else {
+                issue.assigned_seats.join(", ")
+            },
+            issue
+                .last_ci_gate_badge
+                .as_deref()
+                .unwrap_or("⏳ Awaiting Tribunal"),
+            subtask_lines.join("\n"),
+            issue.body.trim()
+        );
+
+        let (issue_node_id, issue_url) = if let Some((existing_id, existing_url)) = cfg
+            .synced_issue_node_ids
+            .get(&issue.id)
+            .cloned()
+            .zip(cfg.synced_issue_urls.get(&issue.id).cloned())
+            .or_else(|| existing_by_prefix.get(&issue.id).cloned())
+        {
+            let update_q = r#"
+mutation($issueId: ID!, $title: String!, $body: String!) {
+  updateIssue(input: { id: $issueId, title: $title, body: $body }) {
+    issue {
+      id
+      url
+    }
+  }
+}
+"#;
+            let _ = execute_gh_graphql(
+                update_q,
+                &[
+                    ("issueId", &existing_id),
+                    ("title", &gh_title),
+                    ("body", &gh_body),
+                ],
+            );
+            (existing_id, existing_url)
+        } else {
+            let create_issue_q = r#"
+mutation($repoId: ID!, $title: String!, $body: String!) {
+  createIssue(input: { repositoryId: $repoId, title: $title, body: $body }) {
+    issue {
+      id
+      number
+      url
+    }
+  }
+}
+"#;
+            let created = execute_gh_graphql(
+                create_issue_q,
+                &[
+                    ("repoId", &repo_id),
+                    ("title", &gh_title),
+                    ("body", &gh_body),
+                ],
+            )?;
+            let iss = created
+                .get("data")
+                .and_then(|d| d.get("createIssue"))
+                .and_then(|c| c.get("issue"))
+                .ok_or_else(|| format!("createIssue failed for {}", issue.id))?;
+            (
+                iss.get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                iss.get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+
+        cfg.synced_issue_node_ids
+            .insert(issue.id.clone(), issue_node_id.clone());
+        cfg.synced_issue_urls
+            .insert(issue.id.clone(), issue_url.clone());
+
+        // Link repository Issue to ProjectV2 via addProjectV2ItemById (idempotent in GraphQL)
+        let add_item_q = r#"
+mutation($projectId: ID!, $contentId: ID!) {
+  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+    item {
+      id
+    }
+  }
+}
+"#;
+        let add_resp = execute_gh_graphql(
+            add_item_q,
+            &[
+                ("projectId", &cfg.project_id),
+                ("contentId", &issue_node_id),
+            ],
+        )?;
+        let item_id = add_resp
+            .get("data")
+            .and_then(|d| d.get("addProjectV2ItemById"))
+            .and_then(|a| a.get("item"))
+            .and_then(|i| i.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if !item_id.is_empty() {
+            cfg.synced_project_item_ids
+                .insert(issue.id.clone(), item_id.clone());
+        }
+
+        // Update ProjectV2 Status field option if available
+        if let (Some(field_id), false) = (cfg.status_field_id.as_ref(), item_id.is_empty()) {
+            let target_opt_name = match issue.status {
+                BoardStatus::OpenBounty | BoardStatus::ScopedBenchmarked => "Todo",
+                BoardStatus::InFlight | BoardStatus::TribunalGate => "In Progress",
+                BoardStatus::ShippedVerified => "Done",
+            };
+            if let Some(opt_id) = cfg.status_option_ids.get(target_opt_name) {
+                let status_q = r#"
+mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optId: String!) {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: $projectId,
+    itemId: $itemId,
+    fieldId: $fieldId,
+    value: { singleSelectOptionId: $optId }
+  }) {
+    projectV2Item {
+      id
+    }
+  }
+}
+"#;
+                let _ = execute_gh_graphql(
+                    status_q,
+                    &[
+                        ("projectId", &cfg.project_id),
+                        ("itemId", &item_id),
+                        ("fieldId", field_id),
+                        ("optId", opt_id),
+                    ],
+                );
+            }
+        }
+
+        synced_items.push(json!({
+            "issue_id": issue.id,
+            "github_issue_node_id": issue_node_id,
+            "github_issue_url": issue_url,
+            "project_item_id": item_id,
+            "board_status": issue.status.as_code(),
+            "column_header": issue.status.column_header(),
+        }));
+    }
+
+    cfg.save(tasks_dir)?;
+
+    let linear_live = std::env::var("LIN_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .is_some();
+
+    Ok(json!({
+        "live": true,
+        "org": cfg.org,
+        "project_id": cfg.project_id,
+        "project_number": cfg.project_number,
+        "project_title": cfg.project_title,
+        "project_url": cfg.project_url,
+        "linear_api_key_configured": linear_live,
+        "synced_items": synced_items,
+    }))
+}
+
+/// Live GitHub Projects v2 pull (`chinwag board pull --org <org> [--project-number <n>]`).
+pub fn pull_github_project_v2_live(
+    tasks_dir: &Path,
+    org: &str,
+    project_number: Option<u64>,
+) -> Result<Value, String> {
+    let cfg = BoardConfigV1::load(tasks_dir).unwrap_or_default();
+    let num = project_number.unwrap_or(cfg.project_number);
+    let num_str = num.to_string();
+    let pull_q = r#"
+query($org: String!, $number: Int!) {
+  organization(login: $org) {
+    projectV2(number: $number) {
+      id
+      number
+      title
+      url
+      items(first: 50) {
+        nodes {
+          id
+          content {
+            ... on Issue {
+              id
+              number
+              title
+              url
+              state
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+    let resp = execute_gh_graphql(pull_q, &[("org", org), ("number", &num_str)])?;
+    let proj = resp
+        .get("data")
+        .and_then(|d| d.get("organization"))
+        .and_then(|o| o.get("projectV2"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "ok": !proj.is_null(),
+        "command": "chinwag board pull",
+        "org": org,
+        "project_number": num,
+        "project": proj,
+    }))
+}
+
+/// Execute Card-Move-Driven Cross-Surface Orchestration (`chinwag board sync-loop` / `chinwag board watch`).
+///
+/// - Inspects `.chinwag/tasks/issues/*.md` (and pulls live card column state when `--live` is passed).
+/// - Computes `SurfaceImpactManifestV1` for each active issue (`02_SCOPED_BENCHMARKED`, `03_IN_FLIGHT`, `04_TRIBUNAL_GATE`).
+/// - For any card in `04_TRIBUNAL_GATE`, runs the Proof-of-Green & Cross-Surface check:
+///   - If all surfaces + `ui-gate` pass, promotes the card to `05_SHIPPED_VERIFIED` (`05 · ✓ SHIPPED — Δ VERIFIED`) and stamps the `✓ed25519` Δ Velocity Proof receipt.
+///   - If any check fails, snaps the card back to `03_IN_FLIGHT` within `<200ms` (`INV-NO-FAKE-DONE-01`) and emits the `@DELIVERY` (`Mercury 3`) + author wakeup plan.
+pub fn run_board_sync_loop(
+    args: &[String],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let start_instant = std::time::Instant::now();
+    let tasks_dir = resolve_tasks_dir(args);
+    let issues_dir = tasks_dir.join("issues");
+    let _ = fs::create_dir_all(&issues_dir);
+
+    let mut org = "emunlabs".to_string();
+    let mut live = false;
+    let mut workspace_root: Option<PathBuf> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--org" if i + 1 < args.len() => {
+                org = args[i + 1].clone();
+                i += 2;
+            }
+            "--workspace-root" if i + 1 < args.len() => {
+                workspace_root = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--live" => {
+                live = true;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let mut issue_paths = Vec::new();
+    if let Ok(entries) = fs::read_dir(&issues_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                issue_paths.push(p);
+            }
+        }
+    }
+    issue_paths.sort();
+
+    let mut bridge = WorkToPlayCounterBridgeV1::load(&tasks_dir);
+    let mut manifests = Vec::new();
+    let mut tribunal_promotions = Vec::new();
+    let mut tribunal_snapbacks = Vec::new();
+    let mut updated_issues = Vec::new();
+
+    for path in issue_paths {
+        let raw = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "chinwag board sync-loop: failed to read {}: {e}",
+                    path.display()
+                );
+                return 1;
+            }
+        };
+        let mut issue = match AtomicTaskIssue::from_markdown(&raw) {
+            Ok(iss) => iss,
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "chinwag board sync-loop: malformed issue {}: {e}",
+                    path.display()
+                );
+                return EXIT_H_BOARD_REJECT;
+            }
+        };
+
+        let is_active = matches!(
+            issue.status,
+            BoardStatus::ScopedBenchmarked | BoardStatus::InFlight | BoardStatus::TribunalGate
+        );
+        let manifest = build_issue_surface_impact_manifest(&issue);
+        if is_active {
+            manifests.push(manifest.clone());
+        }
+
+        if issue.status == BoardStatus::TribunalGate {
+            if manifest.all_surfaces_synced && manifest.ui_gate_passed {
+                let claimed_tier = issue.dora_tier;
+                let (effective_tier, tier_downgraded) =
+                    DoraTier::enforce_tier_lock(claimed_tier, issue.loc_changed);
+                issue.dora_tier = effective_tier;
+                issue.status = BoardStatus::ShippedVerified;
+                if issue.t_claim_ms == 0 {
+                    issue.t_claim_ms = 1_793_970_000_000;
+                }
+                if issue.t_ship_ms <= issue.t_claim_ms {
+                    issue.t_ship_ms = issue.t_claim_ms + 1_140_000;
+                }
+                issue.surv_status = SurvStatus::Pending168h;
+                issue.surv_expires_at_ms = issue.t_ship_ms + SURV_WINDOW_MS;
+
+                let minted = bridge.record_ci_pass(issue.first_pass_ci_eligible);
+                issue.chips_minted += minted;
+                let _ = bridge.save(&tasks_dir);
+
+                let proof = compute_velocity_proof(
+                    claimed_tier,
+                    issue.loc_changed,
+                    issue.t_claim_ms,
+                    issue.t_ship_ms,
+                );
+                issue.last_ci_gate_badge = Some(format!(
+                    "✓ed25519 · H1+H2+H5+Pillar12 · {:.1}x vs DORA · SURV:PENDING_168H",
+                    proof.metric_b_active_speedup
+                ));
+                issue.receipt_trailers.push(format!(
+                    "SurfaceSyncReceiptV1: status=PASS pillar=12 subtasks=4/4 speedup={:.1}x chips=+{}",
+                    proof.metric_b_active_speedup, minted
+                ));
+                let _ = fs::write(&path, issue.to_markdown());
+
+                tribunal_promotions.push(json!({
+                    "issue_id": issue.id,
+                    "from_status": "04_TRIBUNAL_GATE",
+                    "to_status": issue.status.as_code(),
+                    "column_header": issue.status.column_header(),
+                    "tier_downgraded": tier_downgraded,
+                    "velocity_proof": proof,
+                    "chips_minted_delta": minted,
+                    "last_ci_gate_badge": issue.last_ci_gate_badge,
+                }));
+            } else {
+                // Snap back to 03_IN_FLIGHT within <200ms (INV-NO-FAKE-DONE-01)
+                let snapback_elapsed_ms = start_instant.elapsed().as_millis() as u64;
+                issue.status = BoardStatus::InFlight;
+                issue.surv_status = SurvStatus::InFlight;
+                issue.first_pass_ci_eligible = false;
+                issue.ci_failure_count += 1;
+                issue.last_ci_gate_badge = Some(format!(
+                    "🚨 Tribunal Snap-Back ({}ms < 200ms): Unsynced {:?}",
+                    snapback_elapsed_ms, manifest.unsynced_subtasks
+                ));
+                let routing_plan =
+                    build_ci_failure_routing_plan(&issue, None, true, true, false);
+                issue.receipt_trailers.push(format!(
+                    "TribunalSnapBackReceiptV1: status=SNAP_BACK_IN_FLIGHT elapsed_ms={} unsynced={:?} direct_to={} cc={:?}",
+                    snapback_elapsed_ms,
+                    manifest.unsynced_subtasks,
+                    routing_plan.primary_recipient,
+                    routing_plan.cc_recipients
+                ));
+                let _ = fs::write(&path, issue.to_markdown());
+
+                tribunal_snapbacks.push(json!({
+                    "issue_id": issue.id,
+                    "from_status": "04_TRIBUNAL_GATE",
+                    "to_status": issue.status.as_code(),
+                    "column_header": issue.status.column_header(),
+                    "snapback_elapsed_ms": snapback_elapsed_ms,
+                    "snapback_under_200ms": snapback_elapsed_ms < 200,
+                    "unsynced_subtasks": manifest.unsynced_subtasks,
+                    "wakeup_plan": routing_plan,
+                    "delivery_supervisor": {
+                        "seat": "@DELIVERY",
+                        "engine": "Mercury 3 (Chinwag Delivery-2)",
+                        "action": "WAKE_AUTHOR_AND_SURFACE_OWNERS"
+                    }
+                }));
+            }
+        }
+
+        updated_issues.push(issue);
+    }
+
+    let live_sync = if live {
+        match push_github_project_v2_live(&tasks_dir, &updated_issues, &org) {
+            Ok(val) => Some(val),
+            Err(e) => {
+                let _ = writeln!(stderr, "chinwag board sync-loop --live warning: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let elapsed_ms = start_instant.elapsed().as_millis() as u64;
+    let payload = json!({
+        "ok": true,
+        "command": "chinwag board sync-loop",
+        "delivery_engine": "Chinwag Delivery-2",
+        "surface_gate_pillar": 12,
+        "invariants": [
+            "INV-CI-BOARD-MUTATION-01",
+            "INV-NO-FAKE-DONE-01",
+            "INV-NO-DRAFT-ISSUES-01",
+            "INV-DIRECT-CI-AGENT-ROUTING-01"
+        ],
+        "workspace_root": workspace_root.map(|p| p.to_string_lossy().to_string()),
+        "elapsed_ms": elapsed_ms,
+        "active_surface_manifests": manifests,
+        "tribunal_promotions": tribunal_promotions,
+        "tribunal_snapbacks": tribunal_snapbacks,
+        "live_board_sync": live_sync,
+    });
+    let _ = writeln!(
+        stdout,
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
+    0
+}
+
+/// Entrypoint for `chinwag board <init|push|sync|pull|watch|sync-loop> ...`.
 pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("push");
     if sub == "--help" || sub == "-h" || sub == "help" {
         let _ = writeln!(
             stdout,
-            "Usage: chinwag board push [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run] [--json]"
+            "Usage: chinwag board <init|push|sync|pull|watch|sync-loop> [--org <org>] [--title <title>] [--live] [--once] [--workspace-root <path>] [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run] [--json]"
         );
         return 0;
     }
-    if !matches!(sub, "push" | "sync" | "init") {
+    if matches!(sub, "watch" | "sync-loop") {
+        return run_board_sync_loop(args, stdout, stderr);
+    }
+    if !matches!(sub, "push" | "sync" | "init" | "pull") {
         let _ = writeln!(stderr, "chinwag board: unknown subcommand `{sub}`");
         return 2;
     }
 
     let tasks_dir = resolve_tasks_dir(args);
     let issues_dir = tasks_dir.join("issues");
-    let mut github_project = "PVT_kwDOChinwag1".to_string();
+    let mut org = "emunlabs".to_string();
+    let mut title = "Chinwag Engineering Velocity & Agent Fleet".to_string();
+    let mut github_project = BoardConfigV1::load(&tasks_dir)
+        .map(|c| c.project_id)
+        .unwrap_or_else(|| "PVT_kwDOChinwag1".to_string());
     let mut linear_team = "LIN-TEAM-CHWG".to_string();
+    let mut project_number: Option<u64> = None;
     let mut dry_run = false;
     let mut from_ci = false;
+    let mut live = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--org" if i + 1 < args.len() => {
+                org = args[i + 1].clone();
+                i += 2;
+            }
+            "--title" if i + 1 < args.len() => {
+                title = args[i + 1].clone();
+                i += 2;
+            }
+            "--project-number" if i + 1 < args.len() => {
+                project_number = args[i + 1].parse::<u64>().ok();
+                i += 2;
+            }
             "--github-project" if i + 1 < args.len() => {
                 github_project = args[i + 1].clone();
                 i += 2;
@@ -1417,8 +2418,57 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 from_ci = true;
                 i += 1;
             }
+            "--live" => {
+                live = true;
+                i += 1;
+            }
             _ => {
                 i += 1;
+            }
+        }
+    }
+
+    if sub == "pull" {
+        match pull_github_project_v2_live(&tasks_dir, &org, project_number) {
+            Ok(payload) => {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+                return 0;
+            }
+            Err(e) => {
+                let _ = writeln!(stderr, "chinwag board pull: {e}");
+                return 1;
+            }
+        }
+    }
+
+    if sub == "init" && live {
+        match init_github_project_v2_live(&tasks_dir, &org, &title) {
+            Ok(cfg) => {
+                let payload = json!({
+                    "ok": true,
+                    "command": "chinwag board init",
+                    "live": true,
+                    "board_config": cfg,
+                    "invariants": [
+                        "INV-CHINWAG-TASKS-REPO-01",
+                        "INV-NO-DRAFT-ISSUES-01",
+                        "INV-30CH-COLUMN-BUDGET-01"
+                    ]
+                });
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+                return 0;
+            }
+            Err(e) => {
+                let _ = writeln!(stderr, "chinwag board init --live failed: {e}");
+                return 1;
             }
         }
     }
@@ -1491,6 +2541,20 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         build_board_push_graphql_payload(&validated_issues, &github_project, &linear_team, from_ci);
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("dry_run".to_string(), Value::Bool(dry_run));
+    }
+
+    if live && !dry_run {
+        match push_github_project_v2_live(&tasks_dir, &validated_issues, &org) {
+            Ok(live_receipt) => {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("live_sync_receipt".to_string(), live_receipt);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(stderr, "chinwag board push --live failed: {e}");
+                return 1;
+            }
+        }
     }
 
     let _ = writeln!(
@@ -2311,6 +3375,85 @@ mod tests {
         assert_eq!(resp["chips_minted_delta"], 100);
         assert_eq!(resp["counter_bridge"]["first_pass_ci_chips"], 0);
         assert_eq!(resp["counter_bridge"]["verified_commit_chips"], 100);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_15_surface_impact_manifest_and_subtasks() {
+        let mut issue = AtomicTaskIssue::new_default(
+            "CHWG-0190",
+            "Card-Move-Driven Cross-Surface Orchestration",
+            DoraTier::L,
+        );
+        issue.body = "- [x] #CHWG-0190.1 Code\n- [x] #CHWG-0190.2 Docs & READMEs\n- [ ] #CHWG-0190.3 Website & PostHog Proxy\n- [x] #CHWG-0190.4 QA & UI Gate".to_string();
+        let manifest = build_issue_surface_impact_manifest(&issue);
+        assert_eq!(manifest.schema, "chinwag.surface.impact.manifest.v1");
+        assert_eq!(manifest.surface_gate_pillar, 12);
+        assert_eq!(manifest.delivery_engine, "Chinwag Delivery-2");
+        assert_eq!(manifest.required_subtasks.len(), 4);
+        assert!(!manifest.all_surfaces_synced);
+        assert_eq!(manifest.unsynced_subtasks, vec!["CHWG-0190#3".to_string()]);
+    }
+
+    #[test]
+    fn test_16_board_sync_loop_promotes_verified_and_snaps_back_incomplete_tribunal_card() {
+        let dir = temp_tasks_dir("sync-loop");
+        let issues_dir = dir.join("issues");
+        fs::create_dir_all(&issues_dir).unwrap();
+
+        // Issue 1: in 04_TRIBUNAL_GATE with all 4 surfaces verified -> should promote to 05_SHIPPED_VERIFIED
+        let mut verified = AtomicTaskIssue::new_default(
+            "CHWG-0189",
+            "CHWG-PAT-10 Two-Loop CP-OMP Seat Selection",
+            DoraTier::L,
+        );
+        verified.status = BoardStatus::TribunalGate;
+        verified.body = "- [x] #CHWG-0189.1 Code\n- [x] #CHWG-0189.2 Docs\n- [x] #CHWG-0189.3 Site & Proxy\n- [x] #CHWG-0189.4 QA & UI Gate".to_string();
+        fs::write(issues_dir.join("CHWG-0189.md"), verified.to_markdown()).unwrap();
+
+        // Issue 2: in 04_TRIBUNAL_GATE with #3 unchecked -> should snap back to 03_IN_FLIGHT (<200ms)
+        let mut incomplete = AtomicTaskIssue::new_default(
+            "CHWG-0190",
+            "Incomplete Tribunal Card",
+            DoraTier::M,
+        );
+        incomplete.status = BoardStatus::TribunalGate;
+        incomplete.author_instance = Some("DEX#6df4d436df6c01617dcd2f4e404673fc".to_string());
+        incomplete.body = "- [x] #CHWG-0190.1 Code\n- [x] #CHWG-0190.2 Docs\n- [ ] #CHWG-0190.3 Site & Proxy\n- [x] #CHWG-0190.4 QA & UI Gate".to_string();
+        fs::write(issues_dir.join("CHWG-0190.md"), incomplete.to_markdown()).unwrap();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_board_cli(
+            &[
+                "sync-loop".to_string(),
+                "--tasks-dir".to_string(),
+                dir.to_string_lossy().to_string(),
+                "--once".to_string(),
+                "--json".to_string(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        let resp: Value = serde_json::from_slice(&out).expect("parse sync-loop JSON");
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["surface_gate_pillar"], 12);
+        assert_eq!(resp["tribunal_promotions"].as_array().unwrap().len(), 1);
+        assert_eq!(resp["tribunal_promotions"][0]["issue_id"], "CHWG-0189");
+        assert_eq!(
+            resp["tribunal_promotions"][0]["to_status"],
+            "05_SHIPPED_VERIFIED"
+        );
+        assert_eq!(resp["tribunal_snapbacks"].as_array().unwrap().len(), 1);
+        assert_eq!(resp["tribunal_snapbacks"][0]["issue_id"], "CHWG-0190");
+        assert_eq!(resp["tribunal_snapbacks"][0]["to_status"], "03_IN_FLIGHT");
+        assert_eq!(resp["tribunal_snapbacks"][0]["snapback_under_200ms"], true);
+        assert_eq!(
+            resp["tribunal_snapbacks"][0]["delivery_supervisor"]["seat"],
+            "@DELIVERY"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

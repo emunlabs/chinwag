@@ -1,0 +1,28 @@
+{
+  "schema": "chinwag.board.config.v1",
+  "org": "emunlabs",
+  "project_id": "PVT_kwDOFJPsXM4BrFUV",
+  "project_number": 1,
+  "project_title": "Chinwag Engineering Velocity & Agent Fleet",
+  "project_url": "https://github.com/orgs/emunlabs/projects/1",
+  "repository_id": "R_kgDOVU4K-Q",
+  "repository_name_with_owner": "emunlabs/chinwag",
+  "status_field_id": "PVTSSF_lADOFJPsXM4BrFUVzhpZlZQ",
+  "status_option_ids": {
+    "Done": "98236657",
+    "In Progress": "47fc9ee4",
+    "Todo": "f75ad846"
+  },
+  "synced_issue_node_ids": {
+    "CHWG-0189": "I_kwDOVU4K-c8AAAABeK-k7Q",
+    "CHWG-0190": "I_kwDOVU4K-c8AAAABeK-nKA"
+  },
+  "synced_issue_urls": {
+    "CHWG-0189": "https://github.com/emunlabs/chinwag/issues/19",
+    "CHWG-0190": "https://github.com/emunlabs/chinwag/issues/20"
+  },
+  "synced_project_item_ids": {
+    "CHWG-0189": "PVTI_lADOFJPsXM4BrFUVzhHrxhs",
+    "CHWG-0190": "PVTI_lADOFJPsXM4BrFUVzhHrxjc"
+  }
+}
