@@ -1,10 +1,655 @@
 {
+  "schema_version": "CHWG-NATIVE-PM-BOARDS-01.v4",
+  "version": "4.0.0",
+  "default_visibility": "private",
+  "public": false,
+  "public_board": false,
+  "short_description": "Shipped work, hours saved against Chinwag’s published tier model, and recorded credits. Pipeline work stays at 0 hours saved.",
+  "dora_baseline_explainer": {
+    "heading": "How baseline time is estimated",
+    "plain_english": "Baseline Hours is Chinwag’s estimate of active human engineering time for a change this size. Compare it with Chinwag Cycle Time after the change ships.",
+    "model_owner": "Chinwag",
+    "source_attribution": "This is a Chinwag planning model informed by DORA software delivery research and LinearB engineering benchmarks. The S/M/L/XL hour values are Chinwag estimates, not a tier table published or endorsed by DORA or LinearB.",
+    "time_basis": "Active engineering hours. Calendar waiting time is excluded from the hours-saved calculation.",
+    "tiers": [
+      {
+        "tier": "S",
+        "name": "Small",
+        "active_hours": 8.5,
+        "scope": "1–100 changed lines"
+      },
+      {
+        "tier": "M",
+        "name": "Medium",
+        "active_hours": 27,
+        "scope": "101–400 changed lines"
+      },
+      {
+        "tier": "L",
+        "name": "Large",
+        "active_hours": 50,
+        "scope": "401–1,200 changed lines"
+      },
+      {
+        "tier": "XL",
+        "name": "Extra large",
+        "active_hours": 112,
+        "scope": "1,201 or more changed lines"
+      }
+    ],
+    "realized_hours_rule": "Net Hours Saved stays 0 while work is open, scoped, running, or awaiting review. After verified shipment with a completion timestamp and receipt, it is max(0, Baseline Hours − actual elapsed hours).",
+    "tier_lock_rule": "The final changed-line count caps the scoped tier; a smaller delivered change uses the smaller baseline.",
+    "sources": [
+      {
+        "name": "DORA software delivery performance metrics",
+        "url": "https://dora.dev/guides/dora-metrics/",
+        "role": "Delivery performance definitions; not the source of the Chinwag active-hour tiers."
+      },
+      {
+        "name": "LinearB engineering benchmarks",
+        "url": "https://linearb.io/resources/engineering-benchmarks",
+        "role": "Engineering cycle-time and change-size context; not the source of the Chinwag active-hour tiers."
+      }
+    ]
+  },
+  "zero_empty_column_invariant": {
+    "id": "INV-BOARD-NO-BLANK-COLUMN-01",
+    "rule": "A field may be listed in visible_fields only when every item in that view’s filter has a real, non-empty value. Numeric zero is populated; missing evidence is not zero.",
+    "on_failure": "Omit the field from visibleFieldIds before publishing the view. Do not invent values or insert em dashes.",
+    "preflight": "Check every filtered row before creating or updating a view. Keep optional fields hidden until every visible row has a value.",
+    "hidden_until_complete": [
+      "Assignees",
+      "Linked pull requests",
+      "Sub-issues progress",
+      "Parent issue",
+      "Labels",
+      "Milestone",
+      "Reviewers",
+      "Closed",
+      "Start Date",
+      "Target Date",
+      "Active Seats"
+    ],
+    "public_project_extras": [
+      "shortDescription required",
+      "readme required"
+    ]
+  },
+  "invariants": [
+    "INV-DEFAULT-PRIVATE-BOARD-01",
+    "INV-DEFAULT-PRIVATE-TASK-01",
+    "INV-CHINWAG-TASKS-REPO-01",
+    "INV-NO-DRAFT-ISSUES-01",
+    "INV-NO-FAKE-DONE-01",
+    "INV-HONEST-REALIZED-HOURS-01",
+    "INV-BOARD-NO-BLANK-COLUMN-01"
+  ],
+  "security_invariants": {
+    "INV-BOARD-ZERO-LEAK-01": "Private by default. Repository and workspace access controls protect confidential issues; public exports require explicit opt-in and H_board redaction.",
+    "INV-NO-DRAFT-ISSUES-01": "Use repository-backed issues so repository access controls apply.",
+    "INV-HONEST-REALIZED-HOURS-01": "Hours saved are 0 until verified shipment, a real completion timestamp, and a verification receipt exist."
+  },
+  "confidential_seat_policy": "Confidential work is always routed to private repositories. Public showcase mode requires explicit opt-in and redaction.",
+  "surface_impact_gate": {
+    "manifest_schema": "SurfaceImpactManifestV1",
+    "ci_pillar": "Pillar 12 · chinwag-ci surface-gate + Pillar 9 · chinwag-ci ui-gate",
+    "snap_back_latency_ms": 200,
+    "snap_back_invariant": "INV-NO-FAKE-DONE-01",
+    "required_surfaces": [
+      {
+        "id": "code_cli",
+        "sub_issue_suffix": ".1",
+        "scope": "crates/**, src/**"
+      },
+      {
+        "id": "readme_docs",
+        "sub_issue_suffix": ".2",
+        "scope": "README.md, docs/**"
+      },
+      {
+        "id": "marketing_telemetry",
+        "sub_issue_suffix": ".3",
+        "scope": "site/**, hosted-relay/**"
+      },
+      {
+        "id": "ui_geometry_qa",
+        "sub_issue_suffix": ".4",
+        "scope": "1440x900 desktop & 390x844 mobile UI checks"
+      }
+    ],
+    "receipt_rule": "Record only checks that ran. Say when a surface does not apply. Reopen the card if a required check fails."
+  },
+  "custom_fields": [
+    {
+      "name": "Function / Team",
+      "data_type": "SINGLE_SELECT",
+      "options": [
+        {
+          "name": "Engineering",
+          "color": "BLUE"
+        },
+        {
+          "name": "Design",
+          "color": "PINK"
+        },
+        {
+          "name": "Product",
+          "color": "PURPLE"
+        },
+        {
+          "name": "Security",
+          "color": "ORANGE"
+        },
+        {
+          "name": "QA & Release",
+          "color": "YELLOW"
+        },
+        {
+          "name": "Analytics",
+          "color": "BLUE"
+        },
+        {
+          "name": "Docs",
+          "color": "GRAY"
+        }
+      ],
+      "rule": "Choose one primary function so hours are counted once."
+    },
+    {
+      "name": "DORA Baseline",
+      "data_type": "SINGLE_SELECT",
+      "description": "Chinwag’s human-time estimate; see dora_baseline_explainer.",
+      "options": [
+        {
+          "name": "Tier S · 8.5h Eng / 1.1d Cal (<=100 LOC)",
+          "color": "GRAY",
+          "active_eng_hours": 8.5,
+          "calendar_days": 1.1,
+          "min_loc": 1,
+          "max_loc": 100
+        },
+        {
+          "name": "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)",
+          "color": "BLUE",
+          "active_eng_hours": 27,
+          "calendar_days": 3.4,
+          "min_loc": 101,
+          "max_loc": 400
+        },
+        {
+          "name": "Tier L · 50h Eng / 6.2d Cal (400–1,200 LOC)",
+          "color": "PURPLE",
+          "active_eng_hours": 50,
+          "calendar_days": 6.2,
+          "min_loc": 401,
+          "max_loc": 1200
+        },
+        {
+          "name": "Tier XL · 112h Eng / 14.0d Cal (1,200+ LOC)",
+          "color": "ORANGE",
+          "active_eng_hours": 112,
+          "calendar_days": 14,
+          "min_loc": 1201,
+          "max_loc": null
+        }
+      ]
+    },
+    {
+      "name": "Baseline Hours",
+      "data_type": "NUMBER",
+      "unit": "active hours",
+      "description": "Chinwag model estimate for the locked tier; this is planned effort, not realized savings."
+    },
+    {
+      "name": "Chinwag Cycle Time",
+      "data_type": "TEXT",
+      "description": "Actual elapsed time after shipment; plain-language Queued, In progress, or Awaiting review before shipment."
+    },
+    {
+      "name": "Δ Speedup vs. DORA",
+      "data_type": "SINGLE_SELECT",
+      "description": "Comparison with Chinwag’s active-hour model; only verified shipments with measured timing receive a numeric speed band.",
+      "options": [
+        {
+          "name": "⚡ 100x+ Faster vs. DORA",
+          "color": "GREEN"
+        },
+        {
+          "name": "🚀 50x–99x Faster vs. DORA",
+          "color": "BLUE"
+        },
+        {
+          "name": "🔥 10x–49x Faster vs. DORA",
+          "color": "PURPLE"
+        },
+        {
+          "name": "⏱️ Clock Running — In Flight",
+          "color": "YELLOW"
+        },
+        {
+          "name": "📐 Baseline Locked — Queued",
+          "color": "GRAY"
+        },
+        {
+          "name": "Shipped · Measurement unavailable",
+          "color": "ORANGE"
+        },
+        {
+          "name": "Measured · Below 10x baseline",
+          "color": "PINK"
+        }
+      ]
+    },
+    {
+      "name": "Net Hours Saved",
+      "data_type": "NUMBER",
+      "unit": "hours",
+      "formula": "verified_shipped_with_timestamp_and_receipt ? max(0, Baseline Hours - Actual Hours) : 0",
+      "realized_only": true
+    },
+    {
+      "name": "Credits Used",
+      "data_type": "NUMBER",
+      "unit": "credits",
+      "allowed_values_source": "https://chinwag.sh/pricing#function-schedule",
+      "description": "Fixed menu-rated execution credits applied at 05 · ✓ SHIPPED — Δ VERIFIED (0 while queued or in flight; board sync uses 0 Cr; not a billing reconciliation)."
+    },
+    {
+      "name": "Execution Mode",
+      "data_type": "SINGLE_SELECT",
+      "options": [
+        {
+          "name": "CI Fix · 50 Cr",
+          "color": "BLUE",
+          "credits": 50
+        },
+        {
+          "name": "Review · 50 Cr",
+          "color": "GRAY",
+          "credits": 50
+        },
+        {
+          "name": "Pair · 100 Cr",
+          "color": "GREEN",
+          "credits": 100
+        },
+        {
+          "name": "Triad · 150 Cr",
+          "color": "PURPLE",
+          "credits": 150
+        },
+        {
+          "name": "Quad · 200 Cr",
+          "color": "ORANGE",
+          "credits": 200
+        },
+        {
+          "name": "Open bounty",
+          "color": "GREEN",
+          "note": "Contribution reward is separate from execution credits."
+        }
+      ]
+    },
+    {
+      "name": "Verification Receipt",
+      "data_type": "TEXT",
+      "description": "Short evidence summary. Full signature, commit, and check links stay in the issue body.",
+      "examples_by_state": {
+        "queued": "Scoped; verification has not started.",
+        "in_progress": "Work in progress; verification is pending.",
+        "review": "Awaiting independent checks.",
+        "shipped": "Independent review passed; required checks passed; seven-day watch running."
+      }
+    },
+    {
+      "name": "Active Seats",
+      "data_type": "TEXT",
+      "description": "Internal execution record; hidden from default customer views."
+    }
+  ],
+  "insights_charts": [
+    {
+      "name": "Hours Reclaimed by Change Size",
+      "chart_kind": "current",
+      "chart_type": "STACKED_COLUMN",
+      "layout": "Stacked column",
+      "x_axis": "DORA Baseline",
+      "y_axis": "SUM(Net Hours Saved)",
+      "group_by": "Execution Mode",
+      "filter": "status:\"05 · ✓ SHIPPED — Δ VERIFIED\""
+    },
+    {
+      "name": "Hours Reclaimed by Function",
+      "chart_kind": "current",
+      "chart_type": "BAR",
+      "layout": "Bar",
+      "x_axis": "Function / Team",
+      "y_axis": "SUM(Net Hours Saved)",
+      "group_by": null,
+      "filter": "status:\"05 · ✓ SHIPPED — Δ VERIFIED\""
+    },
+    {
+      "name": "Credits Used by Execution Mode",
+      "chart_kind": "current",
+      "chart_type": "COLUMN",
+      "layout": "Column",
+      "x_axis": "Execution Mode",
+      "y_axis": "SUM(Credits Used)",
+      "group_by": null,
+      "filter": "status:\"05 · ✓ SHIPPED — Δ VERIFIED\"",
+      "requires_field_100_percent": "Credits Used"
+    },
+    {
+      "name": "Throughput by Execution Mode",
+      "chart_kind": "current",
+      "chart_type": "STACKED_COLUMN",
+      "layout": "Stacked column",
+      "x_axis": "Execution Mode",
+      "y_axis": "COUNT(Items)",
+      "group_by": "Status",
+      "filter": "status:*"
+    },
+    {
+      "name": "Work by Function",
+      "chart_kind": "current",
+      "chart_type": "STACKED_BAR",
+      "layout": "Stacked bar",
+      "x_axis": "Function / Team",
+      "y_axis": "COUNT(Items)",
+      "group_by": "Status",
+      "filter": "status:*"
+    }
+  ],
+  "insights_capability_policy": "Create only charts the target platform supports after required fields pass the fill check. Record unsupported charts as skipped; never create an empty widget or substitute story points for hours.",
+  "board_sync_credits": 0,
+  "assignee_policy": {
+    "populate_before_surfacing": true,
+    "required_on_visible_rows": true,
+    "source": "An accountable user configured by the customer; agent seat names are not human assignees.",
+    "on_missing": "Remove Assignees from the effective visible fields until every filtered row has an accountable user."
+  },
+  "subagent_fanout_tiers": [
+    {
+      "tier": 1,
+      "name": "Parallel local work",
+      "mechanism": "Isolated workspaces with disjoint file scopes."
+    },
+    {
+      "tier": 2,
+      "name": "Task and surface routing",
+      "mechanism": "Scope the task and create required code, docs, site, and screen-check sub-issues."
+    },
+    {
+      "tier": 3,
+      "name": "Independent review",
+      "mechanism": "Pair, Triad, and Quad execution across independent model families."
+    },
+    {
+      "tier": 4,
+      "name": "Verification runners",
+      "mechanism": "Check applicable surfaces and record the evidence before shipment."
+    }
+  ],
+  "$schema": "https://chinwag.sh/templates/linear-template.json",
   "schema": "chinwag.linear.template.v1",
-  "version": "1.0.0",
-  "team_key": "CHWG",
   "team_name": "Chinwag Engineering Velocity & Agent Fleet",
-  "default_visibility": "public",
-  "public_board": true,
+  "team_key": "CHWG",
+  "cli_bootstrap_command": "chinwag board init --linear --team CHWG --live",
+  "visibility_modes": {
+    "private_default": {
+      "default": true,
+      "public": false,
+      "team_private": true,
+      "description": "New customer boards stay inside private workspace and team access controls."
+    },
+    "public_opt_in": {
+      "default": false,
+      "public": true,
+      "team_private": false,
+      "requires_explicit_opt_in": true,
+      "redaction_gate": "H_board"
+    }
+  },
+  "native_system_fields": [
+    {
+      "name": "Created",
+      "code": "CREATED",
+      "read_only": true,
+      "linear_field": "createdAt",
+      "description": "Server-controlled issue metadata. Optional fields stay hidden until every filtered row has a value."
+    },
+    {
+      "name": "Updated",
+      "code": "UPDATED",
+      "read_only": true,
+      "linear_field": "updatedAt",
+      "description": "Server-controlled issue metadata. Optional fields stay hidden until every filtered row has a value."
+    },
+    {
+      "name": "Closed",
+      "code": "CLOSED",
+      "read_only": true,
+      "linear_field": "completedAt",
+      "description": "Server-controlled issue metadata. Optional fields stay hidden until every filtered row has a value."
+    },
+    {
+      "name": "Parent issue",
+      "code": "PARENT_ISSUE",
+      "read_only": true,
+      "linear_field": "parent",
+      "description": "Server-controlled issue metadata. Optional fields stay hidden until every filtered row has a value."
+    },
+    {
+      "name": "Sub-issues progress",
+      "code": "SUB_ISSUES_PROGRESS",
+      "read_only": true,
+      "linear_field": "children",
+      "description": "Server-controlled issue metadata. Optional fields stay hidden until every filtered row has a value."
+    }
+  ],
+  "workflow_states": [
+    {
+      "position": 1,
+      "code": "01_OPEN_BOUNTY",
+      "name": "01 · 🌱 OPEN BOUNTY (+500 CR)",
+      "type": "triage",
+      "description": "Open contribution. The organization receives 500 credits after verified merge."
+    },
+    {
+      "position": 2,
+      "code": "02_SCOPED_BENCHMARKED",
+      "name": "02 · 📐 SCOPED & BENCHMARKED",
+      "type": "unstarted",
+      "description": "Scope and baseline are recorded. Hours saved stay at zero."
+    },
+    {
+      "position": 3,
+      "code": "03_IN_FLIGHT",
+      "name": "03 · ⚡ IN FLIGHT — CLOCK LIVE",
+      "type": "started",
+      "description": "Work is running. Hours saved stay at zero until verified delivery."
+    },
+    {
+      "position": 4,
+      "code": "04_TRIBUNAL_GATE",
+      "name": "04 · ⚖️ TRIBUNAL & COPY GATE",
+      "type": "started",
+      "description": "Independent review and applicable code, tests, docs, and screen checks must pass."
+    },
+    {
+      "position": 5,
+      "code": "05_SHIPPED_VERIFIED",
+      "name": "05 · ✓ SHIPPED — Δ VERIFIED",
+      "type": "completed",
+      "description": "Verified work has shipped with a completion timestamp and receipt. The seven-day watch starts."
+    }
+  ],
+  "label_groups": [
+    {
+      "name": "Function / Team",
+      "labels": [
+        {
+          "name": "Engineering",
+          "color": "BLUE"
+        },
+        {
+          "name": "Design",
+          "color": "PINK"
+        },
+        {
+          "name": "Product",
+          "color": "PURPLE"
+        },
+        {
+          "name": "Security",
+          "color": "ORANGE"
+        },
+        {
+          "name": "QA & Release",
+          "color": "YELLOW"
+        },
+        {
+          "name": "Analytics",
+          "color": "BLUE"
+        },
+        {
+          "name": "Docs",
+          "color": "GRAY"
+        }
+      ]
+    },
+    {
+      "name": "DORA Baseline",
+      "labels": [
+        {
+          "name": "Tier S · 8.5h Eng / 1.1d Cal (<=100 LOC)",
+          "color": "GRAY",
+          "active_eng_hours": 8.5,
+          "calendar_days": 1.1,
+          "min_loc": 1,
+          "max_loc": 100
+        },
+        {
+          "name": "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)",
+          "color": "BLUE",
+          "active_eng_hours": 27,
+          "calendar_days": 3.4,
+          "min_loc": 101,
+          "max_loc": 400
+        },
+        {
+          "name": "Tier L · 50h Eng / 6.2d Cal (400–1,200 LOC)",
+          "color": "PURPLE",
+          "active_eng_hours": 50,
+          "calendar_days": 6.2,
+          "min_loc": 401,
+          "max_loc": 1200
+        },
+        {
+          "name": "Tier XL · 112h Eng / 14.0d Cal (1,200+ LOC)",
+          "color": "ORANGE",
+          "active_eng_hours": 112,
+          "calendar_days": 14,
+          "min_loc": 1201,
+          "max_loc": null
+        }
+      ]
+    },
+    {
+      "name": "Δ Speedup vs. DORA",
+      "labels": [
+        {
+          "name": "⚡ 100x+ Faster vs. DORA",
+          "color": "GREEN"
+        },
+        {
+          "name": "🚀 50x–99x Faster vs. DORA",
+          "color": "BLUE"
+        },
+        {
+          "name": "🔥 10x–49x Faster vs. DORA",
+          "color": "PURPLE"
+        },
+        {
+          "name": "⏱️ Clock Running — In Flight",
+          "color": "YELLOW"
+        },
+        {
+          "name": "📐 Baseline Locked — Queued",
+          "color": "GRAY"
+        },
+        {
+          "name": "Shipped · Measurement unavailable",
+          "color": "ORANGE"
+        },
+        {
+          "name": "Measured · Below 10x baseline",
+          "color": "PINK"
+        }
+      ]
+    },
+    {
+      "name": "Execution Mode",
+      "labels": [
+        {
+          "name": "CI Fix · 50 Cr",
+          "color": "BLUE",
+          "credits": 50
+        },
+        {
+          "name": "Review · 50 Cr",
+          "color": "GRAY",
+          "credits": 50
+        },
+        {
+          "name": "Pair · 100 Cr",
+          "color": "GREEN",
+          "credits": 100
+        },
+        {
+          "name": "Triad · 150 Cr",
+          "color": "PURPLE",
+          "credits": 150
+        },
+        {
+          "name": "Quad · 200 Cr",
+          "color": "ORANGE",
+          "credits": 200
+        },
+        {
+          "name": "Open bounty",
+          "color": "GREEN",
+          "note": "Contribution reward is separate from execution credits."
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "Engineering",
+    "Design",
+    "Product",
+    "Security",
+    "QA & Release",
+    "Analytics",
+    "Docs",
+    "Tier S · 8.5h Eng / 1.1d Cal (<=100 LOC)",
+    "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)",
+    "Tier L · 50h Eng / 6.2d Cal (400–1,200 LOC)",
+    "Tier XL · 112h Eng / 14.0d Cal (1,200+ LOC)",
+    "⚡ 100x+ Faster vs. DORA",
+    "🚀 50x–99x Faster vs. DORA",
+    "🔥 10x–49x Faster vs. DORA",
+    "⏱️ Clock Running — In Flight",
+    "📐 Baseline Locked — Queued",
+    "Shipped · Measurement unavailable",
+    "Measured · Below 10x baseline",
+    "CI Fix · 50 Cr",
+    "Review · 50 Cr",
+    "Pair · 100 Cr",
+    "Triad · 150 Cr",
+    "Quad · 200 Cr",
+    "Open bounty"
+  ],
   "default_view_layout": "board",
   "views": [
     {
@@ -12,65 +657,100 @@
       "code": "01_KANBAN_EXECUTION_BOARD",
       "name": "01 · Kanban Execution Board",
       "layout": "board",
-      "group_by": "workflow_state",
-      "show_sub_issues": true
+      "group_by": "Status",
+      "visible_fields": [
+        "Title",
+        "Assignees",
+        "Function / Team",
+        "DORA Baseline",
+        "Chinwag Cycle Time",
+        "Δ Speedup vs. DORA",
+        "Net Hours Saved",
+        "Credits Used",
+        "Execution Mode",
+        "Verification Receipt"
+      ],
+      "show_sub_issues": false,
+      "show_sub_issues_progress": false
     },
     {
       "number": 2,
       "code": "02_VELOCITY_AND_DORA_LEDGER",
       "name": "02 · Velocity & DORA Ledger",
       "layout": "list",
-      "group_by": "workflow_state"
+      "group_by": "Status",
+      "sort_by": [
+        {
+          "field": "Updated",
+          "direction": "DESC"
+        }
+      ],
+      "visible_fields": [
+        "Title",
+        "Status",
+        "Assignees",
+        "Function / Team",
+        "Repository",
+        "DORA Baseline",
+        "Baseline Hours",
+        "Chinwag Cycle Time",
+        "Δ Speedup vs. DORA",
+        "Net Hours Saved",
+        "Credits Used",
+        "Execution Mode",
+        "Verification Receipt",
+        "Created",
+        "Updated"
+      ]
+    },
+    {
+      "number": 3,
+      "code": "03_WORK_BY_FUNCTION",
+      "name": "03 · Work by Function",
+      "layout": "list",
+      "group_by": "Function / Team",
+      "filter": "has:status",
+      "visible_fields": [
+        "Title",
+        "Status",
+        "Assignees",
+        "Function / Team",
+        "Repository",
+        "DORA Baseline",
+        "Baseline Hours",
+        "Chinwag Cycle Time",
+        "Δ Speedup vs. DORA",
+        "Net Hours Saved",
+        "Credits Used",
+        "Execution Mode",
+        "Verification Receipt",
+        "Created",
+        "Updated"
+      ]
+    },
+    {
+      "number": 4,
+      "code": "04_OPEN_BOUNTIES",
+      "name": "04 · 🌱 Open Bounties (+500 Credits)",
+      "layout": "board",
+      "group_by": "Status",
+      "filter": "status:\"01 · 🌱 OPEN BOUNTY (+500 CR)\"",
+      "visible_fields": [
+        "Title",
+        "Status",
+        "Assignees",
+        "Function / Team",
+        "DORA Baseline",
+        "Baseline Hours",
+        "Execution Mode",
+        "Verification Receipt"
+      ],
+      "description": "The organization receives 500 credits on verified merge. Hours saved stay 0 until shipment."
     }
   ],
-  "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
-  "invariants": [
-    "INV-DEFAULT-PRIVATE-BOARD-01",
-    "INV-DEFAULT-PRIVATE-TASK-01",
-    "INV-CHINWAG-TASKS-REPO-01",
-    "INV-NO-FAKE-DONE-01"
-  ],
-  "engines": {
-    "delivery_supervisor": "Chinwag Delivery-2",
-    "reflex_worker": "Chinwag Reflex-1",
-    "visual_tribunal": "Chinwag Vision-3"
-  },
-  "workflow_states": [
-    {
-      "code": "01_OPEN_BOUNTY",
-      "name": "01 · 🌱 OPEN BOUNTY (+500 CR)",
-      "type": "triage"
-    },
-    {
-      "code": "02_SCOPED_BENCHMARKED",
-      "name": "02 · 📐 SCOPED & BENCHMARKED",
-      "type": "unstarted"
-    },
-    {
-      "code": "03_IN_FLIGHT",
-      "name": "03 · ⚡ IN FLIGHT — CLOCK LIVE",
-      "type": "started"
-    },
-    {
-      "code": "04_TRIBUNAL_GATE",
-      "name": "04 · ⚖️ TRIBUNAL & COPY GATE",
-      "type": "started"
-    },
-    {
-      "code": "05_SHIPPED_VERIFIED",
-      "name": "05 · ✓ SHIPPED — Δ VERIFIED",
-      "type": "completed"
-    }
-  ],
-  "labels": [
-    "Tier S · 8.5h Eng",
-    "Tier M · 27h Eng",
-    "Tier L · 50h Eng",
-    "Tier XL · 112h Eng",
-    "⚡ 100x+ Faster vs. DORA",
-    "Pair (100 Cr)",
-    "Triad (150 Cr)",
-    "Quad (200 Cr)",
-    "SURV:PENDING_168H"
-  ]
+  "custom_views": [],
+  "parent_child_fanout": {
+    "graphql_mutation": "issueCreate(input: { parentId: $parentId, teamId: $teamId, title: $subTitle, description: $leaseBlock })",
+    "receipt_attachment": "attachmentCreate(input: { issueId: $issueId, title: $receiptSummary, url: $commitCompareUrl })"
+  }
 }
