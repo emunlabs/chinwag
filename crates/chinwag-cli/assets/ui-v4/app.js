@@ -1535,7 +1535,8 @@ function safeChinwagOutboundUrl(raw, fallback = "https://chinwag.sh/open") {
     tailLower.includes("%2f") ||
     tailLower.includes("%5c") ||
     tailLower.includes("%25") ||
-    tailLower.includes("%3a")
+    tailLower.includes("%3a") ||
+    tailLower.includes("%40")
   ) {
     return fallback;
   }
@@ -1576,7 +1577,18 @@ function reconcileCancelledDelivery2State(d2) {
       }
       const rec = recByTurn || recByEntry;
       const isCancelled = Boolean(rec) || Boolean(tId && cancelledSet && cancelledSet.has(tId));
-      if (!isCancelled || entry.kind !== "qa_card") return entry;
+      if (!isCancelled) return entry;
+      if (entry.kind === "run_card") {
+        const stepNum = entry.current_step_num ? String(entry.current_step_num) : "04";
+        return {
+          ...entry,
+          stopped: true,
+          completed: false,
+          current_step_label: "Stopped",
+          current_step_display: `${stepNum} · Stopped`,
+        };
+      }
+      if (entry.kind !== "qa_card") return entry;
       const maxChars = rec && typeof rec.truncatedLen === "number" ? rec.truncatedLen : 0;
       let clampedBody = "[Stopped]";
       if (maxChars > 0) {

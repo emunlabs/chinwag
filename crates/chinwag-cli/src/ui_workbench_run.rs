@@ -520,10 +520,25 @@ fn read_repo_file_nofollow(
             ));
         }
     };
+    match statat(&dir_fd, leaf_name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => {
+            if (u32::from(st.st_mode) & 0o170000) != 0o100000 {
+                return Err(format!(
+                    "refusing symlink or non-regular workspace entry '{leaf_name}'"
+                ));
+            }
+        }
+        Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "refusing inaccessible workspace file '{leaf_name}': {e}"
+            ));
+        }
+    }
     let raw_fd = match openat(
         &dir_fd,
         leaf_name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
         Ok(fd) => fd,
@@ -655,8 +670,87 @@ fn create_new_repo_file_nofollow(
     Ok(())
 }
 
+const UI_V4_MAX_STATE_BYTES: usize = 512 * 1024;
+const MAX_DELIVERY2_PROMPT_CHARS: usize = 4_000;
+const MAX_DELIVERY2_ENTRIES_PER_THREAD: usize = 64;
+const MAX_DELIVERY2_THREADS: usize = 24;
+const MAX_DELIVERY2_MEMORIES: usize = 128;
+const MAX_DELIVERY2_APPROVALS: usize = 128;
+
+fn is_pinned_unsettled_entry(entry: &Value) -> bool {
+    let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
+    matches!(kind, "approval_card" | "oauth_card")
+        && !entry
+            .get("settled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn compact_delivery2_store_for_persistence(store: &mut Delivery2Store) {
+    let active_tid = if store.active_thread_id.trim().is_empty() {
+        "thr-main".to_string()
+    } else {
+        store.active_thread_id.clone()
+    };
+
+    for thr in &mut store.threads {
+        while thr.entries.len() > MAX_DELIVERY2_ENTRIES_PER_THREAD {
+            let remove_idx = thr
+                .entries
+                .iter()
+                .position(|e| !is_pinned_unsettled_entry(e))
+                .unwrap_or(0);
+            thr.entries.remove(remove_idx);
+        }
+    }
+
+    while store.threads.len() > MAX_DELIVERY2_THREADS {
+        let Some(evict_idx) = store
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.id != active_tid && t.id != "thr-main")
+            .min_by_key(|(_, t)| t.updated_at_unix)
+            .map(|(idx, _)| idx)
+        else {
+            break;
+        };
+        store.threads.remove(evict_idx);
+    }
+
+    while store.memories.len() > MAX_DELIVERY2_MEMORIES {
+        let Some(oldest_id) = store
+            .memories
+            .values()
+            .filter(|m| m.id != "mem_default")
+            .min_by_key(|m| (m.updated_at_unix, m.seq))
+            .map(|m| m.id.clone())
+        else {
+            break;
+        };
+        store.memories.remove(&oldest_id);
+    }
+
+    while store.approvals.len() > MAX_DELIVERY2_APPROVALS {
+        let Some(oldest_id) = store
+            .approvals
+            .iter()
+            .min_by_key(|(_, a)| (a.updated_at_unix, a.seq))
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        store.approvals.remove(&oldest_id);
+    }
+}
+
 fn load_ui_v4_state_strict(repo_root: &Path) -> Result<LocalUiV4State, String> {
-    match read_repo_file_nofollow(repo_root, &[".chinwag"], "ui-v4-state.json", 512 * 1024)? {
+    match read_repo_file_nofollow(
+        repo_root,
+        &[".chinwag"],
+        "ui-v4-state.json",
+        UI_V4_MAX_STATE_BYTES,
+    )? {
         None => Ok(LocalUiV4State::default()),
         Some(raw) => serde_json::from_str(&raw)
             .map_err(|e| format!("corrupt .chinwag/ui-v4-state.json: {e}")),
@@ -670,12 +764,25 @@ fn load_ui_v4_state(repo_root: &Path) -> LocalUiV4State {
 fn save_ui_v4_state(repo_root: &Path, state: &LocalUiV4State) -> Result<(), String> {
     let serialized = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to serialize state: {e}"))?;
+    let bytes = if serialized.len() <= UI_V4_MAX_STATE_BYTES {
+        serialized
+    } else {
+        let compact = serde_json::to_string(state)
+            .map_err(|e| format!("failed to serialize compact state: {e}"))?;
+        if compact.len() > UI_V4_MAX_STATE_BYTES {
+            return Err(format!(
+                "refusing to persist .chinwag/ui-v4-state.json ({} bytes exceeds {UI_V4_MAX_STATE_BYTES}-byte loader cap)",
+                compact.len()
+            ));
+        }
+        compact
+    };
     write_repo_file_nofollow_atomic(
         repo_root,
         &[".chinwag"],
         "ui-v4-state.json",
         Mode::RUSR | Mode::WUSR,
-        serialized.as_bytes(),
+        bytes.as_bytes(),
     )
 }
 
@@ -712,6 +819,32 @@ fn mutate_ui_v4_state(
         Ok(v) => v,
         Err((status, err_val)) => return (status, err_val),
     };
+    compact_delivery2_store_for_persistence(&mut state.delivery2);
+    // Guarantee bounded history stays strictly under `UI_V4_MAX_STATE_BYTES` even with dense entries.
+    while serde_json::to_string(&state).is_ok_and(|s| s.len() > UI_V4_MAX_STATE_BYTES) {
+        let active_tid = state.delivery2.active_thread_id.clone();
+        if let Some(evict_thr_idx) = state
+            .delivery2
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.id != active_tid && !t.entries.is_empty())
+            .min_by_key(|(_, t)| t.updated_at_unix)
+            .map(|(idx, _)| idx)
+        {
+            state.delivery2.threads[evict_thr_idx].entries.remove(0);
+        } else if let Some(act_thr) = state
+            .delivery2
+            .threads
+            .iter_mut()
+            .find(|t| t.id == active_tid)
+            && act_thr.entries.len() > 2
+        {
+            act_thr.entries.remove(0);
+        } else {
+            break;
+        }
+    }
     if let Err(e) = save_ui_v4_state(repo_root, &state) {
         return (
             "409 Conflict",
@@ -986,7 +1119,7 @@ fn allow_mask_delivery2_stage2(input: &str) -> String {
                     } else {
                         None
                     };
-                    let next_ok = next_ch.is_none_or(|c| !is_word_char(c));
+                    let next_ok = !matches!(next_ch, Some(c) if is_word_char(c));
                     if next_ok {
                         out.push_str(D2_ALLOW_SENTINEL);
                         i = end_idx;
@@ -5355,6 +5488,7 @@ pub fn sanitize_chinwag_outbound_url(raw: &str, fallback: &str) -> String {
             || tail_lower.contains("%5c")
             || tail_lower.contains("%25")
             || tail_lower.contains("%3a")
+            || tail_lower.contains("%40")
         {
             return fallback.to_string();
         }
@@ -5992,6 +6126,33 @@ fn sync_entry_overlays(entry: &mut Value, state: &LocalUiV4State) {
             }
         }
     } else if kind == "run_card" {
+        let turn_stopped = entry
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .is_some_and(|tid| {
+                state.delivery2.cancelled_turn_clamps.contains_key(tid)
+                    || state.delivery2.cancelled_turn_ids.iter().any(|c| c == tid)
+            });
+        if turn_stopped {
+            if let Some(obj) = entry.as_object_mut() {
+                let step_num = obj
+                    .get("current_step_num")
+                    .and_then(Value::as_str)
+                    .unwrap_or("04")
+                    .to_string();
+                obj.insert("stopped".to_string(), Value::Bool(true));
+                obj.insert("completed".to_string(), Value::Bool(false));
+                obj.insert(
+                    "current_step_label".to_string(),
+                    Value::String("Stopped".to_string()),
+                );
+                obj.insert(
+                    "current_step_display".to_string(),
+                    Value::String(format!("{step_num} · Stopped")),
+                );
+            }
+            return;
+        }
         let run_id_opt = entry
             .get("run_id")
             .and_then(Value::as_str)
@@ -6527,6 +6688,16 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
             }),
         );
     }
+    if raw_prompt.chars().count() > MAX_DELIVERY2_PROMPT_CHARS {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "prompt_too_long",
+                "error": format!("Delivery-2 messages must be at most {MAX_DELIVERY2_PROMPT_CHARS} characters.")
+            }),
+        );
+    }
 
     let client_turn_id = parsed
         .get("turn_id")
@@ -6869,12 +7040,14 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
             }
             thr.updated_at_unix = now;
             thr.entries.push(user_entry);
+            let run_title: String = clean_user_prompt.chars().take(120).collect();
+            let scoped_excerpt: String = clean_user_prompt.chars().take(160).collect();
             let mut run_card = json!({
                 "id": format!("entry-run-{next_seq}"),
                 "kind": "run_card",
                 "seq": next_seq,
                 "run_id": run_id,
-                "title": clean_user_prompt,
+                "title": run_title,
                 "current_step_num": "04",
                 "current_step_label": "Estimate ready",
                 "current_step_display": "04 · Estimate ready",
@@ -6890,7 +7063,7 @@ fn handle_delivery2_message(repo_root: &Path, port: u16, body: &[u8]) -> (&'stat
                 "role": "assistant",
                 "author": "Delivery-2",
                 "body": format!(
-                    "Delivery-2 scoped **\"{clean_user_prompt}\"**: isolate changes on a clean branch with **{driver_lbl}**, run local tests in sandbox, and verify with **{reviewer_lbl}** before opening your review (~**{per_review} Cr** total · pauses at **0 Cr** on protected paths)."
+                    "Delivery-2 scoped **\"{scoped_excerpt}\"**: isolate changes on a clean branch with **{driver_lbl}**, run local tests in sandbox, and verify with **{reviewer_lbl}** before opening your review (~**{per_review} Cr** total · pauses at **0 Cr** on protected paths)."
                 ),
                 "sources": [
                     { "label": format!("Pairing · {driver_lbl} + {reviewer_lbl}"), "target_tab": "agents", "hash": "#agents" },
@@ -7068,11 +7241,39 @@ fn handle_delivery2_cancel(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
         thr.updated_at_unix = unix_now();
 
         if let Some(max_chars) = effective_max_chars {
-            if max_chars == 0 && !clean_turn_id.is_empty() && clean_turn_id != "active" {
-                thr.entries.retain(|e| {
-                    !(e.get("kind").and_then(Value::as_str) == Some("run_card")
-                        && e.get("turn_id").and_then(Value::as_str) == Some(clean_turn_id.as_str()))
-                });
+            if !clean_turn_id.is_empty() && clean_turn_id != "active" {
+                if max_chars == 0 {
+                    thr.entries.retain(|e| {
+                        !(e.get("kind").and_then(Value::as_str) == Some("run_card")
+                            && e.get("turn_id").and_then(Value::as_str)
+                                == Some(clean_turn_id.as_str()))
+                    });
+                } else {
+                    for rc in thr.entries.iter_mut().filter(|e| {
+                        e.get("kind").and_then(Value::as_str) == Some("run_card")
+                            && e.get("turn_id").and_then(Value::as_str)
+                                == Some(clean_turn_id.as_str())
+                    }) {
+                        if let Some(rc_obj) = rc.as_object_mut() {
+                            let step_num = rc_obj
+                                .get("current_step_num")
+                                .and_then(Value::as_str)
+                                .unwrap_or("04")
+                                .to_string();
+                            rc_obj.insert("stopped".to_string(), Value::Bool(true));
+                            rc_obj.insert("completed".to_string(), Value::Bool(false));
+                            rc_obj.insert(
+                                "current_step_label".to_string(),
+                                Value::String("Stopped".to_string()),
+                            );
+                            rc_obj.insert(
+                                "current_step_display".to_string(),
+                                Value::String(format!("{step_num} · Stopped")),
+                            );
+                            rc_obj.insert("seq".to_string(), Value::Number(next_seq.into()));
+                        }
+                    }
+                }
             }
             let target_entry = if let Some(ref eid) = entry_id_opt {
                 thr.entries
@@ -7687,6 +7888,16 @@ fn handle_delivery2_memory(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
                 }),
             );
         }
+        if note_arg.chars().count() > 1_000 {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "memory_note_too_long",
+                    "error": "Workspace memory notes must be at most 1,000 characters."
+                }),
+            );
+        }
         if contains_secret_shaped_token(note_arg) {
             return (
                 "400 Bad Request",
@@ -7823,7 +8034,7 @@ fn handle_delivery2_thread(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(scrub_customer_ui_text)
+                .map(|s| scrub_customer_ui_text(s).chars().take(120).collect())
                 .unwrap_or_else(|| "New thread".to_string());
             state.delivery2.threads.push(Delivery2Thread {
                 id: new_id.clone(),
@@ -10506,6 +10717,7 @@ mod tests {
             "https://chinwag.sh/open?next=%5cevil.example",
             "https://chinwag.sh/open?next=%252f%252fevil.example",
             "https://chinwag.sh/open?user=foo@evil.example",
+            "https://chinwag.sh/open?user=foo%40evil.example",
         ] {
             assert_eq!(
                 sanitize_chinwag_outbound_url(bad_redirect, "https://chinwag.sh/open"),
@@ -10791,6 +11003,89 @@ mod tests {
                 !has_verified_workspace_oauth_receipt(&sym_repo, "linear", None),
                 "symlinked .chinwag directory must be rejected by O_NOFOLLOW receipt check"
             );
+
+            // (f) ARCHITECT-R4-2: FIFO at `.chinwag/github-oauth.json` returns false promptly without blocking!
+            let fifo_repo_dir = tempfile::tempdir().unwrap();
+            let fifo_repo = fs::canonicalize(fifo_repo_dir.path()).unwrap();
+            fs::create_dir_all(fifo_repo.join(".chinwag")).unwrap();
+            let fifo_path = fifo_repo.join(".chinwag/github-oauth.json");
+            let mkfifo_ok = std::process::Command::new("mkfifo")
+                .arg(&fifo_path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(mkfifo_ok, "mkfifo must create test named pipe");
+            assert!(
+                !has_verified_workspace_oauth_receipt(&fifo_repo, "github", None),
+                "FIFO receipt must be rejected non-blockingly"
+            );
         }
+
+        // (g) ARCHITECT-R4-1 + FLINT-R4-1:
+        // 1) Oversized 180,000-char prompt is rejected cleanly (400 prompt_too_long) without touching state.
+        let huge_prompt_body =
+            serde_json::to_vec(&json!({ "prompt": "a".repeat(180_000) })).unwrap();
+        let (st_huge, val_huge) = handle_delivery2_message(&repo, 5487, &huge_prompt_body);
+        assert_eq!(st_huge, "400 Bad Request");
+        assert_eq!(val_huge["error_code"], "prompt_too_long");
+
+        // 2) Mid-stream Stop (`truncated_len > 0`) retains the seen `run_card` and marks it `stopped: true`, `completed: false`.
+        let (st_midmsg, _) = handle_delivery2_message(
+            &repo,
+            5487,
+            br#"{"prompt":"Scope retry backoff jitter tests","turn_id":"turn-midstop-1","thread_id":"thr-main"}"#,
+        );
+        assert_eq!(st_midmsg, "200 OK");
+        let (st_midcancel, val_midcancel) = handle_delivery2_cancel(
+            &repo,
+            5487,
+            br#"{"turn_id":"turn-midstop-1","truncated_len":14,"thread_id":"thr-main"}"#,
+        );
+        assert_eq!(st_midcancel, "200 OK");
+        let mid_run_card = val_midcancel["state"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "run_card" && e["turn_id"] == "turn-midstop-1")
+            .expect("retained mid-stream stopped run_card");
+        assert_eq!(mid_run_card["stopped"], true);
+        assert_eq!(mid_run_card["completed"], false);
+
+        // 3) 80 accumulated generic turns compact cleanly under `UI_V4_MAX_STATE_BYTES` so `load_ui_v4_state_strict` stays `Ok`,
+        // and `save_ui_v4_state` refuses a synthetic >512 KB state without clobbering the valid file on disk!
+        for idx in 0..80 {
+            let msg_bytes = serde_json::to_vec(&json!({
+                "prompt": format!("Scope incremental migration batch #{idx} with isolated sandbox verification"),
+                "thread_id": "thr-main"
+            }))
+            .unwrap();
+            let (st_loop, _) = handle_delivery2_message(&repo, 5487, &msg_bytes);
+            assert_eq!(st_loop, "200 OK");
+        }
+        let strict_after_80 =
+            load_ui_v4_state_strict(&repo).expect("state after 80 turns must load strictly");
+        let main_thr = strict_after_80
+            .delivery2
+            .threads
+            .iter()
+            .find(|t| t.id == "thr-main")
+            .unwrap();
+        assert!(
+            main_thr.entries.len() <= MAX_DELIVERY2_ENTRIES_PER_THREAD,
+            "expected bounded thread entries <= {MAX_DELIVERY2_ENTRIES_PER_THREAD}, got {}",
+            main_thr.entries.len()
+        );
+
+        let mut synthetic_huge = strict_after_80.clone();
+        synthetic_huge.delivery2.threads[0].entries =
+            vec![json!({"id":"huge-1","kind":"qa_card","body":"x".repeat(600_000)})];
+        assert!(
+            save_ui_v4_state(&repo, &synthetic_huge).is_err(),
+            "save_ui_v4_state must refuse state exceeding UI_V4_MAX_STATE_BYTES"
+        );
+        assert!(
+            load_ui_v4_state_strict(&repo).is_ok(),
+            "refused oversized save must leave prior valid .chinwag/ui-v4-state.json intact"
+        );
     }
 }

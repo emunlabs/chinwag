@@ -599,7 +599,11 @@ const sandbox = {
     }
     if (url === "/api/v1/delivery2/cancel") {
       d2CancelCalls.push(body);
-      return { ok: true, status: 200, json: async () => ({ ok: true, cancelled: true, credits_charged: 0 }) };
+      const cancelRes =
+        typeof globalThis.__mockD2CancelHandler === "function"
+          ? await globalThis.__mockD2CancelHandler(body)
+          : { ok: true, cancelled: true, credits_charged: 0 };
+      return { ok: true, status: 200, json: async () => cancelRes };
     }
     if (url === "/api/v1/delivery2/approval") {
       d2ApprovalCalls.push(body);
@@ -1348,7 +1352,7 @@ assert.equal(
   "Cancelled qa_card arriving via snapshot poll must clamp to [Stopped]",
 );
 
-// Also test ARCHITECT-R3-1 exact delayed /api/v4/bootstrap interleaving while BOTH /message and /cancel are held on the wire!
+// Also test ARCHITECT-R3-1 exact delayed /api/v4/bootstrap interleaving while BOTH /message and /cancel are genuinely held on the wire!
 let releaseHeldBootK2;
 mockBootstrapPayload = () =>
   new Promise((resolve) => {
@@ -1359,6 +1363,11 @@ mockD2MessageHandler = () =>
   new Promise((resolve) => {
     releaseHeldMsgK2 = resolve;
   });
+let releaseHeldCancelK2;
+globalThis.__mockD2CancelHandler = () =>
+  new Promise((resolve) => {
+    releaseHeldCancelK2 = () => resolve({ ok: true, cancelled: true, credits_charged: 0 });
+  });
 const heldBootPromise = T.refreshBootstrapQuietly();
 const heldMsgPromise = T.submitDelivery2Prompt("Second question stopped while bootstrap and cancel are held");
 await sleep(5);
@@ -1366,6 +1375,7 @@ const heldTurnId = T.state.d2ActiveTurnId;
 assert.ok(String(heldTurnId || "").startsWith("turn-"), "Active turn ID must be recorded before Stop");
 const cancelPromiseK2 = T.cancelDelivery2Turn();
 await sleep(5);
+// Notice: releaseHeldCancelK2 has NOT been called yet — /cancel is genuinely in flight when bootstrap commits!
 releaseHeldBootK2({
   delivery2: {
     seq: 24,
@@ -1385,14 +1395,16 @@ releaseHeldBootK2({
   },
 });
 await heldBootPromise;
-await cancelPromiseK2;
-releaseHeldMsgK2({ ok: true });
-await heldMsgPromise;
 assert.equal(
   d2Track.textContent.includes("UNSEEN BOOTSTRAP ANSWER"),
   false,
-  "Delayed /api/v4/bootstrap must NEVER render unseen answer of a stopped turn",
+  "Delayed /api/v4/bootstrap WHILE /cancel IS HELD must NEVER render unseen answer of a stopped turn",
 );
+releaseHeldCancelK2();
+await cancelPromiseK2;
+globalThis.__mockD2CancelHandler = null;
+releaseHeldMsgK2({ ok: true });
+await heldMsgPromise;
 assert.equal(
   T.state.data.delivery2.entries.some((e) => e.id === "run-boot-101"),
   false,
@@ -1404,15 +1416,57 @@ assert.equal(
   "Delayed /api/v4/bootstrap qa_card for stopped turn must clamp to [Stopped]",
 );
 
-// K3: Collapsed .d2-disclosure-body sets .inert=true + aria-hidden="true" and clears both on expand
+// FLINT-R4-1: When a turn was stopped AFTER partial display (`truncatedLen > 0`), its retained `run_card` is marked `stopped: true`!
+T.state.d2CancelledTurns.set("turn-partial-rc", {
+  truncatedLen: 12,
+  partialBody: "Partial seen",
+  entryId: "qa-partial-rc",
+});
 T.applyDelivery2ServerPayload({
   seq: 25,
   status: "live",
   entries: [
     {
-      id: "qa-disc-k3",
+      id: "run-partial-rc",
+      kind: "run_card",
+      seq: 25,
+      turn_id: "turn-partial-rc",
+      current_step_num: "04",
+      current_step_label: "Estimate ready",
+      current_step_display: "04 · Estimate ready",
+      completed: false,
+    },
+    {
+      id: "qa-partial-rc",
       kind: "qa_card",
       seq: 25,
+      turn_id: "turn-partial-rc",
+      author: "Delivery-2",
+      body: "Partial seen plus unseen continuation",
+      sources: [{ id: "src-prc", label: "Inbox", hash: "#inbox" }],
+    },
+  ],
+});
+assert.equal(
+  T.state.data.delivery2.entries.find((e) => e.id === "run-partial-rc").stopped,
+  true,
+  "Retained run_card on mid-stream cancelled turn must be marked stopped: true",
+);
+assert.equal(
+  T.state.data.delivery2.entries.find((e) => e.id === "qa-partial-rc").body,
+  "Partial seen",
+  "Mid-stream cancelled qa_card must preserve seen prefix",
+);
+
+// K3: Collapsed .d2-disclosure-body sets .inert=true + aria-hidden="true" and clears both on expand
+T.applyDelivery2ServerPayload({
+  seq: 26,
+  status: "live",
+  entries: [
+    {
+      id: "qa-disc-k3",
+      kind: "qa_card",
+      seq: 26,
       author: "Delivery-2",
       body: "Grounded answer.",
       sources: [{ id: "src-k3", label: "Inbox · #42", hash: "#inbox" }],
@@ -1508,6 +1562,7 @@ for (const badUrl of [
   "https://chinwag.sh/open?next=%5cevil.example",
   "https://chinwag.sh/open?next=%252f%252fevil.example",
   "https://chinwag.sh/open?user=foo@evil.example",
+  "https://chinwag.sh/open?user=foo%40evil.example",
 ]) {
   assert.equal(
     T.safeChinwagOutboundUrl(badUrl),
