@@ -1176,7 +1176,7 @@ code.pill-code,
   border-radius: var(--r-lg);
 }
 
-/* ── 7 · View Headers & Inline Ask Chinwag PM Bar ───────────────────────── */
+/* ── 7 · View Headers & Inline Engineering Task Launcher ────────────────── */
 .view-head {
   display: flex;
   flex-wrap: wrap;
@@ -2395,8 +2395,24 @@ col.diff-col-split-code {
   gap: var(--s-4);
 }
 
+.pairing-selects[data-slots="3"] {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pairing-selects[data-slots="4"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (max-width: 1119.98px) {
+  .pairing-selects[data-slots="3"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 719.98px) {
-  .pairing-selects {
+  .pairing-selects,
+  .pairing-selects[data-slots="3"],
+  .pairing-selects[data-slots="4"] {
     grid-template-columns: minmax(0, 1fr);
   }
 }

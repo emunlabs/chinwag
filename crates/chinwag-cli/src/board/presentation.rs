@@ -772,7 +772,7 @@ pub(super) fn verify_project_population(
         }
         let task_id =
             github_task_id_from_title(title).ok_or("project issue missing task prefix")?;
-        if !super::is_canonical_chwg_ticket_id(&task_id) {
+        if !super::is_canonical_chwg_ticket_id(task_id) {
             return Err(format!("non-canonical project task prefix `{task_id}`"));
         }
         if !seen.insert(task_id) {

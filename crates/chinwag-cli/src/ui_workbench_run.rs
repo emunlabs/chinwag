@@ -73,11 +73,102 @@ pub struct UiDaemonState {
     pub started_at_unix: u64,
 }
 
+fn default_driver_tool() -> String {
+    "claude_code".to_string()
+}
+
+fn default_reviewer_tool() -> String {
+    "codex_cli".to_string()
+}
+
+fn default_test_verifier_tool() -> String {
+    "gemini_cli".to_string()
+}
+
+fn default_security_verifier_tool() -> String {
+    "cursor".to_string()
+}
+
+fn default_review_tier_credits() -> u64 {
+    100
+}
+
+fn default_review_mode() -> String {
+    "pair_sandbox".to_string()
+}
+
+fn default_workstream_engineering() -> String {
+    "engineering".to_string()
+}
+
+pub(crate) fn normalize_workflow_tool_id(raw: &str, fallback: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "claude" | "claude_code" | "claude-code" => "claude_code".to_string(),
+        "codex" | "codex_cli" | "codex-cli" => "codex_cli".to_string(),
+        "gemini" | "gemini_cli" | "gemini-cli" => "gemini_cli".to_string(),
+        "cursor" => "cursor".to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+pub(crate) fn friendly_workflow_tool_label(raw: &str) -> &'static str {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.contains("claude") {
+        "Claude Code"
+    } else if lower.contains("codex") {
+        "Codex CLI"
+    } else if lower.contains("gemini") {
+        "Gemini CLI"
+    } else if lower.contains("cursor") {
+        "Cursor"
+    } else {
+        "Claude Code"
+    }
+}
+
+pub(crate) fn review_mode_for_credits(credits: u64) -> Option<&'static str> {
+    match credits {
+        50 => Some("review_handoff"),
+        100 => Some("pair_sandbox"),
+        150 => Some("three_tool_check"),
+        200 => Some("quad_programming"),
+        _ => None,
+    }
+}
+
+pub(crate) fn credits_for_review_mode(mode: &str) -> Option<u64> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "review_handoff" => Some(50),
+        "pair_sandbox" | "diffs_touching_3_plus_files" => Some(100),
+        "three_tool_check" | "triad_sandbox" => Some(150),
+        "quad_programming" | "quad_sandbox" | "security_review" => Some(200),
+        _ => None,
+    }
+}
+
+fn normalize_workstream_id(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "engineering" | "design" | "product" | "qa" | "security" | "analytics" | "docs" => lower,
+        _ => "engineering".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowConfig {
     pub independent_review: bool,
+    #[serde(default = "default_driver_tool")]
     pub driver_tool: String,
+    #[serde(default = "default_reviewer_tool")]
     pub reviewer_tool: String,
+    #[serde(default = "default_test_verifier_tool")]
+    pub test_verifier_tool: String,
+    #[serde(default = "default_security_verifier_tool")]
+    pub security_verifier_tool: String,
+    #[serde(default = "default_review_tier_credits")]
+    pub review_tier_credits: u64,
+    #[serde(default = "default_review_mode")]
     pub review_mode: String,
     pub protect_sensitive_paths: bool,
     pub auto_test_before_review: bool,
@@ -92,9 +183,12 @@ impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
             independent_review: true,
-            driver_tool: "claude".to_string(),
-            reviewer_tool: "codex".to_string(),
-            review_mode: "diffs_touching_3_plus_files".to_string(),
+            driver_tool: default_driver_tool(),
+            reviewer_tool: default_reviewer_tool(),
+            test_verifier_tool: default_test_verifier_tool(),
+            security_verifier_tool: default_security_verifier_tool(),
+            review_tier_credits: default_review_tier_credits(),
+            review_mode: default_review_mode(),
             protect_sensitive_paths: true,
             auto_test_before_review: true,
             isolated_sandbox: true,
@@ -161,6 +255,8 @@ struct LocalBoardTask {
     title: String,
     status: String,
     assigned_tool: String,
+    #[serde(default = "default_workstream_engineering")]
+    workstream: String,
     created_at_unix: u64,
 }
 
@@ -1661,6 +1757,8 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
 
     let mut in_protected_paths = false;
     let mut parsed_paths: Vec<String> = Vec::new();
+    let mut seen_credits: Option<u64> = None;
+    let mut seen_mode_credits: Option<u64> = None;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1688,9 +1786,30 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
                     cfg.independent_review = b;
                 }
             }
-            "driver_tool" if !val.is_empty() => cfg.driver_tool = val.to_string(),
-            "reviewer_tool" if !val.is_empty() => cfg.reviewer_tool = val.to_string(),
-            "review_mode" if !val.is_empty() => cfg.review_mode = val.to_string(),
+            "driver_tool" if !val.is_empty() => {
+                cfg.driver_tool = normalize_workflow_tool_id(val, "claude_code");
+            }
+            "reviewer_tool" if !val.is_empty() => {
+                cfg.reviewer_tool = normalize_workflow_tool_id(val, "codex_cli");
+            }
+            "test_verifier_tool" if !val.is_empty() => {
+                cfg.test_verifier_tool = normalize_workflow_tool_id(val, "gemini_cli");
+            }
+            "security_verifier_tool" if !val.is_empty() => {
+                cfg.security_verifier_tool = normalize_workflow_tool_id(val, "cursor");
+            }
+            "review_tier_credits" => {
+                if let Ok(c) = val.parse::<u64>()
+                    && review_mode_for_credits(c).is_some()
+                {
+                    seen_credits = Some(c);
+                }
+            }
+            "review_mode" if !val.is_empty() => {
+                if let Some(c) = credits_for_review_mode(val) {
+                    seen_mode_credits = Some(c);
+                }
+            }
             "protect_sensitive_paths" => {
                 if let Ok(b) = val.parse::<bool>() {
                     cfg.protect_sensitive_paths = b;
@@ -1731,6 +1850,12 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
             _ => {}
         }
     }
+    if let Some(c) = seen_credits.or(seen_mode_credits) {
+        cfg.review_tier_credits = c;
+        if let Some(mode) = review_mode_for_credits(c) {
+            cfg.review_mode = mode.to_string();
+        }
+    }
     if !parsed_paths.is_empty() {
         cfg.protected_paths = parsed_paths;
     }
@@ -1738,19 +1863,39 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
 }
 
 pub fn save_workflow_config(repo_root: &Path, cfg: &WorkflowConfig) -> Result<(), String> {
+    let driver = normalize_workflow_tool_id(&cfg.driver_tool, "claude_code");
+    let reviewer = normalize_workflow_tool_id(&cfg.reviewer_tool, "codex_cli");
+    let test_verifier = normalize_workflow_tool_id(&cfg.test_verifier_tool, "gemini_cli");
+    let security_verifier = normalize_workflow_tool_id(&cfg.security_verifier_tool, "cursor");
+    let credits = if review_mode_for_credits(cfg.review_tier_credits).is_some() {
+        cfg.review_tier_credits
+    } else {
+        credits_for_review_mode(&cfg.review_mode).unwrap_or(100)
+    };
+    let mode = review_mode_for_credits(credits).unwrap_or("pair_sandbox");
+
     let mut yaml = String::from("# Chinwag repository workflow guardrails\nversion: 1\n");
     yaml.push_str(&format!("independent_review: {}\n", cfg.independent_review));
     yaml.push_str(&format!(
         "driver_tool: \"{}\"\n",
-        sanitize_yaml_scalar(&cfg.driver_tool)
+        sanitize_yaml_scalar(&driver)
     ));
     yaml.push_str(&format!(
         "reviewer_tool: \"{}\"\n",
-        sanitize_yaml_scalar(&cfg.reviewer_tool)
+        sanitize_yaml_scalar(&reviewer)
     ));
     yaml.push_str(&format!(
+        "test_verifier_tool: \"{}\"\n",
+        sanitize_yaml_scalar(&test_verifier)
+    ));
+    yaml.push_str(&format!(
+        "security_verifier_tool: \"{}\"\n",
+        sanitize_yaml_scalar(&security_verifier)
+    ));
+    yaml.push_str(&format!("review_tier_credits: {credits}\n"));
+    yaml.push_str(&format!(
         "review_mode: \"{}\"\n",
-        sanitize_yaml_scalar(&cfg.review_mode)
+        sanitize_yaml_scalar(mode)
     ));
     yaml.push_str(&format!(
         "protect_sensitive_paths: {}\n",
@@ -2398,7 +2543,10 @@ pub fn parse_all_tasks_json(repo_root: &Path) -> Value {
         items.push(json!({
             "task_id": custom.id,
             "status": "READY",
-            "heading": scrub_customer_text(&custom.title)
+            "heading": scrub_customer_text(&custom.title),
+            "assigned_tool": normalize_workflow_tool_id(&custom.assigned_tool, "claude_code"),
+            "workstream": normalize_workstream_id(&custom.workstream),
+            "is_custom": true
         }));
     }
 
@@ -2459,6 +2607,7 @@ fn clean_markdown_heading(raw: &str) -> String {
 
 fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
     let state = load_ui_v4_state(repo_root);
+    let workflow_cfg = load_workflow_config(repo_root);
     let tasks_val = parse_all_tasks_json(repo_root);
     let task_list = tasks_val
         .get("tasks")
@@ -2474,7 +2623,77 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
     let mut review_cards: Vec<Value> = Vec::new();
     let mut shipped_cards: Vec<Value> = Vec::new();
 
-    for (idx, t) in task_list.iter().take(24).enumerate() {
+    for custom in state.created_tasks.iter().rev() {
+        let effective_status = if let Some(dec) = state.item_decisions.get(&custom.id) {
+            dec.status.as_str()
+        } else if custom.status.trim().is_empty() {
+            "queued"
+        } else {
+            custom.status.as_str()
+        };
+        let assigned_tool =
+            normalize_workflow_tool_id(&custom.assigned_tool, &workflow_cfg.driver_tool);
+        let tool_label = friendly_workflow_tool_label(&assigned_tool);
+        let reviewer_label = friendly_workflow_tool_label(&workflow_cfg.reviewer_tool);
+        let workstream = normalize_workstream_id(&custom.workstream);
+        let clean_title = scrub_customer_text(&custom.title);
+
+        let card = json!({
+            "id": custom.id,
+            "title": clean_title,
+            "status": effective_status,
+            "workstream": workstream,
+            "assigned_tool": assigned_tool,
+            "tool_label": tool_label,
+            "reviewer_label": reviewer_label,
+            "credits_used": if effective_status == "done" { workflow_cfg.review_tier_credits } else { 0 }
+        });
+
+        match effective_status {
+            "done" => shipped_cards.push(card),
+            "needs_review" | "needs_permission" => review_cards.push(card),
+            "running" => active_cards.push(card),
+            _ => queued_cards.push(card),
+        }
+
+        if matches!(
+            effective_status,
+            "needs_review" | "needs_permission" | "running" | "done"
+        ) && inbox_items.len() < 12
+        {
+            inbox_items.push(json!({
+                "id": custom.id,
+                "is_sample": false,
+                "is_sample_walkthrough": false,
+                "kind": if effective_status == "needs_permission" { "permission_hold" } else { "diff_review" },
+                "status": effective_status,
+                "status_label": match effective_status {
+                    "needs_review" => "Ready to review",
+                    "needs_permission" => "Needs permission",
+                    "running" => "Running locally",
+                    _ => "Shipped",
+                },
+                "title": clean_title,
+                "summary": "Workspace task item tracked locally.",
+                "tool_label": tool_label,
+                "reviewer_label": Value::Null,
+                "files_changed": Value::Null,
+                "additions": Value::Null,
+                "deletions": Value::Null,
+                "risk_level": "low",
+                "tests_passed": Value::Null,
+                "credits_used": workflow_cfg.review_tier_credits,
+                "updated_at": format_relative_time(custom.created_at_unix)
+            }));
+        }
+    }
+
+    for (idx, t) in task_list
+        .iter()
+        .filter(|t| !t.get("is_custom").and_then(Value::as_bool).unwrap_or(false))
+        .take(24)
+        .enumerate()
+    {
         let id = t
             .get("task_id")
             .and_then(Value::as_str)
@@ -2518,6 +2737,7 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
             "id": id,
             "title": heading,
             "status": effective_status,
+            "workstream": "engineering",
             "tool_label": tool_label,
             "reviewer_label": reviewer_label,
             "credits_used": if effective_status == "done" { 150 } else { 50 }
@@ -3549,12 +3769,18 @@ fn handle_board_create_task(repo_root: &Path, body: &[u8]) -> (&'static str, Val
             }),
         );
     }
-    let assigned_tool = parsed
+    let raw_tool = parsed
         .get("tool")
         .or_else(|| parsed.get("assigned_tool"))
         .and_then(Value::as_str)
-        .unwrap_or("claude")
-        .to_string();
+        .unwrap_or("claude_code");
+    let assigned_tool = normalize_workflow_tool_id(raw_tool, "claude_code");
+    let tool_label = friendly_workflow_tool_label(&assigned_tool);
+    let raw_ws = parsed
+        .get("workstream")
+        .and_then(Value::as_str)
+        .unwrap_or("engineering");
+    let workstream = normalize_workstream_id(raw_ws);
 
     mutate_ui_v4_state(repo_root, |state| {
         let floor = state.created_tasks.len() as u64;
@@ -3567,6 +3793,7 @@ fn handle_board_create_task(repo_root: &Path, body: &[u8]) -> (&'static str, Val
             title: scrubbed_title.clone(),
             status: "queued".to_string(),
             assigned_tool: assigned_tool.clone(),
+            workstream: workstream.clone(),
             created_at_unix: unix_now(),
         };
         state.created_tasks.push(record);
@@ -3576,7 +3803,9 @@ fn handle_board_create_task(repo_root: &Path, body: &[u8]) -> (&'static str, Val
                 "id": id,
                 "title": scrubbed_title,
                 "status": "queued",
-                "assigned_tool": assigned_tool
+                "assigned_tool": assigned_tool,
+                "tool_label": tool_label,
+                "workstream": workstream
             },
             "credits_charged": 0
         }))
@@ -3605,17 +3834,65 @@ fn handle_workflow_update(repo_root: &Path, body: &[u8]) -> (&'static str, Value
     if let Some(s) = parsed.get("driver_tool").and_then(Value::as_str)
         && !s.trim().is_empty()
     {
-        cfg.driver_tool = s.trim().to_string();
+        cfg.driver_tool = normalize_workflow_tool_id(s, "claude_code");
     }
     if let Some(s) = parsed.get("reviewer_tool").and_then(Value::as_str)
         && !s.trim().is_empty()
     {
-        cfg.reviewer_tool = s.trim().to_string();
+        cfg.reviewer_tool = normalize_workflow_tool_id(s, "codex_cli");
     }
-    if let Some(s) = parsed.get("review_mode").and_then(Value::as_str)
+    if let Some(s) = parsed.get("test_verifier_tool").and_then(Value::as_str)
         && !s.trim().is_empty()
     {
-        cfg.review_mode = s.trim().to_string();
+        cfg.test_verifier_tool = normalize_workflow_tool_id(s, "gemini_cli");
+    }
+    if let Some(s) = parsed.get("security_verifier_tool").and_then(Value::as_str)
+        && !s.trim().is_empty()
+    {
+        cfg.security_verifier_tool = normalize_workflow_tool_id(s, "cursor");
+    }
+    if let Some(credits_val) = parsed.get("review_tier_credits")
+        && !credits_val.is_null()
+    {
+        let Some(credits) = credits_val.as_u64() else {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_review_tier_credits",
+                    "error": "review_tier_credits must be 50, 100, 150, or 200."
+                }),
+            );
+        };
+        let Some(mode) = review_mode_for_credits(credits) else {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_review_tier_credits",
+                    "error": "review_tier_credits must be 50, 100, 150, or 200."
+                }),
+            );
+        };
+        cfg.review_tier_credits = credits;
+        cfg.review_mode = mode.to_string();
+    } else if let Some(s) = parsed.get("review_mode").and_then(Value::as_str)
+        && !s.trim().is_empty()
+    {
+        let Some(credits) = credits_for_review_mode(s) else {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_review_mode",
+                    "error": "review_mode must be review_handoff, pair_sandbox, three_tool_check, or quad_programming."
+                }),
+            );
+        };
+        cfg.review_tier_credits = credits;
+        cfg.review_mode = review_mode_for_credits(credits)
+            .unwrap_or("pair_sandbox")
+            .to_string();
     }
     if let Some(b) = parsed
         .get("protect_sensitive_paths")
@@ -3825,13 +4102,23 @@ fn handle_pm_ask(repo_root: &Path, body: &[u8]) -> (&'static str, Vec<u8>) {
     let (inbox, board, _) = build_inbox_and_board(repo_root);
     let decision_count = inbox["counts"]["needs_decision"].as_u64().unwrap_or(0);
     let shipped_count = board["summary"]["shipped_count"].as_u64().unwrap_or(0);
+    let review_phrase = if decision_count == 1 {
+        "1 change waiting for your review".to_string()
+    } else {
+        format!("{decision_count} changes waiting for your review")
+    };
+    let shipped_phrase = if shipped_count == 1 {
+        "1 shipped change".to_string()
+    } else {
+        format!("{shipped_count} shipped changes")
+    };
     let reply = format!(
-        "Workspace status: {decision_count} item(s) waiting for your review and {shipped_count} shipped item(s). Next step for \"{}\": break into a scoped change, run tests in an isolated sandbox, and verify with a second coding tool before approving.",
+        "Scoped plan for \"{}\": break into an isolated repository change, run tests before review, and verify with an independent coding tool ({review_phrase}, {shipped_phrase}).",
         scrub_customer_text(prompt)
     );
     let payload = serde_json::to_vec_pretty(&json!({
         "ok": true,
-        "role": "Chinwag PM",
+        "role": "Task Scoper",
         "reply": reply,
         "credits_charged": 50
     }))
@@ -4264,7 +4551,7 @@ fn handle_workbench_http_connection_inner(
                 None,
             );
         }
-        ("POST", "/api/v4/board/task") => {
+        ("POST", "/api/v4/board/task" | "/api/v4/board/tasks") => {
             if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
                 let payload = serde_json::to_vec(&held).unwrap_or_default();
                 write_hardened_response(
@@ -5233,12 +5520,20 @@ mod tests {
         let mut cfg = load_workflow_config(&repo);
         cfg.independent_review = false;
         cfg.reviewer_tool = "gemini".to_string();
+        cfg.test_verifier_tool = "codex".to_string();
+        cfg.security_verifier_tool = "cursor".to_string();
+        cfg.review_tier_credits = 200;
         cfg.protected_paths = vec![".env*".to_string(), "secrets/**".to_string()];
         save_workflow_config(&repo, &cfg).unwrap();
 
         let reloaded = load_workflow_config(&repo);
         assert!(!reloaded.independent_review);
-        assert_eq!(reloaded.reviewer_tool, "gemini");
+        assert_eq!(reloaded.driver_tool, "claude_code");
+        assert_eq!(reloaded.reviewer_tool, "gemini_cli");
+        assert_eq!(reloaded.test_verifier_tool, "codex_cli");
+        assert_eq!(reloaded.security_verifier_tool, "cursor");
+        assert_eq!(reloaded.review_tier_credits, 200);
+        assert_eq!(reloaded.review_mode, "quad_programming");
         assert_eq!(reloaded.protected_paths.len(), 2);
 
         let _ = fs::remove_dir_all(&repo);

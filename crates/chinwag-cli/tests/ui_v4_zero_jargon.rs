@@ -222,7 +222,7 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     let captured_ph: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_ph_clone = Arc::clone(&captured_ph);
     std::thread::spawn(move || {
-        for mut stream in ph_listener.incoming().take(3).flatten() {
+        for mut stream in ph_listener.incoming().take(8).flatten() {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let mut buf = [0u8; 8192];
             let n = stream.read(&mut buf).unwrap_or(0);
@@ -349,10 +349,28 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
                 "Cleanroom test run",
                 "Independent second-tool review",
                 "Verified PR ship & receipt",
+                "Quad-programming · 200 Cr",
+                "Three-tool check · 150 Cr",
+                "test_verifier_tool",
+                "security_verifier_tool",
+                "Fix latest failing test",
+                "Add webhook retry backoff",
+                "Audit auth & billing checks",
             ] {
                 assert!(
                     asset_text.contains(required_token),
-                    "/assets/v4/app.js missing required commercial parity string: {required_token}"
+                    "/assets/v4/app.js missing required commercial/CHWG-0235 string: {required_token}"
+                );
+            }
+            for forbidden_legacy in [
+                "What needs my attention",
+                "Summarize what needs my decision",
+                "Security review · 200 Cr",
+                "item(s)",
+            ] {
+                assert!(
+                    !asset_text.contains(forbidden_legacy),
+                    "/assets/v4/app.js must not contain retired copy: {forbidden_legacy}"
                 );
             }
             assert!(
@@ -555,13 +573,95 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
         "/api/v4/workflow",
         json!({
             "independent_review": true,
+            "review_tier_credits": 200,
+            "driver_tool": "claude_code",
+            "reviewer_tool": "codex_cli",
+            "test_verifier_tool": "gemini_cli",
+            "security_verifier_tool": "cursor",
             "protect_sensitive_paths": true,
             "auto_test_before_review": false
         }),
     );
-    assert!(wf_hdr.starts_with("HTTP/1.1 200 OK"));
+    assert!(wf_hdr.starts_with("HTTP/1.1 200 OK"), "{wf_hdr}");
     assert_eq!(wf_val["workflow"]["auto_test_before_review"], false);
+    assert_eq!(wf_val["workflow"]["review_tier_credits"], 200);
+    assert_eq!(wf_val["workflow"]["review_mode"], "quad_programming");
+    assert_eq!(wf_val["workflow"]["driver_tool"], "claude_code");
+    assert_eq!(wf_val["workflow"]["reviewer_tool"], "codex_cli");
+    assert_eq!(wf_val["workflow"]["test_verifier_tool"], "gemini_cli");
+    assert_eq!(wf_val["workflow"]["security_verifier_tool"], "cursor");
     assert!(temp_repo.join(".chinwag/workflow.yaml").is_file());
+    let wf_yaml_text = fs::read_to_string(temp_repo.join(".chinwag/workflow.yaml")).unwrap();
+    assert!(wf_yaml_text.contains("review_tier_credits: 200"));
+    assert!(wf_yaml_text.contains("review_mode: \"quad_programming\""));
+    assert!(wf_yaml_text.contains("test_verifier_tool: \"gemini_cli\""));
+    assert!(wf_yaml_text.contains("security_verifier_tool: \"cursor\""));
+
+    // Verify GET /api/v4/bootstrap round-trips Quad-programming workflow fields cleanly
+    let boot_after_wf_raw = send_raw_http(
+        ui_addr,
+        &format!(
+            "GET /api/v4/bootstrap HTTP/1.1\r\nHost: 127.0.0.1:{ui_port}\r\nSec-Fetch-Site: same-origin\r\nCookie: {cookie_pair}\r\nX-Chinwag-Csrf: {csrf}\r\n\r\n"
+        ),
+    );
+    let (boot_after_wf_hdr, boot_after_wf_body) = split_headers_and_body(&boot_after_wf_raw);
+    assert!(boot_after_wf_hdr.starts_with("HTTP/1.1 200 OK"));
+    let boot_after_wf_json: Value = serde_json::from_slice(boot_after_wf_body).unwrap();
+    assert_eq!(
+        boot_after_wf_json["agents"]["workflow"]["review_tier_credits"],
+        200
+    );
+    assert_eq!(
+        boot_after_wf_json["agents"]["workflow"]["review_mode"],
+        "quad_programming"
+    );
+    assert_eq!(
+        boot_after_wf_json["agents"]["workflow"]["test_verifier_tool"],
+        "gemini_cli"
+    );
+    assert_eq!(
+        boot_after_wf_json["agents"]["workflow"]["security_verifier_tool"],
+        "cursor"
+    );
+
+    // Verify POST /api/v4/board/tasks persists directly and surfaces in GET /api/v4/board queued column
+    let (create_task_hdr, create_task_val) = post_json(
+        "/api/v4/board/tasks",
+        json!({
+            "title": "Add exponential retry backoff to webhook handler",
+            "tool": "claude_code",
+            "workstream": "engineering"
+        }),
+    );
+    assert!(
+        create_task_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{create_task_hdr}"
+    );
+    assert_eq!(create_task_val["ok"], true);
+    assert_eq!(create_task_val["task"]["workstream"], "engineering");
+    assert_eq!(create_task_val["task"]["tool_label"], "Claude Code");
+
+    let board_after_create_raw = send_raw_http(
+        ui_addr,
+        &format!(
+            "GET /api/v4/board HTTP/1.1\r\nHost: 127.0.0.1:{ui_port}\r\nSec-Fetch-Site: same-origin\r\nCookie: {cookie_pair}\r\nX-Chinwag-Csrf: {csrf}\r\n\r\n"
+        ),
+    );
+    let (board_after_create_hdr, board_after_create_body) =
+        split_headers_and_body(&board_after_create_raw);
+    assert!(board_after_create_hdr.starts_with("HTTP/1.1 200 OK"));
+    let board_after_create_json: Value = serde_json::from_slice(board_after_create_body).unwrap();
+    let queued_items = board_after_create_json["columns"][0]["items"]
+        .as_array()
+        .expect("queued column items array");
+    assert!(
+        queued_items.iter().any(|item| {
+            item["title"] == "Add exponential retry backoff to webhook handler"
+                && item["workstream"] == "engineering"
+                && item["tool_label"] == "Claude Code"
+        }),
+        "expected newly queued engineering task in GET /api/v4/board queued column: {queued_items:?}"
+    );
 
     let (sync_hdr, sync_val) = post_json("/api/v4/board/sync", json!({ "target": "github" }));
     assert!(sync_hdr.starts_with("HTTP/1.1 200 OK"));
@@ -600,6 +700,26 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     );
     assert_eq!(ok_tel_val["ok"], true);
     assert_eq!(ok_tel_val["queued"], true);
+
+    for chip_slug in ["retry_backoff_webhook", "audit_auth_billing"] {
+        let (chip_hdr, chip_val) = post_json(
+            "/api/v4/telemetry/track",
+            json!({
+                "event": "ui_pm_prompt_submitted",
+                "properties": {
+                    "input_source": "suggestion_chip",
+                    "chip_slug": chip_slug,
+                    "prompt_length_bucket": "41_120",
+                    "pm_outcome": "plan_returned"
+                }
+            }),
+        );
+        assert!(
+            chip_hdr.starts_with("HTTP/1.1 202 Accepted"),
+            "expected 202 Accepted for chip_slug={chip_slug}: {chip_hdr} {chip_val}"
+        );
+        assert_eq!(chip_val["ok"], true);
+    }
 
     // Wait up to 3s for background curl worker to deliver to ph_listener
     let ph_deadline = Instant::now() + Duration::from_secs(3);

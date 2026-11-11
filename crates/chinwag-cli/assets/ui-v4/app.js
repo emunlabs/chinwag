@@ -409,6 +409,72 @@ function viewportBucket() {
   return "mobile";
 }
 
+const PAIRING_TOOL_IDS = ["claude_code", "codex_cli", "gemini_cli", "cursor"];
+const PAIRING_SLOT_KEYS = ["driver_tool", "reviewer_tool", "test_verifier_tool", "security_verifier_tool"];
+
+function normalizeDetectedToolId(raw) {
+  const low = String(raw || "tool").trim().toLowerCase();
+  if (low === "claude" || low === "claude_code" || low === "claude-code") return "claude_code";
+  if (low === "codex" || low === "codex_cli" || low === "codex-cli") return "codex_cli";
+  if (low === "gemini" || low === "gemini_cli" || low === "gemini-cli") return "gemini_cli";
+  if (low === "cursor") return "cursor";
+  if (low === "gh" || low === "gh_cli" || low === "gh-cli") return "gh_cli";
+  return low.replace(/[^a-z0-9_]/g, "_");
+}
+
+function reviewModeForCredits(credits) {
+  const c = Number(credits);
+  if (c === 50) return "review_handoff";
+  if (c === 150) return "three_tool_check";
+  if (c === 200) return "quad_programming";
+  return "pair_sandbox";
+}
+
+function creditsForReviewMode(mode) {
+  const m = String(mode || "").trim().toLowerCase();
+  if (m === "review_handoff") return 50;
+  if (m === "pair_sandbox" || m === "diffs_touching_3_plus_files") return 100;
+  if (m === "three_tool_check" || m === "triad_sandbox") return 150;
+  if (m === "quad_programming" || m === "quad_sandbox" || m === "security_review") return 200;
+  return null;
+}
+
+function ensureDistinctPairingSlots(agentsObj, changedSlotIdx = -1, nextTool = null, prevTool = null) {
+  if (!agentsObj || typeof agentsObj !== "object") return;
+  if (changedSlotIdx >= 0 && changedSlotIdx < PAIRING_SLOT_KEYS.length && nextTool) {
+    const cleanNext = normalizeToolKind(nextTool);
+    const cleanPrev = prevTool ? normalizeToolKind(prevTool) : null;
+    agentsObj[PAIRING_SLOT_KEYS[changedSlotIdx]] = cleanNext;
+    for (let j = 0; j < PAIRING_SLOT_KEYS.length; j += 1) {
+      if (j === changedSlotIdx) continue;
+      if (normalizeToolKind(agentsObj[PAIRING_SLOT_KEYS[j]]) === cleanNext) {
+        if (cleanPrev && cleanPrev !== cleanNext) {
+          agentsObj[PAIRING_SLOT_KEYS[j]] = cleanPrev;
+        }
+      }
+    }
+  }
+
+  const used = new Set();
+  if (changedSlotIdx >= 0 && changedSlotIdx < PAIRING_SLOT_KEYS.length) {
+    const pinned = normalizeToolKind(agentsObj[PAIRING_SLOT_KEYS[changedSlotIdx]]);
+    agentsObj[PAIRING_SLOT_KEYS[changedSlotIdx]] = pinned;
+    used.add(pinned);
+  }
+  for (let i = 0; i < PAIRING_SLOT_KEYS.length; i += 1) {
+    if (i === changedSlotIdx) continue;
+    const current = normalizeToolKind(agentsObj[PAIRING_SLOT_KEYS[i]]);
+    if (PAIRING_TOOL_IDS.includes(current) && !used.has(current)) {
+      agentsObj[PAIRING_SLOT_KEYS[i]] = current;
+      used.add(current);
+    } else {
+      const replacement = PAIRING_TOOL_IDS.find((cand) => !used.has(cand)) || PAIRING_TOOL_IDS[i];
+      agentsObj[PAIRING_SLOT_KEYS[i]] = replacement;
+      used.add(replacement);
+    }
+  }
+}
+
 function normalizeToolKind(labelOrId) {
   const s = String(labelOrId || "").toLowerCase();
   if (s.includes("claude")) return "claude_code";
@@ -670,7 +736,7 @@ const state = {
   onboardingDismissed: false,
   walkthroughDone: false,
   pmLoading: false,
-  pmResponse: null,
+  launcherDraft: "",
   activeMinutes: 1,
   transportMode: "sse",
   reconnectCount: 0,
@@ -719,6 +785,8 @@ function createEmptyData() {
       ],
       driver_tool: "claude_code",
       reviewer_tool: "codex_cli",
+      test_verifier_tool: "gemini_cli",
+      security_verifier_tool: "cursor",
       review_tier_credits: 100,
       workflow: {
         independent_review: true,
@@ -917,7 +985,8 @@ function normalizeBootstrap(raw) {
     if (Array.isArray(cols)) {
       for (const col of cols) {
         if (!col || typeof col !== "object") continue;
-        const key = String(col.id || col.key || col.status || "").toLowerCase().replace(/\s+/g, "_");
+        const rawKey = String(col.id || col.key || col.status || "").toLowerCase().replace(/\s+/g, "_");
+        const key = rawKey === "active" ? "in_progress" : rawKey === "review" ? "needs_review" : rawKey;
         const list = Array.isArray(col.items) ? col.items : Array.isArray(col.cards) ? col.cards : [];
         if (key in next.board.columns) {
           next.board.columns[key] = list;
@@ -934,12 +1003,21 @@ function normalizeBootstrap(raw) {
     const a = raw.agents;
     if (Array.isArray(a.detected_tools) && a.detected_tools.length > 0) {
       next.agents.detected_tools = a.detected_tools.map((t) => ({
-        id: String(t.id || t.kind || t.name || "tool").toLowerCase().replace(/[^a-z0-9_]/g, "_"),
+        id: normalizeDetectedToolId(t.id || t.kind || t.name || "tool"),
         label: friendlyToolLabel(t.label || t.name || t.id || "Coding tool"),
-        installed: t.installed !== false && t.detected !== false && t.status !== "missing",
+        installed: typeof t.installed === "boolean"
+          ? t.installed
+          : t.detected !== false && t.status !== "missing" && t.status !== "not_installed",
         version: !isAbsent(t.version) ? String(t.version) : null,
         setup_command: !isAbsent(t.setup_command) ? String(t.setup_command) : "chinwag doctor",
       }));
+    }
+    if (!isAbsent(a.driver_tool)) next.agents.driver_tool = normalizeToolKind(a.driver_tool);
+    if (!isAbsent(a.reviewer_tool)) next.agents.reviewer_tool = normalizeToolKind(a.reviewer_tool);
+    if (!isAbsent(a.test_verifier_tool)) next.agents.test_verifier_tool = normalizeToolKind(a.test_verifier_tool);
+    if (!isAbsent(a.security_verifier_tool)) next.agents.security_verifier_tool = normalizeToolKind(a.security_verifier_tool);
+    if ([50, 100, 150, 200].includes(Number(a.review_tier_credits))) {
+      next.agents.review_tier_credits = Number(a.review_tier_credits);
     }
     if (a.workflow && typeof a.workflow === "object") {
       next.agents.workflow = {
@@ -947,10 +1025,30 @@ function normalizeBootstrap(raw) {
         protect_sensitive_paths: a.workflow.protect_sensitive_paths !== false,
         auto_test_before_review: a.workflow.auto_test_before_review !== false,
       };
+      if (!isAbsent(a.workflow.driver_tool)) {
+        next.agents.driver_tool = normalizeToolKind(a.workflow.driver_tool);
+      }
+      if (!isAbsent(a.workflow.reviewer_tool)) {
+        next.agents.reviewer_tool = normalizeToolKind(a.workflow.reviewer_tool);
+      }
+      if (!isAbsent(a.workflow.test_verifier_tool)) {
+        next.agents.test_verifier_tool = normalizeToolKind(a.workflow.test_verifier_tool);
+      }
+      if (!isAbsent(a.workflow.security_verifier_tool)) {
+        next.agents.security_verifier_tool = normalizeToolKind(a.workflow.security_verifier_tool);
+      }
+      const wfCredits = Number(a.workflow.review_tier_credits);
+      if ([50, 100, 150, 200].includes(wfCredits)) {
+        next.agents.review_tier_credits = wfCredits;
+      } else {
+        const mappedCredits = creditsForReviewMode(a.workflow.review_mode);
+        if (mappedCredits !== null) next.agents.review_tier_credits = mappedCredits;
+      }
       if (Array.isArray(a.workflow.protected_paths) && a.workflow.protected_paths.length > 0) {
         next.agents.protected_paths = a.workflow.protected_paths.map(String);
       }
     }
+    ensureDistinctPairingSlots(next.agents);
     if (Array.isArray(a.protected_paths) && a.protected_paths.length > 0) {
       next.agents.protected_paths = a.protected_paths.map(String);
     }
@@ -1799,6 +1897,7 @@ function openInviteModal(triggerSurface = "global_header") {
 function openNewTaskModal(triggerSurface = "board_header", initialTitle = "") {
   trackUiEvent("ui_board_task_modal_opened", { trigger_surface: triggerSurface });
   openModal(null, (close) => {
+    const defaultTool = normalizeToolKind(state.data.agents.driver_tool || "claude_code");
     const titleInput = el("input", {
       type: "text",
       className: "input",
@@ -1810,10 +1909,10 @@ function openNewTaskModal(triggerSurface = "board_header", initialTitle = "") {
     const toolSelect = el(
       "select",
       { className: "select", "aria-label": "Assign coding tool" },
-      el("option", { value: "claude_code" }, "Claude Code"),
-      el("option", { value: "codex_cli" }, "Codex CLI"),
-      el("option", { value: "gemini_cli" }, "Gemini CLI"),
-      el("option", { value: "cursor" }, "Cursor"),
+      el("option", { value: "claude_code", selected: defaultTool === "claude_code" }, "Claude Code"),
+      el("option", { value: "codex_cli", selected: defaultTool === "codex_cli" }, "Codex CLI"),
+      el("option", { value: "gemini_cli", selected: defaultTool === "gemini_cli" }, "Gemini CLI"),
+      el("option", { value: "cursor", selected: defaultTool === "cursor" }, "Cursor"),
     );
     const workstreamSelect = el(
       "select",
@@ -1840,37 +1939,52 @@ function openNewTaskModal(triggerSurface = "board_header", initialTitle = "") {
         }
         titleInput.removeAttribute("aria-invalid");
         errEl.hidden = true;
-        const toolKind = toolSelect.value;
+        const toolKind = normalizeToolKind(toolSelect.value);
         const ws = workstreamSelect.value;
-        await Motion.guardAction(
-          createBtn,
-          async () => {
-            try {
-              await apiRequest("POST", "/api/bus/send", {
-                room: "#eng",
-                body: `New task (${ws}): ${title}`,
+        try {
+          const outcome = await Motion.guardAction(
+            createBtn,
+            async () => {
+              const res = await apiRequest("POST", "/api/v4/board/tasks", {
+                title,
+                tool: toolKind,
+                workstream: ws,
               });
-            } catch (e) {
-              /* local queue fallback when offline */
-            }
-            state.data.board.columns.queued.unshift({
-              id: `task-${Date.now()}`,
-              title,
-              workstream: ws,
-              tool_label: friendlyToolLabel(toolKind),
-              created_at: new Date().toISOString(),
-            });
-            trackUiEvent("ui_board_task_created", {
-              workstream: ws,
-              assigned_tool_kind: toolKind,
-              has_target_files: false,
-            });
-          },
-          { group: footerGroup, busyLabel: "Adding…" },
-        );
-        await close();
-        toaster.show("Task added to Queued");
-        if (state.view === "board") renderCurrentView();
+              try {
+                await apiRequest("POST", "/api/bus/send", {
+                  room: "#eng",
+                  body: `New task (${ws}): ${title}`,
+                });
+              } catch (e) {
+                /* best-effort local bus announcement */
+              }
+              state.data.board.columns.queued.unshift({
+                id: (res && res.task && res.task.id) || `task-${Date.now()}`,
+                title,
+                workstream: ws,
+                tool_label: friendlyToolLabel(toolKind),
+                created_at: new Date().toISOString(),
+              });
+              trackUiEvent("ui_board_task_created", {
+                workstream: ws,
+                assigned_tool_kind: toolKind,
+                has_target_files: false,
+              });
+              return res;
+            },
+            { group: footerGroup, busyLabel: "Adding…" },
+          );
+          if (!outcome) return;
+          await close();
+          toaster.show("Task added to Queued on Board");
+          if (state.view === "board" || state.view === "inbox") renderCurrentView();
+        } catch (err) {
+          trackUiEvent("ui_action_failed", {
+            failed_action: "board_task_create",
+            error_category: "io_error",
+          });
+          toaster.show(err.message || "Could not queue task right now");
+        }
       },
     });
     footerGroup.append(actionBtn({ label: "Cancel", variant: "secondary", onClick: close }), createBtn);
@@ -2063,44 +2177,39 @@ function describeStatusPill(item) {
   return statusPill("Ready to review", "warning", false);
 }
 
-async function submitPmPrompt(promptText, inputSource = "typed_prompt", chipSlug = "none") {
-  const trimmed = String(promptText || "").trim();
+async function queueEngineeringTaskFromLauncher(rawTitle) {
+  const trimmed = String(rawTitle || "").trim();
   if (!trimmed || state.pmLoading) return;
+  const toolKind = normalizeToolKind(state.data.agents.driver_tool || "claude_code");
   state.pmLoading = true;
+  state.launcherDraft = trimmed;
   renderCurrentView();
   try {
-    let replyText = null;
-    try {
-      const res = await apiRequest("POST", "/api/delivery/ask", { prompt: trimmed });
-      const rawReply = String(res.summary || res.message || res.reply || "").trim();
-      if (rawReply && !rawReply.includes("Sitrep (topology=")) {
-        replyText = rawReply;
-      }
-    } catch (e) {
-      replyText = null;
-    }
-    if (!replyText) {
-      const needs = state.data.inbox.counts.needs_decision;
-      const running = state.data.inbox.counts.running;
-      const shipped = state.data.board.summary.shipped_count;
-      replyText =
-        needs > 0
-          ? `${needs} ${needs === 1 ? "change is" : "changes are"} ready for your decision in Inbox, ${running} running in sandbox, and ${shipped} shipped. You can queue "${trimmed}" directly onto the Board.`
-          : `Ready to scope "${trimmed}" in an isolated local workspace with automatic test verification before review.`;
-    }
-    state.pmResponse = { prompt: trimmed, reply: replyText };
-    trackUiEvent("ui_pm_prompt_submitted", {
-      input_source: inputSource,
-      chip_slug: chipSlug,
-      prompt_length_bucket: promptLengthBucket(trimmed.length),
-      pm_outcome: "plan_returned",
+    const res = await apiRequest("POST", "/api/v4/board/tasks", {
+      title: trimmed,
+      tool: toolKind,
+      workstream: "engineering",
     });
+    state.data.board.columns.queued.unshift({
+      id: (res && res.task && res.task.id) || `task-${Date.now()}`,
+      title: trimmed,
+      workstream: "engineering",
+      tool_label: friendlyToolLabel(toolKind),
+      created_at: new Date().toISOString(),
+    });
+    trackUiEvent("ui_board_task_created", {
+      workstream: "engineering",
+      assigned_tool_kind: toolKind,
+      has_target_files: false,
+    });
+    state.launcherDraft = "";
+    toaster.show("Task added to Queued on Board");
   } catch (err) {
     trackUiEvent("ui_action_failed", {
-      failed_action: "pm_prompt",
+      failed_action: "board_task_create",
       error_category: "io_error",
     });
-    toaster.show("Could not reach Chinwag PM right now");
+    toaster.show(err.message || "Could not queue task right now");
   } finally {
     state.pmLoading = false;
     renderCurrentView();
@@ -2139,42 +2248,56 @@ function renderInboxView(root) {
   );
   listPane.appendChild(viewHead);
 
-  // Ask Chinwag PM inline bar
+  // Direct Engineering Task Launcher
   const pmInput = el("input", {
     type: "text",
     id: "ask-pm-input",
     className: "ask-input",
-    placeholder: "Describe a bug to fix, failing check, or task to scope…",
-    "aria-label": "Ask Chinwag PM",
+    value: state.launcherDraft || "",
+    placeholder: "Describe a bug to fix, failing test, or feature to build…",
+    "aria-label": "New engineering task",
+    onInput: () => {
+      state.launcherDraft = pmInput.value;
+    },
     onKeydown: (ev) => {
       if (ev.key === "Enter") {
         ev.preventDefault();
-        submitPmPrompt(pmInput.value, "typed_prompt", "none");
+        if (pmInput.value.trim()) {
+          queueEngineeringTaskFromLauncher(pmInput.value);
+        } else {
+          openNewTaskModal("onboarding_banner", "");
+        }
       }
     },
   });
   const askSubmitBtn = actionBtn({
-    label: state.pmLoading ? "Scoping…" : "Ask",
+    label: state.pmLoading ? "Queueing…" : "Queue task",
     variant: "secondary",
     size: "sm",
     keycap: "⌘K",
     disabled: state.pmLoading,
-    onClick: () => submitPmPrompt(pmInput.value, "typed_prompt", "none"),
+    onClick: () => {
+      if (pmInput.value.trim()) {
+        queueEngineeringTaskFromLauncher(pmInput.value);
+      } else {
+        openNewTaskModal("onboarding_banner", "");
+      }
+    },
   });
 
   const quickChips = [
-    { label: "What needs my attention", prompt: "Summarize what needs my decision right now", slug: "what_needs_me" },
-    { label: "Fix latest failing test", prompt: "Scope a minimal fix for the latest failing test", slug: "scope_fix_last_test" },
-    { label: "What shipped this week", prompt: "Summarize verified changes shipped this week", slug: "what_shipped_this_week" },
+    { label: "Fix latest failing test", prompt: "Fix latest failing unit or CI test in this repository", slug: "scope_fix_last_test" },
+    { label: "Add webhook retry backoff", prompt: "Add exponential retry backoff and idempotency guard to webhook handler", slug: "retry_backoff_webhook" },
+    { label: "Audit auth & billing checks", prompt: "Audit auth and billing routes for missing input validation or rate limits", slug: "audit_auth_billing" },
   ];
 
   const askSection = el(
     "section",
-    { className: "ask-section", "aria-label": "Ask Chinwag PM" },
+    { className: "ask-section", "aria-label": "New engineering task" },
     el(
       "div",
       { className: "ask-bar" },
-      el("label", { className: "ask-label", for: "ask-pm-input" }, "Ask Chinwag PM"),
+      el("label", { className: "ask-label", for: "ask-pm-input" }, "New task"),
       pmInput,
       askSubmitBtn,
     ),
@@ -2188,49 +2311,19 @@ function renderInboxView(root) {
             type: "button",
             className: "chip",
             onClick: () => {
-              pmInput.value = chip.prompt;
-              submitPmPrompt(chip.prompt, "suggestion_chip", chip.slug);
+              trackUiEvent("ui_pm_prompt_submitted", {
+                input_source: "suggestion_chip",
+                chip_slug: chip.slug,
+                prompt_length_bucket: promptLengthBucket(chip.prompt.length),
+                pm_outcome: "plan_returned",
+              });
+              openNewTaskModal("onboarding_banner", chip.prompt);
             },
           },
           chip.label,
         ),
       ),
     ),
-    state.pmResponse
-      ? el(
-          "div",
-          { className: "ask-result", role: "region", "aria-label": "Chinwag PM response" },
-          el(
-            "div",
-            { className: "ask-result-head" },
-            el("span", { className: "t-12 w600 secondary" }, "Chinwag PM"),
-            el(
-              "div",
-              { className: "view-actions" },
-              actionBtn({
-                label: "Create task on Board",
-                variant: "secondary",
-                size: "sm",
-                onClick: () => openNewTaskModal("onboarding_banner", state.pmResponse.prompt),
-              }),
-              el(
-                "button",
-                {
-                  type: "button",
-                  className: "btn-icon",
-                  "aria-label": "Dismiss response",
-                  onClick: () => {
-                    state.pmResponse = null;
-                    renderCurrentView();
-                  },
-                },
-                ICONS.close(),
-              ),
-            ),
-          ),
-          el("p", { className: "t-14" }, state.pmResponse.reply),
-        )
-      : null,
   );
   listPane.appendChild(askSection);
 
@@ -2366,7 +2459,7 @@ function renderInboxView(root) {
             el(
               "p",
               { className: "empty-body" },
-              "Ask Chinwag PM above to scope a fix, or step through a 15-second sample diff review to see how approvals and safety holds work.",
+              "Queue an engineering task above, or step through a 15-second sample diff review to see how approvals and safety holds work.",
             ),
             el(
               "div",
@@ -3226,7 +3319,7 @@ function renderSheetFooter(detail, sheetFoot, armPrimary = false) {
           walkthrough_mode: "sample_item",
           is_under_15s: Date.now() - state.sheetOpenedAtMs < 15000,
         });
-        toaster.show("Sample walkthrough complete. Ask Chinwag PM whenever you're ready.");
+        toaster.show("Sample walkthrough complete. Queue an engineering task whenever you're ready.");
         closeReviewSheetAndNavigate();
       },
     });
@@ -3741,31 +3834,89 @@ function renderBoardView(root) {
 
 // ── 8 · View 3: Agents & Rules ───────────────────────────────────────────────
 
-async function saveWorkflowSettings(patch) {
-  const prev = { ...state.data.agents.workflow };
-  const next = { ...prev, ...patch };
-  state.data.agents.workflow = next;
+async function saveWorkflowSettings(patch = {}) {
+  const agents = state.data.agents;
+  const prevSnapshot = {
+    workflow: { ...agents.workflow },
+    driver_tool: agents.driver_tool,
+    reviewer_tool: agents.reviewer_tool,
+    test_verifier_tool: agents.test_verifier_tool,
+    security_verifier_tool: agents.security_verifier_tool,
+    review_tier_credits: agents.review_tier_credits,
+    protected_paths: [...agents.protected_paths],
+  };
+
+  if (typeof patch.independent_review === "boolean") {
+    agents.workflow.independent_review = patch.independent_review;
+  }
+  if (typeof patch.protect_sensitive_paths === "boolean") {
+    agents.workflow.protect_sensitive_paths = patch.protect_sensitive_paths;
+  }
+  if (typeof patch.auto_test_before_review === "boolean") {
+    agents.workflow.auto_test_before_review = patch.auto_test_before_review;
+  }
+  if (!isAbsent(patch.driver_tool)) agents.driver_tool = normalizeToolKind(patch.driver_tool);
+  if (!isAbsent(patch.reviewer_tool)) agents.reviewer_tool = normalizeToolKind(patch.reviewer_tool);
+  if (!isAbsent(patch.test_verifier_tool)) agents.test_verifier_tool = normalizeToolKind(patch.test_verifier_tool);
+  if (!isAbsent(patch.security_verifier_tool)) agents.security_verifier_tool = normalizeToolKind(patch.security_verifier_tool);
+  if ([50, 100, 150, 200].includes(Number(patch.review_tier_credits))) {
+    agents.review_tier_credits = Number(patch.review_tier_credits);
+  }
+  if (Array.isArray(patch.protected_paths)) {
+    agents.protected_paths = patch.protected_paths.map(String);
+  }
+
+  const payload = {
+    independent_review: agents.workflow.independent_review,
+    protect_sensitive_paths: agents.workflow.protect_sensitive_paths,
+    auto_test_before_review: agents.workflow.auto_test_before_review,
+    driver_tool: agents.driver_tool,
+    reviewer_tool: agents.reviewer_tool,
+    test_verifier_tool: agents.test_verifier_tool,
+    security_verifier_tool: agents.security_verifier_tool,
+    review_tier_credits: agents.review_tier_credits,
+    review_mode: reviewModeForCredits(agents.review_tier_credits),
+    protected_paths: agents.protected_paths,
+  };
+
   try {
-    const res = await apiRequest("POST", "/api/v4/workflow", {
-      independent_review: next.independent_review,
-      protect_sensitive_paths: next.protect_sensitive_paths,
-      auto_test_before_review: next.auto_test_before_review,
-    });
+    const res = await apiRequest("POST", "/api/v4/workflow", payload);
     if (res && res.workflow && typeof res.workflow === "object") {
-      state.data.agents.workflow = {
-        independent_review: res.workflow.independent_review !== false,
-        protect_sensitive_paths: res.workflow.protect_sensitive_paths !== false,
-        auto_test_before_review: res.workflow.auto_test_before_review !== false,
+      const w = res.workflow;
+      agents.workflow = {
+        independent_review: w.independent_review !== false,
+        protect_sensitive_paths: w.protect_sensitive_paths !== false,
+        auto_test_before_review: w.auto_test_before_review !== false,
       };
+      if (!isAbsent(w.driver_tool)) agents.driver_tool = normalizeToolKind(w.driver_tool);
+      if (!isAbsent(w.reviewer_tool)) agents.reviewer_tool = normalizeToolKind(w.reviewer_tool);
+      if (!isAbsent(w.test_verifier_tool)) agents.test_verifier_tool = normalizeToolKind(w.test_verifier_tool);
+      if (!isAbsent(w.security_verifier_tool)) agents.security_verifier_tool = normalizeToolKind(w.security_verifier_tool);
+      if ([50, 100, 150, 200].includes(Number(w.review_tier_credits))) {
+        agents.review_tier_credits = Number(w.review_tier_credits);
+      }
+      if (Array.isArray(w.protected_paths)) {
+        agents.protected_paths = w.protected_paths.map(String);
+      }
+      ensureDistinctPairingSlots(agents);
     }
-    toaster.show("Workflow settings saved");
+    if (!patch.silentToast) {
+      toaster.show(patch.toastMessage || "Workflow settings saved");
+    }
   } catch (err) {
-    state.data.agents.workflow = prev;
+    agents.workflow = prevSnapshot.workflow;
+    agents.driver_tool = prevSnapshot.driver_tool;
+    agents.reviewer_tool = prevSnapshot.reviewer_tool;
+    agents.test_verifier_tool = prevSnapshot.test_verifier_tool;
+    agents.security_verifier_tool = prevSnapshot.security_verifier_tool;
+    agents.review_tier_credits = prevSnapshot.review_tier_credits;
+    agents.protected_paths = prevSnapshot.protected_paths;
     trackUiEvent("ui_action_failed", {
       failed_action: "guardrail_save",
       error_category: "io_error",
     });
     toaster.show(err.message || "Could not save workflow settings");
+    if (state.view === "agents") renderCurrentView();
     throw err;
   }
 }
@@ -3847,66 +3998,60 @@ function renderAgentsView(root) {
   );
   stack.appendChild(toolsBlock);
 
-  // Section 2: Independent Review (Driver != Reviewer)
+  // Section 2: Independent Review (Dynamic 2 / 3 / 4 Tool Slots + Quad-Programming)
   const toolOptions = [
     { value: "claude_code", label: "Claude Code" },
     { value: "codex_cli", label: "Codex CLI" },
     { value: "gemini_cli", label: "Gemini CLI" },
     { value: "cursor", label: "Cursor" },
   ];
-  const driverSelect = el(
-    "select",
-    {
-      className: "select",
-      "aria-label": "Primary coding tool (Driver)",
-      onChange: () => {
-        agents.driver_tool = driverSelect.value;
-        if (agents.reviewer_tool === agents.driver_tool) {
-          const alt = toolOptions.find((o) => o.value !== agents.driver_tool);
-          if (alt) {
-            agents.reviewer_tool = alt.value;
-            reviewerSelect.value = alt.value;
-          }
-        }
-        trackUiEvent("ui_cross_tool_pairing_updated", {
-          driver_tool_kind: agents.driver_tool,
-          reviewer_tool_kind: agents.reviewer_tool,
-          function_credits_cost: agents.review_tier_credits,
-        });
-        toaster.show(`Driver set to ${friendlyToolLabel(agents.driver_tool)}, reviewed by ${friendlyToolLabel(agents.reviewer_tool)}`);
-      },
-    },
-    toolOptions.map((o) => el("option", { value: o.value, selected: agents.driver_tool === o.value }, o.label)),
-  );
-
-  const reviewerSelect = el(
-    "select",
-    {
-      className: "select",
-      "aria-label": "Independent reviewer tool",
-      onChange: () => {
-        if (reviewerSelect.value === agents.driver_tool) {
-          const alt = toolOptions.find((o) => o.value !== agents.driver_tool);
-          if (alt) reviewerSelect.value = alt.value;
-          toaster.show("Reviewer must be a different tool than the driver");
-        }
-        agents.reviewer_tool = reviewerSelect.value;
-        trackUiEvent("ui_cross_tool_pairing_updated", {
-          driver_tool_kind: agents.driver_tool,
-          reviewer_tool_kind: agents.reviewer_tool,
-          function_credits_cost: agents.review_tier_credits,
-        });
-      },
-    },
-    toolOptions.map((o) => el("option", { value: o.value, selected: agents.reviewer_tool === o.value }, o.label)),
-  );
 
   const reviewTiers = [
-    { credits: 50, title: "Review handoff · 50 Cr", desc: "Second tool reviews the diff before Inbox" },
-    { credits: 100, title: "Pair sandbox · 100 Cr", desc: "Driver and reviewer iterate until tests pass" },
-    { credits: 150, title: "Three-tool check · 150 Cr", desc: "Adds dedicated edge-case test verification" },
-    { credits: 200, title: "Security review · 200 Cr", desc: "Full verification for auth, billing, and migrations" },
+    { credits: 50, slots: 2, mode: "review_handoff", title: "Review handoff · 50 Cr", desc: "Second tool reviews the diff before Inbox" },
+    { credits: 100, slots: 2, mode: "pair_sandbox", title: "Pair sandbox · 100 Cr", desc: "Driver and reviewer iterate until tests pass" },
+    { credits: 150, slots: 3, mode: "three_tool_check", title: "Three-tool check · 150 Cr", desc: "Adds a 3rd tool for edge-case & test verification" },
+    { credits: 200, slots: 4, mode: "quad_programming", title: "Quad-programming · 200 Cr", desc: "Four independent tools: driver, code review, tests, and security audit" },
   ];
+
+  ensureDistinctPairingSlots(agents);
+  const activeTier = reviewTiers.find((t) => t.credits === agents.review_tier_credits) || reviewTiers[1];
+  const activeSlots = activeTier.slots;
+
+  const allSlotSpecs = [
+    {
+      slotIdx: 0,
+      key: "driver_tool",
+      label: "1. Writes the change (Driver)",
+      ariaLabel: "Primary coding tool (Driver)",
+    },
+    {
+      slotIdx: 1,
+      key: "reviewer_tool",
+      label: activeSlots === 2 ? "2. Reviews code & diff (Reviewer)" : "2. Reviews code & architecture (Reviewer)",
+      ariaLabel: "Independent reviewer tool",
+    },
+    {
+      slotIdx: 2,
+      key: "test_verifier_tool",
+      label: "3. Breaks edge cases & tests (Test Verifier)",
+      ariaLabel: "Independent test verifier tool",
+    },
+    {
+      slotIdx: 3,
+      key: "security_verifier_tool",
+      label: "4. Audits security, auth & migrations (Security Verifier)",
+      ariaLabel: "Independent security verifier tool",
+    },
+  ];
+  const visibleSlotSpecs = allSlotSpecs.slice(0, activeSlots);
+
+  const installedToolSet = new Set(
+    agents.detected_tools.filter((t) => t.installed).map((t) => normalizeDetectedToolId(t.id)),
+  );
+  const missingActiveToolLabels = visibleSlotSpecs
+    .map((spec) => agents[spec.key])
+    .filter((toolId, idx, arr) => arr.indexOf(toolId) === idx && !installedToolSet.has(toolId))
+    .map((toolId) => friendlyToolLabel(toolId));
 
   const pairingSection = el(
     "section",
@@ -3941,10 +4086,47 @@ function renderAgentsView(root) {
       ),
       el(
         "div",
-        { className: "pairing-selects" },
-        el("div", { className: "section-block" }, el("label", { className: "t-13 w500" }, "Writes the change (Driver)"), driverSelect),
-        el("div", { className: "section-block" }, el("label", { className: "t-13 w500" }, "Reviews independently (Reviewer)"), reviewerSelect),
+        { className: "pairing-selects", dataset: { slots: String(activeSlots) } },
+        visibleSlotSpecs.map((spec) => {
+          const selectEl = el(
+            "select",
+            {
+              className: "select",
+              "aria-label": spec.ariaLabel,
+              onChange: () => {
+                const prevTool = agents[spec.key];
+                const nextTool = selectEl.value;
+                ensureDistinctPairingSlots(agents, spec.slotIdx, nextTool, prevTool);
+                trackUiEvent("ui_cross_tool_pairing_updated", {
+                  driver_tool_kind: agents.driver_tool,
+                  reviewer_tool_kind: agents.reviewer_tool,
+                  function_credits_cost: agents.review_tier_credits,
+                });
+                renderCurrentView();
+                saveWorkflowSettings({
+                  toastMessage: `${spec.label.replace(/^\d+\.\s*/, "")} set to ${friendlyToolLabel(agents[spec.key])}`,
+                }).catch(() => {});
+              },
+            },
+            toolOptions.map((o) =>
+              el("option", { value: o.value, selected: agents[spec.key] === o.value }, o.label),
+            ),
+          );
+          return el(
+            "div",
+            { className: "section-block" },
+            el("label", { className: "t-13 w500" }, spec.label),
+            selectEl,
+          );
+        }),
       ),
+      missingActiveToolLabels.length > 0
+        ? el(
+            "p",
+            { className: "t-12 secondary" },
+            `${missingActiveToolLabels.join(" and ")} ${missingActiveToolLabels.length === 1 ? "is" : "are"} not detected locally yet — copy ${missingActiveToolLabels.length === 1 ? "its" : "their"} install command under Detected coding tools above before running this check.`,
+          )
+        : null,
       el(
         "div",
         { className: "radio-cards", role: "radiogroup", "aria-label": "Review depth" },
@@ -3957,13 +4139,19 @@ function renderAgentsView(root) {
               className: "radio-card",
               "aria-checked": agents.review_tier_credits === tier.credits ? "true" : "false",
               onClick: () => {
+                if (agents.review_tier_credits === tier.credits) return;
                 agents.review_tier_credits = tier.credits;
+                ensureDistinctPairingSlots(agents);
                 trackUiEvent("ui_cross_tool_pairing_updated", {
                   driver_tool_kind: agents.driver_tool,
                   reviewer_tool_kind: agents.reviewer_tool,
                   function_credits_cost: tier.credits,
                 });
                 renderCurrentView();
+                saveWorkflowSettings({
+                  review_tier_credits: tier.credits,
+                  toastMessage: `Review depth set to ${tier.title}`,
+                }).catch(() => {});
               },
             },
             el("span", { className: "t-13 w600 num" }, tier.title),
@@ -3998,8 +4186,11 @@ function renderAgentsView(root) {
           path_category: "custom_glob",
           protected_paths_count_bucket: countBucket(agents.protected_paths.length),
         });
-        toaster.show(`Protected path added: ${val}`);
         renderCurrentView();
+        saveWorkflowSettings({
+          protected_paths: agents.protected_paths,
+          toastMessage: `Protected path added: ${val}`,
+        }).catch(() => {});
       }
     },
   });
@@ -4082,6 +4273,10 @@ function renderAgentsView(root) {
                       protected_paths_count_bucket: countBucket(agents.protected_paths.length),
                     });
                     renderCurrentView();
+                    saveWorkflowSettings({
+                      protected_paths: agents.protected_paths,
+                      toastMessage: `Removed protected path: ${glob}`,
+                    }).catch(() => {});
                   },
                 },
                 "×",
@@ -4731,7 +4926,7 @@ function wireKeyboardShortcuts() {
   document.addEventListener("keydown", (ev) => {
     const mod = ev.metaKey || ev.ctrlKey;
 
-    // Cmd/Ctrl + K -> Focus Ask Chinwag PM input
+    // Cmd/Ctrl + K -> Focus New engineering task input
     if (mod && (ev.key === "k" || ev.key === "K")) {
       ev.preventDefault();
       if (state.view !== "inbox") {
