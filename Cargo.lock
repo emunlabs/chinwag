@@ -775,6 +775,7 @@ dependencies = [
 name = "chinwag-cli"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "chinwag-confirmed-initial-private",
  "chinwag-editor-config-private",
  "chinwag-history-archive",
@@ -785,6 +786,7 @@ dependencies = [
  "chinwag-snapshot-session-private",
  "chinwag-swarm",
  "chinwag-test-fixtures",
+ "ed25519-dalek 2.2.0",
  "iroh",
  "rand 0.9.5",
  "rustix",

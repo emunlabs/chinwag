@@ -695,3 +695,74 @@ async fn daemon_signer_is_bound_to_the_actual_endpoint_and_reuses_room_codec() {
     room_wire::verify_advertisement(&wire, endpoint.id(), 1000).unwrap();
     endpoint.close().await;
 }
+
+#[test]
+fn suspend_and_reopen_keep_gate_denied_preserve_nonces_and_accept_unchanged_peer_once() {
+    let mut fixture = Fixture::new();
+    let peer_ad = fixture.bind_peer(3, 1);
+    let peer_receipt = storage_receipt_for_private_test(&fixture.coordinator, &peer_ad);
+    let old_snapshot = fixture.gate.current_peer().unwrap();
+    assert_eq!(fixture.gate.posture().unwrap().phase, "LIVE_AT_OBSERVATION");
+
+    // Clean WebSocket 1000 disconnect suspends the owner without revoking the gate,
+    // while immediately invalidating issued snapshots and denying peer access.
+    fixture.owner.suspend_for_reconnect().unwrap();
+    drop(fixture.owner);
+    assert_eq!(fixture.gate.posture().unwrap().phase, "PENDING");
+    assert!(fixture.gate.current_peer().is_err());
+    assert!(
+        old_snapshot
+            .revalidate_for(fixture.peer.endpoint_id())
+            .is_err()
+    );
+
+    let mut next_owner = fixture
+        .gate
+        .reopen_owner(
+            fixture.local.endpoint_id(),
+            fixture.coordinator.endpoint_id(),
+            fixture.gate.configuration().relay_policy(),
+            "https://owned-room.invalid/",
+        )
+        .unwrap();
+
+    // Replaying the initial own nonce on the reopened session must fail closed.
+    let replayed_own = advertisement(&fixture.local, 1, 1, 1060);
+    let replayed_receipt = storage_receipt_for_private_test(&fixture.coordinator, &replayed_own);
+    assert!(matches!(
+        next_owner.bind_own(replayed_own, replayed_receipt, &"01".repeat(32)),
+        Err(BindingError::Replay)
+    ));
+
+    // Fresh own attach/advertise on session 2 succeeds.
+    let fresh_own = advertisement(&fixture.local, 2, 1, 1080);
+    let fresh_receipt = storage_receipt_for_private_test(&fixture.coordinator, &fresh_own);
+    next_owner
+        .bind_own(fresh_own, fresh_receipt, &"02".repeat(32))
+        .unwrap();
+
+    // Single-sided reconnect: the coordinator sends the peer's still-unexpired
+    // current advertisement (session 3, revision 1) on the new socket.
+    next_owner.bind_peer(&peer_ad, &peer_receipt).unwrap();
+    assert_eq!(fixture.gate.posture().unwrap().phase, "LIVE_AT_OBSERVATION");
+    assert!(fixture.gate.current_peer().is_ok());
+
+    // Once bound on the active session, replaying the exact same revision again
+    // on the same socket is still rejected as a replay.
+    assert!(matches!(
+        next_owner.bind_peer(&peer_ad, &peer_receipt),
+        Err(BindingError::Replay)
+    ));
+
+    // Terminal revocation permanently blocks reopen_owner.
+    drop(next_owner);
+    assert!(matches!(
+        fixture.gate.reopen_owner(
+            fixture.local.endpoint_id(),
+            fixture.coordinator.endpoint_id(),
+            fixture.gate.configuration().relay_policy(),
+            "https://owned-room.invalid/",
+        ),
+        Err(BindingError::Revoked)
+    ));
+}

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Symmetric Chinwag release builder & bus publisher wrapper (`CHWG-0261`).
+# Compiles `--release --locked` on any authorized peer, uploads the content-addressed
+# binary to Cloudflare R2, installs locally at `$HOME/.local/bin/<binary>`, and
+# broadcasts a signed `RELEASE_BUILT` manifest onto `#all` on the Chinwag Bus.
+
+set -euo pipefail
+
+if [[ -z "${HOME:-}" || "${HOME:0:1}" != "/" ]]; then
+  echo "chinwag-release-publish: HOME must be set to an absolute directory" >&2
+  exit 2
+fi
+
+export PATH="/opt/homebrew/opt/rustup/bin:${HOME}/.cargo/bin:${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}"
+if [[ -d "${HOME}/.chinwag-native-inputs" ]]; then
+  export CHINWAG_PRIVATE_CRSQL_INPUTS="${CHINWAG_PRIVATE_CRSQL_INPUTS:-${HOME}/.chinwag-native-inputs}"
+fi
+
+BINARY="chinwag"
+REPO_ROOT="${CHINWAG_REPO_ROOT:-}"
+SOURCE_BIN=""
+ROLLBACK=0
+JSON_OUT=0
+FROM_ACTOR=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  chinwag-release-publish [--binary chinwag|chinwag-ci] [--repo <repo-path>]
+                          [--source <precompiled-binary>] [--from <INFRAJR#INSTANCE>]
+                          [--rollback] [--json]
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --binary)
+      BINARY="${2:-}"
+      shift 2
+      ;;
+    --repo)
+      REPO_ROOT="${2:-}"
+      shift 2
+      ;;
+    --source)
+      SOURCE_BIN="${2:-}"
+      shift 2
+      ;;
+    --from)
+      FROM_ACTOR="${2:-}"
+      shift 2
+      ;;
+    --rollback)
+      ROLLBACK=1
+      shift
+      ;;
+    --json)
+      JSON_OUT=1
+      shift
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "chinwag-release-publish: unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$BINARY" != "chinwag" && "$BINARY" != "chinwag-ci" ]]; then
+  echo "chinwag-release-publish: --binary must be 'chinwag' or 'chinwag-ci'" >&2
+  exit 2
+fi
+
+if [[ -z "$REPO_ROOT" ]]; then
+  if git rev-parse --show-toplevel >/dev/null 2>&1; then
+    REPO_ROOT="$(git rev-parse --show-toplevel)"
+  elif [[ -d "${HOME}/WORKSPACE/chinwag/.git" || -f "${HOME}/WORKSPACE/chinwag/.git" ]]; then
+    REPO_ROOT="${HOME}/WORKSPACE/chinwag"
+  else
+    echo "chinwag-release-publish: pass --repo <path> or run inside a chinwag checkout" >&2
+    exit 2
+  fi
+fi
+
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+
+if [[ -z "$SOURCE_BIN" ]]; then
+  cargo build \
+    --manifest-path "${REPO_ROOT}/Cargo.toml" \
+    --target-dir "${TARGET_DIR}" \
+    --release \
+    --bin "${BINARY}" \
+    --locked >&2
+  SOURCE_BIN="${TARGET_DIR}/release/${BINARY}"
+fi
+
+if [[ ! -f "$SOURCE_BIN" ]]; then
+  echo "chinwag-release-publish: compiled binary not found at ${SOURCE_BIN}" >&2
+  exit 1
+fi
+
+RUNNER_CHINWAG="${HOME}/.local/bin/chinwag"
+if [[ "$BINARY" == "chinwag" && -x "$SOURCE_BIN" ]]; then
+  RUNNER_CHINWAG="$SOURCE_BIN"
+fi
+
+PUBLISH_ARGS=(
+  release publish
+  --binary "$BINARY"
+  --source "$SOURCE_BIN"
+  --repo "$REPO_ROOT"
+)
+if [[ -n "$FROM_ACTOR" ]]; then
+  PUBLISH_ARGS+=(--from "$FROM_ACTOR")
+fi
+if [[ "$ROLLBACK" -eq 1 ]]; then
+  PUBLISH_ARGS+=(--rollback)
+fi
+if [[ "$JSON_OUT" -eq 1 ]]; then
+  PUBLISH_ARGS+=(--json)
+fi
+
+SCRIPT_SELF="${REPO_ROOT}/scripts/chinwag-release-publish"
+if [[ -f "$SCRIPT_SELF" && ! -L "$SCRIPT_SELF" ]]; then
+  mkdir -p "${HOME}/.local/bin"
+  WRAPPER_TMP="${HOME}/.local/bin/.chinwag-release-publish.tmp.$$"
+  cp "$SCRIPT_SELF" "$WRAPPER_TMP"
+  chmod 0755 "$WRAPPER_TMP"
+  mv -f "$WRAPPER_TMP" "${HOME}/.local/bin/chinwag-release-publish"
+fi
+
+exec "$RUNNER_CHINWAG" "${PUBLISH_ARGS[@]}"

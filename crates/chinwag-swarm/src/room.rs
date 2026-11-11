@@ -243,6 +243,11 @@ fn http_response_error(
     }
 }
 
+pub const ATTACH_CHALLENGE_MAX_RETRIES: usize = 2;
+const ATTACH_WARMUP_BACKOFF_MS: [u64; ATTACH_CHALLENGE_MAX_RETRIES] = [500, 1500];
+pub const RECONNECT_BACKOFF_MIN_MS: u64 = 250;
+pub const RECONNECT_BACKOFF_MAX_MS: u64 = 30_000;
+
 fn startup_http_phase(phase: &'static str, error: Error) -> Error {
     match error {
         Error::Http("timeout")
@@ -251,6 +256,132 @@ fn startup_http_phase(phase: &'static str, error: Error) -> Error {
             ..
         } => Error::PhaseTimeout(phase),
         other => other,
+    }
+}
+
+/// True only for cold-start coordinator timeouts or transient pre-session TCP
+/// connect failures on `attach_challenge_http`. Explicit HTTP status refusals
+/// (401/403/etc.), signature/wire failures, TLS errors, and malformed payloads
+/// always fail closed immediately with zero retries.
+pub fn is_retryable_attach_challenge_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Timeout
+            | Error::PhaseTimeout(_)
+            | Error::Http("timeout" | "connect")
+            | Error::HttpResponse {
+                category: "timeout" | "connect",
+                ..
+            }
+    )
+}
+
+/// True when an established or reconnecting room WebSocket closed cleanly/idly
+/// (`code 1000` / Durable Object hibernation / transient network reset) rather
+/// than an authentication, signature, replay, or coordinator pin violation.
+pub fn is_reconnectable_room_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::WebSocketClosed(1000 | 1001 | 1006)
+            | Error::WebSocket(
+                "peer_close_without_status"
+                    | "connection_reset"
+                    | "unexpected_eof"
+                    | "io_timeout"
+                    | "io"
+                    | "connection_refused"
+                    | "dns"
+            )
+            | Error::Network
+            | Error::Timeout
+            | Error::PhaseTimeout(
+                "peer_advertisement"
+                    | "attach_challenge_http"
+                    | "websocket_upgrade"
+                    | "advertise_challenge_http"
+                    | "advertisement_store_http"
+            )
+            | Error::Http("timeout" | "connect")
+            | Error::HttpResponse {
+                category: "timeout" | "connect",
+                ..
+            }
+    )
+}
+
+/// Pure bounded jittered exponential backoff (`250ms` -> `30s` max).
+/// `jitter_per_mille` in `0..=250` adds up to +25% jitter before clamping to `30s`.
+pub fn reconnect_backoff_duration(attempt: u32, jitter_per_mille: u16) -> Duration {
+    let shift = attempt.min(8);
+    let base_ms = RECONNECT_BACKOFF_MIN_MS
+        .saturating_mul(1u64 << shift)
+        .min(RECONNECT_BACKOFF_MAX_MS);
+    let capped_jitter = u64::from(jitter_per_mille.min(250));
+    let jitter_ms = base_ms.saturating_mul(capped_jitter) / 1000;
+    Duration::from_millis(
+        base_ms
+            .saturating_add(jitter_ms)
+            .clamp(RECONNECT_BACKOFF_MIN_MS, RECONNECT_BACKOFF_MAX_MS),
+    )
+}
+
+/// Computes the next bounded reconnect delay using OS CSPRNG jitter.
+pub fn next_reconnect_backoff(attempt: u32) -> Duration {
+    use rand::{TryRngCore, rngs::OsRng};
+    let mut raw = [0u8; 2];
+    let jitter_per_mille = if OsRng.try_fill_bytes(&mut raw).is_ok() {
+        u16::from_le_bytes(raw) % 251
+    } else {
+        0
+    };
+    reconnect_backoff_duration(attempt, jitter_per_mille)
+}
+
+fn csprng_warmup_jitter_ms() -> u64 {
+    use rand::{TryRngCore, rngs::OsRng};
+    let mut raw = [0u8; 2];
+    if OsRng.try_fill_bytes(&mut raw).is_ok() {
+        u64::from(u16::from_le_bytes(raw) % 200)
+    } else {
+        0
+    }
+}
+
+pub async fn retry_cold_attach_challenge<T, Op, OpFut, Sleep, SleepFut>(
+    max_retries: usize,
+    mut op: Op,
+    mut sleep_fn: Sleep,
+) -> Result<T, Error>
+where
+    Op: FnMut(usize) -> OpFut,
+    OpFut: std::future::Future<Output = Result<T, Error>>,
+    Sleep: FnMut(Duration) -> SleepFut,
+    SleepFut: std::future::Future<Output = ()>,
+{
+    let bounded_retries = max_retries.min(ATTACH_CHALLENGE_MAX_RETRIES);
+    let mut attempt = 0usize;
+    loop {
+        match op(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if attempt >= bounded_retries || !is_retryable_attach_challenge_error(&error) {
+                    return Err(error);
+                }
+                let base_ms = ATTACH_WARMUP_BACKOFF_MS
+                    .get(attempt)
+                    .copied()
+                    .unwrap_or(1500);
+                let delay =
+                    Duration::from_millis(base_ms.saturating_add(csprng_warmup_jitter_ms()));
+                tracing::info!(
+                    room_phase = "attach_challenge_cold_retry",
+                    attempt = attempt + 1,
+                    backoff_ms = delay.as_millis() as u64
+                );
+                sleep_fn(delay).await;
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -537,7 +668,7 @@ impl RoomClient {
         addresses: Vec<SocketAddr>,
         book: MemoryLookup,
     ) -> Result<RoomSession, Error> {
-        self.open_inner(identity, other, addresses, book, None)
+        self.open_inner(identity, other, addresses, book, None, false)
             .await
     }
 
@@ -566,7 +697,39 @@ impl RoomClient {
             self.base.as_str(),
         )?;
         let other = gate.configuration().peer_endpoint_id();
-        self.open_inner(identity, other, addresses, book, Some(owner))
+        self.open_inner(identity, other, addresses, book, Some(owner), false)
+            .await
+    }
+
+    /// Reconnect an already-started ordinary-daemon gate after a clean room
+    /// WebSocket closure (`code 1000` / DO hibernation / transient EOF) without
+    /// permanently revoking the gate if a reconnect attempt itself hits a
+    /// transient timeout/network error. Explicit coordinator/auth/signature
+    /// refusals fail closed and revoke the gate immediately.
+    pub async fn reconnect_daemon(
+        &self,
+        identity: &DaemonRoomIdentity,
+        endpoint: &iroh::Endpoint,
+        gate: DaemonPeerGate,
+        addresses: Vec<SocketAddr>,
+        book: MemoryLookup,
+    ) -> Result<RoomSession, Error> {
+        if !bool::from(
+            identity
+                .endpoint_id()
+                .as_bytes()
+                .ct_eq(endpoint.id().as_bytes()),
+        ) {
+            return Err(BindingError::Endpoint.into());
+        }
+        let owner = gate.reopen_owner(
+            endpoint.id(),
+            self.coordinator,
+            &self.policy,
+            self.base.as_str(),
+        )?;
+        let other = gate.configuration().peer_endpoint_id();
+        self.open_inner(identity, other, addresses, book, Some(owner), true)
             .await
     }
 
@@ -579,9 +742,13 @@ impl RoomClient {
         session: &mut RoomSession,
     ) -> Result<(), Error> {
         let result = self.renew_daemon_presence_inner(identity, session).await;
-        if result.is_err() {
-            // Unknown storage/receipt outcomes fail closed, with no nonce replay.
-            session.close().await;
+        if let Err(ref error) = result {
+            if matches!(error, Error::DaemonBinding(BindingError::Expired)) {
+                session.close_for_reconnect().await;
+            } else {
+                // Unknown storage/receipt outcomes fail closed, with no nonce replay.
+                session.close().await;
+            }
         }
         result
     }
@@ -670,7 +837,8 @@ impl RoomClient {
         other: EndpointId,
         addresses: Vec<SocketAddr>,
         book: MemoryLookup,
-        daemon_owner: Option<DaemonRoomOwner>,
+        mut daemon_owner: Option<DaemonRoomOwner>,
+        preserve_gate_on_transient_failure: bool,
     ) -> Result<RoomSession, Error> {
         if other == identity.endpoint_id()
             || self.coordinator == identity.endpoint_id()
@@ -678,37 +846,57 @@ impl RoomClient {
         {
             return Err(Error::Malformed);
         }
-        let (attach, attach_ray) = self
-            .challenge(identity.endpoint_id(), "attach", None)
+        let pre_session = async {
+            let (attach, attach_ray) = retry_cold_attach_challenge(
+                ATTACH_CHALLENGE_MAX_RETRIES,
+                |_| self.challenge(identity.endpoint_id(), "attach", None),
+                tokio::time::sleep,
+            )
             .await
             .map_err(|error| startup_http_phase("attach_challenge_http", error))?;
-        tracing::info!(room_phase = "attach_challenge_verified");
-        let mut ws_url = self.base.join("/room/genesis/ws").map_err(|_| Error::Url)?;
-        ws_url.set_scheme("wss").map_err(|_| Error::Url)?;
-        let mut builder = ClientBuilder::new()
-            .connector(&self.websocket_tls)
-            .uri(ws_url.as_str())
-            .map_err(|_| Error::Url)?
-            .limits(Limits::default().max_payload_len(Some(LIMIT)))
-            .add_header(
-                http::header::USER_AGENT,
-                http::HeaderValue::from_static(USER_AGENT),
-            )
-            .map_err(|_| Error::Malformed)?;
-        for (name, value) in room_wire::auth_headers(identity, &attach)? {
-            builder = builder
+            tracing::info!(room_phase = "attach_challenge_verified");
+            let mut ws_url = self.base.join("/room/genesis/ws").map_err(|_| Error::Url)?;
+            ws_url.set_scheme("wss").map_err(|_| Error::Url)?;
+            let mut builder = ClientBuilder::new()
+                .connector(&self.websocket_tls)
+                .uri(ws_url.as_str())
+                .map_err(|_| Error::Url)?
+                .limits(Limits::default().max_payload_len(Some(LIMIT)))
                 .add_header(
-                    http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::Malformed)?,
-                    http::HeaderValue::from_str(&value).map_err(|_| Error::Malformed)?,
+                    http::header::USER_AGENT,
+                    http::HeaderValue::from_static(USER_AGENT),
                 )
                 .map_err(|_| Error::Malformed)?;
+            for (name, value) in room_wire::auth_headers(identity, &attach)? {
+                builder = builder
+                    .add_header(
+                        http::HeaderName::from_bytes(name.as_bytes())
+                            .map_err(|_| Error::Malformed)?,
+                        http::HeaderValue::from_str(&value).map_err(|_| Error::Malformed)?,
+                    )
+                    .map_err(|_| Error::Malformed)?;
+            }
+            let (socket, response) = timeout(REQUEST_TIMEOUT, builder.connect())
+                .await
+                .map_err(|_| Error::PhaseTimeout("websocket_upgrade"))?
+                .map_err(websocket_error)?;
+            let websocket_ray = ray(response.headers())?;
+            tracing::info!(room_phase = "websocket_open");
+            Ok::<_, Error>((attach, attach_ray, socket, websocket_ray))
         }
-        let (socket, response) = timeout(REQUEST_TIMEOUT, builder.connect())
-            .await
-            .map_err(|_| Error::PhaseTimeout("websocket_upgrade"))?
-            .map_err(websocket_error)?;
-        let websocket_ray = ray(response.headers())?;
-        tracing::info!(room_phase = "websocket_open");
+        .await;
+        let (attach, attach_ray, socket, websocket_ray) = match pre_session {
+            Ok(tuple) => tuple,
+            Err(error) => {
+                if preserve_gate_on_transient_failure
+                    && is_reconnectable_room_error(&error)
+                    && let Some(owner) = daemon_owner.as_mut()
+                {
+                    let _ = owner.suspend_for_reconnect();
+                }
+                return Err(error);
+            }
+        };
         let policy = Arc::clone(&self.policy);
         let mut session = RoomSession {
             socket,
@@ -781,7 +969,11 @@ impl RoomClient {
                 Ok(session)
             }
             Err(error) => {
-                session.close().await;
+                if preserve_gate_on_transient_failure && is_reconnectable_room_error(&error) {
+                    session.close_for_reconnect().await;
+                } else {
+                    session.close().await;
+                }
                 Err(error)
             }
         }
@@ -920,6 +1112,11 @@ impl RoomSession {
         {
             Ok(wait) => wait,
             Err(error) => {
+                if error == BindingError::Expired
+                    && let Some(owner) = self.daemon_owner.as_mut()
+                {
+                    let _ = owner.suspend_for_reconnect();
+                }
                 drop(self.daemon_owner.take());
                 return Err(error.into());
             }
@@ -928,7 +1125,13 @@ impl RoomSession {
             Ok(()) => self.verified_daemon_peer(),
             Err(error) => Err(error),
         };
-        if result.is_err() {
+        if let Err(ref error) = result {
+            if (is_reconnectable_room_error(error)
+                || matches!(error, Error::DaemonBinding(BindingError::Expired)))
+                && let Some(owner) = self.daemon_owner.as_mut()
+            {
+                let _ = owner.suspend_for_reconnect();
+            }
             drop(self.daemon_owner.take());
         }
         result
@@ -961,6 +1164,16 @@ impl RoomSession {
     }
     pub async fn close(&mut self) {
         drop(self.daemon_owner.take());
+        self.proof = None;
+        self.attached_session_id = None;
+        self.peer_expiry = None;
+        self.book.remove_endpoint_info(self.other);
+        let _ = timeout(Duration::from_secs(2), self.socket.close()).await;
+    }
+    pub async fn close_for_reconnect(&mut self) {
+        if let Some(mut owner) = self.daemon_owner.take() {
+            let _ = owner.suspend_for_reconnect();
+        }
         self.proof = None;
         self.attached_session_id = None;
         self.peer_expiry = None;
@@ -1159,6 +1372,137 @@ mod tests {
             .is_err()
         );
         assert!(parse::<ServerMessage>(br#"{"kind":"ping","payload":""}"#).is_err());
+    }
+
+    #[test]
+    fn reconnect_classification_distinguishes_clean_ws_closure_from_auth_and_pin_refusals() {
+        for transient in [
+            Error::WebSocketClosed(1000),
+            Error::WebSocketClosed(1001),
+            Error::WebSocketClosed(1006),
+            Error::WebSocket("peer_close_without_status"),
+            Error::WebSocket("connection_reset"),
+            Error::WebSocket("unexpected_eof"),
+            Error::Network,
+            Error::PhaseTimeout("attach_challenge_http"),
+            Error::PhaseTimeout("peer_advertisement"),
+        ] {
+            assert!(
+                is_reconnectable_room_error(&transient),
+                "expected transient reconnect classification for {transient}"
+            );
+        }
+        for terminal in [
+            Error::Refused(401),
+            Error::Refused(403),
+            Error::Upgrade(401),
+            Error::Upgrade(403),
+            Error::WebSocketClosed(4003),
+            Error::WebSocket("tls"),
+            Error::WebSocket("frame_protocol"),
+            Error::Replay,
+            Error::Malformed,
+            Error::MissingRay,
+            Error::DaemonBinding(BindingError::Revoked),
+            Error::DaemonBinding(BindingError::Replay),
+        ] {
+            assert!(
+                !is_reconnectable_room_error(&terminal),
+                "expected fail-closed non-reconnectable classification for {terminal}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_backoff_scales_from_250ms_and_caps_at_30s() {
+        assert_eq!(reconnect_backoff_duration(0, 0), Duration::from_millis(250));
+        assert_eq!(
+            reconnect_backoff_duration(0, 200),
+            Duration::from_millis(300)
+        );
+        assert_eq!(reconnect_backoff_duration(1, 0), Duration::from_millis(500));
+        assert_eq!(
+            reconnect_backoff_duration(2, 0),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(reconnect_backoff_duration(7, 250), Duration::from_secs(30));
+        assert_eq!(
+            reconnect_backoff_duration(u32::MAX, u16::MAX),
+            Duration::from_secs(30)
+        );
+        let live = next_reconnect_backoff(0);
+        assert!(live >= Duration::from_millis(250) && live <= Duration::from_millis(313));
+    }
+
+    #[tokio::test]
+    async fn cold_attach_challenge_retries_timeouts_with_warmup_but_never_retries_refusals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 2 cold timeouts followed by warm success on attempt 2 (total 3 calls).
+        let calls = AtomicUsize::new(0);
+        let sleeps = AtomicUsize::new(0);
+        let ok = retry_cold_attach_challenge(
+            ATTACH_CHALLENGE_MAX_RETRIES,
+            |_| {
+                let idx = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if idx < 2 {
+                        Err(Error::HttpResponse {
+                            phase: "challenge_response_headers",
+                            category: "timeout",
+                            elapsed_ms: 5002,
+                        })
+                    } else {
+                        Ok(42u8)
+                    }
+                }
+            },
+            |_| {
+                sleeps.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(sleeps.load(Ordering::SeqCst), 2);
+
+        // Exhausting all retries returns the timeout error cleanly.
+        let exhausted_calls = AtomicUsize::new(0);
+        let exhausted = retry_cold_attach_challenge(
+            ATTACH_CHALLENGE_MAX_RETRIES,
+            |_| {
+                exhausted_calls.fetch_add(1, Ordering::SeqCst);
+                async { Err::<u8, _>(Error::PhaseTimeout("attach_challenge_http")) }
+            },
+            |_| async {},
+        )
+        .await;
+        assert!(matches!(
+            exhausted,
+            Err(Error::PhaseTimeout("attach_challenge_http"))
+        ));
+        assert_eq!(exhausted_calls.load(Ordering::SeqCst), 3);
+
+        // Explicit 403 coordinator refusal fails closed on first attempt with zero retries.
+        let refusal_calls = AtomicUsize::new(0);
+        let refusal_sleeps = AtomicUsize::new(0);
+        let refused = retry_cold_attach_challenge(
+            ATTACH_CHALLENGE_MAX_RETRIES,
+            |_| {
+                refusal_calls.fetch_add(1, Ordering::SeqCst);
+                async { Err::<u8, _>(Error::Refused(403)) }
+            },
+            |_| {
+                refusal_sleeps.fetch_add(1, Ordering::SeqCst);
+                async {}
+            },
+        )
+        .await;
+        assert!(matches!(refused, Err(Error::Refused(403))));
+        assert_eq!(refusal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(refusal_sleeps.load(Ordering::SeqCst), 0);
     }
 }
 

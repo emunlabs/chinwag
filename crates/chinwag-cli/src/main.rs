@@ -101,6 +101,14 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(code);
         }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("release") {
+            let code = bus_run::run_release_cli(
+                &raw_args[2..],
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            );
+            return ExitCode::from(code);
+        }
         if raw_args.get(1).map(|s| s.as_str()) == Some("history") {
             return ExitCode::from(chinwag_history_archive::run_cli(
                 &raw_args[2..],
