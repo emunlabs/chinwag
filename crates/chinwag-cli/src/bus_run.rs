@@ -1288,12 +1288,236 @@ type RoomOwnerFuture<'a> =
 
 enum DaemonOutcome {
     Exit(u8),
-    Reexec(PathBuf),
+    Reexec {
+        install_path: PathBuf,
+        expected_sha256: [u8; 32],
+    },
 }
 
 enum ReleaseDaemonJob {
     StartupCatchup,
     LiveMessage(Box<BusMessage>),
+}
+
+enum ReleaseWorkerEvent {
+    CatchupOpened {
+        present_binaries: Vec<String>,
+    },
+    BinaryResult {
+        binary: String,
+        release_key: Option<String>,
+        outcome: Result<
+            Box<chinwag_cli::release_sync::ReleaseApplyOutcome>,
+            chinwag_cli::release_sync::ReleaseSyncError,
+        >,
+    },
+    CatchupFailed(chinwag_cli::release_sync::ReleaseSyncError),
+}
+
+const MAX_RELEASE_SYNC_TRANSIENT_RETRIES: u32 = 12;
+const PENDING_REEXEC_MAX_DRAIN_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PerBinaryRetryState {
+    release_key: Option<String>,
+    attempts: u32,
+    next_due_at: Option<Instant>,
+    in_flight: bool,
+}
+
+#[derive(Debug, Default)]
+struct ReleaseRetryScheduler {
+    per_binary: std::collections::BTreeMap<String, PerBinaryRetryState>,
+    overflow_reconcile_pending: bool,
+}
+
+impl ReleaseRetryScheduler {
+    fn backoff_for_attempt(attempt: u32) -> Duration {
+        let secs = 10u64.saturating_mul(1u64 << attempt.min(5)).min(300);
+        Duration::from_secs(secs)
+    }
+
+    fn mark_queue_overflow(&mut self) {
+        self.overflow_reconcile_pending = true;
+    }
+
+    fn on_catchup_opened(&mut self, present_binaries: &[String]) {
+        self.per_binary.remove("all");
+        self.per_binary.remove("worker");
+        self.per_binary.retain(|binary, state| {
+            if state.in_flight && !present_binaries.iter().any(|b| b == binary) {
+                return false;
+            }
+            true
+        });
+    }
+
+    fn on_succeeded(&mut self, binary: &str) {
+        self.per_binary.remove(binary);
+    }
+
+    fn on_failed(
+        &mut self,
+        binary: &str,
+        release_key: Option<&str>,
+        retryable: bool,
+        now: Instant,
+    ) -> Option<Duration> {
+        if binary == "unknown" || (release_key.is_none() && !retryable) {
+            return None;
+        }
+        if !retryable {
+            if let Some(entry) = self.per_binary.get_mut(binary)
+                && (release_key.is_none() || entry.release_key.as_deref() == release_key)
+            {
+                entry.in_flight = false;
+                entry.next_due_at = None;
+            }
+            return None;
+        }
+        let entry = self.per_binary.entry(binary.to_owned()).or_default();
+        if let Some(new_key) = release_key
+            && entry.release_key.as_deref() != Some(new_key)
+        {
+            entry.release_key = Some(new_key.to_owned());
+            entry.attempts = 0;
+        }
+        entry.in_flight = false;
+        if entry.attempts >= MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
+            entry.next_due_at = None;
+            return None;
+        }
+        let delay = Self::backoff_for_attempt(entry.attempts);
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.next_due_at = Some(now + delay);
+        Some(delay)
+    }
+
+    fn on_catchup_failed(&mut self, retryable: bool, now: Instant) -> Option<Duration> {
+        let in_flight_keys: Vec<(String, Option<String>)> = self
+            .per_binary
+            .iter()
+            .filter(|(_, st)| st.in_flight)
+            .map(|(k, st)| (k.clone(), st.release_key.clone()))
+            .collect();
+        if in_flight_keys.is_empty() {
+            return self.on_failed("all", None, retryable, now);
+        }
+        let mut earliest: Option<Duration> = None;
+        for (binary, key) in in_flight_keys {
+            if let Some(delay) = self.on_failed(&binary, key.as_deref(), retryable, now) {
+                earliest = Some(earliest.map_or(delay, |prev| prev.min(delay)));
+            }
+        }
+        earliest
+    }
+
+    fn should_dispatch_catchup(&self, now: Instant) -> bool {
+        if self.overflow_reconcile_pending {
+            return true;
+        }
+        self.per_binary
+            .values()
+            .any(|st| !st.in_flight && st.next_due_at.is_some_and(|due| now >= due))
+    }
+
+    fn mark_catchup_dispatched(&mut self, now: Instant) {
+        self.overflow_reconcile_pending = false;
+        for st in self.per_binary.values_mut() {
+            if !st.in_flight && st.next_due_at.is_some_and(|due| now >= due) {
+                st.in_flight = true;
+                st.next_due_at = None;
+            }
+        }
+    }
+}
+
+fn should_complete_pending_reexec(
+    forwards_empty: bool,
+    forward_queue_empty: bool,
+    armed_elapsed: Duration,
+) -> bool {
+    (forwards_empty && forward_queue_empty) || armed_elapsed >= PENDING_REEXEC_MAX_DRAIN_WAIT
+}
+
+fn build_canonical_daemon_reexec_args(
+    bus_args: &[String],
+    canonical_repo_root: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = vec![
+        std::ffi::OsString::from("bus"),
+        std::ffi::OsString::from("daemon"),
+        std::ffi::OsString::from("--repo"),
+        canonical_repo_root.as_os_str().to_os_string(),
+    ];
+    let mut idx = 1;
+    while idx < bus_args.len() {
+        if bus_args[idx] == "--repo" {
+            idx += 2;
+            continue;
+        }
+        out.push(std::ffi::OsString::from(&bus_args[idx]));
+        idx += 1;
+    }
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectLoopOutcome<S> {
+    Reconnected { session: S, next_attempt: u32 },
+    Exhausted { attempts: u32, last_reason: String },
+    FatalRefusal(String),
+}
+
+async fn attempt_room_reconnect_with_cap<S, F, Fut, B, SleepFn, SleepFut>(
+    mut reconnect_attempt: u32,
+    initial_reason: String,
+    room_events: &tokio::sync::mpsc::Sender<Value>,
+    mut backoff_fn: B,
+    mut sleep_fn: SleepFn,
+    mut try_reconnect: F,
+) -> ReconnectLoopOutcome<S>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<S, chinwag_swarm::room::Error>>,
+    B: FnMut(u32) -> Duration,
+    SleepFn: FnMut(Duration) -> SleepFut,
+    SleepFut: std::future::Future<Output = ()>,
+{
+    let mut reason = initial_reason;
+    loop {
+        if reconnect_attempt >= chinwag_swarm::room::MAX_CONSECUTIVE_RECONNECT_ATTEMPTS {
+            return ReconnectLoopOutcome::Exhausted {
+                attempts: reconnect_attempt,
+                last_reason: reason,
+            };
+        }
+        let backoff = backoff_fn(reconnect_attempt);
+        let _ = room_events.try_send(json!({
+            "event": "native_room_reconnect_scheduled",
+            "attempt": reconnect_attempt.saturating_add(1),
+            "backoff_ms": backoff.as_millis() as u64,
+            "reason": reason,
+            "scope": "TRANSPORT_ONLY_NOT_TASK_AUTHORITY"
+        }));
+        sleep_fn(backoff).await;
+        match try_reconnect(reconnect_attempt).await {
+            Ok(new_session) => {
+                return ReconnectLoopOutcome::Reconnected {
+                    session: new_session,
+                    next_attempt: reconnect_attempt.saturating_add(1),
+                };
+            }
+            Err(error) => {
+                if chinwag_swarm::room::is_reconnectable_room_error(&error) {
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    reason = error.to_string();
+                } else {
+                    return ReconnectLoopOutcome::FatalRefusal(error.to_string());
+                }
+            }
+        }
+    }
 }
 
 // One persistent owner future: selecting another daemon event must not drop an
@@ -1378,48 +1602,45 @@ async fn drive_daemon_room(
             Err(_) => return RoomOwnerFailure::PresenceExpired,
         }
 
-        if let Some(mut reason) = disconnect_reason {
+        if let Some(reason) = disconnect_reason {
             session.close_for_reconnect().await;
             reconnecting = true;
-            loop {
-                if reconnect_attempt >= chinwag_swarm::room::MAX_CONSECUTIVE_RECONNECT_ATTEMPTS {
-                    session.close().await;
-                    return RoomOwnerFailure::ReceiveFailed(format!(
-                        "reconnect attempts exhausted after {reconnect_attempt} tries ({reason})"
-                    ));
-                }
-                let backoff = chinwag_swarm::room::next_reconnect_backoff(reconnect_attempt);
-                let _ = room_events.try_send(json!({
-                    "event": "native_room_reconnect_scheduled",
-                    "attempt": reconnect_attempt.saturating_add(1),
-                    "backoff_ms": backoff.as_millis() as u64,
-                    "reason": reason,
-                    "scope": "TRANSPORT_ONLY_NOT_TASK_AUTHORITY"
-                }));
-                tokio::time::sleep(backoff).await;
-                match client
-                    .reconnect_daemon(
+            match attempt_room_reconnect_with_cap(
+                reconnect_attempt,
+                reason,
+                &room_events,
+                chinwag_swarm::room::next_reconnect_backoff,
+                tokio::time::sleep,
+                |_| {
+                    client.reconnect_daemon(
                         identity,
                         endpoint,
                         gate.clone(),
                         addresses.clone(),
                         lookup.clone(),
                     )
-                    .await
-                {
-                    Ok(new_session) => {
-                        *session = new_session;
-                        reconnect_attempt = reconnect_attempt.saturating_add(1);
-                        break;
-                    }
-                    Err(error) => {
-                        if chinwag_swarm::room::is_reconnectable_room_error(&error) {
-                            reconnect_attempt = reconnect_attempt.saturating_add(1);
-                            reason = error.to_string();
-                        } else {
-                            return RoomOwnerFailure::ReceiveFailed(error.to_string());
-                        }
-                    }
+                },
+            )
+            .await
+            {
+                ReconnectLoopOutcome::Reconnected {
+                    session: new_session,
+                    next_attempt,
+                } => {
+                    *session = new_session;
+                    reconnect_attempt = next_attempt;
+                }
+                ReconnectLoopOutcome::Exhausted {
+                    attempts,
+                    last_reason,
+                } => {
+                    session.close().await;
+                    return RoomOwnerFailure::ReceiveFailed(format!(
+                        "reconnect attempts exhausted after {attempts} tries ({last_reason})"
+                    ));
+                }
+                ReconnectLoopOutcome::FatalRefusal(err) => {
+                    return RoomOwnerFailure::ReceiveFailed(err);
                 }
             }
         }
@@ -1469,7 +1690,7 @@ async fn run_daemon_loop_inner(
     .await
     {
         DaemonOutcome::Exit(code) => code,
-        DaemonOutcome::Reexec(_) => 0,
+        DaemonOutcome::Reexec { .. } => 0,
     }
 }
 
@@ -1720,26 +1941,19 @@ async fn run_daemon_loop_reexecable(
     let mut forwarding_original = None;
     let (state_error_tx, mut state_error_rx) = tokio::sync::mpsc::channel::<()>(1);
     let mut exit_code = 0;
-    let mut reexec_target: Option<PathBuf> = None;
-    let mut pending_reexec: Option<(PathBuf, Instant)> = None;
+    let mut reexec_target: Option<(PathBuf, [u8; 32])> = None;
+    let mut pending_reexec: Option<(PathBuf, [u8; 32], Instant)> = None;
     let reexec_sleep = tokio::time::sleep(Duration::from_secs(86_400));
     tokio::pin!(reexec_sleep);
     let startup_chinwag_sha256: Option<[u8; 32]> = std::env::current_exe()
         .ok()
         .and_then(|exe| chinwag_cli::release_sync::local_binary_sha256(&exe));
 
-    const MAX_RELEASE_SYNC_TRANSIENT_RETRIES: u32 = 12;
     let release_reconcile_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let release_new_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut release_retry_attempts: u32 = 0;
-    let mut next_release_retry_at: Option<Instant> = None;
+    let mut retry_scheduler = ReleaseRetryScheduler::default();
 
-    let (release_done_tx, mut release_done_rx) = tokio::sync::mpsc::channel::<
-        Result<
-            (String, chinwag_cli::release_sync::ReleaseApplyOutcome),
-            (String, chinwag_cli::release_sync::ReleaseSyncError),
-        >,
-    >(16);
+    let (release_done_tx, mut release_done_rx) =
+        tokio::sync::mpsc::channel::<ReleaseWorkerEvent>(32);
     let release_job_tx = if !no_governors && controlled_local_driver.is_none() {
         let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(32);
         let _ = job_tx.try_send(ReleaseDaemonJob::StartupCatchup);
@@ -1750,60 +1964,80 @@ async fn run_daemon_loop_reexecable(
             let Ok(home_dir) = chinwag_cli::release_sync::resolve_home_dir() else {
                 return;
             };
+            chinwag_cli::release_sync::cleanup_stale_reexec_dirs(&home_dir);
             while let Some(job) = job_rx.recv().await {
                 let home_clone = home_dir.clone();
                 let journal_clone = journal_for_worker.clone();
                 let ep_clone = ep_for_worker.clone();
-                let outcomes = tokio::task::spawn_blocking(move || {
+                let events = tokio::task::spawn_blocking(move || {
                     let store =
                         chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_clone.clone());
                     match job {
-                        ReleaseDaemonJob::StartupCatchup => {
-                            chinwag_cli::release_sync::sync_releases_from_journal_and_r2_per_binary(
-                                &home_clone,
-                                &journal_clone,
-                                &store,
-                                true,
-                                Some(&ep_clone),
-                            )
-                        }
+                        ReleaseDaemonJob::StartupCatchup => match chinwag_cli::release_sync::sync_releases_from_journal_per_binary(
+                            &home_clone,
+                            &journal_clone,
+                            &store,
+                            Some(&ep_clone),
+                        ) {
+                            Ok(reports) => {
+                                let present_binaries: Vec<String> =
+                                    reports.iter().map(|r| r.binary.clone()).collect();
+                                let mut out =
+                                    vec![ReleaseWorkerEvent::CatchupOpened { present_binaries }];
+                                for report in reports {
+                                    out.push(ReleaseWorkerEvent::BinaryResult {
+                                        binary: report.binary,
+                                        release_key: Some(report.release_key),
+                                        outcome: report.outcome.map(Box::new),
+                                    });
+                                }
+                                out
+                            }
+                            Err(err) => vec![ReleaseWorkerEvent::CatchupFailed(err)],
+                        },
                         ReleaseDaemonJob::LiveMessage(msg) => {
-                            let binary =
-                                chinwag_cli::release_sync::verify_release_built_message(&msg)
-                                    .map(|m| m.binary)
-                                    .unwrap_or_else(|_| "unknown".to_owned());
-                            let res = chinwag_cli::release_sync::apply_release_built_message(
+                            let verified =
+                                chinwag_cli::release_sync::verify_release_built_message(&msg).ok();
+                            let binary = verified
+                                .as_ref()
+                                .map(|m| m.binary.clone())
+                                .unwrap_or_else(|| "unknown".to_owned());
+                            let release_key = verified.as_ref().map(
+                                chinwag_cli::release_sync::InstalledBinaryState::release_history_key,
+                            );
+                            let outcome = chinwag_cli::release_sync::apply_release_built_message(
                                 &home_clone,
                                 &store,
                                 &msg,
                                 Some(&ep_clone),
-                            );
-                            Ok(vec![(binary, res)])
+                            )
+                            .map(Box::new);
+                            vec![ReleaseWorkerEvent::BinaryResult {
+                                binary,
+                                release_key,
+                                outcome,
+                            }]
                         }
                     }
                 })
                 .await;
-                match outcomes {
-                    Ok(Ok(items)) => {
-                        for (binary, res) in items {
-                            let event = match res {
-                                Ok(outcome) => Ok((binary, outcome)),
-                                Err(err) => Err((binary, err)),
-                            };
+                match events {
+                    Ok(items) => {
+                        for event in items {
                             let _ = done_tx.send(event).await;
                         }
                     }
-                    Ok(Err(err)) => {
-                        let _ = done_tx.send(Err(("all".to_owned(), err))).await;
-                    }
                     Err(_) => {
                         let _ = done_tx
-                            .send(Err((
-                                "worker".to_owned(),
-                                chinwag_cli::release_sync::ReleaseSyncError::InstallFailed(
-                                    "release sync worker panicked".to_owned(),
+                            .send(ReleaseWorkerEvent::BinaryResult {
+                                binary: "worker".to_owned(),
+                                release_key: None,
+                                outcome: Err(
+                                    chinwag_cli::release_sync::ReleaseSyncError::InstallFailed(
+                                        "release sync worker panicked".to_owned(),
+                                    ),
                                 ),
-                            )))
+                            })
                             .await;
                     }
                 }
@@ -1869,11 +2103,33 @@ async fn run_daemon_loop_reexecable(
             }
             Some(release_event) = release_done_rx.recv() => {
                 match release_event {
-                    Ok((binary, outcome)) => {
-                        if next_release_retry_at.is_none() {
-                            release_retry_attempts = 0;
-                        }
-                        match outcome {
+                    ReleaseWorkerEvent::CatchupOpened { present_binaries } => {
+                        retry_scheduler.on_catchup_opened(&present_binaries);
+                    }
+                    ReleaseWorkerEvent::CatchupFailed(err) => {
+                        let retryable = err.is_transient_retryable();
+                        let next_delay =
+                            retry_scheduler.on_catchup_failed(retryable, Instant::now());
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            json!({
+                                "event": "native_release_sync_rejected",
+                                "binary": "all",
+                                "reason": err.to_string(),
+                                "retryable": retryable,
+                                "next_retry_secs": next_delay.map(|d| d.as_secs())
+                            })
+                        );
+                        let _ = stdout.flush();
+                    }
+                    ReleaseWorkerEvent::BinaryResult {
+                        binary,
+                        release_key: _,
+                        outcome: Ok(outcome),
+                    } => {
+                        retry_scheduler.on_succeeded(&binary);
+                        match *outcome {
                             chinwag_cli::release_sync::ReleaseApplyOutcome::Installed {
                                 manifest,
                                 install_path,
@@ -1906,9 +2162,13 @@ async fn run_daemon_loop_reexecable(
                                         let _ = write_daemon_state(&repo_root, &guard);
                                     }
                                 }
-                                let manifest_sha = chinwag_cli::release_sync::decode_lowercase_hex_32(&manifest.sha256);
-                                if manifest.binary == "chinwag" && manifest_sha != startup_chinwag_sha256 {
-                                    pending_reexec = Some((install_path, Instant::now()));
+                                if let Some(manifest_sha) =
+                                    chinwag_cli::release_sync::decode_lowercase_hex_32(&manifest.sha256)
+                                    && manifest.binary == "chinwag"
+                                    && Some(manifest_sha) != startup_chinwag_sha256
+                                {
+                                    pending_reexec =
+                                        Some((install_path, manifest_sha, Instant::now()));
                                     reexec_sleep
                                         .as_mut()
                                         .reset(tokio::time::Instant::now() + Duration::from_millis(350));
@@ -1921,6 +2181,7 @@ async fn run_daemon_loop_reexecable(
                                 let manifest_sha = chinwag_cli::release_sync::decode_lowercase_hex_32(&manifest.sha256);
                                 let needs_reexec = manifest.binary == "chinwag"
                                     && startup_chinwag_sha256.is_some()
+                                    && manifest_sha.is_some()
                                     && manifest_sha != startup_chinwag_sha256;
                                 let _ = writeln!(
                                     stdout,
@@ -1934,7 +2195,9 @@ async fn run_daemon_loop_reexecable(
                                     })
                                 );
                                 let _ = stdout.flush();
-                                if needs_reexec {
+                                if let Some(manifest_sha) = manifest_sha
+                                    && needs_reexec
+                                {
                                     if let Ok(home_dir) = chinwag_cli::release_sync::resolve_home_dir()
                                         && let Some(mut receipt) = chinwag_cli::release_sync::build_release_installed_receipt_for_already_installed(
                                             &home_dir,
@@ -1953,7 +2216,8 @@ async fn run_daemon_loop_reexecable(
                                             let _ = write_daemon_state(&repo_root, &guard);
                                         }
                                     }
-                                    pending_reexec = Some((install_path, Instant::now()));
+                                    pending_reexec =
+                                        Some((install_path, manifest_sha, Instant::now()));
                                     reexec_sleep
                                         .as_mut()
                                         .reset(tokio::time::Instant::now() + Duration::from_millis(350));
@@ -1977,11 +2241,18 @@ async fn run_daemon_loop_reexecable(
                             }
                         }
                     }
-                    Err((binary, err)) => {
-                        if release_new_signal.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                            release_retry_attempts = 0;
-                        }
+                    ReleaseWorkerEvent::BinaryResult {
+                        binary,
+                        release_key,
+                        outcome: Err(err),
+                    } => {
                         let retryable = err.is_transient_retryable();
+                        let next_delay = retry_scheduler.on_failed(
+                            &binary,
+                            release_key.as_deref(),
+                            retryable,
+                            Instant::now(),
+                        );
                         let _ = writeln!(
                             stdout,
                             "{}",
@@ -1989,26 +2260,22 @@ async fn run_daemon_loop_reexecable(
                                 "event": "native_release_sync_rejected",
                                 "binary": binary,
                                 "reason": err.to_string(),
-                                "retryable": retryable
+                                "retryable": retryable,
+                                "next_retry_secs": next_delay.map(|d| d.as_secs())
                             })
                         );
                         let _ = stdout.flush();
-                        if retryable && release_retry_attempts < MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
-                            let delay_secs = 10u64
-                                .saturating_mul(1u64 << release_retry_attempts.min(5))
-                                .min(300);
-                            release_retry_attempts = release_retry_attempts.saturating_add(1);
-                            next_release_retry_at =
-                                Some(Instant::now() + Duration::from_secs(delay_secs));
-                        }
                     }
                 }
             }
             () = &mut reexec_sleep, if pending_reexec.is_some() => {
-                if let Some((_, armed_at)) = &pending_reexec {
-                    let drained = forwards.is_empty() && forward_rx.is_empty();
-                    if drained || armed_at.elapsed() >= Duration::from_secs(5) {
-                        if let Some((target_path, _)) = pending_reexec.take() {
+                if let Some((_, _, armed_at)) = &pending_reexec {
+                    if should_complete_pending_reexec(
+                        forwards.is_empty(),
+                        forward_rx.is_empty(),
+                        armed_at.elapsed(),
+                    ) {
+                        if let Some((target_path, expected_sha256, _)) = pending_reexec.take() {
                             let _ = writeln!(
                                 stdout,
                                 "{}",
@@ -2018,7 +2285,7 @@ async fn run_daemon_loop_reexecable(
                                 })
                             );
                             let _ = stdout.flush();
-                            reexec_target = Some(target_path);
+                            reexec_target = Some((target_path, expected_sha256));
                             break;
                         }
                     } else {
@@ -2093,18 +2360,14 @@ async fn run_daemon_loop_reexecable(
                     break;
                 }
                 if let Some(job_tx) = &release_job_tx {
-                    if release_new_signal.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                        release_retry_attempts = 0;
+                    if release_reconcile_needed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        retry_scheduler.mark_queue_overflow();
                     }
-                    let retry_due = next_release_retry_at.is_some_and(|due| Instant::now() >= due);
-                    let overflow_due =
-                        release_reconcile_needed.swap(false, std::sync::atomic::Ordering::SeqCst);
-                    if retry_due || overflow_due {
-                        next_release_retry_at = None;
-                        if job_tx.try_send(ReleaseDaemonJob::StartupCatchup).is_err() {
-                            release_reconcile_needed
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
+                    let now = Instant::now();
+                    if retry_scheduler.should_dispatch_catchup(now)
+                        && job_tx.try_send(ReleaseDaemonJob::StartupCatchup).is_ok()
+                    {
+                        retry_scheduler.mark_catchup_dispatched(now);
                     }
                 }
             }
@@ -2138,7 +2401,6 @@ async fn run_daemon_loop_reexecable(
                 let receipts = receipts.clone();
                 let release_queue = release_job_tx.clone();
                 let release_reconcile = release_reconcile_needed.clone();
-                let release_signal = release_new_signal.clone();
                 handlers.spawn(async move {
                     let _slot = slot;
                     let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), incoming).await else {
@@ -2270,14 +2532,11 @@ async fn run_daemon_loop_reexecable(
                     if result.is_ok()
                         && chinwag_cli::release_sync::is_release_built_candidate(&message)
                         && let Some(queue) = &release_queue
-                    {
-                        release_signal.store(true, std::sync::atomic::Ordering::SeqCst);
-                        if queue
+                        && queue
                             .try_send(ReleaseDaemonJob::LiveMessage(Box::new(message.clone())))
                             .is_err()
-                        {
-                            release_reconcile.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
+                    {
+                        release_reconcile.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     let ack = match result {
                         Ok((seq, subscribers)) => BusAck { ok:true, seq, message_id:message.id.clone(), daemon_endpoint_id:daemon_ep,
@@ -2313,7 +2572,10 @@ async fn run_daemon_loop_reexecable(
     forwards.shutdown().await;
     drop(publications);
     match reexec_target {
-        Some(target) => DaemonOutcome::Reexec(target),
+        Some((install_path, expected_sha256)) => DaemonOutcome::Reexec {
+            install_path,
+            expected_sha256,
+        },
         None => DaemonOutcome::Exit(exit_code),
     }
 }
@@ -3327,7 +3589,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 return 1;
             };
             let outcome = rt.block_on(run_daemon_loop_reexecable(
-                repo_root,
+                repo_root.clone(),
                 port_arg,
                 network_selection,
                 no_governors,
@@ -3340,36 +3602,59 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             drop(rt);
             match outcome {
                 DaemonOutcome::Exit(code) => code,
-                DaemonOutcome::Reexec(exec_path) => {
+                DaemonOutcome::Reexec {
+                    install_path,
+                    expected_sha256,
+                } => {
                     use std::os::unix::process::CommandExt;
-                    let Ok(meta) = fs::symlink_metadata(&exec_path) else {
-                        let _ = writeln!(
-                            stderr,
-                            "chinwag bus daemon: re-exec refused (missing target {})",
-                            exec_path.display()
-                        );
-                        return 1;
+                    let home_dir = match chinwag_cli::release_sync::resolve_home_dir() {
+                        Ok(dir) => dir,
+                        Err(err) => {
+                            let _ = writeln!(stderr, "chinwag bus daemon: re-exec refused ({err})");
+                            return 1;
+                        }
                     };
-                    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-                        let _ = writeln!(
-                            stderr,
-                            "chinwag bus daemon: re-exec refused (non-regular target {})",
-                            exec_path.display()
+                    let prepared = match chinwag_cli::release_sync::prepare_immutable_reexec_binary(
+                        &home_dir,
+                        &install_path,
+                        &expected_sha256,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(err) => {
+                            let _ = writeln!(
+                                stderr,
+                                "chinwag bus daemon: re-exec refused for {}: {err}",
+                                install_path.display()
+                            );
+                            return 1;
+                        }
+                    };
+                    if let Err(err) = rustix::process::fchdir(&prepared.dir_fd) {
+                        let _ =
+                            writeln!(stderr, "chinwag bus daemon: re-exec fchdir refused: {err}");
+                        drop(prepared.dir_fd);
+                        chinwag_cli::release_sync::clear_and_remove_immutable_dir(
+                            &prepared.dir_path,
                         );
                         return 1;
                     }
+                    let reexec_args = build_canonical_daemon_reexec_args(args, &repo_root);
                     let _ = writeln!(
                         stdout,
-                        "chinwag bus daemon: re-executing updated binary at {}",
-                        exec_path.display()
+                        "chinwag bus daemon: re-executing pinned immutable binary {} (source {})",
+                        prepared.binary_path.display(),
+                        install_path.display()
                     );
                     let _ = stdout.flush();
                     let _ = stderr.flush();
-                    let err = Command::new(&exec_path)
+                    let err = Command::new("./chinwag")
                         .arg0("chinwag")
-                        .args(std::env::args_os().skip(1))
+                        .args(&reexec_args)
                         .exec();
                     let _ = writeln!(stderr, "chinwag bus daemon: re-exec failed: {err}");
+                    let _ = std::env::set_current_dir(&home_dir);
+                    drop(prepared.dir_fd);
+                    chinwag_cli::release_sync::clear_and_remove_immutable_dir(&prepared.dir_path);
                     1
                 }
             }
@@ -3791,12 +4076,12 @@ fn print_release_help(stdout: &mut dyn Write) -> u8 {
         stdout,
         r#"Usage:
   chinwag release publish --binary <chinwag|chinwag-ci> --source <PATH> [--repo <PATH>] [--from <INFRAJR#INSTANCE>] [--rollback] [--json]
-  chinwag release sync [--repo <PATH>] [--from-r2|--no-r2] [--json]
+  chinwag release sync [--repo <PATH>] [--json]
   chinwag release status [--json]
 
 Symmetric Bus Release Auto-Installer:
   publish  Verifies codesign & --version, hashes SHA-256 + BLAKE3, uploads content-addressed R2 blob, installs locally, and broadcasts signed RELEASE_BUILT on #all.
-  sync     Replays verified INFRAJR RELEASE_BUILT manifests from the local bus journal (and optionally R2) with pre-exec SHA-256 + BLAKE3 verification.
+  sync     Replays verified INFRAJR RELEASE_BUILT manifests from the local bus journal against content-addressed R2 blobs with pre-exec SHA-256 + BLAKE3 verification.
   status   Reports local ~/.local/bin/{{chinwag,chinwag-ci}} digests and ~/.chinwag/release_sync_state.json monotonic watermarks."#
     );
     0
@@ -3815,7 +4100,6 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
     let mut repo_arg: Option<String> = None;
     let mut from_arg: Option<String> = None;
     let mut rollback = false;
-    let mut check_r2 = true;
     let mut is_json = false;
 
     let mut i = 1;
@@ -3828,14 +4112,6 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
             }
             "--rollback" if sub == "publish" => {
                 rollback = true;
-                i += 1;
-            }
-            "--from-r2" if sub == "sync" => {
-                check_r2 = true;
-                i += 1;
-            }
-            "--no-r2" if sub == "sync" => {
-                check_r2 = false;
                 i += 1;
             }
             "--binary" if sub == "publish" => {
@@ -4044,18 +4320,18 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
                 });
             let store = chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_dir.clone());
             let journal_path = messages_jsonl_path(&repo_root);
-            match chinwag_cli::release_sync::sync_releases_from_journal_and_r2_per_binary(
+            match chinwag_cli::release_sync::sync_releases_from_journal_per_binary(
                 &home_dir,
                 &journal_path,
                 &store,
-                check_r2,
                 local_iroh.as_deref(),
             ) {
-                Ok(outcomes) => {
+                Ok(reports) => {
                     let mut rows = Vec::new();
                     let mut had_error = false;
-                    for (binary, res) in outcomes {
-                        match res {
+                    for report in reports {
+                        let binary = report.binary;
+                        match report.outcome {
                             Ok(chinwag_cli::release_sync::ReleaseApplyOutcome::Installed {
                                 manifest,
                                 install_path,
@@ -5124,6 +5400,8 @@ mod tests {
         for bad in [
             vec!["unknown-sub"],
             vec!["status", "--bogus"],
+            vec!["sync", "--from-r2"],
+            vec!["sync", "--no-r2"],
             vec!["publish", "--binary", "../evil", "--source", "/bin/echo"],
             vec!["publish", "--binary"],
         ] {
@@ -5134,6 +5412,197 @@ mod tests {
             assert!(out.is_empty());
             assert!(!err.is_empty());
         }
+    }
+
+    #[test]
+    fn per_binary_retry_scheduler_bounds_chinwag_ci_despite_chinwag_success() {
+        let mut sched = ReleaseRetryScheduler::default();
+        let mut now = Instant::now();
+        let expected_delays = [10u64, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300, 300];
+        let mut scheduled_delays = Vec::new();
+
+        for cycle in 0..20usize {
+            sched.on_catchup_opened(&["chinwag".to_owned(), "chinwag-ci".to_owned()]);
+            // Healthy `chinwag` succeeds (`AlreadyInstalled`) on every single catchup batch,
+            // AND unauthenticated `#all` noise arrives alongside it — neither may reset
+            // `chinwag-ci`'s exponential backoff or retry cap!
+            sched.on_succeeded("chinwag");
+            assert_eq!(sched.on_failed("unknown", None, false, now), None);
+
+            let delay = sched.on_failed("chinwag-ci", Some("sha-v1:100:1000:0"), true, now);
+            if cycle < MAX_RELEASE_SYNC_TRANSIENT_RETRIES as usize {
+                let d = delay.expect("expected scheduled retry within 12-attempt cap");
+                scheduled_delays.push(d.as_secs());
+                assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(1)));
+                now += d;
+                assert!(sched.should_dispatch_catchup(now));
+                sched.mark_catchup_dispatched(now);
+                // While in-flight, duplicate heartbeat ticks do not re-dispatch.
+                assert!(!sched.should_dispatch_catchup(now));
+            } else {
+                assert_eq!(delay, None, "must stop retrying after 12 attempts");
+                assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(3600)));
+            }
+        }
+        assert_eq!(scheduled_delays, expected_delays);
+
+        // Publishing a genuinely NEW `chinwag-ci` release (`sha-v2:...`) grants a fresh budget.
+        let fresh = sched.on_failed("chinwag-ci", Some("sha-v2:200:2000:0"), true, now);
+        assert_eq!(fresh, Some(Duration::from_secs(10)));
+        sched.on_succeeded("chinwag-ci");
+        assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn retry_scheduler_queue_overflow_persists_until_catchup_dispatched() {
+        let mut sched = ReleaseRetryScheduler::default();
+        let now = Instant::now();
+        assert!(!sched.should_dispatch_catchup(now));
+        sched.mark_queue_overflow();
+        assert!(sched.should_dispatch_catchup(now));
+        // If `job_tx.try_send` is still full on heartbeat 1, `mark_catchup_dispatched`
+        // is not called and `should_dispatch_catchup` remains true on heartbeat 2.
+        assert!(sched.should_dispatch_catchup(now + Duration::from_secs(10)));
+        sched.mark_catchup_dispatched(now + Duration::from_secs(10));
+        assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn pending_reexec_drain_predicate_and_canonical_reexec_args_preserve_repo() {
+        assert!(should_complete_pending_reexec(
+            true,
+            true,
+            Duration::from_millis(350)
+        ));
+        assert!(!should_complete_pending_reexec(
+            false,
+            true,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_complete_pending_reexec(
+            true,
+            false,
+            Duration::from_millis(4999)
+        ));
+        assert!(should_complete_pending_reexec(
+            false,
+            false,
+            Duration::from_secs(5)
+        ));
+
+        let canonical = Path::new("/tmp/canonical-chinwag-repo");
+        let args_relative = vec![
+            "daemon".to_owned(),
+            "--repo".to_owned(),
+            ".".to_owned(),
+            "--port".to_owned(),
+            "44100".to_owned(),
+        ];
+        assert_eq!(
+            build_canonical_daemon_reexec_args(&args_relative, canonical),
+            vec![
+                std::ffi::OsString::from("bus"),
+                std::ffi::OsString::from("daemon"),
+                std::ffi::OsString::from("--repo"),
+                std::ffi::OsString::from("/tmp/canonical-chinwag-repo"),
+                std::ffi::OsString::from("--port"),
+                std::ffi::OsString::from("44100"),
+            ]
+        );
+
+        let args_omitted = vec!["daemon".to_owned(), "--no-governors".to_owned()];
+        assert_eq!(
+            build_canonical_daemon_reexec_args(&args_omitted, canonical),
+            vec![
+                std::ffi::OsString::from("bus"),
+                std::ffi::OsString::from("daemon"),
+                std::ffi::OsString::from("--repo"),
+                std::ffi::OsString::from("/tmp/canonical-chinwag-repo"),
+                std::ffi::OsString::from("--no-governors"),
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_room_reconnect_loop_enforces_240_cap_and_fails_closed_on_refusal() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 1. Continuous WebSocket 1000 closures stop strictly at 240 attempts.
+            let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<Value>(512);
+            let mut calls = 0u32;
+            let exhausted = attempt_room_reconnect_with_cap::<&'static str, _, _, _, _, _>(
+                0,
+                "the room WebSocket closed with code 1000".to_owned(),
+                &events_tx,
+                chinwag_swarm::room::next_reconnect_backoff,
+                |_| std::future::ready(()),
+                |_| {
+                    calls += 1;
+                    std::future::ready(Err(chinwag_swarm::room::Error::WebSocketClosed(1000)))
+                },
+            )
+            .await;
+            assert_eq!(
+                calls,
+                chinwag_swarm::room::MAX_CONSECUTIVE_RECONNECT_ATTEMPTS
+            );
+            assert_eq!(calls, 240);
+            assert!(matches!(
+                exhausted,
+                ReconnectLoopOutcome::Exhausted { attempts: 240, .. }
+            ));
+            let first_ev = events_rx.recv().await.unwrap();
+            assert_eq!(first_ev["event"], "native_room_reconnect_scheduled");
+            assert_eq!(first_ev["attempt"], 1);
+
+            // 2. Transient closures followed by success return Reconnected with updated attempt count.
+            let (events_tx2, _events_rx2) = tokio::sync::mpsc::channel::<Value>(16);
+            let mut calls2 = 0u32;
+            let recovered = attempt_room_reconnect_with_cap(
+                0,
+                "the room WebSocket closed with code 1000".to_owned(),
+                &events_tx2,
+                |_| Duration::from_millis(1),
+                |_| std::future::ready(()),
+                |_| {
+                    calls2 += 1;
+                    if calls2 < 3 {
+                        std::future::ready(Err(chinwag_swarm::room::Error::WebSocketClosed(1000)))
+                    } else {
+                        std::future::ready(Ok("live-session"))
+                    }
+                },
+            )
+            .await;
+            assert_eq!(
+                recovered,
+                ReconnectLoopOutcome::Reconnected {
+                    session: "live-session",
+                    next_attempt: 3,
+                }
+            );
+
+            // 3. Explicit HTTP 403 coordinator refusal fails closed immediately without retry.
+            let (events_tx3, _events_rx3) = tokio::sync::mpsc::channel::<Value>(16);
+            let mut calls3 = 0u32;
+            let refused = attempt_room_reconnect_with_cap::<&'static str, _, _, _, _, _>(
+                0,
+                "the room WebSocket closed with code 1000".to_owned(),
+                &events_tx3,
+                |_| Duration::from_millis(1),
+                |_| std::future::ready(()),
+                |_| {
+                    calls3 += 1;
+                    std::future::ready(Err(chinwag_swarm::room::Error::Refused(403)))
+                },
+            )
+            .await;
+            assert_eq!(calls3, 1);
+            assert!(matches!(refused, ReconnectLoopOutcome::FatalRefusal(_)));
+        });
     }
 }
 
