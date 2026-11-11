@@ -35,7 +35,7 @@ Without a cryptographic coordination layer, running multiple agents against one 
 | :--- | :--- | :--- | :--- |
 | **1. Tool Switching & Context Compaction** | **Total Amnesia.** When one agent hits a rate limit or compacts context, the next agent has zero idea what was just tried or which dead ends (`tombstones`) already failed. | **Dual-Layer Native Memory (`chinwag memory`).** Recall and retain verified learnings, invariants, and `DO_NOT_REPEAT` tombstones across `.chinwag/state.crdb` + `.chinwag/memory.crdb.leann` (`8.5 KB` CSR graph). | ✅ **Available in `v0.1.x`** |
 | **2. Concurrent File Edits** | **Race Conditions & Token Thrash.** Two agents overwrite the same file or burn API tokens refactoring the same module concurrently. | **Atomic Path Leases (`chinwag-claim`) & Isolated Shadow JJ Workspaces.** Signed path/symbol globs (`MAX_TTL_SECONDS = 120`) and isolated colocated Jujutsu (`jj`) workspaces prevent collisions across editors and workstations. | ✅ **Available in `v0.1.x`** |
-| **3. Repo Rules (`CLAUDE.md` / `.cursorrules`)** | **"Prompt Hope."** Static markdown reminders are routinely ignored after context compaction, shipping non-compliant commits. | **Executable Repo Law (`verified_invariants` & `WP-01..WP-15`).** Rules are pinned to `file_path`, `symbol_hash`, and `source_commit` in `.chinwag/state.crdb` and checked before lease grant and commit settlement. | ✅ **Available in `v0.1.x`** |
+| **3. Repo Rules (`CLAUDE.md` / `.cursorrules`)** | **"Prompt Hope."** Static markdown reminders are routinely ignored after context compaction, shipping non-compliant commits. | **Executable Repo Law (`verified_invariants`, `WP-01..WP-15` & `chinwag verify --policy`).** Rules are pinned to `file_path`, `symbol_hash`, and `source_commit` in `.chinwag/state.crdb` and checked out-of-LLM in `<1ms` (`chinwag verify --policy .chinwag/workflow.yaml`) before lease grant and commit settlement. | ✅ **Available in `v0.1.x`** |
 | **4. Git Authorship & Security Audit** | **Zero Accountability.** AI commits are stamped with a personal Git identity or a generic bot token with no record of which agent thread produced the diff. | **Per-Thread `Ed25519` Non-Repudiation (`<SEAT>#<INSTANCE>`) & HPKE Flight Recorder.** Every agent conversation signs messages over the 7-field `chinwag-bus-sig-v2` payload and attaches an `RFC 9180` HPKE flight capsule (`refs/notes/emun-vault`). | ✅ **Available in `v0.1.x`** |
 | **5. CI Failures & Multi-Machine Plumbing** | **Webhook Exposure & Manual Copy-Paste.** Developers manually copy-paste 4,000-line CI logs back into their IDE or expose inbound webhook ports. | **1.4s CI-to-Agent Wakeup (`chinwag-ci wrap`) & Sovereign P2P QUIC (`chinwag-swarm`).** Direct `iroh 1.4.1` QUIC P2P (`0 Credits` on LAN/mesh) plus outbound-only `WSS :443` zero-knowledge relay wakeups. | ✅ **Available in `v0.1.x`** |
 
@@ -70,12 +70,13 @@ chinwag bus status --repo "$PWD"
 
 ---
 
-### 2. Cross-Model Pair & Triad Programming (`Shadow JJ` Workspaces + `chinwag-claim` Leases)
+### 2. Cross-Model Pair, Triad & Quad Programming, `CP-OMP` Seat Selection & Turnkey `Chinwag Delivery-2`
 
-Pairing orthogonal model families (such as **OpenAI Codex**, **Anthropic Claude**, and **Google Gemini**) eliminates single-model blind spots and `$5–$15` Doom-Loop token thrash using `<4,000`-token commit-pinned review packets:
-- **Colocated Shadow Jujutsu (`jj`) Workspaces:** Provisions isolated working trees backed by the same `.git` object store with `0` `index.lock` collisions and `0ms` automatic rebase.
-- **Cryptographic File-Scope Leases (`chinwag-claim`):** Enforces mutually exclusive `--file-scope` globs (`SignedClaimReceipt`, `120s` bounded TTL) and atomic `<= 150 LOC` checkpoints (`INV-SMALL-JJ-DIFF-01`).
-- **Pre-Claim Architectural Gate (`verified_invariants`):** Verifies target `file_path` and `symbol_hash` against active repository invariants before granting a write lease.
+Pairing orthogonal model families (such as **OpenAI Codex**, **Anthropic Claude**, and **Google Gemini**) eliminates single-model blind spots and `$5–$15` Doom-Loop token thrash using `<= 4,000`-token commit-pinned review packets:
+- **Two-Loop Empirical Seat Selection & `<5ms` `CP-OMP` Gram-Schmidt Quorum Sizing (`chinwag omp` / `chinwag pair | triad | quad`):** Projects each task's risk vector across uncorrelated model families (`Author.models != Reviewer.models`), dynamically sizing **Pair (`100 Cr` sandbox / `50 Cr` 2-round handoff)**, **Triad (`150 Cr`)**, or **Quad (`200 Cr`)** quorums in isolated `<= 150 LOC` `Shadow jj` workspaces until residual risk satisfies `||R^K f||_2 <= epsilon_policy`.
+- **Turnkey `Chinwag Delivery-2` Autonomous AI Program Manager (`chinwag delivery enable`):** Continuously updates the repository's per-domain defect-catch dictionary (`OmpDictionaryStateV1` in `.chinwag/state.crdb`) and 7-day post-merge commit survival (`SURV`) across `Rust`, `TypeScript`, `SQL`, `Auth/Crypto`, and `UI/CSS`, rotating Driver and Reviewer seat assignments automatically as the frontier shifts.
+- **Zero-Smalltalk `.cwcard` Protocol Filter (`ERR_CHWG_CHATTER_REJECTED`):** Enforces `<= 4,000-token` schema-locked `.cwcard` review packets and rejects free-form conversational smalltalk so Reviewer models are never sycophantically primed.
+- **Colocated Shadow Jujutsu (`jj`) Workspaces & Cryptographic File-Scope Leases (`chinwag-claim`):** Provisions isolated working trees backed by the same `.git` object store (`0` `index.lock` collisions, `0ms` automatic rebase) and enforces mutually exclusive `--file-scope` globs (`SignedClaimReceipt`, `120s` bounded TTL) and pre-claim `verified_invariants` checks.
 
 ---
 
@@ -123,7 +124,7 @@ chinwag memory stats --bank default
 ### 5. `1.4s` CI-to-Agent Wakeup, `<50 ms` Offline Tombstone Cassettes & Deterministic UI Gate (`chinwag ui-gate` & `chinwag-ci`)
 
 - **Deterministic DOM Geometry Gate (`chinwag ui-gate`):** Evaluates `176/176` machine-measured DOM bounding-box and kinetic scroll checks across 8 viewports and Midnight/Daylight themes (`INV-UI-BLEED`, `INV-UI-OVERLAP`, `INV-UI-CLIP`, `INV-UI-HIT-TEST`), plus optional `Vision-3` `16-surface` multimodal visual audits and autonomous CSS auto-patch.
-- **Companion [`chinwag-ci`](https://github.com/emunlabs/chinwag-ci) Runner:** Pure-Rust static CI binary (`wrap`, `verify-signer`, `test-regressions`, `diff-run`, `fork-run`, `ui-gate`, `attest-green`, `notify`, `selftest`) that scrubs secrets before encryption, coalesces 20-shard CI matrix storms into one `1.4s` agent wakeup, holds the warm CI container open for a signed live patch (`--hold-for-patch`), and replays `.chinwag/regressions/*.json` Tombstone cassettes offline in `<50 ms` at `$0` LLM spend.
+- **Companion [`chinwag-ci`](https://github.com/emunlabs/chinwag-ci) Runner:** Pure-Rust static CI binary (`wrap`, `verify-signer`, `test-regressions`, `diff-run`, `fork-run`, `ui-gate`, `omp-gate`, `policy-gate`, `attest-green`, `notify`, `selftest`) that scrubs secrets before encryption, coalesces 20-shard CI matrix storms into one `1.4s` agent wakeup, holds the warm CI container open for a signed live patch (`--hold-for-patch`), verifies `<5ms` `CP-OMP` orthogonal quorums and `<1ms` `WP-01..WP-15` policy rules, and replays `.chinwag/regressions/*.json` Tombstone cassettes offline in `<50 ms` at `$0` LLM spend.
 
 ---
 
@@ -152,12 +153,16 @@ Every subcommand below is compiled into the single `chinwag` binary (`crates/chi
 Usage:
   chinwag init [--help]
   chinwag status [--repo <path>]
-  chinwag bus <send | inbox | tail | status | instance> [options]
+  chinwag delivery <enable | status> [--repo <path>] [--json]
+  chinwag omp <status | plan> [--repo <path>] [--json]
+  chinwag pair | triad | quad [options]
+  chinwag verify --policy .chinwag/workflow.yaml [--json]
+  chinwag bus <send | inbox | tail | status | instance | wait | recovery> [options]
   chinwag memory <recall | retain | tombstone | stats> [options]
   chinwag agent-dispatch --agent <SEAT> --sender <SEAT#INSTANCE> --item <TASK-ID> --crdb <path> --body <text>
   chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>
   chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]
-  chinwag ui-gate [--url <http://localhost:PORT>] [--surfaces <N>] [--json]
+  chinwag ui-gate [--surface <all|name>] [--audit-json <path>] [--url <http://localhost:PORT>] [--surfaces <N>] [--json]
   chinwag ui [--desktop]
   chinwag a509 [options]
   chinwag cwcard [options]
@@ -216,10 +221,12 @@ flowchart TB
 
 | Crate / Component | Path | Target | Role in the Chinwag Architecture |
 | :--- | :--- | :--- | :--- |
-| **`chinwag-cli`** | [`crates/chinwag-cli`](crates/chinwag-cli) | `bin: chinwag` | Main CLI dispatcher (`init`, `status`, `bus`, `memory`, `agent-dispatch`, `configure-editor`, `mcp-serve`, `ui-gate`, `a509`, `cwcard`). |
+| **`chinwag-cli`** | [`crates/chinwag-cli`](crates/chinwag-cli) | `bin: chinwag` | Main CLI dispatcher (`init`, `status`, `delivery`, `omp`, `pair`, `triad`, `quad`, `verify`, `bus`, `memory`, `agent-dispatch`, `configure-editor`, `mcp-serve`, `ui-gate`, `a509`, `cwcard`). |
 | **`chinwag-mcp`** | [`crates/chinwag-mcp`](crates/chinwag-mcp) | `lib` | Bounded MCP server (`rmcp`) over `stdio` and authenticated loopback `HTTP`, serving `chinwag_read_thread`, `chinwag_pin_context`, and `chinwag_handoff`. |
 | **`chinwag-swarm`** | [`crates/chinwag-swarm`](crates/chinwag-swarm) | `lib` | Sovereign P2P transport built on `iroh 1.4.1` QUIC, `iroh-gossip`, `iroh-blobs` (`BLAKE3` 32 MiB cap), VPN-safe `LAN mDNS`, and `RelayPolicy::Own`. |
 | **`chinwag-claim`** | [`crates/chinwag-claim`](crates/chinwag-claim) | `lib` (`native` + `wasm`) | Pure `Ed25519`-signed task-claim requests, coordinator receipts (`SignedClaimReceipt`), and disjoint `--file-scope` glob policy checks. |
+| **`chinwag-history-archive`** | [`crates/chinwag-history-archive`](crates/chinwag-history-archive) | `lib` | Content-addressed coordinator history archive & pull planner for deterministic cross-machine state synchronization. |
+| **`chinwag-acu`** | [`crates/chinwag-acu`](crates/chinwag-acu) | `lib` | Pairing-based (`BLS12-381`) split-key access control (`ACU AND (Agent OR Archive)`), zero-plaintext-at-rest inboxes, and credit metering. |
 | **`chinwag-seed`** | [`crates/chinwag-seed`](crates/chinwag-seed) | `bin` + `lib` | `RFC 9180` HPKE (`X25519` + `ChaCha20-Poly1305` + `zstd`) 256-byte header flight-recorder capsule library, inspector, `serve-read-mcp`, and `serve-verify-mcp`. |
 | **`chinwag-signing`** | [`crates/chinwag-signing`](crates/chinwag-signing) | `lib` | OpenSSH `Ed25519` key generation, `<SEAT>#<INSTANCE>` identity binding, and repository-scoped `.chinwag/allowed_signers` verification. |
 | **`chinwag-editor-config`** | [`crates/chinwag-editor-config`](crates/chinwag-editor-config) | `lib` | Atomic, symlink-safe generator for `.mcp.json` (Claude Code), `.codex/config.toml` (Codex), `.cursor/mcp.json` (Cursor), and Gemini CLI. |
