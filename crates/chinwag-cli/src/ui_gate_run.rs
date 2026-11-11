@@ -123,10 +123,8 @@ mod tests {
 
     #[test]
     fn surface_flag_delegates_to_chinwag_ci_ui_gate_and_verifies_receipt() {
-        let dir = std::env::temp_dir().join(format!(
-            "chinwag-cli-uigate-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("chinwag-cli-uigate-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(
             dir.join("index.html"),

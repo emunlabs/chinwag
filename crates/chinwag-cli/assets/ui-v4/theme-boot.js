@@ -1,0 +1,1 @@
+(function(){var t="stone";try{var s=localStorage.getItem("chinwag_ui_theme")||localStorage.getItem("chinwag.ui.theme");if(s==="dark")t="dark";else if(s==="stone"||s==="light")t="stone"}catch(e){}document.documentElement.setAttribute("data-theme",t)})();

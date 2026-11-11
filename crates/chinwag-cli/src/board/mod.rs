@@ -1793,8 +1793,12 @@ pub fn write_board_template_pack(
         .map(|p| p.join("templates"))
         .unwrap_or_else(|| tasks_dir.join("templates"));
 
-    fs::create_dir_all(&primary_dir)
-        .map_err(|e| format!("failed to create templates dir {}: {e}", primary_dir.display()))?;
+    fs::create_dir_all(&primary_dir).map_err(|e| {
+        format!(
+            "failed to create templates dir {}: {e}",
+            primary_dir.display()
+        )
+    })?;
     let gh_path = primary_dir.join("github-project-v2-schema.json");
     let lin_path = primary_dir.join("linear-template.json");
     fs::write(&gh_path, format!("{gh_schema}\n"))
@@ -1959,7 +1963,10 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
             BoardSubTaskEntryV1 {
                 subtask_id: sub2_id,
                 surface: "docs_and_readmes".to_string(),
-                label: format!("#{}.2 Docs & READMEs (README.md / docs.chinwag.sh)", issue.id),
+                label: format!(
+                    "#{}.2 Docs & READMEs (README.md / docs.chinwag.sh)",
+                    issue.id
+                ),
                 owner_seats: vec!["DOCS".to_string()],
                 required: true,
                 verified: v2,
@@ -1971,11 +1978,7 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
                     "#{}.3 Website & PostHog Proxy (chinwag.sh / chinwag-edge-proxy)",
                     issue.id
                 ),
-                owner_seats: vec![
-                    "DOCS".to_string(),
-                    "DEX".to_string(),
-                    "INFRAJR".to_string(),
-                ],
+                owner_seats: vec!["DOCS".to_string(), "DEX".to_string(), "INFRAJR".to_string()],
                 required: true,
                 verified: v3,
             },
@@ -2200,60 +2203,59 @@ query($projectId: ID!) {
     let mut custom_field_option_ids: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut system_field_ids = BoardConfigV1::default().system_field_ids;
 
-    if let Ok(f_resp) = execute_gh_graphql(fields_q, &[("projectId", &project_id)]) {
-        if let Some(nodes) = f_resp
+    if let Ok(f_resp) = execute_gh_graphql(fields_q, &[("projectId", &project_id)])
+        && let Some(nodes) = f_resp
             .get("data")
             .and_then(|d| d.get("node"))
             .and_then(|n| n.get("fields"))
             .and_then(|f| f.get("nodes"))
             .and_then(|a| a.as_array())
-        {
-            for field in nodes {
-                let Some(fname) = field.get("name").and_then(|n| n.as_str()) else {
-                    continue;
-                };
-                let Some(fid) = field.get("id").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if fname == "Status" {
-                    status_field_id = Some(fid.to_string());
-                    if let Some(opts) = field.get("options").and_then(|o| o.as_array()) {
-                        for opt in opts {
-                            if let (Some(oid), Some(oname)) = (
-                                opt.get("id").and_then(|v| v.as_str()),
-                                opt.get("name").and_then(|v| v.as_str()),
-                            ) {
-                                status_option_ids.insert(oname.to_string(), oid.to_string());
-                            }
+    {
+        for field in nodes {
+            let Some(fname) = field.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let Some(fid) = field.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if fname == "Status" {
+                status_field_id = Some(fid.to_string());
+                if let Some(opts) = field.get("options").and_then(|o| o.as_array()) {
+                    for opt in opts {
+                        if let (Some(oid), Some(oname)) = (
+                            opt.get("id").and_then(|v| v.as_str()),
+                            opt.get("name").and_then(|v| v.as_str()),
+                        ) {
+                            status_option_ids.insert(oname.to_string(), oid.to_string());
                         }
                     }
-                } else if matches!(
-                    fname,
-                    "Created" | "Updated" | "Closed" | "Parent issue" | "Sub-issues progress"
-                ) {
-                    let key = match fname {
-                        "Created" => "CREATED",
-                        "Updated" => "UPDATED",
-                        "Closed" => "CLOSED",
-                        "Parent issue" => "PARENT_ISSUE",
-                        "Sub-issues progress" => "SUB_ISSUES_PROGRESS",
-                        _ => fname,
-                    };
-                    system_field_ids.insert(key.to_string(), fid.to_string());
-                } else {
-                    custom_field_ids.insert(fname.to_string(), fid.to_string());
-                    if let Some(opts) = field.get("options").and_then(|o| o.as_array()) {
-                        let mut omap = BTreeMap::new();
-                        for opt in opts {
-                            if let (Some(oid), Some(oname)) = (
-                                opt.get("id").and_then(|v| v.as_str()),
-                                opt.get("name").and_then(|v| v.as_str()),
-                            ) {
-                                omap.insert(oname.to_string(), oid.to_string());
-                            }
+                }
+            } else if matches!(
+                fname,
+                "Created" | "Updated" | "Closed" | "Parent issue" | "Sub-issues progress"
+            ) {
+                let key = match fname {
+                    "Created" => "CREATED",
+                    "Updated" => "UPDATED",
+                    "Closed" => "CLOSED",
+                    "Parent issue" => "PARENT_ISSUE",
+                    "Sub-issues progress" => "SUB_ISSUES_PROGRESS",
+                    _ => fname,
+                };
+                system_field_ids.insert(key.to_string(), fid.to_string());
+            } else {
+                custom_field_ids.insert(fname.to_string(), fid.to_string());
+                if let Some(opts) = field.get("options").and_then(|o| o.as_array()) {
+                    let mut omap = BTreeMap::new();
+                    for opt in opts {
+                        if let (Some(oid), Some(oname)) = (
+                            opt.get("id").and_then(|v| v.as_str()),
+                            opt.get("name").and_then(|v| v.as_str()),
+                        ) {
+                            omap.insert(oname.to_string(), oid.to_string());
                         }
-                        custom_field_option_ids.insert(fname.to_string(), omap);
                     }
+                    custom_field_option_ids.insert(fname.to_string(), omap);
                 }
             }
         }
@@ -2291,29 +2293,29 @@ query($projectId: ID!) {
             BoardStatus::TribunalGate.column_header(),
             BoardStatus::ShippedVerified.column_header(),
         );
-        if let Ok(u_resp) = execute_gh_graphql(&update_status_q, &[("fieldId", sfid)]) {
-            if let Some(opts) = u_resp
+        if let Ok(u_resp) = execute_gh_graphql(&update_status_q, &[("fieldId", sfid)])
+            && let Some(opts) = u_resp
                 .get("data")
                 .and_then(|d| d.get("updateProjectV2Field"))
                 .and_then(|u| u.get("projectV2Field"))
                 .and_then(|f| f.get("options"))
                 .and_then(|o| o.as_array())
-            {
-                status_option_ids.clear();
-                for opt in opts {
-                    if let (Some(oid), Some(oname)) = (
-                        opt.get("id").and_then(|v| v.as_str()),
-                        opt.get("name").and_then(|v| v.as_str()),
-                    ) {
-                        status_option_ids.insert(oname.to_string(), oid.to_string());
-                    }
+        {
+            status_option_ids.clear();
+            for opt in opts {
+                if let (Some(oid), Some(oname)) = (
+                    opt.get("id").and_then(|v| v.as_str()),
+                    opt.get("name").and_then(|v| v.as_str()),
+                ) {
+                    status_option_ids.insert(oname.to_string(), oid.to_string());
                 }
             }
         }
     }
 
     // Create any missing custom fields among the 7 canonical fields
-    let single_select_specs: Vec<(&str, Vec<(&str, &str, &str)>)> = vec![
+    type SingleSelectOptionSpec<'a> = (&'a str, &'a str, &'a str);
+    let single_select_specs: Vec<(&str, Vec<SingleSelectOptionSpec<'_>>)> = vec![
         (
             "Δ Speedup vs. DORA",
             vec![
@@ -2405,27 +2407,26 @@ query($projectId: ID!) {
 }}"#,
                 opt_items.join(", ")
             );
-            if let Ok(c_resp) = execute_gh_graphql(&create_ss_q, &[("projectId", &project_id)]) {
-                if let Some(fnode) = c_resp
+            if let Ok(c_resp) = execute_gh_graphql(&create_ss_q, &[("projectId", &project_id)])
+                && let Some(fnode) = c_resp
                     .get("data")
                     .and_then(|d| d.get("createProjectV2Field"))
                     .and_then(|c| c.get("projectV2Field"))
-                {
-                    if let Some(fid) = fnode.get("id").and_then(|v| v.as_str()) {
-                        custom_field_ids.insert(fname.to_string(), fid.to_string());
-                    }
-                    if let Some(oarr) = fnode.get("options").and_then(|o| o.as_array()) {
-                        let mut omap = BTreeMap::new();
-                        for opt in oarr {
-                            if let (Some(oid), Some(oname)) = (
-                                opt.get("id").and_then(|v| v.as_str()),
-                                opt.get("name").and_then(|v| v.as_str()),
-                            ) {
-                                omap.insert(oname.to_string(), oid.to_string());
-                            }
+            {
+                if let Some(fid) = fnode.get("id").and_then(|v| v.as_str()) {
+                    custom_field_ids.insert(fname.to_string(), fid.to_string());
+                }
+                if let Some(oarr) = fnode.get("options").and_then(|o| o.as_array()) {
+                    let mut omap = BTreeMap::new();
+                    for opt in oarr {
+                        if let (Some(oid), Some(oname)) = (
+                            opt.get("id").and_then(|v| v.as_str()),
+                            opt.get("name").and_then(|v| v.as_str()),
+                        ) {
+                            omap.insert(oname.to_string(), oid.to_string());
                         }
-                        custom_field_option_ids.insert(fname.to_string(), omap);
                     }
+                    custom_field_option_ids.insert(fname.to_string(), omap);
                 }
             }
         }
@@ -2455,16 +2456,14 @@ query($projectId: ID!) {
 }}"#
             );
             if let Ok(c_resp) = execute_gh_graphql(&create_scalar_q, &[("projectId", &project_id)])
-            {
-                if let Some(fid) = c_resp
+                && let Some(fid) = c_resp
                     .get("data")
                     .and_then(|d| d.get("createProjectV2Field"))
                     .and_then(|c| c.get("projectV2Field"))
                     .and_then(|f| f.get("id"))
                     .and_then(|v| v.as_str())
-                {
-                    custom_field_ids.insert(fname.to_string(), fid.to_string());
-                }
+            {
+                custom_field_ids.insert(fname.to_string(), fid.to_string());
             }
         }
     }
@@ -2897,8 +2896,10 @@ query($org: String!) {
                     .to_string();
                 if let Some(end) = title.strip_prefix('[').and_then(|s| s.find(']')) {
                     let key = &title[1..1 + end];
-                    existing_by_prefix
-                        .insert(key.to_string(), (id.to_string(), num, url.to_string(), state.clone()));
+                    existing_by_prefix.insert(
+                        key.to_string(),
+                        (id.to_string(), num, url.to_string(), state.clone()),
+                    );
                 }
                 if let Some(colon) = title.find(':') {
                     let prefix = title[..colon].trim();
@@ -2916,10 +2917,11 @@ query($org: String!) {
     let mut synced_items = Vec::new();
     for issue in issues {
         // Respect INV-DEFAULT-PRIVATE-TASK-01: only sync public-safe issues to GitHub Projects v2
-        let is_locked = issue
-            .assigned_seats
-            .iter()
-            .any(|s| PRIVATE_LOCKED_SEATS.iter().any(|p| p.eq_ignore_ascii_case(s)));
+        let is_locked = issue.assigned_seats.iter().any(|s| {
+            PRIVATE_LOCKED_SEATS
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(s))
+        });
         if is_locked {
             continue;
         }
@@ -2946,13 +2948,20 @@ query($org: String!) {
                 let owners = st
                     .owner_seats
                     .iter()
-                    .map(|s| format!("■ {}", s.trim().trim_start_matches('■').trim_start_matches('@').trim()))
+                    .map(|s| {
+                        format!(
+                            "■ {}",
+                            s.trim()
+                                .trim_start_matches('■')
+                                .trim_start_matches('@')
+                                .trim()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
                     "- [{mark}] **{}** — `{}` (Owners: `{owners}`)",
-                    st.label,
-                    st.surface
+                    st.label, st.surface
                 )
             })
             .collect();
@@ -2990,11 +2999,18 @@ query($org: String!) {
         let (issue_node_id, issue_number, issue_url, prior_state) =
             if let Some((existing_id, existing_num, existing_url, existing_state)) =
                 existing_by_prefix.get(&issue.id).cloned().or_else(|| {
-                    cfg.synced_issue_node_ids.get(&issue.id).cloned().and_then(|id| {
-                        let url = cfg.synced_issue_urls.get(&issue.id)?.clone();
-                        let num = cfg.synced_issue_numbers.get(&issue.id).copied().unwrap_or(0);
-                        Some((id, num, url, "OPEN".to_string()))
-                    })
+                    cfg.synced_issue_node_ids
+                        .get(&issue.id)
+                        .cloned()
+                        .and_then(|id| {
+                            let url = cfg.synced_issue_urls.get(&issue.id)?.clone();
+                            let num = cfg
+                                .synced_issue_numbers
+                                .get(&issue.id)
+                                .copied()
+                                .unwrap_or(0);
+                            Some((id, num, url, "OPEN".to_string()))
+                        })
                 })
             {
                 let update_q = r#"
@@ -3170,10 +3186,9 @@ mutation($projectId: ID!, $contentId: ID!) {
             if let (Some(fid), Some(omap)) = (
                 cfg.custom_field_ids.get("DORA Baseline"),
                 cfg.custom_field_option_ids.get("DORA Baseline"),
-            ) {
-                if let Some(oid) = omap.get(issue.dora_tier.canonical_option_label()) {
-                    set_project_item_single_select(&cfg.project_id, &item_id, fid, oid);
-                }
+            ) && let Some(oid) = omap.get(issue.dora_tier.canonical_option_label())
+            {
+                set_project_item_single_select(&cfg.project_id, &item_id, fid, oid);
             }
 
             // 3. Chinwag Cycle Time
@@ -3337,11 +3352,7 @@ query($org: String!, $number: Int!) {
 /// - For any card in `04_TRIBUNAL_GATE` (or an unverified card in `05_SHIPPED_VERIFIED`), runs the Proof-of-Green & Cross-Surface check:
 ///   - If all surfaces + `ui-gate` pass, promotes the card to `05_SHIPPED_VERIFIED` (`05 · ✓ SHIPPED — Δ VERIFIED`) and stamps the `✓ed25519` Δ Velocity Proof receipt.
 ///   - If any check fails, snaps the card back to `03_IN_FLIGHT` within `<200ms` (`INV-NO-FAKE-DONE-01`), reopens any prematurely closed GitHub issue, and emits the `@DELIVERY` (`Mercury 3`) + author wakeup plan.
-pub fn run_board_sync_loop(
-    args: &[String],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> u8 {
+pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let start_instant = std::time::Instant::now();
     let tasks_dir = resolve_tasks_dir(args);
     let issues_dir = tasks_dir.join("issues");
@@ -3484,8 +3495,7 @@ pub fn run_board_sync_loop(
                     "🚨 Tribunal Snap-Back ({}ms < 200ms): Unsynced {:?}",
                     snapback_elapsed_ms, manifest.unsynced_subtasks
                 ));
-                let routing_plan =
-                    build_ci_failure_routing_plan(&issue, None, true, true, false);
+                let routing_plan = build_ci_failure_routing_plan(&issue, None, true, true, false);
                 issue.receipt_trailers.push(format!(
                     "TribunalSnapBackReceiptV1: status=SNAP_BACK_IN_FLIGHT elapsed_ms={} unsynced={:?} direct_to={} cc={:?}",
                     snapback_elapsed_ms,
@@ -3495,13 +3505,12 @@ pub fn run_board_sync_loop(
                 ));
                 let _ = fs::write(&path, issue.to_markdown());
 
-                if live {
-                    if let Some(cfg) = BoardConfigV1::load(&tasks_dir) {
-                        if let Some(node_id) = cfg.synced_issue_node_ids.get(&issue.id) {
-                            let num = cfg.synced_issue_numbers.get(&issue.id).copied();
-                            reopen_github_issue_live(&org, node_id, num);
-                        }
-                    }
+                if live
+                    && let Some(cfg) = BoardConfigV1::load(&tasks_dir)
+                    && let Some(node_id) = cfg.synced_issue_node_ids.get(&issue.id)
+                {
+                    let num = cfg.synced_issue_numbers.get(&issue.id).copied();
+                    reopen_github_issue_live(&org, node_id, num);
                 }
 
                 tribunal_snapbacks.push(json!({
@@ -3712,10 +3721,11 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         };
 
         if public_board
-            && issue
-                .assigned_seats
-                .iter()
-                .any(|s| PRIVATE_LOCKED_SEATS.iter().any(|p| p.eq_ignore_ascii_case(s)))
+            && issue.assigned_seats.iter().any(|s| {
+                PRIVATE_LOCKED_SEATS
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(s))
+            })
         {
             let err_payload = json!({
                 "ok": false,
@@ -3877,19 +3887,19 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
 
     if !dry_run {
         let cfg = BoardConfigV1::load(&tasks_dir);
-        if let Ok(ledger) = sync_board_cards_ledger(&tasks_dir, &validated_issues, cfg.as_ref()) {
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert(
-                    "board_cards_summary".to_string(),
-                    json!({
-                        "total_cards": ledger.total_cards,
-                        "shipped_cards": ledger.shipped_cards,
-                        "total_dora_baseline_hours": ledger.total_dora_baseline_hours,
-                        "total_chinwag_cycle_hours": ledger.total_chinwag_cycle_hours,
-                        "total_net_hours_saved": ledger.total_net_hours_saved,
-                    }),
-                );
-            }
+        if let Ok(ledger) = sync_board_cards_ledger(&tasks_dir, &validated_issues, cfg.as_ref())
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert(
+                "board_cards_summary".to_string(),
+                json!({
+                    "total_cards": ledger.total_cards,
+                    "shipped_cards": ledger.shipped_cards,
+                    "total_dora_baseline_hours": ledger.total_dora_baseline_hours,
+                    "total_chinwag_cycle_hours": ledger.total_chinwag_cycle_hours,
+                    "total_net_hours_saved": ledger.total_net_hours_saved,
+                }),
+            );
         }
     }
 
@@ -4005,8 +4015,7 @@ pub fn evaluate_issue_decision_gate(
                         .or_else(|| v.as_f64());
                     if let Some(s) = score {
                         if k == "public_board_redaction_clean" {
-                            assessment.clef_redaction_clean_score =
-                                (s * 10000.0).round() / 10000.0;
+                            assessment.clef_redaction_clean_score = (s * 10000.0).round() / 10000.0;
                         } else if s > max_trig {
                             max_trig = s;
                         }
@@ -4264,7 +4273,10 @@ fn card_entry_from_issue(
     let cryptographic_receipt = issue.last_ci_gate_badge.clone().unwrap_or_else(|| {
         format!(
             "✓ed25519 · blake3:{}",
-            short_digest(&format!("{}:{}:{}", issue.id, issue.title, issue.t_claim_ms))
+            short_digest(&format!(
+                "{}:{}:{}",
+                issue.id, issue.title, issue.t_claim_ms
+            ))
         )
     });
 
@@ -4317,10 +4329,11 @@ pub fn sync_board_cards_ledger(
         .collect();
 
     for issue in issues {
-        let is_locked = issue
-            .assigned_seats
-            .iter()
-            .any(|s| PRIVATE_LOCKED_SEATS.iter().any(|p| p.eq_ignore_ascii_case(s)));
+        let is_locked = issue.assigned_seats.iter().any(|s| {
+            PRIVATE_LOCKED_SEATS
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(s))
+        });
         if is_locked {
             continue;
         }
@@ -4386,7 +4399,9 @@ pub fn upsert_agent_thread_board_card(
                 .any(|p| p.eq_ignore_ascii_case(sec))
         })
     {
-        return Err("confidential seat (e.g., @PATENT) is hard-locked to private board".to_string());
+        return Err(
+            "confidential seat (e.g., @PATENT) is hard-locked to private board".to_string(),
+        );
     }
 
     let tasks_dir = repo_root.join(".chinwag").join("tasks");
@@ -5421,11 +5436,8 @@ mod tests {
         fs::write(issues_dir.join("CHWG-0189.md"), verified.to_markdown()).unwrap();
 
         // Issue 2: in 04_TRIBUNAL_GATE with #3 unchecked -> should snap back to 03_IN_FLIGHT (<200ms)
-        let mut incomplete = AtomicTaskIssue::new_default(
-            "CHWG-0190",
-            "Incomplete Tribunal Card",
-            DoraTier::M,
-        );
+        let mut incomplete =
+            AtomicTaskIssue::new_default("CHWG-0190", "Incomplete Tribunal Card", DoraTier::M);
         incomplete.status = BoardStatus::TribunalGate;
         incomplete.author_instance = Some("DEX#6df4d436df6c01617dcd2f4e404673fc".to_string());
         incomplete.body = "- [x] #CHWG-0190.1 Code\n- [x] #CHWG-0190.2 Docs\n- [ ] #CHWG-0190.3 Site & Proxy\n- [x] #CHWG-0190.4 QA & UI Gate".to_string();
@@ -5570,7 +5582,7 @@ mod tests {
 
     #[test]
     fn test_19_auto_upsert_agent_thread_board_card_populates_net_hours_saved_and_blocks_confidential_seats()
-    {
+     {
         let repo_dir = temp_tasks_dir("auto-upsert-repo");
         fs::create_dir_all(repo_dir.join(".chinwag/tasks")).unwrap();
 

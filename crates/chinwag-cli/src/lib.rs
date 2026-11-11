@@ -15,6 +15,10 @@ mod execution_route_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod feature_cli_run;
 #[cfg(all(test, target_os = "macos"))]
+mod ui_auth;
+#[cfg(all(test, target_os = "macos"))]
+mod ui_sse;
+#[cfg(all(test, target_os = "macos"))]
 mod ui_workbench_run;
 
 pub mod agent_instance;
@@ -41,17 +45,17 @@ pub mod bus_state;
 #[cfg(target_os = "macos")]
 pub mod bus_store;
 #[cfg(target_os = "macos")]
-pub mod bus_wait_message;
-#[cfg(target_os = "macos")]
-pub mod bus_wait_store;
-#[cfg(target_os = "macos")]
-pub mod bus_wait_grant;
+pub mod bus_wait_cli;
 #[cfg(target_os = "macos")]
 pub mod bus_wait_core;
 #[cfg(target_os = "macos")]
+pub mod bus_wait_grant;
+#[cfg(target_os = "macos")]
 pub mod bus_wait_journal;
 #[cfg(target_os = "macos")]
-pub mod bus_wait_cli;
+pub mod bus_wait_message;
+#[cfg(target_os = "macos")]
+pub mod bus_wait_store;
 #[cfg(target_os = "macos")]
 pub mod execution_binding;
 #[cfg(target_os = "macos")]
@@ -90,6 +94,8 @@ pub mod task_wire;
 pub mod task_write_journal;
 #[cfg(target_os = "macos")]
 pub mod task_writer;
+#[cfg(target_os = "macos")]
+pub mod ui_telemetry;
 #[cfg(target_os = "macos")]
 pub mod workspace_capability_inventory;
 

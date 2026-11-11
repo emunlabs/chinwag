@@ -3,7 +3,9 @@
 mod bus_run;
 mod feature_cli_run;
 mod relay_run;
+mod ui_auth;
 mod ui_gate_run;
+mod ui_sse;
 mod ui_workbench_run;
 
 use std::io::Write;
@@ -101,7 +103,9 @@ fn main() -> ExitCode {
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("history") {
             return ExitCode::from(chinwag_history_archive::run_cli(
-                &raw_args[2..], &mut std::io::stdout().lock(), &mut std::io::stderr().lock(),
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
             ));
         }
         if matches!(raw_args.get(1).map(|s| s.as_str()), Some("tasks" | "task")) {

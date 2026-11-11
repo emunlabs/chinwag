@@ -267,8 +267,15 @@ fn read_jj_path_file(path: &Path) -> InventoryResult<PathBuf> {
         )
         .map_err(|err| InventoryError::Io(err.to_string()))?,
     );
-    if FileType::from_raw_mode(fstat(&file).map_err(|err| InventoryError::Io(err.to_string()))?.st_mode) != FileType::RegularFile {
-        return Err(InventoryError::SharedGitStoreMismatch("JJ backing path must be a regular file".to_owned()));
+    if FileType::from_raw_mode(
+        fstat(&file)
+            .map_err(|err| InventoryError::Io(err.to_string()))?
+            .st_mode,
+    ) != FileType::RegularFile
+    {
+        return Err(InventoryError::SharedGitStoreMismatch(
+            "JJ backing path must be a regular file".to_owned(),
+        ));
     }
     (&mut file)
         .take(4097)
@@ -1019,7 +1026,10 @@ pub fn require_stored_observation_not_authority(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-#[expect(clippy::large_enum_variant, reason = "The admitted checkpoint event carries TaskRefV1 inline; journal records have a strict byte ceiling")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The admitted checkpoint event carries TaskRefV1 inline; journal records have a strict byte ceiling"
+)]
 pub enum InventoryPayloadV1 {
     RegisterWorkspace {
         record: Box<WorkspaceOwnershipRecordV1>,
@@ -1058,7 +1068,10 @@ pub enum InventoryPayloadV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "record_kind", rename_all = "snake_case", deny_unknown_fields)]
-#[expect(clippy::large_enum_variant, reason = "Intent carries the admitted inline checkpoint payload; all journal records are bounded before append")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Intent carries the admitted inline checkpoint payload; all journal records are bounded before append"
+)]
 enum JournalEntryV1 {
     Intent {
         operation_id: String,
@@ -2373,8 +2386,11 @@ impl ContinuousInventoryRegistryV1 {
                             record.status = WorkspaceOwnershipStatusV1::HeldStaleOrUnknown;
                             record.hold_reason = Some(format!("fenced_by_{reason}"));
                             record.pid_birth_binding = None;
-                            if let Some(seq) = registry.workspace_registration_seq.get(id).copied() {
-                                registry.local_workspace_holds.insert(id.clone(), (inspected, seq, record.clone()));
+                            if let Some(seq) = registry.workspace_registration_seq.get(id).copied()
+                            {
+                                registry
+                                    .local_workspace_holds
+                                    .insert(id.clone(), (inspected, seq, record.clone()));
                             }
                         }
                     }
@@ -2389,7 +2405,9 @@ impl ContinuousInventoryRegistryV1 {
                             record.effective_classification = CapabilityClassificationV1::Held;
                             record.hold_or_downgrade_reason = Some(format!("fenced_by_{reason}"));
                             record.installed_binary_sha256 = None;
-                            registry.local_capability_holds.insert(id.clone(), (inspected, record.clone()));
+                            registry
+                                .local_capability_holds
+                                .insert(id.clone(), (inspected, record.clone()));
                         }
                     }
                     return Ok((registry, count));
