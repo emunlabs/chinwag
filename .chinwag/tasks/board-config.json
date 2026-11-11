@@ -90,7 +90,8 @@
     "CHWG-0204": "I_kwDOVU4K-c8AAAABeMDdFQ",
     "CHWG-0205": "I_kwDOVU4K-c8AAAABeMaNFQ",
     "CHWG-0206": "I_kwDOVU4K-c8AAAABeMaVZA",
-    "CHWG-0207": "I_kwDOVU4K-c8AAAABeMacyA"
+    "CHWG-0207": "I_kwDOVU4K-c8AAAABeMacyA",
+    "CHWG-0208": "I_kwDOVU4K-c8AAAABeMakqw"
   },
   "synced_issue_numbers": {
     "CHWG-0189": 19,
@@ -111,7 +112,8 @@
     "CHWG-0204": 34,
     "CHWG-0205": 35,
     "CHWG-0206": 36,
-    "CHWG-0207": 37
+    "CHWG-0207": 37,
+    "CHWG-0208": 38
   },
   "synced_issue_urls": {
     "CHWG-0189": "https://github.com/emunlabs/chinwag/issues/19",
@@ -132,7 +134,8 @@
     "CHWG-0204": "https://github.com/emunlabs/chinwag/issues/34",
     "CHWG-0205": "https://github.com/emunlabs/chinwag/issues/35",
     "CHWG-0206": "https://github.com/emunlabs/chinwag/issues/36",
-    "CHWG-0207": "https://github.com/emunlabs/chinwag/issues/37"
+    "CHWG-0207": "https://github.com/emunlabs/chinwag/issues/37",
+    "CHWG-0208": "https://github.com/emunlabs/chinwag/issues/38"
   },
   "synced_project_item_ids": {
     "CHWG-0189": "PVTI_lADOFJPsXM4BrFUVzhHrxhs",
@@ -153,6 +156,7 @@
     "CHWG-0204": "PVTI_lADOFJPsXM4BrFUVzhHs63c",
     "CHWG-0205": "PVTI_lADOFJPsXM4BrFUVzhHtPsI",
     "CHWG-0206": "PVTI_lADOFJPsXM4BrFUVzhHtPyY",
-    "CHWG-0207": "PVTI_lADOFJPsXM4BrFUVzhHtP5g"
+    "CHWG-0207": "PVTI_lADOFJPsXM4BrFUVzhHtP5g",
+    "CHWG-0208": "PVTI_lADOFJPsXM4BrFUVzhHtQBg"
   }
 }

@@ -334,5 +334,19 @@
     "clairic_ci_fail_prob_median": 0.1,
     "system2_escalated": false,
     "evaluated_at_ms": 1794370333636
+  },
+  "CHWG-0208:03_IN_FLIGHT:180": {
+    "issue_id": "CHWG-0208",
+    "dora_tier_guess": "M",
+    "clef_max_trigger": 0.318,
+    "clef_redaction_clean_score": 0.7621,
+    "clairic_loc_p10": 100.0,
+    "clairic_loc_median": 180.0,
+    "clairic_loc_p90": 240.0,
+    "clairic_burn_usd_median": 3.6,
+    "clairic_minutes_median": 116.0,
+    "clairic_ci_fail_prob_median": 0.18,
+    "system2_escalated": false,
+    "evaluated_at_ms": 1794371053236
   }
 }

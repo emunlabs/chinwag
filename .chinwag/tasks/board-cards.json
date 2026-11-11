@@ -2,11 +2,11 @@
   "schema": "chinwag.board.cards.v1",
   "project_id": "PVT_kwDOFJPsXM4BrFUV",
   "project_url": "https://github.com/orgs/emunlabs/projects/1",
-  "total_cards": 19,
+  "total_cards": 20,
   "shipped_cards": 14,
-  "total_dora_baseline_hours": 938.0,
-  "total_chinwag_cycle_hours": 6.14,
-  "total_net_hours_saved": 931.86,
+  "total_dora_baseline_hours": 965.0,
+  "total_chinwag_cycle_hours": 6.47,
+  "total_net_hours_saved": 958.53,
   "cards": [
     {
       "id": "CHWG-0189",
@@ -805,6 +805,50 @@
         "clairic_ci_fail_prob_median": 0.1,
         "system2_escalated": false,
         "evaluated_at_ms": 1794370333636
+      }
+    },
+    {
+      "id": "CHWG-0208",
+      "ticket_code": null,
+      "title": "CHWG-0208: Fix Top Header Navigation (CI/CD Sticky-Cookie Hijack, Docs target=_blank, docs.chinwag.sh 302 Removal & Single-Row Header Layout) + Mandatory Link-Destination QA Gate",
+      "status": "03_IN_FLIGHT",
+      "column_header": "03 · ⚡ IN FLIGHT — CLOCK LIVE",
+      "dora_tier": "M",
+      "dora_baseline": "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)",
+      "baseline_hours": 27.0,
+      "chinwag_cycle_time": "In Flight · 19m 40s · 180 LOC",
+      "delta_speedup_vs_dora": "⏱️ Clock Running — In Flight",
+      "net_hours_saved": 26.67,
+      "execution_mode": "🌐 Subagent Swarm · Cloud Fan-Out",
+      "active_seats": "■ TYPE · ■ MOTION · ■ DEX · ■ INFRAJR · ■ DOCS · ■ QA",
+      "assigned_seats": [
+        "TYPE",
+        "MOTION",
+        "DEX",
+        "INFRAJR",
+        "DOCS",
+        "QA"
+      ],
+      "cryptographic_receipt": "✓ed25519 · H1+H2+H5+Pillar12 · 0.0x vs DORA · SURV:PENDING_168H",
+      "t_claim_ms": 1794370620000,
+      "t_ship_ms": 0,
+      "trigger_source": "board_push",
+      "github_issue_number": 38,
+      "github_issue_url": "https://github.com/emunlabs/chinwag/issues/38",
+      "project_item_id": "PVTI_lADOFJPsXM4BrFUVzhHtQBg",
+      "decision_gate": {
+        "issue_id": "CHWG-0208",
+        "dora_tier_guess": "M",
+        "clef_max_trigger": 0.318,
+        "clef_redaction_clean_score": 0.7621,
+        "clairic_loc_p10": 100.0,
+        "clairic_loc_median": 180.0,
+        "clairic_loc_p90": 240.0,
+        "clairic_burn_usd_median": 3.6,
+        "clairic_minutes_median": 116.0,
+        "clairic_ci_fail_prob_median": 0.18,
+        "system2_escalated": false,
+        "evaluated_at_ms": 1794371053236
       }
     }
   ]
