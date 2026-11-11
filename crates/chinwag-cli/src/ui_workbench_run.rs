@@ -73,11 +73,102 @@ pub struct UiDaemonState {
     pub started_at_unix: u64,
 }
 
+fn default_driver_tool() -> String {
+    "claude_code".to_string()
+}
+
+fn default_reviewer_tool() -> String {
+    "codex_cli".to_string()
+}
+
+fn default_test_verifier_tool() -> String {
+    "gemini_cli".to_string()
+}
+
+fn default_security_verifier_tool() -> String {
+    "cursor".to_string()
+}
+
+fn default_review_tier_credits() -> u64 {
+    100
+}
+
+fn default_review_mode() -> String {
+    "pair_sandbox".to_string()
+}
+
+fn default_workstream_engineering() -> String {
+    "engineering".to_string()
+}
+
+pub(crate) fn normalize_workflow_tool_id(raw: &str, fallback: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "claude" | "claude_code" | "claude-code" => "claude_code".to_string(),
+        "codex" | "codex_cli" | "codex-cli" => "codex_cli".to_string(),
+        "gemini" | "gemini_cli" | "gemini-cli" => "gemini_cli".to_string(),
+        "cursor" => "cursor".to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+pub(crate) fn friendly_workflow_tool_label(raw: &str) -> &'static str {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.contains("claude") {
+        "Claude Code"
+    } else if lower.contains("codex") {
+        "Codex CLI"
+    } else if lower.contains("gemini") {
+        "Gemini CLI"
+    } else if lower.contains("cursor") {
+        "Cursor"
+    } else {
+        "Claude Code"
+    }
+}
+
+pub(crate) fn review_mode_for_credits(credits: u64) -> Option<&'static str> {
+    match credits {
+        50 => Some("review_handoff"),
+        100 => Some("pair_sandbox"),
+        150 => Some("three_tool_check"),
+        200 => Some("quad_programming"),
+        _ => None,
+    }
+}
+
+pub(crate) fn credits_for_review_mode(mode: &str) -> Option<u64> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "review_handoff" => Some(50),
+        "pair_sandbox" | "diffs_touching_3_plus_files" => Some(100),
+        "three_tool_check" | "triad_sandbox" => Some(150),
+        "quad_programming" | "quad_sandbox" | "security_review" => Some(200),
+        _ => None,
+    }
+}
+
+fn normalize_workstream_id(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "engineering" | "design" | "product" | "qa" | "security" | "analytics" | "docs" => lower,
+        _ => "engineering".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowConfig {
     pub independent_review: bool,
+    #[serde(default = "default_driver_tool")]
     pub driver_tool: String,
+    #[serde(default = "default_reviewer_tool")]
     pub reviewer_tool: String,
+    #[serde(default = "default_test_verifier_tool")]
+    pub test_verifier_tool: String,
+    #[serde(default = "default_security_verifier_tool")]
+    pub security_verifier_tool: String,
+    #[serde(default = "default_review_tier_credits")]
+    pub review_tier_credits: u64,
+    #[serde(default = "default_review_mode")]
     pub review_mode: String,
     pub protect_sensitive_paths: bool,
     pub auto_test_before_review: bool,
@@ -92,9 +183,12 @@ impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
             independent_review: true,
-            driver_tool: "claude".to_string(),
-            reviewer_tool: "codex".to_string(),
-            review_mode: "diffs_touching_3_plus_files".to_string(),
+            driver_tool: default_driver_tool(),
+            reviewer_tool: default_reviewer_tool(),
+            test_verifier_tool: default_test_verifier_tool(),
+            security_verifier_tool: default_security_verifier_tool(),
+            review_tier_credits: default_review_tier_credits(),
+            review_mode: default_review_mode(),
             protect_sensitive_paths: true,
             auto_test_before_review: true,
             isolated_sandbox: true,
@@ -161,6 +255,8 @@ struct LocalBoardTask {
     title: String,
     status: String,
     assigned_tool: String,
+    #[serde(default = "default_workstream_engineering")]
+    workstream: String,
     created_at_unix: u64,
 }
 
@@ -1651,6 +1747,285 @@ fn detect_local_coding_tools(repo_root: &Path) -> Vec<Value> {
     out
 }
 
+const CANONICAL_WORKFLOW_TOOLS: [&str; 4] = ["claude_code", "codex_cli", "gemini_cli", "cursor"];
+
+pub fn ensure_distinct_workflow_slots(
+    cfg: &mut WorkflowConfig,
+    changed_slot: Option<(usize, &str)>,
+) {
+    let mut slots = [
+        normalize_workflow_tool_id(&cfg.driver_tool, "claude_code"),
+        normalize_workflow_tool_id(&cfg.reviewer_tool, "codex_cli"),
+        normalize_workflow_tool_id(&cfg.test_verifier_tool, "gemini_cli"),
+        normalize_workflow_tool_id(&cfg.security_verifier_tool, "cursor"),
+    ];
+
+    let pinned_idx = changed_slot.map(|(idx, _)| idx).filter(|&idx| idx < 4);
+    if let Some((idx, prev_raw)) = changed_slot
+        && idx < 4
+    {
+        let next_val = slots[idx].clone();
+        let prev_val = normalize_workflow_tool_id(prev_raw, CANONICAL_WORKFLOW_TOOLS[idx]);
+        if prev_val != next_val {
+            for (j, slot) in slots.iter_mut().enumerate() {
+                if j != idx && *slot == next_val {
+                    *slot = prev_val.clone();
+                }
+            }
+        }
+    }
+
+    let mut used: Vec<String> = Vec::with_capacity(4);
+    if let Some(idx) = pinned_idx {
+        used.push(slots[idx].clone());
+    }
+    for (i, slot) in slots.iter_mut().enumerate() {
+        if Some(i) == pinned_idx {
+            continue;
+        }
+        if CANONICAL_WORKFLOW_TOOLS.contains(&slot.as_str()) && !used.contains(slot) {
+            used.push(slot.clone());
+        } else {
+            let replacement = CANONICAL_WORKFLOW_TOOLS
+                .iter()
+                .find(|cand| !used.iter().any(|u| u == **cand))
+                .copied()
+                .unwrap_or(CANONICAL_WORKFLOW_TOOLS[i])
+                .to_string();
+            *slot = replacement.clone();
+            used.push(replacement);
+        }
+    }
+
+    cfg.driver_tool = slots[0].clone();
+    cfg.reviewer_tool = slots[1].clone();
+    cfg.test_verifier_tool = slots[2].clone();
+    cfg.security_verifier_tool = slots[3].clone();
+}
+
+fn parse_inline_yaml_string_list(raw: &str) -> Option<Vec<String>> {
+    let inner = raw.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        let first = *chars.peek()?;
+        if first == ',' || first == '[' || first == ']' {
+            return None;
+        }
+        let item = if first == '"' {
+            chars.next();
+            let mut buf = String::new();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    let esc = chars.next()?;
+                    match esc {
+                        '"' | '\\' | '/' => buf.push(esc),
+                        't' => buf.push('\t'),
+                        _ => return None,
+                    }
+                } else if c == '"' {
+                    closed = true;
+                    break;
+                } else if c.is_control() {
+                    return None;
+                } else {
+                    buf.push(c);
+                }
+            }
+            if !closed {
+                return None;
+            }
+            while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                chars.next();
+            }
+            match chars.peek() {
+                None => {}
+                Some(',') => {
+                    chars.next();
+                    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                        chars.next();
+                    }
+                    chars.peek()?;
+                }
+                Some(_) => return None,
+            }
+            buf
+        } else if first == '\'' {
+            chars.next();
+            let mut buf = String::new();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                if c == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        buf.push('\'');
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else if c.is_control() {
+                    return None;
+                } else {
+                    buf.push(c);
+                }
+            }
+            if !closed {
+                return None;
+            }
+            while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                chars.next();
+            }
+            match chars.peek() {
+                None => {}
+                Some(',') => {
+                    chars.next();
+                    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                        chars.next();
+                    }
+                    chars.peek()?;
+                }
+                Some(_) => return None,
+            }
+            buf
+        } else {
+            let mut buf = String::new();
+            let mut saw_comma = false;
+            for c in chars.by_ref() {
+                if c == ',' {
+                    saw_comma = true;
+                    break;
+                }
+                if c == '"' || c == '\'' || c == '[' || c == ']' || c == '#' || c.is_control() {
+                    return None;
+                }
+                buf.push(c);
+            }
+            if saw_comma {
+                while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                    chars.next();
+                }
+                chars.peek()?;
+            }
+            buf.trim().to_string()
+        };
+
+        let trimmed_item = item.trim();
+        if trimmed_item.is_empty()
+            || trimmed_item == "~"
+            || trimmed_item.eq_ignore_ascii_case("null")
+            || trimmed_item.split('/').any(|seg| seg == "..")
+            || trimmed_item.split('\\').any(|seg| seg == "..")
+        {
+            return None;
+        }
+        out.push(trimmed_item.to_string());
+        if chars.peek().is_none() {
+            break;
+        }
+    }
+    Some(out)
+}
+
+fn parse_yaml_path_scalar(raw_item: &str) -> Option<String> {
+    let s = raw_item.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let parsed = if let Some(rest) = s.strip_prefix('"') {
+        let mut buf = String::new();
+        let mut chars = rest.chars();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                let esc = chars.next()?;
+                match esc {
+                    '"' | '\\' | '/' => buf.push(esc),
+                    't' => buf.push('\t'),
+                    _ => return None,
+                }
+            } else if c == '"' {
+                closed = true;
+                break;
+            } else if c.is_control() {
+                return None;
+            } else {
+                buf.push(c);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        let trailing = chars.as_str().trim();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return None;
+        }
+        buf
+    } else if let Some(rest) = s.strip_prefix('\'') {
+        let mut buf = String::new();
+        let mut chars = rest.chars().peekable();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    buf.push('\'');
+                } else {
+                    closed = true;
+                    break;
+                }
+            } else if c.is_control() {
+                return None;
+            } else {
+                buf.push(c);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        let trailing: String = chars.collect();
+        let trailing = trailing.trim();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return None;
+        }
+        buf
+    } else {
+        let without_comment = match s.find(" #") {
+            Some(idx) => &s[..idx],
+            None => s,
+        };
+        let bare = without_comment.trim();
+        if bare.is_empty()
+            || bare.starts_with([
+                '#', '[', ']', '{', '}', '&', '*', '!', '|', '>', '\'', '"', ',',
+            ])
+            || bare
+                .chars()
+                .any(|c| c.is_control() || c == '"' || c == '\'')
+        {
+            return None;
+        }
+        bare.to_string()
+    };
+
+    let clean = parsed.trim();
+    if clean.is_empty()
+        || clean == "~"
+        || clean.eq_ignore_ascii_case("null")
+        || clean.split('/').any(|seg| seg == "..")
+        || clean.split('\\').any(|seg| seg == "..")
+    {
+        return None;
+    }
+    Some(clean.to_string())
+}
+
 pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
     let mut cfg = WorkflowConfig::default();
     let Ok(Some(raw)) =
@@ -1660,21 +2035,36 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
     };
 
     let mut in_protected_paths = false;
-    let mut parsed_paths: Vec<String> = Vec::new();
+    let mut block_invalid = false;
+    let mut block_paths: Vec<String> = Vec::new();
+    let mut resolved_protected_paths: Option<Vec<String>> = None;
+    let mut seen_credits: Option<u64> = None;
+    let mut seen_mode_credits: Option<u64> = None;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         if in_protected_paths {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                let clean = item.trim().trim_matches('"').trim_matches('\'').to_string();
-                if !clean.is_empty() {
-                    parsed_paths.push(clean);
+            if trimmed == "-" {
+                block_invalid = true;
+                continue;
+            } else if let Some(item) = trimmed.strip_prefix("- ") {
+                if let Some(clean) = parse_yaml_path_scalar(item) {
+                    block_paths.push(clean);
+                } else {
+                    block_invalid = true;
                 }
                 continue;
             } else {
+                if !block_invalid && !block_paths.is_empty() {
+                    resolved_protected_paths = Some(std::mem::take(&mut block_paths));
+                } else {
+                    resolved_protected_paths = None;
+                    block_paths.clear();
+                }
                 in_protected_paths = false;
+                block_invalid = false;
             }
         }
         let Some((k, v_raw)) = trimmed.split_once(':') else {
@@ -1688,9 +2078,30 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
                     cfg.independent_review = b;
                 }
             }
-            "driver_tool" if !val.is_empty() => cfg.driver_tool = val.to_string(),
-            "reviewer_tool" if !val.is_empty() => cfg.reviewer_tool = val.to_string(),
-            "review_mode" if !val.is_empty() => cfg.review_mode = val.to_string(),
+            "driver_tool" if !val.is_empty() => {
+                cfg.driver_tool = normalize_workflow_tool_id(val, "claude_code");
+            }
+            "reviewer_tool" if !val.is_empty() => {
+                cfg.reviewer_tool = normalize_workflow_tool_id(val, "codex_cli");
+            }
+            "test_verifier_tool" if !val.is_empty() => {
+                cfg.test_verifier_tool = normalize_workflow_tool_id(val, "gemini_cli");
+            }
+            "security_verifier_tool" if !val.is_empty() => {
+                cfg.security_verifier_tool = normalize_workflow_tool_id(val, "cursor");
+            }
+            "review_tier_credits" => {
+                if let Ok(c) = val.parse::<u64>()
+                    && review_mode_for_credits(c).is_some()
+                {
+                    seen_credits = Some(c);
+                }
+            }
+            "review_mode" if !val.is_empty() => {
+                if let Some(c) = credits_for_review_mode(val) {
+                    seen_mode_credits = Some(c);
+                }
+            }
             "protect_sensitive_paths" => {
                 if let Ok(b) = val.parse::<bool>() {
                     cfg.protect_sensitive_paths = b;
@@ -1722,35 +2133,83 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
                 }
             }
             "protected_paths" => {
-                if val.is_empty() {
+                let raw_after_colon = v_raw.trim();
+                if raw_after_colon.is_empty() {
                     in_protected_paths = true;
-                } else if val == "[]" {
-                    parsed_paths.clear();
+                    block_invalid = false;
+                    block_paths.clear();
+                    resolved_protected_paths = None;
+                } else if let Some(inline_items) = parse_inline_yaml_string_list(raw_after_colon) {
+                    resolved_protected_paths = Some(inline_items);
+                    in_protected_paths = false;
+                    block_invalid = false;
+                    block_paths.clear();
+                } else {
+                    resolved_protected_paths = None;
+                    in_protected_paths = false;
+                    block_invalid = false;
+                    block_paths.clear();
                 }
             }
             _ => {}
         }
     }
-    if !parsed_paths.is_empty() {
-        cfg.protected_paths = parsed_paths;
+    if in_protected_paths {
+        if !block_invalid && !block_paths.is_empty() {
+            resolved_protected_paths = Some(block_paths);
+        } else {
+            resolved_protected_paths = None;
+        }
     }
+    if let Some(c) = seen_credits.or(seen_mode_credits) {
+        cfg.review_tier_credits = c;
+        if let Some(mode) = review_mode_for_credits(c) {
+            cfg.review_mode = mode.to_string();
+        }
+    }
+    if let Some(paths) = resolved_protected_paths {
+        cfg.protected_paths = paths;
+    }
+    ensure_distinct_workflow_slots(&mut cfg, None);
     cfg
 }
 
 pub fn save_workflow_config(repo_root: &Path, cfg: &WorkflowConfig) -> Result<(), String> {
+    let mut normalized = cfg.clone();
+    ensure_distinct_workflow_slots(&mut normalized, None);
+    let driver = normalized.driver_tool;
+    let reviewer = normalized.reviewer_tool;
+    let test_verifier = normalized.test_verifier_tool;
+    let security_verifier = normalized.security_verifier_tool;
+    let credits = if review_mode_for_credits(cfg.review_tier_credits).is_some() {
+        cfg.review_tier_credits
+    } else {
+        credits_for_review_mode(&cfg.review_mode).unwrap_or(100)
+    };
+    let mode = review_mode_for_credits(credits).unwrap_or("pair_sandbox");
+
     let mut yaml = String::from("# Chinwag repository workflow guardrails\nversion: 1\n");
     yaml.push_str(&format!("independent_review: {}\n", cfg.independent_review));
     yaml.push_str(&format!(
         "driver_tool: \"{}\"\n",
-        sanitize_yaml_scalar(&cfg.driver_tool)
+        sanitize_yaml_scalar(&driver)
     ));
     yaml.push_str(&format!(
         "reviewer_tool: \"{}\"\n",
-        sanitize_yaml_scalar(&cfg.reviewer_tool)
+        sanitize_yaml_scalar(&reviewer)
     ));
     yaml.push_str(&format!(
+        "test_verifier_tool: \"{}\"\n",
+        sanitize_yaml_scalar(&test_verifier)
+    ));
+    yaml.push_str(&format!(
+        "security_verifier_tool: \"{}\"\n",
+        sanitize_yaml_scalar(&security_verifier)
+    ));
+    yaml.push_str(&format!("review_tier_credits: {credits}\n"));
+    yaml.push_str(&format!(
         "review_mode: \"{}\"\n",
-        sanitize_yaml_scalar(&cfg.review_mode)
+        sanitize_yaml_scalar(mode)
     ));
     yaml.push_str(&format!(
         "protect_sensitive_paths: {}\n",
@@ -1770,15 +2229,18 @@ pub fn save_workflow_config(repo_root: &Path, cfg: &WorkflowConfig) -> Result<()
         "stop_auto_repair_after_2_attempts: {}\n",
         cfg.stop_auto_repair_after_2_attempts
     ));
-    if cfg.protected_paths.is_empty() {
+    let clean_paths: Vec<String> = cfg
+        .protected_paths
+        .iter()
+        .map(|p| sanitize_yaml_scalar(p))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_paths.is_empty() {
         yaml.push_str("protected_paths: []\n");
     } else {
         yaml.push_str("protected_paths:\n");
-        for p in &cfg.protected_paths {
-            let clean = sanitize_yaml_scalar(p);
-            if !clean.is_empty() {
-                yaml.push_str(&format!("  - \"{clean}\"\n"));
-            }
+        for clean in &clean_paths {
+            yaml.push_str(&format!("  - \"{clean}\"\n"));
         }
     }
 
@@ -2398,7 +2860,10 @@ pub fn parse_all_tasks_json(repo_root: &Path) -> Value {
         items.push(json!({
             "task_id": custom.id,
             "status": "READY",
-            "heading": scrub_customer_text(&custom.title)
+            "heading": scrub_customer_text(&custom.title),
+            "assigned_tool": normalize_workflow_tool_id(&custom.assigned_tool, "claude_code"),
+            "workstream": normalize_workstream_id(&custom.workstream),
+            "is_custom": true
         }));
     }
 
@@ -2459,6 +2924,7 @@ fn clean_markdown_heading(raw: &str) -> String {
 
 fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
     let state = load_ui_v4_state(repo_root);
+    let workflow_cfg = load_workflow_config(repo_root);
     let tasks_val = parse_all_tasks_json(repo_root);
     let task_list = tasks_val
         .get("tasks")
@@ -2474,7 +2940,77 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
     let mut review_cards: Vec<Value> = Vec::new();
     let mut shipped_cards: Vec<Value> = Vec::new();
 
-    for (idx, t) in task_list.iter().take(24).enumerate() {
+    for custom in state.created_tasks.iter().rev() {
+        let effective_status = if let Some(dec) = state.item_decisions.get(&custom.id) {
+            dec.status.as_str()
+        } else if custom.status.trim().is_empty() {
+            "queued"
+        } else {
+            custom.status.as_str()
+        };
+        let assigned_tool =
+            normalize_workflow_tool_id(&custom.assigned_tool, &workflow_cfg.driver_tool);
+        let tool_label = friendly_workflow_tool_label(&assigned_tool);
+        let reviewer_label = friendly_workflow_tool_label(&workflow_cfg.reviewer_tool);
+        let workstream = normalize_workstream_id(&custom.workstream);
+        let clean_title = scrub_customer_text(&custom.title);
+
+        let card = json!({
+            "id": custom.id,
+            "title": clean_title,
+            "status": effective_status,
+            "workstream": workstream,
+            "assigned_tool": assigned_tool,
+            "tool_label": tool_label,
+            "reviewer_label": reviewer_label,
+            "credits_used": if effective_status == "done" { workflow_cfg.review_tier_credits } else { 0 }
+        });
+
+        match effective_status {
+            "done" => shipped_cards.push(card),
+            "needs_review" | "needs_permission" => review_cards.push(card),
+            "running" => active_cards.push(card),
+            _ => queued_cards.push(card),
+        }
+
+        if matches!(
+            effective_status,
+            "needs_review" | "needs_permission" | "running" | "done"
+        ) && inbox_items.len() < 12
+        {
+            inbox_items.push(json!({
+                "id": custom.id,
+                "is_sample": false,
+                "is_sample_walkthrough": false,
+                "kind": if effective_status == "needs_permission" { "permission_hold" } else { "diff_review" },
+                "status": effective_status,
+                "status_label": match effective_status {
+                    "needs_review" => "Ready to review",
+                    "needs_permission" => "Needs permission",
+                    "running" => "Running locally",
+                    _ => "Shipped",
+                },
+                "title": clean_title,
+                "summary": "Workspace task item tracked locally.",
+                "tool_label": tool_label,
+                "reviewer_label": Value::Null,
+                "files_changed": Value::Null,
+                "additions": Value::Null,
+                "deletions": Value::Null,
+                "risk_level": "low",
+                "tests_passed": Value::Null,
+                "credits_used": workflow_cfg.review_tier_credits,
+                "updated_at": format_relative_time(custom.created_at_unix)
+            }));
+        }
+    }
+
+    for (idx, t) in task_list
+        .iter()
+        .filter(|t| !t.get("is_custom").and_then(Value::as_bool).unwrap_or(false))
+        .take(24)
+        .enumerate()
+    {
         let id = t
             .get("task_id")
             .and_then(Value::as_str)
@@ -2518,9 +3054,10 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
             "id": id,
             "title": heading,
             "status": effective_status,
+            "workstream": "engineering",
             "tool_label": tool_label,
             "reviewer_label": reviewer_label,
-            "credits_used": if effective_status == "done" { 150 } else { 50 }
+            "credits_used": if effective_status == "done" { workflow_cfg.review_tier_credits } else { 0 }
         });
 
         match effective_status {
@@ -2556,7 +3093,7 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
                 "deletions": Value::Null,
                 "risk_level": "low",
                 "tests_passed": Value::Null,
-                "credits_used": 150,
+                "credits_used": workflow_cfg.review_tier_credits,
                 "updated_at": "Recent"
             }));
         }
@@ -2641,7 +3178,7 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
     let shipped_count = shipped_cards.len();
     // Shipped-only hours saved (`INV-UI-DONT-MAKE-ME-THINK-01`: 0 when 0 shipped items)
     let hours_saved = (shipped_count as f64) * 2.5;
-    let credits_used = (shipped_count as u64) * 150;
+    let credits_used = (shipped_count as u64) * workflow_cfg.review_tier_credits;
 
     let inbox_json = json!({
         "items": inbox_items,
@@ -3549,12 +4086,18 @@ fn handle_board_create_task(repo_root: &Path, body: &[u8]) -> (&'static str, Val
             }),
         );
     }
-    let assigned_tool = parsed
+    let raw_tool = parsed
         .get("tool")
         .or_else(|| parsed.get("assigned_tool"))
         .and_then(Value::as_str)
-        .unwrap_or("claude")
-        .to_string();
+        .unwrap_or("claude_code");
+    let assigned_tool = normalize_workflow_tool_id(raw_tool, "claude_code");
+    let tool_label = friendly_workflow_tool_label(&assigned_tool);
+    let raw_ws = parsed
+        .get("workstream")
+        .and_then(Value::as_str)
+        .unwrap_or("engineering");
+    let workstream = normalize_workstream_id(raw_ws);
 
     mutate_ui_v4_state(repo_root, |state| {
         let floor = state.created_tasks.len() as u64;
@@ -3567,6 +4110,7 @@ fn handle_board_create_task(repo_root: &Path, body: &[u8]) -> (&'static str, Val
             title: scrubbed_title.clone(),
             status: "queued".to_string(),
             assigned_tool: assigned_tool.clone(),
+            workstream: workstream.clone(),
             created_at_unix: unix_now(),
         };
         state.created_tasks.push(record);
@@ -3576,7 +4120,9 @@ fn handle_board_create_task(repo_root: &Path, body: &[u8]) -> (&'static str, Val
                 "id": id,
                 "title": scrubbed_title,
                 "status": "queued",
-                "assigned_tool": assigned_tool
+                "assigned_tool": assigned_tool,
+                "tool_label": tool_label,
+                "workstream": workstream
             },
             "credits_charged": 0
         }))
@@ -3599,23 +4145,93 @@ fn handle_workflow_update(repo_root: &Path, body: &[u8]) -> (&'static str, Value
     };
 
     let mut cfg = load_workflow_config(repo_root);
+    let prev_slots = [
+        cfg.driver_tool.clone(),
+        cfg.reviewer_tool.clone(),
+        cfg.test_verifier_tool.clone(),
+        cfg.security_verifier_tool.clone(),
+    ];
     if let Some(b) = parsed.get("independent_review").and_then(Value::as_bool) {
         cfg.independent_review = b;
     }
     if let Some(s) = parsed.get("driver_tool").and_then(Value::as_str)
         && !s.trim().is_empty()
     {
-        cfg.driver_tool = s.trim().to_string();
+        cfg.driver_tool = normalize_workflow_tool_id(s, "claude_code");
     }
     if let Some(s) = parsed.get("reviewer_tool").and_then(Value::as_str)
         && !s.trim().is_empty()
     {
-        cfg.reviewer_tool = s.trim().to_string();
+        cfg.reviewer_tool = normalize_workflow_tool_id(s, "codex_cli");
     }
-    if let Some(s) = parsed.get("review_mode").and_then(Value::as_str)
+    if let Some(s) = parsed.get("test_verifier_tool").and_then(Value::as_str)
         && !s.trim().is_empty()
     {
-        cfg.review_mode = s.trim().to_string();
+        cfg.test_verifier_tool = normalize_workflow_tool_id(s, "gemini_cli");
+    }
+    if let Some(s) = parsed.get("security_verifier_tool").and_then(Value::as_str)
+        && !s.trim().is_empty()
+    {
+        cfg.security_verifier_tool = normalize_workflow_tool_id(s, "cursor");
+    }
+    let next_slots = [
+        &cfg.driver_tool,
+        &cfg.reviewer_tool,
+        &cfg.test_verifier_tool,
+        &cfg.security_verifier_tool,
+    ];
+    let changed_indices: Vec<usize> = (0..4)
+        .filter(|&i| next_slots[i] != &prev_slots[i])
+        .collect();
+    let changed_slot = if changed_indices.len() == 1 {
+        let idx = changed_indices[0];
+        Some((idx, prev_slots[idx].as_str()))
+    } else {
+        None
+    };
+    ensure_distinct_workflow_slots(&mut cfg, changed_slot);
+    if let Some(credits_val) = parsed.get("review_tier_credits")
+        && !credits_val.is_null()
+    {
+        let Some(credits) = credits_val.as_u64() else {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_review_tier_credits",
+                    "error": "review_tier_credits must be 50, 100, 150, or 200."
+                }),
+            );
+        };
+        let Some(mode) = review_mode_for_credits(credits) else {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_review_tier_credits",
+                    "error": "review_tier_credits must be 50, 100, 150, or 200."
+                }),
+            );
+        };
+        cfg.review_tier_credits = credits;
+        cfg.review_mode = mode.to_string();
+    } else if let Some(s) = parsed.get("review_mode").and_then(Value::as_str)
+        && !s.trim().is_empty()
+    {
+        let Some(credits) = credits_for_review_mode(s) else {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_review_mode",
+                    "error": "review_mode must be review_handoff, pair_sandbox, three_tool_check, or quad_programming."
+                }),
+            );
+        };
+        cfg.review_tier_credits = credits;
+        cfg.review_mode = review_mode_for_credits(credits)
+            .unwrap_or("pair_sandbox")
+            .to_string();
     }
     if let Some(b) = parsed
         .get("protect_sensitive_paths")
@@ -3816,7 +4432,7 @@ fn handle_pm_ask(repo_root: &Path, body: &[u8]) -> (&'static str, Vec<u8>) {
         let err = serde_json::to_vec(&json!({
             "ok": false,
             "error_code": "empty_prompt",
-            "error": "Ask Chinwag PM a question or describe the task you want broken down."
+            "error": "Describe the engineering task you want queued or broken down."
         }))
         .unwrap_or_default();
         return ("400 Bad Request", err);
@@ -3825,15 +4441,25 @@ fn handle_pm_ask(repo_root: &Path, body: &[u8]) -> (&'static str, Vec<u8>) {
     let (inbox, board, _) = build_inbox_and_board(repo_root);
     let decision_count = inbox["counts"]["needs_decision"].as_u64().unwrap_or(0);
     let shipped_count = board["summary"]["shipped_count"].as_u64().unwrap_or(0);
+    let review_phrase = if decision_count == 1 {
+        "1 change waiting for your review".to_string()
+    } else {
+        format!("{decision_count} changes waiting for your review")
+    };
+    let shipped_phrase = if shipped_count == 1 {
+        "1 shipped change".to_string()
+    } else {
+        format!("{shipped_count} shipped changes")
+    };
     let reply = format!(
-        "Workspace status: {decision_count} item(s) waiting for your review and {shipped_count} shipped item(s). Next step for \"{}\": break into a scoped change, run tests in an isolated sandbox, and verify with a second coding tool before approving.",
+        "Scoped plan for \"{}\": break into an isolated repository change, run tests before review, and verify with an independent coding tool ({review_phrase}, {shipped_phrase}).",
         scrub_customer_text(prompt)
     );
     let payload = serde_json::to_vec_pretty(&json!({
         "ok": true,
-        "role": "Chinwag PM",
+        "role": "Task Scoper",
         "reply": reply,
-        "credits_charged": 50
+        "credits_charged": 0
     }))
     .unwrap_or_default();
     ("200 OK", payload)
@@ -4264,7 +4890,7 @@ fn handle_workbench_http_connection_inner(
                 None,
             );
         }
-        ("POST", "/api/v4/board/task") => {
+        ("POST", "/api/v4/board/task" | "/api/v4/board/tasks") => {
             if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
                 let payload = serde_json::to_vec(&held).unwrap_or_default();
                 write_hardened_response(
@@ -5233,12 +5859,20 @@ mod tests {
         let mut cfg = load_workflow_config(&repo);
         cfg.independent_review = false;
         cfg.reviewer_tool = "gemini".to_string();
+        cfg.test_verifier_tool = "codex".to_string();
+        cfg.security_verifier_tool = "cursor".to_string();
+        cfg.review_tier_credits = 200;
         cfg.protected_paths = vec![".env*".to_string(), "secrets/**".to_string()];
         save_workflow_config(&repo, &cfg).unwrap();
 
         let reloaded = load_workflow_config(&repo);
         assert!(!reloaded.independent_review);
-        assert_eq!(reloaded.reviewer_tool, "gemini");
+        assert_eq!(reloaded.driver_tool, "claude_code");
+        assert_eq!(reloaded.reviewer_tool, "gemini_cli");
+        assert_eq!(reloaded.test_verifier_tool, "codex_cli");
+        assert_eq!(reloaded.security_verifier_tool, "cursor");
+        assert_eq!(reloaded.review_tier_credits, 200);
+        assert_eq!(reloaded.review_mode, "quad_programming");
         assert_eq!(reloaded.protected_paths.len(), 2);
 
         let _ = fs::remove_dir_all(&repo);
@@ -5950,5 +6584,108 @@ mod tests {
             resolve_diff_item_status(Some(&prior_allow_once), true, true, true, true),
             "needs_review"
         );
+    }
+
+    #[test]
+    fn legacy_workflow_migration_deduplicates_slots_and_empty_protected_paths_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(temp.path()).unwrap();
+        init_test_repo(&repo);
+        fs::create_dir_all(repo.join(".chinwag")).unwrap();
+
+        // Legacy 2-field workflow.yaml where driver=gemini would collide with default test_verifier=gemini_cli
+        fs::write(
+            repo.join(".chinwag/workflow.yaml"),
+            "version: 1\ndriver_tool: \"gemini\"\nreviewer_tool: \"codex\"\nreview_mode: \"triad_sandbox\"\n",
+        )
+        .unwrap();
+
+        let migrated = load_workflow_config(&repo);
+        assert_eq!(migrated.driver_tool, "gemini_cli");
+        assert_eq!(migrated.reviewer_tool, "codex_cli");
+        assert_eq!(migrated.test_verifier_tool, "claude_code");
+        assert_eq!(migrated.security_verifier_tool, "cursor");
+        assert_eq!(migrated.review_tier_credits, 150);
+        assert_eq!(migrated.review_mode, "three_tool_check");
+
+        // Single-slot swap via handle_workflow_update swaps colliding slots cleanly
+        let (st_swap, val_swap) =
+            handle_workflow_update(&repo, br#"{"reviewer_tool":"cursor","protected_paths":[]}"#);
+        assert_eq!(st_swap, "200 OK");
+        assert_eq!(val_swap["workflow"]["driver_tool"], "gemini_cli");
+        assert_eq!(val_swap["workflow"]["reviewer_tool"], "cursor");
+        assert_eq!(val_swap["workflow"]["test_verifier_tool"], "claude_code");
+        assert_eq!(val_swap["workflow"]["security_verifier_tool"], "codex_cli");
+        assert_eq!(val_swap["workflow"]["protected_paths"], json!([]));
+
+        // Reloading after `protected_paths: []` preserves empty list instead of restoring defaults
+        let reloaded = load_workflow_config(&repo);
+        assert!(
+            reloaded.protected_paths.is_empty(),
+            "expected empty protected_paths after explicit clear, got {:?}",
+            reloaded.protected_paths
+        );
+
+        // Hand-edited inline YAML flow array parses cleanly (including quoted commas) without dropping to empty
+        fs::write(
+            repo.join(".chinwag/workflow.yaml"),
+            "version: 1\nprotected_paths: [\".env*\", \"secrets/**\", \"config/a,b/**\", 'dir''s/**']\n",
+        )
+        .unwrap();
+        let inline_loaded = load_workflow_config(&repo);
+        assert_eq!(
+            inline_loaded.protected_paths,
+            vec![
+                ".env*".to_string(),
+                "secrets/**".to_string(),
+                "config/a,b/**".to_string(),
+                "dir's/**".to_string()
+            ]
+        );
+
+        // Malformed inline lists (`[,]`, trailing comma, unclosed quote, empty string, traversal `..`),
+        // YAML null / bare `protected_paths:` blocks (at EOF or before another mapping key),
+        // and blocks containing empty/traversal items (`- ""`, `-`, `- "../outside"`) all fail safe
+        // to default protected paths while explicit `protected_paths: []` stays empty.
+        for bad_doc in [
+            "version: 1\nprotected_paths: malformed_scalar\n",
+            "version: 1\nprotected_paths: [,]\n",
+            "version: 1\nprotected_paths: [\".env*\",]\n",
+            "version: 1\nprotected_paths: [,\"secrets/**\"]\n",
+            "version: 1\nprotected_paths: [\"unclosed]\n",
+            "version: 1\nprotected_paths: [\"\"]\n",
+            "version: 1\nprotected_paths: [\"../outside\"]\n",
+            "version: 1\nprotected_paths: [~]\n",
+            "version: 1\nprotected_paths: null\n",
+            "version: 1\nprotected_paths:\n",
+            "version: 1\nprotected_paths:\nreview_tier_credits: 200\n",
+            "version: 1\nprotected_paths:\n  - \"\"\n",
+            "version: 1\nprotected_paths:\n  -\n",
+            "version: 1\nprotected_paths:\n  - \".env*\"\n  - \"../outside\"\n",
+        ] {
+            fs::write(repo.join(".chinwag/workflow.yaml"), bad_doc).unwrap();
+            let malformed_loaded = load_workflow_config(&repo);
+            assert_eq!(
+                malformed_loaded.protected_paths,
+                WorkflowConfig::default().protected_paths,
+                "malformed/null protected_paths doc `{bad_doc:?}` must fail safe to defaults"
+            );
+        }
+
+        // Negative-path validation for out-of-domain credits, invalid review_mode, and empty task title
+        let (st_bad_cr, val_bad_cr) =
+            handle_workflow_update(&repo, br#"{"review_tier_credits":75}"#);
+        assert_eq!(st_bad_cr, "400 Bad Request");
+        assert_eq!(val_bad_cr["error_code"], "invalid_review_tier_credits");
+
+        let (st_bad_mode, val_bad_mode) =
+            handle_workflow_update(&repo, br#"{"review_mode":"unknown_tier"}"#);
+        assert_eq!(st_bad_mode, "400 Bad Request");
+        assert_eq!(val_bad_mode["error_code"], "invalid_review_mode");
+
+        let (st_empty_title, val_empty_title) =
+            handle_board_create_task(&repo, br#"{"title":"   ","tool":"claude_code"}"#);
+        assert_eq!(st_empty_title, "400 Bad Request");
+        assert_eq!(val_empty_title["error_code"], "missing_title");
     }
 }

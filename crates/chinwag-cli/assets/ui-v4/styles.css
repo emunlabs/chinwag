@@ -1176,7 +1176,7 @@ code.pill-code,
   border-radius: var(--r-lg);
 }
 
-/* ── 7 · View Headers & Inline Ask Chinwag PM Bar ───────────────────────── */
+/* ── 7 · View Headers & Inline Engineering Task Launcher ────────────────── */
 .view-head {
   display: flex;
   flex-wrap: wrap;
@@ -1245,24 +1245,6 @@ code.pill-code,
   flex-wrap: wrap;
   gap: var(--s-2);
   margin-top: var(--s-2);
-}
-
-.ask-result {
-  margin-top: var(--s-3);
-  padding: var(--s-4);
-  border-radius: var(--r-lg);
-  border: 1px solid var(--border-subtle);
-  background: var(--bg-surface);
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-2);
-}
-
-.ask-result-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--s-2);
 }
 
 @media (max-width: 719.98px) {
@@ -2395,8 +2377,24 @@ col.diff-col-split-code {
   gap: var(--s-4);
 }
 
+.pairing-selects[data-slots="3"] {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pairing-selects[data-slots="4"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (max-width: 1119.98px) {
+  .pairing-selects[data-slots="3"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 719.98px) {
-  .pairing-selects {
+  .pairing-selects,
+  .pairing-selects[data-slots="3"],
+  .pairing-selects[data-slots="4"] {
     grid-template-columns: minmax(0, 1fr);
   }
 }

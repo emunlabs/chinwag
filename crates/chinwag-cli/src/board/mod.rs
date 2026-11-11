@@ -3674,15 +3674,13 @@ impl Default for BoardCardsLedgerV1 {
 impl BoardCardsLedgerV1 {
     pub fn sanitize_entity_firewall(&mut self, tasks_dir: &Path) {
         let issues_dir = tasks_dir.join("issues");
-        let has_disk_issues = fs::read_dir(&issues_dir)
-            .ok()
-            .is_some_and(|mut entries| {
-                entries.any(|e| {
-                    e.ok()
-                        .and_then(|ent| ent.path().extension().map(|ext| ext == "md"))
-                        .unwrap_or(false)
-                })
-            });
+        let has_disk_issues = fs::read_dir(&issues_dir).ok().is_some_and(|mut entries| {
+            entries.any(|e| {
+                e.ok()
+                    .and_then(|ent| ent.path().extension().map(|ext| ext == "md"))
+                    .unwrap_or(false)
+            })
+        });
         self.cards.retain(|card| {
             let valid_id = if has_disk_issues {
                 is_canonical_chwg_ticket_id(&card.id)
@@ -3693,8 +3691,7 @@ impl BoardCardsLedgerV1 {
                     && !card.id.contains("..")
                     && !card.id.eq_ignore_ascii_case("CHWG-PM-DELIVERY-LOOP-01")
             };
-            valid_id
-                && scan_entity_firewall_text(&format!("{}\n{}", card.id, card.title)).is_ok()
+            valid_id && scan_entity_firewall_text(&format!("{}\n{}", card.id, card.title)).is_ok()
         });
     }
 
@@ -3884,7 +3881,9 @@ pub fn sync_board_cards_ledger(
                     effective_issue.t_ship_ms = p.t_ship_ms;
                 }
             }
-            let disk_path = tasks_dir.join("issues").join(format!("{}.md", effective_issue.id));
+            let disk_path = tasks_dir
+                .join("issues")
+                .join(format!("{}.md", effective_issue.id));
             if disk_path.is_file() {
                 let _ = fs::write(&disk_path, effective_issue.to_markdown());
             }
@@ -3964,15 +3963,13 @@ pub fn upsert_agent_thread_board_card(
     let _ = fs::create_dir_all(&tasks_dir);
 
     let issues_dir = tasks_dir.join("issues");
-    let has_disk_issues = fs::read_dir(&issues_dir)
-        .ok()
-        .is_some_and(|mut entries| {
-            entries.any(|e| {
-                e.ok()
-                    .and_then(|ent| ent.path().extension().map(|ext| ext == "md"))
-                    .unwrap_or(false)
-            })
-        });
+    let has_disk_issues = fs::read_dir(&issues_dir).ok().is_some_and(|mut entries| {
+        entries.any(|e| {
+            e.ok()
+                .and_then(|ent| ent.path().extension().map(|ext| ext == "md"))
+                .unwrap_or(false)
+        })
+    });
     let disk_issue_path = issues_dir.join(format!("{clean_ticket}.md"));
     if has_disk_issues && !disk_issue_path.is_file() {
         return Err(format!(
@@ -4209,7 +4206,12 @@ pub fn upsert_agent_thread_board_card(
     if let Some(ref diss) = disk_issue
         && diss.status == BoardStatus::ShippedVerified
     {
-        let disk_projected = card_entry_from_issue(diss, Some(&cfg), Some(trigger_source), entry.ticket_code.clone());
+        let disk_projected = card_entry_from_issue(
+            diss,
+            Some(&cfg),
+            Some(trigger_source),
+            entry.ticket_code.clone(),
+        );
         entry.status = "05_SHIPPED_VERIFIED".to_string();
         entry.column_header = BoardStatus::ShippedVerified.column_header().to_string();
         entry.net_hours_saved = disk_projected.net_hours_saved;
@@ -4346,10 +4348,7 @@ fn collect_qualified_thread_address(
     seen: &mut BTreeMap<String, (u64, String)>,
 ) {
     for part in raw.split(',') {
-        let clean = part
-            .trim()
-            .trim_start_matches(|c: char| c == '@' || c == '■' || c == '●' || c == '◆')
-            .trim();
+        let clean = part.trim().trim_start_matches(['@', '■', '●', '◆']).trim();
         if !clean.contains('#') {
             continue;
         }
@@ -4381,10 +4380,7 @@ pub fn discover_live_thread_instances(
 ) -> Vec<String> {
     let excluded_norm = exclude_actor
         .and_then(|raw| {
-            let trimmed = raw
-                .trim()
-                .trim_start_matches(|c: char| c == '@' || c == '■' || c == '●' || c == '◆')
-                .trim();
+            let trimmed = raw.trim().trim_start_matches(['@', '■', '●', '◆']).trim();
             crate::agent_instance::ActorAddress::parse(trimmed)
                 .ok()
                 .map(|a| a.to_string())
@@ -6382,10 +6378,8 @@ mod tests {
         ];
         fs::write(bus_dir.join("messages.jsonl"), lines.join("\n")).unwrap();
 
-        let live = discover_live_thread_instances(
-            &repo_dir,
-            Some("DEX#6df4d436df6c01617dcd2f4e404673fc"),
-        );
+        let live =
+            discover_live_thread_instances(&repo_dir, Some("DEX#6df4d436df6c01617dcd2f4e404673fc"));
         assert_eq!(
             live,
             vec![
@@ -6411,7 +6405,10 @@ mod tests {
         );
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].other_ticket_id, "CHWG-0230");
-        assert_eq!(collisions[0].other_owner, "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA");
+        assert_eq!(
+            collisions[0].other_owner,
+            "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA"
+        );
 
         write_active_crisis(
             &repo_dir,

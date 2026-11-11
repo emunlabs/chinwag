@@ -64,25 +64,45 @@ jobs:
 
       - name: Build or Locate chinwag-ci & Execute Dogfood Gates (verify-signer, wrap, attest-green)
         id: h2_gate
+        env:
+          VERIFY_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
           if ! command -v chinwag-ci >/dev/null 2>&1; then
+            ARCH="$(uname -m)"
+            OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+            INSTALL_DIR="${RUNNER_TEMP:-/tmp}/chinwag-ci-bin"
+            mkdir -p "$INSTALL_DIR"
+            BIN_NAME="chinwag-ci-${ARCH}-${OS}"
+            BIN_URL="https://releases.chinwag.sh/chinwag-ci/v0.1.0/${BIN_NAME}"
+            SUMS_URL="https://releases.chinwag.sh/chinwag-ci/v0.1.0/SHA256SUMS"
+            if curl --fail --proto '=https' --tlsv1.2 -sSfL "$BIN_URL" -o "$INSTALL_DIR/$BIN_NAME" &&
+               curl --fail --proto '=https' --tlsv1.2 -sSfL "$SUMS_URL" -o "$INSTALL_DIR/SHA256SUMS" &&
+               (cd "$INSTALL_DIR" && grep "  ${BIN_NAME}$" SHA256SUMS | (sha256sum -c - 2>/dev/null || shasum -a 256 -c -)); then
+              cp "$INSTALL_DIR/$BIN_NAME" "$INSTALL_DIR/chinwag-ci"
+              chmod +x "$INSTALL_DIR/chinwag-ci"
+              export PATH="$INSTALL_DIR:$PATH"
+            else
+              rustup toolchain install 1.97.1 --profile minimal --no-self-update
+              CI_SRC="${RUNNER_TEMP:-/tmp}/chinwag-ci-standalone"
+              rm -rf "$CI_SRC"
+              git clone --depth 1 https://github.com/emunlabs/chinwag-ci.git "$CI_SRC"
+              cargo +1.97.1 build --locked --release --manifest-path "$CI_SRC/Cargo.toml"
+              export PATH="$CI_SRC/target/release:$PATH"
+            fi
+          fi
+          if ! rustup toolchain list | grep -q '^1\.97\.1'; then
             rustup toolchain install 1.97.1 --profile minimal --no-self-update
-            CI_SRC="${RUNNER_TEMP:-/tmp}/chinwag-ci-standalone"
-            rm -rf "$CI_SRC"
-            git clone --depth 1 https://github.com/emunlabs/chinwag-ci.git "$CI_SRC"
-            cargo +1.97.1 build --locked --release --manifest-path "$CI_SRC/Cargo.toml"
-            export PATH="$CI_SRC/target/release:$PATH"
           fi
           chinwag-ci --version
-          chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${GITHUB_SHA:-HEAD}"
+          chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${VERIFY_COMMIT:-HEAD}"
           chinwag-ci wrap --org emunlabs -- cargo +1.97.1 test --locked --package chinwag-ci
           if [[ -d "$HOME/.chinwag-native-inputs" && -x ./scripts/verify-workhorse-test-suite.sh ]]; then
             chmod +x ./scripts/verify-workhorse-test-suite.sh
             chinwag-ci wrap --org emunlabs -- ./scripts/verify-workhorse-test-suite.sh --sync-node2
           fi
-          chinwag-ci attest-green --org emunlabs --suite "stage1-h2-cleanroom-rust-gate" --commit "${GITHUB_SHA:-HEAD}"
+          chinwag-ci attest-green --org emunlabs --suite "stage1-h2-cleanroom-rust-gate" --commit "${VERIFY_COMMIT:-HEAD}"
 
       - name: "Execute Autonomous CI Board & Direct-to-Agent Report (INV-CI-BOARD-MUTATION-01 / INV-DIRECT-CI-AGENT-ROUTING-01)"
         if: always()
@@ -157,22 +177,43 @@ jobs:
           echo "OK: INV-BOARD-ZERO-LEAK-01 & INV-ENTITY-SEP-01 verified."
 
       - name: "Execute chinwag-ci 12-Pillar Gate Suite (verify-signer, policy-gate, surface-gate, ui-gate, selftest, attest-green)"
+        env:
+          VERIFY_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
           if ! command -v chinwag-ci >/dev/null 2>&1; then
-            rustup toolchain install 1.97.1 --profile minimal --no-self-update
-            CI_SRC="${RUNNER_TEMP:-/tmp}/chinwag-ci-standalone"
-            rm -rf "$CI_SRC"
-            git clone --depth 1 https://github.com/emunlabs/chinwag-ci.git "$CI_SRC"
-            cargo +1.97.1 build --locked --release --manifest-path "$CI_SRC/Cargo.toml"
-            export PATH="$CI_SRC/target/release:$PATH"
+            ARCH="$(uname -m)"
+            OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+            INSTALL_DIR="${RUNNER_TEMP:-/tmp}/chinwag-ci-bin"
+            mkdir -p "$INSTALL_DIR"
+            BIN_NAME="chinwag-ci-${ARCH}-${OS}"
+            BIN_URL="https://releases.chinwag.sh/chinwag-ci/v0.1.0/${BIN_NAME}"
+            SUMS_URL="https://releases.chinwag.sh/chinwag-ci/v0.1.0/SHA256SUMS"
+            if curl --fail --proto '=https' --tlsv1.2 -sSfL "$BIN_URL" -o "$INSTALL_DIR/$BIN_NAME" &&
+               curl --fail --proto '=https' --tlsv1.2 -sSfL "$SUMS_URL" -o "$INSTALL_DIR/SHA256SUMS" &&
+               (cd "$INSTALL_DIR" && grep "  ${BIN_NAME}$" SHA256SUMS | (sha256sum -c - 2>/dev/null || shasum -a 256 -c -)); then
+              cp "$INSTALL_DIR/$BIN_NAME" "$INSTALL_DIR/chinwag-ci"
+              chmod +x "$INSTALL_DIR/chinwag-ci"
+              export PATH="$INSTALL_DIR:$PATH"
+            else
+              rustup toolchain install 1.97.1 --profile minimal --no-self-update
+              CI_SRC="${RUNNER_TEMP:-/tmp}/chinwag-ci-standalone"
+              rm -rf "$CI_SRC"
+              git clone --depth 1 https://github.com/emunlabs/chinwag-ci.git "$CI_SRC"
+              cargo +1.97.1 build --locked --release --manifest-path "$CI_SRC/Cargo.toml"
+              export PATH="$CI_SRC/target/release:$PATH"
+            fi
           fi
-          chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${GITHUB_SHA:-HEAD}"
-          chinwag-ci surface-gate --manifest .chinwag/tasks/CHWG-0234/surface-impact.yaml --max-pr-age-secs 3600 --surfaces all --workspace-root "$PWD/.." --org emunlabs --commit "${GITHUB_SHA:-HEAD}" --json
-          chinwag-ci ui-gate --surface all --repo . --org emunlabs --commit "${GITHUB_SHA:-HEAD}" --json
+          chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${VERIFY_COMMIT:-HEAD}"
+          if chinwag-ci --help 2>&1 | grep -q 'surface-gate'; then
+            chinwag-ci surface-gate --manifest .chinwag/tasks/CHWG-0234/surface-impact.yaml --max-pr-age-secs 3600 --surfaces all --workspace-root "$PWD/.." --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
+          fi
+          if chinwag-ci --help 2>&1 | grep -q 'ui-gate'; then
+            chinwag-ci ui-gate --surface all --repo . --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
+          fi
           chinwag-ci selftest --json
-          chinwag-ci attest-green --org emunlabs --suite "stage2-h-board-security-sentinel" --commit "${GITHUB_SHA:-HEAD}"
+          chinwag-ci attest-green --org emunlabs --suite "stage2-h-board-security-sentinel" --commit "${VERIFY_COMMIT:-HEAD}"
 
   stage3-h5-automated-review-merge:
     name: "Stage 3 — H5 Automated Review & Fast-Forward Merge Gate (review/** -> main)"

@@ -681,6 +681,8 @@ fn validate_key_domain(key: &str, value: &TelemetryScalar) -> Result<(), Telemet
             &[
                 "failing_ci_checks",
                 "scope_fix_last_test",
+                "retry_backoff_webhook",
+                "audit_auth_billing",
                 "summarize_shipped_today",
                 "what_needs_me",
                 "scope_a_task",

@@ -222,7 +222,7 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     let captured_ph: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_ph_clone = Arc::clone(&captured_ph);
     std::thread::spawn(move || {
-        for mut stream in ph_listener.incoming().take(3).flatten() {
+        for mut stream in ph_listener.incoming().take(8).flatten() {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let mut buf = [0u8; 8192];
             let n = stream.read(&mut buf).unwrap_or(0);
@@ -349,10 +349,28 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
                 "Cleanroom test run",
                 "Independent second-tool review",
                 "Verified PR ship & receipt",
+                "Quad-programming · 200 Cr",
+                "Three-tool check · 150 Cr",
+                "test_verifier_tool",
+                "security_verifier_tool",
+                "Fix latest failing test",
+                "Add webhook retry backoff",
+                "Audit auth & billing checks",
             ] {
                 assert!(
                     asset_text.contains(required_token),
-                    "/assets/v4/app.js missing required commercial parity string: {required_token}"
+                    "/assets/v4/app.js missing required commercial/CHWG-0235 string: {required_token}"
+                );
+            }
+            for forbidden_legacy in [
+                "What needs my attention",
+                "Summarize what needs my decision",
+                "Security review · 200 Cr",
+                "item(s)",
+            ] {
+                assert!(
+                    !asset_text.contains(forbidden_legacy),
+                    "/assets/v4/app.js must not contain retired copy: {forbidden_legacy}"
                 );
             }
             assert!(
@@ -555,13 +573,186 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
         "/api/v4/workflow",
         json!({
             "independent_review": true,
+            "review_tier_credits": 200,
+            "driver_tool": "claude_code",
+            "reviewer_tool": "codex_cli",
+            "test_verifier_tool": "gemini_cli",
+            "security_verifier_tool": "cursor",
             "protect_sensitive_paths": true,
             "auto_test_before_review": false
         }),
     );
-    assert!(wf_hdr.starts_with("HTTP/1.1 200 OK"));
+    assert!(wf_hdr.starts_with("HTTP/1.1 200 OK"), "{wf_hdr}");
     assert_eq!(wf_val["workflow"]["auto_test_before_review"], false);
+    assert_eq!(wf_val["workflow"]["review_tier_credits"], 200);
+    assert_eq!(wf_val["workflow"]["review_mode"], "quad_programming");
+    assert_eq!(wf_val["workflow"]["driver_tool"], "claude_code");
+    assert_eq!(wf_val["workflow"]["reviewer_tool"], "codex_cli");
+    assert_eq!(wf_val["workflow"]["test_verifier_tool"], "gemini_cli");
+    assert_eq!(wf_val["workflow"]["security_verifier_tool"], "cursor");
     assert!(temp_repo.join(".chinwag/workflow.yaml").is_file());
+    let wf_yaml_text = fs::read_to_string(temp_repo.join(".chinwag/workflow.yaml")).unwrap();
+    assert!(wf_yaml_text.contains("review_tier_credits: 200"));
+    assert!(wf_yaml_text.contains("review_mode: \"quad_programming\""));
+    assert!(wf_yaml_text.contains("test_verifier_tool: \"gemini_cli\""));
+    assert!(wf_yaml_text.contains("security_verifier_tool: \"cursor\""));
+
+    // Verify GET /api/v4/bootstrap round-trips Quad-programming workflow fields cleanly
+    let boot_after_wf_raw = send_raw_http(
+        ui_addr,
+        &format!(
+            "GET /api/v4/bootstrap HTTP/1.1\r\nHost: 127.0.0.1:{ui_port}\r\nSec-Fetch-Site: same-origin\r\nCookie: {cookie_pair}\r\nX-Chinwag-Csrf: {csrf}\r\n\r\n"
+        ),
+    );
+    let (boot_after_wf_hdr, boot_after_wf_body) = split_headers_and_body(&boot_after_wf_raw);
+    assert!(boot_after_wf_hdr.starts_with("HTTP/1.1 200 OK"));
+    let boot_after_wf_json: Value = serde_json::from_slice(boot_after_wf_body).unwrap();
+    assert_eq!(
+        boot_after_wf_json["agents"]["workflow"]["review_tier_credits"],
+        200
+    );
+    assert_eq!(
+        boot_after_wf_json["agents"]["workflow"]["review_mode"],
+        "quad_programming"
+    );
+    assert_eq!(
+        boot_after_wf_json["agents"]["workflow"]["test_verifier_tool"],
+        "gemini_cli"
+    );
+    assert_eq!(
+        boot_after_wf_json["agents"]["workflow"]["security_verifier_tool"],
+        "cursor"
+    );
+
+    // Verify server deduplicates duplicate slots, persists custom & empty `protected_paths: []` round-trip, and rejects invalid inputs
+    let (dedup_wf_hdr, dedup_wf_val) = post_json(
+        "/api/v4/workflow",
+        json!({
+            "driver_tool": "cursor",
+            "reviewer_tool": "cursor",
+            "test_verifier_tool": "cursor",
+            "security_verifier_tool": "cursor",
+            "protected_paths": ["billing/**", "auth/**"]
+        }),
+    );
+    assert!(
+        dedup_wf_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{dedup_wf_hdr}"
+    );
+    let slot_set: std::collections::BTreeSet<&str> = [
+        dedup_wf_val["workflow"]["driver_tool"].as_str().unwrap(),
+        dedup_wf_val["workflow"]["reviewer_tool"].as_str().unwrap(),
+        dedup_wf_val["workflow"]["test_verifier_tool"]
+            .as_str()
+            .unwrap(),
+        dedup_wf_val["workflow"]["security_verifier_tool"]
+            .as_str()
+            .unwrap(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        slot_set.len(),
+        4,
+        "expected 4 pairwise-distinct workflow slots: {dedup_wf_val}"
+    );
+    assert_eq!(
+        dedup_wf_val["workflow"]["protected_paths"],
+        json!(["billing/**", "auth/**"])
+    );
+
+    let (clear_paths_hdr, clear_paths_val) =
+        post_json("/api/v4/workflow", json!({ "protected_paths": [] }));
+    assert!(
+        clear_paths_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{clear_paths_hdr}"
+    );
+    assert_eq!(clear_paths_val["workflow"]["protected_paths"], json!([]));
+
+    let boot_empty_paths_raw = send_raw_http(
+        ui_addr,
+        &format!(
+            "GET /api/v4/bootstrap HTTP/1.1\r\nHost: 127.0.0.1:{ui_port}\r\nSec-Fetch-Site: same-origin\r\nCookie: {cookie_pair}\r\nX-Chinwag-Csrf: {csrf}\r\n\r\n"
+        ),
+    );
+    let (boot_empty_paths_hdr, boot_empty_paths_body) =
+        split_headers_and_body(&boot_empty_paths_raw);
+    assert!(boot_empty_paths_hdr.starts_with("HTTP/1.1 200 OK"));
+    let boot_empty_paths_json: Value = serde_json::from_slice(boot_empty_paths_body).unwrap();
+    assert_eq!(
+        boot_empty_paths_json["agents"]["workflow"]["protected_paths"],
+        json!([]),
+        "removing final protected path must persist empty [] across bootstrap"
+    );
+    assert!(
+        boot_empty_paths_json["agents"]["protected_paths"].is_null(),
+        "server bootstrap must not emit a conflicting top-level agents.protected_paths field"
+    );
+
+    let (bad_credits_hdr, bad_credits_val) =
+        post_json("/api/v4/workflow", json!({ "review_tier_credits": 75 }));
+    assert!(
+        bad_credits_hdr.starts_with("HTTP/1.1 400 Bad Request"),
+        "{bad_credits_hdr}"
+    );
+    assert_eq!(bad_credits_val["error_code"], "invalid_review_tier_credits");
+
+    let (bad_mode_hdr, bad_mode_val) =
+        post_json("/api/v4/workflow", json!({ "review_mode": "invalid_tier" }));
+    assert!(
+        bad_mode_hdr.starts_with("HTTP/1.1 400 Bad Request"),
+        "{bad_mode_hdr}"
+    );
+    assert_eq!(bad_mode_val["error_code"], "invalid_review_mode");
+
+    let (empty_task_hdr, empty_task_val) = post_json(
+        "/api/v4/board/tasks",
+        json!({ "title": "   ", "tool": "claude_code" }),
+    );
+    assert!(
+        empty_task_hdr.starts_with("HTTP/1.1 400 Bad Request"),
+        "{empty_task_hdr}"
+    );
+    assert_eq!(empty_task_val["error_code"], "missing_title");
+
+    // Verify POST /api/v4/board/tasks persists directly and surfaces in GET /api/v4/board queued column
+    let (create_task_hdr, create_task_val) = post_json(
+        "/api/v4/board/tasks",
+        json!({
+            "title": "Add exponential retry backoff to webhook handler",
+            "tool": "claude_code",
+            "workstream": "engineering"
+        }),
+    );
+    assert!(
+        create_task_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{create_task_hdr}"
+    );
+    assert_eq!(create_task_val["ok"], true);
+    assert_eq!(create_task_val["task"]["workstream"], "engineering");
+    assert_eq!(create_task_val["task"]["tool_label"], "Claude Code");
+
+    let board_after_create_raw = send_raw_http(
+        ui_addr,
+        &format!(
+            "GET /api/v4/board HTTP/1.1\r\nHost: 127.0.0.1:{ui_port}\r\nSec-Fetch-Site: same-origin\r\nCookie: {cookie_pair}\r\nX-Chinwag-Csrf: {csrf}\r\n\r\n"
+        ),
+    );
+    let (board_after_create_hdr, board_after_create_body) =
+        split_headers_and_body(&board_after_create_raw);
+    assert!(board_after_create_hdr.starts_with("HTTP/1.1 200 OK"));
+    let board_after_create_json: Value = serde_json::from_slice(board_after_create_body).unwrap();
+    let queued_items = board_after_create_json["columns"][0]["items"]
+        .as_array()
+        .expect("queued column items array");
+    assert!(
+        queued_items.iter().any(|item| {
+            item["title"] == "Add exponential retry backoff to webhook handler"
+                && item["workstream"] == "engineering"
+                && item["tool_label"] == "Claude Code"
+        }),
+        "expected newly queued engineering task in GET /api/v4/board queued column: {queued_items:?}"
+    );
 
     let (sync_hdr, sync_val) = post_json("/api/v4/board/sync", json!({ "target": "github" }));
     assert!(sync_hdr.starts_with("HTTP/1.1 200 OK"));
@@ -601,6 +792,28 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     assert_eq!(ok_tel_val["ok"], true);
     assert_eq!(ok_tel_val["queued"], true);
 
+    for chip_slug in [
+        "scope_fix_last_test",
+        "retry_backoff_webhook",
+        "audit_auth_billing",
+    ] {
+        let (chip_hdr, chip_val) = post_json(
+            "/api/v4/telemetry/track",
+            json!({
+                "event": "ui_board_task_modal_opened",
+                "properties": {
+                    "trigger_surface": "onboarding_banner",
+                    "chip_slug": chip_slug
+                }
+            }),
+        );
+        assert!(
+            chip_hdr.starts_with("HTTP/1.1 202 Accepted"),
+            "expected 202 Accepted for ui_board_task_modal_opened chip_slug={chip_slug}: {chip_hdr} {chip_val}"
+        );
+        assert_eq!(chip_val["ok"], true);
+    }
+
     // Wait up to 3s for background curl worker to deliver to ph_listener
     let ph_deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -628,4 +841,293 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     assert_eq!(delivered_json["properties"]["view"], "credits");
 
     let _ = fs::remove_dir_all(&temp_repo);
+}
+
+#[test]
+fn ui_v4_app_js_behavioral_rollback_and_serialization() {
+    let node_ver = Command::new("node")
+        .arg("--version")
+        .output()
+        .expect("node binary must be installed on PATH for UI v4 behavioral harness");
+    assert!(
+        node_ver.status.success(),
+        "node --version failed: {:?}",
+        node_ver
+    );
+
+    let app_js_path = format!("{}/assets/ui-v4/app.js", env!("CARGO_MANIFEST_DIR"));
+    let harness = r#"
+const fs = require("fs");
+const vm = require("vm");
+const assert = require("assert");
+
+const src = fs.readFileSync(process.env.APP_JS_PATH, "utf8")
+  .replace(/^import\s+\*\s+as\s+Motion\s+from\s+"\.\/motion\.js";/m, "const Motion = new Proxy({ guardAction: async (_btn, fn) => ({ value: await fn(), release: () => {} }) }, { get(t, k) { return k in t ? t[k] : () => ({ update() {}, destroy() {}, show() {}, dismiss() {} }); } });")
+  .replace(/^export\s+/gm, "");
+
+let mockWorkflowHandler = async (body) => ({ ok: true, workflow: body });
+let mockBootstrapHandler = async () => ({ agents: { workflow: { review_tier_credits: 100 } } });
+let mockBoardTaskHandler = async (body) => ({ ok: true, task: { id: "TASK-LOCAL-1", title: body.title, workstream: body.workstream, tool_label: "Claude Code" } });
+const trackedEvents = [];
+
+const sandbox = {
+  console,
+  setTimeout,
+  clearTimeout,
+  Date,
+  Math,
+  JSON,
+  Number,
+  String,
+  Boolean,
+  Array,
+  Object,
+  Set,
+  Map,
+  Promise,
+  Error,
+  RegExp,
+  encodeURIComponent,
+  decodeURIComponent,
+  SERVER_PORT: 5487,
+  CSRF_TOKEN: "test-csrf",
+  fetch: async (url, opts = {}) => {
+    const body = opts.body ? JSON.parse(opts.body) : {};
+    if (url === "/api/v4/telemetry/track") {
+      trackedEvents.push(body);
+      return { ok: true, status: 202, json: async () => ({ ok: true }) };
+    }
+    if (url === "/api/v4/bootstrap") {
+      const res = await mockBootstrapHandler();
+      return { ok: true, status: 200, json: async () => res };
+    }
+    if (url === "/api/v4/workflow") {
+      try {
+        const res = await mockWorkflowHandler(body);
+        return { ok: true, status: 200, json: async () => res };
+      } catch (e) {
+        return { ok: false, status: 500, json: async () => ({ ok: false, error: e.message }) };
+      }
+    }
+    if (url === "/api/v4/board/tasks") {
+      const res = await mockBoardTaskHandler(body);
+      return { ok: true, status: 200, json: async () => res };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  },
+};
+
+vm.createContext(sandbox);
+vm.runInContext(
+  src + "\nglobalThis.__test = { state, normalizeBootstrap, ensureDistinctPairingSlots, saveWorkflowSettings, refreshBootstrapQuietly, queueEngineeringTaskFromLauncher, formatHumanList };",
+  sandbox
+);
+
+(async () => {
+  const T = sandbox.__test;
+
+  // 1. formatHumanList Oxford-comma formatting
+  assert.strictEqual(T.formatHumanList(["Claude Code"]), "Claude Code");
+  assert.strictEqual(T.formatHumanList(["Claude Code", "Cursor"]), "Claude Code and Cursor");
+  assert.strictEqual(T.formatHumanList(["Claude Code", "Codex CLI", "Cursor"]), "Claude Code, Codex CLI, and Cursor");
+
+  // 2. normalizeBootstrap preserves empty protected_paths [] and maps active/review board columns
+  const booted = T.normalizeBootstrap({
+    board: {
+      columns: [
+        { id: "queued", items: [{ id: "Q1" }] },
+        { id: "active", items: [{ id: "A1" }] },
+        { id: "review", items: [{ id: "R1" }] },
+        { id: "shipped", items: [{ id: "S1" }] },
+      ],
+    },
+    agents: {
+      driver_tool: "gemini",
+      reviewer_tool: "codex",
+      workflow: {
+        review_mode: "triad_sandbox",
+        protected_paths: [],
+      },
+    },
+  });
+  assert.strictEqual(booted.board.columns.in_progress[0].id, "A1");
+  assert.strictEqual(booted.board.columns.needs_review[0].id, "R1");
+  assert.deepStrictEqual(booted.agents.protected_paths, []);
+  assert.strictEqual(booted.agents.driver_tool, "gemini_cli");
+  assert.strictEqual(booted.agents.reviewer_tool, "codex_cli");
+  assert.strictEqual(booted.agents.test_verifier_tool, "claude_code");
+  assert.strictEqual(booted.agents.security_verifier_tool, "cursor");
+  assert.strictEqual(booted.agents.review_tier_credits, 150);
+
+  // 3. Failed save rolls back tier, slot, and protected_paths to committed state and permits retry
+  T.state.data = T.normalizeBootstrap({
+    agents: {
+      workflow: {
+        driver_tool: "claude_code",
+        reviewer_tool: "codex_cli",
+        test_verifier_tool: "gemini_cli",
+        security_verifier_tool: "cursor",
+        review_tier_credits: 100,
+        protected_paths: ["auth/**"],
+      },
+    },
+  });
+  T.state.committedWorkflow = null;
+  trackedEvents.length = 0;
+
+  mockWorkflowHandler = async () => { throw new Error("disk full"); };
+  let failed = false;
+  try {
+    await T.saveWorkflowSettings(
+      { review_tier_credits: 200, protected_paths: ["auth/**", "billing/**"] },
+      {
+        changedSlotIdx: 1,
+        nextTool: "cursor",
+        prevTool: "codex_cli",
+        onCommitted: () => trackedEvents.push({ event: "ui_cross_tool_pairing_updated" }),
+      }
+    );
+  } catch (e) {
+    failed = true;
+  }
+  assert.strictEqual(failed, true);
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 100, "failed tier save must revert to committed 100 Cr");
+  assert.strictEqual(T.state.data.agents.reviewer_tool, "codex_cli", "failed slot swap must revert to codex_cli");
+  assert.strictEqual(T.state.data.agents.security_verifier_tool, "cursor", "failed slot swap must revert security slot");
+  assert.deepStrictEqual([...T.state.data.agents.protected_paths], ["auth/**"], "failed path add must revert to committed paths");
+  assert.strictEqual(trackedEvents.some((e) => e.event === "ui_cross_tool_pairing_updated"), false);
+
+  // Retry of 200 Cr succeeds cleanly once backend recovers
+  mockWorkflowHandler = async (body) => ({ ok: true, workflow: body });
+  await T.saveWorkflowSettings({ review_tier_credits: 200 });
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 200);
+
+  // 4. Overlapping saves + mixed-failure interleavings (A-ok/B-fail -> 150 Cr; A-fail/B-ok -> 200 Cr)
+  let callOrder = [];
+  mockWorkflowHandler = async (body) => {
+    callOrder.push(body.review_tier_credits);
+    if (body.review_tier_credits === 150) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    return { ok: true, workflow: body };
+  };
+  const p1 = T.saveWorkflowSettings({ review_tier_credits: 150 });
+  const p2 = T.saveWorkflowSettings({ review_tier_credits: 200 });
+  await Promise.all([p1, p2]);
+  assert.deepStrictEqual(callOrder, [150, 200]);
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 200);
+
+  // Mixed A-ok (150) then B-fail (50) -> rolls back to 150
+  mockWorkflowHandler = async (body) => {
+    if (body.review_tier_credits === 50) throw new Error("reject 50");
+    return { ok: true, workflow: body };
+  };
+  const m1 = T.saveWorkflowSettings({ review_tier_credits: 150 });
+  const m2 = T.saveWorkflowSettings({ review_tier_credits: 50 }).catch(() => "caught");
+  await Promise.all([m1, m2]);
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 150);
+
+  // Mixed A-fail (50) then B-ok (200) -> commits 200 without rollback clobber
+  const m3 = T.saveWorkflowSettings({ review_tier_credits: 50 }).catch(() => "caught");
+  const m4 = T.saveWorkflowSettings({ review_tier_credits: 200 });
+  await Promise.all([m3, m4]);
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 200);
+
+  // 5. Delayed bootstrap GET started before a save that completes BEFORE the GET returns must NOT overwrite committed 200 Cr
+  T.state.data = T.normalizeBootstrap({ agents: { workflow: { review_tier_credits: 100 } } });
+  T.state.committedWorkflow = null;
+  let releaseStaleBootstrap;
+  const staleBootstrapGate = new Promise((resolve) => { releaseStaleBootstrap = resolve; });
+  mockBootstrapHandler = async () => {
+    await staleBootstrapGate;
+    return { agents: { workflow: { review_tier_credits: 100, protected_paths: ["stale/**"] } } };
+  };
+  let lastPersistedPayload = null;
+  mockWorkflowHandler = async (body) => {
+    lastPersistedPayload = body;
+    return { ok: true, workflow: body };
+  };
+  const refreshPromise = T.refreshBootstrapQuietly();
+  await T.saveWorkflowSettings({ review_tier_credits: 200, protected_paths: [] });
+  releaseStaleBootstrap();
+  await refreshPromise;
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 200, "delayed stale bootstrap GET must not revert completed 200 Cr save");
+  assert.strictEqual(T.state.committedWorkflow.review_tier_credits, 200);
+  assert.deepStrictEqual([...T.state.data.agents.protected_paths], []);
+
+  // Subsequent unrelated toggle save must persist 200 Cr (not stale 100 Cr)
+  await T.saveWorkflowSettings({ auto_test_before_review: false });
+  assert.strictEqual(lastPersistedPayload.review_tier_credits, 200);
+  assert.deepStrictEqual(lastPersistedPayload.protected_paths, []);
+
+  // 5b. Delayed bootstrap GET started DURING an active save (hadInFlightAtStart = true) where the save completes BEFORE the GET returns
+  T.state.data = T.normalizeBootstrap({ agents: { workflow: { review_tier_credits: 100, protected_paths: ["old/**"] } } });
+  T.state.committedWorkflow = null;
+  let releaseSaveDuringGet;
+  const saveDuringGetGate = new Promise((resolve) => { releaseSaveDuringGet = resolve; });
+  let releaseGetDuringSave;
+  const getDuringSaveGate = new Promise((resolve) => { releaseGetDuringSave = resolve; });
+  mockWorkflowHandler = async (body) => {
+    await saveDuringGetGate;
+    lastPersistedPayload = body;
+    return { ok: true, workflow: body };
+  };
+  mockBootstrapHandler = async () => {
+    await getDuringSaveGate;
+    return { agents: { workflow: { review_tier_credits: 100, protected_paths: ["old/**"] } } };
+  };
+  const inFlightSavePromise = T.saveWorkflowSettings({ review_tier_credits: 200, protected_paths: ["fresh/**"] });
+  assert.strictEqual(T.state.workflowSaveInFlight, 1);
+  const refreshDuringSavePromise = T.refreshBootstrapQuietly();
+  releaseSaveDuringGet();
+  await inFlightSavePromise;
+  assert.strictEqual(T.state.workflowSaveInFlight, 0);
+  releaseGetDuringSave();
+  await refreshDuringSavePromise;
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 200, "GET started during active save must not revert 200 Cr after save completes");
+  assert.strictEqual(T.state.committedWorkflow.review_tier_credits, 200);
+  assert.deepStrictEqual([...T.state.data.agents.protected_paths], ["fresh/**"]);
+  mockWorkflowHandler = async (body) => {
+    lastPersistedPayload = body;
+    return { ok: true, workflow: body };
+  };
+  await T.saveWorkflowSettings({ independent_review: true });
+  assert.strictEqual(lastPersistedPayload.review_tier_credits, 200);
+  assert.deepStrictEqual(lastPersistedPayload.protected_paths, ["fresh/**"]);
+
+  // 6. queueEngineeringTaskFromLauncher uses server-scrubbed title and deduplicates by task id
+  mockBoardTaskHandler = async () => ({
+    ok: true,
+    task: {
+      id: "TASK-LOCAL-99",
+      title: "Scrubbed webhook retry task",
+      workstream: "engineering",
+      tool_label: "Claude Code",
+    },
+  });
+  await T.queueEngineeringTaskFromLauncher("Raw internal title");
+  await T.queueEngineeringTaskFromLauncher("Duplicate id replay");
+  assert.strictEqual(T.state.data.board.columns.queued.length, 1);
+  assert.strictEqual(T.state.data.board.columns.queued[0].title, "Scrubbed webhook retry task");
+  assert.strictEqual(T.state.launcherDraft, "");
+  console.log("NODE_VM_HARNESS_OK=6_SUITES");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"#;
+
+    let out = Command::new("node")
+        .arg("-e")
+        .arg(harness)
+        .env("APP_JS_PATH", &app_js_path)
+        .output()
+        .expect("execute node VM behavioral harness");
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout_str.contains("NODE_VM_HARNESS_OK=6_SUITES"),
+        "node VM behavioral harness failed:\nstdout: {}\nstderr: {}",
+        stdout_str,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

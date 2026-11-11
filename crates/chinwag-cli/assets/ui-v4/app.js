@@ -409,6 +409,130 @@ function viewportBucket() {
   return "mobile";
 }
 
+const PAIRING_TOOL_IDS = ["claude_code", "codex_cli", "gemini_cli", "cursor"];
+const PAIRING_SLOT_KEYS = ["driver_tool", "reviewer_tool", "test_verifier_tool", "security_verifier_tool"];
+
+function normalizeDetectedToolId(raw) {
+  const low = String(raw || "tool").trim().toLowerCase();
+  if (low === "claude" || low === "claude_code" || low === "claude-code") return "claude_code";
+  if (low === "codex" || low === "codex_cli" || low === "codex-cli") return "codex_cli";
+  if (low === "gemini" || low === "gemini_cli" || low === "gemini-cli") return "gemini_cli";
+  if (low === "cursor") return "cursor";
+  if (low === "gh" || low === "gh_cli" || low === "gh-cli") return "gh_cli";
+  return low.replace(/[^a-z0-9_]/g, "_");
+}
+
+function reviewModeForCredits(credits) {
+  const c = Number(credits);
+  if (c === 50) return "review_handoff";
+  if (c === 150) return "three_tool_check";
+  if (c === 200) return "quad_programming";
+  return "pair_sandbox";
+}
+
+function creditsForReviewMode(mode) {
+  const m = String(mode || "").trim().toLowerCase();
+  if (m === "review_handoff") return 50;
+  if (m === "pair_sandbox" || m === "diffs_touching_3_plus_files") return 100;
+  if (m === "three_tool_check" || m === "triad_sandbox") return 150;
+  if (m === "quad_programming" || m === "quad_sandbox" || m === "security_review") return 200;
+  return null;
+}
+
+function ensureDistinctPairingSlots(agentsObj, changedSlotIdx = -1, nextTool = null, prevTool = null) {
+  if (!agentsObj || typeof agentsObj !== "object") return;
+  if (changedSlotIdx >= 0 && changedSlotIdx < PAIRING_SLOT_KEYS.length && nextTool) {
+    const cleanNext = normalizeToolKind(nextTool);
+    const cleanPrev = prevTool ? normalizeToolKind(prevTool) : null;
+    agentsObj[PAIRING_SLOT_KEYS[changedSlotIdx]] = cleanNext;
+    for (let j = 0; j < PAIRING_SLOT_KEYS.length; j += 1) {
+      if (j === changedSlotIdx) continue;
+      if (normalizeToolKind(agentsObj[PAIRING_SLOT_KEYS[j]]) === cleanNext) {
+        if (cleanPrev && cleanPrev !== cleanNext) {
+          agentsObj[PAIRING_SLOT_KEYS[j]] = cleanPrev;
+        }
+      }
+    }
+  }
+
+  const used = new Set();
+  if (changedSlotIdx >= 0 && changedSlotIdx < PAIRING_SLOT_KEYS.length) {
+    const pinned = normalizeToolKind(agentsObj[PAIRING_SLOT_KEYS[changedSlotIdx]]);
+    agentsObj[PAIRING_SLOT_KEYS[changedSlotIdx]] = pinned;
+    used.add(pinned);
+  }
+  for (let i = 0; i < PAIRING_SLOT_KEYS.length; i += 1) {
+    if (i === changedSlotIdx) continue;
+    const current = normalizeToolKind(agentsObj[PAIRING_SLOT_KEYS[i]]);
+    if (PAIRING_TOOL_IDS.includes(current) && !used.has(current)) {
+      agentsObj[PAIRING_SLOT_KEYS[i]] = current;
+      used.add(current);
+    } else {
+      const replacement = PAIRING_TOOL_IDS.find((cand) => !used.has(cand)) || PAIRING_TOOL_IDS[i];
+      agentsObj[PAIRING_SLOT_KEYS[i]] = replacement;
+      used.add(replacement);
+    }
+  }
+}
+
+function snapshotWorkflowState(agentsObj) {
+  const wf = (agentsObj && agentsObj.workflow) || {};
+  return {
+    workflow: {
+      independent_review: wf.independent_review !== false,
+      protect_sensitive_paths: wf.protect_sensitive_paths !== false,
+      auto_test_before_review: wf.auto_test_before_review !== false,
+    },
+    driver_tool: normalizeToolKind(agentsObj && agentsObj.driver_tool ? agentsObj.driver_tool : "claude_code"),
+    reviewer_tool: normalizeToolKind(agentsObj && agentsObj.reviewer_tool ? agentsObj.reviewer_tool : "codex_cli"),
+    test_verifier_tool: normalizeToolKind(agentsObj && agentsObj.test_verifier_tool ? agentsObj.test_verifier_tool : "gemini_cli"),
+    security_verifier_tool: normalizeToolKind(agentsObj && agentsObj.security_verifier_tool ? agentsObj.security_verifier_tool : "cursor"),
+    review_tier_credits: [50, 100, 150, 200].includes(Number(agentsObj && agentsObj.review_tier_credits))
+      ? Number(agentsObj.review_tier_credits)
+      : 100,
+    protected_paths: Array.isArray(agentsObj && agentsObj.protected_paths)
+      ? agentsObj.protected_paths.map(String)
+      : [],
+  };
+}
+
+function applyWorkflowSnapshot(agentsObj, snap) {
+  if (!agentsObj || !snap) return;
+  agentsObj.workflow = { ...snap.workflow };
+  agentsObj.driver_tool = snap.driver_tool;
+  agentsObj.reviewer_tool = snap.reviewer_tool;
+  agentsObj.test_verifier_tool = snap.test_verifier_tool;
+  agentsObj.security_verifier_tool = snap.security_verifier_tool;
+  agentsObj.review_tier_credits = snap.review_tier_credits;
+  agentsObj.protected_paths = [...snap.protected_paths];
+}
+
+function formatHumanList(items) {
+  const list = Array.isArray(items) ? items.filter((x) => !isAbsent(x)).map(String) : [];
+  if (list.length === 0) return "";
+  if (list.length === 1) return list[0];
+  if (list.length === 2) return `${list[0]} and ${list[1]}`;
+  return `${list.slice(0, -1).join(", ")}, and ${list[list.length - 1]}`;
+}
+
+function prependQueuedBoardTask(resTask, fallback) {
+  const t = resTask && typeof resTask === "object" ? resTask : {};
+  const id = String(t.id || fallback.id || `task-${Date.now()}`);
+  const title = String(!isAbsent(t.title) ? t.title : fallback.title);
+  const workstream = String(!isAbsent(t.workstream) ? t.workstream : fallback.workstream || "engineering");
+  const toolLabel = friendlyToolLabel(t.tool_label || t.assigned_tool || fallback.toolKind || "claude_code");
+  const card = {
+    id,
+    title,
+    workstream,
+    tool_label: toolLabel,
+    created_at: new Date().toISOString(),
+  };
+  const existing = Array.isArray(state.data.board.columns.queued) ? state.data.board.columns.queued : [];
+  state.data.board.columns.queued = [card, ...existing.filter((c) => !c || c.id !== id)];
+  return card;
+}
+
 function normalizeToolKind(labelOrId) {
   const s = String(labelOrId || "").toLowerCase();
   if (s.includes("claude")) return "claude_code";
@@ -670,7 +794,11 @@ const state = {
   onboardingDismissed: false,
   walkthroughDone: false,
   pmLoading: false,
-  pmResponse: null,
+  launcherDraft: "",
+  committedWorkflow: null,
+  workflowSaveSeq: 0,
+  workflowSaveInFlight: 0,
+  workflowSaveChain: Promise.resolve(),
   activeMinutes: 1,
   transportMode: "sse",
   reconnectCount: 0,
@@ -719,6 +847,8 @@ function createEmptyData() {
       ],
       driver_tool: "claude_code",
       reviewer_tool: "codex_cli",
+      test_verifier_tool: "gemini_cli",
+      security_verifier_tool: "cursor",
       review_tier_credits: 100,
       workflow: {
         independent_review: true,
@@ -917,7 +1047,10 @@ function normalizeBootstrap(raw) {
     if (Array.isArray(cols)) {
       for (const col of cols) {
         if (!col || typeof col !== "object") continue;
-        const key = String(col.id || col.key || col.status || "").toLowerCase().replace(/\s+/g, "_");
+        const rawKey = String(col.id || col.key || col.status || "").toLowerCase().replace(/\s+/g, "_");
+        // Backend `ui_workbench_run.rs` emits column IDs `queued | active | review | shipped`,
+        // which map onto client column buckets `queued | in_progress | needs_review | shipped`.
+        const key = rawKey === "active" ? "in_progress" : rawKey === "review" ? "needs_review" : rawKey;
         const list = Array.isArray(col.items) ? col.items : Array.isArray(col.cards) ? col.cards : [];
         if (key in next.board.columns) {
           next.board.columns[key] = list;
@@ -934,12 +1067,21 @@ function normalizeBootstrap(raw) {
     const a = raw.agents;
     if (Array.isArray(a.detected_tools) && a.detected_tools.length > 0) {
       next.agents.detected_tools = a.detected_tools.map((t) => ({
-        id: String(t.id || t.kind || t.name || "tool").toLowerCase().replace(/[^a-z0-9_]/g, "_"),
+        id: normalizeDetectedToolId(t.id || t.kind || t.name || "tool"),
         label: friendlyToolLabel(t.label || t.name || t.id || "Coding tool"),
-        installed: t.installed !== false && t.detected !== false && t.status !== "missing",
+        installed: typeof t.installed === "boolean"
+          ? t.installed
+          : t.detected !== false && t.status !== "missing" && t.status !== "not_installed",
         version: !isAbsent(t.version) ? String(t.version) : null,
         setup_command: !isAbsent(t.setup_command) ? String(t.setup_command) : "chinwag doctor",
       }));
+    }
+    if (!isAbsent(a.driver_tool)) next.agents.driver_tool = normalizeToolKind(a.driver_tool);
+    if (!isAbsent(a.reviewer_tool)) next.agents.reviewer_tool = normalizeToolKind(a.reviewer_tool);
+    if (!isAbsent(a.test_verifier_tool)) next.agents.test_verifier_tool = normalizeToolKind(a.test_verifier_tool);
+    if (!isAbsent(a.security_verifier_tool)) next.agents.security_verifier_tool = normalizeToolKind(a.security_verifier_tool);
+    if ([50, 100, 150, 200].includes(Number(a.review_tier_credits))) {
+      next.agents.review_tier_credits = Number(a.review_tier_credits);
     }
     if (a.workflow && typeof a.workflow === "object") {
       next.agents.workflow = {
@@ -947,11 +1089,31 @@ function normalizeBootstrap(raw) {
         protect_sensitive_paths: a.workflow.protect_sensitive_paths !== false,
         auto_test_before_review: a.workflow.auto_test_before_review !== false,
       };
-      if (Array.isArray(a.workflow.protected_paths) && a.workflow.protected_paths.length > 0) {
+      if (!isAbsent(a.workflow.driver_tool)) {
+        next.agents.driver_tool = normalizeToolKind(a.workflow.driver_tool);
+      }
+      if (!isAbsent(a.workflow.reviewer_tool)) {
+        next.agents.reviewer_tool = normalizeToolKind(a.workflow.reviewer_tool);
+      }
+      if (!isAbsent(a.workflow.test_verifier_tool)) {
+        next.agents.test_verifier_tool = normalizeToolKind(a.workflow.test_verifier_tool);
+      }
+      if (!isAbsent(a.workflow.security_verifier_tool)) {
+        next.agents.security_verifier_tool = normalizeToolKind(a.workflow.security_verifier_tool);
+      }
+      const wfCredits = Number(a.workflow.review_tier_credits);
+      if ([50, 100, 150, 200].includes(wfCredits)) {
+        next.agents.review_tier_credits = wfCredits;
+      } else {
+        const mappedCredits = creditsForReviewMode(a.workflow.review_mode);
+        if (mappedCredits !== null) next.agents.review_tier_credits = mappedCredits;
+      }
+      if (Array.isArray(a.workflow.protected_paths)) {
         next.agents.protected_paths = a.workflow.protected_paths.map(String);
       }
     }
-    if (Array.isArray(a.protected_paths) && a.protected_paths.length > 0) {
+    ensureDistinctPairingSlots(next.agents);
+    if (Array.isArray(a.protected_paths)) {
       next.agents.protected_paths = a.protected_paths.map(String);
     }
     if (Array.isArray(a.learned_rules)) {
@@ -1198,7 +1360,7 @@ const dom = {
   btnMobileMenu: () => document.getElementById("btn-mobile-menu"),
   main: () => document.getElementById("main"),
   sessionAlert: () => document.getElementById("session-alert-host"),
-  viewRoot: () => document.getElementById("view-root"),
+  viewRoot: () => (typeof document !== "undefined" ? document.getElementById("view-root") : null),
   popoverLayer: () => document.getElementById("popover-layer"),
   modalScrim: () => document.getElementById("modal-scrim"),
   modalLayer: () => document.getElementById("modal-layer"),
@@ -1796,9 +1958,12 @@ function openInviteModal(triggerSurface = "global_header") {
   });
 }
 
-function openNewTaskModal(triggerSurface = "board_header", initialTitle = "") {
-  trackUiEvent("ui_board_task_modal_opened", { trigger_surface: triggerSurface });
+function openNewTaskModal(triggerSurface = "board_header", initialTitle = "", chipSlug = null) {
+  const modalOpenedProps = { trigger_surface: triggerSurface };
+  if (chipSlug) modalOpenedProps.chip_slug = chipSlug;
+  trackUiEvent("ui_board_task_modal_opened", modalOpenedProps);
   openModal(null, (close) => {
+    const defaultTool = normalizeToolKind(state.data.agents.driver_tool || "claude_code");
     const titleInput = el("input", {
       type: "text",
       className: "input",
@@ -1810,10 +1975,10 @@ function openNewTaskModal(triggerSurface = "board_header", initialTitle = "") {
     const toolSelect = el(
       "select",
       { className: "select", "aria-label": "Assign coding tool" },
-      el("option", { value: "claude_code" }, "Claude Code"),
-      el("option", { value: "codex_cli" }, "Codex CLI"),
-      el("option", { value: "gemini_cli" }, "Gemini CLI"),
-      el("option", { value: "cursor" }, "Cursor"),
+      el("option", { value: "claude_code", selected: defaultTool === "claude_code" }, "Claude Code"),
+      el("option", { value: "codex_cli", selected: defaultTool === "codex_cli" }, "Codex CLI"),
+      el("option", { value: "gemini_cli", selected: defaultTool === "gemini_cli" }, "Gemini CLI"),
+      el("option", { value: "cursor", selected: defaultTool === "cursor" }, "Cursor"),
     );
     const workstreamSelect = el(
       "select",
@@ -1840,37 +2005,50 @@ function openNewTaskModal(triggerSurface = "board_header", initialTitle = "") {
         }
         titleInput.removeAttribute("aria-invalid");
         errEl.hidden = true;
-        const toolKind = toolSelect.value;
+        const toolKind = normalizeToolKind(toolSelect.value);
         const ws = workstreamSelect.value;
-        await Motion.guardAction(
-          createBtn,
-          async () => {
-            try {
-              await apiRequest("POST", "/api/bus/send", {
-                room: "#eng",
-                body: `New task (${ws}): ${title}`,
+        try {
+          const outcome = await Motion.guardAction(
+            createBtn,
+            async () => {
+              const res = await apiRequest("POST", "/api/v4/board/tasks", {
+                title,
+                tool: toolKind,
+                workstream: ws,
               });
-            } catch (e) {
-              /* local queue fallback when offline */
-            }
-            state.data.board.columns.queued.unshift({
-              id: `task-${Date.now()}`,
-              title,
-              workstream: ws,
-              tool_label: friendlyToolLabel(toolKind),
-              created_at: new Date().toISOString(),
-            });
-            trackUiEvent("ui_board_task_created", {
-              workstream: ws,
-              assigned_tool_kind: toolKind,
-              has_target_files: false,
-            });
-          },
-          { group: footerGroup, busyLabel: "Adding…" },
-        );
-        await close();
-        toaster.show("Task added to Queued");
-        if (state.view === "board") renderCurrentView();
+              try {
+                await apiRequest("POST", "/api/bus/send", {
+                  room: "#eng",
+                  body: `New task (${ws}): ${title}`,
+                });
+              } catch (e) {
+                /* best-effort local bus announcement */
+              }
+              const card = prependQueuedBoardTask(res && res.task, {
+                title,
+                workstream: ws,
+                toolKind,
+              });
+              trackUiEvent("ui_board_task_created", {
+                workstream: card.workstream,
+                assigned_tool_kind: toolKind,
+                has_target_files: false,
+              });
+              return res;
+            },
+            { group: footerGroup, busyLabel: "Adding…" },
+          );
+          if (!outcome) return;
+          await close();
+          toaster.show("Task added to Queued on Board");
+          if (state.view === "board" || state.view === "inbox") renderCurrentView();
+        } catch (err) {
+          trackUiEvent("ui_action_failed", {
+            failed_action: "board_task_create",
+            error_category: "io_error",
+          });
+          toaster.show(err.message || "Could not queue task right now");
+        }
       },
     });
     footerGroup.append(actionBtn({ label: "Cancel", variant: "secondary", onClick: close }), createBtn);
@@ -2063,44 +2241,37 @@ function describeStatusPill(item) {
   return statusPill("Ready to review", "warning", false);
 }
 
-async function submitPmPrompt(promptText, inputSource = "typed_prompt", chipSlug = "none") {
-  const trimmed = String(promptText || "").trim();
+async function queueEngineeringTaskFromLauncher(rawTitle) {
+  const trimmed = String(rawTitle || "").trim();
   if (!trimmed || state.pmLoading) return;
+  const toolKind = normalizeToolKind(state.data.agents.driver_tool || "claude_code");
   state.pmLoading = true;
+  state.launcherDraft = trimmed;
   renderCurrentView();
   try {
-    let replyText = null;
-    try {
-      const res = await apiRequest("POST", "/api/delivery/ask", { prompt: trimmed });
-      const rawReply = String(res.summary || res.message || res.reply || "").trim();
-      if (rawReply && !rawReply.includes("Sitrep (topology=")) {
-        replyText = rawReply;
-      }
-    } catch (e) {
-      replyText = null;
-    }
-    if (!replyText) {
-      const needs = state.data.inbox.counts.needs_decision;
-      const running = state.data.inbox.counts.running;
-      const shipped = state.data.board.summary.shipped_count;
-      replyText =
-        needs > 0
-          ? `${needs} ${needs === 1 ? "change is" : "changes are"} ready for your decision in Inbox, ${running} running in sandbox, and ${shipped} shipped. You can queue "${trimmed}" directly onto the Board.`
-          : `Ready to scope "${trimmed}" in an isolated local workspace with automatic test verification before review.`;
-    }
-    state.pmResponse = { prompt: trimmed, reply: replyText };
-    trackUiEvent("ui_pm_prompt_submitted", {
-      input_source: inputSource,
-      chip_slug: chipSlug,
-      prompt_length_bucket: promptLengthBucket(trimmed.length),
-      pm_outcome: "plan_returned",
+    const res = await apiRequest("POST", "/api/v4/board/tasks", {
+      title: trimmed,
+      tool: toolKind,
+      workstream: "engineering",
     });
+    const card = prependQueuedBoardTask(res && res.task, {
+      title: trimmed,
+      workstream: "engineering",
+      toolKind,
+    });
+    trackUiEvent("ui_board_task_created", {
+      workstream: card.workstream,
+      assigned_tool_kind: toolKind,
+      has_target_files: false,
+    });
+    state.launcherDraft = "";
+    toaster.show("Task added to Queued on Board");
   } catch (err) {
     trackUiEvent("ui_action_failed", {
-      failed_action: "pm_prompt",
+      failed_action: "board_task_create",
       error_category: "io_error",
     });
-    toaster.show("Could not reach Chinwag PM right now");
+    toaster.show(err.message || "Could not queue task right now");
   } finally {
     state.pmLoading = false;
     renderCurrentView();
@@ -2139,42 +2310,56 @@ function renderInboxView(root) {
   );
   listPane.appendChild(viewHead);
 
-  // Ask Chinwag PM inline bar
+  // Direct Engineering Task Launcher
   const pmInput = el("input", {
     type: "text",
     id: "ask-pm-input",
     className: "ask-input",
-    placeholder: "Describe a bug to fix, failing check, or task to scope…",
-    "aria-label": "Ask Chinwag PM",
+    value: state.launcherDraft || "",
+    placeholder: "Describe a bug to fix, failing test, or feature to build…",
+    "aria-label": "New engineering task",
+    onInput: () => {
+      state.launcherDraft = pmInput.value;
+    },
     onKeydown: (ev) => {
       if (ev.key === "Enter") {
         ev.preventDefault();
-        submitPmPrompt(pmInput.value, "typed_prompt", "none");
+        if (pmInput.value.trim()) {
+          queueEngineeringTaskFromLauncher(pmInput.value);
+        } else {
+          openNewTaskModal("onboarding_banner", "");
+        }
       }
     },
   });
   const askSubmitBtn = actionBtn({
-    label: state.pmLoading ? "Scoping…" : "Ask",
+    label: state.pmLoading ? "Queueing…" : "Queue task",
     variant: "secondary",
     size: "sm",
     keycap: "⌘K",
     disabled: state.pmLoading,
-    onClick: () => submitPmPrompt(pmInput.value, "typed_prompt", "none"),
+    onClick: () => {
+      if (pmInput.value.trim()) {
+        queueEngineeringTaskFromLauncher(pmInput.value);
+      } else {
+        openNewTaskModal("onboarding_banner", "");
+      }
+    },
   });
 
   const quickChips = [
-    { label: "What needs my attention", prompt: "Summarize what needs my decision right now", slug: "what_needs_me" },
-    { label: "Fix latest failing test", prompt: "Scope a minimal fix for the latest failing test", slug: "scope_fix_last_test" },
-    { label: "What shipped this week", prompt: "Summarize verified changes shipped this week", slug: "what_shipped_this_week" },
+    { label: "Fix latest failing test", prompt: "Fix latest failing unit or CI test in this repository", slug: "scope_fix_last_test" },
+    { label: "Add webhook retry backoff", prompt: "Add exponential retry backoff and idempotency guard to webhook handler", slug: "retry_backoff_webhook" },
+    { label: "Audit auth & billing checks", prompt: "Audit auth and billing routes for missing input validation or rate limits", slug: "audit_auth_billing" },
   ];
 
   const askSection = el(
     "section",
-    { className: "ask-section", "aria-label": "Ask Chinwag PM" },
+    { className: "ask-section", "aria-label": "New engineering task" },
     el(
       "div",
       { className: "ask-bar" },
-      el("label", { className: "ask-label", for: "ask-pm-input" }, "Ask Chinwag PM"),
+      el("label", { className: "ask-label", for: "ask-pm-input" }, "New task"),
       pmInput,
       askSubmitBtn,
     ),
@@ -2188,49 +2373,13 @@ function renderInboxView(root) {
             type: "button",
             className: "chip",
             onClick: () => {
-              pmInput.value = chip.prompt;
-              submitPmPrompt(chip.prompt, "suggestion_chip", chip.slug);
+              openNewTaskModal("onboarding_banner", chip.prompt, chip.slug);
             },
           },
           chip.label,
         ),
       ),
     ),
-    state.pmResponse
-      ? el(
-          "div",
-          { className: "ask-result", role: "region", "aria-label": "Chinwag PM response" },
-          el(
-            "div",
-            { className: "ask-result-head" },
-            el("span", { className: "t-12 w600 secondary" }, "Chinwag PM"),
-            el(
-              "div",
-              { className: "view-actions" },
-              actionBtn({
-                label: "Create task on Board",
-                variant: "secondary",
-                size: "sm",
-                onClick: () => openNewTaskModal("onboarding_banner", state.pmResponse.prompt),
-              }),
-              el(
-                "button",
-                {
-                  type: "button",
-                  className: "btn-icon",
-                  "aria-label": "Dismiss response",
-                  onClick: () => {
-                    state.pmResponse = null;
-                    renderCurrentView();
-                  },
-                },
-                ICONS.close(),
-              ),
-            ),
-          ),
-          el("p", { className: "t-14" }, state.pmResponse.reply),
-        )
-      : null,
   );
   listPane.appendChild(askSection);
 
@@ -2366,7 +2515,7 @@ function renderInboxView(root) {
             el(
               "p",
               { className: "empty-body" },
-              "Ask Chinwag PM above to scope a fix, or step through a 15-second sample diff review to see how approvals and safety holds work.",
+              "Queue an engineering task above, or step through a 15-second sample diff review to see how approvals and safety holds work.",
             ),
             el(
               "div",
@@ -3226,7 +3375,7 @@ function renderSheetFooter(detail, sheetFoot, armPrimary = false) {
           walkthrough_mode: "sample_item",
           is_under_15s: Date.now() - state.sheetOpenedAtMs < 15000,
         });
-        toaster.show("Sample walkthrough complete. Ask Chinwag PM whenever you're ready.");
+        toaster.show("Sample walkthrough complete. Queue an engineering task whenever you're ready.");
         closeReviewSheetAndNavigate();
       },
     });
@@ -3741,32 +3890,156 @@ function renderBoardView(root) {
 
 // ── 8 · View 3: Agents & Rules ───────────────────────────────────────────────
 
-async function saveWorkflowSettings(patch) {
-  const prev = { ...state.data.agents.workflow };
-  const next = { ...prev, ...patch };
-  state.data.agents.workflow = next;
-  try {
-    const res = await apiRequest("POST", "/api/v4/workflow", {
-      independent_review: next.independent_review,
-      protect_sensitive_paths: next.protect_sensitive_paths,
-      auto_test_before_review: next.auto_test_before_review,
-    });
-    if (res && res.workflow && typeof res.workflow === "object") {
-      state.data.agents.workflow = {
-        independent_review: res.workflow.independent_review !== false,
-        protect_sensitive_paths: res.workflow.protect_sensitive_paths !== false,
-        auto_test_before_review: res.workflow.auto_test_before_review !== false,
-      };
+async function saveWorkflowSettings(mutatorOrPatch = {}, options = {}) {
+  const initialAgents = state.data.agents;
+  if (!state.committedWorkflow) {
+    state.committedWorkflow = snapshotWorkflowState(initialAgents);
+  }
+
+  const draft = snapshotWorkflowState(initialAgents);
+  let changedSlotIdx = Number.isInteger(options.changedSlotIdx) ? options.changedSlotIdx : -1;
+  let nextTool = options.nextTool || null;
+  let prevTool = options.prevTool || null;
+
+  if (typeof mutatorOrPatch === "function") {
+    mutatorOrPatch(draft);
+  } else if (mutatorOrPatch && typeof mutatorOrPatch === "object") {
+    if (typeof mutatorOrPatch.independent_review === "boolean") {
+      draft.workflow.independent_review = mutatorOrPatch.independent_review;
     }
-    toaster.show("Workflow settings saved");
+    if (typeof mutatorOrPatch.protect_sensitive_paths === "boolean") {
+      draft.workflow.protect_sensitive_paths = mutatorOrPatch.protect_sensitive_paths;
+    }
+    if (typeof mutatorOrPatch.auto_test_before_review === "boolean") {
+      draft.workflow.auto_test_before_review = mutatorOrPatch.auto_test_before_review;
+    }
+    if (!isAbsent(mutatorOrPatch.driver_tool)) {
+      prevTool = prevTool || draft.driver_tool;
+      nextTool = nextTool || mutatorOrPatch.driver_tool;
+      if (changedSlotIdx < 0) changedSlotIdx = 0;
+      draft.driver_tool = normalizeToolKind(mutatorOrPatch.driver_tool);
+    }
+    if (!isAbsent(mutatorOrPatch.reviewer_tool)) {
+      prevTool = prevTool || draft.reviewer_tool;
+      nextTool = nextTool || mutatorOrPatch.reviewer_tool;
+      if (changedSlotIdx < 0) changedSlotIdx = 1;
+      draft.reviewer_tool = normalizeToolKind(mutatorOrPatch.reviewer_tool);
+    }
+    if (!isAbsent(mutatorOrPatch.test_verifier_tool)) {
+      prevTool = prevTool || draft.test_verifier_tool;
+      nextTool = nextTool || mutatorOrPatch.test_verifier_tool;
+      if (changedSlotIdx < 0) changedSlotIdx = 2;
+      draft.test_verifier_tool = normalizeToolKind(mutatorOrPatch.test_verifier_tool);
+    }
+    if (!isAbsent(mutatorOrPatch.security_verifier_tool)) {
+      prevTool = prevTool || draft.security_verifier_tool;
+      nextTool = nextTool || mutatorOrPatch.security_verifier_tool;
+      if (changedSlotIdx < 0) changedSlotIdx = 3;
+      draft.security_verifier_tool = normalizeToolKind(mutatorOrPatch.security_verifier_tool);
+    }
+    if ([50, 100, 150, 200].includes(Number(mutatorOrPatch.review_tier_credits))) {
+      draft.review_tier_credits = Number(mutatorOrPatch.review_tier_credits);
+    }
+    if (Array.isArray(mutatorOrPatch.protected_paths)) {
+      draft.protected_paths = mutatorOrPatch.protected_paths.map(String);
+    }
+  }
+
+  ensureDistinctPairingSlots(draft, changedSlotIdx, nextTool, prevTool);
+  applyWorkflowSnapshot(initialAgents, draft);
+
+  if (options.renderOptimistic) {
+    renderCurrentView();
+    if (options.restoreFocusId && typeof document !== "undefined") {
+      const focusTarget = document.getElementById(options.restoreFocusId);
+      if (focusTarget && typeof focusTarget.focus === "function") {
+        focusTarget.focus();
+      }
+    }
+  }
+
+  const toastMessage = options.toastMessage || (mutatorOrPatch && mutatorOrPatch.toastMessage) || "Workflow settings saved";
+  const silentToast = Boolean(options.silentToast || (mutatorOrPatch && mutatorOrPatch.silentToast));
+
+  const payload = {
+    independent_review: draft.workflow.independent_review,
+    protect_sensitive_paths: draft.workflow.protect_sensitive_paths,
+    auto_test_before_review: draft.workflow.auto_test_before_review,
+    driver_tool: draft.driver_tool,
+    reviewer_tool: draft.reviewer_tool,
+    test_verifier_tool: draft.test_verifier_tool,
+    security_verifier_tool: draft.security_verifier_tool,
+    review_tier_credits: draft.review_tier_credits,
+    review_mode: reviewModeForCredits(draft.review_tier_credits),
+    protected_paths: [...draft.protected_paths],
+  };
+
+  const seq = (state.workflowSaveSeq || 0) + 1;
+  state.workflowSaveSeq = seq;
+  state.workflowSaveInFlight = (state.workflowSaveInFlight || 0) + 1;
+
+  const runRequest = () => apiRequest("POST", "/api/v4/workflow", payload);
+  const reqPromise = state.workflowSaveChain.then(runRequest, runRequest);
+  state.workflowSaveChain = reqPromise.catch(() => {});
+
+  try {
+    const res = await reqPromise;
+    const committed = snapshotWorkflowState(draft);
+    if (res && res.workflow && typeof res.workflow === "object") {
+      const w = res.workflow;
+      committed.workflow = {
+        independent_review: w.independent_review !== false,
+        protect_sensitive_paths: w.protect_sensitive_paths !== false,
+        auto_test_before_review: w.auto_test_before_review !== false,
+      };
+      if (!isAbsent(w.driver_tool)) committed.driver_tool = normalizeToolKind(w.driver_tool);
+      if (!isAbsent(w.reviewer_tool)) committed.reviewer_tool = normalizeToolKind(w.reviewer_tool);
+      if (!isAbsent(w.test_verifier_tool)) committed.test_verifier_tool = normalizeToolKind(w.test_verifier_tool);
+      if (!isAbsent(w.security_verifier_tool)) committed.security_verifier_tool = normalizeToolKind(w.security_verifier_tool);
+      if ([50, 100, 150, 200].includes(Number(w.review_tier_credits))) {
+        committed.review_tier_credits = Number(w.review_tier_credits);
+      }
+      if (Array.isArray(w.protected_paths)) {
+        committed.protected_paths = w.protected_paths.map(String);
+      }
+      ensureDistinctPairingSlots(committed);
+    }
+    state.committedWorkflow = committed;
+
+    if (seq === state.workflowSaveSeq) {
+      applyWorkflowSnapshot(state.data.agents, committed);
+    }
+    if (typeof options.onCommitted === "function") {
+      options.onCommitted(committed);
+    }
+    if (!silentToast && seq === state.workflowSaveSeq) {
+      const msg = typeof toastMessage === "function" ? toastMessage(committed) : toastMessage;
+      toaster.show(msg);
+    }
+    return committed;
   } catch (err) {
-    state.data.agents.workflow = prev;
+    if (seq === state.workflowSaveSeq && state.committedWorkflow) {
+      applyWorkflowSnapshot(state.data.agents, state.committedWorkflow);
+      if (state.view === "agents") {
+        renderCurrentView();
+        if (options.restoreFocusId && typeof document !== "undefined") {
+          const focusTarget = document.getElementById(options.restoreFocusId);
+          if (focusTarget && typeof focusTarget.focus === "function") {
+            focusTarget.focus();
+          }
+        }
+      }
+    }
     trackUiEvent("ui_action_failed", {
       failed_action: "guardrail_save",
       error_category: "io_error",
     });
-    toaster.show(err.message || "Could not save workflow settings");
+    if (seq === state.workflowSaveSeq) {
+      toaster.show(err.message || "Could not save workflow settings");
+    }
     throw err;
+  } finally {
+    state.workflowSaveInFlight = Math.max(0, (state.workflowSaveInFlight || 1) - 1);
   }
 }
 
@@ -3847,66 +4120,60 @@ function renderAgentsView(root) {
   );
   stack.appendChild(toolsBlock);
 
-  // Section 2: Independent Review (Driver != Reviewer)
+  // Section 2: Independent Review (Dynamic 2 / 3 / 4 Tool Slots + Quad-Programming)
   const toolOptions = [
     { value: "claude_code", label: "Claude Code" },
     { value: "codex_cli", label: "Codex CLI" },
     { value: "gemini_cli", label: "Gemini CLI" },
     { value: "cursor", label: "Cursor" },
   ];
-  const driverSelect = el(
-    "select",
-    {
-      className: "select",
-      "aria-label": "Primary coding tool (Driver)",
-      onChange: () => {
-        agents.driver_tool = driverSelect.value;
-        if (agents.reviewer_tool === agents.driver_tool) {
-          const alt = toolOptions.find((o) => o.value !== agents.driver_tool);
-          if (alt) {
-            agents.reviewer_tool = alt.value;
-            reviewerSelect.value = alt.value;
-          }
-        }
-        trackUiEvent("ui_cross_tool_pairing_updated", {
-          driver_tool_kind: agents.driver_tool,
-          reviewer_tool_kind: agents.reviewer_tool,
-          function_credits_cost: agents.review_tier_credits,
-        });
-        toaster.show(`Driver set to ${friendlyToolLabel(agents.driver_tool)}, reviewed by ${friendlyToolLabel(agents.reviewer_tool)}`);
-      },
-    },
-    toolOptions.map((o) => el("option", { value: o.value, selected: agents.driver_tool === o.value }, o.label)),
-  );
-
-  const reviewerSelect = el(
-    "select",
-    {
-      className: "select",
-      "aria-label": "Independent reviewer tool",
-      onChange: () => {
-        if (reviewerSelect.value === agents.driver_tool) {
-          const alt = toolOptions.find((o) => o.value !== agents.driver_tool);
-          if (alt) reviewerSelect.value = alt.value;
-          toaster.show("Reviewer must be a different tool than the driver");
-        }
-        agents.reviewer_tool = reviewerSelect.value;
-        trackUiEvent("ui_cross_tool_pairing_updated", {
-          driver_tool_kind: agents.driver_tool,
-          reviewer_tool_kind: agents.reviewer_tool,
-          function_credits_cost: agents.review_tier_credits,
-        });
-      },
-    },
-    toolOptions.map((o) => el("option", { value: o.value, selected: agents.reviewer_tool === o.value }, o.label)),
-  );
 
   const reviewTiers = [
-    { credits: 50, title: "Review handoff · 50 Cr", desc: "Second tool reviews the diff before Inbox" },
-    { credits: 100, title: "Pair sandbox · 100 Cr", desc: "Driver and reviewer iterate until tests pass" },
-    { credits: 150, title: "Three-tool check · 150 Cr", desc: "Adds dedicated edge-case test verification" },
-    { credits: 200, title: "Security review · 200 Cr", desc: "Full verification for auth, billing, and migrations" },
+    { credits: 50, slots: 2, mode: "review_handoff", title: "Review handoff · 50 Cr", desc: "Second tool reviews the diff before Inbox" },
+    { credits: 100, slots: 2, mode: "pair_sandbox", title: "Pair sandbox · 100 Cr", desc: "Driver and reviewer iterate until tests pass" },
+    { credits: 150, slots: 3, mode: "three_tool_check", title: "Three-tool check · 150 Cr", desc: "Adds a 3rd tool for edge-case & test verification" },
+    { credits: 200, slots: 4, mode: "quad_programming", title: "Quad-programming · 200 Cr", desc: "Four independent tools: driver, code review, tests, and security audit" },
   ];
+
+  ensureDistinctPairingSlots(agents);
+  const activeTier = reviewTiers.find((t) => t.credits === agents.review_tier_credits) || reviewTiers[1];
+  const activeSlots = activeTier.slots;
+
+  const allSlotSpecs = [
+    {
+      slotIdx: 0,
+      key: "driver_tool",
+      label: "1. Writes the change (Driver)",
+      ariaLabel: "Primary coding tool (Driver)",
+    },
+    {
+      slotIdx: 1,
+      key: "reviewer_tool",
+      label: activeSlots === 2 ? "2. Reviews code & diff (Reviewer)" : "2. Reviews code & architecture (Reviewer)",
+      ariaLabel: "Independent reviewer tool",
+    },
+    {
+      slotIdx: 2,
+      key: "test_verifier_tool",
+      label: "3. Breaks edge cases & tests (Test Verifier)",
+      ariaLabel: "Independent test verifier tool",
+    },
+    {
+      slotIdx: 3,
+      key: "security_verifier_tool",
+      label: "4. Audits security, auth & migrations (Security Verifier)",
+      ariaLabel: "Independent security verifier tool",
+    },
+  ];
+  const visibleSlotSpecs = allSlotSpecs.slice(0, activeSlots);
+
+  const installedToolSet = new Set(
+    agents.detected_tools.filter((t) => t.installed).map((t) => normalizeDetectedToolId(t.id)),
+  );
+  const missingActiveToolLabels = visibleSlotSpecs
+    .map((spec) => agents[spec.key])
+    .filter((toolId, idx, arr) => arr.indexOf(toolId) === idx && !installedToolSet.has(toolId))
+    .map((toolId) => friendlyToolLabel(toolId));
 
   const pairingSection = el(
     "section",
@@ -3941,10 +4208,59 @@ function renderAgentsView(root) {
       ),
       el(
         "div",
-        { className: "pairing-selects" },
-        el("div", { className: "section-block" }, el("label", { className: "t-13 w500" }, "Writes the change (Driver)"), driverSelect),
-        el("div", { className: "section-block" }, el("label", { className: "t-13 w500" }, "Reviews independently (Reviewer)"), reviewerSelect),
+        { className: "pairing-selects", dataset: { slots: String(activeSlots) } },
+        visibleSlotSpecs.map((spec) => {
+          const selectId = `pairing-slot-${spec.key}`;
+          const selectEl = el(
+            "select",
+            {
+              id: selectId,
+              className: "select",
+              "aria-label": spec.ariaLabel,
+              onChange: () => {
+                const prevTool = state.data.agents[spec.key];
+                const nextTool = selectEl.value;
+                if (prevTool === nextTool) return;
+                saveWorkflowSettings(
+                  {},
+                  {
+                    changedSlotIdx: spec.slotIdx,
+                    nextTool,
+                    prevTool,
+                    renderOptimistic: true,
+                    restoreFocusId: selectId,
+                    toastMessage: (committed) =>
+                      `${spec.label.replace(/^\d+\.\s*/, "")} set to ${friendlyToolLabel(committed[spec.key])}`,
+                    onCommitted: (committed) => {
+                      trackUiEvent("ui_cross_tool_pairing_updated", {
+                        driver_tool_kind: committed.driver_tool,
+                        reviewer_tool_kind: committed.reviewer_tool,
+                        function_credits_cost: committed.review_tier_credits,
+                      });
+                    },
+                  },
+                ).catch(() => {});
+              },
+            },
+            toolOptions.map((o) =>
+              el("option", { value: o.value, selected: agents[spec.key] === o.value }, o.label),
+            ),
+          );
+          return el(
+            "div",
+            { className: "section-block" },
+            el("label", { className: "t-13 w500", for: selectId }, spec.label),
+            selectEl,
+          );
+        }),
       ),
+      missingActiveToolLabels.length > 0
+        ? el(
+            "p",
+            { className: "t-12 secondary" },
+            `${formatHumanList(missingActiveToolLabels)} ${missingActiveToolLabels.length === 1 ? "is" : "are"} not detected locally yet — copy ${missingActiveToolLabels.length === 1 ? "its" : "their"} install command under Detected coding tools above before running this check.`,
+          )
+        : null,
       el(
         "div",
         { className: "radio-cards", role: "radiogroup", "aria-label": "Review depth" },
@@ -3957,13 +4273,21 @@ function renderAgentsView(root) {
               className: "radio-card",
               "aria-checked": agents.review_tier_credits === tier.credits ? "true" : "false",
               onClick: () => {
-                agents.review_tier_credits = tier.credits;
-                trackUiEvent("ui_cross_tool_pairing_updated", {
-                  driver_tool_kind: agents.driver_tool,
-                  reviewer_tool_kind: agents.reviewer_tool,
-                  function_credits_cost: tier.credits,
-                });
-                renderCurrentView();
+                if (state.data.agents.review_tier_credits === tier.credits) return;
+                saveWorkflowSettings(
+                  { review_tier_credits: tier.credits },
+                  {
+                    renderOptimistic: true,
+                    toastMessage: `Review depth set to ${tier.title}`,
+                    onCommitted: (committed) => {
+                      trackUiEvent("ui_cross_tool_pairing_updated", {
+                        driver_tool_kind: committed.driver_tool,
+                        reviewer_tool_kind: committed.reviewer_tool,
+                        function_credits_cost: committed.review_tier_credits,
+                      });
+                    },
+                  },
+                ).catch(() => {});
               },
             },
             el("span", { className: "t-13 w600 num" }, tier.title),
@@ -3992,14 +4316,22 @@ function renderAgentsView(root) {
         globInput.focus();
         return;
       }
-      if (!agents.protected_paths.includes(val)) {
-        agents.protected_paths.push(val);
-        trackUiEvent("ui_protected_path_added", {
-          path_category: "custom_glob",
-          protected_paths_count_bucket: countBucket(agents.protected_paths.length),
-        });
-        toaster.show(`Protected path added: ${val}`);
-        renderCurrentView();
+      const curPaths = state.data.agents.protected_paths;
+      if (!curPaths.includes(val)) {
+        const nextPaths = [...curPaths, val];
+        saveWorkflowSettings(
+          { protected_paths: nextPaths },
+          {
+            renderOptimistic: true,
+            toastMessage: `Protected path added: ${val}`,
+            onCommitted: (committed) => {
+              trackUiEvent("ui_protected_path_added", {
+                path_category: "custom_glob",
+                protected_paths_count_bucket: countBucket(committed.protected_paths.length),
+              });
+            },
+          },
+        ).catch(() => {});
       }
     },
   });
@@ -4076,12 +4408,20 @@ function renderAgentsView(root) {
                   type: "button",
                   "aria-label": `Remove ${glob}`,
                   onClick: () => {
-                    agents.protected_paths = agents.protected_paths.filter((g) => g !== glob);
-                    trackUiEvent("ui_protected_path_removed", {
-                      path_category: "custom_glob",
-                      protected_paths_count_bucket: countBucket(agents.protected_paths.length),
-                    });
-                    renderCurrentView();
+                    const nextPaths = state.data.agents.protected_paths.filter((g) => g !== glob);
+                    saveWorkflowSettings(
+                      { protected_paths: nextPaths },
+                      {
+                        renderOptimistic: true,
+                        toastMessage: `Removed protected path: ${glob}`,
+                        onCommitted: (committed) => {
+                          trackUiEvent("ui_protected_path_removed", {
+                            path_category: "custom_glob",
+                            protected_paths_count_bucket: countBucket(committed.protected_paths.length),
+                          });
+                        },
+                      },
+                    ).catch(() => {});
                   },
                 },
                 "×",
@@ -4731,7 +5071,7 @@ function wireKeyboardShortcuts() {
   document.addEventListener("keydown", (ev) => {
     const mod = ev.metaKey || ev.ctrlKey;
 
-    // Cmd/Ctrl + K -> Focus Ask Chinwag PM input
+    // Cmd/Ctrl + K -> Focus New engineering task input
     if (mod && (ev.key === "k" || ev.key === "K")) {
       ev.preventDefault();
       if (state.view !== "inbox") {
@@ -4835,8 +5175,20 @@ let streamRetryTimer = 0;
 
 async function refreshBootstrapQuietly() {
   try {
+    const hadInFlightAtStart = (state.workflowSaveInFlight || 0) > 0;
+    const startSaveSeq = state.workflowSaveSeq || 0;
     const raw = await apiRequest("GET", "/api/v4/bootstrap");
-    state.data = normalizeBootstrap(raw);
+    const fresh = normalizeBootstrap(raw);
+    if (
+      hadInFlightAtStart ||
+      (state.workflowSaveInFlight || 0) > 0 ||
+      (state.workflowSaveSeq || 0) !== startSaveSeq
+    ) {
+      applyWorkflowSnapshot(fresh.agents, snapshotWorkflowState(state.data.agents));
+    } else {
+      state.committedWorkflow = snapshotWorkflowState(fresh.agents);
+    }
+    state.data = fresh;
     state.bootstrapOk = true;
     syncHeaderChrome();
     return true;
