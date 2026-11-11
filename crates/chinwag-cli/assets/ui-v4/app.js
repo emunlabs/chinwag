@@ -475,6 +475,64 @@ function ensureDistinctPairingSlots(agentsObj, changedSlotIdx = -1, nextTool = n
   }
 }
 
+function snapshotWorkflowState(agentsObj) {
+  const wf = (agentsObj && agentsObj.workflow) || {};
+  return {
+    workflow: {
+      independent_review: wf.independent_review !== false,
+      protect_sensitive_paths: wf.protect_sensitive_paths !== false,
+      auto_test_before_review: wf.auto_test_before_review !== false,
+    },
+    driver_tool: normalizeToolKind(agentsObj && agentsObj.driver_tool ? agentsObj.driver_tool : "claude_code"),
+    reviewer_tool: normalizeToolKind(agentsObj && agentsObj.reviewer_tool ? agentsObj.reviewer_tool : "codex_cli"),
+    test_verifier_tool: normalizeToolKind(agentsObj && agentsObj.test_verifier_tool ? agentsObj.test_verifier_tool : "gemini_cli"),
+    security_verifier_tool: normalizeToolKind(agentsObj && agentsObj.security_verifier_tool ? agentsObj.security_verifier_tool : "cursor"),
+    review_tier_credits: [50, 100, 150, 200].includes(Number(agentsObj && agentsObj.review_tier_credits))
+      ? Number(agentsObj.review_tier_credits)
+      : 100,
+    protected_paths: Array.isArray(agentsObj && agentsObj.protected_paths)
+      ? agentsObj.protected_paths.map(String)
+      : [],
+  };
+}
+
+function applyWorkflowSnapshot(agentsObj, snap) {
+  if (!agentsObj || !snap) return;
+  agentsObj.workflow = { ...snap.workflow };
+  agentsObj.driver_tool = snap.driver_tool;
+  agentsObj.reviewer_tool = snap.reviewer_tool;
+  agentsObj.test_verifier_tool = snap.test_verifier_tool;
+  agentsObj.security_verifier_tool = snap.security_verifier_tool;
+  agentsObj.review_tier_credits = snap.review_tier_credits;
+  agentsObj.protected_paths = [...snap.protected_paths];
+}
+
+function formatHumanList(items) {
+  const list = Array.isArray(items) ? items.filter((x) => !isAbsent(x)).map(String) : [];
+  if (list.length === 0) return "";
+  if (list.length === 1) return list[0];
+  if (list.length === 2) return `${list[0]} and ${list[1]}`;
+  return `${list.slice(0, -1).join(", ")}, and ${list[list.length - 1]}`;
+}
+
+function prependQueuedBoardTask(resTask, fallback) {
+  const t = resTask && typeof resTask === "object" ? resTask : {};
+  const id = String(t.id || fallback.id || `task-${Date.now()}`);
+  const title = String(!isAbsent(t.title) ? t.title : fallback.title);
+  const workstream = String(!isAbsent(t.workstream) ? t.workstream : fallback.workstream || "engineering");
+  const toolLabel = friendlyToolLabel(t.tool_label || t.assigned_tool || fallback.toolKind || "claude_code");
+  const card = {
+    id,
+    title,
+    workstream,
+    tool_label: toolLabel,
+    created_at: new Date().toISOString(),
+  };
+  const existing = Array.isArray(state.data.board.columns.queued) ? state.data.board.columns.queued : [];
+  state.data.board.columns.queued = [card, ...existing.filter((c) => !c || c.id !== id)];
+  return card;
+}
+
 function normalizeToolKind(labelOrId) {
   const s = String(labelOrId || "").toLowerCase();
   if (s.includes("claude")) return "claude_code";
@@ -737,6 +795,10 @@ const state = {
   walkthroughDone: false,
   pmLoading: false,
   launcherDraft: "",
+  committedWorkflow: null,
+  workflowSaveSeq: 0,
+  workflowSaveInFlight: 0,
+  workflowSaveChain: Promise.resolve(),
   activeMinutes: 1,
   transportMode: "sse",
   reconnectCount: 0,
@@ -986,6 +1048,8 @@ function normalizeBootstrap(raw) {
       for (const col of cols) {
         if (!col || typeof col !== "object") continue;
         const rawKey = String(col.id || col.key || col.status || "").toLowerCase().replace(/\s+/g, "_");
+        // Backend `ui_workbench_run.rs` emits column IDs `queued | active | review | shipped`,
+        // which map onto client column buckets `queued | in_progress | needs_review | shipped`.
         const key = rawKey === "active" ? "in_progress" : rawKey === "review" ? "needs_review" : rawKey;
         const list = Array.isArray(col.items) ? col.items : Array.isArray(col.cards) ? col.cards : [];
         if (key in next.board.columns) {
@@ -1044,12 +1108,12 @@ function normalizeBootstrap(raw) {
         const mappedCredits = creditsForReviewMode(a.workflow.review_mode);
         if (mappedCredits !== null) next.agents.review_tier_credits = mappedCredits;
       }
-      if (Array.isArray(a.workflow.protected_paths) && a.workflow.protected_paths.length > 0) {
+      if (Array.isArray(a.workflow.protected_paths)) {
         next.agents.protected_paths = a.workflow.protected_paths.map(String);
       }
     }
     ensureDistinctPairingSlots(next.agents);
-    if (Array.isArray(a.protected_paths) && a.protected_paths.length > 0) {
+    if (Array.isArray(a.protected_paths)) {
       next.agents.protected_paths = a.protected_paths.map(String);
     }
     if (Array.isArray(a.learned_rules)) {
@@ -1296,7 +1360,7 @@ const dom = {
   btnMobileMenu: () => document.getElementById("btn-mobile-menu"),
   main: () => document.getElementById("main"),
   sessionAlert: () => document.getElementById("session-alert-host"),
-  viewRoot: () => document.getElementById("view-root"),
+  viewRoot: () => (typeof document !== "undefined" ? document.getElementById("view-root") : null),
   popoverLayer: () => document.getElementById("popover-layer"),
   modalScrim: () => document.getElementById("modal-scrim"),
   modalLayer: () => document.getElementById("modal-layer"),
@@ -1894,8 +1958,10 @@ function openInviteModal(triggerSurface = "global_header") {
   });
 }
 
-function openNewTaskModal(triggerSurface = "board_header", initialTitle = "") {
-  trackUiEvent("ui_board_task_modal_opened", { trigger_surface: triggerSurface });
+function openNewTaskModal(triggerSurface = "board_header", initialTitle = "", chipSlug = null) {
+  const modalOpenedProps = { trigger_surface: triggerSurface };
+  if (chipSlug) modalOpenedProps.chip_slug = chipSlug;
+  trackUiEvent("ui_board_task_modal_opened", modalOpenedProps);
   openModal(null, (close) => {
     const defaultTool = normalizeToolKind(state.data.agents.driver_tool || "claude_code");
     const titleInput = el("input", {
@@ -1958,15 +2024,13 @@ function openNewTaskModal(triggerSurface = "board_header", initialTitle = "") {
               } catch (e) {
                 /* best-effort local bus announcement */
               }
-              state.data.board.columns.queued.unshift({
-                id: (res && res.task && res.task.id) || `task-${Date.now()}`,
+              const card = prependQueuedBoardTask(res && res.task, {
                 title,
                 workstream: ws,
-                tool_label: friendlyToolLabel(toolKind),
-                created_at: new Date().toISOString(),
+                toolKind,
               });
               trackUiEvent("ui_board_task_created", {
-                workstream: ws,
+                workstream: card.workstream,
                 assigned_tool_kind: toolKind,
                 has_target_files: false,
               });
@@ -2190,15 +2254,13 @@ async function queueEngineeringTaskFromLauncher(rawTitle) {
       tool: toolKind,
       workstream: "engineering",
     });
-    state.data.board.columns.queued.unshift({
-      id: (res && res.task && res.task.id) || `task-${Date.now()}`,
+    const card = prependQueuedBoardTask(res && res.task, {
       title: trimmed,
       workstream: "engineering",
-      tool_label: friendlyToolLabel(toolKind),
-      created_at: new Date().toISOString(),
+      toolKind,
     });
     trackUiEvent("ui_board_task_created", {
-      workstream: "engineering",
+      workstream: card.workstream,
       assigned_tool_kind: toolKind,
       has_target_files: false,
     });
@@ -2311,13 +2373,7 @@ function renderInboxView(root) {
             type: "button",
             className: "chip",
             onClick: () => {
-              trackUiEvent("ui_pm_prompt_submitted", {
-                input_source: "suggestion_chip",
-                chip_slug: chip.slug,
-                prompt_length_bucket: promptLengthBucket(chip.prompt.length),
-                pm_outcome: "plan_returned",
-              });
-              openNewTaskModal("onboarding_banner", chip.prompt);
+              openNewTaskModal("onboarding_banner", chip.prompt, chip.slug);
             },
           },
           chip.label,
@@ -3834,90 +3890,148 @@ function renderBoardView(root) {
 
 // ── 8 · View 3: Agents & Rules ───────────────────────────────────────────────
 
-async function saveWorkflowSettings(patch = {}) {
-  const agents = state.data.agents;
-  const prevSnapshot = {
-    workflow: { ...agents.workflow },
-    driver_tool: agents.driver_tool,
-    reviewer_tool: agents.reviewer_tool,
-    test_verifier_tool: agents.test_verifier_tool,
-    security_verifier_tool: agents.security_verifier_tool,
-    review_tier_credits: agents.review_tier_credits,
-    protected_paths: [...agents.protected_paths],
-  };
+async function saveWorkflowSettings(mutatorOrPatch = {}, options = {}) {
+  const initialAgents = state.data.agents;
+  if (!state.committedWorkflow) {
+    state.committedWorkflow = snapshotWorkflowState(initialAgents);
+  }
 
-  if (typeof patch.independent_review === "boolean") {
-    agents.workflow.independent_review = patch.independent_review;
+  const draft = snapshotWorkflowState(initialAgents);
+  let changedSlotIdx = Number.isInteger(options.changedSlotIdx) ? options.changedSlotIdx : -1;
+  let nextTool = options.nextTool || null;
+  let prevTool = options.prevTool || null;
+
+  if (typeof mutatorOrPatch === "function") {
+    mutatorOrPatch(draft);
+  } else if (mutatorOrPatch && typeof mutatorOrPatch === "object") {
+    if (typeof mutatorOrPatch.independent_review === "boolean") {
+      draft.workflow.independent_review = mutatorOrPatch.independent_review;
+    }
+    if (typeof mutatorOrPatch.protect_sensitive_paths === "boolean") {
+      draft.workflow.protect_sensitive_paths = mutatorOrPatch.protect_sensitive_paths;
+    }
+    if (typeof mutatorOrPatch.auto_test_before_review === "boolean") {
+      draft.workflow.auto_test_before_review = mutatorOrPatch.auto_test_before_review;
+    }
+    if (!isAbsent(mutatorOrPatch.driver_tool)) {
+      prevTool = prevTool || draft.driver_tool;
+      nextTool = nextTool || mutatorOrPatch.driver_tool;
+      if (changedSlotIdx < 0) changedSlotIdx = 0;
+      draft.driver_tool = normalizeToolKind(mutatorOrPatch.driver_tool);
+    }
+    if (!isAbsent(mutatorOrPatch.reviewer_tool)) {
+      prevTool = prevTool || draft.reviewer_tool;
+      nextTool = nextTool || mutatorOrPatch.reviewer_tool;
+      if (changedSlotIdx < 0) changedSlotIdx = 1;
+      draft.reviewer_tool = normalizeToolKind(mutatorOrPatch.reviewer_tool);
+    }
+    if (!isAbsent(mutatorOrPatch.test_verifier_tool)) {
+      prevTool = prevTool || draft.test_verifier_tool;
+      nextTool = nextTool || mutatorOrPatch.test_verifier_tool;
+      if (changedSlotIdx < 0) changedSlotIdx = 2;
+      draft.test_verifier_tool = normalizeToolKind(mutatorOrPatch.test_verifier_tool);
+    }
+    if (!isAbsent(mutatorOrPatch.security_verifier_tool)) {
+      prevTool = prevTool || draft.security_verifier_tool;
+      nextTool = nextTool || mutatorOrPatch.security_verifier_tool;
+      if (changedSlotIdx < 0) changedSlotIdx = 3;
+      draft.security_verifier_tool = normalizeToolKind(mutatorOrPatch.security_verifier_tool);
+    }
+    if ([50, 100, 150, 200].includes(Number(mutatorOrPatch.review_tier_credits))) {
+      draft.review_tier_credits = Number(mutatorOrPatch.review_tier_credits);
+    }
+    if (Array.isArray(mutatorOrPatch.protected_paths)) {
+      draft.protected_paths = mutatorOrPatch.protected_paths.map(String);
+    }
   }
-  if (typeof patch.protect_sensitive_paths === "boolean") {
-    agents.workflow.protect_sensitive_paths = patch.protect_sensitive_paths;
+
+  ensureDistinctPairingSlots(draft, changedSlotIdx, nextTool, prevTool);
+  applyWorkflowSnapshot(initialAgents, draft);
+
+  if (options.renderOptimistic) {
+    renderCurrentView();
+    if (options.restoreFocusId && typeof document !== "undefined") {
+      const focusTarget = document.getElementById(options.restoreFocusId);
+      if (focusTarget && typeof focusTarget.focus === "function") {
+        focusTarget.focus();
+      }
+    }
   }
-  if (typeof patch.auto_test_before_review === "boolean") {
-    agents.workflow.auto_test_before_review = patch.auto_test_before_review;
-  }
-  if (!isAbsent(patch.driver_tool)) agents.driver_tool = normalizeToolKind(patch.driver_tool);
-  if (!isAbsent(patch.reviewer_tool)) agents.reviewer_tool = normalizeToolKind(patch.reviewer_tool);
-  if (!isAbsent(patch.test_verifier_tool)) agents.test_verifier_tool = normalizeToolKind(patch.test_verifier_tool);
-  if (!isAbsent(patch.security_verifier_tool)) agents.security_verifier_tool = normalizeToolKind(patch.security_verifier_tool);
-  if ([50, 100, 150, 200].includes(Number(patch.review_tier_credits))) {
-    agents.review_tier_credits = Number(patch.review_tier_credits);
-  }
-  if (Array.isArray(patch.protected_paths)) {
-    agents.protected_paths = patch.protected_paths.map(String);
-  }
+
+  const toastMessage = options.toastMessage || (mutatorOrPatch && mutatorOrPatch.toastMessage) || "Workflow settings saved";
+  const silentToast = Boolean(options.silentToast || (mutatorOrPatch && mutatorOrPatch.silentToast));
 
   const payload = {
-    independent_review: agents.workflow.independent_review,
-    protect_sensitive_paths: agents.workflow.protect_sensitive_paths,
-    auto_test_before_review: agents.workflow.auto_test_before_review,
-    driver_tool: agents.driver_tool,
-    reviewer_tool: agents.reviewer_tool,
-    test_verifier_tool: agents.test_verifier_tool,
-    security_verifier_tool: agents.security_verifier_tool,
-    review_tier_credits: agents.review_tier_credits,
-    review_mode: reviewModeForCredits(agents.review_tier_credits),
-    protected_paths: agents.protected_paths,
+    independent_review: draft.workflow.independent_review,
+    protect_sensitive_paths: draft.workflow.protect_sensitive_paths,
+    auto_test_before_review: draft.workflow.auto_test_before_review,
+    driver_tool: draft.driver_tool,
+    reviewer_tool: draft.reviewer_tool,
+    test_verifier_tool: draft.test_verifier_tool,
+    security_verifier_tool: draft.security_verifier_tool,
+    review_tier_credits: draft.review_tier_credits,
+    review_mode: reviewModeForCredits(draft.review_tier_credits),
+    protected_paths: [...draft.protected_paths],
   };
 
+  const seq = (state.workflowSaveSeq || 0) + 1;
+  state.workflowSaveSeq = seq;
+  state.workflowSaveInFlight = (state.workflowSaveInFlight || 0) + 1;
+
+  const runRequest = () => apiRequest("POST", "/api/v4/workflow", payload);
+  const reqPromise = state.workflowSaveChain.then(runRequest, runRequest);
+  state.workflowSaveChain = reqPromise.catch(() => {});
+
   try {
-    const res = await apiRequest("POST", "/api/v4/workflow", payload);
+    const res = await reqPromise;
+    const committed = snapshotWorkflowState(draft);
     if (res && res.workflow && typeof res.workflow === "object") {
       const w = res.workflow;
-      agents.workflow = {
+      committed.workflow = {
         independent_review: w.independent_review !== false,
         protect_sensitive_paths: w.protect_sensitive_paths !== false,
         auto_test_before_review: w.auto_test_before_review !== false,
       };
-      if (!isAbsent(w.driver_tool)) agents.driver_tool = normalizeToolKind(w.driver_tool);
-      if (!isAbsent(w.reviewer_tool)) agents.reviewer_tool = normalizeToolKind(w.reviewer_tool);
-      if (!isAbsent(w.test_verifier_tool)) agents.test_verifier_tool = normalizeToolKind(w.test_verifier_tool);
-      if (!isAbsent(w.security_verifier_tool)) agents.security_verifier_tool = normalizeToolKind(w.security_verifier_tool);
+      if (!isAbsent(w.driver_tool)) committed.driver_tool = normalizeToolKind(w.driver_tool);
+      if (!isAbsent(w.reviewer_tool)) committed.reviewer_tool = normalizeToolKind(w.reviewer_tool);
+      if (!isAbsent(w.test_verifier_tool)) committed.test_verifier_tool = normalizeToolKind(w.test_verifier_tool);
+      if (!isAbsent(w.security_verifier_tool)) committed.security_verifier_tool = normalizeToolKind(w.security_verifier_tool);
       if ([50, 100, 150, 200].includes(Number(w.review_tier_credits))) {
-        agents.review_tier_credits = Number(w.review_tier_credits);
+        committed.review_tier_credits = Number(w.review_tier_credits);
       }
       if (Array.isArray(w.protected_paths)) {
-        agents.protected_paths = w.protected_paths.map(String);
+        committed.protected_paths = w.protected_paths.map(String);
       }
-      ensureDistinctPairingSlots(agents);
+      ensureDistinctPairingSlots(committed);
     }
-    if (!patch.silentToast) {
-      toaster.show(patch.toastMessage || "Workflow settings saved");
+    state.committedWorkflow = committed;
+
+    if (seq === state.workflowSaveSeq) {
+      applyWorkflowSnapshot(state.data.agents, committed);
     }
+    if (typeof options.onCommitted === "function") {
+      options.onCommitted(committed);
+    }
+    if (!silentToast && seq === state.workflowSaveSeq) {
+      const msg = typeof toastMessage === "function" ? toastMessage(committed) : toastMessage;
+      toaster.show(msg);
+    }
+    return committed;
   } catch (err) {
-    agents.workflow = prevSnapshot.workflow;
-    agents.driver_tool = prevSnapshot.driver_tool;
-    agents.reviewer_tool = prevSnapshot.reviewer_tool;
-    agents.test_verifier_tool = prevSnapshot.test_verifier_tool;
-    agents.security_verifier_tool = prevSnapshot.security_verifier_tool;
-    agents.review_tier_credits = prevSnapshot.review_tier_credits;
-    agents.protected_paths = prevSnapshot.protected_paths;
+    if (seq === state.workflowSaveSeq && state.committedWorkflow) {
+      applyWorkflowSnapshot(state.data.agents, state.committedWorkflow);
+      if (state.view === "agents") renderCurrentView();
+    }
     trackUiEvent("ui_action_failed", {
       failed_action: "guardrail_save",
       error_category: "io_error",
     });
-    toaster.show(err.message || "Could not save workflow settings");
-    if (state.view === "agents") renderCurrentView();
+    if (seq === state.workflowSaveSeq) {
+      toaster.show(err.message || "Could not save workflow settings");
+    }
     throw err;
+  } finally {
+    state.workflowSaveInFlight = Math.max(0, (state.workflowSaveInFlight || 1) - 1);
   }
 }
 
@@ -4088,24 +4202,36 @@ function renderAgentsView(root) {
         "div",
         { className: "pairing-selects", dataset: { slots: String(activeSlots) } },
         visibleSlotSpecs.map((spec) => {
+          const selectId = `pairing-slot-${spec.key}`;
           const selectEl = el(
             "select",
             {
+              id: selectId,
               className: "select",
               "aria-label": spec.ariaLabel,
               onChange: () => {
-                const prevTool = agents[spec.key];
+                const prevTool = state.data.agents[spec.key];
                 const nextTool = selectEl.value;
-                ensureDistinctPairingSlots(agents, spec.slotIdx, nextTool, prevTool);
-                trackUiEvent("ui_cross_tool_pairing_updated", {
-                  driver_tool_kind: agents.driver_tool,
-                  reviewer_tool_kind: agents.reviewer_tool,
-                  function_credits_cost: agents.review_tier_credits,
-                });
-                renderCurrentView();
-                saveWorkflowSettings({
-                  toastMessage: `${spec.label.replace(/^\d+\.\s*/, "")} set to ${friendlyToolLabel(agents[spec.key])}`,
-                }).catch(() => {});
+                if (prevTool === nextTool) return;
+                saveWorkflowSettings(
+                  {},
+                  {
+                    changedSlotIdx: spec.slotIdx,
+                    nextTool,
+                    prevTool,
+                    renderOptimistic: true,
+                    restoreFocusId: selectId,
+                    toastMessage: (committed) =>
+                      `${spec.label.replace(/^\d+\.\s*/, "")} set to ${friendlyToolLabel(committed[spec.key])}`,
+                    onCommitted: (committed) => {
+                      trackUiEvent("ui_cross_tool_pairing_updated", {
+                        driver_tool_kind: committed.driver_tool,
+                        reviewer_tool_kind: committed.reviewer_tool,
+                        function_credits_cost: committed.review_tier_credits,
+                      });
+                    },
+                  },
+                ).catch(() => {});
               },
             },
             toolOptions.map((o) =>
@@ -4115,7 +4241,7 @@ function renderAgentsView(root) {
           return el(
             "div",
             { className: "section-block" },
-            el("label", { className: "t-13 w500" }, spec.label),
+            el("label", { className: "t-13 w500", for: selectId }, spec.label),
             selectEl,
           );
         }),
@@ -4124,7 +4250,7 @@ function renderAgentsView(root) {
         ? el(
             "p",
             { className: "t-12 secondary" },
-            `${missingActiveToolLabels.join(" and ")} ${missingActiveToolLabels.length === 1 ? "is" : "are"} not detected locally yet — copy ${missingActiveToolLabels.length === 1 ? "its" : "their"} install command under Detected coding tools above before running this check.`,
+            `${formatHumanList(missingActiveToolLabels)} ${missingActiveToolLabels.length === 1 ? "is" : "are"} not detected locally yet — copy ${missingActiveToolLabels.length === 1 ? "its" : "their"} install command under Detected coding tools above before running this check.`,
           )
         : null,
       el(
@@ -4139,19 +4265,21 @@ function renderAgentsView(root) {
               className: "radio-card",
               "aria-checked": agents.review_tier_credits === tier.credits ? "true" : "false",
               onClick: () => {
-                if (agents.review_tier_credits === tier.credits) return;
-                agents.review_tier_credits = tier.credits;
-                ensureDistinctPairingSlots(agents);
-                trackUiEvent("ui_cross_tool_pairing_updated", {
-                  driver_tool_kind: agents.driver_tool,
-                  reviewer_tool_kind: agents.reviewer_tool,
-                  function_credits_cost: tier.credits,
-                });
-                renderCurrentView();
-                saveWorkflowSettings({
-                  review_tier_credits: tier.credits,
-                  toastMessage: `Review depth set to ${tier.title}`,
-                }).catch(() => {});
+                if (state.data.agents.review_tier_credits === tier.credits) return;
+                saveWorkflowSettings(
+                  { review_tier_credits: tier.credits },
+                  {
+                    renderOptimistic: true,
+                    toastMessage: `Review depth set to ${tier.title}`,
+                    onCommitted: (committed) => {
+                      trackUiEvent("ui_cross_tool_pairing_updated", {
+                        driver_tool_kind: committed.driver_tool,
+                        reviewer_tool_kind: committed.reviewer_tool,
+                        function_credits_cost: committed.review_tier_credits,
+                      });
+                    },
+                  },
+                ).catch(() => {});
               },
             },
             el("span", { className: "t-13 w600 num" }, tier.title),
@@ -4180,17 +4308,22 @@ function renderAgentsView(root) {
         globInput.focus();
         return;
       }
-      if (!agents.protected_paths.includes(val)) {
-        agents.protected_paths.push(val);
-        trackUiEvent("ui_protected_path_added", {
-          path_category: "custom_glob",
-          protected_paths_count_bucket: countBucket(agents.protected_paths.length),
-        });
-        renderCurrentView();
-        saveWorkflowSettings({
-          protected_paths: agents.protected_paths,
-          toastMessage: `Protected path added: ${val}`,
-        }).catch(() => {});
+      const curPaths = state.data.agents.protected_paths;
+      if (!curPaths.includes(val)) {
+        const nextPaths = [...curPaths, val];
+        saveWorkflowSettings(
+          { protected_paths: nextPaths },
+          {
+            renderOptimistic: true,
+            toastMessage: `Protected path added: ${val}`,
+            onCommitted: (committed) => {
+              trackUiEvent("ui_protected_path_added", {
+                path_category: "custom_glob",
+                protected_paths_count_bucket: countBucket(committed.protected_paths.length),
+              });
+            },
+          },
+        ).catch(() => {});
       }
     },
   });
@@ -4267,16 +4400,20 @@ function renderAgentsView(root) {
                   type: "button",
                   "aria-label": `Remove ${glob}`,
                   onClick: () => {
-                    agents.protected_paths = agents.protected_paths.filter((g) => g !== glob);
-                    trackUiEvent("ui_protected_path_removed", {
-                      path_category: "custom_glob",
-                      protected_paths_count_bucket: countBucket(agents.protected_paths.length),
-                    });
-                    renderCurrentView();
-                    saveWorkflowSettings({
-                      protected_paths: agents.protected_paths,
-                      toastMessage: `Removed protected path: ${glob}`,
-                    }).catch(() => {});
+                    const nextPaths = state.data.agents.protected_paths.filter((g) => g !== glob);
+                    saveWorkflowSettings(
+                      { protected_paths: nextPaths },
+                      {
+                        renderOptimistic: true,
+                        toastMessage: `Removed protected path: ${glob}`,
+                        onCommitted: (committed) => {
+                          trackUiEvent("ui_protected_path_removed", {
+                            path_category: "custom_glob",
+                            protected_paths_count_bucket: countBucket(committed.protected_paths.length),
+                          });
+                        },
+                      },
+                    ).catch(() => {});
                   },
                 },
                 "×",
@@ -5031,7 +5168,13 @@ let streamRetryTimer = 0;
 async function refreshBootstrapQuietly() {
   try {
     const raw = await apiRequest("GET", "/api/v4/bootstrap");
-    state.data = normalizeBootstrap(raw);
+    const fresh = normalizeBootstrap(raw);
+    if (state.workflowSaveInFlight > 0) {
+      applyWorkflowSnapshot(fresh.agents, snapshotWorkflowState(state.data.agents));
+    } else {
+      state.committedWorkflow = snapshotWorkflowState(fresh.agents);
+    }
+    state.data = fresh;
     state.bootstrapOk = true;
     syncHeaderChrome();
     return true;

@@ -1747,6 +1747,62 @@ fn detect_local_coding_tools(repo_root: &Path) -> Vec<Value> {
     out
 }
 
+const CANONICAL_WORKFLOW_TOOLS: [&str; 4] = ["claude_code", "codex_cli", "gemini_cli", "cursor"];
+
+pub fn ensure_distinct_workflow_slots(
+    cfg: &mut WorkflowConfig,
+    changed_slot: Option<(usize, &str)>,
+) {
+    let mut slots = [
+        normalize_workflow_tool_id(&cfg.driver_tool, "claude_code"),
+        normalize_workflow_tool_id(&cfg.reviewer_tool, "codex_cli"),
+        normalize_workflow_tool_id(&cfg.test_verifier_tool, "gemini_cli"),
+        normalize_workflow_tool_id(&cfg.security_verifier_tool, "cursor"),
+    ];
+
+    let pinned_idx = changed_slot.map(|(idx, _)| idx).filter(|&idx| idx < 4);
+    if let Some((idx, prev_raw)) = changed_slot
+        && idx < 4
+    {
+        let next_val = slots[idx].clone();
+        let prev_val = normalize_workflow_tool_id(prev_raw, CANONICAL_WORKFLOW_TOOLS[idx]);
+        if prev_val != next_val {
+            for (j, slot) in slots.iter_mut().enumerate() {
+                if j != idx && *slot == next_val {
+                    *slot = prev_val.clone();
+                }
+            }
+        }
+    }
+
+    let mut used: Vec<String> = Vec::with_capacity(4);
+    if let Some(idx) = pinned_idx {
+        used.push(slots[idx].clone());
+    }
+    for (i, slot) in slots.iter_mut().enumerate() {
+        if Some(i) == pinned_idx {
+            continue;
+        }
+        if CANONICAL_WORKFLOW_TOOLS.contains(&slot.as_str()) && !used.contains(slot) {
+            used.push(slot.clone());
+        } else {
+            let replacement = CANONICAL_WORKFLOW_TOOLS
+                .iter()
+                .find(|cand| !used.iter().any(|u| u == **cand))
+                .copied()
+                .unwrap_or(CANONICAL_WORKFLOW_TOOLS[i])
+                .to_string();
+            *slot = replacement.clone();
+            used.push(replacement);
+        }
+    }
+
+    cfg.driver_tool = slots[0].clone();
+    cfg.reviewer_tool = slots[1].clone();
+    cfg.test_verifier_tool = slots[2].clone();
+    cfg.security_verifier_tool = slots[3].clone();
+}
+
 pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
     let mut cfg = WorkflowConfig::default();
     let Ok(Some(raw)) =
@@ -1756,6 +1812,7 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
     };
 
     let mut in_protected_paths = false;
+    let mut saw_protected_paths_key = false;
     let mut parsed_paths: Vec<String> = Vec::new();
     let mut seen_credits: Option<u64> = None;
     let mut seen_mode_credits: Option<u64> = None;
@@ -1841,10 +1898,10 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
                 }
             }
             "protected_paths" => {
+                saw_protected_paths_key = true;
+                parsed_paths.clear();
                 if val.is_empty() {
                     in_protected_paths = true;
-                } else if val == "[]" {
-                    parsed_paths.clear();
                 }
             }
             _ => {}
@@ -1856,17 +1913,20 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
             cfg.review_mode = mode.to_string();
         }
     }
-    if !parsed_paths.is_empty() {
+    if saw_protected_paths_key {
         cfg.protected_paths = parsed_paths;
     }
+    ensure_distinct_workflow_slots(&mut cfg, None);
     cfg
 }
 
 pub fn save_workflow_config(repo_root: &Path, cfg: &WorkflowConfig) -> Result<(), String> {
-    let driver = normalize_workflow_tool_id(&cfg.driver_tool, "claude_code");
-    let reviewer = normalize_workflow_tool_id(&cfg.reviewer_tool, "codex_cli");
-    let test_verifier = normalize_workflow_tool_id(&cfg.test_verifier_tool, "gemini_cli");
-    let security_verifier = normalize_workflow_tool_id(&cfg.security_verifier_tool, "cursor");
+    let mut normalized = cfg.clone();
+    ensure_distinct_workflow_slots(&mut normalized, None);
+    let driver = normalized.driver_tool;
+    let reviewer = normalized.reviewer_tool;
+    let test_verifier = normalized.test_verifier_tool;
+    let security_verifier = normalized.security_verifier_tool;
     let credits = if review_mode_for_credits(cfg.review_tier_credits).is_some() {
         cfg.review_tier_credits
     } else {
@@ -1915,15 +1975,18 @@ pub fn save_workflow_config(repo_root: &Path, cfg: &WorkflowConfig) -> Result<()
         "stop_auto_repair_after_2_attempts: {}\n",
         cfg.stop_auto_repair_after_2_attempts
     ));
-    if cfg.protected_paths.is_empty() {
+    let clean_paths: Vec<String> = cfg
+        .protected_paths
+        .iter()
+        .map(|p| sanitize_yaml_scalar(p))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_paths.is_empty() {
         yaml.push_str("protected_paths: []\n");
     } else {
         yaml.push_str("protected_paths:\n");
-        for p in &cfg.protected_paths {
-            let clean = sanitize_yaml_scalar(p);
-            if !clean.is_empty() {
-                yaml.push_str(&format!("  - \"{clean}\"\n"));
-            }
+        for clean in &clean_paths {
+            yaml.push_str(&format!("  - \"{clean}\"\n"));
         }
     }
 
@@ -2740,7 +2803,7 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
             "workstream": "engineering",
             "tool_label": tool_label,
             "reviewer_label": reviewer_label,
-            "credits_used": if effective_status == "done" { 150 } else { 50 }
+            "credits_used": if effective_status == "done" { workflow_cfg.review_tier_credits } else { 0 }
         });
 
         match effective_status {
@@ -2776,7 +2839,7 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
                 "deletions": Value::Null,
                 "risk_level": "low",
                 "tests_passed": Value::Null,
-                "credits_used": 150,
+                "credits_used": workflow_cfg.review_tier_credits,
                 "updated_at": "Recent"
             }));
         }
@@ -2861,7 +2924,7 @@ fn build_inbox_and_board(repo_root: &Path) -> (Value, Value, usize) {
     let shipped_count = shipped_cards.len();
     // Shipped-only hours saved (`INV-UI-DONT-MAKE-ME-THINK-01`: 0 when 0 shipped items)
     let hours_saved = (shipped_count as f64) * 2.5;
-    let credits_used = (shipped_count as u64) * 150;
+    let credits_used = (shipped_count as u64) * workflow_cfg.review_tier_credits;
 
     let inbox_json = json!({
         "items": inbox_items,
@@ -3828,6 +3891,12 @@ fn handle_workflow_update(repo_root: &Path, body: &[u8]) -> (&'static str, Value
     };
 
     let mut cfg = load_workflow_config(repo_root);
+    let prev_slots = [
+        cfg.driver_tool.clone(),
+        cfg.reviewer_tool.clone(),
+        cfg.test_verifier_tool.clone(),
+        cfg.security_verifier_tool.clone(),
+    ];
     if let Some(b) = parsed.get("independent_review").and_then(Value::as_bool) {
         cfg.independent_review = b;
     }
@@ -3851,6 +3920,22 @@ fn handle_workflow_update(repo_root: &Path, body: &[u8]) -> (&'static str, Value
     {
         cfg.security_verifier_tool = normalize_workflow_tool_id(s, "cursor");
     }
+    let next_slots = [
+        &cfg.driver_tool,
+        &cfg.reviewer_tool,
+        &cfg.test_verifier_tool,
+        &cfg.security_verifier_tool,
+    ];
+    let changed_indices: Vec<usize> = (0..4)
+        .filter(|&i| next_slots[i] != &prev_slots[i])
+        .collect();
+    let changed_slot = if changed_indices.len() == 1 {
+        let idx = changed_indices[0];
+        Some((idx, prev_slots[idx].as_str()))
+    } else {
+        None
+    };
+    ensure_distinct_workflow_slots(&mut cfg, changed_slot);
     if let Some(credits_val) = parsed.get("review_tier_credits")
         && !credits_val.is_null()
     {
@@ -4093,7 +4178,7 @@ fn handle_pm_ask(repo_root: &Path, body: &[u8]) -> (&'static str, Vec<u8>) {
         let err = serde_json::to_vec(&json!({
             "ok": false,
             "error_code": "empty_prompt",
-            "error": "Ask Chinwag PM a question or describe the task you want broken down."
+            "error": "Describe the engineering task you want queued or broken down."
         }))
         .unwrap_or_default();
         return ("400 Bad Request", err);
@@ -4120,7 +4205,7 @@ fn handle_pm_ask(repo_root: &Path, body: &[u8]) -> (&'static str, Vec<u8>) {
         "ok": true,
         "role": "Task Scoper",
         "reply": reply,
-        "credits_charged": 50
+        "credits_charged": 0
     }))
     .unwrap_or_default();
     ("200 OK", payload)
@@ -6245,5 +6330,62 @@ mod tests {
             resolve_diff_item_status(Some(&prior_allow_once), true, true, true, true),
             "needs_review"
         );
+    }
+
+    #[test]
+    fn legacy_workflow_migration_deduplicates_slots_and_empty_protected_paths_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(temp.path()).unwrap();
+        init_test_repo(&repo);
+        fs::create_dir_all(repo.join(".chinwag")).unwrap();
+
+        // Legacy 2-field workflow.yaml where driver=gemini would collide with default test_verifier=gemini_cli
+        fs::write(
+            repo.join(".chinwag/workflow.yaml"),
+            "version: 1\ndriver_tool: \"gemini\"\nreviewer_tool: \"codex\"\nreview_mode: \"triad_sandbox\"\n",
+        )
+        .unwrap();
+
+        let migrated = load_workflow_config(&repo);
+        assert_eq!(migrated.driver_tool, "gemini_cli");
+        assert_eq!(migrated.reviewer_tool, "codex_cli");
+        assert_eq!(migrated.test_verifier_tool, "claude_code");
+        assert_eq!(migrated.security_verifier_tool, "cursor");
+        assert_eq!(migrated.review_tier_credits, 150);
+        assert_eq!(migrated.review_mode, "three_tool_check");
+
+        // Single-slot swap via handle_workflow_update swaps colliding slots cleanly
+        let (st_swap, val_swap) =
+            handle_workflow_update(&repo, br#"{"reviewer_tool":"cursor","protected_paths":[]}"#);
+        assert_eq!(st_swap, "200 OK");
+        assert_eq!(val_swap["workflow"]["driver_tool"], "gemini_cli");
+        assert_eq!(val_swap["workflow"]["reviewer_tool"], "cursor");
+        assert_eq!(val_swap["workflow"]["test_verifier_tool"], "claude_code");
+        assert_eq!(val_swap["workflow"]["security_verifier_tool"], "codex_cli");
+        assert_eq!(val_swap["workflow"]["protected_paths"], json!([]));
+
+        // Reloading after `protected_paths: []` preserves empty list instead of restoring defaults
+        let reloaded = load_workflow_config(&repo);
+        assert!(
+            reloaded.protected_paths.is_empty(),
+            "expected empty protected_paths after explicit clear, got {:?}",
+            reloaded.protected_paths
+        );
+
+        // Negative-path validation for out-of-domain credits, invalid review_mode, and empty task title
+        let (st_bad_cr, val_bad_cr) =
+            handle_workflow_update(&repo, br#"{"review_tier_credits":75}"#);
+        assert_eq!(st_bad_cr, "400 Bad Request");
+        assert_eq!(val_bad_cr["error_code"], "invalid_review_tier_credits");
+
+        let (st_bad_mode, val_bad_mode) =
+            handle_workflow_update(&repo, br#"{"review_mode":"unknown_tier"}"#);
+        assert_eq!(st_bad_mode, "400 Bad Request");
+        assert_eq!(val_bad_mode["error_code"], "invalid_review_mode");
+
+        let (st_empty_title, val_empty_title) =
+            handle_board_create_task(&repo, br#"{"title":"   ","tool":"claude_code"}"#);
+        assert_eq!(st_empty_title, "400 Bad Request");
+        assert_eq!(val_empty_title["error_code"], "missing_title");
     }
 }
