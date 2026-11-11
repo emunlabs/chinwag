@@ -841,14 +841,15 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
 
 #[test]
 fn ui_v4_app_js_behavioral_rollback_and_serialization() {
-    let node_ok = Command::new("node")
+    let node_ver = Command::new("node")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !node_ok {
-        return;
-    }
+        .expect("node binary must be installed on PATH for UI v4 behavioral harness");
+    assert!(
+        node_ver.status.success(),
+        "node --version failed: {:?}",
+        node_ver
+    );
 
     let app_js_path = format!("{}/assets/ui-v4/app.js", env!("CARGO_MANIFEST_DIR"));
     let harness = r#"
@@ -861,6 +862,7 @@ const src = fs.readFileSync(process.env.APP_JS_PATH, "utf8")
   .replace(/^export\s+/gm, "");
 
 let mockWorkflowHandler = async (body) => ({ ok: true, workflow: body });
+let mockBootstrapHandler = async () => ({ agents: { workflow: { review_tier_credits: 100 } } });
 let mockBoardTaskHandler = async (body) => ({ ok: true, task: { id: "TASK-LOCAL-1", title: body.title, workstream: body.workstream, tool_label: "Claude Code" } });
 const trackedEvents = [];
 
@@ -891,6 +893,10 @@ const sandbox = {
       trackedEvents.push(body);
       return { ok: true, status: 202, json: async () => ({ ok: true }) };
     }
+    if (url === "/api/v4/bootstrap") {
+      const res = await mockBootstrapHandler();
+      return { ok: true, status: 200, json: async () => res };
+    }
     if (url === "/api/v4/workflow") {
       try {
         const res = await mockWorkflowHandler(body);
@@ -909,7 +915,7 @@ const sandbox = {
 
 vm.createContext(sandbox);
 vm.runInContext(
-  src + "\nglobalThis.__test = { state, normalizeBootstrap, ensureDistinctPairingSlots, saveWorkflowSettings, queueEngineeringTaskFromLauncher, formatHumanList };",
+  src + "\nglobalThis.__test = { state, normalizeBootstrap, ensureDistinctPairingSlots, saveWorkflowSettings, refreshBootstrapQuietly, queueEngineeringTaskFromLauncher, formatHumanList };",
   sandbox
 );
 
@@ -992,12 +998,12 @@ vm.runInContext(
   await T.saveWorkflowSettings({ review_tier_credits: 200 });
   assert.strictEqual(T.state.data.agents.review_tier_credits, 200);
 
-  // 4. Overlapping saves serialize via workflowSaveChain and preserve the newer 200 Cr choice
+  // 4. Overlapping saves + mixed-failure interleavings (A-ok/B-fail -> 150 Cr; A-fail/B-ok -> 200 Cr)
   let callOrder = [];
   mockWorkflowHandler = async (body) => {
     callOrder.push(body.review_tier_credits);
     if (body.review_tier_credits === 150) {
-      await new Promise((r) => setTimeout(r, 40));
+      await new Promise((r) => setTimeout(r, 30));
     }
     return { ok: true, workflow: body };
   };
@@ -1007,7 +1013,50 @@ vm.runInContext(
   assert.deepStrictEqual(callOrder, [150, 200]);
   assert.strictEqual(T.state.data.agents.review_tier_credits, 200);
 
-  // 5. queueEngineeringTaskFromLauncher uses server-scrubbed title and deduplicates by task id
+  // Mixed A-ok (150) then B-fail (50) -> rolls back to 150
+  mockWorkflowHandler = async (body) => {
+    if (body.review_tier_credits === 50) throw new Error("reject 50");
+    return { ok: true, workflow: body };
+  };
+  const m1 = T.saveWorkflowSettings({ review_tier_credits: 150 });
+  const m2 = T.saveWorkflowSettings({ review_tier_credits: 50 }).catch(() => "caught");
+  await Promise.all([m1, m2]);
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 150);
+
+  // Mixed A-fail (50) then B-ok (200) -> commits 200 without rollback clobber
+  const m3 = T.saveWorkflowSettings({ review_tier_credits: 50 }).catch(() => "caught");
+  const m4 = T.saveWorkflowSettings({ review_tier_credits: 200 });
+  await Promise.all([m3, m4]);
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 200);
+
+  // 5. Delayed bootstrap GET started before a save that completes BEFORE the GET returns must NOT overwrite committed 200 Cr
+  T.state.data = T.normalizeBootstrap({ agents: { workflow: { review_tier_credits: 100 } } });
+  T.state.committedWorkflow = null;
+  let releaseStaleBootstrap;
+  const staleBootstrapGate = new Promise((resolve) => { releaseStaleBootstrap = resolve; });
+  mockBootstrapHandler = async () => {
+    await staleBootstrapGate;
+    return { agents: { workflow: { review_tier_credits: 100, protected_paths: ["stale/**"] } } };
+  };
+  let lastPersistedPayload = null;
+  mockWorkflowHandler = async (body) => {
+    lastPersistedPayload = body;
+    return { ok: true, workflow: body };
+  };
+  const refreshPromise = T.refreshBootstrapQuietly();
+  await T.saveWorkflowSettings({ review_tier_credits: 200, protected_paths: [] });
+  releaseStaleBootstrap();
+  await refreshPromise;
+  assert.strictEqual(T.state.data.agents.review_tier_credits, 200, "delayed stale bootstrap GET must not revert completed 200 Cr save");
+  assert.strictEqual(T.state.committedWorkflow.review_tier_credits, 200);
+  assert.deepStrictEqual([...T.state.data.agents.protected_paths], []);
+
+  // Subsequent unrelated toggle save must persist 200 Cr (not stale 100 Cr)
+  await T.saveWorkflowSettings({ auto_test_before_review: false });
+  assert.strictEqual(lastPersistedPayload.review_tier_credits, 200);
+  assert.deepStrictEqual(lastPersistedPayload.protected_paths, []);
+
+  // 6. queueEngineeringTaskFromLauncher uses server-scrubbed title and deduplicates by task id
   mockBoardTaskHandler = async () => ({
     ok: true,
     task: {
@@ -1022,6 +1071,7 @@ vm.runInContext(
   assert.strictEqual(T.state.data.board.columns.queued.length, 1);
   assert.strictEqual(T.state.data.board.columns.queued[0].title, "Scrubbed webhook retry task");
   assert.strictEqual(T.state.launcherDraft, "");
+  console.log("NODE_VM_HARNESS_OK=6_SUITES");
 })().catch((err) => {
   console.error(err);
   process.exit(1);
@@ -1034,10 +1084,11 @@ vm.runInContext(
         .env("APP_JS_PATH", &app_js_path)
         .output()
         .expect("execute node VM behavioral harness");
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success(),
+        out.status.success() && stdout_str.contains("NODE_VM_HARNESS_OK=6_SUITES"),
         "node VM behavioral harness failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
+        stdout_str,
         String::from_utf8_lossy(&out.stderr)
     );
 }

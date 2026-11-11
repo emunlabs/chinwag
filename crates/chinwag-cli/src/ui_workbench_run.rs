@@ -1898,10 +1898,28 @@ pub fn load_workflow_config(repo_root: &Path) -> WorkflowConfig {
                 }
             }
             "protected_paths" => {
-                saw_protected_paths_key = true;
-                parsed_paths.clear();
-                if val.is_empty() {
+                let raw_after_colon = v_raw.trim();
+                if raw_after_colon.is_empty() {
+                    saw_protected_paths_key = true;
+                    parsed_paths.clear();
                     in_protected_paths = true;
+                } else if raw_after_colon == "[]" {
+                    saw_protected_paths_key = true;
+                    parsed_paths.clear();
+                    in_protected_paths = false;
+                } else if let Some(inner) = raw_after_colon
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                {
+                    saw_protected_paths_key = true;
+                    parsed_paths.clear();
+                    in_protected_paths = false;
+                    for entry in inner.split(',') {
+                        let clean = entry.trim().trim_matches('"').trim_matches('\'').trim();
+                        if !clean.is_empty() {
+                            parsed_paths.push(clean.to_string());
+                        }
+                    }
                 }
             }
             _ => {}
@@ -6370,6 +6388,30 @@ mod tests {
             reloaded.protected_paths.is_empty(),
             "expected empty protected_paths after explicit clear, got {:?}",
             reloaded.protected_paths
+        );
+
+        // Hand-edited inline YAML flow array parses cleanly without dropping to empty
+        fs::write(
+            repo.join(".chinwag/workflow.yaml"),
+            "version: 1\nprotected_paths: [\".env*\", \"secrets/**\"]\n",
+        )
+        .unwrap();
+        let inline_loaded = load_workflow_config(&repo);
+        assert_eq!(
+            inline_loaded.protected_paths,
+            vec![".env*".to_string(), "secrets/**".to_string()]
+        );
+
+        // Unparseable scalar after `protected_paths:` fails safe to default protected paths
+        fs::write(
+            repo.join(".chinwag/workflow.yaml"),
+            "version: 1\nprotected_paths: malformed_scalar\n",
+        )
+        .unwrap();
+        let malformed_loaded = load_workflow_config(&repo);
+        assert_eq!(
+            malformed_loaded.protected_paths,
+            WorkflowConfig::default().protected_paths
         );
 
         // Negative-path validation for out-of-domain credits, invalid review_mode, and empty task title

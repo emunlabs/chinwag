@@ -4020,7 +4020,15 @@ async function saveWorkflowSettings(mutatorOrPatch = {}, options = {}) {
   } catch (err) {
     if (seq === state.workflowSaveSeq && state.committedWorkflow) {
       applyWorkflowSnapshot(state.data.agents, state.committedWorkflow);
-      if (state.view === "agents") renderCurrentView();
+      if (state.view === "agents") {
+        renderCurrentView();
+        if (options.restoreFocusId && typeof document !== "undefined") {
+          const focusTarget = document.getElementById(options.restoreFocusId);
+          if (focusTarget && typeof focusTarget.focus === "function") {
+            focusTarget.focus();
+          }
+        }
+      }
     }
     trackUiEvent("ui_action_failed", {
       failed_action: "guardrail_save",
@@ -5167,9 +5175,10 @@ let streamRetryTimer = 0;
 
 async function refreshBootstrapQuietly() {
   try {
+    const startSaveSeq = state.workflowSaveSeq || 0;
     const raw = await apiRequest("GET", "/api/v4/bootstrap");
     const fresh = normalizeBootstrap(raw);
-    if (state.workflowSaveInFlight > 0) {
+    if (state.workflowSaveInFlight > 0 || (state.workflowSaveSeq || 0) !== startSaveSeq) {
       applyWorkflowSnapshot(fresh.agents, snapshotWorkflowState(state.data.agents));
     } else {
       state.committedWorkflow = snapshotWorkflowState(fresh.agents);
