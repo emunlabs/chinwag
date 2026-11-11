@@ -2,7 +2,7 @@ schema: chinwag.surface.impact.manifest.v1
 ticket_id: CHWG-0234
 adr_owner: ARCHITECT
 max_pr_age_secs: 3600
-min_cassettes_count: 0
+min_cassettes_count: 1
 expected_behaviors:
   - "CHWG-0234: strict ^CHWG-[0-9]{4}$ ticket ID filter and INV-ENTITY-SEP-01 entity firewall on board-cards.json"
   - "CHWG-0234: monotonic 05_SHIPPED_VERIFIED protection against retrograde status overwrite"

@@ -154,6 +154,49 @@ fn assert_zero_customer_jargon(surface_name: &str, text: &str) {
     }
 }
 
+fn assert_verified_chinwag_sh_routes_and_no_404s(surface_name: &str, text: &str) {
+    for forbidden_404 in ["/contact", "chinwag.sh/invite"] {
+        assert!(
+            !text.contains(forbidden_404),
+            "CHWG-0249 broken link regression on {surface_name}: found forbidden 404 route '{forbidden_404}'"
+        );
+    }
+
+    const ORIGIN: &str = "https://chinwag.sh";
+    const ALLOWED_PATHS: &[&str] = &["", "/", "/pricing", "/open", "/security", "/privacy"];
+    let mut rest = text;
+    while let Some(idx) = rest.find(ORIGIN) {
+        let after_origin = &rest[idx + ORIGIN.len()..];
+        let end_idx = after_origin
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '"' | '\'' | '`' | '$' | ')' | '(' | '<' | '>' | '\\')
+            })
+            .unwrap_or(after_origin.len());
+        let raw_tail = &after_origin[..end_idx];
+        let route_path = raw_tail.split(['?', '#']).next().unwrap_or("");
+        assert!(
+            ALLOWED_PATHS.contains(&route_path),
+            "CHWG-0249 unverified outbound chinwag.sh route on {surface_name}: '{ORIGIN}{raw_tail}' (path '{route_path}' not in {ALLOWED_PATHS:?})"
+        );
+        rest = &after_origin[end_idx..];
+    }
+}
+
+fn extract_css_rule_body<'a>(css: &'a str, selector_needle: &str) -> &'a str {
+    let start = css
+        .find(selector_needle)
+        .unwrap_or_else(|| panic!("missing CSS selector '{selector_needle}' in styles.css"));
+    let after = &css[start..];
+    let open = after
+        .find('{')
+        .unwrap_or_else(|| panic!("missing '{{' after '{selector_needle}'"));
+    let close = after[open + 1..]
+        .find('}')
+        .unwrap_or_else(|| panic!("missing '}}' after '{selector_needle}'"));
+    &after[open + 1..open + 1 + close]
+}
+
 #[test]
 fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_to_end() {
     let raw_temp_repo: PathBuf = std::env::temp_dir().join(format!(
@@ -301,6 +344,7 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     assert!(!root_hdr.contains("unsafe-inline"), "{root_hdr}");
     let root_html = String::from_utf8_lossy(root_body_bytes);
     assert_zero_customer_jargon("GET /", &root_html);
+    assert_verified_chinwag_sh_routes_and_no_404s("GET /", &root_html);
     let (cookie_pair, csrf) = extract_cookie_and_csrf(&root_hdr, &root_html, ui_port);
 
     for text_asset in [
@@ -325,7 +369,63 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
         );
         let asset_text = String::from_utf8_lossy(body);
         assert_zero_customer_jargon(text_asset, &asset_text);
+        if text_asset == "/assets/v4/styles.css" {
+            let select_rule = extract_css_rule_body(&asset_text, "}\n\n.select {");
+            for req in [
+                "appearance: none;",
+                "-webkit-appearance: none;",
+                "padding: 0 36px 0 12px;",
+                "right 12px center",
+            ] {
+                assert!(
+                    select_rule.contains(req),
+                    "/assets/v4/styles.css .select missing '{req}': {select_rule}"
+                );
+            }
+            assert!(
+                asset_text.contains("[data-theme=\"dark\"] .select"),
+                "/assets/v4/styles.css must define dark-theme .select chevron contrast override"
+            );
+            assert!(
+                asset_text.contains(
+                    "  .select,\n  [data-theme=\"dark\"] .select {\n    appearance: auto;\n    -webkit-appearance: auto;\n    background-image: none;"
+                ),
+                "/assets/v4/styles.css @media (forced-colors: active) must match [data-theme=\"dark\"] .select specificity to clear SVG chevron"
+            );
+
+            let pill_fn_rule = extract_css_rule_body(&asset_text, "\n.pill-fn {");
+            for req in [
+                "min-height: 22px;",
+                "white-space: nowrap;",
+                "flex-shrink: 0;",
+            ] {
+                assert!(
+                    pill_fn_rule.contains(req),
+                    "/assets/v4/styles.css .pill-fn missing '{req}': {pill_fn_rule}"
+                );
+            }
+            assert!(
+                !pill_fn_rule.contains("height: 20px"),
+                "/assets/v4/styles.css .pill-fn must not clamp height: 20px: {pill_fn_rule}"
+            );
+
+            let btn_secondary_pos = asset_text
+                .find("\n.btn-secondary {")
+                .expect(".btn-secondary rule in styles.css");
+            let desktop_menu_hide_pos = asset_text
+                .find(".app-header .menu-btn,\n.btn-secondary.menu-btn,\n.menu-btn {\n  display: none;")
+                .expect("desktop .app-header .menu-btn display:none rule in styles.css");
+            let mobile_breakpoint_pos = asset_text
+                .find("@media (max-width: 719.98px) {\n  .app-header .menu-btn,")
+                .expect("mobile @media (max-width: 719.98px) .menu-btn rule in styles.css");
+            assert!(
+                btn_secondary_pos < desktop_menu_hide_pos
+                    && desktop_menu_hide_pos < mobile_breakpoint_pos,
+                "desktop .menu-btn hide rule must appear AFTER .btn-secondary and BEFORE mobile media query"
+            );
+        }
         if text_asset == "/assets/v4/app.js" {
+            assert_verified_chinwag_sh_routes_and_no_404s(text_asset, &asset_text);
             for required_token in [
                 "Starter Pack",
                 "Team Pack",
@@ -342,7 +442,10 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
                 "Buy Starter Pack · $50 (6,250 Cr)",
                 "500 free starter credits (valid 90 days)",
                 "12 months",
-                "https://chinwag.sh/pricing.html#credit-packs",
+                "https://chinwag.sh/pricing",
+                "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
+                "https://chinwag.sh/pricing?source=local_ui_referral",
+                "https://chinwag.sh/security",
                 "Verified agent handoff",
                 "Repository context sync",
                 "Protected-path safety check",
@@ -433,13 +536,26 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
         );
         let body_str = String::from_utf8_lossy(body);
         assert_zero_customer_jargon(api_path, &body_str);
+        if api_path.starts_with("/api/v4/") {
+            assert_verified_chinwag_sh_routes_and_no_404s(api_path, &body_str);
+        }
+
+        if api_path == "/api/v4/bootstrap" {
+            let boot_json: Value = serde_json::from_slice(body).expect("valid bootstrap JSON");
+            assert_eq!(
+                boot_json["privacy"]["ciso_review_url"],
+                "https://chinwag.sh/pricing?talk=1&source=local_ui#founders"
+            );
+            assert_eq!(
+                boot_json["invite"]["referral_url"],
+                "https://chinwag.sh/pricing?source=local_ui_referral"
+            );
+            assert_eq!(boot_json["invite"]["open_url"], "https://chinwag.sh/open");
+        }
 
         if api_path == "/api/v4/credits" {
             let cred_json: Value = serde_json::from_slice(body).expect("valid credits JSON");
-            assert_eq!(
-                cred_json["pricing_url"],
-                "https://chinwag.sh/pricing.html#credit-packs"
-            );
+            assert_eq!(cred_json["pricing_url"], "https://chinwag.sh/pricing");
             let expiry_notice = cred_json["pack_expiry_notice"].as_str().unwrap_or("");
             assert!(
                 expiry_notice.contains("500 free starter credits (valid 90 days)")
@@ -757,6 +873,38 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     let (sync_hdr, sync_val) = post_json("/api/v4/board/sync", json!({ "target": "github" }));
     assert!(sync_hdr.starts_with("HTTP/1.1 200 OK"));
     assert_eq!(sync_val["credits_charged"], 0);
+
+    // 4b. Verify POST /api/v4/credits/checkout maps all 4 pack SKUs to chinwag.sh/pricing wizard slugs
+    for (sku, expected_wizard_slug) in [
+        ("pack_50", "developer"),
+        ("pack_160", "growth"),
+        ("pack_560", "scale"),
+        ("pack_1000", "volume"),
+    ] {
+        let (chk_hdr, chk_val) = post_json(
+            "/api/v4/credits/checkout",
+            json!({ "pack_sku": sku, "trigger_surface": "credits_tab" }),
+        );
+        assert!(
+            chk_hdr.starts_with("HTTP/1.1 200 OK"),
+            "checkout failed for {sku}: {chk_hdr} {chk_val}"
+        );
+        assert_eq!(chk_val["ok"], true);
+        assert_eq!(chk_val["pack_sku"], sku);
+        assert_eq!(chk_val["pricing_url"], "https://chinwag.sh/pricing");
+        let checkout_url = chk_val["checkout_url"].as_str().unwrap_or("");
+        let expected_prefix = format!(
+            "https://chinwag.sh/pricing?pack={expected_wizard_slug}&source=local_ui&attempt="
+        );
+        assert!(
+            checkout_url.starts_with(&expected_prefix),
+            "expected checkout_url for {sku} to start with '{expected_prefix}', got '{checkout_url}'"
+        );
+        assert_verified_chinwag_sh_routes_and_no_404s(
+            "/api/v4/credits/checkout",
+            &chk_val.to_string(),
+        );
+    }
 
     // 5. Telemetry forwarding: valid event reaches local mock PostHog collector; PII & sample ship rejected!
     let (bad_pii_hdr, bad_pii_val) = post_json(
@@ -1127,6 +1275,379 @@ vm.runInContext(
     assert!(
         out.status.success() && stdout_str.contains("NODE_VM_HARNESS_OK=6_SUITES"),
         "node VM behavioral harness failed:\nstdout: {}\nstderr: {}",
+        stdout_str,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn ui_v4_popover_race_and_mobile_menu_privacy_handoff() {
+    let app_js_path = format!("{}/assets/ui-v4/app.js", env!("CARGO_MANIFEST_DIR"));
+    let harness = r##"
+const fs = require("fs");
+const vm = require("vm");
+const assert = require("assert");
+
+class StubNode {
+  constructor(tagName) {
+    this.tagName = String(tagName || "DIV").toUpperCase();
+    this.children = [];
+    this.parentNode = null;
+    this.attributes = new Map();
+    this.dataset = {};
+    this.listeners = new Map();
+    this.className = "";
+    this.id = "";
+    this.hidden = false;
+    this.checked = false;
+    this.selected = false;
+    this.value = "";
+    this.onclick = null;
+    this._text = "";
+  }
+  get firstChild() {
+    return this.children.length > 0 ? this.children[0] : null;
+  }
+  get isConnected() {
+    return true;
+  }
+  get textContent() {
+    if (this.tagName === "__TEXT__") return this._text;
+    return this.children.map((c) => c.textContent).join("");
+  }
+  set textContent(val) {
+    this.children = [];
+    if (this.tagName === "__TEXT__") {
+      this._text = String(val ?? "");
+    } else if (val !== null && val !== undefined && String(val) !== "") {
+      const t = new StubNode("__TEXT__");
+      t._text = String(val);
+      this.appendChild(t);
+    }
+  }
+  appendChild(child) {
+    if (!child) return child;
+    if (child.parentNode) {
+      child.parentNode.removeChild(child);
+    }
+    child.parentNode = this;
+    this.children.push(child);
+    return child;
+  }
+  append(...nodes) {
+    for (const n of nodes) {
+      if (n === null || n === undefined) continue;
+      if (n instanceof StubNode) {
+        this.appendChild(n);
+      } else {
+        const t = new StubNode("__TEXT__");
+        t._text = String(n);
+        this.appendChild(t);
+      }
+    }
+  }
+  removeChild(child) {
+    const idx = this.children.indexOf(child);
+    if (idx !== -1) {
+      this.children.splice(idx, 1);
+      child.parentNode = null;
+    }
+    return child;
+  }
+  setAttribute(k, v) {
+    const sv = String(v);
+    if (k === "id") this.id = sv;
+    if (k === "class") this.className = sv;
+    this.attributes.set(k, sv);
+  }
+  getAttribute(k) {
+    if (k === "id" && this.id) return this.id;
+    if (k === "class" && this.className) return this.className;
+    return this.attributes.has(k) ? this.attributes.get(k) : null;
+  }
+  removeAttribute(k) {
+    this.attributes.delete(k);
+  }
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(fn);
+  }
+  click() {
+    const ev = {
+      type: "click",
+      target: this,
+      preventDefault() {},
+      stopPropagation() {},
+    };
+    if (typeof this.onclick === "function") this.onclick(ev);
+    for (const fn of this.listeners.get("click") || []) {
+      fn(ev);
+    }
+  }
+  focus() {
+    stubDocument.activeElement = this;
+  }
+  matchesSimple(sel) {
+    if (this.tagName === "__TEXT__") return false;
+    const s = sel.trim();
+    if (s === '.popover[data-state="closing"]') {
+      return this.className.split(/\s+/).includes("popover") && this.dataset.state === "closing";
+    }
+    if (s.startsWith(".")) {
+      const cls = s.slice(1);
+      return this.className.split(/\s+/).includes(cls);
+    }
+    if (s === "[href]") {
+      return this.attributes.has("href");
+    }
+    if (s === "button.btn-primary") {
+      return this.tagName === "BUTTON" && this.className.split(/\s+/).includes("btn-primary");
+    }
+    return this.tagName === s.toUpperCase();
+  }
+  querySelectorAll(selector) {
+    const parts = selector.split(",").map((p) => p.trim()).filter(Boolean);
+    const results = [];
+    const visit = (node) => {
+      for (const child of node.children) {
+        if (parts.some((p) => child.matchesSimple(p))) {
+          results.push(child);
+        }
+        visit(child);
+      }
+    };
+    visit(this);
+    return results;
+  }
+  querySelector(selector) {
+    const all = this.querySelectorAll(selector);
+    return all.length > 0 ? all[0] : null;
+  }
+}
+
+const byId = new Map();
+function mountEl(tag, id, hidden = false) {
+  const n = new StubNode(tag);
+  n.id = id;
+  n.hidden = hidden;
+  byId.set(id, n);
+  return n;
+}
+
+const docEl = new StubNode("html");
+docEl.setAttribute("data-theme", "stone");
+const btnPrivacy = mountEl("button", "btn-privacy");
+const btnMobileMenu = mountEl("button", "btn-mobile-menu");
+const btnInvite = mountEl("button", "btn-invite");
+btnInvite._computedDisplay = "none";
+const popoverLayer = mountEl("div", "popover-layer", true);
+const modalScrim = mountEl("div", "modal-scrim", true);
+const modalLayer = mountEl("div", "modal-layer", true);
+mountEl("div", "toast-region", false);
+mountEl("div", "sr-announcer", false);
+
+const stubDocument = {
+  readyState: "loading",
+  hidden: false,
+  title: "",
+  activeElement: null,
+  documentElement: docEl,
+  createElement: (tag) => new StubNode(tag),
+  createElementNS: (_ns, tag) => new StubNode(tag),
+  createTextNode: (txt) => {
+    const t = new StubNode("__TEXT__");
+    t._text = String(txt ?? "");
+    return t;
+  },
+  getElementById: (id) => byId.get(id) || null,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener() {},
+};
+
+const stubWindow = {
+  location: { hash: "#inbox" },
+  addEventListener() {},
+  setInterval: () => 1,
+  getComputedStyle: (el) => ({ display: el && el._computedDisplay ? el._computedDisplay : "inline-flex" }),
+};
+
+const src = fs
+  .readFileSync(process.env.APP_JS_PATH, "utf8")
+  .replace(
+    /^import\s+\*\s+as\s+Motion\s+from\s+"\.\/motion\.js";/m,
+    `const Motion = new Proxy({
+      settled: () => new Promise((r) => setTimeout(r, 25)),
+      guardAction: async (_btn, fn) => ({ value: await fn(), release: () => {} }),
+      createToaster: () => ({ show() {}, dismiss() {} }),
+      createElapsedClock: () => ({ bind() {}, destroy() {} }),
+      bindIndicator: () => ({ update() {}, destroy() {} }),
+      observeLoop: () => {},
+      switchTheme: (next) => stubDocument.documentElement.setAttribute("data-theme", next),
+    }, { get(t, k) { return k in t ? t[k] : () => ({ update() {}, destroy() {}, show() {}, dismiss() {} }); } });`
+  )
+  .replace(/^export\s+/gm, "");
+
+const sandbox = {
+  console,
+  setTimeout,
+  clearTimeout,
+  requestAnimationFrame: (fn) => setTimeout(fn, 0),
+  Date,
+  Math,
+  JSON,
+  Number,
+  String,
+  Boolean,
+  Array,
+  Object,
+  Set,
+  Map,
+  Promise,
+  Error,
+  RegExp,
+  encodeURIComponent,
+  decodeURIComponent,
+  Node: StubNode,
+  stubDocument,
+  document: stubDocument,
+  window: stubWindow,
+  localStorage: {
+    _m: new Map(),
+    getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },
+    setItem(k, v) { this._m.set(k, String(v)); },
+    removeItem(k) { this._m.delete(k); },
+  },
+  SERVER_PORT: 5487,
+  CSRF_TOKEN: "test-csrf",
+  fetch: async () => ({ ok: true, status: 202, json: async () => ({ ok: true, telemetry_enabled: true }) }),
+};
+
+vm.createContext(sandbox);
+vm.runInContext(
+  src + "\nglobalThis.__domTest = { openPrivacyPopover, openMobileMenuPopover, openInviteModal, closePopover, closeModal, wizardPackSlugForSku };",
+  sandbox
+);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+(async () => {
+  const T = sandbox.__domTest;
+  btnPrivacy.addEventListener("click", () => T.openPrivacyPopover(btnPrivacy));
+  btnMobileMenu.addEventListener("click", () => T.openMobileMenuPopover(btnMobileMenu));
+
+  // 1. Direct #btn-privacy click mounts Local privacy dialog + verified security/founders links and survives settle window
+  btnPrivacy.click();
+  assert.strictEqual(popoverLayer.hidden, false, "direct #btn-privacy click must unhide #popover-layer");
+  const h2Direct = popoverLayer.querySelector("h2");
+  assert.ok(h2Direct && h2Direct.textContent === "Local privacy", "expected Local privacy heading on direct click");
+  const links = popoverLayer.querySelectorAll("a").map((a) => a.getAttribute("href"));
+  assert.deepStrictEqual(links, [
+    "https://chinwag.sh/security",
+    "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
+  ]);
+  await sleep(40);
+  assert.strictEqual(popoverLayer.hidden, false, "Local privacy popover must remain open after Motion.settled window");
+
+  // 2. Stale closePopover() timer race: start animated close (25ms), re-click #btn-privacy 5ms later -> must NOT wipe newly opened popover
+  const closingPromise = T.closePopover();
+  await sleep(5);
+  btnPrivacy.click();
+  assert.strictEqual(popoverLayer.hidden, false);
+  await closingPromise;
+  await sleep(35);
+  assert.strictEqual(popoverLayer.hidden, false, "stale closePopover() Motion.settled completion must never wipe re-opened Local privacy popover");
+  assert.strictEqual(popoverLayer.querySelector("h2").textContent, "Local privacy");
+
+  await T.closePopover({ immediate: true });
+  assert.strictEqual(popoverLayer.hidden, true);
+
+  // 3. Mobile Menu -> "Local privacy & analytics" handoff on same triggerEl opens Local privacy deterministically
+  btnMobileMenu.click();
+  assert.strictEqual(popoverLayer.hidden, false);
+  assert.strictEqual(popoverLayer.querySelector("h2").textContent, "Menu");
+  const menuPrivacyBtn = popoverLayer
+    .querySelectorAll("button")
+    .find((b) => b.textContent.includes("Local privacy & analytics"));
+  assert.ok(menuPrivacyBtn, "Menu must render Local privacy & analytics button");
+  menuPrivacyBtn.click();
+  assert.strictEqual(popoverLayer.hidden, false, "clicking Local privacy & analytics in Menu must immediately open Local privacy");
+  assert.strictEqual(popoverLayer.querySelector("h2").textContent, "Local privacy");
+  await sleep(40);
+  assert.strictEqual(popoverLayer.hidden, false, "Local privacy opened from Menu must survive async Motion.settled timers");
+  assert.strictEqual(popoverLayer.querySelector("h2").textContent, "Local privacy");
+
+  // 4. Mobile Menu -> "Invite teammate · +250 Cr" closes popover immediately, mounts Invite modal with verified referral URL, and restores focus to mobile trigger when #btn-invite is display:none
+  await T.closePopover({ immediate: true });
+  btnMobileMenu.click();
+  const menuInviteBtn = popoverLayer
+    .querySelectorAll("button")
+    .find((b) => b.textContent.includes("Invite teammate"));
+  assert.ok(menuInviteBtn, "Menu must render Invite teammate button");
+  menuInviteBtn.click();
+  assert.strictEqual(popoverLayer.hidden, true, "Invite handoff must close Menu popover immediately");
+  assert.strictEqual(modalLayer.hidden, false, "Invite handoff must open #modal-layer");
+  const copyFields = modalLayer.querySelectorAll(".copy-field").map((n) => n.textContent);
+  assert.ok(
+    copyFields.includes("https://chinwag.sh/pricing?source=local_ui_referral"),
+    `expected verified referral_url in Invite modal, got ${JSON.stringify(copyFields)}`
+  );
+  await T.closeModal();
+  assert.strictEqual(modalLayer.hidden, true);
+  assert.strictEqual(stubDocument.activeElement, btnMobileMenu, "closing Invite modal opened from mobile menu must restore focus to #btn-mobile-menu");
+
+  // 5. Fallback checkout pack slug mapping matches pricing.html wizard keys
+  assert.strictEqual(T.wizardPackSlugForSku("pack_50"), "developer");
+  assert.strictEqual(T.wizardPackSlugForSku("pack_160"), "growth");
+  assert.strictEqual(T.wizardPackSlugForSku("pack_560"), "scale");
+  assert.strictEqual(T.wizardPackSlugForSku("pack_1000"), "volume");
+
+  // 6. Repeated dismissal 5ms apart preserves return-focus target on both closePopover() and closeModal()
+  btnPrivacy.click();
+  assert.strictEqual(popoverLayer.hidden, false);
+  stubDocument.activeElement = null;
+  const popDismiss1 = T.closePopover();
+  await sleep(5);
+  const popDismiss2 = T.closePopover();
+  await Promise.all([popDismiss1, popDismiss2]);
+  assert.strictEqual(popoverLayer.hidden, true);
+  assert.strictEqual(
+    stubDocument.activeElement,
+    btnPrivacy,
+    "repeated closePopover() calls 5ms apart must still restore focus to #btn-privacy"
+  );
+
+  T.openInviteModal("global_header", btnMobileMenu);
+  assert.strictEqual(modalLayer.hidden, false);
+  stubDocument.activeElement = null;
+  const modDismiss1 = T.closeModal();
+  await sleep(5);
+  const modDismiss2 = T.closeModal();
+  await Promise.all([modDismiss1, modDismiss2]);
+  assert.strictEqual(modalLayer.hidden, true);
+  assert.strictEqual(
+    stubDocument.activeElement,
+    btnMobileMenu,
+    "repeated closeModal() calls 5ms apart must still restore focus to trigger"
+  );
+
+  console.log("POPOVER_DOM_HARNESS_OK=6_SUITES");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"##;
+
+    let out = Command::new("node")
+        .arg("-e")
+        .arg(harness)
+        .env("APP_JS_PATH", &app_js_path)
+        .output()
+        .expect("execute node VM popover DOM harness");
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout_str.contains("POPOVER_DOM_HARNESS_OK=6_SUITES"),
+        "node VM popover DOM harness failed:\nstdout: {}\nstderr: {}",
         stdout_str,
         String::from_utf8_lossy(&out.stderr)
     );

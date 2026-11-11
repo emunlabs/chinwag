@@ -1,0 +1,89 @@
+{
+  "tombstone_id": "tombstone-ui-qa-headless-or-mobile-only-v1",
+  "ticket_id": "CHWG-0249",
+  "source_run_id": "CHWG-0249-ui-v4-desktop-links-and-geometry",
+  "forbidden_404_routes": [
+    "/contact",
+    "chinwag.sh/invite"
+  ],
+  "required_css_contracts": [
+    ".select appearance:none",
+    ".pill-fn white-space:nowrap",
+    ".app-header .menu-btn display:none"
+  ],
+  "fork_at_step": 1,
+  "steps": [
+    {
+      "step_index": 0,
+      "kind": "tool",
+      "request_jcs_sha256": "f9068d27e406fe765152496dbcdb875147ed2a40c8af72657128fabf87d45066",
+      "request_json": {
+        "check": "ui_v4_desktop_links_and_geometry",
+        "surface": "127.0.0.1:5487",
+        "ticket_id": "CHWG-0249"
+      },
+      "response_json": {
+        "ok": true,
+        "pricing_url": "https://chinwag.sh/pricing",
+        "founders_url": "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
+        "referral_url": "https://chinwag.sh/pricing?source=local_ui_referral",
+        "security_url": "https://chinwag.sh/security",
+        "pack_slugs": {
+          "pack_50": "developer",
+          "pack_160": "growth",
+          "pack_560": "scale",
+          "pack_1000": "volume"
+        },
+        "css_contracts": [
+          ".select appearance:none",
+          ".pill-fn white-space:nowrap",
+          ".app-header .menu-btn display:none"
+        ]
+      },
+      "simulated_clock_ms": 1762882500000,
+      "simulated_uuid": "00000000-0000-4000-8000-000000000249",
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "cost_micro_usd": 0,
+      "shadow_kv_prefix_hash": null
+    }
+  ],
+  "expectations": [
+    {
+      "type": "json_path_equals",
+      "step_index": 0,
+      "json_path": "$.ok",
+      "expected": true
+    },
+    {
+      "type": "json_path_equals",
+      "step_index": 0,
+      "json_path": "$.pricing_url",
+      "expected": "https://chinwag.sh/pricing"
+    },
+    {
+      "type": "json_path_equals",
+      "step_index": 0,
+      "json_path": "$.founders_url",
+      "expected": "https://chinwag.sh/pricing?talk=1&source=local_ui#founders"
+    },
+    {
+      "type": "json_path_equals",
+      "step_index": 0,
+      "json_path": "$.referral_url",
+      "expected": "https://chinwag.sh/pricing?source=local_ui_referral"
+    },
+    {
+      "type": "forbidden_pattern",
+      "pattern": "/contact"
+    },
+    {
+      "type": "forbidden_pattern",
+      "pattern": "chinwag.sh/invite"
+    },
+    {
+      "type": "max_tool_calls",
+      "max_calls": 1
+    }
+  ]
+}

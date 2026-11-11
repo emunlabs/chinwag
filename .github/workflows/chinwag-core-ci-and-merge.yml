@@ -47,7 +47,7 @@ env:
   RATCHET_WORKHORSE_COMBINED_FLOOR: "320"
   RATCHET_CHINWAG_CLI_LIB_FLOOR: "298"
   RATCHET_CHINWAG_CLI_P0_ADV_FLOOR: "22"
-  RATCHET_CHINWAG_CLI_TOTAL_FLOOR: "408"
+  RATCHET_CHINWAG_CLI_TOTAL_FLOOR: "800"
   RATCHET_WORKSPACE_TOTAL_FLOOR: "766"
 
 jobs:
@@ -207,8 +207,17 @@ jobs:
           fi
           chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${VERIFY_COMMIT:-HEAD}"
           if chinwag-ci --help 2>&1 | grep -q 'surface-gate'; then
-            chinwag-ci surface-gate --manifest .chinwag/tasks/CHWG-0234/surface-impact.yaml --max-pr-age-secs 3600 --surfaces all --workspace-root "$PWD/.." --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
+            WS_ROOT="$PWD/.."
+            if [[ ! -d "$WS_ROOT/chinwag/.chinwag/regressions" && -d ".chinwag/regressions" ]]; then
+              WS_ROOT="."
+            fi
+            MIN_CASSETTES="$(awk '/^min_cassettes_count:/ {print $2}' .chinwag/tasks/CHWG-0234/surface-impact.yaml 2>/dev/null || echo 1)"
+            chinwag-ci surface-gate --manifest .chinwag/tasks/CHWG-0234/surface-impact.yaml --min-cassettes "${MIN_CASSETTES:-1}" --max-pr-age-secs 3600 --surfaces all --workspace-root "$WS_ROOT" --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
           fi
+          if chinwag-ci --help 2>&1 | grep -q 'test-regressions'; then
+            chinwag-ci test-regressions --dir .chinwag/regressions --json
+          fi
+          node ./scripts/verify-ui-v4-contracts.mjs
           if chinwag-ci --help 2>&1 | grep -q 'ui-gate'; then
             chinwag-ci ui-gate --surface all --repo . --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
           fi

@@ -49,7 +49,7 @@ pub const UI_VERSION: &str = "4.1";
 const MAX_CONCURRENT_UI_CONNECTIONS: usize = 64;
 const MAX_BUS_TAIL_READ_BYTES: u64 = 2 * 1024 * 1024;
 pub const PACK_EXPIRY_NOTICE: &str = "500 free starter credits (valid 90 days) · $0 per teammate seat · Paid credit packs remain valid for 12 months from purchase.";
-pub const CREDIT_PACKS_PRICING_URL: &str = "https://chinwag.sh/pricing.html#credit-packs";
+pub const CREDIT_PACKS_PRICING_URL: &str = "https://chinwag.sh/pricing";
 pub const HUMAN_BASELINE_EXPLAINER: &str = "Estimated against typical solo engineering time for similar pull requests (2.5 hours per small bug fix, 5 hours per feature change).";
 
 const UI_V4_INDEX_HTML: &str = include_str!("../assets/ui-v4/index.html");
@@ -3703,7 +3703,7 @@ fn build_bootstrap_json(repo_root: &Path, port: u16) -> Value {
             "summary": "Your source code, diffs, and git history stay on 127.0.0.1 and never leave your machine unless an enabled cloud review step runs on a scoped diff.",
             "billing_note": "Usage analytics never include source code, file paths, prompts, git URLs, emails, or IP addresses.",
             "compliance_note": "Emun Labs is pursuing SOC 2.",
-            "ciso_review_url": "https://chinwag.sh/pricing?talk=1",
+            "ciso_review_url": "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
             "telemetry_enabled": telemetry_prefs.get("telemetry_enabled").and_then(Value::as_bool).unwrap_or(true)
         },
         "invite": {
@@ -4321,9 +4321,16 @@ fn handle_credits_checkout(body: &[u8]) -> (&'static str, Value) {
         );
     };
 
+    let wizard_pack_slug = match canonical_sku {
+        "pack_50" => "developer",
+        "pack_160" => "growth",
+        "pack_560" => "scale",
+        "pack_1000" => "volume",
+        _ => "growth",
+    };
     let attempt_id = mint_rfc4122_v4_uuid();
     let checkout_url = format!(
-        "https://chinwag.sh/pricing.html?pack={canonical_sku}&attempt={attempt_id}#credit-packs"
+        "https://chinwag.sh/pricing?pack={wizard_pack_slug}&source=local_ui&attempt={attempt_id}"
     );
 
     (
@@ -6031,11 +6038,9 @@ mod tests {
             chk_json["checkout_url"]
                 .as_str()
                 .unwrap_or("")
-                .starts_with("https://chinwag.sh/pricing.html?")
-                && chk_json["checkout_url"]
-                    .as_str()
-                    .unwrap_or("")
-                    .ends_with("#credit-packs")
+                .starts_with("https://chinwag.sh/pricing?pack=growth&source=local_ui&attempt="),
+            "unexpected checkout_url: {}",
+            chk_json["checkout_url"]
         );
 
         // 11. Auto-refill rejects missing monthly_cap_usd when enabled: true, succeeds with cap

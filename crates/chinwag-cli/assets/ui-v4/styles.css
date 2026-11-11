@@ -605,10 +605,6 @@ nav.tabs > a[aria-current="page"]::after,
   }
 }
 
-.menu-btn {
-  display: none;
-}
-
 @media (max-width: 1119.98px) {
   .app-header > nav.tabs {
     display: none;
@@ -657,9 +653,6 @@ nav.tabs > a[aria-current="page"]::after,
   }
   .hdr-desktop-only {
     display: none !important;
-  }
-  .menu-btn {
-    display: inline-flex;
   }
   .credit-pill {
     max-width: 112px;
@@ -746,6 +739,20 @@ nav.tabs > a[aria-current="page"]::after,
 
 .btn-secondary:hover:not([aria-disabled="true"]) {
   background-color: var(--action-secondary-bg-hover);
+}
+
+.app-header .menu-btn,
+.btn-secondary.menu-btn,
+.menu-btn {
+  display: none;
+}
+
+@media (max-width: 719.98px) {
+  .app-header .menu-btn,
+  .btn-secondary.menu-btn,
+  .menu-btn {
+    display: inline-flex;
+  }
 }
 
 .btn-ghost {
@@ -891,12 +898,14 @@ code.pill-code,
 .pill-fn {
   display: inline-flex;
   align-items: center;
-  height: 20px;
-  padding: 0 8px;
+  min-height: 22px;
+  padding: 2px 8px;
   border-radius: var(--r-pill);
   font-size: 12px;
   line-height: 16px;
   font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
   background: var(--status-neutral-bg);
   color: var(--status-neutral-ink);
 }
@@ -1078,12 +1087,30 @@ code.pill-code,
 .select {
   width: 100%;
   height: var(--h-md);
-  padding: 0 12px;
   border-radius: var(--r-md);
   border: 1px solid var(--border-control);
-  background: var(--bg-surface);
+  background-color: var(--bg-surface);
   color: var(--ink-primary);
   font-size: 14px;
+}
+
+.input {
+  padding: 0 12px;
+}
+
+.select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 0 36px 0 12px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%2357534E' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px 12px;
+}
+
+[data-theme="dark"] .select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%23A6A09B' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5'/%3E%3C/svg%3E");
 }
 
 .input::placeholder {
@@ -2345,9 +2372,10 @@ col.diff-col-split-code {
 
 .tool-title-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: var(--s-2);
+  gap: 6px var(--s-2);
 }
 
 .cursor-import-card {
@@ -2686,7 +2714,7 @@ col.diff-col-split-code {
 
 .autorefill-controls .select {
   width: auto;
-  min-width: 140px;
+  min-width: 160px;
 }
 
 .enterprise-card {
@@ -2708,13 +2736,14 @@ col.diff-col-split-code {
 
 .popover-scrim {
   position: fixed;
-  inset: 0;
+  inset: var(--header-h) 0 0 0;
   pointer-events: auto;
   background: transparent;
 }
 
 @media (max-width: 719.98px) {
   .popover-scrim {
+    inset: 0;
     background: var(--bg-scrim);
   }
 }
@@ -2769,6 +2798,33 @@ col.diff-col-split-code {
   border: 0;
   border-top: 1px solid var(--border-subtle);
   margin: 0;
+}
+
+.popover-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2) var(--s-3);
+  padding-top: 2px;
+}
+
+.popover-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 500;
+  color: var(--ink-secondary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--border-strong);
+}
+
+.popover-link:hover {
+  color: var(--ink-primary);
+  text-decoration-color: var(--ink-primary);
 }
 
 .bench-table {
@@ -2969,6 +3025,14 @@ col.diff-col-split-code {
   .input,
   .select {
     border: 1px solid CanvasText;
+  }
+
+  .select,
+  [data-theme="dark"] .select {
+    appearance: auto;
+    -webkit-appearance: auto;
+    background-image: none;
+    padding-inline: 12px;
   }
 
   .btn-primary:not([aria-disabled="true"]) {
