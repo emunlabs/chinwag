@@ -78,6 +78,8 @@ pub mod task_wire;
 pub mod task_write_journal;
 #[cfg(target_os = "macos")]
 pub mod task_writer;
+#[cfg(target_os = "macos")]
+pub mod workspace_capability_inventory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invocation {

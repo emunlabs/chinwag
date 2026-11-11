@@ -778,6 +778,7 @@ dependencies = [
  "chinwag-confirmed-initial-private",
  "chinwag-editor-config-private",
  "chinwag-history-archive",
+ "chinwag-host-process",
  "chinwag-mcp-private-anchored",
  "chinwag-signing",
  "chinwag-snapshot-read-owner-private",
