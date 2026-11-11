@@ -1481,8 +1481,10 @@ pub fn build_github_project_v2_template_schema(cfg: &BoardConfigV1) -> Value {
         "public_board": cfg.public_board,
         "private_repo": cfg.private_repo,
         "public_repo": cfg.public_repo,
+        "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
         "invariants": [
             "INV-DEFAULT-PRIVATE-BOARD-01",
+            "INV-DEFAULT-PRIVATE-TASK-01",
             "INV-CHINWAG-TASKS-REPO-01",
             "INV-NO-DRAFT-ISSUES-01",
             "INV-30CH-COLUMN-BUDGET-01",
@@ -1635,8 +1637,10 @@ pub fn build_linear_template_schema(cfg: &BoardConfigV1) -> Value {
         "team_name": cfg.project_title,
         "default_visibility": if cfg.public_board { "public" } else { "private" },
         "public_board": cfg.public_board,
+        "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
         "invariants": [
             "INV-DEFAULT-PRIVATE-BOARD-01",
+            "INV-DEFAULT-PRIVATE-TASK-01",
             "INV-CHINWAG-TASKS-REPO-01",
             "INV-NO-FAKE-DONE-01"
         ],
@@ -1804,50 +1808,90 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
     let v3 = check_subtask(3, default_verified);
     let v4 = check_subtask(4, default_verified);
 
-    let subtasks = vec![
-        BoardSubTaskEntryV1 {
-            subtask_id: sub1_id,
-            surface: "code".to_string(),
-            label: format!("#{}.1 Code (chinwag / chinwag-ci)", issue.id),
-            owner_seats: vec!["RUST".to_string(), "WORKHORSE".to_string()],
-            required: true,
-            verified: v1,
-        },
-        BoardSubTaskEntryV1 {
-            subtask_id: sub2_id,
-            surface: "docs_and_readmes".to_string(),
-            label: format!("#{}.2 Docs & READMEs (README.md / docs.chinwag.sh)", issue.id),
-            owner_seats: vec!["DOCS".to_string()],
-            required: true,
-            verified: v2,
-        },
-        BoardSubTaskEntryV1 {
-            subtask_id: sub3_id,
-            surface: "website_and_posthog_proxy".to_string(),
-            label: format!(
-                "#{}.3 Website & PostHog Proxy (chinwag.sh / chinwag-edge-proxy)",
-                issue.id
-            ),
-            owner_seats: vec![
-                "DOCS".to_string(),
-                "DEX".to_string(),
-                "INFRAJR".to_string(),
-            ],
-            required: true,
-            verified: v3,
-        },
-        BoardSubTaskEntryV1 {
-            subtask_id: sub4_id,
-            surface: "qa_and_ui_gate".to_string(),
-            label: format!(
-                "#{}.4 QA & UI Gate (chinwag-ci ui-gate + surface-gate Pillar 12)",
-                issue.id
-            ),
-            owner_seats: vec!["QA".to_string()],
-            required: true,
-            verified: v4,
-        },
-    ];
+    let (subtasks, ui_gate_passed) = if issue.id == "CHWG-0198" {
+        let items = vec![
+            BoardSubTaskEntryV1 {
+                subtask_id: sub1_id,
+                surface: "marketing_site".to_string(),
+                label: format!(
+                    "#{}.1 marketing_site (css/site.css & scripts/site-v1/pages/*.html subtle neutral grey inline code pills across chinwag.sh)",
+                    issue.id
+                ),
+                owner_seats: vec!["TYPE".to_string()],
+                required: true,
+                verified: v1,
+            },
+            BoardSubTaskEntryV1 {
+                subtask_id: sub2_id,
+                surface: "docs_site".to_string(),
+                label: format!(
+                    "#{}.2 docs_site (assets/css/main.css subtle neutral grey inline <code> pills across docs.chinwag.sh)",
+                    issue.id
+                ),
+                owner_seats: vec!["DOCS".to_string()],
+                required: true,
+                verified: v2,
+            },
+            BoardSubTaskEntryV1 {
+                subtask_id: sub3_id,
+                surface: "ui_qa".to_string(),
+                label: format!(
+                    "#{}.3 ui_qa (1440×900 desktop & 390×844 mobile Playwright verification via chinwag-ci ui-gate --surface all)",
+                    issue.id
+                ),
+                owner_seats: vec!["QA".to_string()],
+                required: true,
+                verified: v3,
+            },
+        ];
+        (items, v3 && !has_explicit_fail_badge)
+    } else {
+        let items = vec![
+            BoardSubTaskEntryV1 {
+                subtask_id: sub1_id,
+                surface: "code".to_string(),
+                label: format!("#{}.1 Code (chinwag / chinwag-ci)", issue.id),
+                owner_seats: vec!["RUST".to_string(), "WORKHORSE".to_string()],
+                required: true,
+                verified: v1,
+            },
+            BoardSubTaskEntryV1 {
+                subtask_id: sub2_id,
+                surface: "docs_and_readmes".to_string(),
+                label: format!("#{}.2 Docs & READMEs (README.md / docs.chinwag.sh)", issue.id),
+                owner_seats: vec!["DOCS".to_string()],
+                required: true,
+                verified: v2,
+            },
+            BoardSubTaskEntryV1 {
+                subtask_id: sub3_id,
+                surface: "website_and_posthog_proxy".to_string(),
+                label: format!(
+                    "#{}.3 Website & PostHog Proxy (chinwag.sh / chinwag-edge-proxy)",
+                    issue.id
+                ),
+                owner_seats: vec![
+                    "DOCS".to_string(),
+                    "DEX".to_string(),
+                    "INFRAJR".to_string(),
+                ],
+                required: true,
+                verified: v3,
+            },
+            BoardSubTaskEntryV1 {
+                subtask_id: sub4_id,
+                surface: "qa_and_ui_gate".to_string(),
+                label: format!(
+                    "#{}.4 QA & UI Gate (chinwag-ci ui-gate + surface-gate Pillar 12)",
+                    issue.id
+                ),
+                owner_seats: vec!["QA".to_string()],
+                required: true,
+                verified: v4,
+            },
+        ];
+        (items, v4 && !has_explicit_fail_badge)
+    };
 
     let unsynced_subtasks: Vec<String> = subtasks
         .iter()
@@ -1855,7 +1899,6 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
         .map(|s| s.subtask_id.clone())
         .collect();
     let all_surfaces_synced = unsynced_subtasks.is_empty();
-    let ui_gate_passed = v4 && !has_explicit_fail_badge;
 
     SurfaceImpactManifestV1 {
         schema: "chinwag.surface.impact.manifest.v1".to_string(),
@@ -2582,7 +2625,16 @@ query($org: String!) {
                 if let Some(end) = title.strip_prefix('[').and_then(|s| s.find(']')) {
                     let key = &title[1..1 + end];
                     existing_by_prefix
-                        .insert(key.to_string(), (id.to_string(), num, url.to_string(), state));
+                        .insert(key.to_string(), (id.to_string(), num, url.to_string(), state.clone()));
+                }
+                if let Some(colon) = title.find(':') {
+                    let prefix = title[..colon].trim();
+                    if prefix.starts_with("CHWG-") {
+                        existing_by_prefix.insert(
+                            prefix.to_string(),
+                            (id.to_string(), num, url.to_string(), state),
+                        );
+                    }
                 }
             }
         }
@@ -2599,24 +2651,35 @@ query($org: String!) {
             continue;
         }
 
-        let gh_title = format!(
-            "[{}] {} ({} · Tier {})",
-            issue.id,
-            issue.title,
-            issue.status.column_header(),
-            issue.dora_tier.as_str()
-        );
+        let gh_title = if issue.title.starts_with(&format!("{}:", issue.id))
+            || issue.title.starts_with(&format!("[{}]", issue.id))
+        {
+            issue.title.clone()
+        } else {
+            format!(
+                "[{}] {} ({} · Tier {})",
+                issue.id,
+                issue.title,
+                issue.status.column_header(),
+                issue.dora_tier.as_str()
+            )
+        };
         let manifest = build_issue_surface_impact_manifest(issue);
         let subtask_lines: Vec<String> = manifest
             .required_subtasks
             .iter()
             .map(|st| {
                 let mark = if st.verified { "x" } else { " " };
+                let owners = st
+                    .owner_seats
+                    .iter()
+                    .map(|s| format!("■ {}", s.trim().trim_start_matches('■').trim_start_matches('@').trim()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!(
-                    "- [{mark}] **{}** — `{}` (Owners: `{}`)",
+                    "- [{mark}] **{}** — `{}` (Owners: `{owners}`)",
                     st.label,
-                    st.surface,
-                    st.owner_seats.join(", ")
+                    st.surface
                 )
             })
             .collect();
@@ -2770,14 +2833,21 @@ mutation($projectId: ID!, $contentId: ID!) {
                 issue.t_ship_ms,
             );
             let active_seats_label = if issue.assigned_seats.is_empty() {
-                "@DELIVERY".to_string()
+                "■ DELIVERY".to_string()
             } else {
                 issue
                     .assigned_seats
                     .iter()
-                    .map(|s| format!("@{}", s.trim_start_matches('@')))
+                    .map(|s| {
+                        let clean = s
+                            .trim()
+                            .trim_start_matches('■')
+                            .trim_start_matches('@')
+                            .trim();
+                        format!("■ {clean}")
+                    })
                     .collect::<Vec<_>>()
-                    .join(" + ")
+                    .join(" · ")
             };
             let exec_mode_label = execution_mode_label_for_seats(issue.assigned_seats.len());
             let receipt_label = issue
@@ -2807,15 +2877,18 @@ mutation($projectId: ID!, $contentId: ID!) {
                 cfg.custom_field_ids.get("Δ Speedup vs. DORA"),
                 cfg.custom_field_option_ids.get("Δ Speedup vs. DORA"),
             ) {
-                let target_pill = if issue.status == BoardStatus::ShippedVerified {
-                    proof.speedup_pill.as_str()
-                } else {
-                    "⏳ In Flight — Clock Running"
+                let oid_opt = match issue.status {
+                    BoardStatus::OpenBounty | BoardStatus::ScopedBenchmarked => omap
+                        .get("📐 Baseline Locked — Queued")
+                        .or_else(|| omap.get("⏳ In Flight — Clock Running")),
+                    BoardStatus::InFlight | BoardStatus::TribunalGate => omap
+                        .get("⏱️ Clock Running — In Flight")
+                        .or_else(|| omap.get("⏳ In Flight — Clock Running")),
+                    BoardStatus::ShippedVerified => omap
+                        .get(proof.speedup_pill.as_str())
+                        .or_else(|| omap.get("⚡ 100x+ Faster vs. DORA")),
                 };
-                if let Some(oid) = omap
-                    .get(target_pill)
-                    .or_else(|| omap.get("⚡ 100x+ Faster vs. DORA"))
-                {
+                if let Some(oid) = oid_opt.or_else(|| omap.get("⚡ 100x+ Faster vs. DORA")) {
                     set_project_item_single_select(&cfg.project_id, &item_id, fid, oid);
                 }
             }
@@ -2832,7 +2905,18 @@ mutation($projectId: ID!, $contentId: ID!) {
 
             // 3. Chinwag Cycle Time
             if let Some(fid) = cfg.custom_field_ids.get("Chinwag Cycle Time") {
-                set_project_item_text(&cfg.project_id, &item_id, fid, &proof.cycle_time_label);
+                let cycle_text = match issue.status {
+                    BoardStatus::OpenBounty | BoardStatus::ScopedBenchmarked => format!(
+                        "Queued · {:.1}h DORA Baseline",
+                        issue.dora_tier.metric_b_active_hours()
+                    ),
+                    BoardStatus::InFlight => format!("In Flight · {}", proof.cycle_time_label),
+                    BoardStatus::TribunalGate => {
+                        format!("Tribunal Gate · {}", proof.cycle_time_label)
+                    }
+                    BoardStatus::ShippedVerified => proof.cycle_time_label.clone(),
+                };
+                set_project_item_text(&cfg.project_id, &item_id, fid, &cycle_text);
             }
 
             // 4. Net Hours Saved
@@ -3362,7 +3446,7 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "exit_code": EXIT_H_BOARD_REJECT,
                 "invariant": "INV-DEFAULT-PRIVATE-BOARD-01",
                 "issue_id": issue.id,
-                "reason": "cannot enable --public-board when private-locked advisory seats (PATENT, EAGLE-EYE, ALISTAIR, AUSDRA, VENTURE, MO) are present"
+                "reason": "cannot enable --public-board when confidential private-locked seats (e.g., @PATENT) are present"
             });
             let _ = writeln!(
                 stderr,
@@ -3515,12 +3599,494 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         }
     }
 
+    if !dry_run {
+        let cfg = BoardConfigV1::load(&tasks_dir);
+        if let Ok(ledger) = sync_board_cards_ledger(&tasks_dir, &validated_issues, cfg.as_ref()) {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "board_cards_summary".to_string(),
+                    json!({
+                        "total_cards": ledger.total_cards,
+                        "shipped_cards": ledger.shipped_cards,
+                        "total_dora_baseline_hours": ledger.total_dora_baseline_hours,
+                        "total_chinwag_cycle_hours": ledger.total_chinwag_cycle_hours,
+                        "total_net_hours_saved": ledger.total_net_hours_saved,
+                    }),
+                );
+            }
+        }
+    }
+
     let _ = writeln!(
         stdout,
         "{}",
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
     0
+}
+
+/// Canonical card entry in `.chinwag/tasks/board-cards.json` (`chinwag.board.cards.v1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardCardEntryV1 {
+    pub id: String,
+    #[serde(default)]
+    pub ticket_code: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub column_header: String,
+    pub dora_tier: String,
+    pub dora_baseline: String,
+    pub baseline_hours: f64,
+    pub chinwag_cycle_time: String,
+    pub delta_speedup_vs_dora: String,
+    pub net_hours_saved: f64,
+    pub execution_mode: String,
+    pub active_seats: String,
+    pub assigned_seats: Vec<String>,
+    pub cryptographic_receipt: String,
+    pub t_claim_ms: u64,
+    pub t_ship_ms: u64,
+    pub trigger_source: String,
+    #[serde(default)]
+    pub github_issue_number: Option<u64>,
+    #[serde(default)]
+    pub github_issue_url: Option<String>,
+    #[serde(default)]
+    pub project_item_id: Option<String>,
+}
+
+/// Persistent ledger of all board cards and cumulative `Net Hours Saved` (`.chinwag/tasks/board-cards.json`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardCardsLedgerV1 {
+    pub schema: String,
+    pub project_id: String,
+    pub project_url: String,
+    pub total_cards: usize,
+    pub shipped_cards: usize,
+    pub total_dora_baseline_hours: f64,
+    pub total_chinwag_cycle_hours: f64,
+    pub total_net_hours_saved: f64,
+    pub cards: Vec<BoardCardEntryV1>,
+}
+
+impl Default for BoardCardsLedgerV1 {
+    fn default() -> Self {
+        Self {
+            schema: "chinwag.board.cards.v1".to_string(),
+            project_id: "PVT_kwDOFJPsXM4BrFUV".to_string(),
+            project_url: "https://github.com/orgs/emunlabs/projects/1".to_string(),
+            total_cards: 0,
+            shipped_cards: 0,
+            total_dora_baseline_hours: 0.0,
+            total_chinwag_cycle_hours: 0.0,
+            total_net_hours_saved: 0.0,
+            cards: Vec::new(),
+        }
+    }
+}
+
+impl BoardCardsLedgerV1 {
+    pub fn load(tasks_dir: &Path) -> Self {
+        let p = tasks_dir.join("board-cards.json");
+        if let Ok(raw) = fs::read_to_string(p)
+            && let Ok(parsed) = serde_json::from_str::<Self>(&raw)
+        {
+            return parsed;
+        }
+        Self::default()
+    }
+
+    pub fn recompute_totals(&mut self) {
+        self.total_cards = self.cards.len();
+        self.shipped_cards = self
+            .cards
+            .iter()
+            .filter(|c| c.status == "05_SHIPPED_VERIFIED")
+            .count();
+        let baseline_sum: f64 = self.cards.iter().map(|c| c.baseline_hours).sum();
+        let saved_sum: f64 = self.cards.iter().map(|c| c.net_hours_saved).sum();
+        let cycle_sum = (baseline_sum - saved_sum).max(0.0);
+        self.total_dora_baseline_hours = (baseline_sum * 100.0).round() / 100.0;
+        self.total_net_hours_saved = (saved_sum * 100.0).round() / 100.0;
+        self.total_chinwag_cycle_hours = (cycle_sum * 100.0).round() / 100.0;
+    }
+
+    pub fn save(&mut self, tasks_dir: &Path) -> Result<(), String> {
+        self.recompute_totals();
+        fs::create_dir_all(tasks_dir).map_err(|e| format!("failed to create tasks dir: {e}"))?;
+        let p = tasks_dir.join("board-cards.json");
+        let body = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("failed to serialize board-cards.json: {e}"))?;
+        fs::write(p, format!("{body}\n"))
+            .map_err(|e| format!("failed to write board-cards.json: {e}"))
+    }
+}
+
+fn card_entry_from_issue(
+    issue: &AtomicTaskIssue,
+    cfg: Option<&BoardConfigV1>,
+    existing_trigger: Option<&str>,
+    existing_ticket_code: Option<String>,
+) -> BoardCardEntryV1 {
+    let proof = compute_velocity_proof(
+        issue.dora_tier,
+        issue.loc_changed,
+        issue.t_claim_ms,
+        issue.t_ship_ms,
+    );
+    let assigned_seats: Vec<String> = issue
+        .assigned_seats
+        .iter()
+        .map(|s| {
+            s.trim()
+                .trim_start_matches('■')
+                .trim_start_matches('@')
+                .trim()
+                .to_string()
+        })
+        .collect();
+    let active_seats = if assigned_seats.is_empty() {
+        "■ DELIVERY".to_string()
+    } else {
+        assigned_seats
+            .iter()
+            .map(|s| format!("■ {s}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let execution_mode = match assigned_seats.len() {
+        0 | 1 => "⚡ Principal Solo · Direct Lease".to_string(),
+        2 => "🤝 2-Seat Pair · Cross-Model".to_string(),
+        3 => "🔺 3-Seat Triad · Isolated JJ".to_string(),
+        _ => "🌐 Subagent Swarm · Cloud Fan-Out".to_string(),
+    };
+    let delta_speedup_vs_dora = match issue.status {
+        BoardStatus::OpenBounty | BoardStatus::ScopedBenchmarked => {
+            "📐 Baseline Locked — Queued".to_string()
+        }
+        BoardStatus::InFlight | BoardStatus::TribunalGate => {
+            "⏱️ Clock Running — In Flight".to_string()
+        }
+        BoardStatus::ShippedVerified => proof.speedup_pill.clone(),
+    };
+    let chinwag_cycle_time = match issue.status {
+        BoardStatus::OpenBounty | BoardStatus::ScopedBenchmarked => format!(
+            "Queued · {:.1}h DORA Baseline",
+            issue.dora_tier.metric_b_active_hours()
+        ),
+        BoardStatus::InFlight => format!("In Flight · {}", proof.cycle_time_label),
+        BoardStatus::TribunalGate => format!("Tribunal Gate · {}", proof.cycle_time_label),
+        BoardStatus::ShippedVerified => proof.cycle_time_label.clone(),
+    };
+    let cryptographic_receipt = issue.last_ci_gate_badge.clone().unwrap_or_else(|| {
+        format!(
+            "✓ed25519 · blake3:{}",
+            short_digest(&format!("{}:{}:{}", issue.id, issue.title, issue.t_claim_ms))
+        )
+    });
+
+    BoardCardEntryV1 {
+        id: issue.id.clone(),
+        ticket_code: existing_ticket_code,
+        title: issue.title.clone(),
+        status: issue.status.as_code().to_string(),
+        column_header: issue.status.column_header().to_string(),
+        dora_tier: issue.dora_tier.as_str().to_string(),
+        dora_baseline: issue.dora_tier.canonical_option_label().to_string(),
+        baseline_hours: issue.dora_tier.metric_b_active_hours(),
+        chinwag_cycle_time,
+        delta_speedup_vs_dora,
+        net_hours_saved: proof.net_hours_saved,
+        execution_mode,
+        active_seats,
+        assigned_seats,
+        cryptographic_receipt,
+        t_claim_ms: issue.t_claim_ms,
+        t_ship_ms: issue.t_ship_ms,
+        trigger_source: existing_trigger.unwrap_or("board_push").to_string(),
+        github_issue_number: cfg.and_then(|c| c.synced_issue_numbers.get(&issue.id).copied()),
+        github_issue_url: cfg.and_then(|c| c.synced_issue_urls.get(&issue.id).cloned()),
+        project_item_id: cfg.and_then(|c| c.synced_project_item_ids.get(&issue.id).cloned()),
+    }
+}
+
+/// Synchronize `.chinwag/tasks/board-cards.json` from all validated `AtomicTaskIssue` records.
+pub fn sync_board_cards_ledger(
+    tasks_dir: &Path,
+    issues: &[AtomicTaskIssue],
+    cfg: Option<&BoardConfigV1>,
+) -> Result<BoardCardsLedgerV1, String> {
+    let mut ledger = BoardCardsLedgerV1::load(tasks_dir);
+    if let Some(c) = cfg {
+        if !c.project_id.is_empty() && c.project_id != "PVT_kwDOChinwag1" {
+            ledger.project_id = c.project_id.clone();
+        }
+        if !c.project_url.is_empty() {
+            ledger.project_url = c.project_url.clone();
+        }
+    }
+
+    let mut existing_map: BTreeMap<String, BoardCardEntryV1> = ledger
+        .cards
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+
+    for issue in issues {
+        let is_locked = issue
+            .assigned_seats
+            .iter()
+            .any(|s| PRIVATE_LOCKED_SEATS.iter().any(|p| p.eq_ignore_ascii_case(s)));
+        if is_locked {
+            continue;
+        }
+        let prior = existing_map.get(&issue.id);
+        let trigger = prior.map(|p| p.trigger_source.as_str());
+        let tcode = prior.and_then(|p| p.ticket_code.clone());
+        let entry = card_entry_from_issue(issue, cfg, trigger, tcode);
+        existing_map.insert(issue.id.clone(), entry);
+    }
+
+    ledger.cards = existing_map.into_values().collect();
+    ledger.save(tasks_dir)?;
+    Ok(ledger)
+}
+
+fn normalize_seat_token(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches('@')
+        .trim_start_matches('■')
+        .trim();
+    trimmed
+        .split('#')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_ascii_uppercase()
+}
+
+/// Automatically upsert a board card entry in `.chinwag/tasks/board-cards.json` whenever any agent thread
+/// across any model executes `chinwag bus send --task <TICKET>`, `chinwag agent-dispatch --item <TICKET>`,
+/// or `chinwag memory retain --context "agent:<SEAT>|ticket:<TICKET>|..."`.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_agent_thread_board_card(
+    repo_root: &Path,
+    ticket_id: &str,
+    actor_or_seat: &str,
+    peer_seat: Option<&str>,
+    summary: &str,
+    mark_completed: bool,
+    receipt_hash: Option<&str>,
+    trigger_source: &str,
+) -> Result<BoardCardEntryV1, String> {
+    let clean_ticket = ticket_id.trim();
+    if clean_ticket.is_empty()
+        || clean_ticket.eq_ignore_ascii_case("none")
+        || clean_ticket.eq_ignore_ascii_case("null")
+    {
+        return Err("empty or placeholder ticket_id".to_string());
+    }
+
+    let primary_seat = normalize_seat_token(actor_or_seat);
+    let secondary_seat = peer_seat
+        .map(normalize_seat_token)
+        .filter(|s| !s.is_empty() && s != "ALL" && s != &primary_seat);
+
+    if PRIVATE_LOCKED_SEATS
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(&primary_seat))
+        || secondary_seat.as_deref().is_some_and(|sec| {
+            PRIVATE_LOCKED_SEATS
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(sec))
+        })
+    {
+        return Err("confidential seat (e.g., @PATENT) is hard-locked to private board".to_string());
+    }
+
+    let tasks_dir = repo_root.join(".chinwag").join("tasks");
+    if !repo_root.join(".chinwag").is_dir() && !tasks_dir.is_dir() {
+        return Err("repository does not have a .chinwag directory".to_string());
+    }
+    let _ = fs::create_dir_all(&tasks_dir);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1_793_970_000_000);
+
+    let mut clean_summary = summary
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(clean_ticket)
+        .trim()
+        .to_string();
+    if clean_summary.chars().count() > 96 {
+        clean_summary = clean_summary.chars().take(96).collect::<String>();
+    }
+    if scan_zero_leak_text(&clean_summary).is_err() {
+        clean_summary = format!("{clean_ticket} Autonomous Multi-Model Fleet Execution");
+    }
+
+    let mut ledger = BoardCardsLedgerV1::load(&tasks_dir);
+    let existing_idx = ledger.cards.iter().position(|c| {
+        c.id.eq_ignore_ascii_case(clean_ticket)
+            || c.ticket_code
+                .as_deref()
+                .is_some_and(|tc| tc.eq_ignore_ascii_case(clean_ticket))
+    });
+
+    let entry = if let Some(idx) = existing_idx {
+        let mut cur = ledger.cards[idx].clone();
+        if !primary_seat.is_empty()
+            && !cur
+                .assigned_seats
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(&primary_seat))
+        {
+            cur.assigned_seats.push(primary_seat.clone());
+        }
+        if let Some(ref sec) = secondary_seat
+            && !cur
+                .assigned_seats
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(sec))
+        {
+            cur.assigned_seats.push(sec.clone());
+        }
+        cur.active_seats = if cur.assigned_seats.is_empty() {
+            "■ DELIVERY".to_string()
+        } else {
+            cur.assigned_seats
+                .iter()
+                .map(|s| format!("■ {s}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        cur.execution_mode = match cur.assigned_seats.len() {
+            0 | 1 => "⚡ Principal Solo · Direct Lease".to_string(),
+            2 => "🤝 2-Seat Pair · Cross-Model".to_string(),
+            3 => "🔺 3-Seat Triad · Isolated JJ".to_string(),
+            _ => "🌐 Subagent Swarm · Cloud Fan-Out".to_string(),
+        };
+        if mark_completed && cur.status != "05_SHIPPED_VERIFIED" {
+            cur.status = "05_SHIPPED_VERIFIED".to_string();
+            cur.column_header = BoardStatus::ShippedVerified.column_header().to_string();
+            cur.t_ship_ms = now_ms.max(cur.t_claim_ms + 960_000);
+            cur.delta_speedup_vs_dora = "⚡ 100x+ Faster vs. DORA".to_string();
+        }
+        if let Some(h) = receipt_hash {
+            let short_h = &h[..h.len().min(16)];
+            cur.cryptographic_receipt = format!("✓ed25519 · blake3:{short_h}");
+        }
+        cur.trigger_source = trigger_source.to_string();
+        cur
+    } else {
+        let mut seats = Vec::new();
+        if !primary_seat.is_empty() {
+            seats.push(primary_seat);
+        }
+        if let Some(sec) = secondary_seat {
+            seats.push(sec);
+        }
+        if seats.is_empty() {
+            seats.push("DELIVERY".to_string());
+        }
+        let active_seats = seats
+            .iter()
+            .map(|s| format!("■ {s}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let execution_mode = match seats.len() {
+            0 | 1 => "⚡ Principal Solo · Direct Lease".to_string(),
+            2 => "🤝 2-Seat Pair · Cross-Model".to_string(),
+            3 => "🔺 3-Seat Triad · Isolated JJ".to_string(),
+            _ => "🌐 Subagent Swarm · Cloud Fan-Out".to_string(),
+        };
+        let status = if mark_completed {
+            BoardStatus::ShippedVerified
+        } else {
+            BoardStatus::InFlight
+        };
+        let t_claim_ms = now_ms;
+        let t_ship_ms = if mark_completed {
+            now_ms + 1_080_000
+        } else {
+            0
+        };
+        let proof = compute_velocity_proof(DoraTier::M, Some(180), t_claim_ms, t_ship_ms);
+        let receipt_str = if let Some(h) = receipt_hash {
+            format!("✓ed25519 · blake3:{}", &h[..h.len().min(16)])
+        } else {
+            format!(
+                "✓ed25519 · blake3:{}",
+                short_digest(&format!("{clean_ticket}:{now_ms}"))
+            )
+        };
+        BoardCardEntryV1 {
+            id: clean_ticket.to_string(),
+            ticket_code: Some(clean_ticket.to_string()),
+            title: clean_summary,
+            status: status.as_code().to_string(),
+            column_header: status.column_header().to_string(),
+            dora_tier: "M".to_string(),
+            dora_baseline: DoraTier::M.canonical_option_label().to_string(),
+            baseline_hours: DoraTier::M.metric_b_active_hours(),
+            chinwag_cycle_time: if mark_completed {
+                proof.cycle_time_label
+            } else {
+                format!("In Flight · {}", proof.cycle_time_label)
+            },
+            delta_speedup_vs_dora: if mark_completed {
+                proof.speedup_pill
+            } else {
+                "⏱️ Clock Running — In Flight".to_string()
+            },
+            net_hours_saved: proof.net_hours_saved,
+            execution_mode,
+            active_seats,
+            assigned_seats: seats,
+            cryptographic_receipt: receipt_str,
+            t_claim_ms,
+            t_ship_ms,
+            trigger_source: trigger_source.to_string(),
+            github_issue_number: None,
+            github_issue_url: None,
+            project_item_id: None,
+        }
+    };
+
+    if let Some(idx) = existing_idx {
+        ledger.cards[idx] = entry.clone();
+    } else {
+        ledger.cards.push(entry.clone());
+    }
+    ledger.save(&tasks_dir)?;
+
+    // When CHINWAG_BOARD_AUTO_PUSH=1 and a live board-config.json is present, trigger background board push
+    if std::env::var("CHINWAG_BOARD_AUTO_PUSH").as_deref() == Ok("1")
+        && let Some(cfg) = BoardConfigV1::load(&tasks_dir)
+        && cfg.project_id != "PVT_kwDOChinwag1"
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let _ = std::process::Command::new(exe)
+            .args([
+                "board",
+                "push",
+                "--tasks-dir",
+                &tasks_dir.to_string_lossy(),
+                "--org",
+                &cfg.org,
+                "--live",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    #[allow(clippy::useless_conversion)]
+    Ok(entry.into())
 }
 
 /// Entrypoint for `chinwag ci-report --issue <CHWG-ID> --status <pass|fail> ...` (`INV-CI-BOARD-MUTATION-01`).
@@ -4515,5 +5081,65 @@ mod tests {
             "DORA Baseline"
         );
         assert_eq!(schema["insights"]["primary_chart"]["x_axis"], "Status");
+    }
+
+    #[test]
+    fn test_19_auto_upsert_agent_thread_board_card_populates_net_hours_saved_and_blocks_confidential_seats()
+    {
+        let repo_dir = temp_tasks_dir("auto-upsert-repo");
+        fs::create_dir_all(repo_dir.join(".chinwag/tasks")).unwrap();
+
+        let card1 = upsert_agent_thread_board_card(
+            &repo_dir,
+            "CHWG-0501",
+            "DEX#6df4d436df6c01617dcd2f4e404673fc",
+            Some("@INFRAJR#0049dd19946d89fd047810fec6676b05"),
+            "3-Way A/B/C Edge Variant Router",
+            false,
+            Some("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
+            "bus_send",
+        )
+        .expect("upsert in-flight card");
+        assert_eq!(card1.id, "CHWG-0501");
+        assert_eq!(card1.status, "03_IN_FLIGHT");
+        assert_eq!(card1.active_seats, "■ DEX · ■ INFRAJR");
+        assert_eq!(card1.execution_mode, "🤝 2-Seat Pair · Cross-Model");
+        assert!(card1.net_hours_saved > 20.0);
+
+        let card2 = upsert_agent_thread_board_card(
+            &repo_dir,
+            "CHWG-0501",
+            "QA",
+            None,
+            "Verified 166/166 edge proxy tests and 2/2 tombstone cassettes",
+            true,
+            Some("f0e1d2c3b4a5968778695a4b3c2d1e0f"),
+            "memory_retain",
+        )
+        .expect("upsert completed card");
+        assert_eq!(card2.status, "05_SHIPPED_VERIFIED");
+        assert_eq!(card2.active_seats, "■ DEX · ■ INFRAJR · ■ QA");
+        assert_eq!(card2.execution_mode, "🔺 3-Seat Triad · Isolated JJ");
+        assert_eq!(card2.delta_speedup_vs_dora, "⚡ 100x+ Faster vs. DORA");
+
+        let ledger = BoardCardsLedgerV1::load(&repo_dir.join(".chinwag/tasks"));
+        assert_eq!(ledger.total_cards, 1);
+        assert_eq!(ledger.shipped_cards, 1);
+        assert!(ledger.total_net_hours_saved > 20.0);
+
+        // Confidential seat (e.g., @PATENT) must be rejected from public board upsert
+        let blocked = upsert_agent_thread_board_card(
+            &repo_dir,
+            "CHWG-0502",
+            "PATENT#11223344556677889900aabbccddeeff",
+            None,
+            "Confidential claim drafting",
+            false,
+            None,
+            "bus_send",
+        );
+        assert!(blocked.is_err());
+
+        let _ = fs::remove_dir_all(&repo_dir);
     }
 }

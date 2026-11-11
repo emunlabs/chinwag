@@ -1,0 +1,87 @@
+{
+  "schema": "chinwag.surface.impact.manifest.v1",
+  "ticket_id": "CHWG-0198",
+  "ticket_code": "CW-SUBTLE-GREY-CODE-PILLS-V23",
+  "title": "CHWG-0198: Replace noisy emerald inline <code> pills with subtle neutral grey (Geist Mono) across chinwag.sh & docs.chinwag.sh",
+  "board_status": "02_SCOPED_BENCHMARKED",
+  "column_header": "02 · 📐 SCOPED & BENCHMARKED",
+  "dora_baseline": "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)",
+  "baseline_hours": 27.0,
+  "delta_speedup_vs_dora": "📐 Baseline Locked — Queued",
+  "execution_mode": "🔺 3-Seat Triad · Isolated JJ",
+  "active_seats": "■ TYPE · ■ DOCS · ■ QA",
+  "delivery_engine": "Chinwag Delivery-2",
+  "surface_gate_pillar": 12,
+  "surfaces": {
+    "code_cli": {
+      "status": "n/a",
+      "required": false,
+      "verified": true,
+      "detail": "No Rust CLI or CI binary changes required"
+    },
+    "readme": {
+      "status": "n/a",
+      "required": false,
+      "verified": true,
+      "detail": "No repository README.md changes required"
+    },
+    "docs_site": {
+      "status": "required",
+      "required": true,
+      "verified": false,
+      "subtask_id": "#CHWG-0198.2",
+      "owner_seat": "■ DOCS",
+      "detail": "assets/css/main.css subtle neutral grey inline <code> pills across docs.chinwag.sh"
+    },
+    "marketing_site": {
+      "status": "required",
+      "required": true,
+      "verified": false,
+      "subtask_id": "#CHWG-0198.1",
+      "owner_seat": "■ TYPE",
+      "detail": "css/site.css & scripts/site-v1/pages/*.html subtle neutral grey inline code pills across chinwag.sh, reserving emerald/rose strictly for semantic status badges"
+    },
+    "telemetry_proxy": {
+      "status": "n/a",
+      "required": false,
+      "verified": true,
+      "detail": "No edge proxy routing or PostHog telemetry schema changes required"
+    },
+    "ui_qa": {
+      "status": "required",
+      "required": true,
+      "verified": false,
+      "subtask_id": "#CHWG-0198.3",
+      "owner_seat": "■ QA",
+      "detail": "1440×900 desktop & 390×844 mobile Playwright verification via chinwag-ci ui-gate --surface all"
+    }
+  },
+  "required_subtasks": [
+    {
+      "subtask_id": "#CHWG-0198.1",
+      "surface": "marketing_site",
+      "owner_seat": "■ TYPE",
+      "required": true,
+      "verified": false,
+      "description": "css/site.css & scripts/site-v1/pages/*.html subtle neutral grey inline code pills across chinwag.sh, reserving emerald/rose strictly for semantic status badges"
+    },
+    {
+      "subtask_id": "#CHWG-0198.2",
+      "surface": "docs_site",
+      "owner_seat": "■ DOCS",
+      "required": true,
+      "verified": false,
+      "description": "assets/css/main.css subtle neutral grey inline <code> pills across docs.chinwag.sh"
+    },
+    {
+      "subtask_id": "#CHWG-0198.3",
+      "surface": "ui_qa",
+      "owner_seat": "■ QA",
+      "required": true,
+      "verified": false,
+      "description": "1440×900 desktop & 390×844 mobile Playwright verification via chinwag-ci ui-gate --surface all"
+    }
+  ],
+  "all_surfaces_synced": false,
+  "ui_gate_passed": false
+}

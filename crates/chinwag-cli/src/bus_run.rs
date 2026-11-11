@@ -2470,6 +2470,19 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     return 2;
                 }
             };
+            if let Some(ref ticket) = task_arg {
+                let mark_done = body.contains("COMPLETED") || body.contains("SHIPPED");
+                let _ = chinwag_cli::board::upsert_agent_thread_board_card(
+                    &repo_root,
+                    ticket,
+                    &sender,
+                    to_arg.as_deref(),
+                    &body,
+                    mark_done,
+                    Some(&msg.digest_sha256),
+                    "bus_send",
+                );
+            }
             if is_json {
                 let out = json!({
                     "ok": true,

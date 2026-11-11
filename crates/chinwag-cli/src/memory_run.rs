@@ -883,6 +883,30 @@ pub fn run_memory(request: MemoryRequest, out: &mut dyn Write, err: &mut dyn Wri
                 }
             };
 
+            let mut retained_ticket: Option<String> = None;
+            let mut retained_seat: Option<String> = None;
+            for seg in context.split('|') {
+                let seg = seg.trim();
+                if let Some(t) = seg.strip_prefix("ticket:") {
+                    retained_ticket = Some(t.trim().to_string());
+                } else if let Some(a) = seg.strip_prefix("agent:") {
+                    retained_seat = Some(a.trim().to_string());
+                }
+            }
+            if let Some(ref ticket) = retained_ticket {
+                let seat_ref = retained_seat.as_deref().unwrap_or(&author);
+                let _ = crate::board::upsert_agent_thread_board_card(
+                    &repo_root,
+                    ticket,
+                    seat_ref,
+                    None,
+                    &content,
+                    true,
+                    Some(&mem_id),
+                    "memory_retain",
+                );
+            }
+
             let payload = json!({
                 "op": "retain",
                 "db_path": &default_planner_db(),

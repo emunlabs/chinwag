@@ -1,191 +1,193 @@
 {
-  "custom_fields": [
-    {
-      "data_type": "SINGLE_SELECT",
-      "name": "Δ Speedup vs. DORA",
-      "options": [
-        {
-          "color": "GREEN",
-          "name": "⚡ 100x+ Faster vs. DORA"
-        },
-        {
-          "color": "BLUE",
-          "name": "🚀 25x–99x Faster vs. DORA"
-        },
-        {
-          "color": "YELLOW",
-          "name": "🟢 10x–24x Faster vs. DORA"
-        },
-        {
-          "color": "GRAY",
-          "name": "⏳ In Flight — Clock Running"
-        }
-      ]
-    },
-    {
-      "data_type": "SINGLE_SELECT",
-      "name": "DORA Baseline",
-      "options": [
-        {
-          "color": "GREEN",
-          "name": "Tier S · 8.5h Eng / 1.1d Cal (<=100 LOC)"
-        },
-        {
-          "color": "BLUE",
-          "name": "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)"
-        },
-        {
-          "color": "PURPLE",
-          "name": "Tier L · 50h Eng / 6.2d Cal (400–1,200 LOC)"
-        },
-        {
-          "color": "ORANGE",
-          "name": "Tier XL · 112h Eng / 14.0d Cal (1,200+ LOC)"
-        }
-      ]
-    },
-    {
-      "data_type": "TEXT",
-      "name": "Chinwag Cycle Time"
-    },
-    {
-      "data_type": "NUMBER",
-      "name": "Net Hours Saved"
-    },
-    {
-      "data_type": "SINGLE_SELECT",
-      "name": "Execution Mode",
-      "options": [
-        {
-          "color": "BLUE",
-          "name": "Solo Seat"
-        },
-        {
-          "color": "GREEN",
-          "name": "Pair (100 Cr)"
-        },
-        {
-          "color": "PURPLE",
-          "name": "Triad (150 Cr)"
-        },
-        {
-          "color": "ORANGE",
-          "name": "Quad (200 Cr)"
-        }
-      ]
-    },
-    {
-      "data_type": "TEXT",
-      "name": "Active Seats"
-    },
-    {
-      "data_type": "TEXT",
-      "name": "Cryptographic Receipt"
-    }
-  ],
+  "schema": "chinwag.github.project_v2.template.v1",
+  "version": "1.0.0",
+  "title": "Chinwag Engineering Velocity & Agent Fleet",
+  "org": "emunlabs",
   "default_visibility": "private",
-  "engines": {
-    "delivery_supervisor": "Chinwag Delivery-2",
-    "reflex_worker": "Chinwag Reflex-1",
-    "visual_tribunal": "Chinwag Vision-3"
-  },
-  "insights": {
-    "primary_chart": {
-      "chart_type": "STACKED_COLUMN",
-      "group_by": "DORA Baseline",
-      "title": "Cumulative Engineering Hours Saved by DORA Complexity Tier",
-      "x_axis": "Status",
-      "y_axis": "SUM(Net Hours Saved)"
-    },
-    "velocity_audit_chart": {
-      "chart_type": "BAR",
-      "group_by": "Execution Mode",
-      "timestamp_anchors": [
-        "CREATED",
-        "UPDATED",
-        "CLOSED"
-      ],
-      "title": "Verified Shipped Cards & Native GitHub Closed Timestamps",
-      "x_axis": "Δ Speedup vs. DORA",
-      "y_axis": "COUNT(Items)"
-    }
-  },
+  "public_board": false,
+  "private_repo": null,
+  "public_repo": null,
+  "confidential_seat_policy": "Confidential seats (e.g., @PATENT) are hard-locked to private repositories (--private / public: false) per INV-DEFAULT-PRIVATE-TASK-01",
   "invariants": [
     "INV-DEFAULT-PRIVATE-BOARD-01",
+    "INV-DEFAULT-PRIVATE-TASK-01",
     "INV-CHINWAG-TASKS-REPO-01",
     "INV-NO-DRAFT-ISSUES-01",
     "INV-30CH-COLUMN-BUDGET-01",
     "INV-NO-FAKE-DONE-01"
   ],
-  "native_github_system_fields": [
-    {
-      "code": "CREATED",
-      "description": "Immutable GitHub issue creation timestamp (t_open anchor)",
-      "immutable_server_timestamp": true,
-      "name": "Created"
-    },
-    {
-      "code": "UPDATED",
-      "description": "Immutable GitHub server mutation timestamp",
-      "immutable_server_timestamp": true,
-      "name": "Updated"
-    },
-    {
-      "code": "CLOSED",
-      "description": "Immutable GitHub issue completion timestamp stamped when 05_SHIPPED_VERIFIED closes the issue",
-      "immutable_server_timestamp": true,
-      "name": "Closed"
-    },
-    {
-      "code": "PARENT_ISSUE",
-      "description": "Parent ticket linkage for cross-surface sub-tasks (#ID.1..#ID.4)",
-      "immutable_server_timestamp": false,
-      "name": "Parent issue"
-    },
-    {
-      "code": "SUB_ISSUES_PROGRESS",
-      "description": "Native progress bar across #ID.1 Code, #ID.2 Docs, #ID.3 Site/Proxy, and #ID.4 QA/UI-Gate",
-      "immutable_server_timestamp": false,
-      "name": "Sub-issues progress"
-    }
-  ],
-  "org": "emunlabs",
-  "private_repo": null,
-  "public_board": false,
-  "public_repo": null,
-  "schema": "chinwag.github.project_v2.template.v1",
+  "engines": {
+    "delivery_supervisor": "Chinwag Delivery-2",
+    "reflex_worker": "Chinwag Reflex-1",
+    "visual_tribunal": "Chinwag Vision-3"
+  },
   "status_columns": [
     {
       "code": "01_OPEN_BOUNTY",
+      "name": "01 · 🌱 OPEN BOUNTY (+500 CR)",
       "color": "GREEN",
-      "description": "Open engineering bounty (+500 Cr reward on verified merge)",
-      "name": "01 · 🌱 OPEN BOUNTY (+500 CR)"
+      "description": "Open engineering bounty (+500 Cr reward on verified merge)"
     },
     {
       "code": "02_SCOPED_BENCHMARKED",
+      "name": "02 · 📐 SCOPED & BENCHMARKED",
       "color": "BLUE",
-      "description": "DORA complexity tier locked and CP-OMP seat quorum assigned",
-      "name": "02 · 📐 SCOPED & BENCHMARKED"
+      "description": "DORA complexity tier locked and CP-OMP seat quorum assigned"
     },
     {
       "code": "03_IN_FLIGHT",
+      "name": "03 · ⚡ IN FLIGHT — CLOCK LIVE",
       "color": "YELLOW",
-      "description": "Active execution in isolated JJ shadow workspace; wall-clock live",
-      "name": "03 · ⚡ IN FLIGHT — CLOCK LIVE"
+      "description": "Active execution in isolated JJ shadow workspace; wall-clock live"
     },
     {
       "code": "04_TRIBUNAL_GATE",
+      "name": "04 · ⚖️ TRIBUNAL & COPY GATE",
       "color": "ORANGE",
-      "description": "H1-H5 + Pillar 12 SurfaceImpactManifestV1 + UI-Gate Tribunal (<200ms snap-back on failure)",
-      "name": "04 · ⚖️ TRIBUNAL & COPY GATE"
+      "description": "H1-H5 + Pillar 12 SurfaceImpactManifestV1 + UI-Gate Tribunal (<200ms snap-back on failure)"
     },
     {
       "code": "05_SHIPPED_VERIFIED",
+      "name": "05 · ✓ SHIPPED — Δ VERIFIED",
       "color": "GREEN",
-      "description": "All surfaces green, Ed25519 velocity proof stamped, GitHub issue closed, 168h SURV live",
-      "name": "05 · ✓ SHIPPED — Δ VERIFIED"
+      "description": "All surfaces green, Ed25519 velocity proof stamped, GitHub issue closed, 168h SURV live"
     }
   ],
-  "title": "Chinwag Engineering Velocity & Agent Fleet",
-  "version": "1.0.0"
+  "custom_fields": [
+    {
+      "name": "Δ Speedup vs. DORA",
+      "data_type": "SINGLE_SELECT",
+      "options": [
+        {
+          "name": "⚡ 100x+ Faster vs. DORA",
+          "color": "GREEN"
+        },
+        {
+          "name": "🚀 25x–99x Faster vs. DORA",
+          "color": "BLUE"
+        },
+        {
+          "name": "🟢 10x–24x Faster vs. DORA",
+          "color": "YELLOW"
+        },
+        {
+          "name": "⏳ In Flight — Clock Running",
+          "color": "GRAY"
+        }
+      ]
+    },
+    {
+      "name": "DORA Baseline",
+      "data_type": "SINGLE_SELECT",
+      "options": [
+        {
+          "name": "Tier S · 8.5h Eng / 1.1d Cal (<=100 LOC)",
+          "color": "GREEN"
+        },
+        {
+          "name": "Tier M · 27h Eng / 3.4d Cal (100–400 LOC)",
+          "color": "BLUE"
+        },
+        {
+          "name": "Tier L · 50h Eng / 6.2d Cal (400–1,200 LOC)",
+          "color": "PURPLE"
+        },
+        {
+          "name": "Tier XL · 112h Eng / 14.0d Cal (1,200+ LOC)",
+          "color": "ORANGE"
+        }
+      ]
+    },
+    {
+      "name": "Chinwag Cycle Time",
+      "data_type": "TEXT"
+    },
+    {
+      "name": "Net Hours Saved",
+      "data_type": "NUMBER"
+    },
+    {
+      "name": "Execution Mode",
+      "data_type": "SINGLE_SELECT",
+      "options": [
+        {
+          "name": "Solo Seat",
+          "color": "BLUE"
+        },
+        {
+          "name": "Pair (100 Cr)",
+          "color": "GREEN"
+        },
+        {
+          "name": "Triad (150 Cr)",
+          "color": "PURPLE"
+        },
+        {
+          "name": "Quad (200 Cr)",
+          "color": "ORANGE"
+        }
+      ]
+    },
+    {
+      "name": "Active Seats",
+      "data_type": "TEXT"
+    },
+    {
+      "name": "Cryptographic Receipt",
+      "data_type": "TEXT"
+    }
+  ],
+  "native_github_system_fields": [
+    {
+      "code": "CREATED",
+      "name": "Created",
+      "immutable_server_timestamp": true,
+      "description": "Immutable GitHub issue creation timestamp (t_open anchor)"
+    },
+    {
+      "code": "UPDATED",
+      "name": "Updated",
+      "immutable_server_timestamp": true,
+      "description": "Immutable GitHub server mutation timestamp"
+    },
+    {
+      "code": "CLOSED",
+      "name": "Closed",
+      "immutable_server_timestamp": true,
+      "description": "Immutable GitHub issue completion timestamp stamped when 05_SHIPPED_VERIFIED closes the issue"
+    },
+    {
+      "code": "PARENT_ISSUE",
+      "name": "Parent issue",
+      "immutable_server_timestamp": false,
+      "description": "Parent ticket linkage for cross-surface sub-tasks (#ID.1..#ID.4)"
+    },
+    {
+      "code": "SUB_ISSUES_PROGRESS",
+      "name": "Sub-issues progress",
+      "immutable_server_timestamp": false,
+      "description": "Native progress bar across #ID.1 Code, #ID.2 Docs, #ID.3 Site/Proxy, and #ID.4 QA/UI-Gate"
+    }
+  ],
+  "insights": {
+    "primary_chart": {
+      "title": "Cumulative Engineering Hours Saved by DORA Complexity Tier",
+      "chart_type": "STACKED_COLUMN",
+      "x_axis": "Status",
+      "y_axis": "SUM(Net Hours Saved)",
+      "group_by": "DORA Baseline"
+    },
+    "velocity_audit_chart": {
+      "title": "Verified Shipped Cards & Native GitHub Closed Timestamps",
+      "chart_type": "BAR",
+      "x_axis": "Δ Speedup vs. DORA",
+      "y_axis": "COUNT(Items)",
+      "group_by": "Execution Mode",
+      "timestamp_anchors": [
+        "CREATED",
+        "UPDATED",
+        "CLOSED"
+      ]
+    }
+  }
 }

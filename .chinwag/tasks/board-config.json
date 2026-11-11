@@ -65,18 +65,62 @@
   },
   "synced_issue_node_ids": {
     "CHWG-0189": "I_kwDOVU4K-c8AAAABeK-k7Q",
-    "CHWG-0190": "I_kwDOVU4K-c8AAAABeK-nKA"
+    "CHWG-0190": "I_kwDOVU4K-c8AAAABeK-nKA",
+    "CHWG-0191": "I_kwDOVU4K-c8AAAABeL0K_A",
+    "CHWG-0192": "I_kwDOVU4K-c8AAAABeL0URw",
+    "CHWG-0193": "I_kwDOVU4K-c8AAAABeL0dcA",
+    "CHWG-0194": "I_kwDOVU4K-c8AAAABeL0mUA",
+    "CHWG-0195": "I_kwDOVU4K-c8AAAABeL0vmw",
+    "CHWG-0196": "I_kwDOVU4K-c8AAAABeL06Mw",
+    "CHWG-0197": "I_kwDOVU4K-c8AAAABeL1DIw",
+    "CHWG-0198": "I_kwDOVU4K-c8AAAABeL1MCw",
+    "CHWG-0199": "I_kwDOVU4K-c8AAAABeL1TQw",
+    "CHWG-0200": "I_kwDOVU4K-c8AAAABeL1aMg",
+    "CHWG-0201": "I_kwDOVU4K-c8AAAABeL1h6w"
   },
   "synced_issue_numbers": {
     "CHWG-0189": 19,
-    "CHWG-0190": 20
+    "CHWG-0190": 20,
+    "CHWG-0191": 21,
+    "CHWG-0192": 22,
+    "CHWG-0193": 23,
+    "CHWG-0194": 24,
+    "CHWG-0195": 25,
+    "CHWG-0196": 26,
+    "CHWG-0197": 27,
+    "CHWG-0198": 28,
+    "CHWG-0199": 29,
+    "CHWG-0200": 30,
+    "CHWG-0201": 31
   },
   "synced_issue_urls": {
     "CHWG-0189": "https://github.com/emunlabs/chinwag/issues/19",
-    "CHWG-0190": "https://github.com/emunlabs/chinwag/issues/20"
+    "CHWG-0190": "https://github.com/emunlabs/chinwag/issues/20",
+    "CHWG-0191": "https://github.com/emunlabs/chinwag/issues/21",
+    "CHWG-0192": "https://github.com/emunlabs/chinwag/issues/22",
+    "CHWG-0193": "https://github.com/emunlabs/chinwag/issues/23",
+    "CHWG-0194": "https://github.com/emunlabs/chinwag/issues/24",
+    "CHWG-0195": "https://github.com/emunlabs/chinwag/issues/25",
+    "CHWG-0196": "https://github.com/emunlabs/chinwag/issues/26",
+    "CHWG-0197": "https://github.com/emunlabs/chinwag/issues/27",
+    "CHWG-0198": "https://github.com/emunlabs/chinwag/issues/28",
+    "CHWG-0199": "https://github.com/emunlabs/chinwag/issues/29",
+    "CHWG-0200": "https://github.com/emunlabs/chinwag/issues/30",
+    "CHWG-0201": "https://github.com/emunlabs/chinwag/issues/31"
   },
   "synced_project_item_ids": {
     "CHWG-0189": "PVTI_lADOFJPsXM4BrFUVzhHrxhs",
-    "CHWG-0190": "PVTI_lADOFJPsXM4BrFUVzhHrxjc"
+    "CHWG-0190": "PVTI_lADOFJPsXM4BrFUVzhHrxjc",
+    "CHWG-0191": "PVTI_lADOFJPsXM4BrFUVzhHsqaU",
+    "CHWG-0192": "PVTI_lADOFJPsXM4BrFUVzhHsqk4",
+    "CHWG-0193": "PVTI_lADOFJPsXM4BrFUVzhHsqvw",
+    "CHWG-0194": "PVTI_lADOFJPsXM4BrFUVzhHsq68",
+    "CHWG-0195": "PVTI_lADOFJPsXM4BrFUVzhHsrFw",
+    "CHWG-0196": "PVTI_lADOFJPsXM4BrFUVzhHsrTA",
+    "CHWG-0197": "PVTI_lADOFJPsXM4BrFUVzhHsre0",
+    "CHWG-0198": "PVTI_lADOFJPsXM4BrFUVzhHsrqw",
+    "CHWG-0199": "PVTI_lADOFJPsXM4BrFUVzhHsrx8",
+    "CHWG-0200": "PVTI_lADOFJPsXM4BrFUVzhHsr4o",
+    "CHWG-0201": "PVTI_lADOFJPsXM4BrFUVzhHssAI"
   }
 }

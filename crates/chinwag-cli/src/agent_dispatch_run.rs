@@ -1177,6 +1177,18 @@ fn run_agent_dispatch_with_effects(
     );
     match result {
         Ok(response) => {
+            let child_seat = identity.child().seat().to_string();
+            let parent_seat = identity.parent().seat().to_string();
+            let _ = crate::board::upsert_agent_thread_board_card(
+                binding.execution_root(),
+                &item,
+                &child_seat,
+                Some(&parent_seat),
+                &body,
+                false,
+                None,
+                "agent_dispatch",
+            );
             if serde_json::to_writer(&mut *out, &response).is_err()
                 || out.write_all(b"\n").is_err()
                 || out.flush().is_err()
