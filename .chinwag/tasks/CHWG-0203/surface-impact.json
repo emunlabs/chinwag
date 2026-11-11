@@ -1,0 +1,49 @@
+{
+  "schema": "chinwag.surface-impact.v1",
+  "ticket_id": "CHWG-0203",
+  "title": "CHWG-0203: Chinwag Local Web App (chinwag ui --open) — Customer-First Clean Product Interface, 5-Layer Localhost Security Guard, Live Diff/Preview Inspector & Zero-Knowledge Slack/GitHub/Linear Bridge (PRD-0039)",
+  "dora_tier": "XL",
+  "dora_baseline_hours": 96.0,
+  "surfaces": {
+    "code_cli": {
+      "status": "required",
+      "paths": [
+        "crates/chinwag-cli/src/board/mod.rs"
+      ]
+    },
+    "readme": {
+      "status": "required",
+      "paths": [
+        "README.md"
+      ]
+    },
+    "docs_site": {
+      "status": "required",
+      "paths": [
+        "src/worker.mjs"
+      ]
+    },
+    "marketing_site": {
+      "status": "required",
+      "paths": [
+        "scripts/site-v1/pages/prds.html",
+        "scripts/site-v1/pages/open.html"
+      ]
+    },
+    "telemetry_proxy": {
+      "status": "required",
+      "paths": [
+        "src/index.mjs",
+        "src/posthog-proxy.mjs",
+        "test/edge-proxy.test.mjs"
+      ]
+    },
+    "ui_qa": {
+      "status": "required",
+      "viewports": [
+        "1440x900",
+        "390x844"
+      ]
+    }
+  }
+}

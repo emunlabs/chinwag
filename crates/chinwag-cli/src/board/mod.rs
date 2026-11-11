@@ -838,9 +838,29 @@ pub fn validate_h_board_issue(
     Ok(())
 }
 
+/// Rejected vendor, bridge, and internal model substrings (`tombstone-ui-vendor-leaks-and-crypto-jargon-v1`)
+/// that must never be pushed to the public GitHub Projects v2 board (`INV-PUBLIC-BOARD-REDACTION-01`).
+pub const FORBIDDEN_BOARD_SUBSTRINGS: [&str; 5] = [
+    "chinwag-eve-bridge",
+    "inception/mercury-3",
+    "Vercel AI Gateway",
+    "@cf/openai/gpt-oss-120b",
+    "3-Repo Git Time Machine",
+];
+
 /// Scans text for Tailscale/RFC1918 IPs, `/Users/` paths, `.crdb` files, provider tokens,
-/// raw `$$` LaTeX math, and patent/confidential markers (`INV-PUBLIC-BOARD-REDACTION-01`).
+/// raw `$$` LaTeX math, patent/confidential markers, and forbidden vendor/jargon substrings (`INV-PUBLIC-BOARD-REDACTION-01`).
 pub fn scan_zero_leak_text(text: &str) -> Result<(), (String, String)> {
+    // 0. Check rejected vendor/bridge/model substrings (tombstone-ui-vendor-leaks-and-crypto-jargon-v1)
+    for forbidden in FORBIDDEN_BOARD_SUBSTRINGS {
+        if text.contains(forbidden) {
+            return Err((
+                "INV-PUBLIC-BOARD-REDACTION-01".to_string(),
+                format!("forbidden vendor/internal jargon substring detected: `{forbidden}`"),
+            ));
+        }
+    }
+
     // 1. Check Tailscale CGNAT (100.64.0.0/10) and RFC1918 / Loopback IPv4 addresses
     if let Some(ip) = find_forbidden_ipv4(text) {
         return Err((
@@ -5141,5 +5161,19 @@ mod tests {
         assert!(blocked.is_err());
 
         let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn test_20_h_board_rejects_forbidden_board_substrings() {
+        for forbidden in FORBIDDEN_BOARD_SUBSTRINGS {
+            let mut issue =
+                AtomicTaskIssue::new_default("CHWG-0599", "Forbidden Jargon Test", DoraTier::S);
+            issue.body = format!("Ticket body containing rejected substring: {forbidden}");
+            let err = validate_h_board_issue(&issue, &issue.to_markdown())
+                .expect_err("must reject forbidden vendor/jargon substring");
+            assert_eq!(err.exit_code, EXIT_H_BOARD_REJECT);
+            assert_eq!(err.invariant, "INV-PUBLIC-BOARD-REDACTION-01");
+            assert!(err.reason.contains(forbidden));
+        }
     }
 }
