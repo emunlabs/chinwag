@@ -386,6 +386,12 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
                 asset_text.contains("[data-theme=\"dark\"] .select"),
                 "/assets/v4/styles.css must define dark-theme .select chevron contrast override"
             );
+            assert!(
+                asset_text.contains(
+                    "  .select,\n  [data-theme=\"dark\"] .select {\n    appearance: auto;\n    -webkit-appearance: auto;\n    background-image: none;"
+                ),
+                "/assets/v4/styles.css @media (forced-colors: active) must match [data-theme=\"dark\"] .select specificity to clear SVG chevron"
+            );
 
             let pill_fn_rule = extract_css_rule_body(&asset_text, "\n.pill-fn {");
             for req in [
@@ -1596,7 +1602,36 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(T.wizardPackSlugForSku("pack_560"), "scale");
   assert.strictEqual(T.wizardPackSlugForSku("pack_1000"), "volume");
 
-  console.log("POPOVER_DOM_HARNESS_OK=5_SUITES");
+  // 6. Repeated dismissal 5ms apart preserves return-focus target on both closePopover() and closeModal()
+  btnPrivacy.click();
+  assert.strictEqual(popoverLayer.hidden, false);
+  stubDocument.activeElement = null;
+  const popDismiss1 = T.closePopover();
+  await sleep(5);
+  const popDismiss2 = T.closePopover();
+  await Promise.all([popDismiss1, popDismiss2]);
+  assert.strictEqual(popoverLayer.hidden, true);
+  assert.strictEqual(
+    stubDocument.activeElement,
+    btnPrivacy,
+    "repeated closePopover() calls 5ms apart must still restore focus to #btn-privacy"
+  );
+
+  T.openInviteModal("global_header", btnMobileMenu);
+  assert.strictEqual(modalLayer.hidden, false);
+  stubDocument.activeElement = null;
+  const modDismiss1 = T.closeModal();
+  await sleep(5);
+  const modDismiss2 = T.closeModal();
+  await Promise.all([modDismiss1, modDismiss2]);
+  assert.strictEqual(modalLayer.hidden, true);
+  assert.strictEqual(
+    stubDocument.activeElement,
+    btnMobileMenu,
+    "repeated closeModal() calls 5ms apart must still restore focus to trigger"
+  );
+
+  console.log("POPOVER_DOM_HARNESS_OK=6_SUITES");
 })().catch((err) => {
   console.error(err);
   process.exit(1);
@@ -1611,7 +1646,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         .expect("execute node VM popover DOM harness");
     let stdout_str = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success() && stdout_str.contains("POPOVER_DOM_HARNESS_OK=5_SUITES"),
+        out.status.success() && stdout_str.contains("POPOVER_DOM_HARNESS_OK=6_SUITES"),
         "node VM popover DOM harness failed:\nstdout: {}\nstderr: {}",
         stdout_str,
         String::from_utf8_lossy(&out.stderr)

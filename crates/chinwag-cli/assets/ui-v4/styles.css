@@ -3027,7 +3027,8 @@ col.diff-col-split-code {
     border: 1px solid CanvasText;
   }
 
-  .select {
+  .select,
+  [data-theme="dark"] .select {
     appearance: auto;
     -webkit-appearance: auto;
     background-image: none;

@@ -1379,6 +1379,8 @@ let desktopTabsIndicator = { update() {}, destroy() {} };
 let mobileTabsIndicator = { update() {}, destroy() {} };
 let activePopoverTrigger = null;
 let activeModalTrigger = null;
+let closingPopoverReturnTrigger = null;
+let closingModalReturnTrigger = null;
 let popoverSeq = 0;
 let modalSeq = 0;
 let lowCreditBannerTracked = false;
@@ -1572,8 +1574,9 @@ async function closePopover(options = {}) {
   const layer = dom.popoverLayer();
   if (!layer || layer.hidden) return;
   const seq = ++popoverSeq;
-  const prevTrigger = activePopoverTrigger;
+  const prevTrigger = activePopoverTrigger || closingPopoverReturnTrigger;
   activePopoverTrigger = null;
+  closingPopoverReturnTrigger = immediate ? null : prevTrigger;
   if (prevTrigger) {
     prevTrigger.setAttribute("aria-expanded", "false");
   }
@@ -1583,6 +1586,7 @@ async function closePopover(options = {}) {
     await Motion.settled(pop);
     if (seq !== popoverSeq) return;
   }
+  closingPopoverReturnTrigger = null;
   clearNode(layer);
   layer.hidden = true;
   if (restoreFocus && prevTrigger && prevTrigger.isConnected) {
@@ -1604,6 +1608,7 @@ function openPopover(triggerEl, buildContent, variantClass = "", options = {}) {
     return;
   }
   ++popoverSeq;
+  closingPopoverReturnTrigger = null;
   clearNode(layer);
   if (activePopoverTrigger && activePopoverTrigger !== triggerEl) {
     activePopoverTrigger.setAttribute("aria-expanded", "false");
@@ -1851,8 +1856,9 @@ async function closeModal(options = {}) {
   const scrim = dom.modalScrim();
   if (!layer || layer.hidden) return;
   const seq = ++modalSeq;
-  const prevTrigger = activeModalTrigger;
+  const prevTrigger = activeModalTrigger || closingModalReturnTrigger;
   activeModalTrigger = null;
+  closingModalReturnTrigger = immediate ? null : prevTrigger;
   const modal = layer.querySelector(".modal");
   if (!immediate) {
     if (modal) modal.dataset.state = "closing";
@@ -1860,6 +1866,7 @@ async function closeModal(options = {}) {
     await Promise.all([modal ? Motion.settled(modal) : null, scrim ? Motion.settled(scrim) : null]);
     if (seq !== modalSeq) return;
   }
+  closingModalReturnTrigger = null;
   clearNode(layer);
   layer.hidden = true;
   if (scrim) {
@@ -1877,6 +1884,7 @@ function openModal(triggerEl, buildModal, large = false) {
   const scrim = dom.modalScrim();
   if (!layer || !scrim) return;
   ++modalSeq;
+  closingModalReturnTrigger = null;
   activeModalTrigger = triggerEl || (typeof document !== "undefined" ? document.activeElement : null);
   clearNode(layer);
   scrim.hidden = false;

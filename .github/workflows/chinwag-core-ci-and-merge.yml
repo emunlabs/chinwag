@@ -217,6 +217,7 @@ jobs:
           if chinwag-ci --help 2>&1 | grep -q 'test-regressions'; then
             chinwag-ci test-regressions --dir .chinwag/regressions --json
           fi
+          node ./scripts/verify-ui-v4-contracts.mjs
           if chinwag-ci --help 2>&1 | grep -q 'ui-gate'; then
             chinwag-ci ui-gate --surface all --repo . --org emunlabs --commit "${VERIFY_COMMIT:-HEAD}" --json
           fi
