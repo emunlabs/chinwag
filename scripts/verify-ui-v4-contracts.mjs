@@ -1735,17 +1735,66 @@ function matchCompoundSelector(compound, node) {
 
 function matchSelectorChain(selector, chain) {
   if (selector.includes("+") || selector.includes("~")) return null;
-  const tokens = selector
-    .replace(/>/g, " > ")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  if (tokens.length === 0) return null;
+  const tokens = [];
+  let cur = "";
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let inQuote = null;
+  for (let i = 0; i < selector.length; i += 1) {
+    const ch = selector[i];
+    if (inQuote) {
+      cur += ch;
+      if (ch === inQuote && selector[i - 1] !== "\\") inQuote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inQuote = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === "(") {
+      parenDepth += 1;
+      cur += ch;
+      continue;
+    }
+    if (ch === ")") {
+      parenDepth = Math.max(0, parenDepth - 1);
+      cur += ch;
+      continue;
+    }
+    if (ch === "[") {
+      bracketDepth += 1;
+      cur += ch;
+      continue;
+    }
+    if (ch === "]") {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+      cur += ch;
+      continue;
+    }
+    if (parenDepth === 0 && bracketDepth === 0) {
+      if (ch === ">") {
+        if (cur.trim()) tokens.push(cur.trim());
+        tokens.push(">");
+        cur = "";
+        continue;
+      }
+      if (/\s/.test(ch)) {
+        if (cur.trim()) tokens.push(cur.trim());
+        cur = "";
+        continue;
+      }
+    }
+    cur += ch;
+  }
+  if (cur.trim()) tokens.push(cur.trim());
+  if (tokens.length === 0 || tokens[0] === ">" || tokens[tokens.length - 1] === ">") return null;
 
   const steps = [];
   let pendingCombinator = " ";
   for (const tok of tokens) {
     if (tok === ">") {
+      if (pendingCombinator === ">") return null;
       pendingCombinator = ">";
     } else {
       steps.push({ compound: tok, combinatorToRight: null });
@@ -1759,40 +1808,33 @@ function matchSelectorChain(selector, chain) {
 
   const lastSpec = matchCompoundSelector(steps[steps.length - 1].compound, chain[chain.length - 1]);
   if (!lastSpec) return null;
-  let totalIds = lastSpec[0];
-  let totalCls = lastSpec[1];
-  let totalTags = lastSpec[2];
 
-  let childChainIdx = chain.length - 1;
-  for (let p = steps.length - 2; p >= 0; p -= 1) {
-    const comb = steps[p].combinatorToRight;
+  function matchAncestors(stepIdx, childChainIdx) {
+    if (stepIdx < 0) return [0, 0, 0];
+    const comb = steps[stepIdx].combinatorToRight;
     if (comb === ">") {
       const parentIdx = childChainIdx - 1;
       if (parentIdx < 0) return null;
-      const spec = matchCompoundSelector(steps[p].compound, chain[parentIdx]);
+      const spec = matchCompoundSelector(steps[stepIdx].compound, chain[parentIdx]);
       if (!spec) return null;
-      totalIds += spec[0];
-      totalCls += spec[1];
-      totalTags += spec[2];
-      childChainIdx = parentIdx;
-    } else {
-      let matchedSpec = null;
-      let ancIdx = childChainIdx - 1;
-      while (ancIdx >= 0) {
-        matchedSpec = matchCompoundSelector(steps[p].compound, chain[ancIdx]);
-        if (matchedSpec) {
-          childChainIdx = ancIdx;
-          break;
-        }
-        ancIdx -= 1;
-      }
-      if (!matchedSpec) return null;
-      totalIds += matchedSpec[0];
-      totalCls += matchedSpec[1];
-      totalTags += matchedSpec[2];
+      const rest = matchAncestors(stepIdx - 1, parentIdx);
+      if (!rest) return null;
+      return [spec[0] + rest[0], spec[1] + rest[1], spec[2] + rest[2]];
     }
+    for (let ancIdx = childChainIdx - 1; ancIdx >= 0; ancIdx -= 1) {
+      const spec = matchCompoundSelector(steps[stepIdx].compound, chain[ancIdx]);
+      if (!spec) continue;
+      const rest = matchAncestors(stepIdx - 1, ancIdx);
+      if (rest) {
+        return [spec[0] + rest[0], spec[1] + rest[1], spec[2] + rest[2]];
+      }
+    }
+    return null;
   }
-  return [totalIds, totalCls, totalTags];
+
+  const ancSpec = matchAncestors(steps.length - 2, chain.length - 1);
+  if (!ancSpec) return null;
+  return [lastSpec[0] + ancSpec[0], lastSpec[1] + ancSpec[1], lastSpec[2] + ancSpec[2]];
 }
 
 function compareCascadeRank(a, b) {
@@ -1844,11 +1886,12 @@ function evalArithmeticExpr(src) {
 }
 
 function resolvePxExpr(rawVal, vars, vw) {
-  if (rawVal === undefined || rawVal === null) return 0;
+  if (rawVal === undefined || rawVal === null) return Number.NaN;
   let v = String(rawVal).trim();
+  if (!v) return Number.NaN;
   for (let depth = 0; depth < 5 && v.includes("var("); depth += 1) {
     v = v.replace(/var\(\s*(--[a-zA-Z0-9_-]+)(?:\s*,\s*([^)]+))?\)/g, (_, name, fb) =>
-      vars[name] !== undefined ? vars[name] : fb || "0px",
+      vars[name] !== undefined ? vars[name] : fb !== undefined ? fb : "",
     );
   }
   v = v.replace(/([0-9.]+)vw/g, (_, n) => `${(Number(n) * vw) / 100}px`);
@@ -1867,9 +1910,26 @@ function resolvePxExpr(rawVal, vars, vw) {
     if (/^[0-9.+\-*/()\s]+$/.test(expr)) {
       return evalArithmeticExpr(expr);
     }
+    return Number.NaN;
   }
   const m = v.match(/^(-?[0-9.]+)(px)?$/);
-  return m ? Number(m[1]) : 0;
+  return m ? Number(m[1]) : Number.NaN;
+}
+
+function requireFinitePx(rawVal, vars, vw, label) {
+  assert.ok(
+    rawVal !== undefined && rawVal !== null && String(rawVal).trim() !== "",
+    `Missing required CSS declaration for ${label}`,
+  );
+  const px = resolvePxExpr(rawVal, vars, vw);
+  assert.ok(Number.isFinite(px), `Unparseable CSS px value '${rawVal}' for ${label}`);
+  return px;
+}
+
+function requirePositivePx(rawVal, vars, vw, label) {
+  const px = requireFinitePx(rawVal, vars, vw, label);
+  assert.ok(px > 0, `Expected positive CSS px value for ${label}, got ${px}`);
+  return px;
 }
 
 function computeDelivery2HeaderBoxes(
@@ -1879,6 +1939,9 @@ function computeDelivery2HeaderBoxes(
   htmlAttrs,
   { statusText = "Waiting for you", glyphEmRatio = 0.62 } = {},
 ) {
+  if (!d2Track.querySelector(".d2-head")) {
+    T.renderDelivery2Panel();
+  }
   const rules = parseCssRulesForCascade(cssText);
   // Guardrail: verify zero `.d2-` selectors use sibling combinators (`+` or `~`) that would be skipped
   for (const r of rules) {
@@ -1930,18 +1993,8 @@ function computeDelivery2HeaderBoxes(
 
   const railChain = [htmlNode, bodyNode, appBodyNode, railNode];
   const railStyle = styleFor(railChain);
-  const railWidth =
-    railStyle.width && railStyle.width !== "var(--rail-current)"
-      ? resolvePxExpr(railStyle.width, vars, vw)
-      : vw >= 1440
-        ? htmlAttrs["data-rail"] === "collapsed"
-          ? resolvePxExpr("var(--rail-spine-w)", vars, vw)
-          : resolvePxExpr("var(--rail-w)", vars, vw)
-        : vw >= 960
-          ? htmlAttrs["data-rail"] === "expanded"
-            ? resolvePxExpr("var(--rail-w)", vars, vw)
-            : resolvePxExpr("var(--rail-spine-w)", vars, vw)
-          : resolvePxExpr(railStyle.width || "320px", vars, vw);
+  // On <960px, `:root` sets `--rail-current: 0px` while `.d2-rail` overrides `width: min(...)` / `100vw`
+  const railWidth = requirePositivePx(railStyle.width, vars, vw, ".d2-rail width");
 
   const toggleFixedStyle = styleFor([
     ...railChain,
@@ -1993,10 +2046,10 @@ function computeDelivery2HeaderBoxes(
 
   const visibleButtons = [];
   if ((toggleFixedStyle.display || "inline-flex") !== "none") {
-    const left = resolvePxExpr(toggleFixedStyle.left, vars, vw);
-    const top = resolvePxExpr(toggleFixedStyle.top, vars, vw);
-    const w = resolvePxExpr(toggleFixedStyle.width, vars, vw);
-    const h = resolvePxExpr(toggleFixedStyle.height, vars, vw);
+    const left = requireFinitePx(toggleFixedStyle.left, vars, vw, "#d2-rail-toggle-fixed left");
+    const top = requireFinitePx(toggleFixedStyle.top, vars, vw, "#d2-rail-toggle-fixed top");
+    const w = requirePositivePx(toggleFixedStyle.width, vars, vw, "#d2-rail-toggle-fixed width");
+    const h = requirePositivePx(toggleFixedStyle.height, vars, vw, "#d2-rail-toggle-fixed height");
     visibleButtons.push({ id: "d2-rail-toggle-fixed", left, top, right: left + w, bottom: top + h });
   }
 
@@ -2004,26 +2057,29 @@ function computeDelivery2HeaderBoxes(
   const spineVisible = (spineStyle.display || "none") !== "none";
   let titleRect = null;
   let statusWordRect = null;
+  let rawTitleW = 0;
+  const titleGroupOverflow = titleGroupStyle.overflow || "visible";
+  const titleFlexShrink = titleStyle["flex-shrink"] || "1";
 
   if (trackVisible) {
     const trackW =
-      trackStyle.width === "100%" ? railWidth : resolvePxExpr(trackStyle.width || `${railWidth - 1}px`, vars, vw);
-    const padTop = resolvePxExpr(headStyle["padding-top"], vars, vw);
-    const padRight = resolvePxExpr(headStyle["padding-right"], vars, vw);
-    const padBottom = resolvePxExpr(headStyle["padding-bottom"], vars, vw);
-    const padLeft = resolvePxExpr(headStyle["padding-left"], vars, vw);
-    const headGap = resolvePxExpr(headStyle.gap, vars, vw);
-    const btnH = resolvePxExpr(actionBtnStyle.height, vars, vw) || 26;
-    const btnW = resolvePxExpr(actionBtnStyle.width, vars, vw) || 26;
-    const actGap = resolvePxExpr(actionsStyle.gap, vars, vw);
+      trackStyle.width === "100%" ? railWidth : requirePositivePx(trackStyle.width, vars, vw, ".d2-track width");
+    const padTop = requireFinitePx(headStyle["padding-top"], vars, vw, ".d2-head padding-top");
+    const padRight = requireFinitePx(headStyle["padding-right"], vars, vw, ".d2-head padding-right");
+    const padBottom = requireFinitePx(headStyle["padding-bottom"], vars, vw, ".d2-head padding-bottom");
+    const padLeft = requireFinitePx(headStyle["padding-left"], vars, vw, ".d2-head padding-left");
+    const headGap = requireFinitePx(headStyle.gap, vars, vw, ".d2-head gap");
+    const btnH = requirePositivePx(actionBtnStyle.height, vars, vw, ".d2-icon-btn height");
+    const btnW = requirePositivePx(actionBtnStyle.width, vars, vw, ".d2-icon-btn width");
+    const actGap = requireFinitePx(actionsStyle.gap, vars, vw, ".d2-head-actions gap");
     const contentTop = padTop;
     const contentH = btnH;
 
     let cursorX = padLeft;
     if ((headToggleStyle.display || "inline-flex") !== "none") {
-      const ml = resolvePxExpr(headToggleStyle["margin-left"], vars, vw);
-      const tw = resolvePxExpr(headToggleStyle.width, vars, vw) || 26;
-      const th = resolvePxExpr(headToggleStyle.height, vars, vw) || 26;
+      const ml = requireFinitePx(headToggleStyle["margin-left"], vars, vw, "#d2-head-toggle margin-left");
+      const tw = requirePositivePx(headToggleStyle.width, vars, vw, "#d2-head-toggle width");
+      const th = requirePositivePx(headToggleStyle.height, vars, vw, "#d2-head-toggle height");
       const tLeft = cursorX + ml;
       visibleButtons.push({
         id: "d2-head-toggle",
@@ -2035,10 +2091,11 @@ function computeDelivery2HeaderBoxes(
       cursorX = tLeft + tw + headGap;
     }
 
-    // 3 right-aligned header action buttons: New thread (+), History (clock), Collapse (<)
-    const actionsTotalW = 3 * btnW + 2 * actGap;
+    const domActionIds = Array.from(d2Track.querySelector(".d2-head-actions").children).map((b) => b.id);
+    assert.ok(domActionIds.length > 0, "Rendered .d2-head-actions must contain >=1 button");
+    const actionsTotalW = domActionIds.length * btnW + (domActionIds.length - 1) * actGap;
     const actionsLeft = trackW - padRight - actionsTotalW;
-    ["d2-btn-new-thread", "d2-btn-history", "d2-btn-collapse"].forEach((id, idx) => {
+    domActionIds.forEach((id, idx) => {
       const bLeft = actionsLeft + idx * (btnW + actGap);
       visibleButtons.push({
         id,
@@ -2049,14 +2106,14 @@ function computeDelivery2HeaderBoxes(
       });
     });
 
+    const renderedTitleText = d2Track.querySelector(".d2-title").textContent;
+    assert.ok(renderedTitleText.length > 0, "Rendered .d2-title must not be empty");
     const titleGroupMaxRight = Math.max(cursorX, actionsLeft - headGap);
-    const titleFontPx = resolvePxExpr(titleStyle["font-size"], vars, vw) || 13;
-    const titleLineH = resolvePxExpr(titleStyle["line-height"], vars, vw) || 18;
-    const rawTitleW = Math.ceil("Delivery-2".length * titleFontPx * glyphEmRatio);
-    const titleRight =
-      titleStyle["flex-shrink"] === "0"
-        ? cursorX + rawTitleW
-        : Math.min(titleGroupMaxRight, cursorX + rawTitleW);
+    const titleFontPx = requirePositivePx(titleStyle["font-size"], vars, vw, ".d2-title font-size");
+    const titleLineH = requirePositivePx(titleStyle["line-height"], vars, vw, ".d2-title line-height");
+    rawTitleW = Math.ceil(renderedTitleText.length * titleFontPx * glyphEmRatio);
+    const titleUnclipped = titleFlexShrink === "0" && titleGroupOverflow !== "hidden";
+    const titleRight = titleUnclipped ? cursorX + rawTitleW : Math.min(titleGroupMaxRight, cursorX + rawTitleW);
     const titleTop = contentTop + (contentH - titleLineH) / 2;
     titleRect = {
       id: "d2-title",
@@ -2067,11 +2124,11 @@ function computeDelivery2HeaderBoxes(
       padBottom,
     };
 
-    const tgGap = resolvePxExpr(titleGroupStyle.gap, vars, vw) || 6;
-    const swGap = resolvePxExpr(statusWrapStyle.gap, vars, vw) || 5;
-    const dotW = resolvePxExpr(statusDotStyle.width, vars, vw) || 6;
-    const wordFontPx = resolvePxExpr(statusWordStyle["font-size"], vars, vw) || 11;
-    const wordLineH = resolvePxExpr(statusWordStyle["line-height"], vars, vw) || 16;
+    const tgGap = requireFinitePx(titleGroupStyle.gap, vars, vw, ".d2-title-group gap");
+    const swGap = requireFinitePx(statusWrapStyle.gap, vars, vw, ".d2-status-wrap gap");
+    const dotW = requirePositivePx(statusDotStyle.width, vars, vw, ".d2-status-dot width");
+    const wordFontPx = requirePositivePx(statusWordStyle["font-size"], vars, vw, ".d2-status-word font-size");
+    const wordLineH = requirePositivePx(statusWordStyle["line-height"], vars, vw, ".d2-status-word line-height");
     const wordLeft = Math.min(titleGroupMaxRight, titleRight + tgGap + dotW + swGap);
     const rawWordW = Math.ceil(statusText.length * wordFontPx * glyphEmRatio);
     const wordRight =
@@ -2093,13 +2150,13 @@ function computeDelivery2HeaderBoxes(
     const spineDotsChain = [...spineTopChain, { tag: "div", id: "", className: "d2-spine-dots", attrs: {} }];
     const spineDotsStyle = styleFor(spineDotsChain);
     const spineDotStyle = styleFor([...spineDotsChain, { tag: "span", id: "", className: "d2-spine-dot", attrs: {} }]);
-    const spinePadTop = resolvePxExpr(spineStyle["padding-top"], vars, vw);
-    const spinePadBottom = resolvePxExpr(spineStyle["padding-bottom"], vars, vw);
-    const spineTopPad = resolvePxExpr(spineTopStyle["padding-top"], vars, vw);
+    const spinePadTop = requireFinitePx(spineStyle["padding-top"], vars, vw, ".d2-spine padding-top");
+    const spinePadBottom = requireFinitePx(spineStyle["padding-bottom"], vars, vw, ".d2-spine padding-bottom");
+    const spineTopPad = requireFinitePx(spineTopStyle["padding-top"], vars, vw, ".d2-spine-top padding-top");
     let spineCursorY = spinePadTop + spineTopPad;
     if ((spineToggleStyle.display || "inline-flex") !== "none") {
-      const sw = resolvePxExpr(spineToggleStyle.width, vars, vw);
-      const sh = resolvePxExpr(spineToggleStyle.height, vars, vw);
+      const sw = requirePositivePx(spineToggleStyle.width, vars, vw, "#d2-spine-toggle width");
+      const sh = requirePositivePx(spineToggleStyle.height, vars, vw, "#d2-spine-toggle height");
       const sLeft = (railWidth - 1 - sw) / 2;
       visibleButtons.push({
         id: "d2-spine-toggle",
@@ -2108,23 +2165,24 @@ function computeDelivery2HeaderBoxes(
         right: sLeft + sw,
         bottom: spineCursorY + sh,
       });
-      spineCursorY += sh + resolvePxExpr(spineTopStyle.gap, vars, vw);
+      spineCursorY += sh + requireFinitePx(spineTopStyle.gap, vars, vw, ".d2-spine-top gap");
     }
-    const dotSize = resolvePxExpr(spineDotStyle.width, vars, vw);
-    const dotH = resolvePxExpr(spineDotStyle.height, vars, vw);
-    const dotsGap = resolvePxExpr(spineDotsStyle.gap, vars, vw);
-    const dotsPadTop = resolvePxExpr(spineDotsStyle["padding-top"], vars, vw);
-    const dotsPadBottom = resolvePxExpr(spineDotsStyle["padding-bottom"], vars, vw);
-    const surfaceCount = d2Spine.querySelectorAll(".d2-spine-dot").length || 4;
+    const dotSize = requirePositivePx(spineDotStyle.width, vars, vw, ".d2-spine-dot width");
+    const dotH = requirePositivePx(spineDotStyle.height, vars, vw, ".d2-spine-dot height");
+    const dotsGap = requireFinitePx(spineDotsStyle.gap, vars, vw, ".d2-spine-dots gap");
+    const dotsPadTop = requireFinitePx(spineDotsStyle["padding-top"], vars, vw, ".d2-spine-dots padding-top");
+    const dotsPadBottom = requireFinitePx(spineDotsStyle["padding-bottom"], vars, vw, ".d2-spine-dots padding-bottom");
+    const surfaceCount = d2Spine.querySelectorAll(".d2-spine-dot").length;
+    assert.ok(surfaceCount > 0, "Rendered .d2-spine-dots must contain >=1 dot");
     spineDotsRect = {
       id: "d2-spine-dots",
       left: (railWidth - 1 - dotSize) / 2,
       top: spineCursorY,
       right: (railWidth - 1 + dotSize) / 2,
-      bottom: spineCursorY + dotsPadTop + surfaceCount * dotH + Math.max(0, surfaceCount - 1) * dotsGap + dotsPadBottom,
+      bottom: spineCursorY + dotsPadTop + surfaceCount * dotH + (surfaceCount - 1) * dotsGap + dotsPadBottom,
     };
-    const cw = resolvePxExpr(spineComposeStyle.width, vars, vw);
-    const ch = resolvePxExpr(spineComposeStyle.height, vars, vw);
+    const cw = requirePositivePx(spineComposeStyle.width, vars, vw, "#d2-spine-compose width");
+    const ch = requirePositivePx(spineComposeStyle.height, vars, vw, "#d2-spine-compose height");
     visibleButtons.push({
       id: "d2-spine-compose",
       left: (railWidth - 1 - cw) / 2,
@@ -2134,7 +2192,17 @@ function computeDelivery2HeaderBoxes(
     });
   }
 
-  return { visibleButtons, titleRect, statusWordRect, spineDotsRect, trackVisible, spineVisible };
+  return {
+    visibleButtons,
+    titleRect,
+    statusWordRect,
+    spineDotsRect,
+    trackVisible,
+    spineVisible,
+    rawTitleW,
+    titleGroupOverflow,
+    titleFlexShrink,
+  };
 }
 
 function rectsOverlap(a, b) {
@@ -2158,7 +2226,7 @@ assert.deepEqual(
 assert.ok(d2Track.querySelector("#d2-head-toggle"), "In-flow #d2-head-toggle must exist for <960px drawer");
 assert.ok(d2Spine.querySelector("#d2-spine-toggle"), "In-flow #d2-spine-toggle must exist in .d2-spine");
 
-// L2: 1440x900 Expanded (`data-rail="expanded"`) — zero overlap across both narrow (0.50em) & wide (0.68em) glyph metrics
+// L2: 1440x900 Expanded (`data-rail="expanded"`) — zero overlap & zero title clipping across narrow (0.50em) & wide (0.68em) glyph metrics
 for (const glyphEmRatio of [0.5, 0.62, 0.68]) {
   const layoutDesktopExpanded = computeDelivery2HeaderBoxes(
     stylesCss,
@@ -2169,6 +2237,17 @@ for (const glyphEmRatio of [0.5, 0.62, 0.68]) {
   );
   assert.equal(layoutDesktopExpanded.trackVisible, true);
   assert.equal(layoutDesktopExpanded.spineVisible, false);
+  assert.notEqual(
+    layoutDesktopExpanded.titleGroupOverflow,
+    "hidden",
+    ".d2-title-group must NOT set overflow:hidden so .d2-title can never be clipped",
+  );
+  assert.equal(layoutDesktopExpanded.titleFlexShrink, "0", ".d2-title must set flex-shrink: 0");
+  assert.equal(
+    layoutDesktopExpanded.titleRect.right - layoutDesktopExpanded.titleRect.left,
+    layoutDesktopExpanded.rawTitleW,
+    ".d2-title box must preserve full unclipped width",
+  );
   assert.equal(
     layoutDesktopExpanded.visibleButtons.some((b) => b.id === "d2-head-toggle" || b.id === "d2-spine-toggle"),
     false,
@@ -2217,6 +2296,13 @@ for (const [mVw, mVh] of [
   [320, 568],
 ]) {
   const layoutMobileDrawer = computeDelivery2HeaderBoxes(stylesCss, mVw, mVh, { "data-d2-drawer": "open" });
+  assert.notEqual(layoutMobileDrawer.titleGroupOverflow, "hidden");
+  assert.equal(layoutMobileDrawer.titleFlexShrink, "0");
+  assert.equal(
+    layoutMobileDrawer.titleRect.right - layoutMobileDrawer.titleRect.left,
+    layoutMobileDrawer.rawTitleW,
+    `${mVw}x${mVh} mobile drawer: .d2-title must remain completely unclipped`,
+  );
   assert.equal(
     layoutMobileDrawer.visibleButtons.some((b) => b.id === "d2-rail-toggle-fixed"),
     false,
@@ -2238,7 +2324,7 @@ for (const [mVw, mVh] of [
   }
 }
 
-// L5: Dual Mutant Canaries —
+// L5: Quadruple Mutant Canaries —
 // (L5a) Exact reproduction of the `0d600d0` cascade-order bug: earlier `@media (min-width: 960px) { .d2-head { padding-left: 41px; } }`
 //       gets reset back to `12px` by the later `.d2-head { padding: 8px var(--rail-inset) 6px; }` shorthand -> title lands at x=12 overlapping [9..35]!
 const mutatedCascadeResetCss = stylesCss.replace(
@@ -2270,7 +2356,12 @@ assert.equal(
 //       which still collides horizontally with `#d2-rail-toggle-fixed` (`x = 9..35px`) -> AABB check catches it!
 const mutatedInsufficientInsetCss = stylesCss.replace(
   /(\.d2-rail\s+\.d2-head\s*\{\s*padding-left:\s*)42px/,
-  "$124px",
+  (_, prefix) => `${prefix}24px`,
+);
+assert.notEqual(
+  mutatedInsufficientInsetCss,
+  stylesCss,
+  "Canary L5b regex must mutate .d2-rail .d2-head padding-left from 42px to 24px",
 );
 const insufficientLayout = computeDelivery2HeaderBoxes(mutatedInsufficientInsetCss, 1440, 900, {
   "data-rail": "expanded",
@@ -2283,6 +2374,32 @@ assert.equal(
   ),
   true,
   "Canary L5b MUST detect overlap when winning cascade rule leaves insufficient padding-left (24px < 35px)",
+);
+
+// (L5c) Mixed child + descendant combinator backtracking canary: `.d2-rail > div .d2-title` must backtrack past
+//       `div.d2-title-group` to `div.d2-track` (direct child of `aside.d2-rail`) and catch right-side action overlap!
+const backtrackingMutantLayout = computeDelivery2HeaderBoxes(
+  `${stylesCss}\n.d2-rail > div .d2-title { font-size: 200px; }`,
+  1440,
+  900,
+  { "data-rail": "expanded" },
+);
+assert.equal(
+  rectsOverlap(
+    backtrackingMutantLayout.visibleButtons.find((b) => b.id === "d2-btn-new-thread"),
+    backtrackingMutantLayout.titleRect,
+  ),
+  true,
+  "Canary L5c MUST backtrack `.d2-rail > div .d2-title` to `div.d2-track` and detect overlap with #d2-btn-new-thread",
+);
+
+// (L5d) Missing CSS declaration fail-closed canary: stripping `.d2-title` metrics must throw rather than fall back to magic constants
+const missingDeclCss = stylesCss.replace(/\.d2-title\s*\{[^}]*\}/, ".d2-title {}");
+assert.notEqual(missingDeclCss, stylesCss);
+assert.throws(
+  () => computeDelivery2HeaderBoxes(missingDeclCss, 1440, 900, { "data-rail": "expanded" }),
+  /Missing required CSS declaration/,
+  "Canary L5d MUST fail closed when required CSS declarations are missing",
 );
 
 console.log(
