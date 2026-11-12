@@ -37,13 +37,13 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -549,8 +549,13 @@ pub fn resolve_home_dir() -> Result<PathBuf, ReleaseSyncError> {
     if !path.is_absolute() {
         return Err(ReleaseSyncError::SafePathViolation("relative_home"));
     }
-    let meta = fs::symlink_metadata(&path)
-        .map_err(|_| ReleaseSyncError::SafePathViolation("unreadable_home"))?;
+    let meta = fs::symlink_metadata(&path).map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("home lstat: {err}"))
+        } else {
+            ReleaseSyncError::SafePathViolation("unreadable_home")
+        }
+    })?;
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return Err(ReleaseSyncError::SafePathViolation(
             "symlink_or_non_dir_home",
@@ -776,6 +781,15 @@ fn classify_state_io_error(context: &str, err: &std::io::Error) -> ReleaseSyncEr
     }
 }
 
+fn classify_install_io_error(context: &str, err: &std::io::Error) -> ReleaseSyncError {
+    let msg = format!("{context}: {err}");
+    if is_transient_io_error(err) {
+        ReleaseSyncError::TransientIo(msg)
+    } else {
+        ReleaseSyncError::InstallFailed(msg)
+    }
+}
+
 /// Opens `path` strictly with `O_NOFOLLOW | O_CLOEXEC`, cross-checking `lstat`
 /// and `fstat` `(dev, ino)` to eliminate symlink/TOCTOU swap races.
 fn open_regular_file_nofollow(
@@ -839,9 +853,11 @@ fn compute_digests_from_open_file(
     let mut total: u64 = 0;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let read = file
-            .read(&mut buf)
-            .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("read failed: {e}")))?;
+        let read = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(classify_journal_io_error("read failed", &err)),
+        };
         if read == 0 {
             break;
         }
@@ -856,7 +872,7 @@ fn compute_digests_from_open_file(
     }
     let post = file
         .metadata()
-        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("post-read fstat: {e}")))?;
+        .map_err(|e| classify_journal_io_error("post-read fstat", &e))?;
     if (post.dev(), post.ino()) != expected_id
         || total != expected_len
         || total != post.len()
@@ -902,6 +918,13 @@ fn is_resolvable_host_cli_binary(path: &Path) -> bool {
 /// on `$HOME/.chinwag/release_sync.lock` to serialize release installation and
 /// watermark state updates across concurrent daemons and CLI invocations.
 fn acquire_release_sync_lock(home_dir: &Path) -> Result<File, ReleaseSyncError> {
+    acquire_release_sync_lock_with_mode(home_dir, false)
+}
+
+fn acquire_release_sync_lock_with_mode(
+    home_dir: &Path,
+    nonblocking: bool,
+) -> Result<File, ReleaseSyncError> {
     let chinwag_dir = ensure_private_dir(&home_dir.join(".chinwag"))?;
     let lock_path = chinwag_dir.join("release_sync.lock");
     let fd = match rustix_open(
@@ -933,11 +956,26 @@ fn acquire_release_sync_lock(home_dir: &Path) -> Result<File, ReleaseSyncError> 
     {
         return Err(ReleaseSyncError::SafePathViolation("unsafe_lock_file"));
     }
-    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| classify_state_io_error("chmod_lock_file", &e))?;
+    let op = if nonblocking {
+        FlockOperation::NonBlockingLockExclusive
+    } else {
+        FlockOperation::LockExclusive
+    };
     loop {
-        match flock(&file, FlockOperation::LockExclusive) {
+        match flock(&file, op) {
             Ok(()) => return Ok(file),
             Err(err) if err == rustix::io::Errno::INTR => continue,
+            Err(err)
+                if nonblocking
+                    && (err == rustix::io::Errno::WOULDBLOCK
+                        || err == rustix::io::Errno::AGAIN) =>
+            {
+                return Err(ReleaseSyncError::TransientIo(
+                    "release_sync.lock contended".into(),
+                ));
+            }
             Err(err) if is_transient_errno(err) => {
                 return Err(ReleaseSyncError::TransientIo(format!(
                     "flock failed: {err}"
@@ -961,14 +999,21 @@ fn ensure_private_dir(dir: &Path) -> Result<PathBuf, ReleaseSyncError> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir_all(dir).map_err(|e| classify_state_io_error("mkdir_failed", &e))?;
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
         }
         Err(err) => return Err(classify_state_io_error("dir_stat_failed", &err)),
     }
-    let meta =
-        fs::symlink_metadata(dir).map_err(|e| classify_state_io_error("dir_stat_failed", &e))?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-        return Err(ReleaseSyncError::SafePathViolation("symlink_or_non_dir"));
+    let (dir_fd, _) = open_dir_nofollow(dir)?;
+    dir_fd
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|e| classify_state_io_error("chmod_private_dir", &e))?;
+    let post = dir_fd
+        .metadata()
+        .map_err(|e| classify_state_io_error("fstat_private_dir", &e))?;
+    if post.file_type().is_symlink() || !post.file_type().is_dir() || (post.mode() & 0o777) != 0o700
+    {
+        return Err(ReleaseSyncError::SafePathViolation(
+            "private_dir_mode_or_type_invalid",
+        ));
     }
     Ok(dir.to_path_buf())
 }
@@ -987,7 +1032,10 @@ fn ensure_bin_and_staging_dirs(home_dir: &Path) -> Result<(PathBuf, PathBuf), Re
         }
         Err(err) => return Err(classify_state_io_error("stat_dot_local", &err)),
     }
+    let _ = open_dir_nofollow(&local_dir)?;
+
     let bin_dir = local_dir.join("bin");
+    let mut created_bin_dir = false;
     match fs::symlink_metadata(&bin_dir) {
         Ok(meta) => {
             if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
@@ -997,13 +1045,21 @@ fn ensure_bin_and_staging_dirs(home_dir: &Path) -> Result<(PathBuf, PathBuf), Re
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir_all(&bin_dir)
                 .map_err(|e| classify_state_io_error("mkdir_local_bin", &e))?;
-            let _ = fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o755));
+            created_bin_dir = true;
         }
         Err(err) => return Err(classify_state_io_error("stat_local_bin", &err)),
     }
+    let (bin_dir_fd, _) = open_dir_nofollow(&bin_dir)?;
+    let bin_meta = bin_dir_fd
+        .metadata()
+        .map_err(|e| classify_state_io_error("fstat_local_bin", &e))?;
+    if created_bin_dir || (bin_meta.mode() & 0o022) != 0 {
+        bin_dir_fd
+            .set_permissions(fs::Permissions::from_mode(0o755))
+            .map_err(|e| classify_state_io_error("chmod_local_bin", &e))?;
+    }
     let staging_dir = bin_dir.join(".staging");
     ensure_private_dir(&staging_dir)?;
-    let _ = fs::set_permissions(&staging_dir, fs::Permissions::from_mode(0o700));
     Ok((bin_dir, staging_dir))
 }
 
@@ -1053,6 +1109,7 @@ pub fn load_release_sync_state(home_dir: &Path) -> Result<ReleaseSyncStateV1, Re
 #[cfg(test)]
 std::thread_local! {
     static TEST_INJECTED_SAVE_STATE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static TEST_INJECTED_PREPARE_REEXEC_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 pub fn save_release_sync_state(
@@ -1060,6 +1117,7 @@ pub fn save_release_sync_state(
     state: &ReleaseSyncStateV1,
 ) -> Result<(), ReleaseSyncError> {
     let chinwag_dir = ensure_private_dir(&home_dir.join(".chinwag"))?;
+    let (chinwag_dir_fd, _) = open_dir_nofollow(&chinwag_dir)?;
     let final_path = chinwag_dir.join("release_sync_state.json");
     match fs::symlink_metadata(&final_path) {
         Ok(meta) => {
@@ -1078,31 +1136,53 @@ pub fn save_release_sync_state(
         return Err(classify_state_io_error("open_tmp", &injected));
     }
     let nonce = csprng_hex_16()?;
-    let tmp_path = chinwag_dir.join(format!(
-        ".release_sync_state.tmp.{}.{nonce}",
-        std::process::id()
-    ));
+    let tmp_name = format!(".release_sync_state.tmp.{}.{nonce}", std::process::id());
     let serialized = serde_json::to_vec_pretty(state)
         .map_err(|_| ReleaseSyncError::StatePersistenceFailed("serialize".into()))?;
     let write_res = (|| -> Result<(), ReleaseSyncError> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .map_err(|e| classify_state_io_error("open_tmp", &e))?;
+        let tmp_fd = rustix::fs::openat(
+            &chinwag_dir_fd,
+            &tmp_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|err| {
+            if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK {
+                ReleaseSyncError::SafePathViolation("state_tmp_symlink")
+            } else if is_transient_errno(err) {
+                ReleaseSyncError::TransientIo(format!("open_tmp: {err}"))
+            } else {
+                ReleaseSyncError::StatePersistenceFailed(format!("open_tmp: {err}"))
+            }
+        })?;
+        let mut file = File::from(tmp_fd);
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| classify_state_io_error("chmod_tmp", &e))?;
         file.write_all(&serialized)
             .map_err(|e| classify_state_io_error("write_tmp", &e))?;
         file.sync_all()
             .map_err(|e| classify_state_io_error("sync_tmp", &e))?;
-        fs::rename(&tmp_path, &final_path).map_err(|e| classify_state_io_error("rename", &e))?;
-        if let Ok(dir_file) = File::open(&chinwag_dir) {
-            let _ = dir_file.sync_all();
-        }
+        drop(file);
+        rustix::fs::renameat(
+            &chinwag_dir_fd,
+            &tmp_name,
+            &chinwag_dir_fd,
+            "release_sync_state.json",
+        )
+        .map_err(|err| {
+            if is_transient_errno(err) {
+                ReleaseSyncError::TransientIo(format!("rename_state: {err}"))
+            } else {
+                ReleaseSyncError::StatePersistenceFailed(format!("rename_state: {err}"))
+            }
+        })?;
+        chinwag_dir_fd
+            .sync_all()
+            .map_err(|e| classify_state_io_error("sync_state_dir", &e))?;
         Ok(())
     })();
     if write_res.is_err() {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = rustix::fs::unlinkat(&chinwag_dir_fd, &tmp_name, rustix::fs::AtFlags::empty());
     }
     write_res
 }
@@ -1332,22 +1412,39 @@ fn run_bounded_owned_spawn(
 }
 
 #[cfg(target_os = "macos")]
+enum ToolRunError {
+    TransientIo(String),
+    Failed(String),
+}
+
+#[cfg(target_os = "macos")]
+fn classify_tool_spawn_io(context: &str, err: &std::io::Error) -> ToolRunError {
+    let msg = format!("{context}: {err}");
+    if is_transient_io_error(err) {
+        ToolRunError::TransientIo(msg)
+    } else {
+        ToolRunError::Failed(msg)
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn spawn_tool_in_dir(
     program: &std::ffi::CStr,
     args: &[&str],
     dir_fd: &File,
     deadline: Duration,
-) -> Result<(), String> {
+) -> Result<(), ToolRunError> {
     use chinwag_host_process::owned_spawn::{SpawnStdio, spawn_at_group};
 
-    let dev_null = File::open("/dev/null").map_err(|e| format!("open /dev/null: {e}"))?;
+    let dev_null =
+        File::open("/dev/null").map_err(|e| classify_tool_spawn_io("open /dev/null", &e))?;
     let (stderr_reader, stderr_writer) =
-        std::io::pipe().map_err(|e| format!("stderr pipe: {e}"))?;
+        std::io::pipe().map_err(|e| classify_tool_spawn_io("stderr pipe", &e))?;
     let c_args: Vec<CString> = args
         .iter()
         .map(|s| CString::new(*s))
         .collect::<Result<_, _>>()
-        .map_err(|e| format!("invalid tool argument: {e}"))?;
+        .map_err(|e| ToolRunError::Failed(format!("invalid tool argument: {e}")))?;
     let env = [
         CString::new("PATH=/usr/bin:/bin").unwrap(),
         CString::new("LC_ALL=C").unwrap(),
@@ -1364,9 +1461,10 @@ fn spawn_tool_in_dir(
         },
         true,
     )
-    .map_err(|e| format!("spawn_at failed: {e}"))?;
+    .map_err(|e| classify_tool_spawn_io("spawn_at failed", &e))?;
     drop(stderr_writer);
-    run_bounded_owned_spawn(child, None, Some(stderr_reader), deadline).map_err(|e| e.message)
+    run_bounded_owned_spawn(child, None, Some(stderr_reader), deadline)
+        .map_err(|e| ToolRunError::Failed(e.message))
 }
 
 #[cfg(target_os = "macos")]
@@ -1387,7 +1485,14 @@ fn set_dir_and_entry_immutable(
             dir_fd,
             VERSION_SMOKE_TIMEOUT,
         )
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("chflags uchg failed: {e}")))
+        .map_err(|err| match err {
+            ToolRunError::TransientIo(msg) => {
+                ReleaseSyncError::TransientIo(format!("chflags uchg failed: {msg}"))
+            }
+            ToolRunError::Failed(msg) => {
+                ReleaseSyncError::InstallFailed(format!("chflags uchg failed: {msg}"))
+            }
+        })
     } else {
         spawn_tool_in_dir(
             c"/usr/bin/chflags",
@@ -1395,7 +1500,14 @@ fn set_dir_and_entry_immutable(
             dir_fd,
             VERSION_SMOKE_TIMEOUT,
         )
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("chflags nouchg failed: {e}")))
+        .map_err(|err| match err {
+            ToolRunError::TransientIo(msg) => {
+                ReleaseSyncError::TransientIo(format!("chflags nouchg failed: {msg}"))
+            }
+            ToolRunError::Failed(msg) => {
+                ReleaseSyncError::InstallFailed(format!("chflags nouchg failed: {msg}"))
+            }
+        })
     }
 }
 
@@ -1412,7 +1524,7 @@ fn set_dir_and_entry_immutable(
 fn verify_fd_immutable(file: &File) -> Result<(), ReleaseSyncError> {
     let meta = file
         .metadata()
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("fstat immutable pin: {e}")))?;
+        .map_err(|e| classify_install_io_error("fstat immutable pin", &e))?;
     if (meta.st_flags() & UF_IMMUTABLE) == 0 {
         return Err(ReleaseSyncError::InstallFailed(
             "kernel UF_IMMUTABLE flag missing on pinned vnode".into(),
@@ -1427,21 +1539,41 @@ fn verify_fd_immutable(_file: &File) -> Result<(), ReleaseSyncError> {
 }
 
 fn open_dir_nofollow(dir: &Path) -> Result<(File, (u64, u64)), ReleaseSyncError> {
-    let lstat = fs::symlink_metadata(dir)
-        .map_err(|_| ReleaseSyncError::SafePathViolation("dir_lstat_failed"))?;
+    let lstat = fs::symlink_metadata(dir).map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("dir lstat failed: {err}"))
+        } else {
+            ReleaseSyncError::SafePathViolation("dir_lstat_failed")
+        }
+    })?;
     if lstat.file_type().is_symlink() || !lstat.file_type().is_dir() {
         return Err(ReleaseSyncError::SafePathViolation("symlink_or_non_dir"));
     }
-    let fd = rustix_open(
+    let fd = match rustix_open(
         dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(|_| ReleaseSyncError::SafePathViolation("dir_open_nofollow_failed"))?;
+    ) {
+        Ok(fd) => fd,
+        Err(err) if is_transient_errno(err) => {
+            return Err(ReleaseSyncError::TransientIo(format!(
+                "dir open failed: {err}"
+            )));
+        }
+        Err(_) => {
+            return Err(ReleaseSyncError::SafePathViolation(
+                "dir_open_nofollow_failed",
+            ));
+        }
+    };
     let file = File::from(fd);
-    let fstat = file
-        .metadata()
-        .map_err(|_| ReleaseSyncError::SafePathViolation("dir_fstat_failed"))?;
+    let fstat = file.metadata().map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("dir fstat failed: {err}"))
+        } else {
+            ReleaseSyncError::SafePathViolation("dir_fstat_failed")
+        }
+    })?;
     if !fstat.file_type().is_dir()
         || (fstat.dev(), fstat.ino()) != (lstat.dev(), lstat.ino())
         || fstat.uid() != rustix::process::geteuid().as_raw()
@@ -1468,6 +1600,8 @@ fn open_regular_at_dir_nofollow(
     .map_err(|err| {
         if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK {
             ReleaseSyncError::SafePathViolation("symlink_open_refused")
+        } else if is_transient_errno(err) {
+            ReleaseSyncError::TransientIo(format!("openat failed: {err}"))
         } else {
             ReleaseSyncError::SourceUnavailable(format!("openat failed: {err}"))
         }
@@ -1475,7 +1609,7 @@ fn open_regular_at_dir_nofollow(
     let file = File::from(fd);
     let fstat = file
         .metadata()
-        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("fstat failed: {e}")))?;
+        .map_err(|e| classify_journal_io_error("fstat failed", &e))?;
     if fstat.file_type().is_symlink() || !fstat.file_type().is_file() {
         return Err(ReleaseSyncError::SafePathViolation(
             "non_regular_binary_file",
@@ -1500,8 +1634,13 @@ fn capture_ancestor_chain_inodes(
     let paths = [home_dir, &local_dir, &bin_dir, &staging_dir, op_dir];
     let mut ids = [(0u64, 0u64); 5];
     for (slot, path) in ids.iter_mut().zip(paths) {
-        let meta = fs::symlink_metadata(path)
-            .map_err(|_| ReleaseSyncError::SafePathViolation("ancestor_stat_failed"))?;
+        let meta = fs::symlink_metadata(path).map_err(|err| {
+            if is_transient_io_error(&err) {
+                ReleaseSyncError::TransientIo(format!("ancestor stat failed: {err}"))
+            } else {
+                ReleaseSyncError::SafePathViolation("ancestor_stat_failed")
+            }
+        })?;
         if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
             return Err(ReleaseSyncError::SafePathViolation(
                 "ancestor_symlink_or_non_dir",
@@ -1669,8 +1808,17 @@ pub fn prepare_immutable_reexec_binary(
     let (dir_fd, dir_id) = open_dir_nofollow(&reexec_dir)?;
     guard.bind_dir_fd(&dir_fd, dir_id);
 
+    #[cfg(test)]
+    if let Some(raw_errno) = TEST_INJECTED_PREPARE_REEXEC_ERRNO.with(|c| c.take()) {
+        let injected = std::io::Error::from_raw_os_error(raw_errno);
+        return Err(classify_journal_io_error(
+            "injected_prepare_reexec",
+            &injected,
+        ));
+    }
+
     let (target_sha256, verified_state_meta, copied_len) = {
-        let _lock = acquire_release_sync_lock(home_dir)?;
+        let _lock = acquire_release_sync_lock_with_mode(home_dir, true)?;
         let canonical_chinwag_path = home_dir.join(".local/bin/chinwag");
         let (target_sha256, verified_state_meta) = if install_path == canonical_chinwag_path {
             let sync_state = load_release_sync_state(home_dir)?;
@@ -1743,14 +1891,18 @@ pub fn prepare_immutable_reexec_binary(
     verify_codesign_strict_in_dir(&dir_fd, "chinwag")?;
     pre_ro
         .set_permissions(fs::Permissions::from_mode(0o755))
-        .map_err(|_| ReleaseSyncError::InstallFailed("reexec chmod 0755".into()))?;
+        .map_err(|e| classify_install_io_error("reexec chmod 0755", &e))?;
     drop(pre_ro);
 
     set_dir_and_entry_immutable(&dir_fd, "chinwag", true)?;
 
-    let dir_post = dir_fd
-        .metadata()
-        .map_err(|_| ReleaseSyncError::SafePathViolation("reexec_dir_fstat"))?;
+    let dir_post = dir_fd.metadata().map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("reexec_dir_fstat: {err}"))
+        } else {
+            ReleaseSyncError::SafePathViolation("reexec_dir_fstat")
+        }
+    })?;
     if (dir_post.dev(), dir_post.ino()) != dir_id {
         return Err(ReleaseSyncError::SafePathViolation("reexec_dir_inode_swap"));
     }
@@ -1791,7 +1943,10 @@ fn verify_codesign_strict_in_dir(dir_fd: &File, binary_name: &str) -> Result<(),
         dir_fd,
         VERSION_SMOKE_TIMEOUT,
     )
-    .map_err(ReleaseSyncError::CodesignFailed)
+    .map_err(|err| match err {
+        ToolRunError::TransientIo(msg) => ReleaseSyncError::TransientIo(msg),
+        ToolRunError::Failed(msg) => ReleaseSyncError::CodesignFailed(msg),
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1811,8 +1966,10 @@ fn ensure_publisher_codesigned_in_dir(
     binary_name: &str,
 ) -> Result<(), ReleaseSyncError> {
     validate_binary_name(binary_name)?;
-    if verify_codesign_strict_in_dir(dir_fd, binary_name).is_ok() {
-        return Ok(());
+    match verify_codesign_strict_in_dir(dir_fd, binary_name) {
+        Ok(()) => return Ok(()),
+        Err(ReleaseSyncError::TransientIo(msg)) => return Err(ReleaseSyncError::TransientIo(msg)),
+        Err(_) => {}
     }
     spawn_tool_in_dir(
         c"/usr/bin/codesign",
@@ -1820,7 +1977,10 @@ fn ensure_publisher_codesigned_in_dir(
         dir_fd,
         VERSION_SMOKE_TIMEOUT,
     )
-    .map_err(ReleaseSyncError::CodesignFailed)?;
+    .map_err(|err| match err {
+        ToolRunError::TransientIo(msg) => ReleaseSyncError::TransientIo(msg),
+        ToolRunError::Failed(msg) => ReleaseSyncError::CodesignFailed(msg),
+    })?;
     verify_codesign_strict_in_dir(dir_fd, binary_name)
 }
 
@@ -1943,7 +2103,6 @@ fn atomic_install_staged_binary(
         }
         let nonce = csprng_hex_16()?;
         let prev_tmp_name = format!(".{binary}.prev.tmp.{}.{nonce}", std::process::id());
-        let prev_tmp = bin_dir.join(&prev_tmp_name);
         if rustix::fs::linkat(
             &bin_dir_fd,
             binary,
@@ -1953,9 +2112,29 @@ fn atomic_install_staged_binary(
         )
         .is_err()
         {
-            fs::copy(&install_path, &prev_tmp)
-                .map_err(|e| ReleaseSyncError::InstallFailed(format!("backup copy: {e}")))?;
-            let _ = fs::set_permissions(&prev_tmp, fs::Permissions::from_mode(0o755));
+            let (mut cur_src, _) = open_regular_at_dir_nofollow(&bin_dir_fd, binary, false, true)?;
+            let prev_fd = rustix::fs::openat(
+                &bin_dir_fd,
+                &prev_tmp_name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o755),
+            )
+            .map_err(|err| {
+                if is_transient_errno(err) {
+                    ReleaseSyncError::TransientIo(format!("backup openat: {err}"))
+                } else {
+                    ReleaseSyncError::InstallFailed(format!("backup openat: {err}"))
+                }
+            })?;
+            let mut prev_file = File::from(prev_fd);
+            std::io::copy(&mut cur_src, &mut prev_file)
+                .map_err(|e| classify_install_io_error("backup copy", &e))?;
+            prev_file
+                .set_permissions(fs::Permissions::from_mode(0o755))
+                .map_err(|e| classify_install_io_error("backup chmod", &e))?;
+            prev_file
+                .sync_all()
+                .map_err(|e| classify_install_io_error("backup sync", &e))?;
         }
         if let Err(err) = rustix::fs::renameat(
             &bin_dir_fd,
@@ -1964,6 +2143,11 @@ fn atomic_install_staged_binary(
             format!("{binary}.prev"),
         ) {
             let _ = rustix::fs::unlinkat(&bin_dir_fd, &prev_tmp_name, rustix::fs::AtFlags::empty());
+            if is_transient_errno(err) {
+                return Err(ReleaseSyncError::TransientIo(format!(
+                    "backup rename: {err}"
+                )));
+            }
             return Err(ReleaseSyncError::InstallFailed(format!(
                 "backup rename: {err}"
             )));
@@ -1979,9 +2163,16 @@ fn atomic_install_staged_binary(
         return Err(ReleaseSyncError::SafePathViolation("staged_inode_swap"));
     }
 
-    rustix::fs::renameat(op_dir_fd, binary, &bin_dir_fd, binary)
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("atomic renameat: {e}")))?;
-    let _ = bin_dir_fd.sync_all();
+    rustix::fs::renameat(op_dir_fd, binary, &bin_dir_fd, binary).map_err(|err| {
+        if is_transient_errno(err) {
+            ReleaseSyncError::TransientIo(format!("atomic renameat: {err}"))
+        } else {
+            ReleaseSyncError::InstallFailed(format!("atomic renameat: {err}"))
+        }
+    })?;
+    bin_dir_fd
+        .sync_all()
+        .map_err(|e| classify_install_io_error("bin_dir sync", &e))?;
     Ok((install_path, previous_backup))
 }
 
@@ -3331,6 +3522,20 @@ impl ReleaseDaemonScheduler {
 
     pub fn on_catchup_send_full(&mut self) {
         self.catchup_queued = false;
+    }
+
+    pub fn on_worker_env_error(
+        &mut self,
+        retryable: bool,
+        is_catchup: bool,
+        now: Instant,
+    ) -> Option<Duration> {
+        if is_catchup {
+            self.catchup_queued = false;
+            self.initial_catchup_pending = false;
+            self.overflow_reconcile_pending = false;
+        }
+        self.on_catchup_failed(retryable, now)
     }
 
     pub fn on_worker_panic(&mut self, now: Instant) {
@@ -6730,5 +6935,155 @@ mod tests {
             "pinned immutable re-exec binary must match release B byte-for-byte"
         );
         cleanup_prepared_reexec(prepared);
+    }
+
+    #[test]
+    fn prepare_reexec_lock_contention_and_transient_helper_errors_are_nonblocking_and_retryable() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let build_dir = temp.path().join("build");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = InMemoryArtifactStore::new();
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let src_bin = build_macho_test_binary(&build_dir, "nonblocking_reexec_lock");
+
+        let published = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &src_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("3333333333333333".into(), 300)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        let expected_sha = decode_lowercase_hex_32(&published.manifest.sha256).unwrap();
+        let install_path = home.join(".local/bin/chinwag");
+
+        // 1. Hold `release_sync.lock` on a separate thread: `prepare_immutable_reexec_binary`
+        //    MUST return immediately (`< 300ms`) with retryable `TransientIo` instead of stalling!
+        let lock_acquired = Arc::new(Barrier::new(2));
+        let release_lock = Arc::new(Barrier::new(2));
+        let home_for_holder = home.clone();
+        let acq_clone = lock_acquired.clone();
+        let rel_clone = release_lock.clone();
+        let holder = std::thread::spawn(move || {
+            let _held = acquire_release_sync_lock_with_mode(&home_for_holder, false).unwrap();
+            acq_clone.wait();
+            rel_clone.wait();
+        });
+        lock_acquired.wait();
+
+        let started = Instant::now();
+        let contended_err = prepare_immutable_reexec_binary(&home, &install_path, &expected_sha)
+            .err()
+            .expect("contended nonblocking flock must return TransientIo immediately");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "nonblocking flock took too long: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(contended_err, ReleaseSyncError::TransientIo(_)));
+        assert!(contended_err.is_transient_retryable());
+
+        release_lock.wait();
+        holder.join().unwrap();
+
+        // 2. Transient OS `Errno`s (`EMFILE` = 24, `EIO` = 5) in preparation helpers
+        //    classify as retryable `TransientIo`, whereas tampered digest/symlinks stay terminal!
+        for raw_errno in [
+            rustix::io::Errno::MFILE.raw_os_error(),
+            rustix::io::Errno::IO.raw_os_error(),
+        ] {
+            TEST_INJECTED_PREPARE_REEXEC_ERRNO.with(|c| c.set(Some(raw_errno)));
+            let err = prepare_immutable_reexec_binary(&home, &install_path, &expected_sha)
+                .err()
+                .expect("injected transient errno must fail attempt cleanly");
+            assert!(
+                matches!(err, ReleaseSyncError::TransientIo(_)),
+                "expected TransientIo for raw errno {raw_errno}, got {err:?}"
+            );
+            assert!(err.is_transient_retryable());
+        }
+        assert!(
+            classify_journal_io_error(
+                "read",
+                &std::io::Error::from_raw_os_error(rustix::io::Errno::IO.raw_os_error())
+            )
+            .is_transient_retryable()
+        );
+        assert!(
+            classify_install_io_error(
+                "chmod",
+                &std::io::Error::from_raw_os_error(rustix::io::Errno::MFILE.raw_os_error())
+            )
+            .is_transient_retryable()
+        );
+
+        // Terminal path violation check: symlink directory still fails closed non-retryably.
+        let sym_dir = temp.path().join("sym-dir");
+        std::os::unix::fs::symlink(&build_dir, &sym_dir).unwrap();
+        let sym_err = open_dir_nofollow(&sym_dir).unwrap_err();
+        assert!(matches!(sym_err, ReleaseSyncError::SafePathViolation(_)));
+        assert!(!sym_err.is_transient_retryable());
+
+        // 3. Subsequent retry after lock release and transient clearing succeeds cleanly!
+        let prepared =
+            prepare_immutable_reexec_binary(&home, &install_path, &expected_sha).unwrap();
+        assert_eq!(prepared.sha256, expected_sha);
+        cleanup_prepared_reexec(prepared);
+    }
+
+    #[test]
+    fn private_dir_and_state_file_permissions_remediate_preexisting_permissive_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let chinwag_dir = home.join(".chinwag");
+        let bin_dir = home.join(".local/bin");
+        let staging_dir = bin_dir.join(".staging");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::set_permissions(&chinwag_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&staging_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_bin_and_staging_dirs(&home).unwrap();
+        save_release_sync_state(&home, &ReleaseSyncStateV1::default()).unwrap();
+
+        assert_eq!(
+            fs::symlink_metadata(&chinwag_dir).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::symlink_metadata(&bin_dir).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::symlink_metadata(&staging_dir).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::symlink_metadata(release_sync_state_path(&home))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

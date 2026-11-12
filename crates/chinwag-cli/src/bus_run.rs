@@ -1300,25 +1300,200 @@ use chinwag_cli::release_sync::{
 
 const PENDING_REEXEC_MAX_DRAIN_WAIT: Duration = Duration::from_secs(5);
 
-struct ReleaseJobSlotGuard(Arc<std::sync::atomic::AtomicUsize>);
+#[derive(Default)]
+struct ReleaseJobQueueGate {
+    frozen_for_reexec: bool,
+    active_jobs: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueReleaseJobError {
+    FrozenForReexec,
+    QueueFullOrClosed,
+}
+
+struct ReleaseJobSlotGuard(Arc<Mutex<ReleaseJobQueueGate>>);
 
 impl Drop for ReleaseJobSlotGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.active_jobs = guard.active_jobs.saturating_sub(1);
     }
 }
 
 fn try_enqueue_release_job(
     tx: &tokio::sync::mpsc::Sender<ReleaseDaemonJob>,
-    pending_jobs: &Arc<std::sync::atomic::AtomicUsize>,
+    gate: &Arc<Mutex<ReleaseJobQueueGate>>,
     job: ReleaseDaemonJob,
-) -> Result<(), tokio::sync::mpsc::error::TrySendError<ReleaseDaemonJob>> {
-    pending_jobs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let res = tx.try_send(job);
-    if res.is_err() {
-        pending_jobs.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+) -> Result<(), EnqueueReleaseJobError> {
+    let mut guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.frozen_for_reexec {
+        return Err(EnqueueReleaseJobError::FrozenForReexec);
     }
-    res
+    guard.active_jobs = guard.active_jobs.saturating_add(1);
+    match tx.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            guard.active_jobs = guard.active_jobs.saturating_sub(1);
+            Err(EnqueueReleaseJobError::QueueFullOrClosed)
+        }
+    }
+}
+
+type ReexecPrepResult = Result<
+    chinwag_cli::release_sync::PreparedImmutableReexec,
+    chinwag_cli::release_sync::ReleaseSyncError,
+>;
+
+struct InFlightReexecPrep {
+    target_path: PathBuf,
+    expected_sha: [u8; 32],
+    handle: tokio::task::JoinHandle<ReexecPrepResult>,
+}
+
+async fn poll_reexec_prep(
+    slot: &mut Option<InFlightReexecPrep>,
+) -> (
+    PathBuf,
+    [u8; 32],
+    Result<ReexecPrepResult, tokio::task::JoinError>,
+) {
+    match slot.as_mut() {
+        Some(in_flight) => {
+            let res = (&mut in_flight.handle).await;
+            let finished = slot.take().expect("in_flight reexec prep must be present");
+            (finished.target_path, finished.expected_sha, res)
+        }
+        None => std::future::pending().await,
+    }
+}
+
+enum ReexecPrepStepOutcome {
+    CommitReexec {
+        install_path: PathBuf,
+        prepared: chinwag_cli::release_sync::PreparedImmutableReexec,
+    },
+    RescheduleTimer(Duration),
+    StayOnlineDisarmed,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_reexec_prep_step(
+    prep_path: PathBuf,
+    prep_sha: [u8; 32],
+    prep_res: Result<ReexecPrepResult, tokio::task::JoinError>,
+    stdout: &mut dyn Write,
+    startup_chinwag_sha256: Option<[u8; 32]>,
+    forwards_empty: bool,
+    forward_queue_empty: bool,
+    release_done_rx: &tokio::sync::mpsc::Receiver<ReleaseDaemonEvent>,
+    release_job_gate: &Arc<Mutex<ReleaseJobQueueGate>>,
+    pending_reexec: &mut Option<(PathBuf, [u8; 32], Instant)>,
+    reexec_prep_retries: &mut u32,
+    backoff_fn: impl FnOnce(u32) -> Duration,
+) -> ReexecPrepStepOutcome {
+    let cleanup_async = |prepared: chinwag_cli::release_sync::PreparedImmutableReexec| {
+        drop(tokio::task::spawn_blocking(move || {
+            chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+        }));
+    };
+
+    match prep_res {
+        Ok(Ok(prepared)) => {
+            if Some(prepared.sha256) == startup_chinwag_sha256 {
+                cleanup_async(prepared);
+                *pending_reexec = None;
+                *reexec_prep_retries = 0;
+                return ReexecPrepStepOutcome::StayOnlineDisarmed;
+            }
+            let Some((cur_path, cur_sha, cur_armed_at)) = pending_reexec.clone() else {
+                cleanup_async(prepared);
+                *reexec_prep_retries = 0;
+                return ReexecPrepStepOutcome::StayOnlineDisarmed;
+            };
+            if cur_path != prep_path || cur_sha != prep_sha {
+                cleanup_async(prepared);
+                *reexec_prep_retries = 0;
+                let settle_remaining =
+                    Duration::from_millis(350).saturating_sub(cur_armed_at.elapsed());
+                return ReexecPrepStepOutcome::RescheduleTimer(
+                    settle_remaining.max(Duration::from_millis(50)),
+                );
+            }
+            // Linearizable quiescence + freeze: evaluate `active_jobs == 0` AND
+            // `release_done_rx.is_empty()` while holding `release_job_gate` so no worker
+            // completion or incoming handler enqueue can slip between check and freeze.
+            let mut gate_guard = release_job_gate.lock().unwrap_or_else(|e| e.into_inner());
+            let worker_idle = gate_guard.active_jobs == 0 && release_done_rx.is_empty();
+            if !should_complete_pending_reexec(
+                forwards_empty,
+                forward_queue_empty,
+                worker_idle,
+                cur_armed_at.elapsed(),
+            ) {
+                drop(gate_guard);
+                cleanup_async(prepared);
+                return ReexecPrepStepOutcome::RescheduleTimer(Duration::from_millis(100));
+            }
+            gate_guard.frozen_for_reexec = true;
+            drop(gate_guard);
+            *reexec_prep_retries = 0;
+            ReexecPrepStepOutcome::CommitReexec {
+                install_path: prep_path,
+                prepared,
+            }
+        }
+        Ok(Err(err))
+            if err.is_transient_retryable()
+                && *reexec_prep_retries
+                    < chinwag_cli::release_sync::MAX_RELEASE_SYNC_TRANSIENT_RETRIES =>
+        {
+            let delay = backoff_fn(*reexec_prep_retries);
+            *reexec_prep_retries = reexec_prep_retries.saturating_add(1);
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_daemon_reexec_retry",
+                    "binary": prep_path.to_string_lossy(),
+                    "reason": err.to_string(),
+                    "next_retry_secs": delay.as_secs()
+                })
+            );
+            let _ = stdout.flush();
+            ReexecPrepStepOutcome::RescheduleTimer(delay)
+        }
+        Ok(Err(err)) => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_daemon_reexec_refused",
+                    "binary": prep_path.to_string_lossy(),
+                    "reason": err.to_string()
+                })
+            );
+            let _ = stdout.flush();
+            *pending_reexec = None;
+            *reexec_prep_retries = 0;
+            ReexecPrepStepOutcome::StayOnlineDisarmed
+        }
+        Err(_) => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_daemon_reexec_refused",
+                    "binary": prep_path.to_string_lossy(),
+                    "reason": "reexec preparation worker panicked"
+                })
+            );
+            let _ = stdout.flush();
+            *pending_reexec = None;
+            *reexec_prep_retries = 0;
+            ReexecPrepStepOutcome::StayOnlineDisarmed
+        }
+    }
 }
 
 fn should_complete_pending_reexec(
@@ -2035,6 +2210,7 @@ async fn run_daemon_loop_reexecable(
     let mut exit_code = 0;
     let mut pinned_reexec: Option<(PathBuf, chinwag_cli::release_sync::PreparedImmutableReexec)> =
         None;
+    let mut reexec_prep_task: Option<InFlightReexecPrep> = None;
     let mut reexec_prep_retries: u32 = 0;
     let mut reexec_requested = false;
     let mut pending_reexec: Option<(PathBuf, [u8; 32], Instant)> = None;
@@ -2045,7 +2221,7 @@ async fn run_daemon_loop_reexecable(
         .and_then(|exe| chinwag_cli::release_sync::local_binary_sha256(&exe));
 
     let release_reconcile_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let pending_release_jobs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release_job_gate = Arc::new(Mutex::new(ReleaseJobQueueGate::default()));
     let retry_scheduler = Arc::new(Mutex::new(
         ReleaseDaemonScheduler::new_with_initial_catchup(),
     ));
@@ -2060,12 +2236,8 @@ async fn run_daemon_loop_reexecable(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .poll_catchup_dispatch(false, Instant::now())
-            && try_enqueue_release_job(
-                &job_tx,
-                &pending_release_jobs,
-                ReleaseDaemonJob::StartupCatchup,
-            )
-            .is_err()
+            && try_enqueue_release_job(&job_tx, &release_job_gate, ReleaseDaemonJob::StartupCatchup)
+                .is_err()
         {
             retry_scheduler
                 .lock()
@@ -2076,37 +2248,59 @@ async fn run_daemon_loop_reexecable(
         let ep_for_worker = endpoint_id.clone();
         let done_tx = release_done_tx;
         let sched_for_worker = retry_scheduler.clone();
-        let slots_for_worker = pending_release_jobs.clone();
+        let gate_for_worker = release_job_gate.clone();
         release_worker_handle = Some(tokio::spawn(async move {
-            let Ok(home_dir) = chinwag_cli::release_sync::resolve_home_dir() else {
-                slots_for_worker.store(0, std::sync::atomic::Ordering::SeqCst);
-                return;
-            };
-            chinwag_cli::release_sync::cleanup_stale_reexec_dirs(&home_dir);
+            let mut cleaned_stale_reexec = false;
             while let Some(job) = job_rx.recv().await {
-                let _job_slot = ReleaseJobSlotGuard(slots_for_worker.clone());
-                let home_clone = home_dir.clone();
+                let _job_slot = ReleaseJobSlotGuard(gate_for_worker.clone());
+                let is_catchup = matches!(job, ReleaseDaemonJob::StartupCatchup);
+                let need_cleanup = !cleaned_stale_reexec;
                 let journal_clone = journal_for_worker.clone();
                 let ep_clone = ep_for_worker.clone();
                 let sched_clone = sched_for_worker.clone();
                 let events = tokio::task::spawn_blocking(move || {
+                    let home_dir = chinwag_cli::release_sync::resolve_home_dir()?;
+                    if need_cleanup {
+                        chinwag_cli::release_sync::cleanup_stale_reexec_dirs(&home_dir);
+                    }
                     let store =
-                        chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_clone.clone());
-                    execute_release_daemon_job(
-                        &home_clone,
-                        &journal_clone,
-                        &store,
-                        &ep_clone,
-                        &sched_clone,
-                        job,
+                        chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_dir.clone());
+                    Ok::<_, chinwag_cli::release_sync::ReleaseSyncError>(
+                        execute_release_daemon_job(
+                            &home_dir,
+                            &journal_clone,
+                            &store,
+                            &ep_clone,
+                            &sched_clone,
+                            job,
+                        ),
                     )
                 })
                 .await;
                 match events {
-                    Ok(items) => {
+                    Ok(Ok(items)) => {
+                        cleaned_stale_reexec = true;
                         for event in items {
                             let _ = done_tx.send(event).await;
                         }
+                    }
+                    Ok(Err(err)) => {
+                        let retryable = err.is_transient_retryable();
+                        let next_retry_secs = if let Ok(mut sched) = sched_for_worker.lock() {
+                            sched
+                                .on_worker_env_error(retryable, is_catchup, Instant::now())
+                                .map(|d| d.as_secs())
+                        } else {
+                            None
+                        };
+                        let _ = done_tx
+                            .send(ReleaseDaemonEvent::Rejected {
+                                binary: "worker".to_owned(),
+                                reason: err.to_string(),
+                                retryable,
+                                next_retry_secs,
+                            })
+                            .await;
                     }
                     Err(_) => {
                         if let Ok(mut sched) = sched_for_worker.lock() {
@@ -2204,101 +2398,72 @@ async fn run_daemon_loop_reexecable(
                         .reset(tokio::time::Instant::now() + Duration::from_millis(350));
                 }
             }
-            () = &mut reexec_sleep, if pending_reexec.is_some() => {
+            () = &mut reexec_sleep, if pending_reexec.is_some() && reexec_prep_task.is_none() => {
                 if let Some((target_path, expected_sha, armed_at)) = pending_reexec.clone() {
-                    let release_worker_idle =
-                        pending_release_jobs.load(std::sync::atomic::Ordering::SeqCst) == 0
-                            && release_done_rx.is_empty();
+                    let release_worker_idle = {
+                        let guard = release_job_gate.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.active_jobs == 0 && release_done_rx.is_empty()
+                    };
                     if should_complete_pending_reexec(
                         forwards.is_empty(),
                         forward_rx.is_empty(),
                         release_worker_idle,
                         armed_at.elapsed(),
                     ) {
-                        // Refresh the authoritative verified release and pin an immutable
-                        // executable snapshot under `$HOME/.chinwag/release_sync.lock`
-                        // BEFORE closing the daemon so concurrent same-HOME installers
-                        // (`chinwag release publish` / `chinwag release sync`) in their
-                        // post-install, pre-publication window never trigger `DigestMismatch`.
+                        // Launch immutable snapshot preparation asynchronously in `spawn_blocking`
+                        // and select on `reexec_prep_task` completion so the live daemon's owner
+                        // loop NEVER suspends polling new connections, heartbeat, shutdown, or
+                        // room presence while preparing or checking `release_sync.lock`.
                         let target_for_prep = target_path.clone();
-                        let prep_res = tokio::task::spawn_blocking(move || {
+                        let handle = tokio::task::spawn_blocking(move || {
                             let home_dir = chinwag_cli::release_sync::resolve_home_dir()?;
                             chinwag_cli::release_sync::prepare_immutable_reexec_binary(
                                 &home_dir,
                                 &target_for_prep,
                                 &expected_sha,
                             )
-                        })
-                        .await;
-                        match prep_res {
-                            Ok(Ok(prepared)) => {
-                                if Some(prepared.sha256) == startup_chinwag_sha256 {
-                                    chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
-                                    pending_reexec = None;
-                                    reexec_prep_retries = 0;
-                                } else {
-                                    pinned_reexec = Some((target_path, prepared));
-                                    reexec_requested = true;
-                                    break;
-                                }
-                            }
-                            Ok(Err(err))
-                                if err.is_transient_retryable()
-                                    && reexec_prep_retries
-                                        < chinwag_cli::release_sync::MAX_RELEASE_SYNC_TRANSIENT_RETRIES =>
-                            {
-                                let delay =
-                                    ReleaseDaemonScheduler::backoff_for_attempt(reexec_prep_retries);
-                                reexec_prep_retries = reexec_prep_retries.saturating_add(1);
-                                let _ = writeln!(
-                                    stdout,
-                                    "{}",
-                                    json!({
-                                        "event": "native_daemon_reexec_retry",
-                                        "binary": target_path.to_string_lossy(),
-                                        "reason": err.to_string(),
-                                        "next_retry_secs": delay.as_secs()
-                                    })
-                                );
-                                let _ = stdout.flush();
-                                reexec_sleep
-                                    .as_mut()
-                                    .reset(tokio::time::Instant::now() + delay);
-                            }
-                            Ok(Err(err)) => {
-                                let _ = writeln!(
-                                    stdout,
-                                    "{}",
-                                    json!({
-                                        "event": "native_daemon_reexec_refused",
-                                        "binary": target_path.to_string_lossy(),
-                                        "reason": err.to_string()
-                                    })
-                                );
-                                let _ = stdout.flush();
-                                pending_reexec = None;
-                                reexec_prep_retries = 0;
-                            }
-                            Err(_) => {
-                                let _ = writeln!(
-                                    stdout,
-                                    "{}",
-                                    json!({
-                                        "event": "native_daemon_reexec_refused",
-                                        "binary": target_path.to_string_lossy(),
-                                        "reason": "reexec preparation worker panicked"
-                                    })
-                                );
-                                let _ = stdout.flush();
-                                pending_reexec = None;
-                                reexec_prep_retries = 0;
-                            }
-                        }
+                        });
+                        reexec_prep_task = Some(InFlightReexecPrep {
+                            target_path,
+                            expected_sha,
+                            handle,
+                        });
                     } else {
                         reexec_sleep
                             .as_mut()
                             .reset(tokio::time::Instant::now() + Duration::from_millis(100));
                     }
+                }
+            }
+            (prep_path, prep_sha, prep_res) = poll_reexec_prep(&mut reexec_prep_task), if reexec_prep_task.is_some() => {
+                match complete_reexec_prep_step(
+                    prep_path,
+                    prep_sha,
+                    prep_res,
+                    stdout,
+                    startup_chinwag_sha256,
+                    forwards.is_empty(),
+                    forward_rx.is_empty(),
+                    &release_done_rx,
+                    &release_job_gate,
+                    &mut pending_reexec,
+                    &mut reexec_prep_retries,
+                    ReleaseDaemonScheduler::backoff_for_attempt,
+                ) {
+                    ReexecPrepStepOutcome::CommitReexec {
+                        install_path,
+                        prepared,
+                    } => {
+                        pinned_reexec = Some((install_path, prepared));
+                        reexec_requested = true;
+                        break;
+                    }
+                    ReexecPrepStepOutcome::RescheduleTimer(delay) => {
+                        reexec_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + delay);
+                    }
+                    ReexecPrepStepOutcome::StayOnlineDisarmed => {}
                 }
             }
             original = forward_rx.recv(), if network.is_some() && forwards.is_empty() => {
@@ -2375,7 +2540,7 @@ async fn run_daemon_loop_reexecable(
                     if should_send
                         && try_enqueue_release_job(
                             job_tx,
-                            &pending_release_jobs,
+                            &release_job_gate,
                             ReleaseDaemonJob::StartupCatchup,
                         )
                         .is_err()
@@ -2417,7 +2582,7 @@ async fn run_daemon_loop_reexecable(
                 let receipts = receipts.clone();
                 let release_queue = release_job_tx.clone();
                 let release_reconcile = release_reconcile_needed.clone();
-                let release_pending_jobs = pending_release_jobs.clone();
+                let release_gate = release_job_gate.clone();
                 handlers.spawn(async move {
                     let _slot = slot;
                     let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), incoming).await else {
@@ -2551,7 +2716,7 @@ async fn run_daemon_loop_reexecable(
                         && let Some(queue) = &release_queue
                         && try_enqueue_release_job(
                             queue,
-                            &release_pending_jobs,
+                            &release_gate,
                             ReleaseDaemonJob::LiveMessage(Box::new(message.clone())),
                         )
                         .is_err()
@@ -2586,21 +2751,27 @@ async fn run_daemon_loop_reexecable(
         session.close().await;
     }
     endpoint.close().await;
-    // Shut down all incoming BusFrame handlers first so no connection task can
-    // enqueue additional jobs into `release_job_tx`.
     handlers.shutdown().await;
-    // Quiesce the dedicated release worker to natural completion (never aborting
-    // an in-flight `spawn_blocking` installation) and drain all final events so
-    // `pending_reexec` reflects the exact latest binary installed on disk.
+    if let Some(in_flight) = reexec_prep_task.take()
+        && let Ok(Ok(prepared)) = in_flight.handle.await
+    {
+        let _ = tokio::task::spawn_blocking(move || {
+            chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+        })
+        .await;
+    }
+    // Quiesce the dedicated release worker cleanly (on re-exec, `release_job_gate`
+    // was already atomically frozen at `active_jobs == 0 && release_done_rx.is_empty()`
+    // BEFORE closing service, so zero post-close refresh is ever needed; on SIGTERM,
+    // any in-flight installation finishes naturally before exit).
     let tearing_down_for_reexec = reexec_requested && exit_code == 0;
-    let mut teardown_updated_reexec = false;
     quiesce_release_worker_and_drain_events(
         &mut release_job_tx,
         &mut release_done_tx_keepalive,
         &mut release_worker_handle,
         &mut release_done_rx,
         |release_event| {
-            if process_release_daemon_event(
+            let _ = process_release_daemon_event(
                 release_event,
                 stdout,
                 &repo_root,
@@ -2613,74 +2784,35 @@ async fn run_daemon_loop_reexecable(
                 startup_chinwag_sha256,
                 tearing_down_for_reexec,
                 &mut pending_reexec,
-            ) {
-                teardown_updated_reexec = true;
-            }
+            );
         },
     )
     .await;
     forwards.shutdown().await;
     drop(publications);
-    if reexec_requested && exit_code == 0 {
-        if teardown_updated_reexec
-            && let Some((latest_path, latest_sha, _)) = pending_reexec.take()
-            && pinned_reexec
-                .as_ref()
-                .is_none_or(|(_, p)| p.sha256 != latest_sha)
-        {
-            if let Some((_, old_prepared)) = pinned_reexec.take() {
-                chinwag_cli::release_sync::cleanup_prepared_reexec(old_prepared);
-            }
-            let refresh_path = latest_path.clone();
-            let refreshed = tokio::task::spawn_blocking(move || {
-                let home_dir = chinwag_cli::release_sync::resolve_home_dir()?;
-                chinwag_cli::release_sync::prepare_immutable_reexec_binary(
-                    &home_dir,
-                    &refresh_path,
-                    &latest_sha,
-                )
+    if reexec_requested
+        && exit_code == 0
+        && let Some((install_path, prepared)) = pinned_reexec.take()
+    {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            json!({
+                "event": "native_daemon_reexec",
+                "binary": install_path.to_string_lossy()
             })
-            .await;
-            match refreshed {
-                Ok(Ok(prepared)) => {
-                    pinned_reexec = Some((latest_path, prepared));
-                }
-                Ok(Err(err)) => {
-                    let _ = writeln!(
-                        stdout,
-                        "{}",
-                        json!({
-                            "event": "native_daemon_reexec_refused",
-                            "binary": latest_path.to_string_lossy(),
-                            "reason": err.to_string()
-                        })
-                    );
-                    let _ = stdout.flush();
-                    return DaemonOutcome::Exit(1);
-                }
-                Err(_) => {
-                    return DaemonOutcome::Exit(1);
-                }
-            }
-        }
-        if let Some((install_path, prepared)) = pinned_reexec.take() {
-            let _ = writeln!(
-                stdout,
-                "{}",
-                json!({
-                    "event": "native_daemon_reexec",
-                    "binary": install_path.to_string_lossy()
-                })
-            );
-            let _ = stdout.flush();
-            return DaemonOutcome::Reexec {
-                install_path,
-                prepared,
-            };
-        }
+        );
+        let _ = stdout.flush();
+        return DaemonOutcome::Reexec {
+            install_path,
+            prepared,
+        };
     }
     if let Some((_, prepared)) = pinned_reexec.take() {
-        chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+        let _ = tokio::task::spawn_blocking(move || {
+            chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+        })
+        .await;
     }
     DaemonOutcome::Exit(exit_code)
 }
@@ -5750,17 +5882,15 @@ mod tests {
             let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(8);
             let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(8);
             let mut done_tx_keepalive = Some(done_tx.clone());
-            let pending_jobs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let job_gate = Arc::new(Mutex::new(ReleaseJobQueueGate::default()));
             let b_entered_blocking = Arc::new(tokio::sync::Notify::new());
 
-            // Enqueue two consecutive `chinwag` jobs (A then B) via gapless slot counter.
-            try_enqueue_release_job(&job_tx, &pending_jobs, ReleaseDaemonJob::StartupCatchup)
-                .unwrap();
-            try_enqueue_release_job(&job_tx, &pending_jobs, ReleaseDaemonJob::StartupCatchup)
-                .unwrap();
-            assert_eq!(pending_jobs.load(std::sync::atomic::Ordering::SeqCst), 2);
+            // Enqueue two consecutive `chinwag` jobs (A then B) via gapless queue gate.
+            try_enqueue_release_job(&job_tx, &job_gate, ReleaseDaemonJob::StartupCatchup).unwrap();
+            try_enqueue_release_job(&job_tx, &job_gate, ReleaseDaemonJob::StartupCatchup).unwrap();
+            assert_eq!(job_gate.lock().unwrap().active_jobs, 2);
 
-            let slots_clone = pending_jobs.clone();
+            let gate_clone = job_gate.clone();
             let b_entered_clone = b_entered_blocking.clone();
             let install_for_worker = install_path.clone();
             let bin_a_clone = bin_a.clone();
@@ -5771,7 +5901,7 @@ mod tests {
             let mut step = 0usize;
             let mut worker_handle = Some(tokio::spawn(async move {
                 while let Some(_job) = job_rx.recv().await {
-                    let _guard = ReleaseJobSlotGuard(slots_clone.clone());
+                    let _guard = ReleaseJobSlotGuard(gate_clone.clone());
                     step += 1;
                     let current_step = step;
                     let dst = install_for_worker.clone();
@@ -5864,7 +5994,7 @@ mod tests {
             b_entered_blocking.notified().await;
             tokio::time::sleep(Duration::from_millis(360)).await;
             assert_eq!(
-                pending_jobs.load(std::sync::atomic::Ordering::SeqCst),
+                job_gate.lock().unwrap().active_jobs,
                 1,
                 "release B should still hold its pending job slot while inside blocking installation"
             );
@@ -5872,7 +6002,7 @@ mod tests {
                 !should_complete_pending_reexec(
                     true,
                     true,
-                    pending_jobs.load(std::sync::atomic::Ordering::SeqCst) == 0,
+                    job_gate.lock().unwrap().active_jobs == 0,
                     Duration::from_millis(360),
                 ),
                 "live loop must defer re-exec while release B is busy"
@@ -5904,7 +6034,7 @@ mod tests {
                 },
             )
             .await;
-            assert_eq!(pending_jobs.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(job_gate.lock().unwrap().active_jobs, 0);
 
             // Also verify rollback back to `sha_startup`: disarms in live loop (`false`),
             // and commits `sha_startup` in teardown mode (`true`)!
@@ -5981,6 +6111,309 @@ mod tests {
         );
         drop(prepared.dir_fd);
         clear_and_remove_immutable_dir(&prepared.dir_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_reexec_prep_never_suspends_loop_defers_handler_release_b_and_retries_transient_io() {
+        use chinwag_cli::release_sync::{
+            CURRENT_TARGET_TRIPLE, RELEASE_MANIFEST_SCHEMA, ReleaseApplyOutcome, ReleaseManifestV1,
+            ReleaseSyncError, cleanup_prepared_reexec, expected_artifact_key, local_binary_sha256,
+            prepare_immutable_reexec_binary,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let home_dir = temp.path().join("home");
+        let bin_dir = home_dir.join(".local/bin");
+        let build_dir = temp.path().join("build");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+
+        let compile_signed_macho = |label: &str| -> (PathBuf, [u8; 32], String) {
+            let src = build_dir.join(format!("{label}.c"));
+            let out = build_dir.join(format!("chinwag-{label}"));
+            fs::write(
+                &src,
+                format!("int main(void) {{ const char *v = \"{label}\"; (void)v; return 0; }}\n"),
+            )
+            .unwrap();
+            let st = std::process::Command::new("/usr/bin/clang")
+                .args(["-O2", "-o"])
+                .arg(&out)
+                .arg(&src)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let cs = std::process::Command::new("/usr/bin/codesign")
+                .args(["-s", "-", "--force"])
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(cs.success());
+            let sha = local_binary_sha256(&out).unwrap();
+            let sha_hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+            (out, sha, sha_hex)
+        };
+
+        let (_bin_startup, sha_startup, _) = compile_signed_macho("loop_startup");
+        let (bin_a, sha_a, _sha_a_hex) = compile_signed_macho("loop_a");
+        let (bin_b, sha_b, sha_b_hex) = compile_signed_macho("loop_b");
+        let install_path = bin_dir.join("chinwag");
+        fs::copy(&bin_a, &install_path).unwrap();
+
+        let manifest_b = ReleaseManifestV1 {
+            schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+            binary: "chinwag".to_owned(),
+            target_triple: CURRENT_TARGET_TRIPLE.to_owned(),
+            git_commit: "bbbbbbbbbbbbbbbb".to_owned(),
+            commit_epoch: 200,
+            built_at_ms: 1_700_000_200,
+            sha256: sha_b_hex.clone(),
+            blake3: "bb".repeat(32),
+            size_bytes: fs::metadata(&bin_b).unwrap().len(),
+            artifact_key: expected_artifact_key("chinwag", CURRENT_TARGET_TRIPLE, &sha_b_hex),
+            rollback: false,
+        };
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (ticks_while_prep_in_flight, committed_sha, log_text) = rt.block_on(async {
+            let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(8);
+            let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(8);
+            let job_gate = Arc::new(Mutex::new(ReleaseJobQueueGate::default()));
+
+            let repo_dir = temp.path().join("repo");
+            fs::create_dir_all(repo_dir.join(".chinwag/bus")).unwrap();
+            let (bcast_tx, _) = broadcast::channel::<BusMessage>(16);
+            let (fwd_tx, _) = tokio::sync::mpsc::channel::<BusMessage>(16);
+            let publications = Mutex::new(NativePublication::open(&repo_dir).unwrap());
+            let daemon_state = Mutex::new(DaemonState {
+                ok: true,
+                pid: 1,
+                endpoint_id: "ep".into(),
+                bound_sockets: vec![],
+                alpns: vec![],
+                repo_root: repo_dir.to_string_lossy().into_owned(),
+                tasks_md: String::new(),
+                messages_jsonl: String::new(),
+                started_at: 0,
+                last_heartbeat: 0,
+                total_messages: 0,
+                product_governor: String::new(),
+                delivery_router: String::new(),
+            });
+
+            // Worker installs release B when an active connection handler enqueues it!
+            let gate_for_worker = job_gate.clone();
+            let dst_for_worker = install_path.clone();
+            let src_b_for_worker = bin_b.clone();
+            let mb_for_worker = manifest_b.clone();
+            let done_for_worker = done_tx.clone();
+            let allow_b_finish = Arc::new(tokio::sync::Notify::new());
+            let allow_b_clone = allow_b_finish.clone();
+            let worker = tokio::spawn(async move {
+                if let Some(_job) = job_rx.recv().await {
+                    let _slot = ReleaseJobSlotGuard(gate_for_worker);
+                    allow_b_clone.notified().await;
+                    let tmp = dst_for_worker.with_extension("tmp.loop_b");
+                    fs::copy(&src_b_for_worker, &tmp).unwrap();
+                    fs::rename(&tmp, &dst_for_worker).unwrap();
+                    done_for_worker
+                        .send(ReleaseDaemonEvent::Applied {
+                            binary: "chinwag".to_owned(),
+                            outcome: Box::new(ReleaseApplyOutcome::Installed {
+                                manifest: mb_for_worker,
+                                install_path: dst_for_worker,
+                                previous_backup_path: None,
+                                receipt_message: None,
+                            }),
+                        })
+                        .await
+                        .unwrap();
+                }
+            });
+
+            let mut pending_reexec: Option<(PathBuf, [u8; 32], Instant)> =
+                Some((install_path.clone(), sha_a, Instant::now()));
+            let mut reexec_prep_task: Option<InFlightReexecPrep> = None;
+            let mut reexec_prep_retries = 0u32;
+            let mut sink = Vec::new();
+            let reexec_sleep = tokio::time::sleep(Duration::from_millis(5));
+            tokio::pin!(reexec_sleep);
+            let mut heartbeat = tokio::time::interval(Duration::from_millis(15));
+            heartbeat.tick().await;
+
+            let prep_a_started = Arc::new(tokio::sync::Notify::new());
+            let release_prep_a = Arc::new(std::sync::Barrier::new(2));
+            let mut prep_attempt = 0usize;
+            let mut ticks_during_prep_a = 0usize;
+            let mut handler_enqueued_b = false;
+            let committed_prepared;
+
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        if reexec_prep_task.is_some() && !handler_enqueued_b {
+                            ticks_during_prep_a += 1;
+                            if ticks_during_prep_a >= 3 {
+                                // Proves the live `tokio::select!` loop was NOT suspended while
+                                // `reexec_prep_task` was blocked! Now simulate an active connection
+                                // handler enqueueing release B while A's snapshot is being prepared!
+                                try_enqueue_release_job(
+                                    &job_tx,
+                                    &job_gate,
+                                    ReleaseDaemonJob::StartupCatchup,
+                                )
+                                .unwrap();
+                                handler_enqueued_b = true;
+                                let unblock = release_prep_a.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    unblock.wait();
+                                });
+                            }
+                        }
+                    }
+                    Some(ev) = done_rx.recv() => {
+                        if process_release_daemon_event(
+                            ev,
+                            &mut sink,
+                            &repo_dir,
+                            "ep",
+                            false,
+                            &fwd_tx,
+                            &publications,
+                            &bcast_tx,
+                            &daemon_state,
+                            Some(sha_startup),
+                            false,
+                            &mut pending_reexec,
+                        ) {
+                            reexec_prep_retries = 0;
+                            reexec_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_millis(10));
+                        }
+                    }
+                    () = &mut reexec_sleep, if pending_reexec.is_some() && reexec_prep_task.is_none() => {
+                        let (target_path, expected_sha, _) = pending_reexec.clone().unwrap();
+                        let idle = {
+                            let g = job_gate.lock().unwrap();
+                            g.active_jobs == 0 && done_rx.is_empty()
+                        };
+                        if idle {
+                            prep_attempt += 1;
+                            let attempt = prep_attempt;
+                            let home_for_prep = home_dir.clone();
+                            let target_for_prep = target_path.clone();
+                            let started_notify = prep_a_started.clone();
+                            let barrier_a = release_prep_a.clone();
+                            let handle = tokio::task::spawn_blocking(move || {
+                                if attempt == 1 {
+                                    started_notify.notify_one();
+                                    let prepared = prepare_immutable_reexec_binary(
+                                        &home_for_prep,
+                                        &target_for_prep,
+                                        &expected_sha,
+                                    )?;
+                                    barrier_a.wait();
+                                    Ok(prepared)
+                                } else if attempt == 2 {
+                                    // Simulate a one-shot transient EIO/EMFILE on B's first preparation!
+                                    Err(ReleaseSyncError::TransientIo(
+                                        "simulated one-shot EMFILE during preparation".into(),
+                                    ))
+                                } else {
+                                    prepare_immutable_reexec_binary(
+                                        &home_for_prep,
+                                        &target_for_prep,
+                                        &expected_sha,
+                                    )
+                                }
+                            });
+                            reexec_prep_task = Some(InFlightReexecPrep {
+                                target_path,
+                                expected_sha,
+                                handle,
+                            });
+                        } else {
+                            // B is currently active in the worker; let B finish in the live loop!
+                            allow_b_finish.notify_one();
+                            reexec_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_millis(15));
+                        }
+                    }
+                    (prep_path, prep_sha, prep_res) = poll_reexec_prep(&mut reexec_prep_task), if reexec_prep_task.is_some() => {
+                        match complete_reexec_prep_step(
+                            prep_path,
+                            prep_sha,
+                            prep_res,
+                            &mut sink,
+                            Some(sha_startup),
+                            true,
+                            true,
+                            &done_rx,
+                            &job_gate,
+                            &mut pending_reexec,
+                            &mut reexec_prep_retries,
+                            |_| Duration::from_millis(10),
+                        ) {
+                            ReexecPrepStepOutcome::CommitReexec { prepared, .. } => {
+                                committed_prepared = prepared;
+                                break;
+                            }
+                            ReexecPrepStepOutcome::RescheduleTimer(delay) => {
+                                reexec_sleep
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + delay);
+                            }
+                            ReexecPrepStepOutcome::StayOnlineDisarmed => {
+                                panic!("unexpected disarm during live B upgrade + transient retry");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Once `CommitReexec` fired, `job_gate` MUST be atomically frozen so no late
+            // connection handler can enqueue work during endpoint/handler teardown!
+            assert_eq!(
+                try_enqueue_release_job(&job_tx, &job_gate, ReleaseDaemonJob::StartupCatchup),
+                Err(EnqueueReleaseJobError::FrozenForReexec)
+            );
+            drop(job_tx);
+            worker.await.unwrap();
+
+            let sha = committed_prepared.sha256;
+            cleanup_prepared_reexec(committed_prepared);
+            (
+                ticks_during_prep_a,
+                sha,
+                String::from_utf8_lossy(&sink).into_owned(),
+            )
+        });
+        drop(rt);
+
+        assert!(
+            ticks_while_prep_in_flight >= 3,
+            "owner select! loop must continue polling heartbeats/handlers while preparation runs"
+        );
+        assert_eq!(
+            committed_sha, sha_b,
+            "daemon must discard A's pin while B is active, survive transient retry, and commit B"
+        );
+        assert!(
+            log_text.contains("\"native_daemon_reexec_retry\""),
+            "transient EIO/EMFILE during preparation must schedule retry instead of refusing: {log_text}"
+        );
+        assert!(
+            !log_text.contains("\"native_daemon_reexec_refused\""),
+            "transient error must not trigger terminal refusal: {log_text}"
+        );
     }
 
     #[test]
