@@ -451,6 +451,9 @@ pub async fn capture(
     let started = Instant::now();
     let started_unix_ms = host_unix_ms();
     let command_evidence = CommandEvidence::snapshot(command)?;
+    // INVARIANT: Zero .await points may precede spawn(); execution::execute
+    // relies on synchronous child spawn immediately after its pre-spawn
+    // recipient-revocation, admission, fixture, and lease verification.
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

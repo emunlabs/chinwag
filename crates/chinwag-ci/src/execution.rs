@@ -331,59 +331,123 @@ fn recorded_id(fixture: &PreparedFixture) -> Option<String> {
     }
     container_id(&bytes).ok().flatten()
 }
-/// Actual execution only after complete issuer/intent/run/job-key matching and
-/// enough CURRENT lease for capture+control closure. Cleanup failure is sealed
-/// as UNKNOWN and is never eligible for green or a repeated workload send.
-pub async fn execute(
+fn verify_pre_spawn_invariants(
+    profiles: &BoundProfiles,
+    fixture: &PreparedFixture,
+    admission: &CurrentAdmission,
+    job: &RegisteredJob,
+    signers: &crate::recipient_key::SeatSignerDirectory,
+    revocations: &crate::recipient_key::VerifiedRevocationState,
+    verified_now: u64,
+) -> Result<(), ExecutionError> {
+    let profile = profiles.command();
+    profiles
+        .reverify_recipient_keys(signers, revocations, verified_now)
+        .map_err(|_| ExecutionError::Scope)?;
+    profiles
+        .validate_admission(admission, job, verified_now)
+        .map_err(|_| ExecutionError::Scope)?;
+    fixture
+        .verify_unchanged(profile)
+        .map_err(|_| ExecutionError::Scope)?;
+    if verified_now
+        .saturating_add(profile.spec().timeout_seconds)
+        .saturating_add(CLOSE_RESERVE_SECONDS)
+        >= admission.record().expires_unix
+    {
+        return Err(ExecutionError::Scope);
+    }
+    Ok(())
+}
+
+async fn run_post_listing_pre_spawn_gate<'a, E, F>(
+    profiles: &BoundProfiles,
+    fixture: &PreparedFixture,
+    admission: &CurrentAdmission,
+    job: &RegisteredJob,
+    signers: &crate::recipient_key::SeatSignerDirectory,
+    pre_spawn_revocations: F,
+    now_fn: fn() -> Result<u64, ExecutionError>,
+) -> Result<(), E>
+where
+    E: From<ExecutionError>,
+    F: std::future::Future<Output = Result<&'a crate::recipient_key::VerifiedRevocationState, E>>,
+{
+    let revocations = pre_spawn_revocations.await?;
+    let verified_now = now_fn().map_err(E::from)?;
+    verify_pre_spawn_invariants(
+        profiles,
+        fixture,
+        admission,
+        job,
+        signers,
+        revocations,
+        verified_now,
+    )
+    .map_err(E::from)
+}
+
+/// Actual execution only after complete issuer/intent/run/job-key matching,
+/// post-listing live recipient-revocation reverification, and enough CURRENT
+/// lease for capture+control closure. Cleanup failure is sealed as UNKNOWN and
+/// is never eligible for green or a repeated workload send.
+pub async fn execute<'a, E, F>(
     profiles: &BoundProfiles,
     fixture: PreparedFixture,
     image: &ImageReady,
     admission: &CurrentAdmission,
     job: &RegisteredJob,
-) -> Result<IsolatedCapturedRun, ExecutionError> {
+    signers: &crate::recipient_key::SeatSignerDirectory,
+    pre_spawn_revocations: F,
+) -> Result<IsolatedCapturedRun, E>
+where
+    E: From<ExecutionError>,
+    F: std::future::Future<Output = Result<&'a crate::recipient_key::VerifiedRevocationState, E>>,
+{
     if !cfg!(target_os = "linux") {
-        return Err(ExecutionError::Platform);
+        return Err(ExecutionError::Platform.into());
     }
     let profile = profiles.command();
     if image.command_profile != profile.digest() || fixture.path() != profile.execution_directory()
     {
-        return Err(ExecutionError::Scope);
+        return Err(ExecutionError::Scope.into());
     }
     fixture
         .verify_unchanged(profile)
-        .map_err(|_| ExecutionError::Scope)?;
+        .map_err(|_| E::from(ExecutionError::Scope))?;
+    let initial_now = now().map_err(E::from)?;
     profiles
-        .validate_admission(admission, job, now()?)
-        .map_err(|_| ExecutionError::Scope)?;
+        .validate_admission(admission, job, initial_now)
+        .map_err(|_| E::from(ExecutionError::Scope))?;
     let r = admission.record();
-    if now()?
+    if initial_now
         .saturating_add(profile.spec().timeout_seconds)
         .saturating_add(CLOSE_RESERVE_SECONDS)
         >= r.expires_unix
     {
-        return Err(ExecutionError::Scope);
+        return Err(ExecutionError::Scope.into());
     }
     if listed(profile, format!("name=^/{}$", profile.container_name()))
-        .await?
+        .await
+        .map_err(E::from)?
         .is_some()
     {
-        return Err(ExecutionError::Existing);
+        return Err(ExecutionError::Existing.into());
     }
-    // All asynchronous preparation completed; recheck current admission and
-    // exact public fixture immediately before the owned spawn.
-    profiles
-        .validate_admission(admission, job, now()?)
-        .map_err(|_| ExecutionError::Scope)?;
-    fixture
-        .verify_unchanged(profile)
-        .map_err(|_| ExecutionError::Scope)?;
-    if now()?
-        .saturating_add(profile.spec().timeout_seconds)
-        .saturating_add(CLOSE_RESERVE_SECONDS)
-        >= r.expires_unix
-    {
-        return Err(ExecutionError::Scope);
-    }
+    // Container-listing await completed; execute the caller's live revocation
+    // refresh and synchronously recheck recipient-key revocations, current
+    // admission, exact public fixture, and remaining lease immediately before
+    // Command::spawn() inside capture.
+    run_post_listing_pre_spawn_gate(
+        profiles,
+        &fixture,
+        admission,
+        job,
+        signers,
+        pre_spawn_revocations,
+        now,
+    )
+    .await?;
     let context = UnverifiedRunContext {
         repository: r.spec.repository.clone(),
         source_commit: r.spec.source_commit.clone(),
@@ -411,7 +475,7 @@ pub async fn execute(
     // A public name/label alone never authorizes removal. This invocation's
     // own CID, held in its fresh private staging, must match BEFORE cleanup.
     let cleanup = cleanup(profile, recorded.as_deref()).await;
-    let captured = captured.map_err(|_| ExecutionError::Control)?;
+    let captured = captured.map_err(|_| E::from(ExecutionError::Control))?;
     let mut lifecycle = cleanup.unwrap_or(ContainerLifecycle {
         classification: "OWNED_CONTAINER_CLOSE_UNKNOWN_DO_NOT_REPEAT",
         owned_container_id: None,
@@ -504,5 +568,298 @@ mod tests {
             assert!(!image_matches(&serde_json::to_vec(&bad).unwrap(), &p));
         }
         assert!(!image_matches(b"[]", &p));
+    }
+
+    #[tokio::test]
+    async fn post_listing_pre_spawn_gate_refuses_active_key_revocation_and_preserves_caller_errors()
+    {
+        use crate::{
+            admission::{AdmissionRecord, CommittedAdmission},
+            authorization,
+            custody::{OwnerCustody, OwnerRole, PublicDestination, PublicEnrollment},
+            envelope::{AcuGateKey, Destination, DestinationKey, ResponseKey},
+            intent::{self, IntentSpec, IntentVerification},
+            preparation,
+            profile::DeliveryProfileSpec,
+            recipient_key::{
+                RecipientKeyPurpose, SeatSignerDirectory, VerifiedRevocationState,
+                sign_public_key_enrollment_descriptor, sign_revocation_statement,
+            },
+            runner_identity::RunnerIdentity,
+            runtime::{HttpFailure, RuntimeError},
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let vault = dir.path().join("admission");
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = OwnerCustody::create_new(
+            &vault.canonicalize().unwrap(),
+            OwnerRole::Admission,
+            [17; 32],
+            None,
+        )
+        .unwrap();
+        let PublicEnrollment::Admission { signer: issuer } = owner.public_enrollment().unwrap()
+        else {
+            panic!("issuer")
+        };
+
+        let fixture_bytes = b"#[test] fn ok() {}";
+        let cmd_spec = CommandProfileSpec {
+            version: 1,
+            execution_id: [41; 32],
+            rust_image: format!("docker.io/library/rust@sha256:{}", "a".repeat(64)),
+            fixture_sha256: Sha256::digest(fixture_bytes).into(),
+            timeout_seconds: 60,
+            isolation: "UNPRIVILEGED_NETWORKLESS_DOCKER_FIXED_RUST_FIXTURE_V1".into(),
+        };
+        let cb = serde_json::to_vec(&cmd_spec).unwrap();
+        let cp = CommandProfile::parse(&cb).unwrap();
+
+        let ed = |n| *iroh::SecretKey::from_bytes(&[n; 32]).public().as_bytes();
+        let seat_sk = SigningKey::from_bytes(&[12; 32]);
+        let signers = SeatSignerDirectory::from_pinned_seats(&[(
+            "WORKHORSE",
+            seat_sk.verifying_key().to_bytes(),
+        )])
+        .unwrap();
+        let recipient = PublicDestination {
+            role: Destination::Recipient,
+            store_id: [2; 32],
+            store_binding: [3; 32],
+            psk: DestinationKey::generate(Destination::Recipient)
+                .unwrap()
+                .public(),
+            response_base: ResponseKey::generate(Destination::Recipient)
+                .unwrap()
+                .public(),
+            receipt_signer: ed(4),
+            release_request_signer: ed(4),
+            transport: ed(5),
+        };
+        let psk_binding = sign_public_key_enrollment_descriptor(
+            "WORKHORSE",
+            "wh-exec-psk-e1",
+            1,
+            RecipientKeyPurpose::AcuRecipientPsk,
+            &recipient.psk,
+            900,
+            2_000,
+            &seat_sk,
+        )
+        .unwrap();
+        let response_binding = sign_public_key_enrollment_descriptor(
+            "WORKHORSE",
+            "wh-exec-resp-e1",
+            1,
+            RecipientKeyPurpose::AcuRecipientResponseBase,
+            &recipient.response_base,
+            900,
+            2_000,
+            &seat_sk,
+        )
+        .unwrap();
+        let archive = PublicDestination {
+            role: Destination::Archive,
+            store_id: [6; 32],
+            store_binding: [7; 32],
+            psk: DestinationKey::generate(Destination::Archive)
+                .unwrap()
+                .public(),
+            response_base: ResponseKey::generate(Destination::Archive)
+                .unwrap()
+                .public(),
+            receipt_signer: ed(8),
+            release_request_signer: ed(8),
+            transport: ed(9),
+        };
+        let deliv_spec = DeliveryProfileSpec {
+            version: 1,
+            repository_id: 42,
+            initiating_instance: "WORKHORSE#exec-fixture".into(),
+            recipient,
+            recipient_psk_binding: Some(psk_binding),
+            recipient_response_base_binding: Some(response_binding),
+            recipient_key_revocations: Vec::new(),
+            archive,
+            acu_gate_base: AcuGateKey::generate().unwrap().public(),
+            acu_signer: ed(10),
+            admission_signer: issuer,
+            relay_origin: "https://relay-fixture.trycloudflare.com/".into(),
+            admission_origin: "https://admission-fixture.trycloudflare.com/".into(),
+            acu_origin: "https://acu-fixture.trycloudflare.com/".into(),
+            command_profile_sha256: cp.digest(),
+            original_policy_sha256: [11; 32],
+            original_policy_epoch: 1,
+            expires_unix: 1600,
+            customer_custody_boundary: "CUSTOMER_ACU_AND_ARCHIVE_SHARED_HOST_UID".into(),
+        };
+        let db = serde_json::to_vec(&deliv_spec).unwrap();
+        let deliv_hash: [u8; 32] = Sha256::digest(&db).into();
+        let key_hex = hex::encode(seat_sk.verifying_key().to_bytes());
+        let intent_spec = IntentSpec {
+            schema: "chinwag.ci-dispatch-intent.v1".into(),
+            repository: "example/ci-test".into(),
+            repository_id: 42,
+            source_commit: hex::encode([13; 20]),
+            workflow_ref: "example/ci-test/.github/workflows/ci.yml@refs/heads/review".into(),
+            workflow_commit: hex::encode([13; 20]),
+            recipient_instance: "WORKHORSE#exec-fixture".into(),
+            delivery_profile_sha256: hex::encode(deliv_hash),
+            command_sha256: hex::encode(cp.digest()),
+            nonce: hex::encode([18; 32]),
+            expires_unix: 1500,
+        };
+        let body = serde_json::to_string(&intent_spec).unwrap();
+        let id = "bus-exec-test";
+        let sender = "WORKHORSE#exec-fixture";
+        let to = "ADMISSION#exec-fixture";
+        let room = "#eng";
+        let task = "CHWG-CI-EXEC";
+        let signed = format!(
+            "chinwag-bus-sig-v2|{}",
+            [id, "1000", sender, to, room, task, &body]
+                .map(|s| format!("{}:{s}", s.len()))
+                .join("|")
+        );
+        let digest = hex::encode(Sha256::digest(
+            format!("chinwag-bus-v1|1000|{room}|{sender}|{key_hex}|{to}|{task}|{body}").as_bytes(),
+        ));
+        let original = serde_json::json!({
+            "id": id,
+            "ts_unix": 1000,
+            "sender": sender,
+            "sender_endpoint_id": key_hex,
+            "to": to,
+            "room": room,
+            "task_id": task,
+            "body": body,
+            "digest_sha256": digest,
+            "pubkey_ed25519": key_hex,
+            "signature_ed25519": hex::encode(seat_sk.sign(signed.as_bytes()).to_bytes()),
+        });
+        let verified_intent = intent::verify_original(
+            &serde_json::to_vec(&original).unwrap(),
+            IntentVerification {
+                initiator_instance: sender,
+                initiator_public_key: seat_sk.verifying_key().to_bytes(),
+                admission_addressee: to,
+                task_id: task,
+                room,
+                now_unix: 1001,
+            },
+        )
+        .unwrap();
+        let bound = BoundProfiles::resolve(&verified_intent, &cb, &db, 1001).unwrap();
+        let staging_path = dir.path().canonicalize().unwrap().join("staging");
+        let fixture =
+            preparation::materialize(&cp, bound.intended_source(), fixture_bytes, &staging_path)
+                .unwrap();
+
+        let runner = RunnerIdentity::generate().unwrap();
+        let keys = runner.public_keys();
+        let admitted = CommittedAdmission::synthetic_fixture(AdmissionRecord {
+            spec: verified_intent.spec().clone(),
+            initiating_instance: verified_intent.initiating_instance().into(),
+            intent_digest: *verified_intent.original_digest(),
+            token_sha256: [19; 32],
+            issuer_jti_sha256: [20; 32],
+            audience: "fixture".into(),
+            run_id: 100,
+            run_attempt: 1,
+            signing_key: keys.signing_ed25519,
+            agent_transport_key: keys.agent_transport_ed25519,
+            archive_transport_key: keys.archive_transport_ed25519,
+            usable_from_unix: 1000,
+            expires_unix: 1300,
+        });
+        let certificate = owner.certify_admission(&admitted).unwrap();
+        let current = authorization::verify_historical_certificate(&certificate, issuer)
+            .unwrap()
+            .require_current(1001)
+            .unwrap();
+        let registered = RegisteredJob {
+            run_id: 100,
+            run_attempt: 1,
+            keys,
+        };
+
+        let mut live_revocations = VerifiedRevocationState::new();
+        // 1. Clean live revocation state after listing await succeeds.
+        {
+            let rev_ref = &mut live_revocations;
+            run_post_listing_pre_spawn_gate(
+                &bound,
+                &fixture,
+                &current,
+                &registered,
+                &signers,
+                async move {
+                    tokio::task::yield_now().await;
+                    Ok::<&VerifiedRevocationState, RuntimeError>(rev_ref)
+                },
+                || Ok(1005),
+            )
+            .await
+            .unwrap();
+        }
+
+        // 2. Upstream caller error (e.g. HTTP failure on POST /v1/revocations) is preserved.
+        let http_err = run_post_listing_pre_spawn_gate(
+            &bound,
+            &fixture,
+            &current,
+            &registered,
+            &signers,
+            async {
+                tokio::task::yield_now().await;
+                Err::<&VerifiedRevocationState, RuntimeError>(RuntimeError::Http(
+                    HttpFailure::Status(503),
+                ))
+            },
+            || Ok(1005),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            http_err,
+            RuntimeError::Http(HttpFailure::Status(503))
+        ));
+
+        // 3. Active-key revocation arriving during the async listing / refresh window
+        // causes synchronous pre-spawn refusal before capture is reached.
+        let rev_bytes = sign_revocation_statement(
+            "WORKHORSE",
+            2,
+            &["wh-exec-psk-e1".to_string()],
+            1004,
+            &seat_sk,
+        )
+        .unwrap();
+        let signers_ref = &signers;
+        let rev_ref = &mut live_revocations;
+        let scope_err = run_post_listing_pre_spawn_gate(
+            &bound,
+            &fixture,
+            &current,
+            &registered,
+            &signers,
+            async move {
+                tokio::task::yield_now().await;
+                rev_ref
+                    .ingest_signed_revocation(&rev_bytes, signers_ref)
+                    .unwrap();
+                Ok::<&VerifiedRevocationState, ExecutionError>(rev_ref)
+            },
+            || Ok(1005),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(scope_err, ExecutionError::Scope));
     }
 }

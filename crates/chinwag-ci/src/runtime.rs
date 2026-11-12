@@ -63,6 +63,11 @@ impl RuntimeError {
         }
     }
 }
+impl From<crate::execution::ExecutionError> for RuntimeError {
+    fn from(_: crate::execution::ExecutionError) -> Self {
+        Self::Refused
+    }
+}
 /// Fixed categories only. Never retain or format a reqwest error, URL, body,
 /// token, header or upstream message in an operational diagnostic.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

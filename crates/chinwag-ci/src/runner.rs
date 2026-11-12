@@ -425,19 +425,37 @@ async fn run_phased(path: &Path, trace: &mut Trace) -> Result<(RunnerObservation
     .require_current(runtime::now()?))?;
     ck(profiles.validate_admission(&admission, &job.registered(), runtime::now()?))?;
     trace.enter(Phase::CaptureExecution);
-    refresh_live_revocations(
-        &client,
-        &config,
-        &plan,
-        &intent,
-        d.admission_signer,
+    ck(profiles.reverify_recipient_keys(&pinned_signers, &live_revocations, runtime::now()?))?;
+    let registered = job.registered();
+    let live_revocations_ref = &mut live_revocations;
+    let client_ref = &client;
+    let config_ref = &config;
+    let plan_ref = &plan;
+    let intent_ref = &intent;
+    let signers_ref = &pinned_signers;
+    let admission_signer = d.admission_signer;
+    let captured = execution::execute(
+        &profiles,
+        fixture,
+        &image,
+        &admission,
+        &registered,
         &pinned_signers,
-        &mut live_revocations,
+        async move {
+            refresh_live_revocations(
+                client_ref,
+                config_ref,
+                plan_ref,
+                intent_ref,
+                admission_signer,
+                signers_ref,
+                live_revocations_ref,
+            )
+            .await?;
+            Ok::<&crate::recipient_key::VerifiedRevocationState, RuntimeError>(live_revocations_ref)
+        },
     )
     .await?;
-    ck(profiles.reverify_recipient_keys(&pinned_signers, &live_revocations, runtime::now()?))?;
-    let captured =
-        ck(execution::execute(&profiles, fixture, &image, &admission, &job.registered()).await)?;
     let green = captured.eligible_for_green();
     let complete = captured.output_is_complete();
     let plaintext = ck(captured.plaintext_for_sealing())?;
