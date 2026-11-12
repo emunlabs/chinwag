@@ -686,7 +686,7 @@ fn is_zombie_or_gone_process(pid: u32) -> bool {
             Err(_) => return true,
         }
     }
-    false
+    true
 }
 
 fn is_live_positive_daemon_pid(pid: u32) -> bool {

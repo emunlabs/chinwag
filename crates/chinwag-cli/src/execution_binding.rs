@@ -479,27 +479,40 @@ fn reject_git_config_includes(bytes: &[u8]) -> BindingResult<()> {
         .stdin
         .take()
         .ok_or(BindingError::UnsupportedGitConfig)?;
-    let output = std::thread::scope(|scope| {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or(BindingError::UnsupportedGitConfig)?;
+    let stdout_bytes = std::thread::scope(|scope| {
         let writer = scope.spawn(move || {
             let res = stdin.write_all(bytes);
             drop(stdin);
             res
         });
-        let waited = child.wait_with_output();
-        let write_res = writer
-            .join()
-            .map_err(|_| BindingError::UnsupportedGitConfig)?;
-        let out = waited.map_err(io)?;
-        if !out.status.success() {
+        let mut buf = Vec::new();
+        let read_res = (&mut stdout)
+            .take(MAX_GIT_TEXT as u64 + 1)
+            .read_to_end(&mut buf);
+        let overflowed = buf.len() > MAX_GIT_TEXT;
+        drop(stdout);
+        if overflowed || read_res.is_err() {
+            let _ = child.kill();
+        }
+        let waited = child.wait();
+        let write_joined = writer.join();
+        let read_err = read_res.err();
+        let status = waited.map_err(io)?;
+        let write_res = write_joined.map_err(|_| BindingError::UnsupportedGitConfig)?;
+        if let Some(err) = read_err {
+            return Err(io(err));
+        }
+        if overflowed || !status.success() {
             return Err(BindingError::UnsupportedGitConfig);
         }
         write_res.map_err(io)?;
-        Ok(out)
+        Ok(buf)
     })?;
-    if output.stdout.len() > MAX_GIT_TEXT {
-        return Err(BindingError::UnsupportedGitConfig);
-    }
-    for raw_key in output.stdout.split(|&b| b == 0) {
+    for raw_key in stdout_bytes.split(|&b| b == 0) {
         if raw_key.is_empty() {
             continue;
         }

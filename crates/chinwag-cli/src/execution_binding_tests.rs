@@ -566,6 +566,28 @@ fn p009_git_config_allows_harmless_include_substrings_and_rejects_includeif_dire
             Err(BindingError::UnsupportedGitConfig)
         ));
     }
+
+    // Quadratic `git config --list --name-only` key-expansion input (< 70 KiB input
+    // expanding to > 33 MiB stdout via a 65,536-byte subsection + 512 keys) must stream-bound
+    // stdout at `MAX_GIT_TEXT + 1`, terminate/reap the child, and fail closed with
+    // `UnsupportedGitConfig` without unbounded allocation or stdin deadlock.
+    let mut expanded = baseline_cfg.clone();
+    expanded.extend_from_slice(b"\n[harmless \"");
+    expanded.extend(std::iter::repeat_n(b'a', 65_536));
+    expanded.extend_from_slice(b"\"]\n");
+    for _ in 0..512 {
+        expanded.extend_from_slice(b"\tk\n");
+    }
+    assert!(expanded.len() < MAX_GIT_TEXT);
+    fs::write(&config_path, &expanded).unwrap();
+    assert!(matches!(
+        b.revalidate(&f.authority()),
+        Err(BindingError::UnsupportedGitConfig)
+    ));
+    assert!(matches!(
+        f.selection().verify_effective_toplevel(),
+        Err(BindingError::UnsupportedGitConfig)
+    ));
 }
 #[test]
 fn p009_wrong_native_application_schema_and_site_refuse_before_effects() {
