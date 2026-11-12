@@ -227,6 +227,31 @@ pub fn write_daemon_state_bytes(root: &Path, bytes: &[u8]) -> Result<()> {
     StateWriter::open(root)?.write(bytes)
 }
 
+/// Read bounded diagnostic `daemon.json` bytes via descriptor-pinned `O_NOFOLLOW`
+/// traversal without creating `.chinwag/bus` when absent.
+pub fn read_daemon_state_bytes(root: &Path) -> Result<Option<Vec<u8>>> {
+    let Some(directory) = BusDirectory::open_existing(root).map_err(|_| StateError::Directory)?
+    else {
+        return Ok(None);
+    };
+    let Some(mut observed) = observe(&directory, STATE_NAME)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut observed.file)
+        .take((MAX_DAEMON_STATE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() > MAX_DAEMON_STATE_BYTES {
+        return Err(StateError::Oversize);
+    }
+    if Stamp::read(&observed.file)? != observed.stamp || bytes.len() as u64 != observed.stamp.len {
+        return Err(StateError::Changed);
+    }
+    verify_original(&directory, Some(&observed))?;
+    Ok(Some(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +460,29 @@ mod tests {
         assert_eq!(writer.write(b"new bytes"), Err(StateError::Directory));
         assert!(!state(&root).exists());
         assert!(!root.join(".chinwag/old-bus/daemon.json").exists());
+    }
+    #[test]
+    fn read_daemon_state_bytes_respects_absent_valid_and_symlink_guards() {
+        let temp = TempDir::new().unwrap();
+        let clean_root = fs::canonicalize(temp.path()).unwrap();
+        // Absent `.chinwag/bus` returns `Ok(None)` without mutating clean repo.
+        assert_eq!(read_daemon_state_bytes(&clean_root), Ok(None));
+        assert!(!clean_root.join(".chinwag").exists());
+
+        write_daemon_state_bytes(&clean_root, br#"{"ok":true}"#).unwrap();
+        assert_eq!(
+            read_daemon_state_bytes(&clean_root),
+            Ok(Some(br#"{"ok":true}"#.to_vec()))
+        );
+
+        // Symlinked `daemon.json` fails closed as `UnsafeState`.
+        fs::remove_file(state(&clean_root)).unwrap();
+        let outside = clean_root.join("outside.json");
+        private_file(&outside, br#"{"ok":true}"#);
+        symlink(&outside, state(&clean_root)).unwrap();
+        assert_eq!(
+            read_daemon_state_bytes(&clean_root),
+            Err(StateError::UnsafeState)
+        );
     }
 }

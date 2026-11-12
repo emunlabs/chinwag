@@ -9,10 +9,10 @@ use std::{
     collections::BTreeSet,
     ffi::OsStr,
     fs::File,
-    io::Read,
+    io::{Read, Write},
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 pub type BindingResult<T> = std::result::Result<T, BindingError>;
@@ -327,6 +327,35 @@ impl RepositorySelection {
     pub fn execution_root(&self) -> &Path {
         self.root()
     }
+    pub fn is_linked_worktree(&self) -> bool {
+        self.git.commonfile.is_some() || self.git.gitdir.id != self.git.common.id
+    }
+    pub fn common_worktree_root(&self) -> Option<&Path> {
+        if self.git.common.path.file_name() == Some(OsStr::new(".git")) {
+            self.git.common.path.parent()
+        } else {
+            None
+        }
+    }
+    pub fn same_common_git_identity(&self, other: &Self) -> bool {
+        self.git.common.id == other.git.common.id
+    }
+    pub fn verify_effective_toplevel(&self) -> BindingResult<()> {
+        reject_git_pins_config_includes(&self.git)?;
+        let top = safe_git(&self.root.path, &["rev-parse", "--show-toplevel"])?;
+        let top = std::str::from_utf8(&top)
+            .map_err(|_| BindingError::GitMetadata)?
+            .strip_suffix('\n')
+            .ok_or(BindingError::GitMetadata)?;
+        if top.contains(['\n', '\r']) {
+            return Err(BindingError::GitMetadata);
+        }
+        let effective_root = HeldDir::open(Path::new(top))?;
+        if effective_root.path != self.root.path || effective_root.id != self.root.id {
+            return Err(BindingError::NamespaceChanged);
+        }
+        self.revalidate()
+    }
     pub fn revalidate(&self) -> BindingResult<()> {
         self.root.verify()?;
         self.git.verify()
@@ -418,16 +447,102 @@ pub struct WorkspaceExecutionBinding {
     enrollment: Enrollment,
     commitment: Sha256Digest,
 }
-fn safe_git(root: &Path, args: &[&str]) -> BindingResult<Vec<u8>> {
-    for path in [root.join(".git/config")] {
-        if path.is_file() {
+fn reject_git_config_includes(bytes: &[u8]) -> BindingResult<()> {
+    let _ = std::str::from_utf8(bytes).map_err(|_| BindingError::UnsupportedGitConfig)?;
+    let mut command = Command::new("/usr/bin/git");
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir("/")
+        .args([
+            "--no-pager",
+            "config",
+            "--no-includes",
+            "--file",
+            "-",
+            "--list",
+            "--name-only",
+            "-z",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(io)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or(BindingError::UnsupportedGitConfig)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or(BindingError::UnsupportedGitConfig)?;
+    let stdout_bytes = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            let res = stdin.write_all(bytes);
+            drop(stdin);
+            res
+        });
+        let mut buf = Vec::new();
+        let read_res = (&mut stdout)
+            .take(MAX_GIT_TEXT as u64 + 1)
+            .read_to_end(&mut buf);
+        let overflowed = buf.len() > MAX_GIT_TEXT;
+        drop(stdout);
+        if overflowed || read_res.is_err() {
+            let _ = child.kill();
+        }
+        let waited = child.wait();
+        let write_joined = writer.join();
+        let read_err = read_res.err();
+        let status = waited.map_err(io)?;
+        let write_res = write_joined.map_err(|_| BindingError::UnsupportedGitConfig)?;
+        if let Some(err) = read_err {
+            return Err(io(err));
+        }
+        if overflowed || !status.success() {
+            return Err(BindingError::UnsupportedGitConfig);
+        }
+        write_res.map_err(io)?;
+        Ok(buf)
+    })?;
+    for raw_key in stdout_bytes.split(|&b| b == 0) {
+        if raw_key.is_empty() {
+            continue;
+        }
+        let key = std::str::from_utf8(raw_key).map_err(|_| BindingError::UnsupportedGitConfig)?;
+        let section = key.split('.').next().unwrap_or("");
+        if section.eq_ignore_ascii_case("include") || section.eq_ignore_ascii_case("includeif") {
+            return Err(BindingError::UnsupportedGitConfig);
+        }
+    }
+    Ok(())
+}
+fn reject_git_pins_config_includes(git: &GitPins) -> BindingResult<()> {
+    for path in [
+        git.gitdir.path.join("config"),
+        git.gitdir.path.join("config.worktree"),
+        git.common.path.join("config"),
+    ] {
+        if std::fs::symlink_metadata(&path).is_ok() {
             let f = HeldFile::open(&path, MAX_GIT_TEXT)?;
-            let text = std::str::from_utf8(&f.bytes)
-                .map_err(|_| BindingError::UnsupportedGitConfig)?
-                .to_ascii_lowercase();
-            if text.contains("include") {
-                return Err(BindingError::UnsupportedGitConfig);
-            }
+            reject_git_config_includes(&f.bytes)?;
+        }
+    }
+    Ok(())
+}
+fn safe_git(root: &Path, args: &[&str]) -> BindingResult<Vec<u8>> {
+    if std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_dir()) {
+        let path = root.join(".git/config");
+        if std::fs::symlink_metadata(&path).is_ok() {
+            let f = HeldFile::open(&path, MAX_GIT_TEXT)?;
+            reject_git_config_includes(&f.bytes)?;
         }
     }
     let mut command = Command::new("/usr/bin/git");
@@ -477,21 +592,7 @@ fn safe_git(root: &Path, args: &[&str]) -> BindingResult<Vec<u8>> {
 fn git_state(root: &HeldDir, git: &GitPins) -> BindingResult<(GitOid, BranchBinding)> {
     // Reject local config includes before any subprocess can follow them,
     // including the common configuration of linked worktrees.
-    for path in [
-        git.gitdir.path.join("config"),
-        git.gitdir.path.join("config.worktree"),
-        git.common.path.join("config"),
-    ] {
-        if std::fs::symlink_metadata(&path).is_ok() {
-            let f = HeldFile::open(&path, MAX_GIT_TEXT)?;
-            let text = std::str::from_utf8(&f.bytes)
-                .map_err(|_| BindingError::UnsupportedGitConfig)?
-                .to_ascii_lowercase();
-            if text.contains("include") {
-                return Err(BindingError::UnsupportedGitConfig);
-            }
-        }
-    }
+    reject_git_pins_config_includes(git)?;
     // A local core.worktree override can preserve HEAD, branch and Git-directory
     // identities while redirecting a scrubbed child to another workspace.
     let top = safe_git(&root.path, &["rev-parse", "--show-toplevel"])?;
