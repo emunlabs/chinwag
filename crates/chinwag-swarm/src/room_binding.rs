@@ -204,14 +204,24 @@ struct PeerJoin {
     deadline: Instant,
     generation: u64,
 }
+struct RetainedPeerLease {
+    session_id: String,
+    revision: u64,
+    advertisement_sha256: String,
+    expiry_unix: u64,
+    deadline: Instant,
+}
 struct State {
     started: bool,
+    active_owner: bool,
+    reconnect_armed: bool,
     closed: bool,
     generation: u64,
     own: Option<Arc<OwnJoin>>,
     own_nonces: Vec<String>,
     peer: Option<Arc<PeerJoin>>,
     active_peer_session: Option<String>,
+    last_peer_lease: Option<RetainedPeerLease>,
     seen_peer_sessions: BTreeMap<String, u64>,
 }
 struct Shared {
@@ -236,12 +246,15 @@ impl DaemonPeerGate {
                 clock,
                 state: Mutex::new(State {
                     started: false,
+                    active_owner: false,
+                    reconnect_armed: false,
                     closed: false,
                     generation: 0,
                     own: None,
                     own_nonces: Vec::new(),
                     peer: None,
                     active_peer_session: None,
+                    last_peer_lease: None,
                     seen_peer_sessions: BTreeMap::new(),
                 }),
             }),
@@ -315,6 +328,8 @@ impl DaemonPeerGate {
             .lock()
             .map_err(|_| BindingError::Revoked)?;
         state.closed = true;
+        state.active_owner = false;
+        state.reconnect_armed = false;
         state.peer = None;
         state.own = None;
         Ok(())
@@ -339,13 +354,51 @@ impl DaemonPeerGate {
             .state
             .lock()
             .map_err(|_| BindingError::Revoked)?;
-        if state.started || state.closed {
+        if state.started || state.closed || state.active_owner {
             return Err(BindingError::Revoked);
         }
         state.started = true;
+        state.active_owner = true;
         Ok(DaemonRoomOwner {
             gate: self.clone(),
             origin: origin.into(),
+            suspended_for_reconnect: false,
+        })
+    }
+    /// Reopen an already-started, non-revoked gate after a transient room
+    /// transport disconnect (`code 1000` / DO hibernation / EOF) whose previous
+    /// owner explicitly suspended itself. Preserves all prior own nonces and
+    /// retired peer session watermarks so no historical challenge or retired
+    /// session can ever re-enter.
+    pub(crate) fn reopen_owner(
+        &self,
+        actual: EndpointId,
+        coordinator: EndpointId,
+        policy: &RelayPolicy,
+        origin: &str,
+    ) -> Result<DaemonRoomOwner, BindingError> {
+        let config = &self.shared.config;
+        if !same_endpoint(actual, config.local)
+            || !same_endpoint(coordinator, config.coordinator)
+            || policy != &*config.policy
+            || origin.is_empty()
+        {
+            return Err(BindingError::Configuration);
+        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| BindingError::Revoked)?;
+        if !state.started || state.closed || state.active_owner || !state.reconnect_armed {
+            return Err(BindingError::Revoked);
+        }
+        state.reconnect_armed = false;
+        state.active_owner = true;
+        Ok(DaemonRoomOwner {
+            gate: self.clone(),
+            origin: origin.into(),
+            suspended_for_reconnect: false,
         })
     }
 }
@@ -484,14 +537,90 @@ impl EndpointHooks for DaemonPeerHooks {
 }
 
 /// Original nonclone session owner; cancellation/drop revokes every issued
-/// snapshot and hook. It cannot mint proof from a public RoomProof boolean.
+/// snapshot and hook unless explicitly suspended for transient reconnect.
+/// It cannot mint proof from a public RoomProof boolean.
 pub(crate) struct DaemonRoomOwner {
     gate: DaemonPeerGate,
     origin: String,
+    suspended_for_reconnect: bool,
 }
 impl DaemonRoomOwner {
     pub(crate) fn origin(&self) -> &str {
         &self.origin
+    }
+    /// Clear active own/peer admissions and invalidate issued snapshots so the
+    /// gate remains deny-all while reconnecting, without permanently revoking
+    /// a healthy configuration on clean WebSocket `1000` / DO hibernation.
+    /// Arms a single-use reconnect lease (`reconnect_armed`) consumed by `reopen_owner`.
+    pub(crate) fn suspend_for_reconnect(&mut self) -> Result<(), BindingError> {
+        if self.suspended_for_reconnect {
+            return Ok(());
+        }
+        let mut state = self
+            .gate
+            .shared
+            .state
+            .lock()
+            .map_err(|_| BindingError::Revoked)?;
+        if state.closed || !state.active_owner {
+            return Err(BindingError::Revoked);
+        }
+        state.own = None;
+        state.peer = None;
+        state.active_owner = false;
+        state.reconnect_armed = true;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(BindingError::Revoked)?;
+        self.suspended_for_reconnect = true;
+        Ok(())
+    }
+    /// Record an in-flight renewal challenge nonce whose commit crossed lease
+    /// expiry and atomically suspend the owner for a fresh-session reconnect,
+    /// keeping admission closed without permanently revoking the gate.
+    pub(crate) fn record_retired_nonce_and_suspend(
+        &mut self,
+        attempted_nonce: &str,
+    ) -> Result<(), BindingError> {
+        let mut state = self
+            .gate
+            .shared
+            .state
+            .lock()
+            .map_err(|_| BindingError::Revoked)?;
+        if state.closed || (!state.active_owner && !self.suspended_for_reconnect) {
+            return Err(BindingError::Revoked);
+        }
+        let already_recorded = state
+            .own_nonces
+            .iter()
+            .fold(subtle::Choice::from(0u8), |used, nonce| {
+                used | nonce.as_bytes().ct_eq(attempted_nonce.as_bytes())
+            });
+        if !bool::from(already_recorded) {
+            if state.own_nonces.len() >= MAX_OWN_PRESENCE_NONCES {
+                state.closed = true;
+                state.active_owner = false;
+                state.reconnect_armed = false;
+                state.own = None;
+                state.peer = None;
+                return Err(BindingError::Replay);
+            }
+            state.own_nonces.push(attempted_nonce.to_owned());
+        }
+        if !self.suspended_for_reconnect {
+            state.own = None;
+            state.peer = None;
+            state.active_owner = false;
+            state.reconnect_armed = true;
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .ok_or(BindingError::Revoked)?;
+            self.suspended_for_reconnect = true;
+        }
+        Ok(())
     }
     pub(crate) fn renewal_wait(&self) -> Result<Duration, BindingError> {
         let ticket = self.prepare_renewal()?;
@@ -639,11 +768,29 @@ impl DaemonRoomOwner {
             .state
             .lock()
             .map_err(|_| BindingError::Revoked)?;
-        if state.closed || state.own.is_some() {
+        if state.closed || state.own.is_some() || !state.active_owner {
             return Err(BindingError::Revoked);
         }
         let (now, instant) = self.gate.shared.clock.now()?;
         check_time(advertisement.expiry_unix, expires, now, instant)?;
+        if state.own_nonces.len() >= MAX_OWN_PRESENCE_NONCES {
+            state.closed = true;
+            state.active_owner = false;
+            state.own = None;
+            state.peer = None;
+            return Err(BindingError::Replay);
+        }
+        let reused = state
+            .own_nonces
+            .iter()
+            .fold(subtle::Choice::from(0u8), |used, nonce| {
+                used | nonce
+                    .as_bytes()
+                    .ct_eq(advertisement.challenge_nonce.as_bytes())
+            });
+        if bool::from(reused) {
+            return Err(BindingError::Replay);
+        }
         state.own_nonces.push(advertisement.challenge_nonce.clone());
         state.own = Some(Arc::new(OwnJoin {
             advertisement,
@@ -699,23 +846,58 @@ impl DaemonRoomOwner {
             .state
             .lock()
             .map_err(|_| BindingError::Revoked)?;
-        if state.closed {
+        if state.closed || !state.active_owner {
             return Err(BindingError::Revoked);
         }
         let (now, instant) = self.gate.shared.clock.now()?;
         check_time(advertisement.expiry_unix, expires, now, instant)?;
         let own = state.own.as_ref().ok_or(BindingError::Unavailable)?;
         check_time(own.advertisement.expiry_unix, own.deadline, now, instant)?;
-        if let Some(previous) = state.seen_peer_sessions.get(&advertisement.session_id) {
-            if state.active_peer_session.as_deref() != Some(advertisement.session_id.as_str())
-                || advertisement.revision <= *previous
-            {
+        let mut effective_deadline = expires;
+        if let Some(&previous) = state.seen_peer_sessions.get(&advertisement.session_id) {
+            if state.active_peer_session.as_deref() != Some(advertisement.session_id.as_str()) {
                 return Err(BindingError::Replay);
             }
-        } else if state.seen_peer_sessions.len() >= 8 {
+            let retained_unchanged = if state.peer.is_none() && advertisement.revision == previous {
+                state.last_peer_lease.as_ref().and_then(|lease| {
+                    let hash_matches = bool::from(
+                        lease
+                            .advertisement_sha256
+                            .as_bytes()
+                            .ct_eq(receipt.advertisement_sha256.as_bytes()),
+                    );
+                    if lease.session_id == advertisement.session_id
+                        && lease.revision == previous
+                        && lease.expiry_unix == advertisement.expiry_unix
+                        && hash_matches
+                    {
+                        Some(lease.deadline)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(original_deadline) = retained_unchanged {
+                // Enforce the original monotonic cutoff so reconnecting with an
+                // unchanged surviving peer advertisement can never extend its lifetime.
+                check_time(advertisement.expiry_unix, original_deadline, now, instant)?;
+                effective_deadline = expires.min(original_deadline);
+            } else if advertisement.revision <= previous {
+                return Err(BindingError::Replay);
+            }
+        } else if state.seen_peer_sessions.len() >= MAX_OWN_PRESENCE_NONCES {
             return Err(BindingError::Replay);
         }
         state.active_peer_session = Some(advertisement.session_id.clone());
+        state.last_peer_lease = Some(RetainedPeerLease {
+            session_id: advertisement.session_id.clone(),
+            revision: advertisement.revision,
+            advertisement_sha256: receipt.advertisement_sha256.clone(),
+            expiry_unix: advertisement.expiry_unix,
+            deadline: effective_deadline,
+        });
         state
             .seen_peer_sessions
             .insert(advertisement.session_id.clone(), advertisement.revision);
@@ -727,7 +909,7 @@ impl DaemonRoomOwner {
             advertisement: advertisement.clone(),
             receipt: receipt.clone(),
             address,
-            deadline: expires,
+            deadline: effective_deadline,
             generation: state.generation,
         }));
         Ok(())
@@ -735,7 +917,9 @@ impl DaemonRoomOwner {
 }
 impl Drop for DaemonRoomOwner {
     fn drop(&mut self) {
-        let _ = self.gate.revoke();
+        if !self.suspended_for_reconnect {
+            let _ = self.gate.revoke();
+        }
     }
 }
 

@@ -1286,39 +1286,701 @@ enum RoomOwnerFailure {
 type RoomOwnerFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = RoomOwnerFailure> + 'a>>;
 
-// One persistent owner future: selecting another daemon event must not drop an
-// in-flight renewal. After renewal, recreate receive with the new lease timer.
-async fn drive_daemon_room(
-    session: &mut RoomSession,
-    client: &RoomClient,
-    identity: &DaemonRoomIdentity,
-    renewed: tokio::sync::mpsc::Sender<()>,
-) -> RoomOwnerFailure {
-    loop {
-        let wait = match session.daemon_renewal_wait() {
-            Ok(wait) => wait,
-            Err(_) => return RoomOwnerFailure::PresenceExpired,
-        };
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {
-                if let Err(error) = client.renew_daemon_presence(identity, session).await {
-                    return RoomOwnerFailure::RenewalUnknown(error.to_string());
-                }
-                // Only a bounded diagnostic notification; gate state, not this
-                // notification, remains authoritative for every publication.
-                let _ = renewed.try_send(());
+enum DaemonOutcome {
+    Exit(u8),
+    Reexec {
+        install_path: PathBuf,
+        prepared: chinwag_cli::release_sync::PreparedImmutableReexec,
+    },
+}
+
+use chinwag_cli::release_sync::{
+    ReleaseDaemonEvent, ReleaseDaemonJob, ReleaseDaemonScheduler, execute_release_daemon_job,
+};
+
+const PENDING_REEXEC_MAX_DRAIN_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct ReleaseJobQueueGate {
+    frozen_for_reexec: bool,
+    active_jobs: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueReleaseJobError {
+    FrozenForReexec,
+    QueueFullOrClosed,
+}
+
+struct ReleaseJobSlotGuard(Arc<Mutex<ReleaseJobQueueGate>>);
+
+impl Drop for ReleaseJobSlotGuard {
+    fn drop(&mut self) {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.active_jobs = guard.active_jobs.saturating_sub(1);
+    }
+}
+
+fn try_enqueue_release_job(
+    tx: &tokio::sync::mpsc::Sender<ReleaseDaemonJob>,
+    gate: &Arc<Mutex<ReleaseJobQueueGate>>,
+    job: ReleaseDaemonJob,
+) -> Result<(), EnqueueReleaseJobError> {
+    let mut guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.frozen_for_reexec {
+        return Err(EnqueueReleaseJobError::FrozenForReexec);
+    }
+    guard.active_jobs = guard.active_jobs.saturating_add(1);
+    match tx.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            guard.active_jobs = guard.active_jobs.saturating_sub(1);
+            Err(EnqueueReleaseJobError::QueueFullOrClosed)
+        }
+    }
+}
+
+type ReexecPrepResult = Result<
+    chinwag_cli::release_sync::PreparedImmutableReexec,
+    chinwag_cli::release_sync::ReleaseSyncError,
+>;
+
+#[derive(Clone, Debug)]
+struct PendingReexecTarget {
+    install_path: PathBuf,
+    expected_sha: [u8; 32],
+    armed_at: Instant,
+    generation: u64,
+}
+
+#[derive(Default, Debug)]
+struct PendingReexecSlot {
+    current: Option<PendingReexecTarget>,
+    next_generation: u64,
+}
+
+impl PendingReexecSlot {
+    fn arm(&mut self, install_path: PathBuf, expected_sha: [u8; 32]) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.current = Some(PendingReexecTarget {
+            install_path,
+            expected_sha,
+            armed_at: Instant::now(),
+            generation,
+        });
+        generation
+    }
+
+    fn arm_if_changed(&mut self, install_path: PathBuf, expected_sha: [u8; 32]) -> bool {
+        if let Some(ref cur) = self.current
+            && cur.install_path == install_path
+            && cur.expected_sha == expected_sha
+        {
+            return false;
+        }
+        self.arm(install_path, expected_sha);
+        true
+    }
+
+    fn clear(&mut self) {
+        self.current = None;
+    }
+
+    fn is_some(&self) -> bool {
+        self.current.is_some()
+    }
+
+    fn current(&self) -> Option<&PendingReexecTarget> {
+        self.current.as_ref()
+    }
+}
+
+struct InFlightReexecPrep {
+    target_path: PathBuf,
+    expected_sha: [u8; 32],
+    generation: u64,
+    handle: tokio::task::JoinHandle<ReexecPrepResult>,
+}
+
+async fn poll_reexec_prep(
+    slot: &mut Option<InFlightReexecPrep>,
+) -> (
+    PathBuf,
+    [u8; 32],
+    u64,
+    Result<ReexecPrepResult, tokio::task::JoinError>,
+) {
+    match slot.as_mut() {
+        Some(in_flight) => {
+            let res = (&mut in_flight.handle).await;
+            let finished = slot.take().expect("in_flight reexec prep must be present");
+            (
+                finished.target_path,
+                finished.expected_sha,
+                finished.generation,
+                res,
+            )
+        }
+        None => std::future::pending().await,
+    }
+}
+
+enum ReexecPrepStepOutcome {
+    CommitReexec {
+        install_path: PathBuf,
+        prepared: chinwag_cli::release_sync::PreparedImmutableReexec,
+    },
+    RescheduleTimer(Duration),
+    StayOnlineDisarmed,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_reexec_prep_step(
+    prep_path: PathBuf,
+    prep_sha: [u8; 32],
+    prep_generation: u64,
+    prep_res: Result<ReexecPrepResult, tokio::task::JoinError>,
+    stdout: &mut dyn Write,
+    startup_chinwag_sha256: Option<[u8; 32]>,
+    forwards_empty: bool,
+    forward_queue_empty: bool,
+    release_done_rx: &tokio::sync::mpsc::Receiver<ReleaseDaemonEvent>,
+    release_job_gate: &Arc<Mutex<ReleaseJobQueueGate>>,
+    pending_reexec: &mut PendingReexecSlot,
+    reexec_prep_retries: &mut u32,
+    backoff_fn: impl FnOnce(u32) -> Duration,
+) -> ReexecPrepStepOutcome {
+    let cleanup_async = |prepared: chinwag_cli::release_sync::PreparedImmutableReexec| {
+        drop(tokio::task::spawn_blocking(move || {
+            chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+        }));
+    };
+    let cleanup_if_prepared = |res: Result<ReexecPrepResult, tokio::task::JoinError>| {
+        if let Ok(Ok(prepared)) = res {
+            cleanup_async(prepared);
+        }
+    };
+
+    // Authoritative generation + target freshness gate BEFORE any result branch
+    // can disarm `pending_reexec` or mutate `reexec_prep_retries`: if `pending_reexec`
+    // was cleared or superseded by a newer generation while this preparation ran,
+    // discard this stale completion without disturbing the active target.
+    let Some(cur) = pending_reexec.current().cloned() else {
+        cleanup_if_prepared(prep_res);
+        *reexec_prep_retries = 0;
+        return ReexecPrepStepOutcome::StayOnlineDisarmed;
+    };
+    if cur.generation != prep_generation
+        || cur.install_path != prep_path
+        || cur.expected_sha != prep_sha
+    {
+        cleanup_if_prepared(prep_res);
+        *reexec_prep_retries = 0;
+        let settle_remaining = Duration::from_millis(350).saturating_sub(cur.armed_at.elapsed());
+        return ReexecPrepStepOutcome::RescheduleTimer(
+            settle_remaining.max(Duration::from_millis(50)),
+        );
+    }
+
+    match prep_res {
+        Ok(Ok(prepared)) => {
+            if Some(prepared.sha256) == startup_chinwag_sha256 {
+                cleanup_async(prepared);
+                pending_reexec.clear();
+                *reexec_prep_retries = 0;
+                return ReexecPrepStepOutcome::StayOnlineDisarmed;
             }
-            update = session.receive_daemon_peer() => {
-                if let Err(error) = update {
-                    // Room errors expose fixed, sanitized Display messages.
-                    // Keep that reason without logging Debug/source chains.
-                    return RoomOwnerFailure::ReceiveFailed(error.to_string());
+            // Linearizable quiescence + freeze: evaluate `active_jobs == 0` AND
+            // `release_done_rx.is_empty()` while holding `release_job_gate` so no worker
+            // completion or incoming handler enqueue can slip between check and freeze.
+            let mut gate_guard = release_job_gate.lock().unwrap_or_else(|e| e.into_inner());
+            let worker_idle = gate_guard.active_jobs == 0 && release_done_rx.is_empty();
+            if !should_complete_pending_reexec(
+                forwards_empty,
+                forward_queue_empty,
+                worker_idle,
+                cur.armed_at.elapsed(),
+            ) {
+                drop(gate_guard);
+                cleanup_async(prepared);
+                return ReexecPrepStepOutcome::RescheduleTimer(Duration::from_millis(100));
+            }
+            gate_guard.frozen_for_reexec = true;
+            drop(gate_guard);
+            *reexec_prep_retries = 0;
+            ReexecPrepStepOutcome::CommitReexec {
+                install_path: prep_path,
+                prepared,
+            }
+        }
+        Ok(Err(err))
+            if err.is_transient_retryable()
+                && *reexec_prep_retries
+                    < chinwag_cli::release_sync::MAX_RELEASE_SYNC_TRANSIENT_RETRIES =>
+        {
+            let delay = backoff_fn(*reexec_prep_retries);
+            *reexec_prep_retries = reexec_prep_retries.saturating_add(1);
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_daemon_reexec_retry",
+                    "binary": prep_path.to_string_lossy(),
+                    "reason": err.to_string(),
+                    "next_retry_secs": delay.as_secs()
+                })
+            );
+            let _ = stdout.flush();
+            ReexecPrepStepOutcome::RescheduleTimer(delay)
+        }
+        Ok(Err(err)) => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_daemon_reexec_refused",
+                    "binary": prep_path.to_string_lossy(),
+                    "reason": err.to_string()
+                })
+            );
+            let _ = stdout.flush();
+            pending_reexec.clear();
+            *reexec_prep_retries = 0;
+            ReexecPrepStepOutcome::StayOnlineDisarmed
+        }
+        Err(_) => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_daemon_reexec_refused",
+                    "binary": prep_path.to_string_lossy(),
+                    "reason": "reexec preparation worker panicked"
+                })
+            );
+            let _ = stdout.flush();
+            pending_reexec.clear();
+            *reexec_prep_retries = 0;
+            ReexecPrepStepOutcome::StayOnlineDisarmed
+        }
+    }
+}
+
+fn should_complete_pending_reexec(
+    forwards_empty: bool,
+    forward_queue_empty: bool,
+    release_worker_idle: bool,
+    armed_elapsed: Duration,
+) -> bool {
+    release_worker_idle
+        && ((forwards_empty && forward_queue_empty)
+            || armed_elapsed >= PENDING_REEXEC_MAX_DRAIN_WAIT)
+}
+
+async fn quiesce_release_worker_and_drain_events(
+    release_job_tx: &mut Option<tokio::sync::mpsc::Sender<ReleaseDaemonJob>>,
+    release_done_tx_keepalive: &mut Option<tokio::sync::mpsc::Sender<ReleaseDaemonEvent>>,
+    release_worker_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    release_done_rx: &mut tokio::sync::mpsc::Receiver<ReleaseDaemonEvent>,
+    mut on_event: impl FnMut(ReleaseDaemonEvent),
+) {
+    drop(release_job_tx.take());
+    drop(release_done_tx_keepalive.take());
+    while let Some(ev) = release_done_rx.recv().await {
+        on_event(ev);
+    }
+    if let Some(worker) = release_worker_handle.take() {
+        let _ = worker.await;
+    }
+    while let Ok(ev) = release_done_rx.try_recv() {
+        on_event(ev);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_release_daemon_event(
+    release_event: ReleaseDaemonEvent,
+    stdout: &mut dyn Write,
+    repo_root: &Path,
+    endpoint_id: &str,
+    has_network: bool,
+    forward_tx: &tokio::sync::mpsc::Sender<BusMessage>,
+    publications: &Mutex<NativePublication>,
+    tx: &broadcast::Sender<BusMessage>,
+    state: &Mutex<DaemonState>,
+    startup_chinwag_sha256: Option<[u8; 32]>,
+    tearing_down_for_reexec: bool,
+    pending_reexec: &mut PendingReexecSlot,
+) -> bool {
+    match release_event {
+        ReleaseDaemonEvent::Applied { binary, outcome } => match *outcome {
+            chinwag_cli::release_sync::ReleaseApplyOutcome::Installed {
+                manifest,
+                install_path,
+                receipt_message,
+                ..
+            } => {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    json!({
+                        "event": "native_release_sync",
+                        "outcome": "installed",
+                        "binary": binary,
+                        "sha256": manifest.sha256,
+                        "git_commit": manifest.git_commit,
+                        "rollback": manifest.rollback
+                    })
+                );
+                let _ = stdout.flush();
+                if let Some(mut receipt) = receipt_message.map(|b| *b)
+                    && verify_detached_bus_signature(repo_root, &mut receipt)
+                {
+                    let peer = if has_network { Some(forward_tx) } else { None };
+                    if let Ok(mut ingress) = publications.lock()
+                        && let Ok((seq, _)) = ingress.publish(&receipt, tx, peer)
+                        && let Ok(mut guard) = state.lock()
+                    {
+                        guard.last_heartbeat = unix_now();
+                        guard.total_messages = seq;
+                        let _ = write_daemon_state(repo_root, &guard);
+                    }
+                }
+                if manifest.binary == "chinwag"
+                    && let Some(manifest_sha) =
+                        chinwag_cli::release_sync::decode_lowercase_hex_32(&manifest.sha256)
+                {
+                    if Some(manifest_sha) != startup_chinwag_sha256 || tearing_down_for_reexec {
+                        pending_reexec.arm(install_path, manifest_sha);
+                        return true;
+                    }
+                    // Rollback back to the running process's own startup digest while still
+                    // in the live loop disarms any stale prior `pending_reexec` target.
+                    pending_reexec.clear();
+                }
+                false
+            }
+            chinwag_cli::release_sync::ReleaseApplyOutcome::AlreadyInstalled {
+                manifest,
+                install_path,
+            } => {
+                let manifest_sha =
+                    chinwag_cli::release_sync::decode_lowercase_hex_32(&manifest.sha256);
+                let needs_reexec = manifest.binary == "chinwag"
+                    && startup_chinwag_sha256.is_some()
+                    && manifest_sha.is_some()
+                    && manifest_sha != startup_chinwag_sha256;
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    json!({
+                        "event": "native_release_sync",
+                        "outcome": "already_installed",
+                        "binary": binary,
+                        "sha256": manifest.sha256,
+                        "reexec_scheduled": needs_reexec
+                    })
+                );
+                let _ = stdout.flush();
+                if manifest.binary == "chinwag"
+                    && let Some(manifest_sha) = manifest_sha
+                {
+                    if needs_reexec {
+                        if let Ok(home_dir) = chinwag_cli::release_sync::resolve_home_dir()
+                            && let Some(mut receipt) = chinwag_cli::release_sync::build_release_installed_receipt_for_already_installed(
+                                &home_dir,
+                                &manifest,
+                                endpoint_id,
+                            )
+                            && verify_detached_bus_signature(repo_root, &mut receipt)
+                        {
+                            let peer = if has_network { Some(forward_tx) } else { None };
+                            if let Ok(mut ingress) = publications.lock()
+                                && let Ok((seq, _)) = ingress.publish(&receipt, tx, peer)
+                                && let Ok(mut guard) = state.lock()
+                            {
+                                guard.last_heartbeat = unix_now();
+                                guard.total_messages = seq;
+                                let _ = write_daemon_state(repo_root, &guard);
+                            }
+                        }
+                        return pending_reexec.arm_if_changed(install_path, manifest_sha);
+                    } else if tearing_down_for_reexec {
+                        return pending_reexec.arm_if_changed(install_path, manifest_sha);
+                    } else {
+                        pending_reexec.clear();
+                    }
+                }
+                false
+            }
+            chinwag_cli::release_sync::ReleaseApplyOutcome::SkippedTargetMismatch {
+                manifest_target,
+                local_target,
+            } => {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    json!({
+                        "event": "native_release_sync",
+                        "outcome": "skipped_target_mismatch",
+                        "manifest_target": manifest_target,
+                        "local_target": local_target
+                    })
+                );
+                let _ = stdout.flush();
+                false
+            }
+        },
+        ReleaseDaemonEvent::Rejected {
+            binary,
+            reason,
+            retryable,
+            next_retry_secs,
+        } => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_release_sync_rejected",
+                    "binary": binary,
+                    "reason": reason,
+                    "retryable": retryable,
+                    "next_retry_secs": next_retry_secs
+                })
+            );
+            let _ = stdout.flush();
+            false
+        }
+        ReleaseDaemonEvent::Suppressed {
+            binary,
+            release_key,
+            reason,
+        } => {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_release_sync_suppressed",
+                    "binary": binary,
+                    "release_key": release_key,
+                    "reason": reason
+                })
+            );
+            let _ = stdout.flush();
+            false
+        }
+    }
+}
+
+fn build_canonical_daemon_reexec_args(
+    bus_args: &[String],
+    canonical_repo_root: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = vec![
+        std::ffi::OsString::from("bus"),
+        std::ffi::OsString::from("daemon"),
+        std::ffi::OsString::from("--repo"),
+        canonical_repo_root.as_os_str().to_os_string(),
+    ];
+    let mut idx = 1;
+    while idx < bus_args.len() {
+        if bus_args[idx] == "--repo" {
+            idx += 2;
+            continue;
+        }
+        out.push(std::ffi::OsString::from(&bus_args[idx]));
+        idx += 1;
+    }
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectLoopOutcome<S> {
+    Reconnected { session: S, next_attempt: u32 },
+    Exhausted { attempts: u32, last_reason: String },
+    FatalRefusal(String),
+}
+
+async fn attempt_room_reconnect_with_cap<S, F, Fut, B, SleepFn, SleepFut>(
+    mut reconnect_attempt: u32,
+    initial_reason: String,
+    room_events: &tokio::sync::mpsc::Sender<Value>,
+    mut backoff_fn: B,
+    mut sleep_fn: SleepFn,
+    mut try_reconnect: F,
+) -> ReconnectLoopOutcome<S>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<S, chinwag_swarm::room::Error>>,
+    B: FnMut(u32) -> Duration,
+    SleepFn: FnMut(Duration) -> SleepFut,
+    SleepFut: std::future::Future<Output = ()>,
+{
+    let mut reason = initial_reason;
+    loop {
+        if reconnect_attempt >= chinwag_swarm::room::MAX_CONSECUTIVE_RECONNECT_ATTEMPTS {
+            return ReconnectLoopOutcome::Exhausted {
+                attempts: reconnect_attempt,
+                last_reason: reason,
+            };
+        }
+        let backoff = backoff_fn(reconnect_attempt);
+        let _ = room_events.try_send(json!({
+            "event": "native_room_reconnect_scheduled",
+            "attempt": reconnect_attempt.saturating_add(1),
+            "backoff_ms": backoff.as_millis() as u64,
+            "reason": reason,
+            "scope": "TRANSPORT_ONLY_NOT_TASK_AUTHORITY"
+        }));
+        sleep_fn(backoff).await;
+        match try_reconnect(reconnect_attempt).await {
+            Ok(new_session) => {
+                return ReconnectLoopOutcome::Reconnected {
+                    session: new_session,
+                    next_attempt: reconnect_attempt.saturating_add(1),
+                };
+            }
+            Err(error) => {
+                if chinwag_swarm::room::is_reconnectable_room_error(&error) {
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    reason = error.to_string();
+                } else {
+                    return ReconnectLoopOutcome::FatalRefusal(error.to_string());
                 }
             }
         }
     }
 }
 
+// One persistent owner future: selecting another daemon event must not drop an
+// in-flight renewal. Clean WebSocket closures (`code 1000` / DO hibernation /
+// transient network resets) and sleep/wake presence expiries reconnect with
+// bounded jittered exponential backoff (`250ms` -> `30s`), while explicit
+// coordinator/auth/signature/pin refusals fail closed immediately.
+#[allow(clippy::too_many_arguments)]
+async fn drive_daemon_room(
+    session: &mut RoomSession,
+    client: &RoomClient,
+    identity: &DaemonRoomIdentity,
+    endpoint: &Endpoint,
+    gate: DaemonPeerGate,
+    addresses: Vec<SocketAddr>,
+    lookup: MemoryLookup,
+    room_events: tokio::sync::mpsc::Sender<Value>,
+) -> RoomOwnerFailure {
+    let mut reconnect_attempt: u32 = 0;
+    let mut reconnecting = false;
+    loop {
+        let mut disconnect_reason: Option<String> = None;
+        match session.daemon_renewal_wait() {
+            Ok(wait) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {
+                        match client.renew_daemon_presence(identity, session).await {
+                            Ok(()) => {
+                                reconnect_attempt = 0;
+                                reconnecting = false;
+                                let _ = room_events.try_send(json!({
+                                    "event": "native_transport_presence_renewed",
+                                    "scope": "TRANSPORT_ONLY_NOT_TASK_AUTHORITY",
+                                    "original_message_replay": false
+                                }));
+                            }
+                            Err(chinwag_swarm::room::Error::DaemonBinding(
+                                chinwag_swarm::room_binding::BindingError::Expired,
+                            )) => {
+                                disconnect_reason = Some("transport presence expired across sleep".to_owned());
+                            }
+                            Err(error) => {
+                                return RoomOwnerFailure::RenewalUnknown(error.to_string());
+                            }
+                        }
+                    }
+                    update = session.receive_daemon_peer() => {
+                        match update {
+                            Ok(_) => {
+                                if reconnecting {
+                                    reconnect_attempt = 0;
+                                    reconnecting = false;
+                                    let _ = room_events.try_send(json!({
+                                        "event": "native_room_reconnected",
+                                        "scope": "TRANSPORT_ONLY_NOT_TASK_AUTHORITY"
+                                    }));
+                                }
+                            }
+                            Err(error) => {
+                                if chinwag_swarm::room::is_reconnectable_room_error(&error)
+                                    || matches!(
+                                        error,
+                                        chinwag_swarm::room::Error::DaemonBinding(
+                                            chinwag_swarm::room_binding::BindingError::Expired
+                                        )
+                                    )
+                                {
+                                    disconnect_reason = Some(error.to_string());
+                                } else {
+                                    return RoomOwnerFailure::ReceiveFailed(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(chinwag_swarm::room::Error::DaemonBinding(
+                chinwag_swarm::room_binding::BindingError::Expired,
+            )) => {
+                disconnect_reason = Some("transport presence expired across sleep".to_owned());
+            }
+            Err(_) => return RoomOwnerFailure::PresenceExpired,
+        }
+
+        if let Some(reason) = disconnect_reason {
+            session.close_for_reconnect().await;
+            reconnecting = true;
+            match attempt_room_reconnect_with_cap(
+                reconnect_attempt,
+                reason,
+                &room_events,
+                chinwag_swarm::room::next_reconnect_backoff,
+                tokio::time::sleep,
+                |_| {
+                    client.reconnect_daemon(
+                        identity,
+                        endpoint,
+                        gate.clone(),
+                        addresses.clone(),
+                        lookup.clone(),
+                    )
+                },
+            )
+            .await
+            {
+                ReconnectLoopOutcome::Reconnected {
+                    session: new_session,
+                    next_attempt,
+                } => {
+                    *session = new_session;
+                    reconnect_attempt = next_attempt;
+                }
+                ReconnectLoopOutcome::Exhausted {
+                    attempts,
+                    last_reason,
+                } => {
+                    session.close().await;
+                    return RoomOwnerFailure::ReceiveFailed(format!(
+                        "reconnect attempts exhausted after {attempts} tries ({last_reason})"
+                    ));
+                }
+                ReconnectLoopOutcome::FatalRefusal(err) => {
+                    return RoomOwnerFailure::ReceiveFailed(err);
+                }
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 async fn run_daemon_loop(
     repo_root: PathBuf,
     port: u16,
@@ -1339,6 +2001,7 @@ async fn run_daemon_loop(
     .await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn run_daemon_loop_inner(
     repo_root: PathBuf,
     port: u16,
@@ -1348,29 +2011,57 @@ async fn run_daemon_loop_inner(
     shutdown: impl std::future::Future<Output = ()>,
     controlled_local_driver: Option<RoomOwnerFuture<'static>>,
 ) -> u8 {
+    match run_daemon_loop_reexecable(
+        repo_root,
+        port,
+        network_selection,
+        no_governors,
+        stdout,
+        shutdown,
+        controlled_local_driver,
+    )
+    .await
+    {
+        DaemonOutcome::Exit(code) => code,
+        DaemonOutcome::Reexec { prepared, .. } => {
+            chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+            0
+        }
+    }
+}
+
+async fn run_daemon_loop_reexecable(
+    repo_root: PathBuf,
+    port: u16,
+    network_selection: Option<NetworkSelection>,
+    no_governors: bool,
+    stdout: &mut dyn Write,
+    shutdown: impl std::future::Future<Output = ()>,
+    controlled_local_driver: Option<RoomOwnerFuture<'static>>,
+) -> DaemonOutcome {
     // This private seam exercises responsiveness under a pending owner. It
     // cannot replace the real owner or create authority on a networked daemon.
     if controlled_local_driver.is_some() && network_selection.is_some() {
-        return 1;
+        return DaemonOutcome::Exit(1);
     }
     tokio::pin!(shutdown);
     let secret = match load_or_create_daemon_secret(&repo_root) {
         Ok(secret) => secret,
         Err(error) => {
             let _ = writeln!(stdout, "chinwag bus daemon: {error}");
-            return 1;
+            return DaemonOutcome::Exit(1);
         }
     };
     let publications = match NativePublication::open(&repo_root) {
         Ok(publications) => Arc::new(Mutex::new(publications)),
         Err(error) => {
             let _ = writeln!(stdout, "chinwag bus daemon: {error}");
-            return 1;
+            return DaemonOutcome::Exit(1);
         }
     };
     let receipts = match publications.lock() {
         Ok(publication) => publication.receipts.clone(),
-        Err(_) => return 1,
+        Err(_) => return DaemonOutcome::Exit(1),
     };
     if network_selection.is_some() {
         let known_weak = fs::canonicalize(&repo_root).ok().and_then(|root| {
@@ -1381,7 +2072,7 @@ async fn run_daemon_loop_inner(
                 stdout,
                 "chinwag bus network HELD: existing identity requires explicit owner disposition"
             );
-            return 1;
+            return DaemonOutcome::Exit(1);
         }
     }
     let network = match network_selection {
@@ -1389,7 +2080,7 @@ async fn run_daemon_loop_inner(
             Ok(gate) => Some((selection, gate)),
             Err(error) => {
                 let _ = writeln!(stdout, "chinwag bus daemon: {error}");
-                return 1;
+                return DaemonOutcome::Exit(1);
             }
         },
         None => None,
@@ -1402,7 +2093,7 @@ async fn run_daemon_loop_inner(
             Ok(endpoint) => endpoint,
             Err(_) => {
                 let _ = writeln!(stdout, "chinwag bus daemon endpoint bind refused");
-                return 1;
+                return DaemonOutcome::Exit(1);
             }
         };
     // Home-relay selection is diagnostic only. Explicit peer relay addresses
@@ -1433,14 +2124,14 @@ async fn run_daemon_loop_inner(
             Ok(identity) => identity,
             Err(_) => {
                 endpoint.close().await;
-                return 1;
+                return DaemonOutcome::Exit(1);
             }
         };
         let client = match selection.client() {
             Ok(client) => client,
             Err(_) => {
                 endpoint.close().await;
-                return 1;
+                return DaemonOutcome::Exit(1);
             }
         };
         let addresses = if selection.relay_only() {
@@ -1453,7 +2144,13 @@ async fn run_daemon_loop_inner(
                 .collect()
         };
         match client
-            .open_daemon(&identity, &endpoint, gate.clone(), addresses, lookup)
+            .open_daemon(
+                &identity,
+                &endpoint,
+                gate.clone(),
+                addresses.clone(),
+                lookup.clone(),
+            )
             .await
         {
             Ok(mut session) => {
@@ -1466,9 +2163,9 @@ async fn run_daemon_loop_inner(
                         stdout,
                         "chinwag bus network HELD: current verified peer unavailable"
                     );
-                    return 1;
+                    return DaemonOutcome::Exit(1);
                 }
-                room_credentials = Some((client, identity));
+                room_credentials = Some((client, identity, gate.clone(), addresses, lookup));
                 Some(session)
             }
             Err(error) => {
@@ -1477,7 +2174,7 @@ async fn run_daemon_loop_inner(
                     stdout,
                     "chinwag bus network HELD: compatible coordinator unavailable ({error})"
                 );
-                return 1;
+                return DaemonOutcome::Exit(1);
             }
         }
     } else {
@@ -1551,7 +2248,7 @@ async fn run_daemon_loop_inner(
             stdout,
             "chinwag bus HELD: diagnostic state unsafe or persistence unknown"
         );
-        return 1;
+        return DaemonOutcome::Exit(1);
     }
 
     let _ = writeln!(
@@ -1580,17 +2277,145 @@ async fn run_daemon_loop_inner(
     let mut forwarding_original = None;
     let (state_error_tx, mut state_error_rx) = tokio::sync::mpsc::channel::<()>(1);
     let mut exit_code = 0;
+    let mut pinned_reexec: Option<(PathBuf, chinwag_cli::release_sync::PreparedImmutableReexec)> =
+        None;
+    let mut reexec_prep_task: Option<InFlightReexecPrep> = None;
+    let mut reexec_prep_retries: u32 = 0;
+    let mut reexec_requested = false;
+    let mut pending_reexec = PendingReexecSlot::default();
+    let reexec_sleep = tokio::time::sleep(Duration::from_secs(86_400));
+    tokio::pin!(reexec_sleep);
+    let startup_chinwag_sha256: Option<[u8; 32]> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| chinwag_cli::release_sync::local_binary_sha256(&exe));
+
+    let release_reconcile_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_job_gate = Arc::new(Mutex::new(ReleaseJobQueueGate::default()));
+    let retry_scheduler = Arc::new(Mutex::new(
+        ReleaseDaemonScheduler::new_with_initial_catchup(),
+    ));
+
+    let (release_done_tx, mut release_done_rx) =
+        tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(32);
+    let mut release_done_tx_keepalive = Some(release_done_tx.clone());
+    let mut release_worker_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut release_job_tx = if !no_governors && controlled_local_driver.is_none() {
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(32);
+        if retry_scheduler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poll_catchup_dispatch(false, Instant::now())
+            && try_enqueue_release_job(&job_tx, &release_job_gate, ReleaseDaemonJob::StartupCatchup)
+                .is_err()
+        {
+            retry_scheduler
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .on_catchup_send_full();
+        }
+        let journal_for_worker = messages_jsonl_path(&repo_root);
+        let ep_for_worker = endpoint_id.clone();
+        let done_tx = release_done_tx;
+        let sched_for_worker = retry_scheduler.clone();
+        let gate_for_worker = release_job_gate.clone();
+        release_worker_handle = Some(tokio::spawn(async move {
+            let mut cleaned_stale_reexec = false;
+            while let Some(job) = job_rx.recv().await {
+                let _job_slot = ReleaseJobSlotGuard(gate_for_worker.clone());
+                let is_catchup = matches!(job, ReleaseDaemonJob::StartupCatchup);
+                let need_cleanup = !cleaned_stale_reexec;
+                let journal_clone = journal_for_worker.clone();
+                let ep_clone = ep_for_worker.clone();
+                let sched_clone = sched_for_worker.clone();
+                let events = tokio::task::spawn_blocking(move || {
+                    let home_dir = chinwag_cli::release_sync::resolve_home_dir()?;
+                    if need_cleanup {
+                        chinwag_cli::release_sync::cleanup_stale_reexec_dirs(&home_dir);
+                    }
+                    let store =
+                        chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_dir.clone());
+                    Ok::<_, chinwag_cli::release_sync::ReleaseSyncError>(
+                        execute_release_daemon_job(
+                            &home_dir,
+                            &journal_clone,
+                            &store,
+                            &ep_clone,
+                            &sched_clone,
+                            job,
+                        ),
+                    )
+                })
+                .await;
+                match events {
+                    Ok(Ok(items)) => {
+                        cleaned_stale_reexec = true;
+                        for event in items {
+                            let _ = done_tx.send(event).await;
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        let retryable = err.is_transient_retryable();
+                        let next_retry_secs = if let Ok(mut sched) = sched_for_worker.lock() {
+                            sched
+                                .on_worker_env_error(retryable, is_catchup, Instant::now())
+                                .map(|d| d.as_secs())
+                        } else {
+                            None
+                        };
+                        let _ = done_tx
+                            .send(ReleaseDaemonEvent::Rejected {
+                                binary: "worker".to_owned(),
+                                reason: err.to_string(),
+                                retryable,
+                                next_retry_secs,
+                            })
+                            .await;
+                    }
+                    Err(_) => {
+                        if let Ok(mut sched) = sched_for_worker.lock() {
+                            sched.on_worker_panic(Instant::now());
+                        }
+                        let _ = done_tx
+                            .send(ReleaseDaemonEvent::Rejected {
+                                binary: "worker".to_owned(),
+                                reason: "release sync worker panicked".to_owned(),
+                                retryable: false,
+                                next_retry_secs: None,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }));
+        Some(job_tx)
+    } else {
+        drop(release_done_tx);
+        None
+    };
+
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut governor_tick = tokio::time::interval(Duration::from_secs(45));
     governor_tick.tick().await;
 
-    let (renewed_tx, mut renewed_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (room_events_tx, mut room_events_rx) = tokio::sync::mpsc::channel::<Value>(8);
+    let endpoint_for_room = endpoint.clone();
     let mut room_driver: RoomOwnerFuture<'_> = match controlled_local_driver {
         Some(driver) => driver,
         None => Box::pin(async {
+            let room_events_tx = room_events_tx;
             match (&mut room_session, &room_credentials) {
-                (Some(session), Some((client, identity))) => {
-                    drive_daemon_room(session, client, identity, renewed_tx).await
+                (Some(session), Some((client, identity, gate, addresses, lookup))) => {
+                    drive_daemon_room(
+                        session,
+                        client,
+                        identity,
+                        &endpoint_for_room,
+                        gate.clone(),
+                        addresses.clone(),
+                        lookup.clone(),
+                        room_events_tx,
+                    )
+                    .await
                 }
                 (None, None) => std::future::pending().await,
                 _ => RoomOwnerFailure::PresenceExpired,
@@ -1617,10 +2442,101 @@ async fn run_daemon_loop_inner(
                 exit_code = 1;
                 break;
             }
-            Some(()) = renewed_rx.recv() => {
-                let _ = writeln!(stdout, "{}", json!({"event":"native_transport_presence_renewed",
-                    "scope":"TRANSPORT_ONLY_NOT_TASK_AUTHORITY", "original_message_replay":false}));
+            Some(event) = room_events_rx.recv() => {
+                let _ = writeln!(stdout, "{event}");
                 let _ = stdout.flush();
+            }
+            Some(release_event) = release_done_rx.recv() => {
+                if process_release_daemon_event(
+                    release_event,
+                    stdout,
+                    &repo_root,
+                    &endpoint_id,
+                    network.is_some(),
+                    &forward_tx,
+                    &publications,
+                    &tx,
+                    &state,
+                    startup_chinwag_sha256,
+                    false,
+                    &mut pending_reexec,
+                ) {
+                    reexec_prep_retries = 0;
+                    reexec_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_millis(350));
+                }
+            }
+            () = &mut reexec_sleep, if pending_reexec.is_some() && reexec_prep_task.is_none() => {
+                if let Some(cur) = pending_reexec.current().cloned() {
+                    let release_worker_idle = {
+                        let guard = release_job_gate.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.active_jobs == 0 && release_done_rx.is_empty()
+                    };
+                    if should_complete_pending_reexec(
+                        forwards.is_empty(),
+                        forward_rx.is_empty(),
+                        release_worker_idle,
+                        cur.armed_at.elapsed(),
+                    ) {
+                        // Launch immutable snapshot preparation asynchronously in `spawn_blocking`
+                        // and select on `reexec_prep_task` completion so the live daemon's owner
+                        // loop NEVER suspends polling new connections, heartbeat, shutdown, or
+                        // room presence while preparing or checking `release_sync.lock`.
+                        let target_for_prep = cur.install_path.clone();
+                        let expected_sha = cur.expected_sha;
+                        let handle = tokio::task::spawn_blocking(move || {
+                            let home_dir = chinwag_cli::release_sync::resolve_home_dir()?;
+                            chinwag_cli::release_sync::prepare_immutable_reexec_binary(
+                                &home_dir,
+                                &target_for_prep,
+                                &expected_sha,
+                            )
+                        });
+                        reexec_prep_task = Some(InFlightReexecPrep {
+                            target_path: cur.install_path,
+                            expected_sha,
+                            generation: cur.generation,
+                            handle,
+                        });
+                    } else {
+                        reexec_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + Duration::from_millis(100));
+                    }
+                }
+            }
+            (prep_path, prep_sha, prep_generation, prep_res) = poll_reexec_prep(&mut reexec_prep_task), if reexec_prep_task.is_some() => {
+                match complete_reexec_prep_step(
+                    prep_path,
+                    prep_sha,
+                    prep_generation,
+                    prep_res,
+                    stdout,
+                    startup_chinwag_sha256,
+                    forwards.is_empty(),
+                    forward_rx.is_empty(),
+                    &release_done_rx,
+                    &release_job_gate,
+                    &mut pending_reexec,
+                    &mut reexec_prep_retries,
+                    ReleaseDaemonScheduler::backoff_for_attempt,
+                ) {
+                    ReexecPrepStepOutcome::CommitReexec {
+                        install_path,
+                        prepared,
+                    } => {
+                        pinned_reexec = Some((install_path, prepared));
+                        reexec_requested = true;
+                        break;
+                    }
+                    ReexecPrepStepOutcome::RescheduleTimer(delay) => {
+                        reexec_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + delay);
+                    }
+                    ReexecPrepStepOutcome::StayOnlineDisarmed => {}
+                }
             }
             original = forward_rx.recv(), if network.is_some() && forwards.is_empty() => {
                 if let (Some(message), Some((selection, gate))) = (original, &network) {
@@ -1686,6 +2602,27 @@ async fn run_daemon_loop_inner(
                     exit_code = 1;
                     break;
                 }
+                if let Some(job_tx) = &release_job_tx {
+                    let overflow_seen =
+                        release_reconcile_needed.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    let should_send = retry_scheduler
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .poll_catchup_dispatch(overflow_seen, Instant::now());
+                    if should_send
+                        && try_enqueue_release_job(
+                            job_tx,
+                            &release_job_gate,
+                            ReleaseDaemonJob::StartupCatchup,
+                        )
+                        .is_err()
+                    {
+                        retry_scheduler
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .on_catchup_send_full();
+                    }
+                }
             }
             _ = governor_tick.tick(), if !no_governors => {
                 // Reconciliation is a trigger, not authority to create a new task invocation.
@@ -1715,6 +2652,9 @@ async fn run_daemon_loop_inner(
                 let daemon_ep = endpoint_id.clone();
                 let state_error = state_error_tx.clone();
                 let receipts = receipts.clone();
+                let release_queue = release_job_tx.clone();
+                let release_reconcile = release_reconcile_needed.clone();
+                let release_gate = release_job_gate.clone();
                 handlers.spawn(async move {
                     let _slot = slot;
                     let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), incoming).await else {
@@ -1843,6 +2783,18 @@ async fn run_daemon_loop_inner(
                     // immediately before constructing the positive ACK.
                     let result = confirm_publication_current(result, || !federated ||
                         network.as_ref().is_some_and(|(selection, gate)| selection.remote_path(conn, gate).is_ok()));
+                    if result.is_ok()
+                        && chinwag_cli::release_sync::is_release_built_candidate(&message)
+                        && let Some(queue) = &release_queue
+                        && try_enqueue_release_job(
+                            queue,
+                            &release_gate,
+                            ReleaseDaemonJob::LiveMessage(Box::new(message.clone())),
+                        )
+                        .is_err()
+                    {
+                        release_reconcile.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     let ack = match result {
                         Ok((seq, subscribers)) => BusAck { ok:true, seq, message_id:message.id.clone(), daemon_endpoint_id:daemon_ep,
                                 transport:"iroh-quic/chinwag-bus-1".into(), room:message.room.clone(),
@@ -1871,11 +2823,70 @@ async fn run_daemon_loop_inner(
         session.close().await;
     }
     endpoint.close().await;
-    // These are this daemon's own handlers, never a foreign review/worker.
-    // Abort at their await points and await every original task handle.
     handlers.shutdown().await;
+    if let Some(in_flight) = reexec_prep_task.take()
+        && let Ok(Ok(prepared)) = in_flight.handle.await
+    {
+        let _ = tokio::task::spawn_blocking(move || {
+            chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+        })
+        .await;
+    }
+    // Quiesce the dedicated release worker cleanly (on re-exec, `release_job_gate`
+    // was already atomically frozen at `active_jobs == 0 && release_done_rx.is_empty()`
+    // BEFORE closing service, so zero post-close refresh is ever needed; on SIGTERM,
+    // any in-flight installation finishes naturally before exit).
+    let tearing_down_for_reexec = reexec_requested && exit_code == 0;
+    quiesce_release_worker_and_drain_events(
+        &mut release_job_tx,
+        &mut release_done_tx_keepalive,
+        &mut release_worker_handle,
+        &mut release_done_rx,
+        |release_event| {
+            let _ = process_release_daemon_event(
+                release_event,
+                stdout,
+                &repo_root,
+                &endpoint_id,
+                network.is_some(),
+                &forward_tx,
+                &publications,
+                &tx,
+                &state,
+                startup_chinwag_sha256,
+                tearing_down_for_reexec,
+                &mut pending_reexec,
+            );
+        },
+    )
+    .await;
     forwards.shutdown().await;
-    exit_code
+    drop(publications);
+    if reexec_requested
+        && exit_code == 0
+        && let Some((install_path, prepared)) = pinned_reexec.take()
+    {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            json!({
+                "event": "native_daemon_reexec",
+                "binary": install_path.to_string_lossy()
+            })
+        );
+        let _ = stdout.flush();
+        return DaemonOutcome::Reexec {
+            install_path,
+            prepared,
+        };
+    }
+    if let Some((_, prepared)) = pinned_reexec.take() {
+        let _ = tokio::task::spawn_blocking(move || {
+            chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+        })
+        .await;
+    }
+    DaemonOutcome::Exit(exit_code)
 }
 
 /// Fallback is possible only when no selected-daemon exchange was attempted.
@@ -1951,16 +2962,16 @@ pub fn send_bus_message_sync(
     let msg_id = format!("bus-{}-{}", ts_unix, &digest[..8]);
 
     let mut msg = BusMessage {
-        id: msg_id.clone(),
+        id: msg_id,
         seq: 0,
         ts_unix,
         ts_iso,
-        room: room_norm.clone(),
-        sender: sender.clone(),
-        sender_cast: sender_cast.clone(),
+        room: room_norm,
+        sender,
+        sender_cast,
         sender_endpoint_id,
         to,
-        task_id: task_id.clone(),
+        task_id,
         body: body.to_string(),
         digest_sha256: digest,
         pubkey_ed25519: None,
@@ -1968,10 +2979,28 @@ pub fn send_bus_message_sync(
         sig_verified: false,
     };
     sign_bus_message(&mut msg, &signing_secret);
+    publish_prebuilt_bus_message_sync_with_transport(repo_root, msg, transport_secret)
+}
+
+pub fn publish_prebuilt_bus_message_sync(
+    repo_root: &Path,
+    msg: BusMessage,
+) -> Result<(BusMessage, BusAck), InstanceError> {
+    let transport_secret = actor_transport_secret(&msg.sender);
+    publish_prebuilt_bus_message_sync_with_transport(repo_root, msg, transport_secret)
+}
+
+fn publish_prebuilt_bus_message_sync_with_transport(
+    repo_root: &Path,
+    mut msg: BusMessage,
+    transport_secret: SecretKey,
+) -> Result<(BusMessage, BusAck), InstanceError> {
     if !verify_detached_bus_signature(repo_root, &mut msg) {
         return Err(InstanceError::SigningIdentityUnavailable);
     }
 
+    let msg_id = msg.id.clone();
+    let room_norm = msg.room.clone();
     let daemon = read_daemon_state(repo_root);
     let explicit_route = std::env::var_os("CHINWAG_BUS_ADDR").is_some()
         || std::env::var_os("CHINWAG_BUS_ENDPOINT_ID").is_some();
@@ -2868,8 +3897,8 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 let _ = writeln!(stderr, "chinwag bus: failed to initialize tokio runtime");
                 return 1;
             };
-            rt.block_on(run_daemon_loop(
-                repo_root,
+            let outcome = rt.block_on(run_daemon_loop_reexecable(
+                repo_root.clone(),
                 port_arg,
                 network_selection,
                 no_governors,
@@ -2877,7 +3906,43 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 async {
                     let _ = tokio::signal::ctrl_c().await;
                 },
-            ))
+                None,
+            ));
+            drop(rt);
+            match outcome {
+                DaemonOutcome::Exit(code) => code,
+                DaemonOutcome::Reexec {
+                    install_path,
+                    prepared,
+                } => {
+                    use std::os::unix::process::CommandExt;
+                    if let Err(err) = rustix::process::fchdir(&prepared.dir_fd) {
+                        let _ =
+                            writeln!(stderr, "chinwag bus daemon: re-exec fchdir refused: {err}");
+                        chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+                        return 1;
+                    }
+                    let reexec_args = build_canonical_daemon_reexec_args(args, &repo_root);
+                    let _ = writeln!(
+                        stdout,
+                        "chinwag bus daemon: re-executing pinned immutable binary {} (source {})",
+                        prepared.binary_path.display(),
+                        install_path.display()
+                    );
+                    let _ = stdout.flush();
+                    let _ = stderr.flush();
+                    let err = Command::new("./chinwag")
+                        .arg0("chinwag")
+                        .args(&reexec_args)
+                        .exec();
+                    let _ = writeln!(stderr, "chinwag bus daemon: re-exec failed: {err}");
+                    if let Ok(home_dir) = chinwag_cli::release_sync::resolve_home_dir() {
+                        let _ = std::env::set_current_dir(&home_dir);
+                    }
+                    chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+                    1
+                }
+            }
         }
         "send" | "pub" | "publish" | "post" => {
             let pos_body = positionals.join(" ").trim().to_string();
@@ -3287,6 +4352,366 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 );
             }
             0
+        }
+    }
+}
+
+fn print_release_help(stdout: &mut dyn Write) -> u8 {
+    let _ = writeln!(
+        stdout,
+        r#"Usage:
+  chinwag release publish --binary <chinwag|chinwag-ci> --source <PATH> [--repo <PATH>] [--from <INFRAJR#INSTANCE>] [--rollback] [--json]
+  chinwag release sync [--repo <PATH>] [--json]
+  chinwag release status [--json]
+
+Symmetric Bus Release Auto-Installer:
+  publish  Verifies codesign & --version, hashes SHA-256 + BLAKE3, uploads content-addressed R2 blob, installs locally, and broadcasts signed RELEASE_BUILT on #all.
+  sync     Replays verified INFRAJR RELEASE_BUILT manifests from the local bus journal against content-addressed R2 blobs with pre-exec SHA-256 + BLAKE3 verification.
+  status   Reports local ~/.local/bin/{{chinwag,chinwag-ci}} digests and ~/.chinwag/release_sync_state.json monotonic watermarks."#
+    );
+    0
+}
+
+pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    let Some(sub) = args.first().map(String::as_str) else {
+        return print_release_help(stdout);
+    };
+    if matches!(sub, "--help" | "-h" | "help") {
+        return print_release_help(stdout);
+    }
+
+    let mut binary_arg: Option<String> = None;
+    let mut source_arg: Option<String> = None;
+    let mut repo_arg: Option<String> = None;
+    let mut from_arg: Option<String> = None;
+    let mut rollback = false;
+    let mut is_json = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => return print_release_help(stdout),
+            "--json" => {
+                is_json = true;
+                i += 1;
+            }
+            "--rollback" if sub == "publish" => {
+                rollback = true;
+                i += 1;
+            }
+            "--binary" if sub == "publish" => {
+                let Some(val) = args.get(i + 1).filter(|v| !v.starts_with('-')) else {
+                    let _ = writeln!(stderr, "chinwag release: --binary requires a value");
+                    return 2;
+                };
+                if binary_arg.replace(val.clone()).is_some() {
+                    let _ = writeln!(stderr, "chinwag release: duplicate --binary");
+                    return 2;
+                }
+                i += 2;
+            }
+            "--source" if sub == "publish" => {
+                let Some(val) = args.get(i + 1).filter(|v| !v.starts_with('-')) else {
+                    let _ = writeln!(stderr, "chinwag release: --source requires a value");
+                    return 2;
+                };
+                if source_arg.replace(val.clone()).is_some() {
+                    let _ = writeln!(stderr, "chinwag release: duplicate --source");
+                    return 2;
+                }
+                i += 2;
+            }
+            "--repo" if matches!(sub, "publish" | "sync") => {
+                let Some(val) = args.get(i + 1).filter(|v| !v.starts_with('-')) else {
+                    let _ = writeln!(stderr, "chinwag release: --repo requires a value");
+                    return 2;
+                };
+                if repo_arg.replace(val.clone()).is_some() {
+                    let _ = writeln!(stderr, "chinwag release: duplicate --repo");
+                    return 2;
+                }
+                i += 2;
+            }
+            "--from" if sub == "publish" => {
+                let Some(val) = args.get(i + 1).filter(|v| !v.starts_with('-')) else {
+                    let _ = writeln!(stderr, "chinwag release: --from requires a value");
+                    return 2;
+                };
+                if from_arg.replace(val.clone()).is_some() {
+                    let _ = writeln!(stderr, "chinwag release: duplicate --from");
+                    return 2;
+                }
+                i += 2;
+            }
+            other => {
+                let _ = writeln!(
+                    stderr,
+                    "chinwag release: unsupported argument `{other}` for subcommand `{sub}`"
+                );
+                return 2;
+            }
+        }
+    }
+
+    let home_dir = match chinwag_cli::release_sync::resolve_home_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            let _ = writeln!(stderr, "chinwag release: {err}");
+            return 1;
+        }
+    };
+
+    match sub {
+        "status" => match chinwag_cli::release_sync::collect_release_status_json(&home_dir) {
+            Ok(status_val) => {
+                if is_json {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::to_string_pretty(&status_val).unwrap_or_default()
+                    );
+                } else {
+                    let target = status_val["target_triple"].as_str().unwrap_or("unknown");
+                    let _ = writeln!(stdout, "Chinwag Symmetric Release Sync ({target})");
+                    for bin in chinwag_cli::release_sync::ALLOWED_BINARIES {
+                        let disk = &status_val["local_binaries"][bin];
+                        let recorded = &status_val["recorded_state"]["binaries"][bin];
+                        let present = disk["present"].as_bool().unwrap_or(false);
+                        let sha = disk["sha256"].as_str().unwrap_or("absent");
+                        let commit = recorded["git_commit"].as_str().unwrap_or("untracked");
+                        let _ = writeln!(
+                            stdout,
+                            "  • {bin}: present={present} sha256={sha} recorded_commit={commit}"
+                        );
+                    }
+                }
+                0
+            }
+            Err(err) => {
+                let _ = writeln!(stderr, "chinwag release status: {err}");
+                1
+            }
+        },
+        "publish" => {
+            let (Some(binary), Some(source)) = (binary_arg.as_deref(), source_arg.as_deref())
+            else {
+                let _ = writeln!(
+                    stderr,
+                    "Usage: chinwag release publish --binary <chinwag|chinwag-ci> --source <PATH> [--repo <PATH>] [--from <INFRAJR#INSTANCE>] [--rollback] [--json]"
+                );
+                return 2;
+            };
+            if let Err(err) = chinwag_cli::release_sync::validate_binary_name(binary) {
+                let _ = writeln!(stderr, "chinwag release publish: {err}");
+                return 2;
+            }
+            let selected = match resolve_repo_root(repo_arg.as_deref()) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    let _ = writeln!(
+                        stderr,
+                        "chinwag release publish: repository selection refused: {error}"
+                    );
+                    return 2;
+                }
+            };
+            if let Err(error) = selected.revalidate() {
+                let _ = writeln!(
+                    stderr,
+                    "chinwag release publish: repository selection refused: {error}"
+                );
+                return 2;
+            }
+            let repo_root = selected.execution_root().to_path_buf();
+            let store = chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_dir.clone());
+            let req = chinwag_cli::release_sync::PublishReleaseRequest {
+                home_dir: &home_dir,
+                repo_root: &repo_root,
+                binary,
+                source_binary_path: Path::new(source),
+                explicit_from: from_arg.as_deref(),
+                rollback,
+                commit_override: None,
+            };
+            match chinwag_cli::release_sync::publish_release(req, &store, |msg| {
+                publish_prebuilt_bus_message_sync(&repo_root, msg.clone())
+                    .map(|(_, ack)| ack.seq)
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok(outcome) => {
+                    if is_json {
+                        let out = json!({
+                            "ok": true,
+                            "manifest": outcome.manifest,
+                            "install_path": outcome.install_path.to_string_lossy(),
+                            "previous_backup_path": outcome.previous_backup_path.as_ref().map(|p| p.to_string_lossy()),
+                            "message_id": outcome.release_built_message.id,
+                            "bus_seq": outcome.bus_seq,
+                            "crate_memory_synced": outcome.crate_memory_synced,
+                        });
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::to_string_pretty(&out).unwrap_or_default()
+                        );
+                    } else {
+                        let _ = writeln!(
+                            stdout,
+                            "✓ Published RELEASE_BUILT for {} ({} @ {})\n  • SHA-256: {}\n  • BLAKE3:  {}\n  • R2 Key:  r2://{}/{}\n  • Bus Seq: {} ({})",
+                            outcome.manifest.binary,
+                            outcome.manifest.target_triple,
+                            outcome.manifest.git_commit,
+                            outcome.manifest.sha256,
+                            outcome.manifest.blake3,
+                            chinwag_cli::release_sync::R2_BUCKET_NAME,
+                            outcome.manifest.artifact_key,
+                            outcome.bus_seq,
+                            outcome.release_built_message.id
+                        );
+                    }
+                    0
+                }
+                Err(err) => {
+                    let _ = writeln!(stderr, "chinwag release publish: {err}");
+                    1
+                }
+            }
+        }
+        "sync" => {
+            let selected = match resolve_repo_root(repo_arg.as_deref()) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    let _ = writeln!(
+                        stderr,
+                        "chinwag release sync: repository selection refused: {error}"
+                    );
+                    return 2;
+                }
+            };
+            if let Err(error) = selected.revalidate() {
+                let _ = writeln!(
+                    stderr,
+                    "chinwag release sync: repository selection refused: {error}"
+                );
+                return 2;
+            }
+            let repo_root = selected.execution_root().to_path_buf();
+            let local_iroh = read_daemon_state(&repo_root)
+                .map(|s| s.endpoint_id)
+                .or_else(|| {
+                    load_or_create_daemon_secret(&repo_root)
+                        .ok()
+                        .map(|k| k.public().to_string())
+                });
+            let store = chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_dir.clone());
+            let journal_path = messages_jsonl_path(&repo_root);
+            match chinwag_cli::release_sync::sync_releases_from_journal_per_binary(
+                &home_dir,
+                &journal_path,
+                &store,
+                local_iroh.as_deref(),
+            ) {
+                Ok(reports) => {
+                    let mut rows = Vec::new();
+                    let mut had_error = false;
+                    for report in reports {
+                        let binary = report.binary;
+                        match report.outcome {
+                            Ok(chinwag_cli::release_sync::ReleaseApplyOutcome::Installed {
+                                manifest,
+                                install_path,
+                                receipt_message,
+                                ..
+                            }) => {
+                                if let Some(receipt) = receipt_message {
+                                    let _ = publish_prebuilt_bus_message_sync(&repo_root, *receipt);
+                                }
+                                rows.push(json!({
+                                    "binary": binary,
+                                    "status": "installed",
+                                    "sha256": manifest.sha256,
+                                    "git_commit": manifest.git_commit,
+                                    "install_path": install_path.to_string_lossy(),
+                                }));
+                            }
+                            Ok(
+                                chinwag_cli::release_sync::ReleaseApplyOutcome::AlreadyInstalled {
+                                    manifest,
+                                    install_path,
+                                },
+                            ) => {
+                                rows.push(json!({
+                                    "binary": binary,
+                                    "status": "already_installed",
+                                    "sha256": manifest.sha256,
+                                    "git_commit": manifest.git_commit,
+                                    "install_path": install_path.to_string_lossy(),
+                                }));
+                            }
+                            Ok(
+                                chinwag_cli::release_sync::ReleaseApplyOutcome::SkippedTargetMismatch {
+                                    manifest_target,
+                                    local_target,
+                                },
+                            ) => {
+                                rows.push(json!({
+                                    "binary": binary,
+                                    "status": "skipped_target_mismatch",
+                                    "manifest_target": manifest_target,
+                                    "local_target": local_target,
+                                }));
+                            }
+                            Err(err) => {
+                                had_error = true;
+                                if !is_json {
+                                    let _ =
+                                        writeln!(stderr, "chinwag release sync ({binary}): {err}");
+                                }
+                                rows.push(json!({
+                                    "binary": binary,
+                                    "status": "error",
+                                    "error": err.to_string(),
+                                }));
+                            }
+                        }
+                    }
+                    if is_json {
+                        let out = json!({
+                            "ok": !had_error,
+                            "outcomes": rows,
+                        });
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::to_string_pretty(&out).unwrap_or_default()
+                        );
+                    } else if rows.is_empty() {
+                        let _ = writeln!(
+                            stdout,
+                            "chinwag release sync: no pending RELEASE_BUILT manifests"
+                        );
+                    } else {
+                        for row in &rows {
+                            let _ = writeln!(
+                                stdout,
+                                "  • {}: {} ({})",
+                                row["binary"].as_str().unwrap_or("unknown"),
+                                row["status"].as_str().unwrap_or("unknown"),
+                                row["sha256"].as_str().unwrap_or("-")
+                            );
+                        }
+                    }
+                    u8::from(had_error)
+                }
+                Err(err) => {
+                    let _ = writeln!(stderr, "chinwag release sync: {err}");
+                    1
+                }
+            }
+        }
+        other => {
+            let _ = writeln!(stderr, "chinwag release: unknown subcommand `{other}`");
+            2
         }
     }
 }
@@ -4230,6 +5655,1204 @@ mod tests {
             assert_eq!(run_bus_cli(&args, &mut out, &mut err), 2);
             assert!(out.is_empty());
         }
+    }
+
+    #[test]
+    fn release_cli_help_status_and_strict_flag_validation() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            run_release_cli(&["--help".to_owned()], &mut out, &mut err),
+            0
+        );
+        assert!(String::from_utf8(out).unwrap().starts_with("Usage:"));
+        assert!(err.is_empty());
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            run_release_cli(
+                &["status".to_owned(), "--json".to_owned()],
+                &mut out,
+                &mut err,
+            ),
+            0
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["schema"], "chinwag.release-status.v1");
+
+        for bad in [
+            vec!["unknown-sub"],
+            vec!["status", "--bogus"],
+            vec!["sync", "--from-r2"],
+            vec!["sync", "--no-r2"],
+            vec!["publish", "--binary", "../evil", "--source", "/bin/echo"],
+            vec!["publish", "--binary"],
+        ] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args: Vec<String> = bad.into_iter().map(str::to_owned).collect();
+            assert_eq!(run_release_cli(&args, &mut out, &mut err), 2);
+            assert!(out.is_empty());
+            assert!(!err.is_empty());
+        }
+    }
+
+    #[test]
+    fn per_binary_retry_scheduler_bounds_chinwag_ci_despite_chinwag_success() {
+        use chinwag_cli::release_sync::{
+            CURRENT_TARGET_TRIPLE, MAX_RELEASE_SYNC_TRANSIENT_RETRIES, RELEASE_MANIFEST_SCHEMA,
+            ReleaseApplyOutcome, ReleaseManifestV1, ReleaseSyncError, expected_artifact_key,
+        };
+
+        let sample_manifest =
+            |binary: &str, target: &str, sha_byte: u8, epoch: u64, built_at_ms: u64| {
+                let sha256 = format!("{sha_byte:02x}").repeat(32);
+                let blake3 = format!("{:02x}", sha_byte.wrapping_add(1)).repeat(32);
+                let artifact_key = expected_artifact_key(binary, target, &sha256);
+                ReleaseManifestV1 {
+                    schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+                    binary: binary.to_owned(),
+                    target_triple: target.to_owned(),
+                    git_commit: "abcd1234abcd1234".to_owned(),
+                    commit_epoch: epoch,
+                    built_at_ms,
+                    sha256,
+                    blake3,
+                    size_bytes: 4096,
+                    artifact_key,
+                    rollback: false,
+                }
+            };
+
+        let mut sched = ReleaseDaemonScheduler::default();
+        let mut now = Instant::now();
+        let expected_delays = [10u64, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300, 300];
+        let mut scheduled_delays = Vec::new();
+
+        let cw_installed = sample_manifest("chinwag", CURRENT_TARGET_TRIPLE, 0x11, 100, 1000);
+        let ci_old_installed =
+            sample_manifest("chinwag-ci", CURRENT_TARGET_TRIPLE, 0x21, 100, 1000);
+        let ci_failing = sample_manifest("chinwag-ci", CURRENT_TARGET_TRIPLE, 0x22, 200, 2000);
+        let transient_err = ReleaseSyncError::ArtifactStoreFailed("r2 timeout".to_owned());
+
+        for cycle in 0..20usize {
+            // Healthy `chinwag` succeeds (`AlreadyInstalled`) on every cycle, AND foreign-target
+            // `SkippedTargetMismatch` + older `AlreadyInstalled` replays for `chinwag-ci` arrive
+            // alongside it — NONE may clear or reset `ci_failing`'s retry state!
+            sched.on_outcome(&ReleaseApplyOutcome::AlreadyInstalled {
+                manifest: cw_installed.clone(),
+                install_path: PathBuf::from("/tmp/chinwag"),
+            });
+            sched.on_outcome(&ReleaseApplyOutcome::SkippedTargetMismatch {
+                manifest_target: "x86_64-apple-darwin".to_owned(),
+                local_target: CURRENT_TARGET_TRIPLE.to_owned(),
+            });
+            sched.on_outcome(&ReleaseApplyOutcome::AlreadyInstalled {
+                manifest: ci_old_installed.clone(),
+                install_path: PathBuf::from("/tmp/chinwag-ci"),
+            });
+
+            let delay = sched.on_manifest_failed(&ci_failing, &transient_err, now);
+            if cycle < MAX_RELEASE_SYNC_TRANSIENT_RETRIES as usize {
+                let d = delay.expect("expected scheduled retry within 12-attempt cap");
+                scheduled_delays.push(d.as_secs());
+                assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(1)));
+                now += d;
+                assert!(sched.poll_catchup_dispatch(false, now));
+                // Duplicate heartbeat ticks while catchup is queued do not enqueue twice.
+                assert!(!sched.poll_catchup_dispatch(false, now));
+                // Reset `catchup_queued` as worker execution would:
+                let _ = chinwag_cli::release_sync::execute_release_daemon_job(
+                    Path::new("/nonexistent"),
+                    Path::new("/nonexistent/messages.jsonl"),
+                    &chinwag_cli::release_sync::WranglerR2ArtifactStore::new(PathBuf::from(
+                        "/nonexistent",
+                    )),
+                    "ep-test",
+                    &Mutex::new(ReleaseDaemonScheduler::default()),
+                    ReleaseDaemonJob::StartupCatchup,
+                );
+                sched.on_catchup_send_full();
+            } else {
+                assert_eq!(delay, None, "must stop retrying after 12 attempts");
+                assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(3600)));
+            }
+        }
+        assert_eq!(scheduled_delays, expected_delays);
+
+        // Publishing a genuinely NEW `chinwag-ci` release grants a fresh budget.
+        let ci_newer = sample_manifest("chinwag-ci", CURRENT_TARGET_TRIPLE, 0x23, 300, 3000);
+        let fresh = sched.on_manifest_failed(&ci_newer, &transient_err, now);
+        assert_eq!(fresh, Some(Duration::from_secs(10)));
+        sched.on_outcome(&ReleaseApplyOutcome::Installed {
+            manifest: ci_newer,
+            install_path: PathBuf::from("/tmp/chinwag-ci"),
+            previous_backup_path: None,
+            receipt_message: None,
+        });
+        assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn retry_scheduler_queue_overflow_persists_until_catchup_dispatched() {
+        let mut sched = ReleaseDaemonScheduler::default();
+        let now = Instant::now();
+        assert!(!sched.should_dispatch_catchup(now));
+        assert!(sched.poll_catchup_dispatch(true, now));
+        // Simulate `job_tx.try_send` full on heartbeat 1: `on_catchup_send_full` re-arms
+        // dispatch while keeping `overflow_reconcile_pending` true for heartbeat 2.
+        sched.on_catchup_send_full();
+        assert!(sched.should_dispatch_catchup(now + Duration::from_secs(10)));
+        assert!(sched.poll_catchup_dispatch(false, now + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn pending_reexec_drain_predicate_and_canonical_reexec_args_preserve_repo() {
+        assert!(should_complete_pending_reexec(
+            true,
+            true,
+            true,
+            Duration::from_millis(350)
+        ));
+        // Never begin re-exec teardown while the release worker is still busy,
+        // even past the 5s forwarding drain ceiling!
+        assert!(!should_complete_pending_reexec(
+            true,
+            true,
+            false,
+            Duration::from_secs(10)
+        ));
+        assert!(!should_complete_pending_reexec(
+            false,
+            true,
+            true,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_complete_pending_reexec(
+            true,
+            false,
+            true,
+            Duration::from_millis(4999)
+        ));
+        assert!(should_complete_pending_reexec(
+            false,
+            false,
+            true,
+            Duration::from_secs(5)
+        ));
+
+        let canonical = Path::new("/tmp/canonical-chinwag-repo");
+        let args_relative = vec![
+            "daemon".to_owned(),
+            "--repo".to_owned(),
+            ".".to_owned(),
+            "--port".to_owned(),
+            "44100".to_owned(),
+        ];
+        assert_eq!(
+            build_canonical_daemon_reexec_args(&args_relative, canonical),
+            vec![
+                std::ffi::OsString::from("bus"),
+                std::ffi::OsString::from("daemon"),
+                std::ffi::OsString::from("--repo"),
+                std::ffi::OsString::from("/tmp/canonical-chinwag-repo"),
+                std::ffi::OsString::from("--port"),
+                std::ffi::OsString::from("44100"),
+            ]
+        );
+
+        let args_omitted = vec!["daemon".to_owned(), "--no-governors".to_owned()];
+        assert_eq!(
+            build_canonical_daemon_reexec_args(&args_omitted, canonical),
+            vec![
+                std::ffi::OsString::from("bus"),
+                std::ffi::OsString::from("daemon"),
+                std::ffi::OsString::from("--repo"),
+                std::ffi::OsString::from("/tmp/canonical-chinwag-repo"),
+                std::ffi::OsString::from("--no-governors"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reexec_quiescence_waits_for_inflight_release_b_and_commits_latest_digest() {
+        use chinwag_cli::release_sync::{
+            CURRENT_TARGET_TRIPLE, RELEASE_MANIFEST_SCHEMA, ReleaseApplyOutcome, ReleaseManifestV1,
+            clear_and_remove_immutable_dir, expected_artifact_key, local_binary_sha256,
+            prepare_immutable_reexec_binary,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let home_dir = temp.path().join("home");
+        let bin_dir = home_dir.join(".local/bin");
+        let build_dir = temp.path().join("build");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+
+        let compile_signed_macho = |label: &str| -> (PathBuf, [u8; 32], String) {
+            let src = build_dir.join(format!("{label}.c"));
+            let out = build_dir.join(format!("chinwag-{label}"));
+            fs::write(
+                &src,
+                format!("int main(void) {{ const char *v = \"{label}\"; (void)v; return 0; }}\n"),
+            )
+            .unwrap();
+            let st = std::process::Command::new("/usr/bin/clang")
+                .args(["-O2", "-o"])
+                .arg(&out)
+                .arg(&src)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let cs = std::process::Command::new("/usr/bin/codesign")
+                .args(["-s", "-", "--force"])
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(cs.success());
+            let sha = local_binary_sha256(&out).unwrap();
+            let sha_hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+            (out, sha, sha_hex)
+        };
+
+        let (bin_startup, sha_startup, sha_startup_hex) = compile_signed_macho("startup");
+        let (bin_a, sha_a, sha_a_hex) = compile_signed_macho("release_a");
+        let (bin_b, sha_b, sha_b_hex) = compile_signed_macho("release_b");
+        assert_ne!(sha_a, sha_b);
+        assert_ne!(sha_startup, sha_a);
+        assert_ne!(sha_startup, sha_b);
+        let _ = bin_startup;
+
+        let install_path = bin_dir.join("chinwag");
+        let make_manifest =
+            |sha_hex: &str, epoch: u64, built_at_ms: u64, path: &Path| ReleaseManifestV1 {
+                schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+                binary: "chinwag".to_owned(),
+                target_triple: CURRENT_TARGET_TRIPLE.to_owned(),
+                git_commit: format!("{epoch:016x}"),
+                commit_epoch: epoch,
+                built_at_ms,
+                sha256: sha_hex.to_owned(),
+                blake3: "bb".repeat(32),
+                size_bytes: fs::metadata(path).unwrap().len(),
+                artifact_key: expected_artifact_key("chinwag", CURRENT_TARGET_TRIPLE, sha_hex),
+                rollback: false,
+            };
+        let manifest_a = make_manifest(&sha_a_hex, 100, 1_700_000_100, &bin_a);
+        let manifest_b = make_manifest(&sha_b_hex, 200, 1_700_000_200, &bin_b);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (selected_path, selected_sha) = rt.block_on(async {
+            let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(8);
+            let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(8);
+            let mut done_tx_keepalive = Some(done_tx.clone());
+            let job_gate = Arc::new(Mutex::new(ReleaseJobQueueGate::default()));
+            let b_entered_blocking = Arc::new(tokio::sync::Notify::new());
+
+            // Enqueue two consecutive `chinwag` jobs (A then B) via gapless queue gate.
+            try_enqueue_release_job(&job_tx, &job_gate, ReleaseDaemonJob::StartupCatchup).unwrap();
+            try_enqueue_release_job(&job_tx, &job_gate, ReleaseDaemonJob::StartupCatchup).unwrap();
+            assert_eq!(job_gate.lock().unwrap().active_jobs, 2);
+
+            let gate_clone = job_gate.clone();
+            let b_entered_clone = b_entered_blocking.clone();
+            let install_for_worker = install_path.clone();
+            let bin_a_clone = bin_a.clone();
+            let bin_b_clone = bin_b.clone();
+            let m_a = manifest_a.clone();
+            let m_b = manifest_b.clone();
+
+            let mut step = 0usize;
+            let mut worker_handle = Some(tokio::spawn(async move {
+                while let Some(_job) = job_rx.recv().await {
+                    let _guard = ReleaseJobSlotGuard(gate_clone.clone());
+                    step += 1;
+                    let current_step = step;
+                    let dst = install_for_worker.clone();
+                    let src_a = bin_a_clone.clone();
+                    let src_b = bin_b_clone.clone();
+                    let ma = m_a.clone();
+                    let mb = m_b.clone();
+                    let notify_b = b_entered_clone.clone();
+
+                    let ev = tokio::task::spawn_blocking(move || {
+                        if current_step == 1 {
+                            let tmp = dst.with_extension("tmp.a");
+                            fs::copy(&src_a, &tmp).unwrap();
+                            fs::rename(&tmp, &dst).unwrap();
+                            ReleaseDaemonEvent::Applied {
+                                binary: "chinwag".to_owned(),
+                                outcome: Box::new(ReleaseApplyOutcome::Installed {
+                                    manifest: ma,
+                                    install_path: dst,
+                                    previous_backup_path: None,
+                                    receipt_message: None,
+                                }),
+                            }
+                        } else {
+                            notify_b.notify_one();
+                            // Remain inside blocking installation longer than the 350ms re-exec timer!
+                            std::thread::sleep(Duration::from_millis(450));
+                            let tmp = dst.with_extension("tmp.b");
+                            fs::copy(&src_b, &tmp).unwrap();
+                            fs::rename(&tmp, &dst).unwrap();
+                            ReleaseDaemonEvent::Applied {
+                                binary: "chinwag".to_owned(),
+                                outcome: Box::new(ReleaseApplyOutcome::Installed {
+                                    manifest: mb,
+                                    install_path: dst,
+                                    previous_backup_path: None,
+                                    receipt_message: None,
+                                }),
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    done_tx.send(ev).await.unwrap();
+                }
+            }));
+
+            let mut pending_reexec = PendingReexecSlot::default();
+            let repo_dir = temp.path().join("repo");
+            fs::create_dir_all(repo_dir.join(".chinwag/bus")).unwrap();
+            let (bcast_tx, _) = broadcast::channel::<BusMessage>(16);
+            let (fwd_tx, _) = tokio::sync::mpsc::channel::<BusMessage>(16);
+            let publications = Mutex::new(NativePublication::open(&repo_dir).unwrap());
+            let daemon_state = Mutex::new(DaemonState {
+                ok: true,
+                pid: 1,
+                endpoint_id: "ep".into(),
+                bound_sockets: vec![],
+                alpns: vec![],
+                repo_root: repo_dir.to_string_lossy().into_owned(),
+                tasks_md: String::new(),
+                messages_jsonl: String::new(),
+                started_at: 0,
+                last_heartbeat: 0,
+                total_messages: 0,
+                product_governor: String::new(),
+                delivery_router: String::new(),
+            });
+            let mut sink = Vec::new();
+
+            // Consume release A's completion event -> arms `pending_reexec` with A's digest.
+            let ev_a = done_rx.recv().await.unwrap();
+            assert!(process_release_daemon_event(
+                ev_a,
+                &mut sink,
+                &repo_dir,
+                "ep",
+                false,
+                &fwd_tx,
+                &publications,
+                &bcast_tx,
+                &daemon_state,
+                Some(sha_startup),
+                false,
+                &mut pending_reexec,
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_a);
+
+            // Wait until release B is actively inside `spawn_blocking` and 360ms (> 350ms) has elapsed.
+            b_entered_blocking.notified().await;
+            tokio::time::sleep(Duration::from_millis(360)).await;
+            assert_eq!(
+                job_gate.lock().unwrap().active_jobs,
+                1,
+                "release B should still hold its pending job slot while inside blocking installation"
+            );
+            assert!(
+                !should_complete_pending_reexec(
+                    true,
+                    true,
+                    job_gate.lock().unwrap().active_jobs == 0,
+                    Duration::from_millis(360),
+                ),
+                "live loop must defer re-exec while release B is busy"
+            );
+
+            // Now run post-loop quiescence while B is STILL mid-flight inside `spawn_blocking`:
+            // it MUST await B's completion, drain B's event, and update `pending_reexec` to `sha_b`!
+            let mut job_tx_opt = Some(job_tx);
+            quiesce_release_worker_and_drain_events(
+                &mut job_tx_opt,
+                &mut done_tx_keepalive,
+                &mut worker_handle,
+                &mut done_rx,
+                |ev| {
+                    let _ = process_release_daemon_event(
+                        ev,
+                        &mut sink,
+                        &repo_dir,
+                        "ep",
+                        false,
+                        &fwd_tx,
+                        &publications,
+                        &bcast_tx,
+                        &daemon_state,
+                        Some(sha_startup),
+                        true,
+                        &mut pending_reexec,
+                    );
+                },
+            )
+            .await;
+            assert_eq!(job_gate.lock().unwrap().active_jobs, 0);
+
+            // Also verify rollback back to `sha_startup`: disarms in live loop (`false`),
+            // and commits `sha_startup` in teardown mode (`true`)!
+            let mut rollback_manifest =
+                make_manifest(&sha_startup_hex, 50, 1_700_000_300, &bin_startup);
+            rollback_manifest.rollback = true;
+            let mut live_pending = PendingReexecSlot::default();
+            live_pending.arm(install_path.clone(), sha_a);
+            assert!(!process_release_daemon_event(
+                ReleaseDaemonEvent::Applied {
+                    binary: "chinwag".to_owned(),
+                    outcome: Box::new(ReleaseApplyOutcome::Installed {
+                        manifest: rollback_manifest.clone(),
+                        install_path: install_path.clone(),
+                        previous_backup_path: None,
+                        receipt_message: None,
+                    }),
+                },
+                &mut sink,
+                &repo_dir,
+                "ep",
+                false,
+                &fwd_tx,
+                &publications,
+                &bcast_tx,
+                &daemon_state,
+                Some(sha_startup),
+                false,
+                &mut live_pending,
+            ));
+            assert!(
+                !live_pending.is_some(),
+                "rollback to startup digest in live loop must disarm stale pending_reexec"
+            );
+            let mut teardown_pending = PendingReexecSlot::default();
+            teardown_pending.arm(install_path.clone(), sha_a);
+            assert!(process_release_daemon_event(
+                ReleaseDaemonEvent::Applied {
+                    binary: "chinwag".to_owned(),
+                    outcome: Box::new(ReleaseApplyOutcome::Installed {
+                        manifest: rollback_manifest,
+                        install_path: install_path.clone(),
+                        previous_backup_path: None,
+                        receipt_message: None,
+                    }),
+                },
+                &mut sink,
+                &repo_dir,
+                "ep",
+                false,
+                &fwd_tx,
+                &publications,
+                &bcast_tx,
+                &daemon_state,
+                Some(sha_startup),
+                true,
+                &mut teardown_pending,
+            ));
+            assert_eq!(teardown_pending.current().unwrap().expected_sha, sha_startup);
+
+            let selected = pending_reexec.current().cloned().unwrap();
+            (selected.install_path, selected.expected_sha)
+        });
+        drop(rt);
+
+        assert_eq!(
+            selected_sha, sha_b,
+            "quiesced re-exec target MUST commit to release B's digest, not stale release A!"
+        );
+        let prepared =
+            prepare_immutable_reexec_binary(&home_dir, &selected_path, &selected_sha).unwrap();
+        assert_eq!(
+            local_binary_sha256(&prepared.binary_path),
+            Some(sha_b),
+            "pinned immutable re-exec binary must match release B with zero DigestMismatch"
+        );
+        drop(prepared.dir_fd);
+        clear_and_remove_immutable_dir(&prepared.dir_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_reexec_prep_never_suspends_loop_defers_handler_release_b_and_retries_transient_io() {
+        use chinwag_cli::release_sync::{
+            CURRENT_TARGET_TRIPLE, RELEASE_MANIFEST_SCHEMA, ReleaseApplyOutcome, ReleaseManifestV1,
+            ReleaseSyncError, cleanup_prepared_reexec, expected_artifact_key, local_binary_sha256,
+            prepare_immutable_reexec_binary,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let home_dir = temp.path().join("home");
+        let bin_dir = home_dir.join(".local/bin");
+        let build_dir = temp.path().join("build");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+
+        let compile_signed_macho = |label: &str| -> (PathBuf, [u8; 32], String) {
+            let src = build_dir.join(format!("{label}.c"));
+            let out = build_dir.join(format!("chinwag-{label}"));
+            fs::write(
+                &src,
+                format!("int main(void) {{ const char *v = \"{label}\"; (void)v; return 0; }}\n"),
+            )
+            .unwrap();
+            let st = std::process::Command::new("/usr/bin/clang")
+                .args(["-O2", "-o"])
+                .arg(&out)
+                .arg(&src)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let cs = std::process::Command::new("/usr/bin/codesign")
+                .args(["-s", "-", "--force"])
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(cs.success());
+            let sha = local_binary_sha256(&out).unwrap();
+            let sha_hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+            (out, sha, sha_hex)
+        };
+
+        let (_bin_startup, sha_startup, _) = compile_signed_macho("loop_startup");
+        let (bin_a, sha_a, _sha_a_hex) = compile_signed_macho("loop_a");
+        let (bin_b, sha_b, sha_b_hex) = compile_signed_macho("loop_b");
+        let install_path = bin_dir.join("chinwag");
+        fs::copy(&bin_a, &install_path).unwrap();
+
+        let manifest_b = ReleaseManifestV1 {
+            schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+            binary: "chinwag".to_owned(),
+            target_triple: CURRENT_TARGET_TRIPLE.to_owned(),
+            git_commit: "bbbbbbbbbbbbbbbb".to_owned(),
+            commit_epoch: 200,
+            built_at_ms: 1_700_000_200,
+            sha256: sha_b_hex.clone(),
+            blake3: "bb".repeat(32),
+            size_bytes: fs::metadata(&bin_b).unwrap().len(),
+            artifact_key: expected_artifact_key("chinwag", CURRENT_TARGET_TRIPLE, &sha_b_hex),
+            rollback: false,
+        };
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (ticks_while_prep_in_flight, committed_sha, log_text) = rt.block_on(async {
+            let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(8);
+            let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(8);
+            let job_gate = Arc::new(Mutex::new(ReleaseJobQueueGate::default()));
+
+            let repo_dir = temp.path().join("repo");
+            fs::create_dir_all(repo_dir.join(".chinwag/bus")).unwrap();
+            let (bcast_tx, _) = broadcast::channel::<BusMessage>(16);
+            let (fwd_tx, _) = tokio::sync::mpsc::channel::<BusMessage>(16);
+            let publications = Mutex::new(NativePublication::open(&repo_dir).unwrap());
+            let daemon_state = Mutex::new(DaemonState {
+                ok: true,
+                pid: 1,
+                endpoint_id: "ep".into(),
+                bound_sockets: vec![],
+                alpns: vec![],
+                repo_root: repo_dir.to_string_lossy().into_owned(),
+                tasks_md: String::new(),
+                messages_jsonl: String::new(),
+                started_at: 0,
+                last_heartbeat: 0,
+                total_messages: 0,
+                product_governor: String::new(),
+                delivery_router: String::new(),
+            });
+
+            // Worker installs release B when an active connection handler enqueues it!
+            let gate_for_worker = job_gate.clone();
+            let dst_for_worker = install_path.clone();
+            let src_b_for_worker = bin_b.clone();
+            let mb_for_worker = manifest_b.clone();
+            let done_for_worker = done_tx.clone();
+            let allow_b_finish = Arc::new(tokio::sync::Notify::new());
+            let allow_b_clone = allow_b_finish.clone();
+            let worker = tokio::spawn(async move {
+                if let Some(_job) = job_rx.recv().await {
+                    let _slot = ReleaseJobSlotGuard(gate_for_worker);
+                    allow_b_clone.notified().await;
+                    let tmp = dst_for_worker.with_extension("tmp.loop_b");
+                    fs::copy(&src_b_for_worker, &tmp).unwrap();
+                    fs::rename(&tmp, &dst_for_worker).unwrap();
+                    done_for_worker
+                        .send(ReleaseDaemonEvent::Applied {
+                            binary: "chinwag".to_owned(),
+                            outcome: Box::new(ReleaseApplyOutcome::Installed {
+                                manifest: mb_for_worker,
+                                install_path: dst_for_worker,
+                                previous_backup_path: None,
+                                receipt_message: None,
+                            }),
+                        })
+                        .await
+                        .unwrap();
+                }
+            });
+
+            let mut pending_reexec = PendingReexecSlot::default();
+            pending_reexec.arm(install_path.clone(), sha_a);
+            let mut reexec_prep_task: Option<InFlightReexecPrep> = None;
+            let mut reexec_prep_retries = 0u32;
+            let mut sink = Vec::new();
+            let reexec_sleep = tokio::time::sleep(Duration::from_millis(5));
+            tokio::pin!(reexec_sleep);
+            let mut heartbeat = tokio::time::interval(Duration::from_millis(15));
+            heartbeat.tick().await;
+
+            let prep_a_started = Arc::new(tokio::sync::Notify::new());
+            let release_prep_a = Arc::new(std::sync::Barrier::new(2));
+            let mut prep_attempt = 0usize;
+            let mut ticks_during_prep_a = 0usize;
+            let mut handler_enqueued_b = false;
+            let committed_prepared;
+
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        if reexec_prep_task.is_some() && !handler_enqueued_b {
+                            ticks_during_prep_a += 1;
+                            if ticks_during_prep_a >= 3 {
+                                // Proves the live `tokio::select!` loop was NOT suspended while
+                                // `reexec_prep_task` was blocked! Now simulate an active connection
+                                // handler enqueueing release B while A's snapshot is being prepared!
+                                try_enqueue_release_job(
+                                    &job_tx,
+                                    &job_gate,
+                                    ReleaseDaemonJob::StartupCatchup,
+                                )
+                                .unwrap();
+                                handler_enqueued_b = true;
+                                let unblock = release_prep_a.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    unblock.wait();
+                                });
+                            }
+                        }
+                    }
+                    Some(ev) = done_rx.recv() => {
+                        if process_release_daemon_event(
+                            ev,
+                            &mut sink,
+                            &repo_dir,
+                            "ep",
+                            false,
+                            &fwd_tx,
+                            &publications,
+                            &bcast_tx,
+                            &daemon_state,
+                            Some(sha_startup),
+                            false,
+                            &mut pending_reexec,
+                        ) {
+                            reexec_prep_retries = 0;
+                            reexec_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_millis(10));
+                        }
+                    }
+                    () = &mut reexec_sleep, if pending_reexec.is_some() && reexec_prep_task.is_none() => {
+                        let cur = pending_reexec.current().cloned().unwrap();
+                        let idle = {
+                            let g = job_gate.lock().unwrap();
+                            g.active_jobs == 0 && done_rx.is_empty()
+                        };
+                        if idle {
+                            prep_attempt += 1;
+                            let attempt = prep_attempt;
+                            let home_for_prep = home_dir.clone();
+                            let target_for_prep = cur.install_path.clone();
+                            let expected_sha = cur.expected_sha;
+                            let started_notify = prep_a_started.clone();
+                            let barrier_a = release_prep_a.clone();
+                            let handle = tokio::task::spawn_blocking(move || {
+                                if attempt == 1 {
+                                    started_notify.notify_one();
+                                    let prepared = prepare_immutable_reexec_binary(
+                                        &home_for_prep,
+                                        &target_for_prep,
+                                        &expected_sha,
+                                    )?;
+                                    barrier_a.wait();
+                                    Ok(prepared)
+                                } else if attempt == 2 {
+                                    // Simulate a one-shot transient EIO/EMFILE on B's first preparation!
+                                    Err(ReleaseSyncError::TransientIo(
+                                        "simulated one-shot EMFILE during preparation".into(),
+                                    ))
+                                } else {
+                                    prepare_immutable_reexec_binary(
+                                        &home_for_prep,
+                                        &target_for_prep,
+                                        &expected_sha,
+                                    )
+                                }
+                            });
+                            reexec_prep_task = Some(InFlightReexecPrep {
+                                target_path: cur.install_path,
+                                expected_sha,
+                                generation: cur.generation,
+                                handle,
+                            });
+                        } else {
+                            // B is currently active in the worker; let B finish in the live loop!
+                            allow_b_finish.notify_one();
+                            reexec_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_millis(15));
+                        }
+                    }
+                    (prep_path, prep_sha, prep_gen, prep_res) = poll_reexec_prep(&mut reexec_prep_task), if reexec_prep_task.is_some() => {
+                        match complete_reexec_prep_step(
+                            prep_path,
+                            prep_sha,
+                            prep_gen,
+                            prep_res,
+                            &mut sink,
+                            Some(sha_startup),
+                            true,
+                            true,
+                            &done_rx,
+                            &job_gate,
+                            &mut pending_reexec,
+                            &mut reexec_prep_retries,
+                            |_| Duration::from_millis(10),
+                        ) {
+                            ReexecPrepStepOutcome::CommitReexec { prepared, .. } => {
+                                committed_prepared = prepared;
+                                break;
+                            }
+                            ReexecPrepStepOutcome::RescheduleTimer(delay) => {
+                                reexec_sleep
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + delay);
+                            }
+                            ReexecPrepStepOutcome::StayOnlineDisarmed => {
+                                panic!("unexpected disarm during live B upgrade + transient retry");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Once `CommitReexec` fired, `job_gate` MUST be atomically frozen so no late
+            // connection handler can enqueue work during endpoint/handler teardown!
+            assert_eq!(
+                try_enqueue_release_job(&job_tx, &job_gate, ReleaseDaemonJob::StartupCatchup),
+                Err(EnqueueReleaseJobError::FrozenForReexec)
+            );
+            drop(job_tx);
+            worker.await.unwrap();
+
+            let sha = committed_prepared.sha256;
+            cleanup_prepared_reexec(committed_prepared);
+            (
+                ticks_during_prep_a,
+                sha,
+                String::from_utf8_lossy(&sink).into_owned(),
+            )
+        });
+        drop(rt);
+
+        assert!(
+            ticks_while_prep_in_flight >= 3,
+            "owner select! loop must continue polling heartbeats/handlers while preparation runs"
+        );
+        assert_eq!(
+            committed_sha, sha_b,
+            "daemon must discard A's pin while B is active, survive transient retry, and commit B"
+        );
+        assert!(
+            log_text.contains("\"native_daemon_reexec_retry\""),
+            "transient EIO/EMFILE during preparation must schedule retry instead of refusing: {log_text}"
+        );
+        assert!(
+            !log_text.contains("\"native_daemon_reexec_refused\""),
+            "transient error must not trigger terminal refusal: {log_text}"
+        );
+    }
+
+    #[test]
+    fn daemon_room_reconnect_loop_enforces_240_cap_and_fails_closed_on_refusal() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 1. Continuous WebSocket 1000 closures stop strictly at 240 attempts.
+            let (events_tx, mut events_rx) = tokio::sync::mpsc::channel::<Value>(512);
+            let mut calls = 0u32;
+            let exhausted = attempt_room_reconnect_with_cap::<&'static str, _, _, _, _, _>(
+                0,
+                "the room WebSocket closed with code 1000".to_owned(),
+                &events_tx,
+                chinwag_swarm::room::next_reconnect_backoff,
+                |_| std::future::ready(()),
+                |_| {
+                    calls += 1;
+                    std::future::ready(Err(chinwag_swarm::room::Error::WebSocketClosed(1000)))
+                },
+            )
+            .await;
+            assert_eq!(
+                calls,
+                chinwag_swarm::room::MAX_CONSECUTIVE_RECONNECT_ATTEMPTS
+            );
+            assert_eq!(calls, 240);
+            assert!(matches!(
+                exhausted,
+                ReconnectLoopOutcome::Exhausted { attempts: 240, .. }
+            ));
+            let first_ev = events_rx.recv().await.unwrap();
+            assert_eq!(first_ev["event"], "native_room_reconnect_scheduled");
+            assert_eq!(first_ev["attempt"], 1);
+
+            // 2. Transient closures followed by success return Reconnected with updated attempt count.
+            let (events_tx2, _events_rx2) = tokio::sync::mpsc::channel::<Value>(16);
+            let mut calls2 = 0u32;
+            let recovered = attempt_room_reconnect_with_cap(
+                0,
+                "the room WebSocket closed with code 1000".to_owned(),
+                &events_tx2,
+                |_| Duration::from_millis(1),
+                |_| std::future::ready(()),
+                |_| {
+                    calls2 += 1;
+                    if calls2 < 3 {
+                        std::future::ready(Err(chinwag_swarm::room::Error::WebSocketClosed(1000)))
+                    } else {
+                        std::future::ready(Ok("live-session"))
+                    }
+                },
+            )
+            .await;
+            assert_eq!(
+                recovered,
+                ReconnectLoopOutcome::Reconnected {
+                    session: "live-session",
+                    next_attempt: 3,
+                }
+            );
+
+            // 3. Explicit HTTP 403 coordinator refusal fails closed immediately without retry.
+            let (events_tx3, _events_rx3) = tokio::sync::mpsc::channel::<Value>(16);
+            let mut calls3 = 0u32;
+            let refused = attempt_room_reconnect_with_cap::<&'static str, _, _, _, _, _>(
+                0,
+                "the room WebSocket closed with code 1000".to_owned(),
+                &events_tx3,
+                |_| Duration::from_millis(1),
+                |_| std::future::ready(()),
+                |_| {
+                    calls3 += 1;
+                    std::future::ready(Err(chinwag_swarm::room::Error::Refused(403)))
+                },
+            )
+            .await;
+            assert_eq!(calls3, 1);
+            assert!(matches!(refused, ReconnectLoopOutcome::FatalRefusal(_)));
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_reexec_prep_errors_and_startup_shortcuts_never_disarm_newer_release_b() {
+        use chinwag_cli::release_sync::{
+            CURRENT_TARGET_TRIPLE, RELEASE_MANIFEST_SCHEMA, ReleaseApplyOutcome, ReleaseManifestV1,
+            ReleaseSyncError, cleanup_prepared_reexec, expected_artifact_key, local_binary_sha256,
+            prepare_immutable_reexec_binary,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let home_dir = temp.path().join("home");
+        let bin_dir = home_dir.join(".local/bin");
+        let build_dir = temp.path().join("build");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+
+        let compile_signed_macho = |label: &str| -> (PathBuf, [u8; 32], String) {
+            let src = build_dir.join(format!("{label}.c"));
+            let out = build_dir.join(format!("chinwag-{label}"));
+            fs::write(
+                &src,
+                format!("int main(void) {{ const char *v = \"{label}\"; (void)v; return 0; }}\n"),
+            )
+            .unwrap();
+            let st = std::process::Command::new("/usr/bin/clang")
+                .args(["-O2", "-o"])
+                .arg(&out)
+                .arg(&src)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let cs = std::process::Command::new("/usr/bin/codesign")
+                .args(["-s", "-", "--force"])
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(cs.success());
+            let sha = local_binary_sha256(&out).unwrap();
+            let sha_hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+            (out, sha, sha_hex)
+        };
+
+        let (bin_startup, sha_startup, _) = compile_signed_macho("stale_startup");
+        let (bin_a, sha_a, _) = compile_signed_macho("stale_a");
+        let (bin_b, sha_b, sha_b_hex) = compile_signed_macho("stale_b");
+        let install_path = bin_dir.join("chinwag");
+        fs::copy(&bin_a, &install_path).unwrap();
+
+        let manifest_b = ReleaseManifestV1 {
+            schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+            binary: "chinwag".to_owned(),
+            target_triple: CURRENT_TARGET_TRIPLE.to_owned(),
+            git_commit: "bbbbbbbbbbbbbbbb".to_owned(),
+            commit_epoch: 200,
+            built_at_ms: 1_700_000_200,
+            sha256: sha_b_hex.clone(),
+            blake3: "bb".repeat(32),
+            size_bytes: fs::metadata(&bin_b).unwrap().len(),
+            artifact_key: expected_artifact_key("chinwag", CURRENT_TARGET_TRIPLE, &sha_b_hex),
+            rollback: false,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let repo_dir = temp.path().join("repo");
+            fs::create_dir_all(repo_dir.join(".chinwag/bus")).unwrap();
+            let (bcast_tx, _) = broadcast::channel::<BusMessage>(16);
+            let (fwd_tx, _) = tokio::sync::mpsc::channel::<BusMessage>(16);
+            let (_done_tx, done_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(8);
+            let job_gate = Arc::new(Mutex::new(ReleaseJobQueueGate::default()));
+            let publications = Mutex::new(NativePublication::open(&repo_dir).unwrap());
+            let daemon_state = Mutex::new(DaemonState {
+                ok: true,
+                pid: 1,
+                endpoint_id: "ep".into(),
+                bound_sockets: vec![],
+                alpns: vec![],
+                repo_root: repo_dir.to_string_lossy().into_owned(),
+                tasks_md: String::new(),
+                messages_jsonl: String::new(),
+                started_at: 0,
+                last_heartbeat: 0,
+                total_messages: 0,
+                product_governor: String::new(),
+                delivery_router: String::new(),
+            });
+
+            let mut pending_reexec = PendingReexecSlot::default();
+            let gen_a = pending_reexec.arm(install_path.clone(), sha_a);
+            let mut retries = 0u32;
+            let mut sink = Vec::new();
+
+            // Prepare a startup-digest snapshot up front before B replaces `install_path`.
+            let startup_copy = build_dir.join("startup_snapshot_src");
+            fs::copy(&bin_startup, &startup_copy).unwrap();
+            let stale_startup_prepared =
+                prepare_immutable_reexec_binary(&home_dir, &startup_copy, &sha_startup).unwrap();
+
+            // Simulate B completing and being processed by the responsive daemon loop
+            // BEFORE A's preparation returns its result!
+            fs::copy(&bin_b, &install_path).unwrap();
+            assert!(process_release_daemon_event(
+                ReleaseDaemonEvent::Applied {
+                    binary: "chinwag".to_owned(),
+                    outcome: Box::new(ReleaseApplyOutcome::Installed {
+                        manifest: manifest_b,
+                        install_path: install_path.clone(),
+                        previous_backup_path: None,
+                        receipt_message: None,
+                    }),
+                },
+                &mut sink,
+                &repo_dir,
+                "ep",
+                false,
+                &fwd_tx,
+                &publications,
+                &bcast_tx,
+                &daemon_state,
+                Some(sha_startup),
+                false,
+                &mut pending_reexec,
+            ));
+            let gen_b = pending_reexec.current().unwrap().generation;
+            assert!(gen_b > gen_a);
+
+            // 1. Stale terminal error from A (e.g. codesign timeout after releasing lock)
+            //    MUST NOT disarm B or emit terminal refusal for the active target!
+            let out_terminal = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                gen_a,
+                Ok(Err(ReleaseSyncError::CodesignFailed(
+                    "timed out after 5000ms".into(),
+                ))),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(
+                out_terminal,
+                ReexecPrepStepOutcome::RescheduleTimer(_)
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_b);
+            assert_eq!(pending_reexec.current().unwrap().generation, gen_b);
+            assert_eq!(retries, 0);
+
+            // 2. Stale worker panic from A MUST NOT disarm B!
+            let panic_join =
+                tokio::spawn(async move { panic!("simulated stale prep panic") }).await;
+            let out_panic = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                gen_a,
+                panic_join,
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(
+                out_panic,
+                ReexecPrepStepOutcome::RescheduleTimer(_)
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_b);
+            assert_eq!(retries, 0);
+
+            // 3. Stale transient error from A MUST NOT consume B's retry budget!
+            let out_transient = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                gen_a,
+                Ok(Err(ReleaseSyncError::TransientIo("stale EMFILE".into()))),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(
+                out_transient,
+                ReexecPrepStepOutcome::RescheduleTimer(_)
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_b);
+            assert_eq!(retries, 0);
+
+            // 4. Stale `Ok(Ok(prepared))` matching `startup_chinwag_sha256` MUST NOT
+            //    trigger the startup-digest shortcut to disarm B!
+            let out_startup_shortcut = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                gen_a,
+                Ok(Ok(stale_startup_prepared)),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(
+                out_startup_shortcut,
+                ReexecPrepStepOutcome::RescheduleTimer(_)
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_b);
+
+            // 5. Same-digest ABA (`A` gen_1 -> cleared -> `A` gen_3): stale terminal error
+            //    from `gen_1` MUST NOT disarm `gen_3` even though `(install_path, sha_a)` matches!
+            let mut aba_slot = PendingReexecSlot::default();
+            let aba_gen_1 = aba_slot.arm(install_path.clone(), sha_a);
+            aba_slot.clear();
+            let aba_gen_2 = aba_slot.arm(install_path.clone(), sha_a);
+            assert!(aba_gen_2 > aba_gen_1);
+            let out_aba = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                aba_gen_1,
+                Ok(Err(ReleaseSyncError::CodesignFailed("stale gen_1".into()))),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut aba_slot,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(out_aba, ReexecPrepStepOutcome::RescheduleTimer(_)));
+            assert_eq!(aba_slot.current().unwrap().generation, aba_gen_2);
+
+            // 6. Finally, B's own current-generation preparation prepares and commits cleanly!
+            let prepared_b =
+                prepare_immutable_reexec_binary(&home_dir, &install_path, &sha_b).unwrap();
+            match complete_reexec_prep_step(
+                install_path.clone(),
+                sha_b,
+                gen_b,
+                Ok(Ok(prepared_b)),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            ) {
+                ReexecPrepStepOutcome::CommitReexec { prepared, .. } => {
+                    assert_eq!(prepared.sha256, sha_b);
+                    cleanup_prepared_reexec(prepared);
+                }
+                _ => panic!("expected CommitReexec for current generation B"),
+            }
+        });
     }
 }
 

@@ -695,3 +695,208 @@ async fn daemon_signer_is_bound_to_the_actual_endpoint_and_reuses_room_codec() {
     room_wire::verify_advertisement(&wire, endpoint.id(), 1000).unwrap();
     endpoint.close().await;
 }
+
+#[test]
+fn suspend_and_reopen_keep_gate_denied_preserve_nonces_and_accept_unchanged_peer_once() {
+    let mut fixture = Fixture::new();
+    let peer_ad = fixture.bind_peer(3, 1);
+    let peer_receipt = storage_receipt_for_private_test(&fixture.coordinator, &peer_ad);
+    let old_snapshot = fixture.gate.current_peer().unwrap();
+    assert_eq!(fixture.gate.posture().unwrap().phase, "LIVE_AT_OBSERVATION");
+
+    // Clean WebSocket 1000 disconnect suspends the owner without revoking the gate,
+    // while immediately invalidating issued snapshots and denying peer access.
+    fixture.owner.suspend_for_reconnect().unwrap();
+    drop(fixture.owner);
+    assert_eq!(fixture.gate.posture().unwrap().phase, "PENDING");
+    assert!(fixture.gate.current_peer().is_err());
+    assert!(
+        old_snapshot
+            .revalidate_for(fixture.peer.endpoint_id())
+            .is_err()
+    );
+
+    let mut next_owner = fixture
+        .gate
+        .reopen_owner(
+            fixture.local.endpoint_id(),
+            fixture.coordinator.endpoint_id(),
+            fixture.gate.configuration().relay_policy(),
+            "https://owned-room.invalid/",
+        )
+        .unwrap();
+
+    // Replaying the initial own nonce on the reopened session must fail closed.
+    let replayed_own = advertisement(&fixture.local, 1, 1, 1060);
+    let replayed_receipt = storage_receipt_for_private_test(&fixture.coordinator, &replayed_own);
+    assert!(matches!(
+        next_owner.bind_own(replayed_own, replayed_receipt, &"01".repeat(32)),
+        Err(BindingError::Replay)
+    ));
+
+    // Fresh own attach/advertise on session 2 succeeds.
+    let fresh_own = advertisement(&fixture.local, 2, 1, 1080);
+    let fresh_receipt = storage_receipt_for_private_test(&fixture.coordinator, &fresh_own);
+    next_owner
+        .bind_own(fresh_own, fresh_receipt, &"02".repeat(32))
+        .unwrap();
+
+    // Single-sided reconnect: the coordinator sends the peer's still-unexpired
+    // current advertisement (session 3, revision 1) on the new socket.
+    next_owner.bind_peer(&peer_ad, &peer_receipt).unwrap();
+    assert_eq!(fixture.gate.posture().unwrap().phase, "LIVE_AT_OBSERVATION");
+    assert!(fixture.gate.current_peer().is_ok());
+
+    // Once bound on the active session, replaying the exact same revision again
+    // on the same socket is still rejected as a replay.
+    assert!(matches!(
+        next_owner.bind_peer(&peer_ad, &peer_receipt),
+        Err(BindingError::Replay)
+    ));
+
+    // Terminal revocation permanently blocks reopen_owner.
+    drop(next_owner);
+    assert!(matches!(
+        fixture.gate.reopen_owner(
+            fixture.local.endpoint_id(),
+            fixture.coordinator.endpoint_id(),
+            fixture.gate.configuration().relay_policy(),
+            "https://owned-room.invalid/",
+        ),
+        Err(BindingError::Revoked)
+    ));
+}
+
+#[test]
+fn unchanged_peer_readmission_preserves_original_monotonic_cutoff() {
+    let mut fixture = Fixture::new();
+    let peer_ad = fixture.bind_peer(3, 1);
+    let peer_receipt = storage_receipt_for_private_test(&fixture.coordinator, &peer_ad);
+
+    // Original peer admission at wall=1000, monotonic=0ms has monotonic cutoff 60_000ms.
+    fixture.owner.suspend_for_reconnect().unwrap();
+    drop(fixture.owner);
+
+    // Advance monotonic clock to 70_000ms (past original 60_000ms cutoff) while wall
+    // clock is skewed/lagging at 1030 (< expiry_unix 1060).
+    fixture.clock.wall.store(1030, Ordering::SeqCst);
+    fixture.clock.millis.store(70_000, Ordering::SeqCst);
+
+    let mut next_owner = fixture
+        .gate
+        .reopen_owner(
+            fixture.local.endpoint_id(),
+            fixture.coordinator.endpoint_id(),
+            fixture.gate.configuration().relay_policy(),
+            "https://owned-room.invalid/",
+        )
+        .unwrap();
+    let fresh_own = advertisement(&fixture.local, 2, 1, 1090);
+    let fresh_receipt = storage_receipt_for_private_test(&fixture.coordinator, &fresh_own);
+    next_owner
+        .bind_own(fresh_own, fresh_receipt, &"02".repeat(32))
+        .unwrap();
+
+    // Unchanged peer record MUST be rejected as Expired because it crossed its
+    // original monotonic deadline (60_000ms), never granted a fresh deadline!
+    assert!(matches!(
+        next_owner.bind_peer(&peer_ad, &peer_receipt),
+        Err(BindingError::Expired)
+    ));
+    assert!(fixture.gate.current_peer().is_err());
+
+    // Conversely, if readmitted at wall=1010 / monotonic=20_000ms (wall would suggest
+    // +50s -> 70_000ms), its deadline remains clamped to the original 60_000ms cutoff.
+    let mut fixture2 = Fixture::new();
+    let peer_ad2 = fixture2.bind_peer(3, 1);
+    let peer_receipt2 = storage_receipt_for_private_test(&fixture2.coordinator, &peer_ad2);
+    fixture2.owner.suspend_for_reconnect().unwrap();
+    drop(fixture2.owner);
+    fixture2.clock.wall.store(1010, Ordering::SeqCst);
+    fixture2.clock.millis.store(20_000, Ordering::SeqCst);
+    let mut owner2 = fixture2
+        .gate
+        .reopen_owner(
+            fixture2.local.endpoint_id(),
+            fixture2.coordinator.endpoint_id(),
+            fixture2.gate.configuration().relay_policy(),
+            "https://owned-room.invalid/",
+        )
+        .unwrap();
+    let own2 = advertisement(&fixture2.local, 2, 1, 1090);
+    let own2_receipt = storage_receipt_for_private_test(&fixture2.coordinator, &own2);
+    owner2
+        .bind_own(own2, own2_receipt, &"02".repeat(32))
+        .unwrap();
+    owner2.bind_peer(&peer_ad2, &peer_receipt2).unwrap();
+    assert!(fixture2.gate.current_peer().is_ok());
+
+    fixture2.clock.millis.store(60_000, Ordering::SeqCst);
+    assert!(matches!(
+        fixture2.gate.current_peer(),
+        Err(BindingError::Expired)
+    ));
+}
+
+#[test]
+fn expired_inflight_renewal_retires_nonce_and_suspends_for_single_reopen() {
+    let mut fixture = Fixture::new();
+    fixture.bind_peer(3, 1);
+    fixture.clock.wall.store(1030, Ordering::SeqCst);
+    fixture.clock.millis.store(30_000, Ordering::SeqCst);
+    let ticket = fixture.owner.prepare_renewal().unwrap();
+    let ad = renewed_own(&fixture, 2, 1090, 11);
+    let receipt = storage_receipt_for_private_test(&fixture.coordinator, &ad);
+
+    // Cross lease expiry while HTTP renewal is in flight.
+    fixture.clock.wall.store(1060, Ordering::SeqCst);
+    fixture.clock.millis.store(60_000, Ordering::SeqCst);
+    assert!(matches!(
+        fixture
+            .owner
+            .commit_renewal(ticket, ad.clone(), receipt.clone()),
+        Err(BindingError::Expired)
+    ));
+
+    // Retire the attempted nonce and suspend cleanly instead of terminal revocation.
+    fixture
+        .owner
+        .record_retired_nonce_and_suspend(&ad.challenge_nonce)
+        .unwrap();
+    // Idempotent second suspend (as invoked by RoomSession::close_for_reconnect).
+    fixture.owner.suspend_for_reconnect().unwrap();
+    drop(fixture.owner);
+
+    assert!(fixture.gate.current_peer().is_err());
+    assert_eq!(fixture.gate.posture().unwrap().phase, "PENDING");
+
+    // Single-use reopen lease succeeds once and rejects concurrent/duplicate reopen.
+    let mut reopened = fixture
+        .gate
+        .reopen_owner(
+            fixture.local.endpoint_id(),
+            fixture.coordinator.endpoint_id(),
+            fixture.gate.configuration().relay_policy(),
+            "https://owned-room.invalid/",
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.gate.reopen_owner(
+            fixture.local.endpoint_id(),
+            fixture.coordinator.endpoint_id(),
+            fixture.gate.configuration().relay_policy(),
+            "https://owned-room.invalid/",
+        ),
+        Err(BindingError::Revoked)
+    ));
+
+    // Attempting to reuse the retired renewal nonce on the new session fails closed.
+    let mut replay_retired_nonce = advertisement(&fixture.local, 2, 1, 1120);
+    replay_retired_nonce.challenge_nonce = ad.challenge_nonce.clone();
+    let bad_receipt = storage_receipt_for_private_test(&fixture.coordinator, &replay_retired_nonce);
+    assert!(
+        reopened
+            .bind_own(replay_retired_nonce, bad_receipt, &"02".repeat(32))
+            .is_err()
+    );
+}
