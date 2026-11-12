@@ -710,10 +710,10 @@ fn validate_daemon_state_structure(state: &DaemonState) -> Result<(), ()> {
         || state.bound_sockets.is_empty()
         || state.endpoint_id.parse::<EndpointId>().is_err()
         || state.started_at > unix_now().saturating_add(60)
-        || !state.bound_sockets.iter().all(|s| {
-            s.parse::<SocketAddr>()
-                .is_ok_and(|addr| !addr.ip().is_unspecified() && addr.port() != 0)
-        })
+        || !state
+            .bound_sockets
+            .iter()
+            .all(|s| s.parse::<SocketAddr>().is_ok_and(|addr| addr.port() != 0))
     {
         return Err(());
     }
@@ -3177,7 +3177,10 @@ fn resolve_release_publish_daemon_route_with_env(
             explicit_route: false,
         });
     }
-    if let Some(common_root) = selected.common_worktree_root().filter(|p| *p != exec_root) {
+    if selected.is_linked_worktree() {
+        let Some(common_root) = selected.common_worktree_root().filter(|p| *p != exec_root) else {
+            return Err(InstanceError::PublicationRejected);
+        };
         let common_selected = chinwag_cli::execution_binding::select_repository(
             chinwag_cli::execution_binding::RepoSelectors {
                 explicit_repo: Some(common_root),
@@ -3187,9 +3190,11 @@ fn resolve_release_publish_daemon_route_with_env(
         )
         .map_err(|_| InstanceError::PublicationRejected)?;
         common_selected
-            .revalidate()
+            .verify_effective_toplevel()
             .map_err(|_| InstanceError::PublicationRejected)?;
-        if !selected.same_common_git_identity(&common_selected) {
+        if common_selected.is_linked_worktree()
+            || !selected.same_common_git_identity(&common_selected)
+        {
             return Err(InstanceError::PublicationRejected);
         }
         let Some(common_daemon) =
@@ -7261,13 +7266,19 @@ mod tests {
             Err(InstanceError::PublicationRejected)
         ));
 
-        // 2. Start active primary daemon -> linked worktree discovers it without mutating `linked`.
+        // 2. Start active primary daemon (including ordinary wildcard `0.0.0.0` / `[::]` bind
+        //    entries as emitted by `endpoint.bound_sockets()`) -> linked worktree discovers it
+        //    without mutating `linked`.
         let valid_endpoint = SecretKey::from_bytes(&[7; 32]).public().to_string();
         let common_state = DaemonState {
             ok: true,
             pid: std::process::id(),
             endpoint_id: valid_endpoint.clone(),
-            bound_sockets: vec!["127.0.0.1:44330".to_owned()],
+            bound_sockets: vec![
+                "0.0.0.0:44330".to_owned(),
+                "[::]:44330".to_owned(),
+                "127.0.0.1:44330".to_owned(),
+            ],
             alpns: vec!["chinwag/bus/1".to_owned()],
             repo_root: primary.to_string_lossy().into_owned(),
             tasks_md: primary.join("TASKS.md").to_string_lossy().into_owned(),
@@ -7339,7 +7350,7 @@ mod tests {
             resolve_release_publish_daemon_route_with_env(&linked_sel, None, None).unwrap();
         assert_eq!(
             after_dead_local.daemon.unwrap().bound_sockets,
-            vec!["127.0.0.1:44330".to_owned()]
+            common_state.bound_sockets
         );
 
         // 5. Active local daemon in linked worktree takes precedence over primary daemon.
@@ -7353,10 +7364,277 @@ mod tests {
             vec!["127.0.0.1:45441".to_owned()]
         );
 
-        // 6. Symlinked local `daemon.json` fails closed (`Err(PublicationRejected)`) in BOTH
+        // 6. Real daemon startup state (`run_daemon_loop_inner` writing `endpoint.bound_sockets()`)
+        //    is accepted by `read_daemon_state_strict` and discovered from `linked_sel`.
+        fs::remove_file(daemon_json_path(&linked)).unwrap();
+        fs::remove_file(daemon_json_path(&primary)).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let mut out = Vec::new();
+            let daemon_fut = run_daemon_loop(
+                primary.clone(),
+                0,
+                None,
+                true,
+                &mut out,
+                async move {
+                    let _ = stop_rx.await;
+                },
+            );
+            let probe_fut = async {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let live_discovered = loop {
+                    if let Ok(route) =
+                        resolve_release_publish_daemon_route_with_env(&linked_sel, None, None)
+                        && let Some(d) = route.daemon
+                    {
+                        break d;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for real daemon startup state to validate from linked worktree"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                };
+                assert!(
+                    live_discovered.bound_sockets.iter().any(|s| {
+                        s.parse::<std::net::SocketAddr>()
+                            .is_ok_and(|a| a.ip().is_unspecified())
+                    }),
+                    "expected real daemon bound_sockets to contain wildcard bind entry: {:?}",
+                    live_discovered.bound_sockets
+                );
+                assert!(
+                    read_daemon_state_strict_with_env(&primary, None, None)
+                        .unwrap()
+                        .is_some()
+                );
+                let _ = stop_tx.send(());
+            };
+            let (exit_code, ()) = tokio::join!(daemon_fut, probe_fut);
+            assert_eq!(exit_code, 0);
+        });
+
+        // 7. Linked worktrees backed by a bare repo (`bare.git`) or `--separate-git-dir`
+        //    (including a `.git`-named external holder directory) fail closed (`PublicationRejected`)
+        //    when no local daemon is running rather than falling through to orphan `daemon: None`.
+        let bare_repo = base.join("bare.git");
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "clone",
+                    "-q",
+                    "--bare",
+                    primary.to_str().unwrap(),
+                    bare_repo.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bare_linked = base.join("bare-linked");
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "bare-wt",
+                    bare_linked.to_str().unwrap(),
+                ])
+                .current_dir(&bare_repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bare_linked_sel = chinwag_cli::execution_binding::select_repository(
+            chinwag_cli::execution_binding::RepoSelectors {
+                explicit_repo: Some(&bare_linked),
+                environment_repo: None,
+                cwd: &bare_linked,
+            },
+        )
+        .unwrap();
+        assert!(bare_linked_sel.is_linked_worktree());
+        assert!(bare_linked_sel.common_worktree_root().is_none());
+        assert!(matches!(
+            resolve_release_publish_daemon_route_with_env(&bare_linked_sel, None, None),
+            Err(InstanceError::PublicationRejected)
+        ));
+
+        let sep_holder = base.join("sep-holder");
+        fs::create_dir_all(&sep_holder).unwrap();
+        let sep_gitdir = sep_holder.join("repo.git");
+        let sep_primary = base.join("sep-primary");
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    sep_gitdir.to_str().unwrap(),
+                    sep_primary.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(sep_primary.join("README.md"), "seed\n").unwrap();
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(["add", "README.md"])
+                .current_dir(&sep_primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "seed",
+                ])
+                .current_dir(&sep_primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        write_daemon_state(&sep_holder, &common_state).unwrap();
+        let sep_linked = base.join("sep-linked");
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "sep-wt",
+                    sep_linked.to_str().unwrap(),
+                ])
+                .current_dir(&sep_primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sep_linked_sel = chinwag_cli::execution_binding::select_repository(
+            chinwag_cli::execution_binding::RepoSelectors {
+                explicit_repo: Some(&sep_linked),
+                environment_repo: None,
+                cwd: &sep_linked,
+            },
+        )
+        .unwrap();
+        assert!(sep_linked_sel.is_linked_worktree());
+        assert_eq!(sep_linked_sel.common_worktree_root(), None);
+        assert!(matches!(
+            resolve_release_publish_daemon_route_with_env(&sep_linked_sel, None, None),
+            Err(InstanceError::PublicationRejected)
+        ));
+
+        // 7c. Even when an external holder directory uses a `.git` basename, redirecting
+        //     `core.worktree` away from the holder causes `verify_effective_toplevel()` to
+        //     reject a planted `daemon.json` inside the holder directory.
+        let dotgit_holder = base.join("dotgit-holder");
+        fs::create_dir_all(&dotgit_holder).unwrap();
+        let dotgit_dir = dotgit_holder.join(".git");
+        let dotgit_primary = base.join("dotgit-primary");
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    dotgit_dir.to_str().unwrap(),
+                    dotgit_primary.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(["config", "core.worktree", dotgit_primary.to_str().unwrap(),])
+                .current_dir(&dotgit_holder)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(dotgit_primary.join("README.md"), "seed\n").unwrap();
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(["add", "README.md"])
+                .current_dir(&dotgit_primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "seed",
+                ])
+                .current_dir(&dotgit_primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        write_daemon_state(&dotgit_holder, &common_state).unwrap();
+        let dotgit_linked = base.join("dotgit-linked");
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "dotgit-wt",
+                    dotgit_linked.to_str().unwrap(),
+                ])
+                .current_dir(&dotgit_primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let dotgit_linked_sel = chinwag_cli::execution_binding::select_repository(
+            chinwag_cli::execution_binding::RepoSelectors {
+                explicit_repo: Some(&dotgit_linked),
+                environment_repo: None,
+                cwd: &dotgit_linked,
+            },
+        )
+        .unwrap();
+        assert!(dotgit_linked_sel.is_linked_worktree());
+        assert!(matches!(
+            resolve_release_publish_daemon_route_with_env(&dotgit_linked_sel, None, None),
+            Err(InstanceError::PublicationRejected)
+        ));
+
+        // 8. Symlinked local `daemon.json` fails closed (`Err(PublicationRejected)`) in BOTH
         //    `resolve_release_publish_daemon_route` AND `read_daemon_state_strict` — never
         //    followed via `fs::read_to_string` and never masked by local-jsonl split-brain!
-        fs::remove_file(daemon_json_path(&linked)).unwrap();
+        write_daemon_state(&primary, &common_state).unwrap();
         let outside = base.join("outside-daemon.json");
         let mut f = fs::OpenOptions::new()
             .create_new(true)
@@ -7368,6 +7646,13 @@ mod tests {
             .unwrap();
         drop(f);
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::create_dir_all(linked.join(".chinwag/bus")).unwrap();
+        fs::set_permissions(linked.join(".chinwag"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            linked.join(".chinwag/bus"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         symlink(&outside, daemon_json_path(&linked)).unwrap();
         assert!(matches!(
             resolve_release_publish_daemon_route_with_env(&linked_sel, None, None),
@@ -7375,7 +7660,7 @@ mod tests {
         ));
         assert!(read_daemon_state_strict_with_env(&linked, None, None).is_err());
 
-        // 7. Symlinked primary `daemon.json` also fails closed (`Err(PublicationRejected)`).
+        // 9. Symlinked primary `daemon.json` also fails closed (`Err(PublicationRejected)`).
         fs::remove_file(daemon_json_path(&linked)).unwrap();
         fs::remove_file(daemon_json_path(&primary)).unwrap();
         symlink(&outside, daemon_json_path(&primary)).unwrap();

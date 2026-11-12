@@ -327,6 +327,9 @@ impl RepositorySelection {
     pub fn execution_root(&self) -> &Path {
         self.root()
     }
+    pub fn is_linked_worktree(&self) -> bool {
+        self.git.commonfile.is_some() || self.git.gitdir.id != self.git.common.id
+    }
     pub fn common_worktree_root(&self) -> Option<&Path> {
         if self.git.common.path.file_name() == Some(OsStr::new(".git")) {
             self.git.common.path.parent()
@@ -336,6 +339,36 @@ impl RepositorySelection {
     }
     pub fn same_common_git_identity(&self, other: &Self) -> bool {
         self.git.common.id == other.git.common.id
+    }
+    pub fn verify_effective_toplevel(&self) -> BindingResult<()> {
+        for path in [
+            self.git.gitdir.path.join("config"),
+            self.git.gitdir.path.join("config.worktree"),
+            self.git.common.path.join("config"),
+        ] {
+            if std::fs::symlink_metadata(&path).is_ok() {
+                let f = HeldFile::open(&path, MAX_GIT_TEXT)?;
+                let text = std::str::from_utf8(&f.bytes)
+                    .map_err(|_| BindingError::UnsupportedGitConfig)?
+                    .to_ascii_lowercase();
+                if text.contains("include") {
+                    return Err(BindingError::UnsupportedGitConfig);
+                }
+            }
+        }
+        let top = safe_git(&self.root.path, &["rev-parse", "--show-toplevel"])?;
+        let top = std::str::from_utf8(&top)
+            .map_err(|_| BindingError::GitMetadata)?
+            .strip_suffix('\n')
+            .ok_or(BindingError::GitMetadata)?;
+        if top.contains(['\n', '\r']) {
+            return Err(BindingError::GitMetadata);
+        }
+        let effective_root = HeldDir::open(Path::new(top))?;
+        if effective_root.path != self.root.path || effective_root.id != self.root.id {
+            return Err(BindingError::NamespaceChanged);
+        }
+        self.revalidate()
     }
     pub fn revalidate(&self) -> BindingResult<()> {
         self.root.verify()?;
