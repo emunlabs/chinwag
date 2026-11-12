@@ -1851,7 +1851,6 @@ async fn run_daemon_loop_reexecable(
                         &ep_clone,
                         &sched_clone,
                         job,
-                        Instant::now(),
                     )
                 })
                 .await;
@@ -1863,7 +1862,7 @@ async fn run_daemon_loop_reexecable(
                     }
                     Err(_) => {
                         if let Ok(mut sched) = sched_for_worker.lock() {
-                            sched.on_worker_panic();
+                            sched.on_worker_panic(Instant::now());
                         }
                         let _ = done_tx
                             .send(ReleaseDaemonEvent::Rejected {
@@ -5311,7 +5310,6 @@ mod tests {
                     "ep-test",
                     &Mutex::new(ReleaseDaemonScheduler::default()),
                     ReleaseDaemonJob::StartupCatchup,
-                    now,
                 );
                 sched.on_catchup_send_full();
             } else {

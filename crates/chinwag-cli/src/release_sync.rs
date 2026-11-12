@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 #[cfg(target_os = "macos")]
@@ -206,6 +206,7 @@ pub struct BinarySyncReport {
     pub release_key: String,
     pub manifest: ReleaseManifestV1,
     pub outcome: Result<ReleaseApplyOutcome, ReleaseSyncError>,
+    pub completed_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,7 +348,7 @@ pub trait ReleaseArtifactStore: Send + Sync {
     fn upload_artifact(
         &self,
         artifact_key: &str,
-        local_file: &Path,
+        source_file: &File,
     ) -> Result<(), ReleaseSyncError>;
     fn download_artifact(
         &self,
@@ -359,6 +360,8 @@ pub trait ReleaseArtifactStore: Send + Sync {
 pub struct WranglerR2ArtifactStore {
     home_dir: PathBuf,
     bucket: String,
+    #[cfg(test)]
+    wrangler_bin_override: Option<PathBuf>,
 }
 
 impl WranglerR2ArtifactStore {
@@ -366,10 +369,27 @@ impl WranglerR2ArtifactStore {
         Self {
             home_dir,
             bucket: R2_BUCKET_NAME.to_owned(),
+            #[cfg(test)]
+            wrangler_bin_override: None,
         }
     }
 
-    fn resolve_wrangler_bin() -> Result<PathBuf, ReleaseSyncError> {
+    #[cfg(test)]
+    fn with_wrangler_bin(home_dir: PathBuf, wrangler_bin: PathBuf) -> Self {
+        Self {
+            home_dir,
+            bucket: R2_BUCKET_NAME.to_owned(),
+            wrangler_bin_override: Some(wrangler_bin),
+        }
+    }
+
+    fn resolve_wrangler_bin(&self) -> Result<PathBuf, ReleaseSyncError> {
+        #[cfg(test)]
+        if let Some(ref candidate) = self.wrangler_bin_override
+            && is_resolvable_host_cli_binary(candidate)
+        {
+            return Ok(candidate.clone());
+        }
         if let Some(override_bin) = std::env::var_os("CHINWAG_WRANGLER_BIN") {
             let candidate = PathBuf::from(override_bin);
             if is_resolvable_host_cli_binary(&candidate) {
@@ -395,9 +415,25 @@ impl WranglerR2ArtifactStore {
         ))
     }
 
-    fn run_wrangler(&self, args: &[&str]) -> Result<(), ReleaseSyncError> {
-        let wrangler = Self::resolve_wrangler_bin()?;
+    fn run_wrangler(
+        &self,
+        args: &[&str],
+        stdin_source: Option<&File>,
+    ) -> Result<(), ReleaseSyncError> {
+        let wrangler = self.resolve_wrangler_bin()?;
         let chinwag_dir = ensure_private_dir(&self.home_dir.join(".chinwag"))?;
+        let stdin_cfg = match stdin_source {
+            Some(file) => {
+                let mut dup_fd = file.try_clone().map_err(|e| {
+                    ReleaseSyncError::ArtifactStoreFailed(format!("dup upload fd: {e}"))
+                })?;
+                dup_fd.seek(SeekFrom::Start(0)).map_err(|e| {
+                    ReleaseSyncError::ArtifactStoreFailed(format!("rewind upload fd: {e}"))
+                })?;
+                Stdio::from(dup_fd)
+            }
+            None => Stdio::null(),
+        };
         let mut cmd = Command::new(wrangler);
         // Critical under launchd (where default cwd is `/`): running wrangler in
         // `$HOME/.chinwag` ensures `.wrangler/cache` resolves inside a writable
@@ -410,7 +446,7 @@ impl WranglerR2ArtifactStore {
                 "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             )
             .env("CI", "1")
-            .stdin(Stdio::null())
+            .stdin(stdin_cfg)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         run_bounded_command(&mut cmd, WRANGLER_R2_TIMEOUT).map_err(|reason| {
@@ -423,24 +459,26 @@ impl ReleaseArtifactStore for WranglerR2ArtifactStore {
     fn upload_artifact(
         &self,
         artifact_key: &str,
-        local_file: &Path,
+        source_file: &File,
     ) -> Result<(), ReleaseSyncError> {
         validate_artifact_key_structure(artifact_key)?;
         let object_path = format!("{}/{artifact_key}", self.bucket);
-        let file_str = local_file
-            .to_str()
-            .ok_or(ReleaseSyncError::SafePathViolation("non_utf8_staging_path"))?;
-        self.run_wrangler(&[
-            "r2",
-            "object",
-            "put",
-            &object_path,
-            "--file",
-            file_str,
-            "--content-type",
-            "application/octet-stream",
-            "--remote",
-        ])
+        // Stream directly from the caller's verified, kernel-immutable (`UF_IMMUTABLE`)
+        // open file descriptor via `--pipe` (`stdin`) so no `.staging` pathname is ever
+        // resolved after digest + smoke verification.
+        self.run_wrangler(
+            &[
+                "r2",
+                "object",
+                "put",
+                &object_path,
+                "--pipe",
+                "--content-type",
+                "application/octet-stream",
+                "--remote",
+            ],
+            Some(source_file),
+        )
     }
 
     fn download_artifact(
@@ -453,15 +491,18 @@ impl ReleaseArtifactStore for WranglerR2ArtifactStore {
         let file_str = destination_file
             .to_str()
             .ok_or(ReleaseSyncError::SafePathViolation("non_utf8_staging_path"))?;
-        self.run_wrangler(&[
-            "r2",
-            "object",
-            "get",
-            &object_path,
-            "--file",
-            file_str,
-            "--remote",
-        ])
+        self.run_wrangler(
+            &[
+                "r2",
+                "object",
+                "get",
+                &object_path,
+                "--file",
+                file_str,
+                "--remote",
+            ],
+            None,
+        )
     }
 }
 
@@ -1481,6 +1522,7 @@ pub fn cleanup_stale_reexec_dirs(home_dir: &Path) {
         };
         let Some(rest) = name
             .strip_prefix("reexec.")
+            .or_else(|| name.strip_prefix("op.pub."))
             .or_else(|| name.strip_prefix("op."))
         else {
             continue;
@@ -2595,12 +2637,11 @@ fn publish_release_inner(
 
     let (bin_dir, staging_dir) = ensure_bin_and_staging_dirs(req.home_dir)?;
     let nonce = csprng_hex_16()?;
-    let op_dir = staging_dir.join(format!("op.pub.{}.{nonce}", std::process::id()));
+    let op_dir = staging_dir.join(format!("op.{}.pub.{nonce}", std::process::id()));
     fs::create_dir(&op_dir)
         .map_err(|e| ReleaseSyncError::InstallFailed(format!("pub op_dir create: {e}")))?;
     fs::set_permissions(&op_dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| ReleaseSyncError::InstallFailed(format!("pub op_dir chmod: {e}")))?;
-    let staged_path = op_dir.join(req.binary);
     let mut op_guard = StagedOpGuard::new(op_dir.clone(), req.binary);
 
     let (op_dir_fd, op_dir_id) = open_dir_nofollow(&op_dir)?;
@@ -2655,7 +2696,7 @@ fn publish_release_inner(
     let target_triple = CURRENT_TARGET_TRIPLE.to_owned();
     let artifact_key = expected_artifact_key(req.binary, &target_triple, &sha256);
 
-    store.upload_artifact(&artifact_key, &staged_path)?;
+    store.upload_artifact(&artifact_key, &staged_file)?;
     if capture_ancestor_chain_inodes(req.home_dir, &op_dir)? != ancestors_before {
         return Err(ReleaseSyncError::SafePathViolation("ancestor_inode_swap"));
     }
@@ -2777,10 +2818,12 @@ fn sync_releases_from_journal_per_binary_inner(
         roots,
         receipt_key_override,
         None,
+        &mut Instant::now,
     )?
     .executed_reports)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_releases_from_journal_per_binary_filtered_inner(
     home_dir: &Path,
     messages_jsonl_path: &Path,
@@ -2789,6 +2832,7 @@ fn sync_releases_from_journal_per_binary_filtered_inner(
     roots: &ReleaseTrustRoots<'_>,
     receipt_key_override: Option<&SigningKey>,
     eligibility: Option<&ReleaseEligibilityFilter>,
+    clock: &mut dyn FnMut() -> Instant,
 ) -> Result<JournalCatchupBatch, ReleaseSyncError> {
     let mut candidates_per_binary: BTreeMap<String, Vec<(BusMessage, ReleaseManifestV1)>> =
         BTreeMap::new();
@@ -2906,11 +2950,13 @@ fn sync_releases_from_journal_per_binary_filtered_inner(
             Some(observed_max_epoch),
             None,
         );
+        let completed_at = clock();
         executed_reports.push(BinarySyncReport {
             binary,
             release_key,
             manifest,
             outcome,
+            completed_at,
         });
     }
     Ok(JournalCatchupBatch {
@@ -3036,13 +3082,31 @@ impl ReleaseDaemonScheduler {
         self.catchup_queued = false;
     }
 
-    pub fn on_worker_panic(&mut self) {
+    pub fn on_worker_panic(&mut self, now: Instant) {
         self.catchup_queued = false;
-        if let Some(ref mut jr) = self.journal_open_retry {
+        if let Some(ref mut jr) = self.journal_open_retry
+            && jr.in_flight
+        {
             jr.in_flight = false;
+            if jr.retryable && jr.attempts < MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
+                let delay = Self::backoff_for_attempt(jr.attempts);
+                jr.attempts = jr.attempts.saturating_add(1);
+                jr.next_due_at = Some(now + delay);
+            } else {
+                jr.next_due_at = None;
+            }
         }
         for st in self.per_binary.values_mut() {
-            st.in_flight = false;
+            if st.in_flight {
+                st.in_flight = false;
+                if st.retryable && st.attempts < MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
+                    let delay = Self::backoff_for_attempt(st.attempts);
+                    st.attempts = st.attempts.saturating_add(1);
+                    st.next_due_at = Some(now + delay);
+                } else {
+                    st.next_due_at = None;
+                }
+            }
         }
     }
 
@@ -3101,9 +3165,12 @@ impl ReleaseDaemonScheduler {
         for st in self.per_binary.values_mut() {
             if st.in_flight {
                 st.in_flight = false;
-                if st.retryable && retryable {
-                    let delay = Self::backoff_for_attempt(st.attempts.saturating_sub(1));
+                if retryable && st.retryable && st.attempts < MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
+                    let delay = Self::backoff_for_attempt(st.attempts);
+                    st.attempts = st.attempts.saturating_add(1);
                     st.next_due_at = Some(now + delay);
+                } else {
+                    st.next_due_at = None;
                 }
             }
         }
@@ -3127,45 +3194,61 @@ impl ReleaseDaemonScheduler {
         Some(delay)
     }
 
-    fn check_live_eligibility(
+    fn precheck_live_eligibility(
         &mut self,
-        home_dir: &Path,
         manifest: &ReleaseManifestV1,
         now: Instant,
-    ) -> Result<(), &'static str> {
+    ) -> LiveEligibilityPrecheck {
         if manifest.target_triple != CURRENT_TARGET_TRIPLE {
-            return Ok(());
+            return LiveEligibilityPrecheck::Eligible;
         }
         let release_key = InstalledBinaryState::release_history_key(manifest);
         if let Some(st) = self.per_binary.get_mut(&manifest.binary) {
             if st.release_key == release_key {
                 if !st.retryable {
-                    return Err("deterministic_failure_cached");
+                    return LiveEligibilityPrecheck::Suppressed("deterministic_failure_cached");
                 }
                 if st.in_flight {
-                    return Err("attempt_in_flight");
+                    return LiveEligibilityPrecheck::Suppressed("attempt_in_flight");
                 }
                 if let Some(due) = st.next_due_at {
                     if now < due {
-                        return Err("backoff_active");
+                        return LiveEligibilityPrecheck::Suppressed("backoff_active");
                     }
                     st.in_flight = true;
                     st.next_due_at = None;
-                    return Ok(());
+                    return LiveEligibilityPrecheck::Eligible;
                 }
                 if st.attempts >= MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
-                    return Err("retry_budget_exhausted");
+                    return LiveEligibilityPrecheck::Suppressed("retry_budget_exhausted");
                 }
                 st.in_flight = true;
-                return Ok(());
+                return LiveEligibilityPrecheck::Eligible;
             }
-            if !st.is_superseded_by(manifest)
-                && !is_manifest_already_satisfied_locally(home_dir, manifest)
-            {
-                return Err("superseded_by_newer_pending_release");
+            if !st.is_superseded_by(manifest) {
+                return LiveEligibilityPrecheck::NeedsLocalSatisfactionCheck;
             }
         }
-        Ok(())
+        LiveEligibilityPrecheck::Eligible
+    }
+
+    fn confirm_live_eligibility_after_local_check(
+        &mut self,
+        manifest: &ReleaseManifestV1,
+        now: Instant,
+        satisfied_locally: bool,
+    ) -> Result<(), &'static str> {
+        match self.precheck_live_eligibility(manifest, now) {
+            LiveEligibilityPrecheck::Eligible => Ok(()),
+            LiveEligibilityPrecheck::Suppressed(reason) => Err(reason),
+            LiveEligibilityPrecheck::NeedsLocalSatisfactionCheck => {
+                if satisfied_locally {
+                    Ok(())
+                } else {
+                    Err("superseded_by_newer_pending_release")
+                }
+            }
+        }
     }
 
     pub fn on_outcome(&mut self, outcome: &ReleaseApplyOutcome) {
@@ -3250,6 +3333,12 @@ impl ReleaseDaemonScheduler {
     }
 }
 
+enum LiveEligibilityPrecheck {
+    Eligible,
+    Suppressed(&'static str),
+    NeedsLocalSatisfactionCheck,
+}
+
 fn is_manifest_already_satisfied_locally(home_dir: &Path, manifest: &ReleaseManifestV1) -> bool {
     let Ok((expected_sha256, _)) = manifest.validate_structural() else {
         return false;
@@ -3282,7 +3371,6 @@ pub fn execute_release_daemon_job(
     local_iroh_endpoint: &str,
     scheduler: &Mutex<ReleaseDaemonScheduler>,
     job: ReleaseDaemonJob,
-    now: Instant,
 ) -> Vec<ReleaseDaemonEvent> {
     execute_release_daemon_job_inner(
         home_dir,
@@ -3293,7 +3381,7 @@ pub fn execute_release_daemon_job(
         None,
         scheduler,
         job,
-        now,
+        &mut Instant::now,
     )
 }
 
@@ -3307,13 +3395,14 @@ fn execute_release_daemon_job_inner(
     receipt_key_override: Option<&SigningKey>,
     scheduler: &Mutex<ReleaseDaemonScheduler>,
     job: ReleaseDaemonJob,
-    now: Instant,
+    clock: &mut dyn FnMut() -> Instant,
 ) -> Vec<ReleaseDaemonEvent> {
     match job {
         ReleaseDaemonJob::StartupCatchup => {
+            let started_at = clock();
             let eligibility = {
                 let mut sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
-                sched.begin_catchup_execution(now)
+                sched.begin_catchup_execution(started_at)
             };
             let Some(filter) = eligibility else {
                 return Vec::new();
@@ -3326,6 +3415,7 @@ fn execute_release_daemon_job_inner(
                 roots,
                 receipt_key_override,
                 Some(&filter),
+                clock,
             ) {
                 Ok(batch) => {
                     let mut sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
@@ -3342,8 +3432,11 @@ fn execute_release_daemon_job_inner(
                             }
                             Err(err) => {
                                 let retryable = err.is_transient_retryable();
-                                let next_delay =
-                                    sched.on_manifest_failed(&report.manifest, &err, now);
+                                let next_delay = sched.on_manifest_failed(
+                                    &report.manifest,
+                                    &err,
+                                    report.completed_at,
+                                );
                                 events.push(ReleaseDaemonEvent::Rejected {
                                     binary: report.binary,
                                     reason: err.to_string(),
@@ -3356,10 +3449,11 @@ fn execute_release_daemon_job_inner(
                     events
                 }
                 Err(err) => {
+                    let failed_at = clock();
                     let retryable = err.is_transient_retryable();
                     let next_delay = {
                         let mut sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
-                        sched.on_catchup_failed(retryable, now)
+                        sched.on_catchup_failed(retryable, failed_at)
                     };
                     vec![ReleaseDaemonEvent::Rejected {
                         binary: "all".to_owned(),
@@ -3392,14 +3486,38 @@ fn execute_release_daemon_job_inner(
                 }];
             }
             let release_key = InstalledBinaryState::release_history_key(&manifest);
-            {
+            let precheck = {
+                let check_at = clock();
                 let mut sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(reason) = sched.check_live_eligibility(home_dir, &manifest, now) {
+                sched.precheck_live_eligibility(&manifest, check_at)
+            };
+            match precheck {
+                LiveEligibilityPrecheck::Eligible => {}
+                LiveEligibilityPrecheck::Suppressed(reason) => {
                     return vec![ReleaseDaemonEvent::Suppressed {
                         binary: manifest.binary,
                         release_key,
                         reason,
                     }];
+                }
+                LiveEligibilityPrecheck::NeedsLocalSatisfactionCheck => {
+                    // Inspect local binary digest + sync state OUTSIDE the scheduler mutex
+                    // so a blocking filesystem lock never stalls the daemon select! heartbeat.
+                    let satisfied_locally =
+                        is_manifest_already_satisfied_locally(home_dir, &manifest);
+                    let confirm_at = clock();
+                    let mut sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Err(reason) = sched.confirm_live_eligibility_after_local_check(
+                        &manifest,
+                        confirm_at,
+                        satisfied_locally,
+                    ) {
+                        return vec![ReleaseDaemonEvent::Suppressed {
+                            binary: manifest.binary,
+                            release_key,
+                            reason,
+                        }];
+                    }
                 }
             }
             let outcome = apply_release_built_message_inner(
@@ -3412,6 +3530,7 @@ fn execute_release_daemon_job_inner(
                 None,
                 None,
             );
+            let finished_at = clock();
             let mut sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
             match outcome {
                 Ok(applied) => {
@@ -3423,7 +3542,7 @@ fn execute_release_daemon_job_inner(
                 }
                 Err(err) => {
                     let retryable = err.is_transient_retryable();
-                    let next_delay = sched.on_manifest_failed(&manifest, &err, now);
+                    let next_delay = sched.on_manifest_failed(&manifest, &err, finished_at);
                     vec![ReleaseDaemonEvent::Rejected {
                         binary: manifest.binary,
                         reason: err.to_string(),
@@ -3528,15 +3647,28 @@ mod tests {
         }
     }
 
+    fn read_all_from_pinned_fd(source_file: &File) -> Result<Vec<u8>, ReleaseSyncError> {
+        let mut dup_fd = source_file
+            .try_clone()
+            .map_err(|e| ReleaseSyncError::ArtifactStoreFailed(e.to_string()))?;
+        dup_fd
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| ReleaseSyncError::ArtifactStoreFailed(e.to_string()))?;
+        let mut bytes = Vec::new();
+        dup_fd
+            .read_to_end(&mut bytes)
+            .map_err(|e| ReleaseSyncError::ArtifactStoreFailed(e.to_string()))?;
+        Ok(bytes)
+    }
+
     impl ReleaseArtifactStore for InMemoryArtifactStore {
         fn upload_artifact(
             &self,
             artifact_key: &str,
-            local_file: &Path,
+            source_file: &File,
         ) -> Result<(), ReleaseSyncError> {
             validate_artifact_key_structure(artifact_key)?;
-            let bytes = fs::read(local_file)
-                .map_err(|e| ReleaseSyncError::ArtifactStoreFailed(e.to_string()))?;
+            let bytes = read_all_from_pinned_fd(source_file)?;
             self.blobs
                 .lock()
                 .unwrap()
@@ -4095,7 +4227,8 @@ mod tests {
         let artifact_key = expected_artifact_key("chinwag", CURRENT_TARGET_TRIPLE, &sha_hex);
         let tmp_src = temp.path().join("unsigned.bin");
         fs::write(&tmp_src, unsigned_bytes).unwrap();
-        store.upload_artifact(&artifact_key, &tmp_src).unwrap();
+        let tmp_src_file = File::open(&tmp_src).unwrap();
+        store.upload_artifact(&artifact_key, &tmp_src_file).unwrap();
 
         let manifest = ReleaseManifestV1 {
             schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
@@ -4250,7 +4383,8 @@ mod tests {
         let (_, sha_150, b3_150) = compute_file_digests(&bin_150).unwrap();
         let sha_150_hex = encode_hex(&sha_150);
         let key_150 = expected_artifact_key("chinwag", CURRENT_TARGET_TRIPLE, &sha_150_hex);
-        store.upload_artifact(&key_150, &bin_150).unwrap();
+        let bin_150_file = File::open(&bin_150).unwrap();
+        store.upload_artifact(&key_150, &bin_150_file).unwrap();
         let unflagged_150 = ReleaseManifestV1 {
             schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
             binary: "chinwag".into(),
@@ -4970,11 +5104,10 @@ mod tests {
             fn upload_artifact(
                 &self,
                 artifact_key: &str,
-                local_file: &Path,
+                source_file: &File,
             ) -> Result<(), ReleaseSyncError> {
                 validate_artifact_key_structure(artifact_key)?;
-                let bytes = fs::read(local_file)
-                    .map_err(|e| ReleaseSyncError::ArtifactStoreFailed(e.to_string()))?;
+                let bytes = read_all_from_pinned_fd(source_file)?;
                 self.blobs
                     .lock()
                     .unwrap()
@@ -5064,7 +5197,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_a.release_built_message.clone())),
-            now,
+            &mut || now,
         );
         assert!(matches!(
             ev_a.as_slice(),
@@ -5111,7 +5244,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_b.release_built_message.clone())),
-            now,
+            &mut || now,
         );
         assert!(matches!(
             ev_b1.as_slice(),
@@ -5154,6 +5287,7 @@ mod tests {
             ),
             &infrajr_key,
         );
+        let t_foreign = now + Duration::from_secs(1);
         let ev_foreign = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5163,7 +5297,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(foreign_msg)),
-            now + Duration::from_secs(1),
+            &mut || t_foreign,
         );
         assert!(matches!(
             ev_foreign.as_slice(),
@@ -5180,6 +5314,7 @@ mod tests {
 
         // [P2 #3b] Authenticated replay of currently installed release A returns `AlreadyInstalled`
         // (with 0 extra R2 downloads) and MUST ALSO preserve newer release B's pending retry!
+        let t_replay_a = now + Duration::from_secs(2);
         let ev_replay_a = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5189,7 +5324,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_a.release_built_message.clone())),
-            now + Duration::from_secs(2),
+            &mut || t_replay_a,
         );
         assert!(matches!(
             ev_replay_a.as_slice(),
@@ -5206,6 +5341,7 @@ mod tests {
         );
 
         // [P2 #2] Duplicate LiveMessage replay of B during its 10s backoff is suppressed (0 extra downloads)!
+        let t_dup_b = now + Duration::from_secs(3);
         let ev_dup_b = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5215,7 +5351,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_b.release_built_message.clone())),
-            now + Duration::from_secs(3),
+            &mut || t_dup_b,
         );
         assert!(matches!(
             ev_dup_b.as_slice(),
@@ -5226,12 +5362,12 @@ mod tests {
         ));
         assert_eq!(store.downloads_for(&pub_ci_b.manifest.artifact_key), 1);
 
-        // Exhaust B's remaining 11 retry attempts via StartupCatchup (attempts 2..=13 -> 1 initial + 12 retries = 13 total downloads? Wait:
-        // initial LiveMessage scheduled retry #1 (attempts = 1); 11 more retries reach attempts = 12, and the 12th retry hits attempts == 12 -> None!).
+        // Exhaust B's 12 scheduled retries via StartupCatchup (1 initial + 12 retries = 13 total downloads).
         let remaining_delays = [10u64, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300, 300];
         for delay_secs in remaining_delays {
             now += Duration::from_secs(delay_secs);
             assert!(sched.lock().unwrap().should_dispatch_catchup(now));
+            let tick = now;
             let _ = execute_release_daemon_job_inner(
                 &sub_home,
                 &journal,
@@ -5241,7 +5377,7 @@ mod tests {
                 Some(&infrajr_key),
                 &sched,
                 ReleaseDaemonJob::StartupCatchup,
-                now,
+                &mut || tick,
             );
         }
         let b_downloads_at_exhaustion = store.downloads_for(&pub_ci_b.manifest.artifact_key);
@@ -5254,6 +5390,7 @@ mod tests {
         );
 
         // [P2 #2] LiveMessage replay of exhausted B is suppressed with 0 R2 downloads!
+        let t_exhausted = now + Duration::from_secs(30);
         let ev_exhausted_live = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5263,7 +5400,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_b.release_built_message.clone())),
-            now + Duration::from_secs(30),
+            &mut || t_exhausted,
         );
         assert!(matches!(
             ev_exhausted_live.as_slice(),
@@ -5308,6 +5445,7 @@ mod tests {
         )
         .unwrap();
 
+        let tick_cw_1 = now;
         let _ = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5317,12 +5455,13 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_cw_1.release_built_message.clone())),
-            now,
+            &mut || tick_cw_1,
         );
         assert_eq!(store.downloads_for(&pub_cw_1.manifest.artifact_key), 1);
 
         // Advance 10s -> `CW_1` is due (and advances to 20s backoff), while exhausted `B` gets ZERO downloads!
         now += Duration::from_secs(10);
+        let tick_cw_1_retry = now;
         let _ = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5332,7 +5471,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
-            now,
+            &mut || tick_cw_1_retry,
         );
         assert_eq!(store.downloads_for(&pub_cw_1.manifest.artifact_key), 2);
         assert_eq!(
@@ -5372,6 +5511,7 @@ mod tests {
             ),
         )
         .unwrap();
+        let tick_ci_c = now;
         let _ = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5381,7 +5521,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_c.release_built_message.clone())),
-            now,
+            &mut || tick_ci_c,
         );
         assert_eq!(store.downloads_for(&pub_ci_c.manifest.artifact_key), 1);
 
@@ -5389,6 +5529,7 @@ mod tests {
         store.set_failing(&pub_ci_c.manifest.artifact_key, false);
         store.set_failing(&pub_cw_1.manifest.artifact_key, false);
 
+        let tick_plus_10 = now + Duration::from_secs(10);
         let events_at_10s = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5398,7 +5539,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
-            now + Duration::from_secs(10),
+            &mut || tick_plus_10,
         );
         assert_eq!(events_at_10s.len(), 1);
         assert_eq!(store.downloads_for(&pub_ci_c.manifest.artifact_key), 2);
@@ -5409,6 +5550,7 @@ mod tests {
         );
 
         // At `now + 20s`, `CW_1`'s backoff matures and `StartupCatchup` installs `CW_1` cleanly!
+        let tick_plus_20 = now + Duration::from_secs(20);
         let events_at_20s = execute_release_daemon_job_inner(
             &sub_home,
             &journal,
@@ -5418,7 +5560,7 @@ mod tests {
             Some(&infrajr_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
-            now + Duration::from_secs(20),
+            &mut || tick_plus_20,
         );
         assert_eq!(events_at_20s.len(), 1);
         assert_eq!(store.downloads_for(&pub_cw_1.manifest.artifact_key), 3);
@@ -5428,5 +5570,472 @@ mod tests {
                 .unwrap()
                 .should_dispatch_catchup(now + Duration::from_secs(600))
         );
+    }
+
+    #[test]
+    fn scheduler_mutex_not_held_while_local_satisfaction_waits_on_sync_flock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let sub_home = temp.path().join("sub-home");
+        let build_dir = temp.path().join("build");
+        for d in [&pub_home, &sub_home, &build_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let journal = temp.path().join("messages.jsonl");
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = InMemoryArtifactStore::new();
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+
+        let ci_a_bin = build_macho_test_binary(&build_dir, "flock_a");
+        let ci_b_bin = build_macho_test_binary(&build_dir, "flock_b");
+
+        let pub_ci_a = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag-ci",
+                source_binary_path: &ci_a_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("aaaa1000aaaa1000".into(), 100)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+
+        let pub_ci_b = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag-ci",
+                source_binary_path: &ci_b_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("bbbb2000bbbb2000".into(), 200)),
+            },
+            &store,
+            |_| Ok(2),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+
+        // Remove B's blob so B fails transiently and enters `per_binary` retry state.
+        store
+            .blobs
+            .lock()
+            .unwrap()
+            .remove(&pub_ci_b.manifest.artifact_key);
+
+        let sched = Mutex::new(ReleaseDaemonScheduler::default());
+        let t0 = Instant::now();
+
+        // Install A cleanly, then fail B so `sched` holds newer pending release B.
+        let _ = execute_release_daemon_job_inner(
+            &sub_home,
+            &journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_a.release_built_message.clone())),
+            &mut || t0,
+        );
+        let _ = execute_release_daemon_job_inner(
+            &sub_home,
+            &journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_b.release_built_message.clone())),
+            &mut || t0,
+        );
+        assert!(
+            sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(10))
+        );
+
+        // Hold subscriber's cross-process release-sync flock on the main thread!
+        let held_flock = acquire_release_sync_lock(&sub_home).unwrap();
+        let worker_entered = AtomicBool::new(false);
+        let worker_done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let handle = s.spawn(|| {
+                worker_entered.store(true, Ordering::SeqCst);
+                let res = execute_release_daemon_job_inner(
+                    &sub_home,
+                    &journal,
+                    &store,
+                    "sub-ep",
+                    &roots,
+                    Some(&infrajr_key),
+                    &sched,
+                    ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_a.release_built_message.clone())),
+                    &mut || t0 + Duration::from_secs(1),
+                );
+                worker_done.store(true, Ordering::SeqCst);
+                res
+            });
+
+            while !worker_entered.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Give the worker time to pass `precheck_live_eligibility` and block on `held_flock`
+            // inside `is_manifest_already_satisfied_locally`.
+            std::thread::sleep(Duration::from_millis(40));
+            assert!(
+                !worker_done.load(Ordering::SeqCst),
+                "worker must be blocked waiting on held release-sync flock"
+            );
+            for _ in 0..10 {
+                assert!(
+                    sched.try_lock().is_ok(),
+                    "scheduler mutex MUST NOT be held while worker waits on filesystem/flock I/O!"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            drop(held_flock);
+            let ev = handle.join().unwrap();
+            assert!(matches!(
+                ev.as_slice(),
+                [ReleaseDaemonEvent::Applied { outcome, .. }]
+                    if matches!(**outcome, ReleaseApplyOutcome::AlreadyInstalled { .. })
+            ));
+        });
+
+        assert!(
+            sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(10)),
+            "newer release B's pending retry must still be preserved"
+        );
+    }
+
+    #[test]
+    fn wrangler_upload_streams_pinned_fd_via_pipe_even_under_staging_displacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let build_dir = temp.path().join("build");
+        let capture_dir = temp.path().join("capture");
+        for d in [&pub_home, &build_dir, &capture_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+
+        let captured_args = capture_dir.join("args.txt");
+        let captured_body = capture_dir.join("stdin.bin");
+        let mock_wrangler = capture_dir.join("mock-wrangler.sh");
+        // Mock wrangler simulates an adversary renaming `$HOME/.local/bin/.staging` aside
+        // and planting decoy bytes at the original `.staging/<op_dir>/chinwag` pathname
+        // BEFORE draining `stdin`, then restoring `.staging` after reading `stdin`.
+        let script = format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"{}\"\n\
+             STAGING=\"$HOME/.local/bin/.staging\"\n\
+             DISPLACED=\"$HOME/.local/bin/.staging.displaced\"\n\
+             mv \"$STAGING\" \"$DISPLACED\"\n\
+             mkdir -p \"$STAGING\"\n\
+             for d in \"$DISPLACED\"/*; do\n\
+               base=$(basename \"$d\")\n\
+               mkdir -p \"$STAGING/$base\"\n\
+               printf 'DECOY-ATTACKER-PAYLOAD' > \"$STAGING/$base/chinwag\"\n\
+             done\n\
+             cat > \"{}\"\n\
+             rm -rf \"$STAGING\"\n\
+             mv \"$DISPLACED\" \"$STAGING\"\n",
+            captured_args.display(),
+            captured_body.display()
+        );
+        fs::write(&mock_wrangler, script).unwrap();
+        fs::set_permissions(&mock_wrangler, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = WranglerR2ArtifactStore::with_wrangler_bin(pub_home.clone(), mock_wrangler);
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let src_bin = build_macho_test_binary(&build_dir, "pipe_upload_v1");
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+
+        let outcome = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &src_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("cafebabecafebabe".into(), 500)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+
+        let args_text = fs::read_to_string(&captured_args).unwrap();
+        let args_lines: Vec<&str> = args_text.lines().collect();
+        assert!(
+            args_lines.contains(&"--pipe"),
+            "wrangler upload MUST pass --pipe, got: {args_lines:?}"
+        );
+        assert!(
+            !args_lines.contains(&"--file"),
+            "wrangler upload MUST NOT pass --file, got: {args_lines:?}"
+        );
+        assert!(
+            !args_text.contains(".staging"),
+            "wrangler upload argv MUST NOT expose any .staging pathname, got: {args_lines:?}"
+        );
+
+        let uploaded_bytes = fs::read(&captured_body).unwrap();
+        assert_ne!(uploaded_bytes, b"DECOY-ATTACKER-PAYLOAD");
+        assert_eq!(uploaded_bytes.len() as u64, outcome.manifest.size_bytes);
+        assert_eq!(
+            encode_hex(&compute_sha256_bytes(&uploaded_bytes)),
+            outcome.manifest.sha256,
+            "uploaded R2 stream must match exact verified descriptor digest despite .staging swap"
+        );
+        assert_eq!(
+            encode_hex(&compute_blake3_bytes(&uploaded_bytes)),
+            outcome.manifest.blake3
+        );
+    }
+
+    #[test]
+    fn retry_backoff_measured_from_failure_completion_not_job_start() {
+        struct SlowTimeoutStore {
+            blobs: Mutex<BTreeMap<String, Vec<u8>>>,
+            clock: std::sync::Arc<Mutex<Instant>>,
+            timeout_duration: Duration,
+        }
+
+        impl ReleaseArtifactStore for SlowTimeoutStore {
+            fn upload_artifact(
+                &self,
+                artifact_key: &str,
+                source_file: &File,
+            ) -> Result<(), ReleaseSyncError> {
+                validate_artifact_key_structure(artifact_key)?;
+                let bytes = read_all_from_pinned_fd(source_file)?;
+                self.blobs
+                    .lock()
+                    .unwrap()
+                    .insert(artifact_key.to_owned(), bytes);
+                Ok(())
+            }
+
+            fn download_artifact(
+                &self,
+                _artifact_key: &str,
+                _destination_file: &Path,
+            ) -> Result<(), ReleaseSyncError> {
+                *self.clock.lock().unwrap() += self.timeout_duration;
+                Err(ReleaseSyncError::ArtifactStoreFailed(
+                    "wrangler r2 timed out after 120s".into(),
+                ))
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let sub_home = temp.path().join("sub-home");
+        let build_dir = temp.path().join("build");
+        for d in [&pub_home, &sub_home, &build_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let journal = temp.path().join("messages.jsonl");
+
+        let t0 = Instant::now();
+        let shared_clock = std::sync::Arc::new(Mutex::new(t0));
+        let store = SlowTimeoutStore {
+            blobs: Mutex::new(BTreeMap::new()),
+            clock: std::sync::Arc::clone(&shared_clock),
+            timeout_duration: Duration::from_secs(120),
+        };
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let src_bin = build_macho_test_binary(&build_dir, "slow_r2_v1");
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+
+        let pub_v1 = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag-ci",
+                source_binary_path: &src_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("9999000099990000".into(), 900)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        fs::write(
+            &journal,
+            format!(
+                "{}\n",
+                serde_json::to_string(&pub_v1.release_built_message).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let sched = Mutex::new(ReleaseDaemonScheduler::default());
+        // Clear initial_catchup_pending first so `should_dispatch_catchup` reflects retry schedule only.
+        sched.lock().unwrap().initial_catchup_pending = false;
+
+        // 1. LiveMessage starts at `t0`, spends 120s in `download_artifact` (`t0 + 120s`), and fails.
+        //    10s retry #1 MUST be scheduled at `(t0 + 120s) + 10s = t0 + 130s`, NOT `t0 + 10s`!
+        let ev1 = execute_release_daemon_job_inner(
+            &sub_home,
+            &journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::LiveMessage(Box::new(pub_v1.release_built_message.clone())),
+            &mut || *shared_clock.lock().unwrap(),
+        );
+        assert!(matches!(
+            ev1.as_slice(),
+            [ReleaseDaemonEvent::Rejected {
+                retryable: true,
+                next_retry_secs: Some(10),
+                ..
+            }]
+        ));
+        assert_eq!(*shared_clock.lock().unwrap(), t0 + Duration::from_secs(120));
+        assert!(
+            !sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(129)),
+            "10s backoff after a 120s timeout must NOT fire before t0 + 130s!"
+        );
+        assert!(
+            sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(130)),
+            "10s backoff after a 120s timeout MUST fire at t0 + 130s"
+        );
+
+        // 2. StartupCatchup starts at `t0 + 130s`, spends another 120s (`t0 + 250s`), and fails.
+        //    20s retry #2 MUST be scheduled at `(t0 + 250s) + 20s = t0 + 270s`!
+        *shared_clock.lock().unwrap() = t0 + Duration::from_secs(130);
+        let ev2 = execute_release_daemon_job_inner(
+            &sub_home,
+            &journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::StartupCatchup,
+            &mut || *shared_clock.lock().unwrap(),
+        );
+        assert!(matches!(
+            ev2.as_slice(),
+            [ReleaseDaemonEvent::Rejected {
+                retryable: true,
+                next_retry_secs: Some(20),
+                ..
+            }]
+        ));
+        assert_eq!(*shared_clock.lock().unwrap(), t0 + Duration::from_secs(250));
+        assert!(
+            !sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(269))
+        );
+        assert!(
+            sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(270))
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_reexec_dirs_reclaims_dead_pid_publisher_and_installer_immutable_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let (_, staging_dir) = ensure_bin_and_staging_dirs(&home).unwrap();
+
+        // Spawn and reap a short-lived process to obtain a guaranteed-dead PID.
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = child.id();
+        let _ = child.wait().unwrap();
+        let dead_rustix_pid = rustix::process::Pid::from_raw(dead_pid as i32).unwrap();
+        assert_eq!(
+            rustix::process::test_kill_process(dead_rustix_pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+
+        let self_pid = std::process::id();
+        let dead_names = [
+            format!("op.{dead_pid}.pub.1111111111111111"),
+            format!("op.pub.{dead_pid}.2222222222222222"),
+            format!("op.{dead_pid}.3333333333333333"),
+            format!("reexec.{dead_pid}.4444444444444444"),
+        ];
+        let live_name = format!("op.{self_pid}.pub.5555555555555555");
+
+        for dir_name in dead_names.iter().chain(std::iter::once(&live_name)) {
+            let dir_path = staging_dir.join(dir_name);
+            fs::create_dir(&dir_path).unwrap();
+            fs::write(dir_path.join("chinwag"), b"immutable-staged-bytes").unwrap();
+            let (dir_fd, _) = open_dir_nofollow(&dir_path).unwrap();
+            set_dir_and_entry_immutable(&dir_fd, "chinwag", true).unwrap();
+        }
+
+        cleanup_stale_reexec_dirs(&home);
+
+        for dead_name in &dead_names {
+            assert!(
+                !staging_dir.join(dead_name).exists(),
+                "dead-PID immutable staging dir '{dead_name}' MUST be unlocked and reclaimed"
+            );
+        }
+
+        let live_dir = staging_dir.join(&live_name);
+        assert!(
+            live_dir.join("chinwag").is_file(),
+            "live-PID publisher staging dir MUST remain untouched"
+        );
+        // Unlock live_dir before TempDir drops so cleanup succeeds cleanly on macOS.
+        if let Ok((live_fd, _)) = open_dir_nofollow(&live_dir) {
+            let _ = set_dir_and_entry_immutable(&live_fd, "chinwag", false);
+        }
     }
 }
