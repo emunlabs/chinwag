@@ -1845,7 +1845,14 @@ function compareCascadeRank(a, b) {
 }
 
 function evalArithmeticExpr(src) {
-  const tokens = src.match(/[0-9.]+|[+\-*/()]/g) || [];
+  const tokenRe = /\d+(?:\.\d+)?|\.\d+|[+\-*/()]|\S+/g;
+  const tokens = src.match(tokenRe) || [];
+  if (tokens.length === 0) return Number.NaN;
+  for (const tok of tokens) {
+    if (!/^(?:\d+(?:\.\d+)?|\.\d+|[+\-*/()])$/.test(tok)) {
+      return Number.NaN;
+    }
+  }
   let pos = 0;
   function parseAddSub() {
     let val = parseMulDiv();
@@ -1861,59 +1868,144 @@ function evalArithmeticExpr(src) {
     while (pos < tokens.length && (tokens[pos] === "*" || tokens[pos] === "/")) {
       const op = tokens[pos++];
       const rhs = parsePrimary();
-      val = op === "*" ? val * rhs : rhs !== 0 ? val / rhs : 0;
+      val = op === "*" ? val * rhs : rhs !== 0 ? val / rhs : Number.NaN;
     }
     return val;
   }
   function parsePrimary() {
+    if (pos >= tokens.length) return Number.NaN;
     if (tokens[pos] === "-") {
       pos += 1;
       return -parsePrimary();
     }
-    if (tokens[pos] === "+") {
-      pos += 1;
-      return parsePrimary();
-    }
     if (tokens[pos] === "(") {
       pos += 1;
       const inner = parseAddSub();
-      if (tokens[pos] === ")") pos += 1;
+      if (tokens[pos] !== ")") return Number.NaN;
+      pos += 1;
       return inner;
     }
-    return Number(tokens[pos++] || 0);
+    const tok = tokens[pos];
+    if (!/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(tok)) return Number.NaN;
+    pos += 1;
+    return Number(tok);
   }
-  return parseAddSub();
+  const result = parseAddSub();
+  return pos === tokens.length ? result : Number.NaN;
+}
+
+function splitTopLevelCommaArgs(src) {
+  const parts = [];
+  let cur = "";
+  let depth = 0;
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "(") {
+      depth += 1;
+      cur += ch;
+    } else if (ch === ")") {
+      if (depth === 0) return null;
+      depth -= 1;
+      cur += ch;
+    } else if (ch === "," && depth === 0) {
+      parts.push(cur.trim());
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  if (depth !== 0) return null;
+  parts.push(cur.trim());
+  return parts.some((p) => p === "") ? null : parts;
+}
+
+function substituteCssVars(raw, vars) {
+  let v = raw;
+  for (let depth = 0; depth < 8 && v.includes("var("); depth += 1) {
+    let next = "";
+    let idx = 0;
+    while (idx < v.length) {
+      const start = v.indexOf("var(", idx);
+      if (start === -1) {
+        next += v.slice(idx);
+        break;
+      }
+      next += v.slice(idx, start);
+      let pDepth = 1;
+      let k = start + 4;
+      let commaAt = -1;
+      while (k < v.length && pDepth > 0) {
+        if (v[k] === "(") pDepth += 1;
+        else if (v[k] === ")") pDepth -= 1;
+        else if (v[k] === "," && pDepth === 1 && commaAt === -1) commaAt = k;
+        k += 1;
+      }
+      if (pDepth !== 0) return null;
+      const innerEnd = k - 1;
+      const rawName = (commaAt === -1 ? v.slice(start + 4, innerEnd) : v.slice(start + 4, commaAt)).trim();
+      if (!/^--[a-zA-Z0-9_-]+$/.test(rawName)) return null;
+      if (Object.prototype.hasOwnProperty.call(vars, rawName)) {
+        next += vars[rawName];
+      } else if (commaAt !== -1) {
+        next += v.slice(commaAt + 1, innerEnd).trim();
+      } else {
+        return null;
+      }
+      idx = k;
+    }
+    v = next;
+  }
+  return v.includes("var(") ? null : v;
+}
+
+function extractBalancedCallBody(v, fnName) {
+  const prefix = `${fnName}(`;
+  if (!v.startsWith(prefix) || !v.endsWith(")")) return null;
+  let depth = 0;
+  for (let i = fnName.length; i < v.length; i += 1) {
+    if (v[i] === "(") depth += 1;
+    else if (v[i] === ")") {
+      depth -= 1;
+      if (depth === 0 && i !== v.length - 1) return null;
+    }
+  }
+  return depth === 0 ? v.slice(prefix.length, -1) : null;
 }
 
 function resolvePxExpr(rawVal, vars, vw) {
   if (rawVal === undefined || rawVal === null) return Number.NaN;
-  let v = String(rawVal).trim();
+  const expanded = substituteCssVars(String(rawVal).trim(), vars);
+  if (expanded === null) return Number.NaN;
+  let v = expanded.trim();
   if (!v) return Number.NaN;
-  for (let depth = 0; depth < 5 && v.includes("var("); depth += 1) {
-    v = v.replace(/var\(\s*(--[a-zA-Z0-9_-]+)(?:\s*,\s*([^)]+))?\)/g, (_, name, fb) =>
-      vars[name] !== undefined ? vars[name] : fb !== undefined ? fb : "",
-    );
+  v = v.replace(/(-?(?:\d+(?:\.\d+)?|\.\d+))vw\b/g, (_, n) => `${(Number(n) * vw) / 100}px`);
+  const minBody = extractBalancedCallBody(v, "min");
+  const maxBody = minBody === null ? extractBalancedCallBody(v, "max") : null;
+  if (minBody !== null || maxBody !== null) {
+    const isMin = minBody !== null;
+    const rawArgs = splitTopLevelCommaArgs(isMin ? minBody : maxBody);
+    if (!rawArgs || rawArgs.length === 0) return Number.NaN;
+    const args = rawArgs.map((part) => resolvePxExpr(part, vars, vw));
+    if (args.some((x) => !Number.isFinite(x))) return Number.NaN;
+    return isMin ? Math.min(...args) : Math.max(...args);
   }
-  v = v.replace(/([0-9.]+)vw/g, (_, n) => `${(Number(n) * vw) / 100}px`);
-  if (v.startsWith("min(") && v.endsWith(")")) {
-    const args = v
-      .slice(4, -1)
-      .split(",")
-      .map((part) => resolvePxExpr(part.trim(), vars, vw));
-    return Math.min(...args);
-  }
-  if (v.startsWith("calc(") && v.endsWith(")")) {
-    const expr = v
-      .slice(5, -1)
-      .replace(/px/g, "")
+  const calcBody = extractBalancedCallBody(v, "calc");
+  if (calcBody !== null) {
+    const inner = calcBody
+      .replace(/\bcalc\(/g, "(")
+      .replace(/(-?(?:\d+(?:\.\d+)?|\.\d+))px\b/g, "$1")
       .trim();
-    if (/^[0-9.+\-*/()\s]+$/.test(expr)) {
-      return evalArithmeticExpr(expr);
+    if (/^[0-9.+\-*/()\s]+$/.test(inner)) {
+      return evalArithmeticExpr(inner);
     }
     return Number.NaN;
   }
-  const m = v.match(/^(-?[0-9.]+)(px)?$/);
-  return m ? Number(m[1]) : Number.NaN;
+  const m = v.match(/^(-?(?:\d+(?:\.\d+)?|\.\d+))(px)?$/);
+  if (!m) return Number.NaN;
+  const num = Number(m[1]);
+  // In CSS, only literal zero may omit its unit (`0`); non-zero unitless lengths are invalid
+  if (!m[2] && num !== 0) return Number.NaN;
+  return num;
 }
 
 function requireFinitePx(rawVal, vars, vw, label) {
@@ -2324,7 +2416,7 @@ for (const [mVw, mVh] of [
   }
 }
 
-// L5: Quadruple Mutant Canaries —
+// L5: Quintuple Mutant Canaries (L5a–L5e) —
 // (L5a) Exact reproduction of the `0d600d0` cascade-order bug: earlier `@media (min-width: 960px) { .d2-head { padding-left: 41px; } }`
 //       gets reset back to `12px` by the later `.d2-head { padding: 8px var(--rail-inset) 6px; }` shorthand -> title lands at x=12 overlapping [9..35]!
 const mutatedCascadeResetCss = stylesCss.replace(
@@ -2401,6 +2493,25 @@ assert.throws(
   /Missing required CSS declaration/,
   "Canary L5d MUST fail closed when required CSS declarations are missing",
 );
+
+// (L5e) Unresolved CSS custom property inside `calc(...)` fail-closed canary (W3C CSS Variables IACVT):
+//       `calc(var(--missing-header-inset) + 42px)` and `calc(var(--missing-header-inset, ) + 42px)` MUST throw!
+for (const invalidCalcExpr of [
+  "calc(var(--missing-header-inset) + 42px)",
+  "calc(var(--missing-header-inset, ) + 42px)",
+]) {
+  assert.throws(
+    () =>
+      computeDelivery2HeaderBoxes(
+        `${stylesCss}\n@media (min-width: 960px) and (max-width: 1439.98px) { .d2-rail .d2-head { padding-left: ${invalidCalcExpr}; } }`,
+        1200,
+        900,
+        { "data-rail": "expanded" },
+      ),
+    /Unparseable CSS px value/,
+    `Canary L5e MUST fail closed on invalid/unresolved calc expression '${invalidCalcExpr}'`,
+  );
+}
 
 console.log(
   JSON.stringify({
