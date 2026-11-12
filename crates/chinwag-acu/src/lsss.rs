@@ -11,6 +11,11 @@ use ff::Field;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// Maximum number of LSSS rows permitted in a serialized or in-memory policy matrix.
+pub(crate) const MAX_SERIALIZED_ROWS: usize = 4096;
+/// Maximum number of LSSS columns permitted in a serialized or in-memory policy matrix.
+pub(crate) const MAX_SERIALIZED_COLS: usize = 4096;
+
 /// Monotone boolean/threshold access policy AST over seat or key-branch identifiers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessTree {
@@ -141,6 +146,11 @@ impl LsssMatrix {
     pub fn validate(&self) -> Result<(), AcuError> {
         if self.cols == 0 || self.rows.is_empty() {
             return Err(AcuError::EmptyPolicy);
+        }
+        if self.cols > MAX_SERIALIZED_COLS || self.rows.len() > MAX_SERIALIZED_ROWS {
+            return Err(AcuError::SerializationError(
+                "invalid AcuCiphertext dimensions",
+            ));
         }
         for (seat_id, row) in &self.rows {
             if !is_valid_seat_id(seat_id) {

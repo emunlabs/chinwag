@@ -223,6 +223,9 @@ impl EncryptedCiPayload {
         if !is_valid_metadata_token(repo_id) || !is_valid_metadata_token(task_id) {
             return Err(AcuError::InvalidMetadata);
         }
+        if plaintext.len() > MAX_SERIALIZED_BLOB_BYTES / 2 {
+            return Err(AcuError::SerializationError("plaintext exceeds max size"));
+        }
         let matrix = LsssMatrix::from_tree(tree)?;
 
         // Sample uniform session secret in G1 -> Gt so c0_g1 = payload_g1 + g1 * s is 48-byte compressible.
@@ -305,6 +308,11 @@ impl EncryptedCiPayload {
 
 /// Derive a 256-bit ChaCha20-Poly1305 key from a target-group element $K \in \mathbb{G}_T$
 /// and context AAD via HKDF-SHA256, zeroizing the canonical $\mathbb{F}_{p^{12}}$ representation on drop.
+///
+/// Note (`CHWG-0271` / `bls12_381 = "=0.8.0"`): Because `bls12_381` 0.8.0 does not expose `Gt::to_bytes()`,
+/// this derivation hashes the deterministic `Fp12` debug representation pinned via `=0.8.0` and
+/// locked against a known-answer test vector in `test_15`. Any future `bls12_381` version bump MUST
+/// verify byte-identical `Gt` KAT output before upgrading.
 pub fn derive_aead_key_from_gt(element: &Gt, associated_data: &[u8]) -> Zeroizing<[u8; 32]> {
     let canonical_fp12 = Zeroizing::new(format!("{element:?}"));
     let hk = Hkdf::<Sha256>::new(Some(ACU_HKDF_SALT), canonical_fp12.as_bytes());

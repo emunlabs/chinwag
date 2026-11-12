@@ -700,6 +700,7 @@ impl AcuParquetArchiveStore {
                 &filter.org_id,
                 &row.task_id,
                 payload.acu_ciphertext.policy_epoch,
+                payload.acu_ciphertext.clone(),
                 acu_row.clone(),
                 row.timestamp_utc,
                 archive_ed25519_sk,

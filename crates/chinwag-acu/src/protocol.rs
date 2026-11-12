@@ -10,9 +10,9 @@ use crate::AcuError;
 use crate::acu::{
     AcuCiphertext, CiphertextRow, PartialDecryptionShare, acu_partial_decrypt_at_epoch,
     acu_verify_partial_share, escalate_threshold, insert_key, insert_sibling_key,
-    revoke_and_rerandomize, verify_row_randomness_witness,
+    revoke_and_rerandomize, verify_row_randomness_witness, verify_sealed_basis,
 };
-use crate::aead::{EncryptedCiPayload, is_valid_metadata_token};
+use crate::aead::{DEFAULT_MESSAGE_ARCHIVE_ID, EncryptedCiPayload, is_valid_metadata_token};
 use crate::keys::{SeatPublicKey, SeatSecretKey, is_valid_seat_id};
 use bls12_381::{G1Affine, G2Affine, Scalar};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -345,6 +345,8 @@ pub struct AcuShareRequest {
     pub task_id: String,
     /// Policy epoch of the ciphertext (`>= 1`).
     pub policy_epoch: u64,
+    /// Full `CHWGACU2` header whose `SealedBasisCommitments` AAD authenticates the policy rows to `sk_ACU`.
+    pub acu_ciphertext: AcuCiphertext,
     /// The ACU's ciphertext row from [`EncryptedCiPayload`].
     pub acu_row: CiphertextRow,
     /// Request timestamp in milliseconds since Unix epoch.
@@ -364,6 +366,7 @@ impl AcuShareRequest {
         repo_id: impl Into<String>,
         task_id: impl Into<String>,
         policy_epoch: u64,
+        acu_ciphertext: AcuCiphertext,
         acu_row: CiphertextRow,
         timestamp_ms: u64,
         requester_ed25519_sk: &SigningKey,
@@ -383,6 +386,7 @@ impl AcuShareRequest {
             &repo_id,
             &task_id,
             policy_epoch,
+            &acu_ciphertext,
             &acu_row,
             timestamp_ms,
         );
@@ -396,6 +400,7 @@ impl AcuShareRequest {
             repo_id,
             task_id,
             policy_epoch,
+            acu_ciphertext,
             acu_row,
             timestamp_ms,
             requester_signature: sig.to_bytes(),
@@ -411,9 +416,11 @@ impl AcuShareRequest {
         repo_id: &str,
         task_id: &str,
         policy_epoch: u64,
+        acu_ciphertext: &AcuCiphertext,
         acu_row: &CiphertextRow,
         timestamp_ms: u64,
     ) -> Vec<u8> {
+        let ct_bytes = acu_ciphertext.to_bytes();
         let mut out = Vec::new();
         out.extend_from_slice(ACU_SHARE_REQ_DOMAIN);
         push_len_prefixed_str(&mut out, request_id);
@@ -423,6 +430,8 @@ impl AcuShareRequest {
         push_len_prefixed_str(&mut out, repo_id);
         push_len_prefixed_str(&mut out, task_id);
         out.extend_from_slice(&policy_epoch.to_be_bytes());
+        out.extend_from_slice(&(ct_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&ct_bytes);
         out.extend_from_slice(&(acu_row.row_index as u32).to_be_bytes());
         push_len_prefixed_str(&mut out, &acu_row.seat_id);
         out.extend_from_slice(&(acu_row.matrix_row.len() as u32).to_be_bytes());
@@ -475,6 +484,37 @@ pub struct AuditLogEntry {
     pub entry_sha256: [u8; 32],
 }
 
+impl AuditLogEntry {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_entry_sha256(
+        request_id: &str,
+        requester_seat_id: &str,
+        acu_seat_id: &str,
+        repo_id: &str,
+        task_id: &str,
+        policy_epoch: u64,
+        decision: AcuAuditDecision,
+        reason: &str,
+        timestamp_ms: u64,
+    ) -> [u8; 32] {
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"chinwag-acu-audit/v2");
+        push_len_prefixed_str(&mut preimage, request_id);
+        push_len_prefixed_str(&mut preimage, requester_seat_id);
+        push_len_prefixed_str(&mut preimage, acu_seat_id);
+        push_len_prefixed_str(&mut preimage, repo_id);
+        push_len_prefixed_str(&mut preimage, task_id);
+        preimage.extend_from_slice(&policy_epoch.to_be_bytes());
+        push_len_prefixed_str(&mut preimage, &format!("{decision:?}"));
+        push_len_prefixed_str(&mut preimage, reason);
+        preimage.extend_from_slice(&timestamp_ms.to_be_bytes());
+        let digest = Sha256::digest(&preimage);
+        let mut entry_sha256 = [0u8; 32];
+        entry_sha256.copy_from_slice(&digest);
+        entry_sha256
+    }
+}
+
 /// Signed response sent over `iroh` (`chinwag-mesh`) from the CISO's `chinwag` fat client
 /// back to the waking agent or archive unit, carrying $D_{\text{ACU}} \in \mathbb{G}_T$ and the [`AuditLogEntry`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -496,9 +536,9 @@ pub struct AcuShareResponse {
 }
 
 impl AcuShareResponse {
-    /// Verify the CISO ACU's Ed25519 signature AND verify that `partial_share` ($D_{\text{ACU}}$)
-    /// matches `policy_epoch` and satisfies the bilinear pairing check against `acu_row` and
-    /// the ACU's BLS12-381 public key.
+    /// Verify the CISO ACU's Ed25519 signature, audit-entry SHA-256 integrity, AND that `partial_share`
+    /// ($D_{\text{ACU}}$) matches `policy_epoch` and satisfies the bilinear pairing check against
+    /// `acu_row` and the ACU's BLS12-381 public key.
     pub fn verify_by_agent(
         &self,
         acu_row: &CiphertextRow,
@@ -509,6 +549,33 @@ impl AcuShareResponse {
                 expected: self.policy_epoch,
                 actual: self.partial_share.policy_epoch,
             });
+        }
+        if acu_row.seat_id != self.acu_seat_id {
+            return Err(AcuError::InvalidPartialShare {
+                row_index: acu_row.row_index,
+                seat_id: acu_row.seat_id.clone(),
+            });
+        }
+        if self.audit_entry.request_id != self.request_id
+            || self.audit_entry.acu_seat_id != self.acu_seat_id
+            || self.audit_entry.requester_seat_id != self.requester_seat_id
+            || self.audit_entry.policy_epoch != self.policy_epoch
+        {
+            return Err(AcuError::SignatureVerificationFailed("audit_entry"));
+        }
+        let expected_audit_sha256 = AuditLogEntry::compute_entry_sha256(
+            &self.audit_entry.request_id,
+            &self.audit_entry.requester_seat_id,
+            &self.audit_entry.acu_seat_id,
+            &self.audit_entry.repo_id,
+            &self.audit_entry.task_id,
+            self.audit_entry.policy_epoch,
+            self.audit_entry.decision,
+            &self.audit_entry.reason,
+            self.audit_entry.timestamp_ms,
+        );
+        if self.audit_entry.entry_sha256 != expected_audit_sha256 {
+            return Err(AcuError::SignatureVerificationFailed("audit_entry"));
         }
         let acu_rec = registry.get_active(&self.acu_seat_id)?;
         let preimage = Self::canonical_preimage(
@@ -565,6 +632,7 @@ pub struct CisoAcuFatClient {
     acu_pk: SeatPublicKey,
     acu_ed25519_sk: SigningKey,
     revoked_seats: BTreeSet<String>,
+    archive_seats: BTreeSet<String>,
     audit_log: Vec<AuditLogEntry>,
 }
 
@@ -572,13 +640,23 @@ impl CisoAcuFatClient {
     /// Initialize a new CISO ACU fat client with its BLS12-381 keypair and Ed25519 signing key.
     #[must_use]
     pub fn new(acu_sk: SeatSecretKey, acu_pk: SeatPublicKey, acu_ed25519_sk: SigningKey) -> Self {
+        let mut archive_seats = BTreeSet::new();
+        archive_seats.insert(DEFAULT_MESSAGE_ARCHIVE_ID.to_string());
         Self {
             acu_sk,
             acu_pk,
             acu_ed25519_sk,
             revoked_seats: BTreeSet::new(),
+            archive_seats,
             audit_log: Vec::new(),
         }
+    }
+
+    /// Register an Archive Unit seat identifier that is restricted exclusively to
+    /// [`CisoAcuFatClient::authorize_archive_investigation`] (requiring a forensic ticket)
+    /// and blocked from live [`CisoAcuFatClient::handle_iroh_share_request`].
+    pub fn register_archive_seat(&mut self, seat_id: impl Into<String>) {
+        self.archive_seats.insert(seat_id.into());
     }
 
     /// Borrow the ACU operator's BLS12-381 secret key for authorized policy evolution (`CHWG-0271`).
@@ -661,17 +739,28 @@ impl CisoAcuFatClient {
         revoke_and_rerandomize(ct, &self.acu_sk, revoked_seat_ids, seat_keys, rng)
     }
 
-    /// Process an inbound [`AcuShareRequest`] over the `iroh` P2P bus (`chinwag-mesh`):
-    /// 1. Checks local CISO instant-revocation state, `policy_epoch >= 1`, row randomness witness,
+    /// Process an inbound live [`AcuShareRequest`] over the `iroh` P2P bus (`chinwag-mesh`):
+    /// 1. Rejects archive seats (which must go through [`Self::authorize_archive_investigation`] with a ticket).
+    /// 2. Checks local CISO instant-revocation state, `policy_epoch >= 1`, row randomness witness,
     ///    and `.chinwag/allowed_signers` status.
-    /// 2. Verifies the requesting agent's Ed25519 signature.
-    /// 3. Computes $D_{\text{ACU}} = e(c_1, g_2) + e(g_1, c_2 \cdot (-sk_{\text{ACU}})) \in \mathbb{G}_T$.
-    /// 4. Records a signed [`AuditLogEntry`] and returns a signed [`AcuShareResponse`].
+    /// 3. Verifies the requesting agent's Ed25519 signature AND authenticates `req.acu_ciphertext`
+    ///    against `self.acu_sk` (`SealedBasisCommitments`), confirming the requester is a policy member
+    ///    and no unpruned revoked seats remain in `req.acu_ciphertext.rows`.
+    /// 4. Computes $D_{\text{ACU}} = e(c_1, g_2) + e(g_1, c_2 \cdot (-sk_{\text{ACU}})) \in \mathbb{G}_T$,
+    ///    records a signed [`AuditLogEntry`], and returns a signed [`AcuShareResponse`].
     pub fn handle_iroh_share_request(
         &mut self,
         req: &AcuShareRequest,
         registry: &AllowedSignersRegistry,
     ) -> Result<AcuShareResponse, AcuError> {
+        if self.archive_seats.contains(&req.requester_seat_id) {
+            self.record_audit(
+                req,
+                AcuAuditDecision::Denied,
+                "archive_seat_requires_investigation_ticket",
+            );
+            return Err(AcuError::InvalidMetadata);
+        }
         self.process_share_request_internal(req, registry, AcuAuditDecision::Granted, "ok")
     }
 
@@ -691,7 +780,9 @@ impl CisoAcuFatClient {
             );
             return Err(AcuError::InvalidMetadata);
         }
-        if req.requester_seat_id != expected_archive_seat_id {
+        if req.requester_seat_id != expected_archive_seat_id
+            || !self.archive_seats.contains(&req.requester_seat_id)
+        {
             self.record_audit(req, AcuAuditDecision::Denied, "requester_not_archive_unit");
             return Err(AcuError::UnknownSeat(req.requester_seat_id.clone()));
         }
@@ -747,6 +838,7 @@ impl CisoAcuFatClient {
             &req.repo_id,
             &req.task_id,
             req.policy_epoch,
+            &req.acu_ciphertext,
             &req.acu_row,
             req.timestamp_ms,
         );
@@ -771,6 +863,50 @@ impl CisoAcuFatClient {
                 row_index: req.acu_row.row_index,
                 seat_id: req.acu_row.seat_id.clone(),
             });
+        }
+
+        // Authenticate full CHWGACU2 header + AAD-bound policy rows against sk_ACU.
+        if req.acu_ciphertext.policy_epoch != req.policy_epoch
+            || req.acu_ciphertext.rows.get(req.acu_row.row_index) != Some(&req.acu_row)
+            || verify_sealed_basis(&req.acu_ciphertext, &self.acu_sk).is_err()
+        {
+            self.record_audit(
+                req,
+                AcuAuditDecision::Denied,
+                "unauthenticated_or_tampered_acu_ciphertext",
+            );
+            return Err(AcuError::BasisUnsealFailed);
+        }
+
+        // Require requester_seat_id to be an explicit non-ACU member of the authenticated LSSS policy.
+        let requester_in_policy = req
+            .acu_ciphertext
+            .rows
+            .iter()
+            .any(|r| r.seat_id == req.requester_seat_id && r.seat_id != self.acu_pk.seat_id);
+        if !requester_in_policy {
+            self.record_audit(
+                req,
+                AcuAuditDecision::Denied,
+                "requester_not_in_ciphertext_policy",
+            );
+            return Err(AcuError::PolicyNotSatisfied);
+        }
+
+        // On live requests, refuse share issuance if ANY policy row belongs to an unpruned revoked seat
+        // (prevents sibling/proxy decryption before `revoke_and_rerandomize` prunes the revoked seat).
+        if grant_decision == AcuAuditDecision::Granted {
+            for row in &req.acu_ciphertext.rows {
+                let registry_revoked = registry.get_any(&row.seat_id).is_ok_and(|rec| rec.revoked);
+                if self.revoked_seats.contains(&row.seat_id) || registry_revoked {
+                    self.record_audit(
+                        req,
+                        AcuAuditDecision::Denied,
+                        "ciphertext_contains_unpruned_revoked_seat",
+                    );
+                    return Err(AcuError::SeatRevoked(row.seat_id.clone()));
+                }
+            }
         }
 
         // Compute partial pairing decryption share D_ACU.
@@ -805,20 +941,17 @@ impl CisoAcuFatClient {
         decision: AcuAuditDecision,
         reason: &str,
     ) -> AuditLogEntry {
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(b"chinwag-acu-audit/v2");
-        push_len_prefixed_str(&mut preimage, &req.request_id);
-        push_len_prefixed_str(&mut preimage, &req.requester_seat_id);
-        push_len_prefixed_str(&mut preimage, &req.acu_seat_id);
-        push_len_prefixed_str(&mut preimage, &req.repo_id);
-        push_len_prefixed_str(&mut preimage, &req.task_id);
-        preimage.extend_from_slice(&req.policy_epoch.to_be_bytes());
-        push_len_prefixed_str(&mut preimage, &format!("{decision:?}"));
-        push_len_prefixed_str(&mut preimage, reason);
-        preimage.extend_from_slice(&req.timestamp_ms.to_be_bytes());
-        let digest = Sha256::digest(&preimage);
-        let mut entry_sha256 = [0u8; 32];
-        entry_sha256.copy_from_slice(&digest);
+        let entry_sha256 = AuditLogEntry::compute_entry_sha256(
+            &req.request_id,
+            &req.requester_seat_id,
+            &req.acu_seat_id,
+            &req.repo_id,
+            &req.task_id,
+            req.policy_epoch,
+            decision,
+            reason,
+            req.timestamp_ms,
+        );
 
         let entry = AuditLogEntry {
             request_id: req.request_id.clone(),

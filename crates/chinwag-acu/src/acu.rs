@@ -18,7 +18,10 @@ use crate::AcuError;
 use crate::keys::{
     MAX_SEAT_ID_BYTES, SeatPublicKey, SeatSecretKey, is_valid_seat_id, sample_nonzero_scalar,
 };
-use crate::lsss::{LsssMatrix, find_reconstruction_weights, submatrix_rank};
+use crate::lsss::{
+    LsssMatrix, MAX_SERIALIZED_COLS, MAX_SERIALIZED_ROWS, find_reconstruction_weights,
+    submatrix_rank,
+};
 use bls12_381::{G1Affine, G1Projective, G2Affine, G2Projective, Gt, Scalar, pairing};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -38,9 +41,6 @@ const BASIS_SEAL_AAD_DOMAIN: &[u8] = b"chinwag-acu/v2/basis-seal-aad";
 const G1_COMPRESSED_BYTES: usize = 48;
 const G2_COMPRESSED_BYTES: usize = 96;
 const POLY1305_TAG_BYTES: usize = 16;
-
-const MAX_SERIALIZED_ROWS: usize = 4096;
-const MAX_SERIALIZED_COLS: usize = 4096;
 
 /// RAII wrapper zeroizing transient $\mathbb{G}_1$ basis commitment vectors on drop across all exit paths.
 struct ZeroizeG1Vec(Vec<G1Projective>);
@@ -111,6 +111,33 @@ pub struct AcuCiphertext {
 }
 
 impl AcuCiphertext {
+    /// Validate full in-memory structural equivalence between `self.matrix` and `self.rows`.
+    pub fn validate_structure(&self) -> Result<(), AcuError> {
+        self.matrix.validate()?;
+        if self.rows.len() != self.matrix.rows.len() {
+            return Err(AcuError::DimensionMismatch {
+                expected: self.matrix.rows.len(),
+                actual: self.rows.len(),
+            });
+        }
+        for (expected_idx, (row, (mat_seat, mat_vec))) in
+            self.rows.iter().zip(self.matrix.rows.iter()).enumerate()
+        {
+            if row.row_index != expected_idx || row.seat_id != *mat_seat {
+                return Err(AcuError::SerializationError(
+                    "AcuCiphertext rows/matrix seat or index mismatch",
+                ));
+            }
+            if row.matrix_row != *mat_vec {
+                return Err(AcuError::DimensionMismatch {
+                    expected: mat_vec.len(),
+                    actual: row.matrix_row.len(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Serialize this [`AcuCiphertext`] into a deterministic, self-framing binary format
     /// (`CHWGACU2`) using canonical Zcash/IETF compressed BLS12-381 points (`48` bytes for $\mathbb{G}_1$,
     /// `96` bytes for $\mathbb{G}_2$), `32`-byte little-endian $\mathbb{F}_r$ scalars, and
@@ -427,7 +454,7 @@ pub fn insert_key(
     new_row: Vec<Scalar>,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<usize, AcuError> {
-    ct.matrix.validate()?;
+    ct.validate_structure()?;
     let basis_commitments = unseal_basis_commitments(ct, acu_sk)?;
 
     if new_row.len() != ct.matrix.cols {
@@ -517,12 +544,15 @@ pub fn insert_sibling_key(
 /// **Dynamic Policy Operation 2 — Threshold Escalation (`escalate_threshold`)**:
 ///
 /// Executed exclusively by the ACU operator holding `acu_sk` without decrypting $c_0$:
-/// 1. Unseals $\{V_m\}$ from `ct.sealed_basis`.
-/// 2. Samples $\Delta t$ fresh non-zero column secrets $u_1, \dots, u_{\Delta t} \xleftarrow{\$} \mathbb{F}_r^*$
-///    and appends $g_1^{u_1}, \dots, g_1^{u_{\Delta t}}$ to $\{V_m'\}$.
-/// 3. Extends each affected row $j$ with Vandermonde powers of $x_j = j + 1$ starting at the
-///    sub-gate's current Vandermonde degree and shifts `row.c1` with fresh row randomness $r'_j$.
-/// 4. Zero-pads unaffected rows and re-seals $\{V_m'\}$ under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
+/// 1. Unseals $\{V_m\}$ from `ct.sealed_basis` and verifies that `affected_row_indices` form a valid
+///    sibling `OR` or `Threshold(t-of-n)` gate, extracting each row's exact Vandermonde abscissa $x_j \in \mathbb{F}_r^*$
+///    (preserving true abscissas even if intermediate siblings were pruned in an earlier revocation).
+/// 2. Samples $\Delta t$ fresh non-zero column secrets $u_1, \dots, u_{\Delta t} \xleftarrow{\$} \mathbb{F}_r^*$,
+///    extends affected rows with $x_j^t, \dots, x_j^{t + \Delta t - 1}$, and zero-pads unaffected rows.
+/// 3. Rotates $c_{0,\mathbb{G}_1}$, $c_0$, $\{V_m'\}$, and **all** rows (affected and unaffected) by a fresh
+///    blinding delta $\Delta v = (\Delta s, \Delta v_1, \dots, \Delta v_{\text{new\_cols}-1}) \in (\mathbb{F}_r^*)^{\text{new\_cols}}$
+///    so shares issued at `policy_epoch + 1` cannot be downgraded onto cached prior-epoch ciphertexts,
+///    then re-seals $\{V_m'\}$ under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
 pub fn escalate_threshold(
     ct: &mut AcuCiphertext,
     acu_sk: &SeatSecretKey,
@@ -531,7 +561,7 @@ pub fn escalate_threshold(
     seat_keys: &BTreeMap<String, SeatPublicKey>,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(), AcuError> {
-    ct.matrix.validate()?;
+    ct.validate_structure()?;
     let mut basis_commitments = unseal_basis_commitments(ct, acu_sk)?;
 
     if delta_t == 0 {
@@ -559,12 +589,85 @@ pub fn escalate_threshold(
     }
 
     let unique_affected: Vec<usize> = affected_set.iter().copied().collect();
-    let current_rank = submatrix_rank(&ct.matrix, &unique_affected).max(1);
+    let current_rank = submatrix_rank(&ct.matrix, &unique_affected);
+    if current_rank == 0 {
+        return Err(AcuError::InvalidAccessTree("affected rows have zero rank"));
+    }
     if current_rank + delta_t > unique_affected.len() {
         return Err(AcuError::InvalidThreshold {
             threshold: current_rank + delta_t,
             children: unique_affected.len(),
         });
+    }
+
+    // Extract and algebraically verify each affected row's Vandermonde abscissa x_j in F_r^*.
+    let first_row = &ct.rows[unique_affected[0]].matrix_row;
+    let mut diff_cols = Vec::new();
+    let mut has_nonzero_parent = false;
+    for (col, &first_val) in first_row.iter().enumerate().take(ct.matrix.cols) {
+        let all_equal = unique_affected[1..]
+            .iter()
+            .all(|&r_idx| ct.rows[r_idx].matrix_row[col] == first_val);
+        if all_equal {
+            if !bool::from(first_val.is_zero()) {
+                has_nonzero_parent = true;
+            }
+        } else {
+            diff_cols.push(col);
+        }
+    }
+    if !has_nonzero_parent {
+        return Err(AcuError::InvalidAccessTree(
+            "affected rows do not share a non-zero parent label",
+        ));
+    }
+
+    let mut abscissa_by_row: BTreeMap<usize, Scalar> = BTreeMap::new();
+    if current_rank == 1 {
+        if !diff_cols.is_empty() {
+            return Err(AcuError::InvalidAccessTree(
+                "rank-1 affected rows do not share an identical OR parent vector",
+            ));
+        }
+        for (pos, &r_idx) in unique_affected.iter().enumerate() {
+            abscissa_by_row.insert(r_idx, Scalar::from((pos + 1) as u64));
+        }
+    } else {
+        if diff_cols.len() != current_rank - 1 {
+            return Err(AcuError::InvalidAccessTree(
+                "affected rows do not form a valid sibling threshold gate",
+            ));
+        }
+        for (r_idx, row) in ct.rows.iter().enumerate() {
+            if !affected_set.contains(&r_idx)
+                && diff_cols
+                    .iter()
+                    .any(|&c| !bool::from(row.matrix_row[c].is_zero()))
+            {
+                return Err(AcuError::InvalidAccessTree(
+                    "affected_row_indices omits sibling rows of the target threshold gate",
+                ));
+            }
+        }
+        let degree_one_col = diff_cols[0];
+        let mut seen_x: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for &r_idx in &unique_affected {
+            let x_j = ct.rows[r_idx].matrix_row[degree_one_col];
+            if bool::from(x_j.is_zero()) || !seen_x.insert(x_j.to_bytes()) {
+                return Err(AcuError::InvalidAccessTree(
+                    "affected threshold rows lack distinct non-zero Vandermonde abscissas",
+                ));
+            }
+            for (deg_offset, &col_idx) in diff_cols.iter().enumerate() {
+                let expected_pow = scalar_pow(x_j, (deg_offset + 1) as u64);
+                if ct.rows[r_idx].matrix_row[col_idx] != expected_pow {
+                    return Err(AcuError::InvalidAccessTree(
+                        "affected rows violate Vandermonde threshold structure",
+                    ));
+                }
+            }
+            abscissa_by_row.insert(r_idx, x_j);
+        }
     }
 
     let new_cols = ct
@@ -576,19 +679,19 @@ pub fn escalate_threshold(
             "invalid AcuCiphertext dimensions",
         ))?;
 
-    // Verify public keys for all affected rows before mutating state.
-    for &idx in &unique_affected {
-        let seat_id = &ct.rows[idx].seat_id;
+    // Verify public keys for ALL rows in `ct.rows` so every row can be freshly rerandomized.
+    for row in &ct.rows {
         let pk = seat_keys
-            .get(seat_id)
-            .ok_or_else(|| AcuError::UnknownSeat(seat_id.clone()))?;
-        if pk.seat_id != *seat_id || !pk.verify_consistency() {
-            return Err(AcuError::InvalidPublicKey(seat_id.clone()));
+            .get(&row.seat_id)
+            .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
+        if pk.seat_id != row.seat_id || !pk.verify_consistency() {
+            return Err(AcuError::InvalidPublicKey(row.seat_id.clone()));
         }
     }
 
     let g1 = G1Projective::generator();
     let g2 = G2Projective::generator();
+    let g2_aff = G2Affine::generator();
 
     // Sample delta_t fresh column secrets u_1..u_{delta_t} and extend basis_commitments.
     let mut u = Zeroizing::new(Vec::with_capacity(delta_t));
@@ -602,36 +705,75 @@ pub fn escalate_threshold(
     let mut new_rows = ct.rows.clone();
 
     let base_exp = current_rank;
-    for row_idx in 0..new_rows.len() {
-        if affected_set.contains(&row_idx) {
-            let x_j = Scalar::from((row_idx + 1) as u64);
+    for (row_idx, (new_row, (_, new_mat_row))) in new_rows
+        .iter_mut()
+        .zip(new_matrix.rows.iter_mut())
+        .enumerate()
+    {
+        if let Some(&x_j) = abscissa_by_row.get(&row_idx) {
             let mut x_pow = scalar_pow(x_j, base_exp as u64);
             let mut delta_lambda = Scalar::ZERO;
 
             for m in 0..delta_t {
-                new_matrix.rows[row_idx].1.push(x_pow);
-                new_rows[row_idx].matrix_row.push(x_pow);
+                new_mat_row.push(x_pow);
+                new_row.matrix_row.push(x_pow);
                 delta_lambda += u[m] * x_pow;
                 x_pow *= x_j;
             }
 
-            let pk = &seat_keys[&new_rows[row_idx].seat_id];
-            let mut r_prime = sample_nonzero_scalar(rng);
-            new_rows[row_idx].c1 += g1 * delta_lambda + pk.pk1 * r_prime;
-            new_rows[row_idx].c2 += g2 * r_prime;
-            new_rows[row_idx].c3 += g1 * r_prime;
+            new_row.c1 += g1 * delta_lambda;
             delta_lambda.zeroize();
-            r_prime.zeroize();
         } else {
             for _ in 0..delta_t {
-                new_matrix.rows[row_idx].1.push(Scalar::ZERO);
-                new_rows[row_idx].matrix_row.push(Scalar::ZERO);
+                new_mat_row.push(Scalar::ZERO);
+                new_row.matrix_row.push(Scalar::ZERO);
             }
         }
     }
     u.zeroize();
-
     new_matrix.cols = new_cols;
+
+    // Rotate c0_g1, c0, basis_commitments[0..new_cols], and ALL rows by fresh blinding delta_v
+    // so new-epoch shares (e.g. D_ACU) cannot be downgraded onto cached prior-epoch ciphertexts.
+    let mut delta_v = Zeroizing::new(Vec::with_capacity(new_cols));
+    let (delta_s, new_c0_g1) = loop {
+        let candidate_ds = sample_nonzero_scalar(rng);
+        let candidate_c0_g1 = ct.c0_g1 + g1 * candidate_ds;
+        let candidate_v0 = basis_commitments.0[0] + g1 * candidate_ds;
+        if !bool::from(candidate_c0_g1.is_identity()) && !bool::from(candidate_v0.is_identity()) {
+            break (candidate_ds, candidate_c0_g1);
+        }
+    };
+    delta_v.push(delta_s);
+    basis_commitments.0[0] += g1 * delta_s;
+
+    for vm in basis_commitments.0.iter_mut().skip(1) {
+        let dv_m = loop {
+            let candidate = sample_nonzero_scalar(rng);
+            if !bool::from((*vm + g1 * candidate).is_identity()) {
+                break candidate;
+            }
+        };
+        *vm += g1 * dv_m;
+        delta_v.push(dv_m);
+    }
+
+    let new_c0 = pairing(&G1Affine::from(new_c0_g1), &g2_aff);
+
+    for row in &mut new_rows {
+        let pk = &seat_keys[&row.seat_id];
+        let mut rot_lambda = inner_product(&row.matrix_row, &delta_v);
+        let mut r_prime = sample_nonzero_scalar(rng);
+
+        row.c1 += g1 * rot_lambda + pk.pk1 * r_prime;
+        row.c2 += g2 * r_prime;
+        row.c3 += g1 * r_prime;
+
+        rot_lambda.zeroize();
+        r_prime.zeroize();
+    }
+    delta_v.zeroize();
+
     let new_epoch = ct
         .policy_epoch
         .checked_add(1)
@@ -643,13 +785,15 @@ pub fn escalate_threshold(
         &ct.sealed_basis.acu_seat_id,
         &acu_pk1,
         new_epoch,
-        &ct.c0_g1,
+        &new_c0_g1,
         &new_rows,
         rng,
     );
     acu_pk1.zeroize();
     let new_sealed_basis = re_sealed_res?;
 
+    ct.c0_g1 = new_c0_g1;
+    ct.c0 = new_c0;
     ct.matrix = new_matrix;
     ct.rows = new_rows;
     ct.sealed_basis = new_sealed_basis;
@@ -674,7 +818,7 @@ pub fn revoke_and_rerandomize(
     seat_keys: &BTreeMap<String, SeatPublicKey>,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(), AcuError> {
-    ct.matrix.validate()?;
+    ct.validate_structure()?;
     let mut basis_commitments = unseal_basis_commitments(ct, acu_sk)?;
 
     let revoked_set: BTreeSet<&str> = revoked_seat_ids.iter().copied().collect();
@@ -905,15 +1049,9 @@ fn combine_inner(
     shares: &[PartialDecryptionShare],
     seat_keys_opt: Option<&BTreeMap<String, SeatPublicKey>>,
 ) -> Result<Gt, AcuError> {
-    ct.matrix.validate()?;
+    ct.validate_structure()?;
     if ct.policy_epoch == 0 {
         return Err(AcuError::SerializationError("policy_epoch must be >= 1"));
-    }
-    if ct.rows.len() != ct.matrix.rows.len() {
-        return Err(AcuError::DimensionMismatch {
-            expected: ct.matrix.rows.len(),
-            actual: ct.rows.len(),
-        });
     }
     let expected_sealed_len = expected_sealed_basis_len(ct.matrix.cols)?;
     if ct.sealed_basis.ciphertext.len() != expected_sealed_len {
@@ -1098,6 +1236,18 @@ fn seal_basis_commitments(
     })
 }
 
+/// Cryptographically authenticate `ct` against `acu_sk` by unsealing `ct.sealed_basis`
+/// (verifying its ChaCha20-Poly1305 tag and injective binary AAD over `policy_epoch`,
+/// `acu_seat_id`, `cols`, `c0_g1`, and all `rows`) and immediately zeroizing the unsealed commitments.
+pub(crate) fn verify_sealed_basis(
+    ct: &AcuCiphertext,
+    acu_sk: &SeatSecretKey,
+) -> Result<(), AcuError> {
+    let unsealed = unseal_basis_commitments(ct, acu_sk)?;
+    drop(unsealed);
+    Ok(())
+}
+
 fn unseal_basis_commitments(
     ct: &AcuCiphertext,
     acu_sk: &SeatSecretKey,
@@ -1108,9 +1258,9 @@ fn unseal_basis_commitments(
     {
         return Err(AcuError::BasisUnsealFailed);
     }
-    if bool::from(ct.sealed_basis.ephemeral_pk1.is_identity())
-        || bool::from(ct.c0_g1.is_identity())
-        || ct.rows.len() != ct.matrix.rows.len()
+    ct.validate_structure()
+        .map_err(|_| AcuError::BasisUnsealFailed)?;
+    if bool::from(ct.sealed_basis.ephemeral_pk1.is_identity()) || bool::from(ct.c0_g1.is_identity())
     {
         return Err(AcuError::BasisUnsealFailed);
     }
