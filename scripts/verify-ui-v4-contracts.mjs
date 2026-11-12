@@ -1734,27 +1734,63 @@ function matchCompoundSelector(compound, node) {
 }
 
 function matchSelectorChain(selector, chain) {
-  if (selector.includes(">") || selector.includes("+") || selector.includes("~")) return null;
-  const parts = selector.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return null;
-  const lastSpec = matchCompoundSelector(parts[parts.length - 1], chain[chain.length - 1]);
+  if (selector.includes("+") || selector.includes("~")) return null;
+  const tokens = selector
+    .replace(/>/g, " > ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (tokens.length === 0) return null;
+
+  const steps = [];
+  let pendingCombinator = " ";
+  for (const tok of tokens) {
+    if (tok === ">") {
+      pendingCombinator = ">";
+    } else {
+      steps.push({ compound: tok, combinatorToRight: null });
+      if (steps.length >= 2) {
+        steps[steps.length - 2].combinatorToRight = pendingCombinator;
+      }
+      pendingCombinator = " ";
+    }
+  }
+  if (steps.length === 0) return null;
+
+  const lastSpec = matchCompoundSelector(steps[steps.length - 1].compound, chain[chain.length - 1]);
   if (!lastSpec) return null;
   let totalIds = lastSpec[0];
   let totalCls = lastSpec[1];
   let totalTags = lastSpec[2];
 
-  let ancIdx = chain.length - 2;
-  for (let p = parts.length - 2; p >= 0; p -= 1) {
-    let matchedSpec = null;
-    while (ancIdx >= 0) {
-      matchedSpec = matchCompoundSelector(parts[p], chain[ancIdx]);
-      ancIdx -= 1;
-      if (matchedSpec) break;
+  let childChainIdx = chain.length - 1;
+  for (let p = steps.length - 2; p >= 0; p -= 1) {
+    const comb = steps[p].combinatorToRight;
+    if (comb === ">") {
+      const parentIdx = childChainIdx - 1;
+      if (parentIdx < 0) return null;
+      const spec = matchCompoundSelector(steps[p].compound, chain[parentIdx]);
+      if (!spec) return null;
+      totalIds += spec[0];
+      totalCls += spec[1];
+      totalTags += spec[2];
+      childChainIdx = parentIdx;
+    } else {
+      let matchedSpec = null;
+      let ancIdx = childChainIdx - 1;
+      while (ancIdx >= 0) {
+        matchedSpec = matchCompoundSelector(steps[p].compound, chain[ancIdx]);
+        if (matchedSpec) {
+          childChainIdx = ancIdx;
+          break;
+        }
+        ancIdx -= 1;
+      }
+      if (!matchedSpec) return null;
+      totalIds += matchedSpec[0];
+      totalCls += matchedSpec[1];
+      totalTags += matchedSpec[2];
     }
-    if (!matchedSpec) return null;
-    totalIds += matchedSpec[0];
-    totalCls += matchedSpec[1];
-    totalTags += matchedSpec[2];
   }
   return [totalIds, totalCls, totalTags];
 }
@@ -1836,8 +1872,26 @@ function resolvePxExpr(rawVal, vars, vw) {
   return m ? Number(m[1]) : 0;
 }
 
-function computeDelivery2HeaderBoxes(cssText, vw, htmlAttrs, statusText = "Waiting for you") {
+function computeDelivery2HeaderBoxes(
+  cssText,
+  vw,
+  vh,
+  htmlAttrs,
+  { statusText = "Waiting for you", glyphEmRatio = 0.62 } = {},
+) {
   const rules = parseCssRulesForCascade(cssText);
+  // Guardrail: verify zero `.d2-` selectors use sibling combinators (`+` or `~`) that would be skipped
+  for (const r of rules) {
+    for (const sel of r.selectors) {
+      if (sel.includes(".d2-") || sel.includes("#d2-")) {
+        assert.equal(
+          sel.includes("+") || sel.includes("~"),
+          false,
+          `Unsupported sibling combinator in Delivery-2 selector '${sel}'`,
+        );
+      }
+    }
+  }
   const htmlNode = { tag: "html", id: "", className: "", attrs: htmlAttrs };
   const bodyNode = { tag: "body", id: "doc-body", className: "", attrs: {} };
   const appBodyNode = { tag: "div", id: "app-body", className: "app-body", attrs: {} };
@@ -1998,8 +2052,11 @@ function computeDelivery2HeaderBoxes(cssText, vw, htmlAttrs, statusText = "Waiti
     const titleGroupMaxRight = Math.max(cursorX, actionsLeft - headGap);
     const titleFontPx = resolvePxExpr(titleStyle["font-size"], vars, vw) || 13;
     const titleLineH = resolvePxExpr(titleStyle["line-height"], vars, vw) || 18;
-    const rawTitleW = Math.ceil("Delivery-2".length * titleFontPx * 0.56);
-    const titleRight = Math.min(titleGroupMaxRight, cursorX + rawTitleW);
+    const rawTitleW = Math.ceil("Delivery-2".length * titleFontPx * glyphEmRatio);
+    const titleRight =
+      titleStyle["flex-shrink"] === "0"
+        ? cursorX + rawTitleW
+        : Math.min(titleGroupMaxRight, cursorX + rawTitleW);
     const titleTop = contentTop + (contentH - titleLineH) / 2;
     titleRect = {
       id: "d2-title",
@@ -2016,8 +2073,11 @@ function computeDelivery2HeaderBoxes(cssText, vw, htmlAttrs, statusText = "Waiti
     const wordFontPx = resolvePxExpr(statusWordStyle["font-size"], vars, vw) || 11;
     const wordLineH = resolvePxExpr(statusWordStyle["line-height"], vars, vw) || 16;
     const wordLeft = Math.min(titleGroupMaxRight, titleRight + tgGap + dotW + swGap);
-    const rawWordW = Math.ceil(statusText.length * wordFontPx * 0.54);
-    const wordRight = Math.min(titleGroupMaxRight, wordLeft + rawWordW);
+    const rawWordW = Math.ceil(statusText.length * wordFontPx * glyphEmRatio);
+    const wordRight =
+      statusWordStyle.overflow === "hidden"
+        ? Math.min(titleGroupMaxRight, wordLeft + rawWordW)
+        : wordLeft + rawWordW;
     const wordTop = contentTop + (contentH - wordLineH) / 2;
     statusWordRect = {
       id: "d2-status-word",
@@ -2030,12 +2090,16 @@ function computeDelivery2HeaderBoxes(cssText, vw, htmlAttrs, statusText = "Waiti
 
   let spineDotsRect = null;
   if (spineVisible) {
+    const spineDotsChain = [...spineTopChain, { tag: "div", id: "", className: "d2-spine-dots", attrs: {} }];
+    const spineDotsStyle = styleFor(spineDotsChain);
+    const spineDotStyle = styleFor([...spineDotsChain, { tag: "span", id: "", className: "d2-spine-dot", attrs: {} }]);
     const spinePadTop = resolvePxExpr(spineStyle["padding-top"], vars, vw);
+    const spinePadBottom = resolvePxExpr(spineStyle["padding-bottom"], vars, vw);
     const spineTopPad = resolvePxExpr(spineTopStyle["padding-top"], vars, vw);
     let spineCursorY = spinePadTop + spineTopPad;
     if ((spineToggleStyle.display || "inline-flex") !== "none") {
-      const sw = resolvePxExpr(spineToggleStyle.width, vars, vw) || 26;
-      const sh = resolvePxExpr(spineToggleStyle.height, vars, vw) || 26;
+      const sw = resolvePxExpr(spineToggleStyle.width, vars, vw);
+      const sh = resolvePxExpr(spineToggleStyle.height, vars, vw);
       const sLeft = (railWidth - 1 - sw) / 2;
       visibleButtons.push({
         id: "d2-spine-toggle",
@@ -2044,23 +2108,29 @@ function computeDelivery2HeaderBoxes(cssText, vw, htmlAttrs, statusText = "Waiti
         right: sLeft + sw,
         bottom: spineCursorY + sh,
       });
-      spineCursorY += sh + (resolvePxExpr(spineTopStyle.gap, vars, vw) || 10);
+      spineCursorY += sh + resolvePxExpr(spineTopStyle.gap, vars, vw);
     }
+    const dotSize = resolvePxExpr(spineDotStyle.width, vars, vw);
+    const dotH = resolvePxExpr(spineDotStyle.height, vars, vw);
+    const dotsGap = resolvePxExpr(spineDotsStyle.gap, vars, vw);
+    const dotsPadTop = resolvePxExpr(spineDotsStyle["padding-top"], vars, vw);
+    const dotsPadBottom = resolvePxExpr(spineDotsStyle["padding-bottom"], vars, vw);
+    const surfaceCount = d2Spine.querySelectorAll(".d2-spine-dot").length || 4;
     spineDotsRect = {
       id: "d2-spine-dots",
-      left: (railWidth - 1 - 6) / 2,
+      left: (railWidth - 1 - dotSize) / 2,
       top: spineCursorY,
-      right: (railWidth - 1 + 6) / 2,
-      bottom: spineCursorY + 4 * 6 + 3 * 6 + 8,
+      right: (railWidth - 1 + dotSize) / 2,
+      bottom: spineCursorY + dotsPadTop + surfaceCount * dotH + Math.max(0, surfaceCount - 1) * dotsGap + dotsPadBottom,
     };
-    const cw = resolvePxExpr(spineComposeStyle.width, vars, vw) || 28;
-    const ch = resolvePxExpr(spineComposeStyle.height, vars, vw) || 28;
+    const cw = resolvePxExpr(spineComposeStyle.width, vars, vw);
+    const ch = resolvePxExpr(spineComposeStyle.height, vars, vw);
     visibleButtons.push({
       id: "d2-spine-compose",
       left: (railWidth - 1 - cw) / 2,
-      top: 900 - 12 - ch,
+      top: vh - spinePadBottom - ch,
       right: (railWidth - 1 + cw) / 2,
-      bottom: 900 - 12,
+      bottom: vh - spinePadBottom,
     });
   }
 
@@ -2088,36 +2158,44 @@ assert.deepEqual(
 assert.ok(d2Track.querySelector("#d2-head-toggle"), "In-flow #d2-head-toggle must exist for <960px drawer");
 assert.ok(d2Spine.querySelector("#d2-spine-toggle"), "In-flow #d2-spine-toggle must exist in .d2-spine");
 
-// L2: 1440x900 Expanded (`data-rail="expanded"`) — zero overlap between every visible button and `.d2-title` / `#d2-status-word`
-const layoutDesktopExpanded = computeDelivery2HeaderBoxes(stylesCss, 1440, { "data-rail": "expanded" });
-assert.equal(layoutDesktopExpanded.trackVisible, true);
-assert.equal(layoutDesktopExpanded.spineVisible, false);
-assert.equal(
-  layoutDesktopExpanded.visibleButtons.some((b) => b.id === "d2-head-toggle" || b.id === "d2-spine-toggle"),
-  false,
-  "Desktop >=960px must hide in-flow #d2-head-toggle and #d2-spine-toggle so only stationary #d2-rail-toggle-fixed is visible",
-);
-const desktopFixedToggle = layoutDesktopExpanded.visibleButtons.find((b) => b.id === "d2-rail-toggle-fixed");
-assert.ok(desktopFixedToggle, "Stationary #d2-rail-toggle-fixed must be visible at 1440x900");
-assert.ok(
-  layoutDesktopExpanded.titleRect.left - desktopFixedToggle.right >= 6,
-  `Delivery-2 .d2-title (left=${layoutDesktopExpanded.titleRect.left}px) must clear #d2-rail-toggle-fixed (right=${desktopFixedToggle.right}px) by >=6px`,
-);
-for (const btn of layoutDesktopExpanded.visibleButtons) {
-  assert.equal(
-    rectsOverlap(btn, layoutDesktopExpanded.titleRect),
-    false,
-    `1440x900 expanded: button #${btn.id} (${JSON.stringify(btn)}) overlaps .d2-title (${JSON.stringify(layoutDesktopExpanded.titleRect)})`,
+// L2: 1440x900 Expanded (`data-rail="expanded"`) — zero overlap across both narrow (0.50em) & wide (0.68em) glyph metrics
+for (const glyphEmRatio of [0.5, 0.62, 0.68]) {
+  const layoutDesktopExpanded = computeDelivery2HeaderBoxes(
+    stylesCss,
+    1440,
+    900,
+    { "data-rail": "expanded" },
+    { glyphEmRatio },
   );
+  assert.equal(layoutDesktopExpanded.trackVisible, true);
+  assert.equal(layoutDesktopExpanded.spineVisible, false);
   assert.equal(
-    rectsOverlap(btn, layoutDesktopExpanded.statusWordRect),
+    layoutDesktopExpanded.visibleButtons.some((b) => b.id === "d2-head-toggle" || b.id === "d2-spine-toggle"),
     false,
-    `1440x900 expanded: button #${btn.id} (${JSON.stringify(btn)}) overlaps #d2-status-word (${JSON.stringify(layoutDesktopExpanded.statusWordRect)})`,
+    "Desktop >=960px must hide in-flow #d2-head-toggle and #d2-spine-toggle so only stationary #d2-rail-toggle-fixed is visible",
   );
+  const desktopFixedToggle = layoutDesktopExpanded.visibleButtons.find((b) => b.id === "d2-rail-toggle-fixed");
+  assert.ok(desktopFixedToggle, "Stationary #d2-rail-toggle-fixed must be visible at 1440x900");
+  assert.ok(
+    layoutDesktopExpanded.titleRect.left - desktopFixedToggle.right >= 6,
+    `Delivery-2 .d2-title (left=${layoutDesktopExpanded.titleRect.left}px) must clear #d2-rail-toggle-fixed (right=${desktopFixedToggle.right}px) by >=6px`,
+  );
+  for (const btn of layoutDesktopExpanded.visibleButtons) {
+    assert.equal(
+      rectsOverlap(btn, layoutDesktopExpanded.titleRect),
+      false,
+      `1440x900 expanded (em=${glyphEmRatio}): button #${btn.id} overlaps .d2-title`,
+    );
+    assert.equal(
+      rectsOverlap(btn, layoutDesktopExpanded.statusWordRect),
+      false,
+      `1440x900 expanded (em=${glyphEmRatio}): button #${btn.id} overlaps #d2-status-word`,
+    );
+  }
 }
 
 // L3: 1200x900 Collapsed 44px Spine & 1200x900 User-Expanded — zero overlap in both states
-const layoutSpineCollapsed = computeDelivery2HeaderBoxes(stylesCss, 1200, {});
+const layoutSpineCollapsed = computeDelivery2HeaderBoxes(stylesCss, 1200, 900, {});
 assert.equal(layoutSpineCollapsed.trackVisible, false);
 assert.equal(layoutSpineCollapsed.spineVisible, true);
 for (const btn of layoutSpineCollapsed.visibleButtons) {
@@ -2127,50 +2205,84 @@ for (const btn of layoutSpineCollapsed.visibleButtons) {
     `1200x900 spine: button #${btn.id} overlaps .d2-spine-dots`,
   );
 }
-const layoutLaptopExpanded = computeDelivery2HeaderBoxes(stylesCss, 1200, { "data-rail": "expanded" });
+const layoutLaptopExpanded = computeDelivery2HeaderBoxes(stylesCss, 1200, 900, { "data-rail": "expanded" });
 for (const btn of layoutLaptopExpanded.visibleButtons) {
   assert.equal(rectsOverlap(btn, layoutLaptopExpanded.titleRect), false, `1200x900 expanded overlap on #${btn.id}`);
   assert.equal(rectsOverlap(btn, layoutLaptopExpanded.statusWordRect), false, `1200x900 status overlap on #${btn.id}`);
 }
 
-// L4: 390x844 Mobile Open Drawer — `#d2-rail-toggle-fixed` hidden, in-flow `#d2-head-toggle` clears `.d2-title`
-const layoutMobileDrawer = computeDelivery2HeaderBoxes(stylesCss, 390, { "data-d2-drawer": "open" });
-assert.equal(
-  layoutMobileDrawer.visibleButtons.some((b) => b.id === "d2-rail-toggle-fixed"),
-  false,
-  "<960px mobile drawer must hide #d2-rail-toggle-fixed",
-);
-const mobileHeadToggle = layoutMobileDrawer.visibleButtons.find((b) => b.id === "d2-head-toggle");
-assert.ok(mobileHeadToggle, "<960px mobile drawer must show in-flow #d2-head-toggle");
-for (const btn of layoutMobileDrawer.visibleButtons) {
+// L4: 390x844 & 320x568 Mobile Open Drawer — `#d2-rail-toggle-fixed` hidden, unclipped `.d2-title` clears all buttons
+for (const [mVw, mVh] of [
+  [390, 844],
+  [320, 568],
+]) {
+  const layoutMobileDrawer = computeDelivery2HeaderBoxes(stylesCss, mVw, mVh, { "data-d2-drawer": "open" });
   assert.equal(
-    rectsOverlap(btn, layoutMobileDrawer.titleRect),
+    layoutMobileDrawer.visibleButtons.some((b) => b.id === "d2-rail-toggle-fixed"),
     false,
-    `390x844 mobile drawer: button #${btn.id} overlaps .d2-title`,
+    "<960px mobile drawer must hide #d2-rail-toggle-fixed",
   );
-  assert.equal(
-    rectsOverlap(btn, layoutMobileDrawer.statusWordRect),
-    false,
-    `390x844 mobile drawer: button #${btn.id} overlaps #d2-status-word`,
-  );
+  const mobileHeadToggle = layoutMobileDrawer.visibleButtons.find((b) => b.id === "d2-head-toggle");
+  assert.ok(mobileHeadToggle, "<960px mobile drawer must show in-flow #d2-head-toggle");
+  for (const btn of layoutMobileDrawer.visibleButtons) {
+    assert.equal(
+      rectsOverlap(btn, layoutMobileDrawer.titleRect),
+      false,
+      `${mVw}x${mVh} mobile drawer: button #${btn.id} overlaps .d2-title`,
+    );
+    assert.equal(
+      rectsOverlap(btn, layoutMobileDrawer.statusWordRect),
+      false,
+      `${mVw}x${mVh} mobile drawer: button #${btn.id} overlaps #d2-status-word`,
+    );
+  }
 }
 
-// L5: Mutant Canary Self-Test — prove this cascade + AABB engine catches the exact `padding` shorthand override bug!
-const mutatedBuggyCss = stylesCss.replace(
+// L5: Dual Mutant Canaries —
+// (L5a) Exact reproduction of the `0d600d0` cascade-order bug: earlier `@media (min-width: 960px) { .d2-head { padding-left: 41px; } }`
+//       gets reset back to `12px` by the later `.d2-head { padding: 8px var(--rail-inset) 6px; }` shorthand -> title lands at x=12 overlapping [9..35]!
+const mutatedCascadeResetCss = stylesCss.replace(
   /@media\s*\(min-width:\s*960px\)\s*\{\s*\.d2-rail\s+\.d2-head\s*\{\s*padding-left:\s*42px;\s*\}\s*\}/,
   "",
 );
-assert.notEqual(mutatedBuggyCss, stylesCss, "Mutant canary regex must match the production .d2-rail .d2-head rule");
-const buggyLayout = computeDelivery2HeaderBoxes(
-  `@media (min-width: 960px) { .d2-head { padding-left: 41px; } }\n${mutatedBuggyCss}`,
+assert.notEqual(mutatedCascadeResetCss, stylesCss, "Mutant canary regex must match production .d2-rail .d2-head rule");
+const cascadeResetLayout = computeDelivery2HeaderBoxes(
+  `@media (min-width: 960px) { .d2-head { padding-left: 41px; } }\n${mutatedCascadeResetCss}`,
   1440,
+  900,
   { "data-rail": "expanded" },
 );
-const buggyToggle = buggyLayout.visibleButtons.find((b) => b.id === "d2-rail-toggle-fixed");
 assert.equal(
-  rectsOverlap(buggyToggle, buggyLayout.titleRect),
+  cascadeResetLayout.titleRect.left,
+  12,
+  "Canary L5a: later `.d2-head { padding: ... }` shorthand resets equal-specificity earlier `padding-left: 41px` back to 12px",
+);
+assert.equal(
+  rectsOverlap(
+    cascadeResetLayout.visibleButtons.find((b) => b.id === "d2-rail-toggle-fixed"),
+    cascadeResetLayout.titleRect,
+  ),
   true,
-  "Mutant canary MUST detect overlap when a later `.d2-head { padding: ... }` shorthand resets `padding-left`",
+  "Canary L5a MUST detect overlap when shorthand resets padding-left to 12px",
+);
+
+// (L5b) Active insufficient-inset mutant: `.d2-rail .d2-head { padding-left: 24px; }` wins the cascade (title.left === 24px),
+//       which still collides horizontally with `#d2-rail-toggle-fixed` (`x = 9..35px`) -> AABB check catches it!
+const mutatedInsufficientInsetCss = stylesCss.replace(
+  /(\.d2-rail\s+\.d2-head\s*\{\s*padding-left:\s*)42px/,
+  "$124px",
+);
+const insufficientLayout = computeDelivery2HeaderBoxes(mutatedInsufficientInsetCss, 1440, 900, {
+  "data-rail": "expanded",
+});
+assert.equal(insufficientLayout.titleRect.left, 24);
+assert.equal(
+  rectsOverlap(
+    insufficientLayout.visibleButtons.find((b) => b.id === "d2-rail-toggle-fixed"),
+    insufficientLayout.titleRect,
+  ),
+  true,
+  "Canary L5b MUST detect overlap when winning cascade rule leaves insufficient padding-left (24px < 35px)",
 );
 
 console.log(

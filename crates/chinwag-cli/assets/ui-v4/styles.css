@@ -3409,7 +3409,6 @@ col.diff-col-split-code {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  overflow: hidden;
   flex: 1 1 auto;
 }
 
@@ -3420,6 +3419,7 @@ col.diff-col-split-code {
   letter-spacing: -0.01em;
   color: var(--ink-primary);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .d2-status-wrap {
