@@ -34,7 +34,21 @@ event-only probe are excluded from that controlled payload run.
    Lossless argv and working-directory metadata are sealed too; the process
    environment is not copied. Output remains untrusted data and grants no repair
    authority. The active agent needs separate authorization to change source.
-5. The envelope implements customer **ACU AND (Recipient OR Archive)** access.
+5. The envelope implements customer **ACU AND (Recipient OR Archive)** access on
+   hybrid post-quantum HPKE **`X25519-MLKEM768`** (`MLKEM768-X25519` / `X-Wing`,
+   IANA / `draft-ietf-hpke-pq-03` & `draft-irtf-cfrg-concrete-hybrid-kems-02`
+   KEM ID `0x647a`, `HKDF-SHA256` `0x0001`, `ChaCha20Poly1305` `0x0003`, with
+   backward-compatible classical `X25519` `0x0020` profile/envelope parsing for
+   legacy stored objects). Because `.chinwag/allowed_signers` authorizes seat
+   Ed25519 signing keys rather than encryption keys, [`recipient_key.rs`](src/recipient_key.rs)
+   enforces an explicit domain-separated Ed25519-signed recipient encryption-key
+   descriptor contract (`kid`, `seat`, `purpose`, `ciphersuite`, `kem_id`,
+   `1216`-byte `enc_public_key_hex`, monotonic `epoch` rotation, finite validity,
+   and signed revocation checks) verified against the bijective seat directory.
+   When ACU custody is not enabled, [`envelope.rs`](src/envelope.rs) also supports
+   direct offline-capable Base-mode `.cwcard` (`CWCARD01`) sealing to a verified
+   `cwcard:offline-base-v1` recipient key with mandatory runner Ed25519 origin
+   authentication before local decapsulation.
    The native CI transport uses `chinwag/ci-ciphertext/1`, one pinned destination
    peer and the same selected owned relay. UDP binds only loopback; address
    discovery, direct routing and public-relay fallback are disabled. No remote

@@ -9,8 +9,12 @@
 use crate::{
     CommandEvidence, authorization,
     custody::PublicDestination,
-    envelope::{self, Destination, KeyPins},
+    envelope::{self, Destination, KemPublicKey, KemSuite, KeyPins},
     intent::VerifiedIntent,
+    recipient_key::{
+        RecipientKeyPurpose, SeatSignerDirectory, VerifiedRecipientKey, VerifiedRevocationState,
+        valid_seat, verify_signed_recipient_key,
+    },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,7 +49,7 @@ pub struct DeliveryProfileSpec {
     pub initiating_instance: String,
     pub recipient: PublicDestination,
     pub archive: PublicDestination,
-    pub acu_gate_base: [u8; 32],
+    pub acu_gate_base: KemPublicKey,
     pub acu_signer: [u8; 32],
     pub admission_signer: [u8; 32],
     pub relay_origin: String,
@@ -227,11 +231,11 @@ impl DeliveryProfile {
             return Err(ProfileError);
         }
         let keys = KeyPins {
-            acu_gate_base: spec.acu_gate_base,
-            recipient_psk: r.psk,
-            archive_psk: a.psk,
-            recipient_response_base: r.response_base,
-            archive_response_base: a.response_base,
+            acu_gate_base: spec.acu_gate_base.clone(),
+            recipient_psk: r.psk.clone(),
+            archive_psk: a.psk.clone(),
+            recipient_response_base: r.response_base.clone(),
+            archive_response_base: a.response_base.clone(),
             acu_signer: spec.acu_signer,
             recipient_receipt_signer: r.receipt_signer,
             archive_receipt_signer: a.receipt_signer,
@@ -252,6 +256,52 @@ impl DeliveryProfile {
     }
     pub fn key_pins(&self) -> &KeyPins {
         &self.keys
+    }
+    pub fn suite(&self) -> KemSuite {
+        self.keys
+            .suite()
+            .expect("DeliveryProfile::parse validated uniform KemSuite")
+    }
+    /// Verifies that the recipient's `psk` and `response_base` `X25519-MLKEM768`
+    /// (`0x647a`) encryption keys in this `DeliveryProfile` are explicitly bound
+    /// by valid, non-revoked, purpose-separated Ed25519 enrollment descriptors
+    /// signed by the initiating seat's `.chinwag/allowed_signers` signing key.
+    pub fn verify_recipient_key_bindings(
+        &self,
+        psk_enrollment: &[u8],
+        response_base_enrollment: &[u8],
+        signers: &SeatSignerDirectory,
+        revocations: &VerifiedRevocationState,
+        now_unix: u64,
+    ) -> Result<(VerifiedRecipientKey, VerifiedRecipientKey), ProfileError> {
+        if self.suite() != KemSuite::X25519MlKem768 || now_unix >= self.spec.expires_unix {
+            return Err(ProfileError);
+        }
+        let Some((expected_seat, instance_suffix)) = self.spec.initiating_instance.split_once('#')
+        else {
+            return Err(ProfileError);
+        };
+        if !valid_seat(expected_seat) || instance_suffix.is_empty() || instance_suffix.contains('#')
+        {
+            return Err(ProfileError);
+        }
+        let verified_psk =
+            verify_signed_recipient_key(psk_enrollment, signers, revocations, now_unix)
+                .map_err(|_| ProfileError)?;
+        let verified_response =
+            verify_signed_recipient_key(response_base_enrollment, signers, revocations, now_unix)
+                .map_err(|_| ProfileError)?;
+        if verified_psk.seat() != expected_seat
+            || verified_response.seat() != expected_seat
+            || verified_psk.purpose() != RecipientKeyPurpose::AcuRecipientPsk
+            || verified_response.purpose() != RecipientKeyPurpose::AcuRecipientResponseBase
+            || verified_psk.kid() == verified_response.kid()
+            || verified_psk.public_key() != &self.keys.recipient_psk
+            || verified_response.public_key() != &self.keys.recipient_response_base
+        {
+            return Err(ProfileError);
+        }
+        Ok((verified_psk, verified_response))
     }
     pub fn historical_recovery_scope(&self) -> ([u8; 32], &KeyPins, [u8; 32], u64) {
         (
@@ -709,5 +759,227 @@ mod tests {
                 .authenticate_current_artifact(&certificate, copy(), &registered, 1002)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn enterprise_acu_release_ledger_and_recipient_bindings_roundtrip_on_x25519_mlkem768() {
+        use crate::{
+            acu::{self, PolicySpec, ReleaseLedger},
+            recipient_key::sign_public_key_enrollment,
+            storage::CiphertextStore,
+        };
+        let mk_dir = || {
+            let d = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            d
+        };
+        let dirs: Vec<_> = (0..7).map(|_| mk_dir()).collect();
+        let store =
+            |i: usize| CiphertextStore::open(&dirs[i].path().canonicalize().unwrap()).unwrap();
+
+        let recipient_owner = OwnerCustody::create_new(
+            &dirs[0].path().canonicalize().unwrap(),
+            OwnerRole::Recipient,
+            [31; 32],
+            Some((store(4), [41; 32])),
+        )
+        .unwrap();
+        let archive_owner = OwnerCustody::create_new(
+            &dirs[1].path().canonicalize().unwrap(),
+            OwnerRole::Archive,
+            [32; 32],
+            Some((store(5), [42; 32])),
+        )
+        .unwrap();
+        let acu_owner = OwnerCustody::create_new(
+            &dirs[2].path().canonicalize().unwrap(),
+            OwnerRole::Acu,
+            [33; 32],
+            None,
+        )
+        .unwrap();
+        let admission_owner = OwnerCustody::create_new(
+            &dirs[3].path().canonicalize().unwrap(),
+            OwnerRole::Admission,
+            [34; 32],
+            None,
+        )
+        .unwrap();
+
+        let PublicEnrollment::Destination(r_dest) = recipient_owner.public_enrollment().unwrap()
+        else {
+            panic!("recipient")
+        };
+        let PublicEnrollment::Destination(a_dest) = archive_owner.public_enrollment().unwrap()
+        else {
+            panic!("archive")
+        };
+        let PublicEnrollment::Acu {
+            gate_base,
+            signer: acu_signer,
+        } = acu_owner.public_enrollment().unwrap()
+        else {
+            panic!("acu")
+        };
+        let PublicEnrollment::Admission {
+            signer: admission_signer,
+        } = admission_owner.public_enrollment().unwrap()
+        else {
+            panic!("admission")
+        };
+
+        let seat_sk = ed25519_dalek::SigningKey::from_bytes(&[12; 32]);
+        let signers = SeatSignerDirectory::from_pinned_seats(&[(
+            "WORKHORSE",
+            seat_sk.verifying_key().to_bytes(),
+        )])
+        .unwrap();
+        let revocations = VerifiedRevocationState::new();
+        let psk_binding = sign_public_key_enrollment(
+            "WORKHORSE",
+            "wh-profile-acu-psk-e1",
+            1,
+            RecipientKeyPurpose::AcuRecipientPsk,
+            &r_dest.psk,
+            900,
+            2_000,
+            &seat_sk,
+        )
+        .unwrap();
+        let resp_binding = sign_public_key_enrollment(
+            "WORKHORSE",
+            "wh-profile-acu-resp-e1",
+            1,
+            RecipientKeyPurpose::AcuRecipientResponseBase,
+            &r_dest.response_base,
+            900,
+            2_000,
+            &seat_sk,
+        )
+        .unwrap();
+
+        let cb = serde_json::to_vec(&command()).unwrap();
+        let cp = CommandProfile::parse(&cb).unwrap();
+        let pins = KeyPins {
+            acu_gate_base: gate_base.clone(),
+            recipient_psk: r_dest.psk.clone(),
+            archive_psk: a_dest.psk.clone(),
+            recipient_response_base: r_dest.response_base.clone(),
+            archive_response_base: a_dest.response_base.clone(),
+            acu_signer,
+            recipient_receipt_signer: r_dest.receipt_signer,
+            archive_receipt_signer: a_dest.receipt_signer,
+        };
+        let policy_spec = PolicySpec {
+            version: 1,
+            epoch: 1,
+            issued_unix: 1_000,
+            expires_unix: 1_600,
+            active: true,
+            allow_recipient: true,
+            allow_archive: true,
+            repository_id: 42,
+            initiating_instance: "WORKHORSE#profile-fixture".into(),
+            key_pins_sha256: acu::key_pins_digest(&pins).unwrap(),
+            recipient_store_id: [41; 32],
+            archive_store_id: [42; 32],
+            allowed_historical_envelopes: Vec::new(),
+        };
+        let policy = acu::verify_current_policy(
+            &acu_owner.sign_release_policy(&policy_spec).unwrap(),
+            acu_signer,
+            1_001,
+        )
+        .unwrap();
+
+        let spec = DeliveryProfileSpec {
+            version: 1,
+            repository_id: 42,
+            initiating_instance: "WORKHORSE#profile-fixture".into(),
+            recipient: r_dest,
+            archive: a_dest,
+            acu_gate_base: gate_base,
+            acu_signer,
+            admission_signer,
+            relay_origin: "https://relay-fixture.trycloudflare.com/".into(),
+            admission_origin: "https://admission-fixture.trycloudflare.com/".into(),
+            acu_origin: "https://acu-fixture.trycloudflare.com/".into(),
+            command_profile_sha256: cp.digest(),
+            original_policy_sha256: policy.digest(),
+            original_policy_epoch: 1,
+            expires_unix: 1_600,
+            customer_custody_boundary: "CUSTOMER_ACU_AND_ARCHIVE_SHARED_HOST_UID".into(),
+        };
+        let db = serde_json::to_vec(&spec).unwrap();
+        let intent = verified_intent(cp.digest(), hash(&db), 99);
+        let bound = BoundProfiles::resolve(&intent, &cb, &db, 1_001).unwrap();
+        bound
+            .delivery()
+            .verify_recipient_key_bindings(
+                &psk_binding,
+                &resp_binding,
+                &signers,
+                &revocations,
+                1_001,
+            )
+            .unwrap();
+
+        let runner = RunnerIdentity::generate().unwrap();
+        let r_keys = runner.public_keys();
+        let admitted = CommittedAdmission::synthetic_fixture(AdmissionRecord {
+            spec: intent.spec().clone(),
+            initiating_instance: intent.initiating_instance().into(),
+            intent_digest: *intent.original_digest(),
+            token_sha256: [51; 32],
+            issuer_jti_sha256: [52; 32],
+            audience: "fixture".into(),
+            run_id: 267,
+            run_attempt: 1,
+            signing_key: r_keys.signing_ed25519,
+            agent_transport_key: r_keys.agent_transport_ed25519,
+            archive_transport_key: r_keys.archive_transport_ed25519,
+            usable_from_unix: 1_000,
+            expires_unix: 1_300,
+        });
+        let certificate = admission_owner.certify_admission(&admitted).unwrap();
+        let current = authorization::verify_historical_certificate(&certificate, admission_signer)
+            .unwrap()
+            .require_current(1_001)
+            .unwrap();
+        let claims = current.expected_provenance(policy.digest(), 1).unwrap();
+        let secret_payload = b"full X25519-MLKEM768 + ReleaseLedger 2-of-3 roundtrip";
+        let sealed = runner
+            .seal_failure(claims, bound.delivery().key_pins().clone(), secret_payload)
+            .unwrap();
+        let admitted_env = bound
+            .authenticate_current_artifact(
+                &certificate,
+                sealed,
+                &RegisteredJob {
+                    run_id: 267,
+                    run_attempt: 1,
+                    keys: r_keys,
+                },
+                1_002,
+            )
+            .unwrap();
+        let raw_req = recipient_owner
+            .create_release_request(&admitted_env, &policy, 1_002, 1_200)
+            .unwrap();
+        let mut ledger = ReleaseLedger::open(
+            &dirs[6].path().canonicalize().unwrap(),
+            acu_signer,
+            admission_signer,
+        )
+        .unwrap();
+        let grant_bytes = ledger
+            .release(&acu_owner, &admitted_env, &policy, &raw_req, 1_003)
+            .unwrap();
+        let verified_grant =
+            acu::verify_grant(&grant_bytes, &raw_req, &admitted_env, &policy, 1_004).unwrap();
+        let opened = recipient_owner
+            .open_payload_from_grant(&admitted_env, &verified_grant, &policy, 1_004)
+            .unwrap();
+        assert_eq!(&*opened, secret_payload.as_slice());
     }
 }

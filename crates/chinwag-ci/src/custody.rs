@@ -10,7 +10,7 @@
 use crate::{
     envelope::{
         AcuGateKey, AuthenticatedEnvelope, Destination, DestinationKey, EnvelopeError, GateSecret,
-        ResponseKey, WrappedSecret,
+        KemPublicKey, ResponseKey, WrappedSecret,
     },
     receipt::{ReceiptError, ReceiptSigner, VerifiedStorageReceipt},
     storage::CiphertextStore,
@@ -78,8 +78,8 @@ pub struct PublicDestination {
     pub role: Destination,
     pub store_id: [u8; 32],
     pub store_binding: [u8; 32],
-    pub psk: [u8; 32],
-    pub response_base: [u8; 32],
+    pub psk: KemPublicKey,
+    pub response_base: KemPublicKey,
     pub receipt_signer: [u8; 32],
     /// Explicit dual-purpose enrollment of the same owner signing identity.
     /// Release requests and storage receipts use distinct signature domains
@@ -92,7 +92,7 @@ pub struct PublicDestination {
 pub enum PublicEnrollment {
     Destination(PublicDestination),
     Acu {
-        gate_base: [u8; 32],
+        gate_base: KemPublicKey,
         signer: [u8; 32],
     },
     Admission {
@@ -414,10 +414,10 @@ impl OwnerCustody {
         else {
             return Err(crate::acu::AcuError::Rejected);
         };
-        if response.public()
+        if &response.public()
             != match role {
-                Destination::Recipient => envelope.key_pins().recipient_response_base,
-                Destination::Archive => envelope.key_pins().archive_response_base,
+                Destination::Recipient => &envelope.key_pins().recipient_response_base,
+                Destination::Archive => &envelope.key_pins().archive_response_base,
             }
         {
             return Err(crate::acu::AcuError::Rejected);
@@ -924,11 +924,11 @@ mod tests {
             panic!("ACU enrollment")
         };
         let keys = KeyPins {
-            acu_gate_base: *gate_base,
-            recipient_psk: r.psk,
-            archive_psk: a.psk,
-            recipient_response_base: r.response_base,
-            archive_response_base: a.response_base,
+            acu_gate_base: gate_base.clone(),
+            recipient_psk: r.psk.clone(),
+            archive_psk: a.psk.clone(),
+            recipient_response_base: r.response_base.clone(),
+            archive_response_base: a.response_base.clone(),
             acu_signer: *signer,
             recipient_receipt_signer: r.receipt_signer,
             archive_receipt_signer: a.receipt_signer,

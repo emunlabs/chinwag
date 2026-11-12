@@ -1183,7 +1183,7 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
     same_enrollment(&*archive.lock().await, &d.spec().archive)?;
     if checked(acu.public_enrollment())?
         != (PublicEnrollment::Acu {
-            gate_base: d.spec().acu_gate_base,
+            gate_base: d.spec().acu_gate_base.clone(),
             signer: d.spec().acu_signer,
         })
     {

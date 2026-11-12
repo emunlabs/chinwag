@@ -11,7 +11,9 @@ use crate::{
     admission::{AdmissionError, AdmissionLedger, ReleaseDisposition},
     authorization::{self as auth, AdmissionBoundEnvelope, AuthorizationError},
     custody::OwnerCustody,
-    envelope::{AuthenticatedEnvelope, Destination, GateSecret, KeyPins, WrappedSecret},
+    envelope::{
+        AuthenticatedEnvelope, Destination, GateSecret, KemPublicKey, KeyPins, WrappedSecret,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -218,7 +220,7 @@ pub(crate) struct RequestStatement {
     pub(crate) role: Destination,
     pub(crate) signer: [u8; 32],
     pub(crate) store_id: [u8; 32],
-    response_base: [u8; 32],
+    response_base: KemPublicKey,
     envelope_digest: [u8; 32],
     admission_sha256: [u8; 32],
     policy_sha256: [u8; 32],
@@ -237,10 +239,10 @@ pub(crate) struct VerifiedRequest {
     pub(crate) statement: RequestStatement,
     pub(crate) digest: [u8; 32],
 }
-fn response_pin(envelope: &AuthenticatedEnvelope, role: Destination) -> [u8; 32] {
+fn response_pin(envelope: &AuthenticatedEnvelope, role: Destination) -> KemPublicKey {
     match role {
-        Destination::Recipient => envelope.key_pins().recipient_response_base,
-        Destination::Archive => envelope.key_pins().archive_response_base,
+        Destination::Recipient => envelope.key_pins().recipient_response_base.clone(),
+        Destination::Archive => envelope.key_pins().archive_response_base.clone(),
     }
 }
 pub(crate) fn request_statement(
@@ -547,11 +549,11 @@ mod tests {
             assert_eq!(r.receipt_signer, r.release_request_signer);
             assert_eq!(a.receipt_signer, a.release_request_signer);
             let pins = KeyPins {
-                acu_gate_base: gate_base,
-                recipient_psk: r.psk,
-                archive_psk: a.psk,
-                recipient_response_base: r.response_base,
-                archive_response_base: a.response_base,
+                acu_gate_base: gate_base.clone(),
+                recipient_psk: r.psk.clone(),
+                archive_psk: a.psk.clone(),
+                recipient_response_base: r.response_base.clone(),
+                archive_response_base: a.response_base.clone(),
                 acu_signer: signer,
                 recipient_receipt_signer: r.receipt_signer,
                 archive_receipt_signer: a.receipt_signer,
@@ -1233,10 +1235,10 @@ mod tests {
             "store_id",
         ] {
             let mut changed: SignedRequest = auth::parse(&raw).unwrap();
-            let target = match field {
+            let target: &mut [u8] = match field {
                 "nonce" => &mut changed.statement.nonce,
                 "envelope_digest" => &mut changed.statement.envelope_digest,
-                "response_base" => &mut changed.statement.response_base,
+                "response_base" => changed.statement.response_base.as_mut_bytes_for_test(),
                 "signer" => &mut changed.statement.signer,
                 "admission_sha256" => &mut changed.statement.admission_sha256,
                 "store_id" => &mut changed.statement.store_id,

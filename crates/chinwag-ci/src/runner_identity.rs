@@ -84,6 +84,25 @@ impl RunnerIdentity {
         crate::envelope::seal(&self.signer, claims, pins, plaintext)
     }
 
+    /// Direct offline-capable Base-mode `.cwcard` (`CWCARD01`) sealing to a
+    /// seat-authenticated `X25519-MLKEM768` (`0x647a`) recipient encryption key,
+    /// signed by this runner's ephemeral Ed25519 identity.
+    pub fn seal_cwcard_offline(
+        &self,
+        claims: crate::envelope::ClaimedProvenance,
+        recipient_key: &crate::recipient_key::VerifiedRecipientKey,
+        sealed_unix: u64,
+        plaintext: &[u8],
+    ) -> Result<crate::envelope::SealedCwcard, crate::envelope::EnvelopeError> {
+        crate::envelope::seal_cwcard_offline(
+            &self.signer,
+            claims,
+            recipient_key,
+            sealed_unix,
+            plaintext,
+        )
+    }
+
     /// Signs only the typed admission PoP domain for THIS job's public keys.
     /// This is not a coordinator K2 or permission to execute/repair a task.
     pub fn sign_admission(

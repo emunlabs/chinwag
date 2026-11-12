@@ -56,6 +56,7 @@ pub mod preparation;
 pub mod profile;
 #[cfg(unix)]
 pub mod receipt;
+pub mod recipient_key;
 #[cfg(unix)]
 pub mod runner;
 pub mod runner_binding;
