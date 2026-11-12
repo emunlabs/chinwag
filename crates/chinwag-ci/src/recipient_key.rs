@@ -253,12 +253,9 @@ impl VerifiedRevocationState {
         if !bool::from(s.signer_ed25519[..].ct_eq(&expected_signer[..])) {
             return Err(RecipientKeyError::Rejected);
         }
-        verify_ed25519(
-            &expected_signer,
-            &revocation_signing_bytes(s)?,
-            &signed.signature_hex,
-        )?;
-        let stmt_digest: [u8; 32] = Sha256::digest(&reencoded).into();
+        let signing_payload = revocation_signing_bytes(s)?;
+        verify_ed25519(&expected_signer, &signing_payload, &signed.signature_hex)?;
+        let stmt_digest: [u8; 32] = Sha256::digest(&signing_payload).into();
         if self.seen_statements.contains(&stmt_digest) {
             return Ok(());
         }

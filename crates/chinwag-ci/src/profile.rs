@@ -406,12 +406,14 @@ fn validate_embedded_recipient_bindings(
             return Err(ProfileError);
         }
     }
-    let mut combined_revocations = external_revocations.clone();
+    let mut embedded_revocations = VerifiedRevocationState::new();
     for rev in &spec.recipient_key_revocations {
-        combined_revocations
+        embedded_revocations
             .ingest_signed_revocation_struct(rev, signers)
             .map_err(|_| ProfileError)?;
     }
+    let mut combined_revocations = external_revocations.clone();
+    combined_revocations.merge_verified(&embedded_revocations);
     let verified_psk =
         verify_signed_recipient_key_struct(psk_signed, signers, &combined_revocations, now_unix)
             .map_err(|_| ProfileError)?;

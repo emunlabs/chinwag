@@ -236,9 +236,6 @@ async fn refresh_live_revocations(
     signers: &crate::recipient_key::SeatSignerDirectory,
     state: &mut crate::recipient_key::VerifiedRevocationState,
 ) -> Result<()> {
-    let (_, local_state) =
-        runtime::load_revocation_statements(config.recipient_revocations.as_deref(), plan)?;
-    state.merge_verified(&local_state);
     let mut nonce = [0_u8; 32];
     ck(getrandom::fill(&mut nonce))?;
     if bool::from(nonce[..].ct_eq(&[0_u8; 32][..])) {
@@ -251,6 +248,9 @@ async fn refresh_live_revocations(
         &runtime::RevocationStatusRequest { nonce },
     )
     .await?;
+    // Verify the remote challenge-bound snapshot and reload any runner-local
+    // revocation file synchronously AFTER the HTTP await so zero awaits occur
+    // before returning to the protected execution/sealing boundary.
     ck(authorization::verify_revocation_status(
         &raw,
         admission_signer,
@@ -259,7 +259,11 @@ async fn refresh_live_revocations(
         nonce,
         signers,
         state,
-    ))
+    ))?;
+    let (_, local_state) =
+        runtime::load_revocation_statements(config.recipient_revocations.as_deref(), plan)?;
+    state.merge_verified(&local_state);
+    Ok(())
 }
 /// Return 1 for a fully delivered red workload, 0 only for a fully delivered
 /// eligible green workload. Any missing admission/receipt/closure stays held.

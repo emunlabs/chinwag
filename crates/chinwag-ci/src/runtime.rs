@@ -2057,5 +2057,22 @@ mod tests {
                 )
                 .is_err()
         );
+
+        // Profile carrying an older embedded revocation `r1(t1)` composes cleanly with a
+        // newer live external revocation snapshot containing only `r2(t2)` (`t2 > t1`) when
+        // both revoke retired keys and the active profile keys remain valid:
+        let mut deliv_with_r1 = deliv_spec.clone();
+        deliv_with_r1.recipient_key_revocations = vec![r1];
+        let deliv_with_r1_bytes = serde_json::to_vec(&deliv_with_r1).unwrap();
+        let parsed_deliv_with_r1 = DeliveryProfile::parse(&deliv_with_r1_bytes).unwrap();
+        let mut newer_external_only = crate::recipient_key::VerifiedRevocationState::new();
+        newer_external_only
+            .ingest_signed_revocation_struct(&r2, &signers)
+            .unwrap();
+        assert!(
+            parsed_deliv_with_r1
+                .verify_authenticated_recipient_keys(&signers, &newer_external_only, t)
+                .is_ok()
+        );
     }
 }

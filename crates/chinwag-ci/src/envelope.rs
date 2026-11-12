@@ -230,12 +230,12 @@ impl KemPublicKey {
         hash(self.as_bytes())
     }
 
-    pub(crate) fn x25519_component(&self) -> &[u8; 32] {
+    pub(crate) fn x25519_component(&self) -> [u8; 32] {
         match &self.0 {
-            KemPublicInner::X25519MlKem768(bytes) => bytes[XWING_MLKEM768_PK_BYTES..]
-                .try_into()
-                .expect("1216 - 1184 == 32"),
-            KemPublicInner::X25519Legacy(bytes) => bytes,
+            KemPublicInner::X25519MlKem768(bytes) => {
+                std::array::from_fn(|i| bytes[XWING_MLKEM768_PK_BYTES + i])
+            }
+            KemPublicInner::X25519Legacy(bytes) => *bytes,
         }
     }
 
@@ -2088,7 +2088,7 @@ mod tests {
         // 2. Non-canonical / low-order X25519 share in `[1184..1216]`
         let mut low_order = [0_u8; 32];
         low_order[0] = 1;
-        let mut high_bit_alias = *f.pins.recipient_response_base.x25519_component();
+        let mut high_bit_alias = f.pins.recipient_response_base.x25519_component();
         high_bit_alias[31] |= 0x80;
         let mut modulus = [0xff_u8; 32];
         modulus[0] = 0xed;
