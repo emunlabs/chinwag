@@ -2,10 +2,40 @@
 // 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 #[cfg(unix)]
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if matches!(args.as_slice(), [_, flag] if flag == "--version" || flag == "-V") {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        if writeln!(
+            out,
+            "{} {}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        )
+        .is_err()
+            || out.flush().is_err()
+        {
+            eprintln!("CI_VERSION_STDOUT_WRITE_FAILED");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    else {
+        eprintln!("CI_RUNTIME_INIT_FAILED");
+        std::process::exit(2);
+    };
+    rt.block_on(async_main(args));
+}
+
+#[cfg(unix)]
+async fn async_main(args: Vec<std::ffi::OsString>) {
     let mut result: Result<(), ()> = match args.as_slice() {
         [_, action, config, public] if action == "owner-init" || action == "owner-verify" => {
             let result = if action == "owner-init" {
@@ -87,7 +117,7 @@ async fn main() {
         }
         _ => {
             eprintln!(
-                "usage: chinwag-ci owner-init|owner-verify CONFIG PUBLIC; policy-sign CONFIG PUBLIC SPEC OUTPUT; serve-root|serve-studio|runner|agent-init CONFIG; agent-read PIPE_DIRECTORY SCOPE_SHA256"
+                "usage: chinwag-ci --version|-V; owner-init|owner-verify CONFIG PUBLIC; policy-sign CONFIG PUBLIC SPEC OUTPUT; serve-root|serve-studio|runner|agent-init CONFIG; agent-read PIPE_DIRECTORY SCOPE_SHA256"
             );
             std::process::exit(2)
         }

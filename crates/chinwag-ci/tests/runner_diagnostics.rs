@@ -20,3 +20,42 @@ fn refused_runner_reports_fixed_phase_without_echoing_untrusted_configuration() 
     assert!(!stderr.contains("SENTINEL"));
     assert!(!stderr.contains(d.path().to_str().unwrap()));
 }
+
+#[cfg(unix)]
+#[test]
+fn version_flags_exit_zero_and_reject_extra_positional_arguments() {
+    let expected = format!("chinwag-ci {}\n", env!("CARGO_PKG_VERSION"));
+    for flag in ["--version", "-V"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_chinwag-ci"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "flag {flag} failed");
+        assert!(out.stderr.is_empty(), "unexpected stderr for {flag}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), expected);
+    }
+
+    let extra = std::process::Command::new(env!("CARGO_BIN_EXE_chinwag-ci"))
+        .args(["--version", "unexpected"])
+        .output()
+        .unwrap();
+    assert_eq!(extra.status.code(), Some(2));
+    assert!(extra.stdout.is_empty());
+
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let broken_pipe = std::process::Command::new(env!("CARGO_BIN_EXE_chinwag-ci"))
+        .arg("--version")
+        .stdout(std::process::Stdio::from(writer))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(broken_pipe.status.code(), Some(1));
+    assert!(
+        String::from_utf8(broken_pipe.stderr)
+            .unwrap()
+            .contains("CI_VERSION_STDOUT_WRITE_FAILED")
+    );
+}
