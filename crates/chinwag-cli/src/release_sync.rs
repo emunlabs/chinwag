@@ -69,6 +69,9 @@ const MAX_RELEASE_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_CLOUDFLARE_ENV_BYTES: u64 = 64 * 1024;
 const MAX_CLOUDFLARE_TOKEN_BYTES: usize = 512;
+const STDERR_DIAGNOSTIC_MAX_BYTES: usize = 512;
+const STDERR_CAPTURE_LOOKAHEAD_BYTES: usize =
+    STDERR_DIAGNOSTIC_MAX_BYTES + MAX_CLOUDFLARE_TOKEN_BYTES;
 const MAX_APPLIED_RELEASE_HISTORY: usize = 64;
 const VERSION_SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRANGLER_R2_TIMEOUT: Duration = Duration::from_secs(120);
@@ -369,6 +372,15 @@ struct CloudflareR2Credentials {
     account_id: Option<String>,
 }
 
+impl std::fmt::Debug for CloudflareR2Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudflareR2Credentials")
+            .field("api_token", &self.api_token.as_ref().map(|_| "[REDACTED]"))
+            .field("account_id", &self.account_id)
+            .finish()
+    }
+}
+
 fn classify_cloudflare_env_io(context: &str, err: &std::io::Error) -> ReleaseSyncError {
     if is_transient_io_error(err) {
         ReleaseSyncError::TransientIo(format!("{context}: {err}"))
@@ -486,6 +498,15 @@ fn parse_cloudflare_dotenv(content: &str) -> Result<CloudflareR2Credentials, Rel
                     account_id = Some(validate_cloudflare_account_id(parsed)?);
                 }
             }
+            other
+                if other.eq_ignore_ascii_case("CLOUDFLARE_R2_API_TOKEN")
+                    || other.eq_ignore_ascii_case("CLOUDFLARE_API_TOKEN")
+                    || other.eq_ignore_ascii_case("CLOUDFLARE_ACCOUNT_ID") =>
+            {
+                return Err(ReleaseSyncError::ArtifactStoreFailed(format!(
+                    "wrong-case Cloudflare R2 credential key '{other}' in cloudflare.env (expected uppercase)"
+                )));
+            }
             _ => {}
         }
     }
@@ -496,6 +517,15 @@ fn parse_cloudflare_dotenv(content: &str) -> Result<CloudflareR2Credentials, Rel
     })
 }
 
+#[cfg(test)]
+type CloudflareEnvMidReadHook = Box<dyn FnMut(usize)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CLOUDFLARE_ENV_MID_READ_HOOK: std::cell::RefCell<Option<CloudflareEnvMidReadHook>> =
+        std::cell::RefCell::new(None);
+}
+
 fn load_cloudflare_r2_credentials_with_env<F>(
     chinwag_dir_fd: &File,
     allow_ambient_env: bool,
@@ -504,118 +534,203 @@ fn load_cloudflare_r2_credentials_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    match rustix::fs::openat(
-        chinwag_dir_fd,
-        "cloudflare.env",
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => {
-            let mut file = File::from(fd);
-            let fstat = file
-                .metadata()
-                .map_err(|e| classify_cloudflare_env_io("fstat cloudflare.env", &e))?;
-            if fstat.file_type().is_symlink() || !fstat.file_type().is_file() {
-                return Err(ReleaseSyncError::SafePathViolation(
-                    "cloudflare_env_not_regular",
-                ));
+    const MAX_CONCURRENT_ROTATION_RETRIES: usize = 3;
+
+    for attempt in 0..MAX_CONCURRENT_ROTATION_RETRIES {
+        #[cfg(not(test))]
+        let _ = attempt;
+        match rustix::fs::openat(
+            chinwag_dir_fd,
+            "cloudflare.env",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => {
+                let mut file = File::from(fd);
+                let fstat = file
+                    .metadata()
+                    .map_err(|e| classify_cloudflare_env_io("fstat cloudflare.env", &e))?;
+                if fstat.file_type().is_symlink() || !fstat.file_type().is_file() {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_not_regular",
+                    ));
+                }
+                let euid = rustix::process::geteuid().as_raw();
+                if fstat.uid() != euid {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_owner_mismatch",
+                    ));
+                }
+                if (fstat.mode() & 0o077) != 0 {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_permissions",
+                    ));
+                }
+                if fstat.nlink() > 1 {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_hardlink",
+                    ));
+                }
+                if fstat.nlink() == 0 {
+                    // Concurrent atomic rename/unlink removed the directory entry right
+                    // after `openat`; retry to observe the replacement or surface as retryable.
+                    continue;
+                }
+                if fstat.len() > MAX_CLOUDFLARE_ENV_BYTES {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_too_large",
+                    ));
+                }
+                if let Ok(flags) = rustix::fs::fcntl_getfl(&file) {
+                    let _ = rustix::fs::fcntl_setfl(&file, flags - OFlags::NONBLOCK);
+                }
+                let cap = usize::try_from(fstat.len()).unwrap_or(0);
+                let mut raw = zeroize::Zeroizing::new(Vec::with_capacity(cap));
+                (&mut file)
+                    .take(MAX_CLOUDFLARE_ENV_BYTES + 1)
+                    .read_to_end(&mut raw)
+                    .map_err(|e| classify_cloudflare_env_io("read cloudflare.env", &e))?;
+                if raw.len() as u64 > MAX_CLOUDFLARE_ENV_BYTES {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_too_large",
+                    ));
+                }
+                #[cfg(test)]
+                TEST_CLOUDFLARE_ENV_MID_READ_HOOK.with(|slot| {
+                    if let Some(hook) = slot.borrow_mut().as_mut() {
+                        hook(attempt);
+                    }
+                });
+                let post = file
+                    .metadata()
+                    .map_err(|e| classify_cloudflare_env_io("post-fstat cloudflare.env", &e))?;
+                if post.uid() != euid {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_owner_mismatch",
+                    ));
+                }
+                if (post.mode() & 0o077) != 0 {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_permissions",
+                    ));
+                }
+                if post.nlink() > 1 {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_hardlink",
+                    ));
+                }
+                if (post.dev(), post.ino()) != (fstat.dev(), fstat.ino()) {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "cloudflare_env_mutated",
+                    ));
+                }
+                if post.nlink() == 0 {
+                    continue;
+                }
+                let text = std::str::from_utf8(&raw).map_err(|_| {
+                    ReleaseSyncError::ArtifactStoreFailed(
+                        "cloudflare.env is not valid UTF-8".into(),
+                    )
+                })?;
+                return parse_cloudflare_dotenv(text);
             }
-            if fstat.nlink() != 1 {
-                return Err(ReleaseSyncError::SafePathViolation(
-                    "cloudflare_env_hardlink",
-                ));
-            }
-            let euid = rustix::process::geteuid().as_raw();
-            if fstat.uid() != euid {
-                return Err(ReleaseSyncError::SafePathViolation(
-                    "cloudflare_env_owner_mismatch",
-                ));
-            }
-            if (fstat.mode() & 0o077) != 0 {
-                return Err(ReleaseSyncError::SafePathViolation(
-                    "cloudflare_env_permissions",
-                ));
-            }
-            if fstat.len() > MAX_CLOUDFLARE_ENV_BYTES {
-                return Err(ReleaseSyncError::SafePathViolation(
-                    "cloudflare_env_too_large",
-                ));
-            }
-            let cap = usize::try_from(fstat.len()).unwrap_or(0);
-            let mut raw = zeroize::Zeroizing::new(Vec::with_capacity(cap));
-            (&mut file)
-                .take(MAX_CLOUDFLARE_ENV_BYTES + 1)
-                .read_to_end(&mut raw)
-                .map_err(|e| classify_cloudflare_env_io("read cloudflare.env", &e))?;
-            if raw.len() as u64 > MAX_CLOUDFLARE_ENV_BYTES {
-                return Err(ReleaseSyncError::SafePathViolation(
-                    "cloudflare_env_too_large",
-                ));
-            }
-            let post = file
-                .metadata()
-                .map_err(|e| classify_cloudflare_env_io("post-fstat cloudflare.env", &e))?;
-            if (post.dev(), post.ino()) != (fstat.dev(), fstat.ino())
-                || post.nlink() != 1
-                || post.uid() != euid
-                || (post.mode() & 0o077) != 0
-            {
-                return Err(ReleaseSyncError::SafePathViolation(
-                    "cloudflare_env_mutated",
-                ));
-            }
-            let text = std::str::from_utf8(&raw).map_err(|_| {
-                ReleaseSyncError::ArtifactStoreFailed("cloudflare.env is not valid UTF-8".into())
-            })?;
-            parse_cloudflare_dotenv(text)
-        }
-        Err(rustix::io::Errno::NOENT) => {
-            if !allow_ambient_env {
+            Err(rustix::io::Errno::NOENT) => {
+                if !allow_ambient_env {
+                    return Ok(CloudflareR2Credentials {
+                        api_token: None,
+                        account_id: None,
+                    });
+                }
+                let lookup_trimmed = |k: &str| {
+                    env_lookup(k)
+                        .map(|v| zeroize::Zeroizing::new(v.trim().to_owned()))
+                        .filter(|v| !v.is_empty())
+                };
+                let api_token = if let Some(tok) = lookup_trimmed("CLOUDFLARE_R2_API_TOKEN") {
+                    validate_cloudflare_api_token(&tok, "CLOUDFLARE_R2_API_TOKEN")?;
+                    Some(tok)
+                } else if let Some(tok) = lookup_trimmed("CLOUDFLARE_API_TOKEN") {
+                    validate_cloudflare_api_token(&tok, "CLOUDFLARE_API_TOKEN")?;
+                    Some(tok)
+                } else {
+                    None
+                };
+                let account_id = match lookup_trimmed("CLOUDFLARE_ACCOUNT_ID") {
+                    Some(acct) => Some(validate_cloudflare_account_id(&acct)?),
+                    None => None,
+                };
                 return Ok(CloudflareR2Credentials {
-                    api_token: None,
-                    account_id: None,
+                    api_token,
+                    account_id,
                 });
             }
-            let lookup_trimmed = |k: &str| {
-                env_lookup(k)
-                    .map(|v| zeroize::Zeroizing::new(v.trim().to_owned()))
-                    .filter(|v| !v.is_empty())
-            };
-            let api_token = if let Some(tok) = lookup_trimmed("CLOUDFLARE_R2_API_TOKEN") {
-                validate_cloudflare_api_token(&tok, "CLOUDFLARE_R2_API_TOKEN")?;
-                Some(tok)
-            } else if let Some(tok) = lookup_trimmed("CLOUDFLARE_API_TOKEN") {
-                validate_cloudflare_api_token(&tok, "CLOUDFLARE_API_TOKEN")?;
-                Some(tok)
-            } else {
-                None
-            };
-            let account_id = match lookup_trimmed("CLOUDFLARE_ACCOUNT_ID") {
-                Some(acct) => Some(validate_cloudflare_account_id(&acct)?),
-                None => None,
-            };
-            Ok(CloudflareR2Credentials {
-                api_token,
-                account_id,
-            })
+            Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_symlink",
+                ));
+            }
+            Err(err) if is_transient_errno(err) => {
+                return Err(ReleaseSyncError::TransientIo(format!(
+                    "open cloudflare.env: {err}"
+                )));
+            }
+            Err(_) => {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_unreadable",
+                ));
+            }
         }
-        Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => Err(
-            ReleaseSyncError::SafePathViolation("cloudflare_env_symlink"),
-        ),
-        Err(err) if is_transient_errno(err) => Err(ReleaseSyncError::TransientIo(format!(
-            "open cloudflare.env: {err}"
-        ))),
-        Err(_) => Err(ReleaseSyncError::SafePathViolation(
-            "cloudflare_env_unreadable",
-        )),
     }
+
+    Err(ReleaseSyncError::TransientIo(
+        "cloudflare.env concurrently replaced during read".into(),
+    ))
 }
 
-fn scrub_secret_from_diagnostic(msg: &str, secret: Option<&str>) -> String {
-    match secret {
-        Some(tok) if !tok.is_empty() && msg.contains(tok) => msg.replace(tok, "[REDACTED]"),
-        _ => msg.to_owned(),
+fn format_redacted_stderr_preview(
+    captured: &[u8],
+    was_truncated: bool,
+    secret: Option<&str>,
+) -> String {
+    let lossy = zeroize::Zeroizing::new(String::from_utf8_lossy(captured).into_owned());
+    let mut work = zeroize::Zeroizing::new(match secret {
+        Some(tok) if !tok.is_empty() => {
+            let mut redacted = String::with_capacity(lossy.len());
+            let mut rest = lossy.as_str();
+            while let Some(pos) = rest.find(tok) {
+                redacted.push_str(&rest[..pos]);
+                redacted.push_str("[REDACTED]");
+                rest = &rest[pos + tok.len()..];
+            }
+            if was_truncated {
+                let mut matched_prefix = 0usize;
+                for prefix_len in (1..tok.len()).rev() {
+                    if rest.ends_with(&tok[..prefix_len]) {
+                        matched_prefix = prefix_len;
+                        break;
+                    }
+                }
+                if matched_prefix > 0 {
+                    redacted.push_str(&rest[..rest.len() - matched_prefix]);
+                    redacted.push_str("[REDACTED]");
+                } else {
+                    redacted.push_str(rest);
+                }
+            } else {
+                redacted.push_str(rest);
+            }
+            redacted
+        }
+        _ => (*lossy).clone(),
+    });
+    if work.len() > STDERR_DIAGNOSTIC_MAX_BYTES {
+        let mut end = STDERR_DIAGNOSTIC_MAX_BYTES;
+        while !work.is_char_boundary(end) {
+            end -= 1;
+        }
+        work.truncate(end);
     }
+    work.trim().to_owned()
 }
 
 pub struct WranglerR2ArtifactStore {
@@ -691,6 +806,7 @@ impl WranglerR2ArtifactStore {
         let _ = open_dir_nofollow(&self.home_dir)?;
         let wrangler = self.resolve_wrangler_bin()?;
         let chinwag_dir = ensure_private_dir(&self.home_dir.join(".chinwag"))?;
+        let private_tmp_dir = ensure_private_dir(&chinwag_dir.join("tmp"))?;
         let (chinwag_dir_fd, _) = open_dir_nofollow(&chinwag_dir)?;
         let allow_ambient_env = std::env::var_os("HOME")
             .is_some_and(|ambient_home| Path::new(&ambient_home) == self.home_dir);
@@ -730,13 +846,14 @@ impl WranglerR2ArtifactStore {
         let mut cmd = Command::new(&wrangler);
         // Critical under launchd (where default cwd is `/` and ambient CLOUDFLARE_*
         // variables are absent): scrub the child environment via `env_clear()`, set
-        // cwd to `$HOME/.chinwag` so `.wrangler/cache` resolves inside a writable
-        // private `0700` directory, and inject verified non-interactive R2 credentials
-        // from `$HOME/.chinwag/cloudflare.env` (`0600`).
+        // cwd to `$HOME/.chinwag` and `TMPDIR` to `$HOME/.chinwag/tmp` (`0700`) so
+        // `.wrangler/cache` and scratch files resolve inside private `0700` directories,
+        // and inject verified non-interactive R2 credentials from `$HOME/.chinwag/cloudflare.env`.
         cmd.env_clear()
             .args(args)
             .current_dir(&chinwag_dir)
             .env("HOME", &self.home_dir)
+            .env("TMPDIR", &private_tmp_dir)
             .env("PATH", safe_path)
             .env("LC_ALL", "C")
             .env("CI", "1")
@@ -750,15 +867,19 @@ impl WranglerR2ArtifactStore {
         if let Some(ref acct) = creds.account_id {
             cmd.env("CLOUDFLARE_ACCOUNT_ID", acct.as_str());
         }
-        run_bounded_command(&mut cmd, WRANGLER_R2_TIMEOUT).map_err(|failure| {
-            let scrubbed = scrub_secret_from_diagnostic(
-                &failure.message,
-                creds.api_token.as_deref().map(String::as_str),
-            );
+        run_bounded_command_with_redaction(
+            &mut cmd,
+            WRANGLER_R2_TIMEOUT,
+            creds.api_token.as_deref().map(String::as_str),
+        )
+        .map_err(|failure| {
             if failure.transient_io {
-                ReleaseSyncError::TransientIo(format!("wrangler r2 failed: {scrubbed}"))
+                ReleaseSyncError::TransientIo(format!("wrangler r2 failed: {}", failure.message))
             } else {
-                ReleaseSyncError::ArtifactStoreFailed(format!("wrangler r2 failed: {scrubbed}"))
+                ReleaseSyncError::ArtifactStoreFailed(format!(
+                    "wrangler r2 failed: {}",
+                    failure.message
+                ))
             }
         })
     }
@@ -1254,7 +1375,7 @@ fn check_installed_binary_matches(
 /// into `/opt/homebrew/Cellar/...`). Never used for release artifacts, state,
 /// or signing keys, all of which use `open_regular_file_nofollow` (`O_NOFOLLOW`).
 fn is_resolvable_host_cli_binary(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|m| m.is_file())
+    fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
 }
 
 /// Acquires an exclusive cross-process `flock` (`O_NOFOLLOW | O_CLOEXEC`, `0600`)
@@ -1661,6 +1782,14 @@ fn terminate_and_reap_std_child(child: &mut std::process::Child, child_pid: u32)
 }
 
 fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), BoundedCommandFailure> {
+    run_bounded_command_with_redaction(cmd, deadline, None)
+}
+
+fn run_bounded_command_with_redaction(
+    cmd: &mut Command,
+    deadline: Duration,
+    redact_secret: Option<&str>,
+) -> Result<(), BoundedCommandFailure> {
     // Spawn in a dedicated process group (`pgid == child_pid`) so any background
     // descendant holding inherited stdout/stderr pipes can be terminated cleanly
     // at the deadline without stalling the release worker.
@@ -1695,8 +1824,11 @@ fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), Boun
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             if let Err(err) = spawn_pipe_drainer(
                 move || {
-                    let mut preview = Vec::with_capacity(512);
-                    let _ = (&mut err_pipe).take(512).read_to_end(&mut preview);
+                    let mut preview =
+                        zeroize::Zeroizing::new(Vec::with_capacity(STDERR_DIAGNOSTIC_MAX_BYTES));
+                    let _ = (&mut err_pipe)
+                        .take((STDERR_CAPTURE_LOOKAHEAD_BYTES + 1) as u64)
+                        .read_to_end(&mut preview);
                     let _ = std::io::copy(&mut err_pipe, &mut std::io::sink());
                     let _ = tx.send(preview);
                 },
@@ -1750,12 +1882,16 @@ fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), Boun
                         }
                     }
                 } else {
-                    Vec::new()
+                    zeroize::Zeroizing::new(Vec::new())
                 };
                 if status.success() {
                     return Ok(());
                 }
-                let snippet = String::from_utf8_lossy(&stderr_buf).trim().to_owned();
+                let was_truncated = stderr_buf.len() > STDERR_CAPTURE_LOOKAHEAD_BYTES;
+                let captured_slice =
+                    &stderr_buf[..stderr_buf.len().min(STDERR_CAPTURE_LOOKAHEAD_BYTES)];
+                let snippet =
+                    format_redacted_stderr_preview(captured_slice, was_truncated, redact_secret);
                 return Err(BoundedCommandFailure {
                     message: if snippet.is_empty() {
                         format!("exit status {status}")
@@ -8160,6 +8296,162 @@ mod tests {
         assert_eq!(
             allowed.account_id.as_deref().unwrap(),
             "0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn wrangler_r2_store_rejects_fifo_without_blocking_and_wrong_case_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let chinwag_dir = home.join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::set_permissions(&chinwag_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mock_wrangler = temp.path().join("exec-wrangler.sh");
+        fs::write(&mock_wrangler, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+        fs::set_permissions(&mock_wrangler, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let payload_path = temp.path().join("payload.bin");
+        fs::write(&payload_path, b"payload").unwrap();
+        let payload_file = File::open(&payload_path).unwrap();
+        let key = format!(
+            "chinwag-artifacts/releases/chinwag/{CURRENT_TARGET_TRIPLE}/{}",
+            "ef".repeat(32)
+        );
+        let store = WranglerR2ArtifactStore::with_wrangler_bin(home.clone(), mock_wrangler.clone());
+
+        // 1. FIFO with no writer at cloudflare.env must NOT block openat (O_NONBLOCK) and
+        //    must immediately reject as SafePathViolation("cloudflare_env_not_regular").
+        let cf_env = chinwag_dir.join("cloudflare.env");
+        let mkfifo_bin = if Path::new("/usr/bin/mkfifo").exists() {
+            "/usr/bin/mkfifo"
+        } else {
+            "/bin/mkfifo"
+        };
+        let status = Command::new(mkfifo_bin)
+            .args(["-m", "0600"])
+            .arg(&cf_env)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let started = Instant::now();
+        let err = store.upload_artifact(&key, &payload_file).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            err,
+            ReleaseSyncError::SafePathViolation("cloudflare_env_not_regular")
+        );
+        fs::remove_file(&cf_env).unwrap();
+
+        // 2. Wrong-case key name fails closed with actionable error (never leaking secret).
+        fs::write(&cf_env, "cloudflare_api_token=secret_lower_tok_888\n").unwrap();
+        fs::set_permissions(&cf_env, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = store.upload_artifact(&key, &payload_file).unwrap_err();
+        assert!(matches!(err, ReleaseSyncError::ArtifactStoreFailed(_)));
+        assert!(err.to_string().contains("wrong-case"));
+        assert!(!err.to_string().contains("secret_lower_tok_888"));
+
+        // 3. Non-executable wrangler binary (0644) is rejected by is_resolvable_host_cli_binary.
+        let non_exec = temp.path().join("non-exec-wrangler.sh");
+        fs::write(&non_exec, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&non_exec, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_resolvable_host_cli_binary(&non_exec));
+        assert!(is_resolvable_host_cli_binary(&mock_wrangler));
+    }
+
+    #[test]
+    fn cloudflare_env_atomic_rotation_mid_read_retries_and_remains_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let chinwag_dir = temp.path().join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::set_permissions(&chinwag_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let cf_env = chinwag_dir.join("cloudflare.env");
+        fs::write(&cf_env, "CLOUDFLARE_API_TOKEN=old_token_v1\n").unwrap();
+        fs::set_permissions(&cf_env, fs::Permissions::from_mode(0o600)).unwrap();
+        let (dir_fd, _) = open_dir_nofollow(&chinwag_dir).unwrap();
+
+        // Case 1: Single atomic rename (`mv cloudflare.env.tmp cloudflare.env`) mid-read
+        // drops old inode `nlink` to 0; loader retries immediately and reads `rotated_token_v2`.
+        let chinwag_clone = chinwag_dir.clone();
+        TEST_CLOUDFLARE_ENV_MID_READ_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |attempt| {
+                if attempt == 0 {
+                    let staging = chinwag_clone.join("cloudflare.env.tmp");
+                    fs::write(&staging, "CLOUDFLARE_API_TOKEN=rotated_token_v2\n").unwrap();
+                    fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::rename(&staging, chinwag_clone.join("cloudflare.env")).unwrap();
+                }
+            }));
+        });
+        let creds = load_cloudflare_r2_credentials_with_env(&dir_fd, false, |_| None).unwrap();
+        TEST_CLOUDFLARE_ENV_MID_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(creds.api_token.as_deref().unwrap(), "rotated_token_v2");
+
+        // Case 2: Continuous concurrent replacement across all bounded retries yields
+        // retryable TransientIo (NEVER non-retryable SafePathViolation).
+        let chinwag_clone2 = chinwag_dir.clone();
+        TEST_CLOUDFLARE_ENV_MID_READ_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |attempt| {
+                let staging = chinwag_clone2.join(format!("cloudflare.env.tmp.{attempt}"));
+                fs::write(&staging, "CLOUDFLARE_API_TOKEN=churn_tok\n").unwrap();
+                fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::rename(&staging, chinwag_clone2.join("cloudflare.env")).unwrap();
+            }));
+        });
+        let err = load_cloudflare_r2_credentials_with_env(&dir_fd, false, |_| None).unwrap_err();
+        TEST_CLOUDFLARE_ENV_MID_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            matches!(err, ReleaseSyncError::TransientIo(_)),
+            "expected retryable TransientIo on repeated atomic rotation, got: {err:?}"
+        );
+        assert!(err.is_transient_retryable());
+    }
+
+    #[test]
+    fn stderr_redaction_covers_cutoff_straddling_and_max_length_tokens() {
+        // 1. ARCHITECT exact reproducer: 473 diagnostic bytes + 40-byte token crossing byte 512.
+        let tok40 = "cf_secret_token_0123456789abcdefABCDEF99";
+        assert_eq!(tok40.len(), 40);
+        let mut stream_513 = vec![b'x'; 473];
+        stream_513.extend_from_slice(tok40.as_bytes());
+        assert_eq!(stream_513.len(), 513);
+        let preview = format_redacted_stderr_preview(&stream_513, false, Some(tok40));
+        assert!(
+            !preview.contains("cf_secret"),
+            "token crossing 512-byte preview cutoff must be completely redacted: {preview}"
+        );
+        assert!(preview.contains("[REDACTED]"));
+        assert!(preview.len() <= STDERR_DIAGNOSTIC_MAX_BYTES);
+
+        // 2. Maximum-length 512-byte token starting at byte 511 (ends at byte 1023 <= 1024).
+        let max_tok = format!("MAXTOK_{}", "Z".repeat(MAX_CLOUDFLARE_TOKEN_BYTES - 7));
+        assert_eq!(max_tok.len(), MAX_CLOUDFLARE_TOKEN_BYTES);
+        let mut stream_max = vec![b'p'; 511];
+        stream_max.extend_from_slice(max_tok.as_bytes());
+        assert_eq!(stream_max.len(), 1023);
+        let preview_max = format_redacted_stderr_preview(&stream_max, false, Some(&max_tok));
+        assert!(
+            !preview_max.contains("MAXTOK_"),
+            "max-length token starting at byte 511 must be redacted before 512-byte slice: {preview_max}"
+        );
+        assert!(preview_max.len() <= STDERR_DIAGNOSTIC_MAX_BYTES);
+
+        // 3. Multiple early tokens shrink output below 512 while a final token straddles the
+        //    1024-byte capture cap (`was_truncated = true`).
+        let mut stream_cap = Vec::new();
+        for _ in 0..12 {
+            stream_cap.extend_from_slice(tok40.as_bytes());
+            stream_cap.push(b' ');
+        }
+        while stream_cap.len() < STDERR_CAPTURE_LOOKAHEAD_BYTES - 17 {
+            stream_cap.push(b'm');
+        }
+        stream_cap.extend_from_slice(&tok40.as_bytes()[..17]);
+        assert_eq!(stream_cap.len(), STDERR_CAPTURE_LOOKAHEAD_BYTES);
+        let preview_cap = format_redacted_stderr_preview(&stream_cap, true, Some(tok40));
+        assert!(
+            !preview_cap.contains("cf_secret"),
+            "partial token prefix at 1024-byte capture cap must be redacted: {preview_cap}"
         );
     }
 }
