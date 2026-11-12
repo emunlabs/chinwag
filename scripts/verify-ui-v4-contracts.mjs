@@ -1575,7 +1575,7 @@ for (const badUrl of [
 // Suite L: Deterministic CSS Cascade + 2D Bounding-Box Non-Overlap Ratchet
 // Guarantees stationary/in-flow rail toggles & action icons NEVER collide with
 // `.d2-title` ("Delivery-2"), `#d2-status-word`, or `.d2-spine-dots` across
-// 1440x900 expanded, 1280x900 spine/expanded, and 390x844 mobile drawer.
+// 1440x900 expanded, 1280x900 & 1200x900 spine/expanded, and 390x844 & 320x568 mobile drawer.
 // ============================================================================
 function parseCssRulesForCascade(cssText) {
   const clean = cssText.replace(/\/\*[\s\S]*?\*\//g, "");
@@ -2365,21 +2365,37 @@ for (const glyphEmRatio of [0.5, 0.62, 0.68]) {
   }
 }
 
-// L3: 1200x900 Collapsed 44px Spine & 1200x900 User-Expanded — zero overlap in both states
-const layoutSpineCollapsed = computeDelivery2HeaderBoxes(stylesCss, 1200, 900, {});
-assert.equal(layoutSpineCollapsed.trackVisible, false);
-assert.equal(layoutSpineCollapsed.spineVisible, true);
-for (const btn of layoutSpineCollapsed.visibleButtons) {
+// L3: 1280x900 & 1200x900 Collapsed 44px Spine & User-Expanded — zero overlap & zero title clipping in both states
+for (const [lVw, lVh] of [
+  [1280, 900],
+  [1200, 900],
+]) {
+  const layoutSpineCollapsed = computeDelivery2HeaderBoxes(stylesCss, lVw, lVh, {});
+  assert.equal(layoutSpineCollapsed.trackVisible, false);
+  assert.equal(layoutSpineCollapsed.spineVisible, true);
+  for (const btn of layoutSpineCollapsed.visibleButtons) {
+    assert.equal(
+      rectsOverlap(btn, layoutSpineCollapsed.spineDotsRect),
+      false,
+      `${lVw}x${lVh} spine: button #${btn.id} overlaps .d2-spine-dots`,
+    );
+  }
+  const layoutLaptopExpanded = computeDelivery2HeaderBoxes(stylesCss, lVw, lVh, { "data-rail": "expanded" });
+  assert.notEqual(layoutLaptopExpanded.titleGroupOverflow, "hidden");
+  assert.equal(layoutLaptopExpanded.titleFlexShrink, "0");
   assert.equal(
-    rectsOverlap(btn, layoutSpineCollapsed.spineDotsRect),
-    false,
-    `1200x900 spine: button #${btn.id} overlaps .d2-spine-dots`,
+    layoutLaptopExpanded.titleRect.right - layoutLaptopExpanded.titleRect.left,
+    layoutLaptopExpanded.rawTitleW,
+    `${lVw}x${lVh} expanded: .d2-title must remain completely unclipped`,
   );
-}
-const layoutLaptopExpanded = computeDelivery2HeaderBoxes(stylesCss, 1200, 900, { "data-rail": "expanded" });
-for (const btn of layoutLaptopExpanded.visibleButtons) {
-  assert.equal(rectsOverlap(btn, layoutLaptopExpanded.titleRect), false, `1200x900 expanded overlap on #${btn.id}`);
-  assert.equal(rectsOverlap(btn, layoutLaptopExpanded.statusWordRect), false, `1200x900 status overlap on #${btn.id}`);
+  for (const btn of layoutLaptopExpanded.visibleButtons) {
+    assert.equal(rectsOverlap(btn, layoutLaptopExpanded.titleRect), false, `${lVw}x${lVh} expanded overlap on #${btn.id}`);
+    assert.equal(
+      rectsOverlap(btn, layoutLaptopExpanded.statusWordRect),
+      false,
+      `${lVw}x${lVh} status overlap on #${btn.id}`,
+    );
+  }
 }
 
 // L4: 390x844 & 320x568 Mobile Open Drawer — `#d2-rail-toggle-fixed` hidden, unclipped `.d2-title` clears all buttons
