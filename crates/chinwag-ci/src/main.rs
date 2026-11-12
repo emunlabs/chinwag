@@ -7,9 +7,7 @@
 #[cfg(unix)]
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    if let [_, flag] = args.as_slice()
-        && (flag == "--version" || flag == "-V")
-    {
+    if matches!(args.as_slice(), [_, flag] if flag == "--version" || flag == "-V") {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         if writeln!(
@@ -21,6 +19,7 @@ fn main() {
         .is_err()
             || out.flush().is_err()
         {
+            eprintln!("CI_VERSION_STDOUT_WRITE_FAILED");
             std::process::exit(1);
         }
         return;

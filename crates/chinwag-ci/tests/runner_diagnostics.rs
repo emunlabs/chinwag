@@ -41,4 +41,21 @@ fn version_flags_exit_zero_and_reject_extra_positional_arguments() {
         .unwrap();
     assert_eq!(extra.status.code(), Some(2));
     assert!(extra.stdout.is_empty());
+
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let broken_pipe = std::process::Command::new(env!("CARGO_BIN_EXE_chinwag-ci"))
+        .arg("--version")
+        .stdout(std::process::Stdio::from(writer))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert_eq!(broken_pipe.status.code(), Some(1));
+    assert!(
+        String::from_utf8(broken_pipe.stderr)
+            .unwrap()
+            .contains("CI_VERSION_STDOUT_WRITE_FAILED")
+    );
 }
