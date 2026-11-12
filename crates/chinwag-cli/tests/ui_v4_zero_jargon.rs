@@ -1794,6 +1794,39 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
         "GET /api/v1/delivery2/state without CSRF header must return 403: {unauth_get_hdr}"
     );
 
+    // Also verify all 4 remaining POST /api/v1/delivery2/* routes reject requests missing X-Chinwag-Csrf (`403 Forbidden`)
+    for (route_path, sample_body) in [
+        ("/api/v1/delivery2/cancel", r#"{"turn_id":"t1"}"#),
+        (
+            "/api/v1/delivery2/approval",
+            r#"{"id":"hitl-1","decision":"deny"}"#,
+        ),
+        (
+            "/api/v1/delivery2/memory",
+            r#"{"id":"mem_default","action":"undo"}"#,
+        ),
+        ("/api/v1/delivery2/thread", r#"{"action":"new"}"#),
+    ] {
+        let unauth_post_raw = send_raw_http(
+            ui_addr,
+            &format!(
+                "POST {route_path} HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{ui_port}\r\n\
+                 Sec-Fetch-Site: same-origin\r\n\
+                 Origin: http://127.0.0.1:{ui_port}\r\n\
+                 Content-Type: application/json\r\n\
+                 Cookie: {cookie_pair}\r\n\
+                 Content-Length: {}\r\n\r\n{sample_body}",
+                sample_body.len()
+            ),
+        );
+        let (unauth_post_hdr, _) = split_headers_and_body(&unauth_post_raw);
+        assert!(
+            unauth_post_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+            "{route_path} without CSRF header must return 403: {unauth_post_hdr}"
+        );
+    }
+
     let get_auth_json = |path: &str| -> (String, String, Value) {
         let req = format!(
             "GET {path} HTTP/1.1\r\n\

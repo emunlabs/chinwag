@@ -677,49 +677,170 @@ const MAX_DELIVERY2_THREADS: usize = 24;
 const MAX_DELIVERY2_MEMORIES: usize = 128;
 const MAX_DELIVERY2_APPROVALS: usize = 128;
 
-fn is_pinned_unsettled_entry(entry: &Value) -> bool {
-    let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
-    matches!(kind, "approval_card" | "oauth_card")
-        && !entry
-            .get("settled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+fn is_entry_unsettled_workflow(state: &LocalUiV4State, thr_id: &str, entry: &Value) -> bool {
+    if entry
+        .get("settled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    match entry.get("kind").and_then(Value::as_str).unwrap_or("") {
+        "approval_card" => {
+            if let Some(aid) = entry.get("approval_id").and_then(Value::as_str)
+                && state.delivery2.approvals.contains_key(aid)
+            {
+                return false;
+            }
+            if let Some(iid) = entry.get("item_id").and_then(Value::as_str) {
+                if state
+                    .delivery2
+                    .approvals
+                    .contains_key(&format!("hitl-{iid}"))
+                {
+                    return false;
+                }
+                if state
+                    .item_decisions
+                    .get(iid)
+                    .is_some_and(|d| matches!(d.status.as_str(), "done" | "rejected"))
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        "oauth_card" => {
+            if let Some(surface) = entry.get("surface").and_then(Value::as_str)
+                && let Some(pref) = state.delivery2.connections.get(surface)
+            {
+                let Some(active_nonce) = pref.oauth_state.as_deref() else {
+                    return false;
+                };
+                if let Some(card_nonce) = entry.get("oauth_state").and_then(Value::as_str)
+                    && card_nonce != active_nonce
+                {
+                    return false;
+                }
+                if let Some(active_otid) = pref.oauth_thread_id.as_deref()
+                    && active_otid != thr_id
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
-fn compact_delivery2_store_for_persistence(store: &mut Delivery2Store) {
-    let active_tid = if store.active_thread_id.trim().is_empty() {
+fn thread_has_pinned_workflow(state: &LocalUiV4State, thr: &Delivery2Thread) -> bool {
+    if thr
+        .entries
+        .iter()
+        .any(|e| is_entry_unsettled_workflow(state, &thr.id, e))
+    {
+        return true;
+    }
+    state.delivery2.connections.values().any(|pref| {
+        pref.oauth_state.is_some() && pref.oauth_thread_id.as_deref() == Some(thr.id.as_str())
+    })
+}
+
+fn stamp_approval_settlement_in_threads(
+    threads: &mut [Delivery2Thread],
+    canonical_approval_id: &str,
+    canonical_item_id: &str,
+    settled: bool,
+    decision: Option<&str>,
+    receipt: Option<&str>,
+    seq: u64,
+) {
+    for thr in threads {
+        for entry in &mut thr.entries {
+            if entry.get("kind").and_then(Value::as_str) != Some("approval_card") {
+                continue;
+            }
+            let matches_aid = entry
+                .get("approval_id")
+                .and_then(Value::as_str)
+                .is_some_and(|a| a == canonical_approval_id || a == canonical_item_id);
+            let matches_iid = !canonical_item_id.is_empty()
+                && entry
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|i| i == canonical_item_id);
+            if (matches_aid || matches_iid)
+                && let Some(obj) = entry.as_object_mut()
+            {
+                obj.insert("settled".to_string(), Value::Bool(settled));
+                obj.insert(
+                    "settled_decision".to_string(),
+                    decision
+                        .map(|d| Value::String(d.to_string()))
+                        .unwrap_or(Value::Null),
+                );
+                obj.insert(
+                    "settled_receipt".to_string(),
+                    receipt
+                        .map(|r| Value::String(r.to_string()))
+                        .unwrap_or(Value::Null),
+                );
+                if seq > 0 {
+                    let prev_seq = obj.get("seq").and_then(Value::as_u64).unwrap_or(1);
+                    obj.insert("seq".to_string(), Value::Number(prev_seq.max(seq).into()));
+                }
+            }
+        }
+    }
+}
+
+fn compact_delivery2_store_for_persistence(state: &mut LocalUiV4State) -> Result<(), String> {
+    let active_tid = if state.delivery2.active_thread_id.trim().is_empty() {
         "thr-main".to_string()
     } else {
-        store.active_thread_id.clone()
+        state.delivery2.active_thread_id.clone()
     };
 
-    for thr in &mut store.threads {
-        while thr.entries.len() > MAX_DELIVERY2_ENTRIES_PER_THREAD {
-            let remove_idx = thr
+    for thr_idx in 0..state.delivery2.threads.len() {
+        while state.delivery2.threads[thr_idx].entries.len() > MAX_DELIVERY2_ENTRIES_PER_THREAD {
+            let thr_id = state.delivery2.threads[thr_idx].id.clone();
+            let remove_idx = state.delivery2.threads[thr_idx]
                 .entries
                 .iter()
-                .position(|e| !is_pinned_unsettled_entry(e))
-                .unwrap_or(0);
-            thr.entries.remove(remove_idx);
+                .position(|e| !is_entry_unsettled_workflow(state, &thr_id, e));
+            let Some(idx) = remove_idx else {
+                return Err(format!(
+                    "Thread '{}' holds more than {MAX_DELIVERY2_ENTRIES_PER_THREAD} unsettled approval or sign-in cards; resolve or skip a pending card first.",
+                    thr_id
+                ));
+            };
+            state.delivery2.threads[thr_idx].entries.remove(idx);
         }
     }
 
-    while store.threads.len() > MAX_DELIVERY2_THREADS {
-        let Some(evict_idx) = store
+    while state.delivery2.threads.len() > MAX_DELIVERY2_THREADS {
+        let Some(evict_idx) = state
+            .delivery2
             .threads
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.id != active_tid && t.id != "thr-main")
+            .filter(|(_, t)| {
+                t.id != active_tid && t.id != "thr-main" && !thread_has_pinned_workflow(state, t)
+            })
             .min_by_key(|(_, t)| t.updated_at_unix)
             .map(|(idx, _)| idx)
         else {
-            break;
+            return Err(format!(
+                "Cannot evict threads while {MAX_DELIVERY2_THREADS} or more threads hold unsettled approvals or OAuth sign-ins; resolve or skip a pending card first."
+            ));
         };
-        store.threads.remove(evict_idx);
+        state.delivery2.threads.remove(evict_idx);
     }
 
-    while store.memories.len() > MAX_DELIVERY2_MEMORIES {
-        let Some(oldest_id) = store
+    while state.delivery2.memories.len() > MAX_DELIVERY2_MEMORIES {
+        let Some(oldest_id) = state
+            .delivery2
             .memories
             .values()
             .filter(|m| m.id != "mem_default")
@@ -728,11 +849,12 @@ fn compact_delivery2_store_for_persistence(store: &mut Delivery2Store) {
         else {
             break;
         };
-        store.memories.remove(&oldest_id);
+        state.delivery2.memories.remove(&oldest_id);
     }
 
-    while store.approvals.len() > MAX_DELIVERY2_APPROVALS {
-        let Some(oldest_id) = store
+    while state.delivery2.approvals.len() > MAX_DELIVERY2_APPROVALS {
+        let Some(oldest_id) = state
+            .delivery2
             .approvals
             .iter()
             .min_by_key(|(_, a)| (a.updated_at_unix, a.seq))
@@ -740,8 +862,10 @@ fn compact_delivery2_store_for_persistence(store: &mut Delivery2Store) {
         else {
             break;
         };
-        store.approvals.remove(&oldest_id);
+        state.delivery2.approvals.remove(&oldest_id);
     }
+
+    Ok(())
 }
 
 fn load_ui_v4_state_strict(repo_root: &Path) -> Result<LocalUiV4State, String> {
@@ -819,28 +943,79 @@ fn mutate_ui_v4_state(
         Ok(v) => v,
         Err((status, err_val)) => return (status, err_val),
     };
-    compact_delivery2_store_for_persistence(&mut state.delivery2);
-    // Guarantee bounded history stays strictly under `UI_V4_MAX_STATE_BYTES` even with dense entries.
-    while serde_json::to_string(&state).is_ok_and(|s| s.len() > UI_V4_MAX_STATE_BYTES) {
-        let active_tid = state.delivery2.active_thread_id.clone();
-        if let Some(evict_thr_idx) = state
+    if let Err(e) = compact_delivery2_store_for_persistence(&mut state) {
+        return (
+            "409 Conflict",
+            json!({
+                "ok": false,
+                "disposition": "HELD",
+                "error_code": "pending_workflow_limit_exceeded",
+                "error": e
+            }),
+        );
+    }
+    // Guarantee bounded history stays strictly under `UI_V4_MAX_STATE_BYTES` even with dense entries,
+    // without ever discarding unsettled approval/OAuth cards (`ARCHITECT-R5-1`).
+    while matches!(serde_json::to_string(&state), Ok(s) if s.len() > UI_V4_MAX_STATE_BYTES) {
+        let active_tid = if state.delivery2.active_thread_id.trim().is_empty() {
+            "thr-main".to_string()
+        } else {
+            state.delivery2.active_thread_id.clone()
+        };
+        if let Some((thr_idx, entry_idx)) = state
             .delivery2
             .threads
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.id != active_tid && !t.entries.is_empty())
+            .filter(|(_, t)| t.id != active_tid)
+            .filter_map(|(idx, t)| {
+                t.entries
+                    .iter()
+                    .position(|e| !is_entry_unsettled_workflow(&state, &t.id, e))
+                    .map(|epos| (idx, epos, t.updated_at_unix))
+            })
+            .min_by_key(|(_, _, ts)| *ts)
+            .map(|(idx, epos, _)| (idx, epos))
+        {
+            state.delivery2.threads[thr_idx].entries.remove(entry_idx);
+        } else if let Some(empty_thr_idx) = state
+            .delivery2
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.id != active_tid
+                    && t.id != "thr-main"
+                    && t.entries.is_empty()
+                    && !thread_has_pinned_workflow(&state, t)
+            })
             .min_by_key(|(_, t)| t.updated_at_unix)
             .map(|(idx, _)| idx)
         {
-            state.delivery2.threads[evict_thr_idx].entries.remove(0);
-        } else if let Some(act_thr) = state
+            state.delivery2.threads.remove(empty_thr_idx);
+        } else if let Some((act_idx, entry_idx)) = state
             .delivery2
             .threads
-            .iter_mut()
-            .find(|t| t.id == active_tid)
-            && act_thr.entries.len() > 2
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.id == active_tid)
+            .and_then(|(idx, t)| {
+                let non_pinned_count = t
+                    .entries
+                    .iter()
+                    .filter(|e| !is_entry_unsettled_workflow(&state, &t.id, e))
+                    .count();
+                if non_pinned_count > 1 {
+                    t.entries
+                        .iter()
+                        .position(|e| !is_entry_unsettled_workflow(&state, &t.id, e))
+                        .map(|epos| (idx, epos))
+                } else {
+                    None
+                }
+            })
         {
-            act_thr.entries.remove(0);
+            state.delivery2.threads[act_idx].entries.remove(entry_idx);
         } else {
             break;
         }
@@ -4730,13 +4905,23 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
         let next_seq = state.delivery2.seq;
         match action {
             "approve" | "apply_locally" => {
+                let rcpt = format!("Approved in Inbox · {hh_mm} · 0 Cr while paused");
+                stamp_approval_settlement_in_threads(
+                    &mut state.delivery2.threads,
+                    &hitl_key,
+                    item_id,
+                    true,
+                    Some("approved"),
+                    Some(&rcpt),
+                    next_seq,
+                );
                 state.delivery2.approvals.remove(item_id);
                 state.delivery2.approvals.insert(
                     hitl_key.clone(),
                     Delivery2ApprovalRecord {
                         id: hitl_key,
                         decision: "approved".to_string(),
-                        receipt: format!("Approved in Inbox · {hh_mm} · 0 Cr while paused"),
+                        receipt: rcpt,
                         decided_at_label: hh_mm,
                         updated_at_unix: now,
                         seq: next_seq,
@@ -4744,13 +4929,23 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
                 );
             }
             "reject" => {
+                let rcpt = format!("Rejected in Inbox · {hh_mm} · 0 Cr while paused");
+                stamp_approval_settlement_in_threads(
+                    &mut state.delivery2.threads,
+                    &hitl_key,
+                    item_id,
+                    true,
+                    Some("denied"),
+                    Some(&rcpt),
+                    next_seq,
+                );
                 state.delivery2.approvals.remove(item_id);
                 state.delivery2.approvals.insert(
                     hitl_key.clone(),
                     Delivery2ApprovalRecord {
                         id: hitl_key,
                         decision: "denied".to_string(),
-                        receipt: format!("Rejected in Inbox · {hh_mm} · 0 Cr while paused"),
+                        receipt: rcpt,
                         decided_at_label: hh_mm,
                         updated_at_unix: now,
                         seq: next_seq,
@@ -4758,6 +4953,15 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
                 );
             }
             "undo_reject" | "request_changes" => {
+                stamp_approval_settlement_in_threads(
+                    &mut state.delivery2.threads,
+                    &hitl_key,
+                    item_id,
+                    false,
+                    None,
+                    None,
+                    next_seq,
+                );
                 state.delivery2.approvals.remove(&hitl_key);
                 state.delivery2.approvals.remove(item_id);
             }
@@ -6119,7 +6323,33 @@ fn sync_entry_overlays(entry: &mut Value, state: &LocalUiV4State) {
                     "seq".to_string(),
                     Value::Number(base_seq.max(rec.seq).into()),
                 );
-            } else {
+            } else if let Some(item_dec) =
+                iid.as_deref().and_then(|id| state.item_decisions.get(id))
+            {
+                if matches!(item_dec.status.as_str(), "done" | "rejected") {
+                    let dec = if item_dec.status == "done" {
+                        "approved"
+                    } else {
+                        "denied"
+                    };
+                    let hh_mm = format_utc_hh_mm(item_dec.updated_at_unix);
+                    let rcpt = if item_dec.status == "done" {
+                        format!("Approved in Inbox · {hh_mm} · 0 Cr while paused")
+                    } else {
+                        format!("Rejected in Inbox · {hh_mm} · 0 Cr while paused")
+                    };
+                    obj.insert("settled".to_string(), Value::Bool(true));
+                    obj.insert(
+                        "settled_decision".to_string(),
+                        Value::String(dec.to_string()),
+                    );
+                    obj.insert("settled_receipt".to_string(), Value::String(rcpt));
+                } else {
+                    obj.insert("settled".to_string(), Value::Bool(false));
+                    obj.insert("settled_decision".to_string(), Value::Null);
+                    obj.insert("settled_receipt".to_string(), Value::Null);
+                }
+            } else if !obj.get("settled").and_then(Value::as_bool).unwrap_or(false) {
                 obj.insert("settled".to_string(), Value::Bool(false));
                 obj.insert("settled_decision".to_string(), Value::Null);
                 obj.insert("settled_receipt".to_string(), Value::Null);
@@ -7497,6 +7727,7 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
                     .unwrap_or_else(|| "https://chinwag.sh/open".to_string());
                 if let Some(pref_mut) = state.delivery2.connections.get_mut(&surface) {
                     pref_mut.oauth_state = None;
+                    pref_mut.oauth_thread_id = None;
                     if surface != "slack" {
                         pref_mut.in_thread = Some(true);
                     }
@@ -7506,25 +7737,27 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
                 let receipt = format!("{surface_label} verified · {hh_mm} · 0 Cr while paused");
                 let card_id = format!("entry-oauth-{surface}");
                 let _ = ensure_active_thread_mut(&mut state.delivery2, seeded);
-                if let Some(thr) = state
-                    .delivery2
-                    .threads
-                    .iter_mut()
-                    .find(|t| t.id == target_tid)
-                {
-                    thr.updated_at_unix = now;
+                for thr in &mut state.delivery2.threads {
+                    if thr.id == target_tid {
+                        thr.updated_at_unix = now;
+                    }
                     if let Some(existing) = thr
                         .entries
                         .iter_mut()
                         .find(|e| e.get("id").and_then(Value::as_str) == Some(card_id.as_str()))
                         && let Some(obj) = existing.as_object_mut()
+                        && (thr.id == target_tid
+                            || !obj.get("settled").and_then(Value::as_bool).unwrap_or(false))
                     {
                         obj.insert("settled".to_string(), Value::Bool(true));
                         obj.insert(
                             "settled_decision".to_string(),
                             Value::String("verified".to_string()),
                         );
-                        obj.insert("settled_receipt".to_string(), Value::String(receipt));
+                        obj.insert(
+                            "settled_receipt".to_string(),
+                            Value::String(receipt.clone()),
+                        );
                         obj.insert("seq".to_string(), Value::Number(next_seq.into()));
                     }
                 }
@@ -7553,6 +7786,7 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
             if decision == "skip" {
                 pref.in_thread = Some(false);
                 pref.oauth_state = None;
+                pref.oauth_thread_id = None;
             } else {
                 pref.challenge_url = Some(challenge_url.clone());
                 pref.oauth_state = Some(nonce.clone());
@@ -7561,28 +7795,63 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
 
             let now = unix_now();
             let hh_mm = format_utc_hh_mm(now);
-            let thr = ensure_active_thread_mut(&mut state.delivery2, seeded);
-            thr.updated_at_unix = now;
+            let _ = ensure_active_thread_mut(&mut state.delivery2, seeded);
             let card_id = format!("entry-oauth-{surface}");
             if decision == "skip" {
                 let receipt = format!(
                     "Skipped {surface_label} sign-in for now · {hh_mm} · 0 Cr while paused"
                 );
-                if let Some(existing) = thr
-                    .entries
-                    .iter_mut()
-                    .find(|e| e.get("id").and_then(Value::as_str) == Some(card_id.as_str()))
-                    && let Some(obj) = existing.as_object_mut()
-                {
-                    obj.insert("settled".to_string(), Value::Bool(true));
-                    obj.insert(
-                        "settled_decision".to_string(),
-                        Value::String("skip".to_string()),
-                    );
-                    obj.insert("settled_receipt".to_string(), Value::String(receipt));
-                    obj.insert("seq".to_string(), Value::Number(next_seq.into()));
+                for thr in &mut state.delivery2.threads {
+                    if thr.id == active_tid {
+                        thr.updated_at_unix = now;
+                    }
+                    if let Some(existing) = thr
+                        .entries
+                        .iter_mut()
+                        .find(|e| e.get("id").and_then(Value::as_str) == Some(card_id.as_str()))
+                        && let Some(obj) = existing.as_object_mut()
+                        && (thr.id == active_tid
+                            || !obj.get("settled").and_then(Value::as_bool).unwrap_or(false))
+                    {
+                        obj.insert("settled".to_string(), Value::Bool(true));
+                        obj.insert(
+                            "settled_decision".to_string(),
+                            Value::String("skip".to_string()),
+                        );
+                        obj.insert(
+                            "settled_receipt".to_string(),
+                            Value::String(receipt.clone()),
+                        );
+                        obj.insert("seq".to_string(), Value::Number(next_seq.into()));
+                    }
                 }
             } else {
+                let supersede_rcpt = format!(
+                    "Moved {surface_label} sign-in to current thread · {hh_mm} · 0 Cr while paused"
+                );
+                for thr in &mut state.delivery2.threads {
+                    if thr.id == active_tid {
+                        continue;
+                    }
+                    if let Some(existing) = thr
+                        .entries
+                        .iter_mut()
+                        .find(|e| e.get("id").and_then(Value::as_str) == Some(card_id.as_str()))
+                        && let Some(obj) = existing.as_object_mut()
+                        && !obj.get("settled").and_then(Value::as_bool).unwrap_or(false)
+                    {
+                        obj.insert("settled".to_string(), Value::Bool(true));
+                        obj.insert(
+                            "settled_decision".to_string(),
+                            Value::String("superseded".to_string()),
+                        );
+                        obj.insert(
+                            "settled_receipt".to_string(),
+                            Value::String(supersede_rcpt.clone()),
+                        );
+                        obj.insert("seq".to_string(), Value::Number(next_seq.into()));
+                    }
+                }
                 let oauth_card = json!({
                     "id": card_id,
                     "kind": "oauth_card",
@@ -7597,14 +7866,22 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
                     "challenge_url": challenge_url,
                     "settled": false
                 });
-                if let Some(pos) = thr
-                    .entries
-                    .iter()
-                    .position(|e| e.get("id").and_then(Value::as_str) == Some(card_id.as_str()))
+                if let Some(thr) = state
+                    .delivery2
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.id == active_tid)
                 {
-                    thr.entries[pos] = oauth_card;
-                } else {
-                    thr.entries.push(oauth_card);
+                    thr.updated_at_unix = now;
+                    if let Some(pos) = thr
+                        .entries
+                        .iter()
+                        .position(|e| e.get("id").and_then(Value::as_str) == Some(card_id.as_str()))
+                    {
+                        thr.entries[pos] = oauth_card;
+                    } else {
+                        thr.entries.push(oauth_card);
+                    }
                 }
             }
 
@@ -7761,6 +8038,15 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
 
         state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
         let next_seq = state.delivery2.seq;
+        stamp_approval_settlement_in_threads(
+            &mut state.delivery2.threads,
+            &canonical_approval_id,
+            &canonical_item_id,
+            true,
+            Some(canonical_decision),
+            Some(&receipt),
+            next_seq,
+        );
         let rec = Delivery2ApprovalRecord {
             id: canonical_approval_id.clone(),
             decision: canonical_decision.to_string(),
@@ -11086,6 +11372,163 @@ mod tests {
         assert!(
             load_ui_v4_state_strict(&repo).is_ok(),
             "refused oversized save must leave prior valid .chinwag/ui-v4-state.json intact"
+        );
+
+        // (h) ARCHITECT-R5-1: Pending workflow preservation across BOTH thread eviction and byte-budget shedding!
+        let pend_dir = tempfile::tempdir().unwrap();
+        let pend_repo = fs::canonicalize(pend_dir.path()).unwrap();
+        init_test_repo(&pend_repo);
+        fs::create_dir_all(pend_repo.join(".chinwag")).unwrap();
+
+        // 1) Create thread `T`, start GitHub OAuth sign-in there, then create 23 more threads (25 total > 24 cap) -> `T` must NOT be evicted!
+        let (st_t0, val_t0) = handle_delivery2_thread(
+            &pend_repo,
+            5487,
+            br#"{"action":"new","title":"OAuth origin thread"}"#,
+        );
+        assert_eq!(st_t0, "200 OK");
+        let origin_tid = val_t0["active_thread_id"].as_str().unwrap().to_string();
+
+        let (st_gh_conn, _) = handle_delivery2_approval(
+            &pend_repo,
+            5487,
+            br#"{"kind":"oauth","surface":"github","decision":"connect"}"#,
+        );
+        assert_eq!(st_gh_conn, "200 OK");
+
+        for i in 0..23 {
+            let new_body = serde_json::to_vec(&json!({
+                "action": "new",
+                "title": format!("Idle thread #{i}")
+            }))
+            .unwrap();
+            let (st_idle, _) = handle_delivery2_thread(&pend_repo, 5487, &new_body);
+            assert_eq!(st_idle, "200 OK");
+        }
+
+        let (st_sw_origin, val_sw_origin) = handle_delivery2_thread(
+            &pend_repo,
+            5487,
+            serde_json::to_vec(&json!({ "action": "switch", "thread_id": origin_tid }))
+                .unwrap()
+                .as_slice(),
+        );
+        assert_eq!(
+            st_sw_origin, "200 OK",
+            "Thread holding pending OAuth sign-in must survive 25-thread compaction"
+        );
+        assert!(
+            val_sw_origin["state"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == "entry-oauth-github" && e["settled"] == false),
+            "Pending GitHub oauth_card must remain intact in originating thread"
+        );
+
+        // 2) Byte-budget shedding under dense multi-KB entries protects unsettled cards at index 0
+        // and returns 409 HELD when no safe non-pinned eviction can satisfy bounds!
+        let (st_dense_shed_ok, _) = mutate_ui_v4_state(&pend_repo, |st| {
+            let thr = st
+                .delivery2
+                .threads
+                .iter_mut()
+                .find(|t| t.id == origin_tid)
+                .unwrap();
+            thr.entries.insert(
+                0,
+                json!({
+                    "id": "entry-hitl-pinned-0",
+                    "kind": "approval_card",
+                    "settled": false,
+                    "title": "Pinned unsettled approval at index 0"
+                }),
+            );
+            for k in 0..45 {
+                thr.entries.push(json!({
+                    "id": format!("dense-qa-{k}"),
+                    "kind": "qa_card",
+                    "body": "d".repeat(13_000)
+                }));
+            }
+            Ok(json!({ "ok": true }))
+        });
+        assert_eq!(st_dense_shed_ok, "200 OK");
+        let after_dense = load_ui_v4_state_strict(&pend_repo).unwrap();
+        let origin_after_dense = after_dense
+            .delivery2
+            .threads
+            .iter()
+            .find(|t| t.id == origin_tid)
+            .unwrap();
+        assert!(
+            origin_after_dense
+                .entries
+                .iter()
+                .any(|e| e["id"] == "entry-hitl-pinned-0" && e["settled"] == false),
+            "Byte-budget shedding must NEVER evict unsettled approval_card at index 0"
+        );
+        assert!(
+            origin_after_dense
+                .entries
+                .iter()
+                .any(|e| e["id"] == "entry-oauth-github" && e["settled"] == false),
+            "Byte-budget shedding must NEVER evict unsettled oauth_card"
+        );
+
+        // 3) Count-bound HELD (> MAX_DELIVERY2_ENTRIES_PER_THREAD unsettled cards) AND byte-budget HELD
+        // (<= MAX_DELIVERY2_ENTRIES_PER_THREAD dense unsettled cards exceeding UI_V4_MAX_STATE_BYTES)
+        // both return 409 HELD without corrupting the valid state on disk!
+        let (st_held_count, val_held_count) = mutate_ui_v4_state(&pend_repo, |st| {
+            let thr = st
+                .delivery2
+                .threads
+                .iter_mut()
+                .find(|t| t.id == origin_tid)
+                .unwrap();
+            thr.entries = (0..=MAX_DELIVERY2_ENTRIES_PER_THREAD)
+                .map(|k| {
+                    json!({
+                        "id": format!("unsettled-only-{k}"),
+                        "kind": "approval_card",
+                        "settled": false
+                    })
+                })
+                .collect();
+            Ok(json!({ "ok": true }))
+        });
+        assert_eq!(st_held_count, "409 Conflict");
+        assert_eq!(val_held_count["disposition"], "HELD");
+        assert_eq!(
+            val_held_count["error_code"],
+            "pending_workflow_limit_exceeded"
+        );
+
+        let (st_held_bytes, val_held_bytes) = mutate_ui_v4_state(&pend_repo, |st| {
+            let thr = st
+                .delivery2
+                .threads
+                .iter_mut()
+                .find(|t| t.id == origin_tid)
+                .unwrap();
+            thr.entries = (0..40)
+                .map(|k| {
+                    json!({
+                        "id": format!("unsettled-dense-{k}"),
+                        "kind": "approval_card",
+                        "settled": false,
+                        "question": "q".repeat(15_000)
+                    })
+                })
+                .collect();
+            Ok(json!({ "ok": true }))
+        });
+        assert_eq!(st_held_bytes, "409 Conflict");
+        assert_eq!(val_held_bytes["disposition"], "HELD");
+        assert_eq!(val_held_bytes["error_code"], "state_save_failed");
+        assert!(
+            load_ui_v4_state_strict(&pend_repo).is_ok(),
+            "HELD compaction/byte-budget refusals must leave valid .chinwag/ui-v4-state.json intact"
         );
     }
 }
