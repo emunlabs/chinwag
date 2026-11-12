@@ -249,7 +249,7 @@ pub(crate) async fn pinned_bytes(
     }
     Ok(bytes)
 }
-fn materialize(
+pub(crate) fn materialize(
     profile: &CommandProfile,
     source: &str,
     bytes: &[u8],

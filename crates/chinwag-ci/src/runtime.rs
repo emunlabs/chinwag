@@ -63,6 +63,11 @@ impl RuntimeError {
         }
     }
 }
+impl From<crate::execution::ExecutionError> for RuntimeError {
+    fn from(_: crate::execution::ExecutionError) -> Self {
+        Self::Refused
+    }
+}
 /// Fixed categories only. Never retain or format a reqwest error, URL, body,
 /// token, header or upstream message in an operational diagnostic.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -141,6 +146,27 @@ pub struct Plan {
     pub bootstrap_hint: [u8; 32],
 }
 impl Plan {
+    pub(crate) fn pinned_seat_signers(&self) -> Result<crate::recipient_key::SeatSignerDirectory> {
+        if self.version != 1
+            || self.bootstrap_hint == [0; 32]
+            || self.expected_oidc_subject.is_empty()
+            || self.expected_oidc_subject.len() > 1024
+            || !intent::qualified_instance(&self.scope.instance)
+        {
+            return Err(RuntimeError::Refused);
+        }
+        let (seat, _) = self
+            .scope
+            .instance
+            .split_once('#')
+            .ok_or(RuntimeError::Refused)?;
+        checked(
+            crate::recipient_key::SeatSignerDirectory::from_pinned_seats(&[(
+                seat,
+                self.scope.public_key,
+            )]),
+        )
+    }
     pub(crate) fn intent(&self) -> Result<VerifiedIntent> {
         if self.version != 1
             || self.bootstrap_hint == [0; 32]
@@ -161,16 +187,37 @@ impl Plan {
             },
         ))
     }
+    #[cfg(test)]
     pub(crate) fn profiles(&self) -> Result<BoundProfiles> {
-        checked(BoundProfiles::resolve(
+        self.profiles_with_revocations(&crate::recipient_key::VerifiedRevocationState::new())
+    }
+    pub(crate) fn profiles_with_revocations(
+        &self,
+        revocations: &crate::recipient_key::VerifiedRevocationState,
+    ) -> Result<BoundProfiles> {
+        checked(BoundProfiles::resolve_with_revocations(
             &self.intent()?,
             self.command_profile.as_bytes(),
             self.delivery_profile.as_bytes(),
+            revocations,
             now()?,
         ))
     }
+    #[cfg(test)]
     pub(crate) fn delivery(&self) -> Result<DeliveryProfile> {
-        checked(DeliveryProfile::parse(self.delivery_profile.as_bytes()))
+        self.delivery_with_revocations(&crate::recipient_key::VerifiedRevocationState::new())
+    }
+    pub(crate) fn delivery_with_revocations(
+        &self,
+        revocations: &crate::recipient_key::VerifiedRevocationState,
+    ) -> Result<DeliveryProfile> {
+        let signers = self.pinned_seat_signers()?;
+        let d = checked(DeliveryProfile::parse(self.delivery_profile.as_bytes()))?;
+        if d.spec().initiating_instance != self.scope.instance {
+            return Err(RuntimeError::Refused);
+        }
+        checked(d.verify_authenticated_recipient_keys(&signers, revocations, now()?))?;
+        Ok(d)
     }
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +281,8 @@ pub struct RootConfiguration {
     pub output_directory: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_agent: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_revocations: Option<PathBuf>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -248,6 +297,8 @@ pub struct StudioConfiguration {
     pub release_ledger: PathBuf,
     pub current_policy: PathBuf,
     pub output_directory: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_revocations: Option<PathBuf>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,6 +389,30 @@ pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 fn read<T: Serialize + for<'a> Deserialize<'a>>(p: &Path) -> Result<T> {
     checked(owner_cli::read_public(p))
+}
+pub(crate) fn load_revocation_statements(
+    path: Option<&Path>,
+    plan: &Plan,
+) -> Result<(
+    Vec<crate::recipient_key::SignedRecipientKeyRevocation>,
+    crate::recipient_key::VerifiedRevocationState,
+)> {
+    let mut state = crate::recipient_key::VerifiedRevocationState::new();
+    let Some(path) = path else {
+        return Ok((Vec::new(), state));
+    };
+    let statements: Vec<crate::recipient_key::SignedRecipientKeyRevocation> = read(path)?;
+    let signers = plan.pinned_seat_signers()?;
+    for rev in &statements {
+        checked(state.ingest_signed_revocation_struct(rev, &signers))?;
+    }
+    Ok((statements, state))
+}
+pub(crate) fn load_revocations(
+    path: Option<&Path>,
+    plan: &Plan,
+) -> Result<crate::recipient_key::VerifiedRevocationState> {
+    load_revocation_statements(path, plan).map(|(_, state)| state)
 }
 fn register(path: &Path, job: &Job) -> Result<()> {
     if path.try_exists().map_err(|_| RuntimeError::Refused)? {
@@ -435,7 +510,8 @@ async fn delivery_complete(State(s): State<Arc<RootState>>, body: Bytes) -> impl
     let result = async {
         let request: crate::delivery_barrier::DualDeliveryRequest = decode(&body)?;
         let plan: Plan = read(&s.config.plan)?;
-        let profiles = plan.profiles()?;
+        let revocations = load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+        let profiles = plan.profiles_with_revocations(&revocations)?;
         let job: Job = read(&s.config.registered_job)?;
         let owner = s.recipient.lock().await;
         let e = recover(
@@ -453,6 +529,13 @@ async fn delivery_complete(State(s): State<Arc<RootState>>, body: Bytes) -> impl
         ))?;
         drop(owner);
         let mut slot = s.dual_delivery.lock().await;
+        let post_wait_revocations =
+            load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+        checked(profiles.reverify_recipient_keys(
+            &plan.pinned_seat_signers()?,
+            &post_wait_revocations,
+            now()?,
+        ))?;
         if let Some(prior) = slot.as_ref() {
             if prior.receipt_set_digest() != proof.receipt_set_digest() {
                 return Err(RuntimeError::Refused);
@@ -509,7 +592,8 @@ async fn bootstrap(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoRes
             None,
         )
         .await?;
-        plan.profiles()?
+        let revocations = load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+        plan.profiles_with_revocations(&revocations)?
             .validate_registered_job(&request.job.registered())
             .map_err(|_| RuntimeError::Refused)?;
         register(&s.config.registered_job, &request.job)?;
@@ -526,6 +610,9 @@ fn is_ready(s: &RootState, job: &Job) -> Result<()> {
     {
         return Err(RuntimeError::Refused);
     }
+    let plan: Plan = read(&s.config.plan)?;
+    let revocations = load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+    let _ = plan.delivery_with_revocations(&revocations)?;
     Ok(())
 }
 async fn readiness(State(s): State<Arc<RootState>>) -> impl IntoResponse {
@@ -535,6 +622,24 @@ async fn readiness(State(s): State<Arc<RootState>>) -> impl IntoResponse {
     } else {
         (StatusCode::TOO_EARLY, "CI_OWNERS_PENDING")
     }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RevocationStatusRequest {
+    pub nonce: [u8; 32],
+}
+async fn revocations_status(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoResponse {
+    http_result((|| {
+        let r: RevocationStatusRequest = decode(&body)?;
+        let plan: Plan = read(&s.config.plan)?;
+        let intent = plan.intent()?;
+        let (statements, _) =
+            load_revocation_statements(s.config.recipient_revocations.as_deref(), &plan)?;
+        checked(
+            s.admission
+                .certify_revocation_status(&intent, r.nonce, statements),
+        )
+    })())
 }
 async fn challenge(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoResponse {
     use crate::http_diagnostics::Phase;
@@ -558,11 +663,13 @@ async fn challenge(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoRes
         )
         .await?;
         trace.phase(Phase::WorkflowVerified);
+        trace.phase(Phase::LedgerWait);
+        let mut ledger = s.ledger.lock().await;
+        let revocations = load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+        let _ = plan.profiles_with_revocations(&revocations)?;
         let intent = plan.intent()?;
         let t = now()?;
         let exp = intent.spec().expires_unix.min(t + 300);
-        trace.phase(Phase::LedgerWait);
-        let mut ledger = s.ledger.lock().await;
         trace.phase(Phase::LedgerIssue);
         let c = checked(ledger.issue(
             &intent,
@@ -615,7 +722,10 @@ async fn admit(State(s): State<Arc<RootState>>, body: Bytes) -> impl IntoRespons
             signature,
             now()?,
         ))?;
-        let admission = checked(s.ledger.lock().await.consume(&binding, r.nonce, now()?))?;
+        let mut ledger = s.ledger.lock().await;
+        let revocations = load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+        let _ = plan.profiles_with_revocations(&revocations)?;
+        let admission = checked(ledger.consume(&binding, r.nonce, now()?))?;
         let record = match admission {
             AdmissionOutcome::NewlyCommitted(a) | AdmissionOutcome::ReconciledOriginal(a) => a,
         };
@@ -678,13 +788,16 @@ impl Drop for OnlineGuard<'_> {
 async fn receive(
     owner: &mut OwnerCustody,
     plan: &Plan,
+    revocations_path: Option<&Path>,
     job: &Job,
     role: Destination,
     budget: &OwnerBudget,
     outputs: &Path,
     online: Option<&AtomicBool>,
 ) -> Result<ArtifactObservation> {
-    let profiles = plan.profiles()?;
+    let initial_revocations = load_revocations(revocations_path, plan)?;
+    let profiles = plan.profiles_with_revocations(&initial_revocations)?;
+    let pinned_signers = plan.pinned_seat_signers()?;
     let d = profiles.delivery().spec();
     let destination = match role {
         Destination::Recipient => &d.recipient,
@@ -718,12 +831,15 @@ async fn receive(
         .min(Duration::from_secs(1800));
     let operation = pair.receive_once(remaining, |claim| {
         let result: Result<Vec<u8>> = (|| {
+            let live_revocations = load_revocations(revocations_path, plan)?;
+            let t = now()?;
+            checked(profiles.reverify_recipient_keys(&pinned_signers, &live_revocations, t))?;
             let sealed = checked(envelope::parse_storage_blob(&claim.ciphertext))?;
             let bound = checked(profiles.authenticate_current_artifact(
                 &claim.manifest,
                 sealed,
                 &job.registered(),
-                now()?,
+                t,
             ))?;
             let reply = checked(owner.persist_native_admitted(&bound, &claim, &d.relay_origin))?;
             let blob = checked(bound.complete_admitted_blob())?;
@@ -808,6 +924,8 @@ struct QualifiedCapture {
 #[allow(clippy::too_many_arguments)]
 fn qualified_output(
     owner: &OwnerCustody,
+    plan: &Plan,
+    revocations_path: Option<&Path>,
     envelope: &authorization::AdmissionBoundEnvelope,
     policy: &acu::CurrentPolicy,
     profile: &crate::profile::CommandProfile,
@@ -843,19 +961,23 @@ fn qualified_output(
         observation: obs,
         verified,
         plaintext,
-        read_authorization: crate::agent_read::ReadAuthorization::qualified(
+        read_authorization: crate::agent_read::ReadAuthorization::qualified_for_plan(
             grant.expires_unix(),
             policy,
+            plan.clone(),
+            revocations_path.map(Path::to_path_buf),
         ),
     })
 }
 async fn recipient_read(
     owner: &OwnerCustody,
     plan: &Plan,
+    revocations_path: Option<&Path>,
     obs: ArtifactObservation,
     outputs: &Path,
 ) -> Result<QualifiedCapture> {
-    let delivery = plan.delivery()?;
+    let initial_revocations = load_revocations(revocations_path, plan)?;
+    let delivery = plan.delivery_with_revocations(&initial_revocations)?;
     let e = recover(owner, &delivery, Destination::Recipient, obs.object)?;
     let client = checked(crate::github::normal_https_client())?;
     let policy_bytes = request_bytes(
@@ -866,12 +988,14 @@ async fn recipient_read(
         128 * 1024,
     )
     .await?;
+    let pre_request_revocations = load_revocations(revocations_path, plan)?;
+    let _ = plan.delivery_with_revocations(&pre_request_revocations)?;
+    let t = now()?;
     let policy = checked(acu::verify_current_policy(
         &policy_bytes,
         delivery.spec().acu_signer,
-        now()?,
+        t,
     ))?;
-    let t = now()?;
     let request = checked(owner.create_release_request(
         &e,
         &policy,
@@ -899,6 +1023,8 @@ async fn recipient_read(
         128 * 1024,
     )
     .await?;
+    let pre_open_revocations = load_revocations(revocations_path, plan)?;
+    let _ = plan.delivery_with_revocations(&pre_open_revocations)?;
     let current = checked(acu::verify_current_policy(
         &current_bytes,
         delivery.spec().acu_signer,
@@ -906,6 +1032,8 @@ async fn recipient_read(
     ))?;
     qualified_output(
         owner,
+        plan,
+        revocations_path,
         &e,
         &current,
         &checked(crate::profile::CommandProfile::parse(
@@ -933,7 +1061,8 @@ pub async fn serve_root(path: &Path) -> Result<()> {
     let recipient = config.recipient.open()?;
     let admission = config.admission.open()?;
     let plan: Plan = read(&config.plan)?;
-    let d = plan.delivery()?;
+    let startup_revocations = load_revocations(config.recipient_revocations.as_deref(), &plan)?;
+    let d = plan.delivery_with_revocations(&startup_revocations)?;
     if checked(admission.public_enrollment())?
         != (PublicEnrollment::Admission {
             signer: d.spec().admission_signer,
@@ -957,6 +1086,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
     let app = Router::new()
         .route("/v1/bootstrap", post(bootstrap))
         .route("/v1/ready", get(readiness))
+        .route("/v1/revocations", post(revocations_status))
         .route("/v1/challenge", post(challenge))
         .route("/v1/admit", post(admit))
         .route("/v1/delivery-complete", post(delivery_complete))
@@ -982,6 +1112,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
             receive(
                 &mut owner,
                 &plan,
+                s.config.recipient_revocations.as_deref(),
                 &job,
                 Destination::Recipient,
                 &receiver_budget,
@@ -997,13 +1128,15 @@ pub async fn serve_root(path: &Path) -> Result<()> {
         let dual = wait_dual(&s, &obs, &receiver_budget).await?;
         let recipient = s.recipient.lock().await;
         let qualified = tokio::select! {
-            result = recipient_read(&recipient, &plan, obs, &s.config.output_directory) => result,
+            result = recipient_read(&recipient, &plan, s.config.recipient_revocations.as_deref(), obs, &s.config.output_directory) => result,
             _ = receiver_budget.work_stopped() => Err(RuntimeError::Refused),
         }?;
         if let Some(agent) = &s.config.idle_agent {
+            let wake_revocations =
+                load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
             let envelope = recover(
                 &recipient,
-                &plan.delivery()?,
+                &plan.delivery_with_revocations(&wake_revocations)?,
                 Destination::Recipient,
                 qualified.observation.object,
             )?;
@@ -1015,6 +1148,7 @@ pub async fn serve_root(path: &Path) -> Result<()> {
                 agent,
                 crate::idle_agent::QualifiedWake {
                     plan: &plan,
+                    recipient_revocations: s.config.recipient_revocations.as_deref(),
                     envelope: &envelope,
                     verified: &qualified.verified,
                     plaintext: &qualified.plaintext,
@@ -1142,22 +1276,21 @@ async fn release(State(s): State<Arc<StudioState>>, body: Bytes) -> impl IntoRes
     let result = match result {
         Ok(r) => {
             async {
-                let plan: Plan = read(&s.config.plan)?;
-                let d = plan.delivery()?;
+                let request = checked(hex::decode(r.signed_request_hex))?;
                 let archive = s.archive.lock().await;
+                let mut ledger = s.ledger.lock().await;
+                let plan: Plan = read(&s.config.plan)?;
+                let revocations =
+                    load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+                let d = plan.delivery_with_revocations(&revocations)?;
                 let e = recover(&archive, &d, Destination::Archive, r.object)?;
+                let t = now()?;
                 let policy = checked(acu::verify_current_policy(
                     &read_raw(&s.config.current_policy, 128 * 1024)?,
                     acu_pin(&s.acu)?,
-                    now()?,
+                    t,
                 ))?;
-                let request = checked(hex::decode(r.signed_request_hex))?;
-                checked(
-                    s.ledger
-                        .lock()
-                        .await
-                        .release(&s.acu, &e, &policy, &request, now()?),
-                )
+                checked(ledger.release(&s.acu, &e, &policy, &request, t))
             }
             .await
         }
@@ -1175,7 +1308,8 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
     )?;
     let plan: Plan = read(&config.plan)?;
     let job: Job = read(&config.registered_job)?;
-    let d = plan.delivery()?;
+    let startup_revocations = load_revocations(config.recipient_revocations.as_deref(), &plan)?;
+    let d = plan.delivery_with_revocations(&startup_revocations)?;
     let stop = Arc::new(AtomicBool::new(false));
     let budget = OwnerBudget::new(Duration::from_secs(config.lifetime_seconds), stop.clone());
     let archive = Arc::new(Mutex::new(config.archive.open()?));
@@ -1183,7 +1317,7 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
     same_enrollment(&*archive.lock().await, &d.spec().archive)?;
     if checked(acu.public_enrollment())?
         != (PublicEnrollment::Acu {
-            gate_base: d.spec().acu_gate_base,
+            gate_base: d.spec().acu_gate_base.clone(),
             signer: d.spec().acu_signer,
         })
     {
@@ -1213,6 +1347,7 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
         let obs = receive(
             &mut *s.archive.lock().await,
             &plan,
+            s.config.recipient_revocations.as_deref(),
             &job,
             Destination::Archive,
             &receiver_budget,
@@ -1221,16 +1356,24 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
         )
         .await?;
         let archive = s.archive.lock().await;
+        let mut ledger = s.ledger.lock().await;
+        let pre_release_revocations =
+            load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+        let d = plan.delivery_with_revocations(&pre_release_revocations)?;
         let e = recover(&archive, &d, Destination::Archive, obs.object)?;
+        let t = now()?;
         let p = checked(acu::verify_current_policy(
             &read_raw(&s.config.current_policy, 128 * 1024)?,
             acu_pin(&s.acu)?,
-            now()?,
+            t,
         ))?;
-        let t = now()?;
         let request =
             checked(archive.create_release_request(&e, &p, t, (t + 120).min(p.expires_unix())))?;
-        let grant = checked(s.ledger.lock().await.release(&s.acu, &e, &p, &request, t))?;
+        let grant = checked(ledger.release(&s.acu, &e, &p, &request, t))?;
+        drop(ledger);
+        let pre_open_revocations =
+            load_revocations(s.config.recipient_revocations.as_deref(), &plan)?;
+        let _ = plan.delivery_with_revocations(&pre_open_revocations)?;
         let current = checked(acu::verify_current_policy(
             &read_raw(&s.config.current_policy, 128 * 1024)?,
             acu_pin(&s.acu)?,
@@ -1238,6 +1381,8 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
         ))?;
         qualified_output(
             &archive,
+            &plan,
+            s.config.recipient_revocations.as_deref(),
             &e,
             &current,
             &checked(crate::profile::CommandProfile::parse(
@@ -1507,5 +1652,432 @@ mod tests {
         );
         let n = response.unwrap().unwrap();
         assert!(String::from_utf8_lossy(&bytes[..n]).starts_with("HTTP/1.1 408"));
+    }
+    #[test]
+    fn plan_enforces_pinned_seat_signer_and_live_revocation_file() {
+        use crate::{
+            envelope::{AcuGateKey, DestinationKey, ResponseKey},
+            intent::IntentSpec,
+            profile::{CommandProfileSpec, DeliveryProfileSpec},
+            recipient_key::{
+                RecipientKeyPurpose, SignedRecipientKeyRevocation,
+                sign_public_key_enrollment_descriptor, sign_revocation_statement,
+            },
+        };
+        use ed25519_dalek::Signer;
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = now().unwrap();
+        let ed = |n| *iroh::SecretKey::from_bytes(&[n; 32]).public().as_bytes();
+        let seat_sk = ed25519_dalek::SigningKey::from_bytes(&[77; 32]);
+        let cmd_spec = CommandProfileSpec {
+            version: 1,
+            execution_id: [1; 32],
+            rust_image: format!("docker.io/library/rust@sha256:{}", "a".repeat(64)),
+            fixture_sha256: Sha256::digest(b"fixture").into(),
+            timeout_seconds: 60,
+            isolation: "UNPRIVILEGED_NETWORKLESS_DOCKER_FIXED_RUST_FIXTURE_V1".into(),
+        };
+        let cmd_bytes = serde_json::to_vec(&cmd_spec).unwrap();
+        let cmd_digest: [u8; 32] = Sha256::digest(&cmd_bytes).into();
+
+        let recipient = PublicDestination {
+            role: Destination::Recipient,
+            store_id: [2; 32],
+            store_binding: [3; 32],
+            psk: DestinationKey::generate(Destination::Recipient)
+                .unwrap()
+                .public(),
+            response_base: ResponseKey::generate(Destination::Recipient)
+                .unwrap()
+                .public(),
+            receipt_signer: ed(4),
+            release_request_signer: ed(4),
+            transport: ed(5),
+        };
+        let psk_bind = sign_public_key_enrollment_descriptor(
+            "WORKHORSE",
+            "wh-runtime-psk-e1",
+            1,
+            RecipientKeyPurpose::AcuRecipientPsk,
+            &recipient.psk,
+            t.saturating_sub(60),
+            t + 3_600,
+            &seat_sk,
+        )
+        .unwrap();
+        let resp_bind = sign_public_key_enrollment_descriptor(
+            "WORKHORSE",
+            "wh-runtime-resp-e1",
+            1,
+            RecipientKeyPurpose::AcuRecipientResponseBase,
+            &recipient.response_base,
+            t.saturating_sub(60),
+            t + 3_600,
+            &seat_sk,
+        )
+        .unwrap();
+        let archive = PublicDestination {
+            role: Destination::Archive,
+            store_id: [6; 32],
+            store_binding: [7; 32],
+            psk: DestinationKey::generate(Destination::Archive)
+                .unwrap()
+                .public(),
+            response_base: ResponseKey::generate(Destination::Archive)
+                .unwrap()
+                .public(),
+            receipt_signer: ed(8),
+            release_request_signer: ed(8),
+            transport: ed(9),
+        };
+        let deliv_spec = DeliveryProfileSpec {
+            version: 1,
+            repository_id: 42,
+            initiating_instance: "WORKHORSE#runtime-test".into(),
+            recipient,
+            recipient_psk_binding: Some(psk_bind),
+            recipient_response_base_binding: Some(resp_bind),
+            recipient_key_revocations: Vec::new(),
+            archive,
+            acu_gate_base: AcuGateKey::generate().unwrap().public(),
+            acu_signer: ed(10),
+            admission_signer: ed(11),
+            relay_origin: "https://relay-rt.trycloudflare.com/".into(),
+            admission_origin: "https://admission-rt.trycloudflare.com/".into(),
+            acu_origin: "https://acu-rt.trycloudflare.com/".into(),
+            command_profile_sha256: cmd_digest,
+            original_policy_sha256: [12; 32],
+            original_policy_epoch: 1,
+            expires_unix: t + 1_800,
+            customer_custody_boundary: "CUSTOMER_ACU_AND_ARCHIVE_SHARED_HOST_UID".into(),
+        };
+        let deliv_bytes = serde_json::to_vec(&deliv_spec).unwrap();
+        let deliv_digest: [u8; 32] = Sha256::digest(&deliv_bytes).into();
+
+        let intent_spec = IntentSpec {
+            schema: "chinwag.ci-dispatch-intent.v1".into(),
+            repository: "emunlabs/chinwag".into(),
+            repository_id: 42,
+            source_commit: hex::encode([13; 20]),
+            workflow_ref:
+                "emunlabs/chinwag/.github/workflows/chinwag-core-ci-and-merge.yml@refs/heads/main"
+                    .into(),
+            workflow_commit: hex::encode([13; 20]),
+            recipient_instance: "WORKHORSE#runtime-test".into(),
+            delivery_profile_sha256: hex::encode(deliv_digest),
+            command_sha256: hex::encode(cmd_digest),
+            nonce: hex::encode([14; 32]),
+            expires_unix: t + 900,
+        };
+        let body = serde_json::to_string(&intent_spec).unwrap();
+        let id = "bus-runtime-test";
+        let sender = "WORKHORSE#runtime-test";
+        let to = "ADMISSION#runtime-test";
+        let room = "#eng";
+        let task = "CHWG-0267";
+        let key_hex = hex::encode(seat_sk.verifying_key().to_bytes());
+        let ts_str = t.to_string();
+        let signed = format!(
+            "chinwag-bus-sig-v2|{}",
+            [id, ts_str.as_str(), sender, to, room, task, body.as_str()]
+                .map(|s| format!("{}:{s}", s.len()))
+                .join("|")
+        );
+        let digest = hex::encode(Sha256::digest(
+            format!("chinwag-bus-v1|{t}|{room}|{sender}|{key_hex}|{to}|{task}|{body}").as_bytes(),
+        ));
+        let original = serde_json::json!({
+            "id": id,
+            "ts_unix": t,
+            "sender": sender,
+            "sender_endpoint_id": key_hex,
+            "to": to,
+            "room": room,
+            "task_id": task,
+            "body": body,
+            "digest_sha256": digest,
+            "pubkey_ed25519": key_hex,
+            "signature_ed25519": hex::encode(seat_sk.sign(signed.as_bytes()).to_bytes()),
+        });
+        let plan = Plan {
+            version: 1,
+            scope: Scope {
+                instance: sender.into(),
+                public_key: seat_sk.verifying_key().to_bytes(),
+                addressee: to.into(),
+                task_id: task.into(),
+                room: room.into(),
+            },
+            native_original: serde_json::to_string(&original).unwrap(),
+            command_profile: String::from_utf8(cmd_bytes).unwrap(),
+            delivery_profile: String::from_utf8(deliv_bytes).unwrap(),
+            expected_oidc_subject: "repo:emunlabs/chinwag:ref:refs/heads/main".into(),
+            bootstrap_hint: [15; 32],
+        };
+
+        // Valid Plan resolves both profiles() and delivery() cleanly:
+        let initial_profiles = plan.profiles().unwrap();
+        let signers = plan.pinned_seat_signers().unwrap();
+        let (empty_statements, empty_rev) = load_revocation_statements(None, &plan).unwrap();
+        assert!(empty_statements.is_empty());
+        assert!(
+            initial_profiles
+                .reverify_recipient_keys(&signers, &empty_rev, t)
+                .is_ok()
+        );
+        assert!(plan.delivery().is_ok());
+
+        // Mismatched scope.public_key causes Plan::delivery() to fail closed even without intent():
+        let mut wrong_pin_plan = plan.clone();
+        wrong_pin_plan.scope.public_key = ed(99);
+        assert!(wrong_pin_plan.delivery().is_err());
+
+        // Mid-flight live signed revocation update loaded via load_revocation_statements causes
+        // already-resolved BoundProfiles::reverify_recipient_keys AND fresh Plan resolution to refuse:
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+        let rev_path = canonical_dir.join("revocations.json");
+        let rev_raw =
+            sign_revocation_statement("WORKHORSE", 1, &["wh-runtime-psk-e1".into()], t, &seat_sk)
+                .unwrap();
+        let rev_struct: SignedRecipientKeyRevocation = serde_json::from_slice(&rev_raw).unwrap();
+        write_new(&rev_path, &serde_json::to_vec(&vec![rev_struct]).unwrap()).unwrap();
+
+        let (statements, loaded) = load_revocation_statements(Some(&rev_path), &plan).unwrap();
+        assert_eq!(statements.len(), 1);
+        assert!(
+            initial_profiles
+                .reverify_recipient_keys(&signers, &loaded, t)
+                .is_err()
+        );
+        assert!(plan.profiles_with_revocations(&loaded).is_err());
+        assert!(plan.delivery_with_revocations(&loaded).is_err());
+
+        // Forged / wrong-signer revocation statement in revocations file fails closed:
+        let bad_rev_path = canonical_dir.join("bad-revocations.json");
+        write_new(&bad_rev_path, &serde_json::to_vec(&statements).unwrap()).unwrap();
+        assert!(load_revocation_statements(Some(&bad_rev_path), &wrong_pin_plan).is_err());
+
+        // Challenge-bound admission-signed live revocation status (/v1/revocations) round-trips
+        // and rejects nonce replay, wrong admission signer, wrong intent digest, or stripped JSON:
+        let adm_secret = iroh::SecretKey::from_bytes(&[42_u8; 32]);
+        let adm_pin = *adm_secret.public().as_bytes();
+        let intent = plan.intent().unwrap();
+        let nonce = [77_u8; 32];
+        let signed_empty = crate::authorization::certify_revocation_status(
+            &intent,
+            nonce,
+            Vec::new(),
+            &adm_secret,
+        )
+        .unwrap();
+        let mut runner_rev = crate::recipient_key::VerifiedRevocationState::new();
+        assert!(
+            crate::authorization::verify_revocation_status(
+                &signed_empty,
+                adm_pin,
+                *intent.original_digest(),
+                &plan.scope.instance,
+                nonce,
+                &signers,
+                &mut runner_rev,
+            )
+            .is_ok()
+        );
+        // Replaying with a different challenge nonce fails closed:
+        assert!(
+            crate::authorization::verify_revocation_status(
+                &signed_empty,
+                adm_pin,
+                *intent.original_digest(),
+                &plan.scope.instance,
+                [78_u8; 32],
+                &signers,
+                &mut runner_rev,
+            )
+            .is_err()
+        );
+        // Wrong admission signer pin fails closed:
+        assert!(
+            crate::authorization::verify_revocation_status(
+                &signed_empty,
+                ed(91),
+                *intent.original_digest(),
+                &plan.scope.instance,
+                nonce,
+                &signers,
+                &mut runner_rev,
+            )
+            .is_err()
+        );
+        // Signed non-empty revocation status propagates into runner's grow-only state and refuses profiles:
+        let nonce2 = [79_u8; 32];
+        let signed_revoked = crate::authorization::certify_revocation_status(
+            &intent,
+            nonce2,
+            statements,
+            &adm_secret,
+        )
+        .unwrap();
+        assert!(
+            crate::authorization::verify_revocation_status(
+                &signed_revoked,
+                adm_pin,
+                *intent.original_digest(),
+                &plan.scope.instance,
+                nonce2,
+                &signers,
+                &mut runner_rev,
+            )
+            .is_ok()
+        );
+        assert!(
+            initial_profiles
+                .reverify_recipient_keys(&signers, &runner_rev, t)
+                .is_err()
+        );
+        // Even if a subsequent status returns empty statements, runner's grow-only state stays revoked:
+        let nonce3 = [80_u8; 32];
+        let signed_after = crate::authorization::certify_revocation_status(
+            &intent,
+            nonce3,
+            Vec::new(),
+            &adm_secret,
+        )
+        .unwrap();
+        assert!(
+            crate::authorization::verify_revocation_status(
+                &signed_after,
+                adm_pin,
+                *intent.original_digest(),
+                &plan.scope.instance,
+                nonce3,
+                &signers,
+                &mut runner_rev,
+            )
+            .is_ok()
+        );
+        assert!(
+            initial_profiles
+                .reverify_recipient_keys(&signers, &runner_rev, t)
+                .is_err()
+        );
+
+        // Repeated cumulative multi-entry snapshots `[r1(t1), r2(t2)]` (`t1 < t2`) for retired
+        // keys refresh idempotently across multiple runner phases without rejecting `r1(t1)`:
+        let r1: SignedRecipientKeyRevocation = serde_json::from_slice(
+            &sign_revocation_statement("WORKHORSE", 1, &["wh-retired-1".into()], t - 20, &seat_sk)
+                .unwrap(),
+        )
+        .unwrap();
+        let r2: SignedRecipientKeyRevocation = serde_json::from_slice(
+            &sign_revocation_statement("WORKHORSE", 1, &["wh-retired-2".into()], t - 10, &seat_sk)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut cumulative_rev = crate::recipient_key::VerifiedRevocationState::new();
+        for n in [[81_u8; 32], [82_u8; 32], [83_u8; 32]] {
+            let snap = crate::authorization::certify_revocation_status(
+                &intent,
+                n,
+                vec![r1.clone(), r2.clone()],
+                &adm_secret,
+            )
+            .unwrap();
+            assert!(
+                crate::authorization::verify_revocation_status(
+                    &snap,
+                    adm_pin,
+                    *intent.original_digest(),
+                    &plan.scope.instance,
+                    n,
+                    &signers,
+                    &mut cumulative_rev,
+                )
+                .is_ok()
+            );
+            assert!(
+                initial_profiles
+                    .reverify_recipient_keys(&signers, &cumulative_rev, t)
+                    .is_ok()
+            );
+        }
+
+        // ReadAuthorization::qualified_for_plan enforces live recipient revocations after ACU
+        // policy fetch (`current_until`), refusing wake/spawn/FIFO read once revoked:
+        let acu_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(acu_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let acu_canon = acu_dir.path().canonicalize().unwrap();
+        let acu_owner =
+            OwnerCustody::create_new(&acu_canon, crate::custody::OwnerRole::Acu, [55; 32], None)
+                .unwrap();
+        let acu_pin = match acu_owner.public_enrollment().unwrap() {
+            PublicEnrollment::Acu { signer, .. } => signer,
+            _ => unreachable!(),
+        };
+        let pol_spec = acu::PolicySpec {
+            version: 1,
+            epoch: 1,
+            issued_unix: t - 10,
+            expires_unix: t + 900,
+            active: true,
+            allow_recipient: true,
+            allow_archive: true,
+            repository_id: 42,
+            initiating_instance: plan.scope.instance.clone(),
+            key_pins_sha256: [33; 32],
+            recipient_store_id: [1; 32],
+            archive_store_id: [6; 32],
+            allowed_historical_envelopes: Vec::new(),
+        };
+        let pol_raw = acu_owner.sign_release_policy(&pol_spec).unwrap();
+        let cur_pol = acu::verify_current_policy(&pol_raw, acu_pin, t).unwrap();
+        let live_rev_path = canonical_dir.join("wake-live-revocations.json");
+        write_new(&live_rev_path, b"[]").unwrap();
+        let read_auth = crate::agent_read::ReadAuthorization::qualified_for_plan(
+            t + 600,
+            &cur_pol,
+            plan.clone(),
+            Some(live_rev_path.clone()),
+        );
+        let monotonic = tokio::time::Instant::now();
+        assert!(
+            read_auth
+                .current_until(
+                    &pol_raw,
+                    crate::agent_deadline::Sample::fixture(monotonic, t)
+                )
+                .is_ok()
+        );
+        let live_rev_tmp = canonical_dir.join("wake-live-revocations.tmp");
+        write_new(&live_rev_tmp, &std::fs::read(&rev_path).unwrap()).unwrap();
+        std::fs::rename(&live_rev_tmp, &live_rev_path).unwrap();
+        assert!(
+            read_auth
+                .current_until(
+                    &pol_raw,
+                    crate::agent_deadline::Sample::fixture(monotonic, t)
+                )
+                .is_err()
+        );
+
+        // Profile carrying an older embedded revocation `r1(t1)` composes cleanly with a
+        // newer live external revocation snapshot containing only `r2(t2)` (`t2 > t1`) when
+        // both revoke retired keys and the active profile keys remain valid:
+        let mut deliv_with_r1 = deliv_spec.clone();
+        deliv_with_r1.recipient_key_revocations = vec![r1];
+        let deliv_with_r1_bytes = serde_json::to_vec(&deliv_with_r1).unwrap();
+        let parsed_deliv_with_r1 = DeliveryProfile::parse(&deliv_with_r1_bytes).unwrap();
+        let mut newer_external_only = crate::recipient_key::VerifiedRevocationState::new();
+        newer_external_only
+            .ingest_signed_revocation_struct(&r2, &signers)
+            .unwrap();
+        assert!(
+            parsed_deliv_with_r1
+                .verify_authenticated_recipient_keys(&signers, &newer_external_only, t)
+                .is_ok()
+        );
     }
 }

@@ -70,6 +70,7 @@ pub struct VerifiedIntent {
     original_id: String,
     original_digest: [u8; 32],
     initiating_instance: String,
+    initiator_public_key: [u8; 32],
     issued_unix: u64,
 }
 
@@ -89,6 +90,11 @@ impl VerifiedIntent {
     pub fn initiating_instance(&self) -> &str {
         &self.initiating_instance
     }
+
+    pub fn initiator_public_key(&self) -> [u8; 32] {
+        self.initiator_public_key
+    }
+
     pub fn issued_unix(&self) -> u64 {
         self.issued_unix
     }
@@ -271,6 +277,7 @@ pub fn verify_original(
         original_id: original.id,
         original_digest: digest,
         initiating_instance: original.sender,
+        initiator_public_key: expected.initiator_public_key,
         issued_unix: original.ts_unix,
     })
 }

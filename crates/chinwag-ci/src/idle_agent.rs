@@ -408,6 +408,7 @@ pub async fn enroll(config: &Path) -> Result<(), IdleAgentError> {
 
 pub(crate) struct QualifiedWake<'a> {
     pub plan: &'a Plan,
+    pub recipient_revocations: Option<&'a Path>,
     pub envelope: &'a AdmissionBoundEnvelope,
     pub verified: &'a VerifiedCapture,
     pub plaintext: &'a [u8],
@@ -607,13 +608,18 @@ pub(crate) async fn wake(config: &Path, q: QualifiedWake<'_>) -> Result<(), Idle
     let idle: IdleReceipt = checked(store.read(WakePhase::Idle))?;
     binding(&c, &idle, &q)?;
     let before = unchanged(&c).await?;
-    let delivery = checked(q.plan.delivery())?;
+    let wake_revocations = checked(runtime::load_revocations(q.recipient_revocations, q.plan))?;
+    let delivery = checked(q.plan.delivery_with_revocations(&wake_revocations))?;
     let authority_until = checked(
         q.read_authorization
             .current(&delivery.spec().acu_origin)
             .await,
     )?
     .min(q.budget.work_until);
+    // Reverify recipient revocations synchronously after the ACU policy await,
+    // immediately before recording durable wake reservation.
+    let post_acu_revocations = checked(runtime::load_revocations(q.recipient_revocations, q.plan))?;
+    let _ = checked(q.plan.delivery_with_revocations(&post_acu_revocations))?;
     let reservation = serde_json::json!({
         "classification":"WAKE_RESERVED_NOT_STARTED","configuration_sha256":c.digest()?,
         "generation":c.generation,"session_id":idle.session_id,
@@ -629,6 +635,9 @@ pub(crate) async fn wake(config: &Path, q: QualifiedWake<'_>) -> Result<(), Idle
     c.validate()?;
     binding(&c, &idle, &q)?;
     unchanged(&c).await?;
+    let pre_launch_revocations =
+        checked(runtime::load_revocations(q.recipient_revocations, q.plan))?;
+    let _ = checked(q.plan.delivery_with_revocations(&pre_launch_revocations))?;
     let listener = checked(crate::agent_read::ScopedPipes::bind(
         &c.reader_directory,
         &c.route.workspace,
@@ -674,7 +683,14 @@ pub(crate) async fn wake(config: &Path, q: QualifiedWake<'_>) -> Result<(), Idle
     let (failed_tx, mut failed_rx) = tokio::sync::watch::channel(false);
     let agent = async {
         let r=agent_process::run_prepared(prepared,prompt,work_until,
-            async { q.read_authorization.current(&delivery.spec().acu_origin).await.map_err(|_| agent_process::AgentRouteError) },
+            async {
+                let until = q.read_authorization.current(&delivery.spec().acu_origin).await.map_err(|_| agent_process::AgentRouteError)?;
+                // Reload and verify recipient revocations synchronously AFTER the ACU
+                // policy await so zero awaits occur before spawn or prompt delivery.
+                let rev = runtime::load_revocations(q.recipient_revocations, q.plan).map_err(|_| agent_process::AgentRouteError)?;
+                q.plan.delivery_with_revocations(&rev).map_err(|_| agent_process::AgentRouteError)?;
+                Ok(until)
+            },
             |pid|{
                 store.record(WakePhase::Started,&serde_json::json!({
                     "classification":"ORIGINAL_AGENT_CHILD_STARTED_PROMPT_NOT_YET_SENT",

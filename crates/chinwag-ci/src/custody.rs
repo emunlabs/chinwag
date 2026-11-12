@@ -10,7 +10,7 @@
 use crate::{
     envelope::{
         AcuGateKey, AuthenticatedEnvelope, Destination, DestinationKey, EnvelopeError, GateSecret,
-        ResponseKey, WrappedSecret,
+        KemPublicKey, ResponseKey, WrappedSecret,
     },
     receipt::{ReceiptError, ReceiptSigner, VerifiedStorageReceipt},
     storage::CiphertextStore,
@@ -78,8 +78,8 @@ pub struct PublicDestination {
     pub role: Destination,
     pub store_id: [u8; 32],
     pub store_binding: [u8; 32],
-    pub psk: [u8; 32],
-    pub response_base: [u8; 32],
+    pub psk: KemPublicKey,
+    pub response_base: KemPublicKey,
     pub receipt_signer: [u8; 32],
     /// Explicit dual-purpose enrollment of the same owner signing identity.
     /// Release requests and storage receipts use distinct signature domains
@@ -92,7 +92,7 @@ pub struct PublicDestination {
 pub enum PublicEnrollment {
     Destination(PublicDestination),
     Acu {
-        gate_base: [u8; 32],
+        gate_base: KemPublicKey,
         signer: [u8; 32],
     },
     Admission {
@@ -414,10 +414,10 @@ impl OwnerCustody {
         else {
             return Err(crate::acu::AcuError::Rejected);
         };
-        if response.public()
+        if &response.public()
             != match role {
-                Destination::Recipient => envelope.key_pins().recipient_response_base,
-                Destination::Archive => envelope.key_pins().archive_response_base,
+                Destination::Recipient => &envelope.key_pins().recipient_response_base,
+                Destination::Archive => &envelope.key_pins().archive_response_base,
             }
         {
             return Err(crate::acu::AcuError::Rejected);
@@ -472,6 +472,21 @@ impl OwnerCustody {
             return Err(CustodyError::Role);
         };
         crate::authorization::certify(admission, signer).map_err(|_| CustodyError::Held)
+    }
+    /// Certifies a challenge-bound live recipient-revocation snapshot for this
+    /// admitted plan's exact intent and initiating seat.
+    pub fn certify_revocation_status(
+        &self,
+        intent: &crate::intent::VerifiedIntent,
+        nonce: [u8; 32],
+        statements: Vec<crate::recipient_key::SignedRecipientKeyRevocation>,
+    ) -> Result<Vec<u8>, CustodyError> {
+        self.guard.check()?;
+        let Keys::Admission { signer } = &self.keys else {
+            return Err(CustodyError::Role);
+        };
+        crate::authorization::certify_revocation_status(intent, nonce, statements, signer)
+            .map_err(|_| CustodyError::Held)
     }
     fn assemble(
         guard: Arc<Guard>,
@@ -924,11 +939,11 @@ mod tests {
             panic!("ACU enrollment")
         };
         let keys = KeyPins {
-            acu_gate_base: *gate_base,
-            recipient_psk: r.psk,
-            archive_psk: a.psk,
-            recipient_response_base: r.response_base,
-            archive_response_base: a.response_base,
+            acu_gate_base: gate_base.clone(),
+            recipient_psk: r.psk.clone(),
+            archive_psk: a.psk.clone(),
+            recipient_response_base: r.response_base.clone(),
+            archive_response_base: a.response_base.clone(),
             acu_signer: *signer,
             recipient_receipt_signer: r.receipt_signer,
             archive_receipt_signer: a.receipt_signer,
