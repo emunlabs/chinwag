@@ -253,6 +253,71 @@ fn allowed_signers_bijection_enrollment_rotation_and_revocation_enforced() {
         verify_signed_recipient_key(&signed_k1, &signers, registry.revocation_state(), 2_200)
             .is_err()
     );
+
+    // Revoking active K2 (epoch 2) with min_valid_epoch = 1 evicts K2 AND strictly
+    // advances the slot's monotonic epoch floor so re-enrolling a fresh K3 at epoch 2
+    // or with a backdated issued_unix (< 2_100) is REFUSED, whereas epoch 3 succeeds!
+    let rev_k2 = sign_revocation_statement(
+        "WORKHORSE",
+        1,
+        &["wh-hpke-2026-e2".to_string()],
+        2_250,
+        &workhorse_sk,
+    )
+    .unwrap();
+    registry
+        .ingest_signed_revocation(&rev_k2, &signers)
+        .unwrap();
+    assert!(
+        registry
+            .active_key("WORKHORSE", RecipientKeyPurpose::CwcardOfflineBase)
+            .is_none()
+    );
+
+    let recip_k3_reused_epoch = RecipientDecryptionKey::generate(
+        "WORKHORSE",
+        "wh-hpke-2026-e2-retry",
+        2,
+        RecipientKeyPurpose::CwcardOfflineBase,
+    )
+    .unwrap();
+    let signed_k3_reused_epoch = recip_k3_reused_epoch
+        .sign_enrollment(&workhorse_sk, 2_300, 15_000)
+        .unwrap();
+    assert!(
+        registry
+            .enroll(&signed_k3_reused_epoch, &signers, 2_300)
+            .is_err()
+    );
+
+    let recip_k3_backdated = RecipientDecryptionKey::generate(
+        "WORKHORSE",
+        "wh-hpke-2026-e3-backdated",
+        3,
+        RecipientKeyPurpose::CwcardOfflineBase,
+    )
+    .unwrap();
+    let signed_k3_backdated = recip_k3_backdated
+        .sign_enrollment(&workhorse_sk, 2_050, 15_000)
+        .unwrap();
+    assert!(
+        registry
+            .enroll(&signed_k3_backdated, &signers, 2_300)
+            .is_err()
+    );
+
+    let recip_k3 = RecipientDecryptionKey::generate(
+        "WORKHORSE",
+        "wh-hpke-2026-e3",
+        3,
+        RecipientKeyPurpose::CwcardOfflineBase,
+    )
+    .unwrap();
+    let signed_k3 = recip_k3
+        .sign_enrollment(&workhorse_sk, 2_300, 15_000)
+        .unwrap();
+    let verified_k3 = registry.enroll(&signed_k3, &signers, 2_300).unwrap();
+    assert_eq!(verified_k3.epoch(), 3);
 }
 
 fn sign_raw_descriptor_for_negative_test(
@@ -659,6 +724,9 @@ fn enterprise_acu_gated_x25519_mlkem768_composes_with_allowed_signers_and_legacy
         repository_id: 42,
         initiating_instance: "WORKHORSE#acu-pq-instance".into(),
         recipient: r_dest,
+        recipient_psk_binding: Some(serde_json::from_slice(&psk_binding).unwrap()),
+        recipient_response_base_binding: Some(serde_json::from_slice(&response_binding).unwrap()),
+        recipient_key_revocations: Vec::new(),
         archive: a_dest,
         acu_gate_base: gate_base,
         acu_signer,
@@ -812,6 +880,9 @@ fn enterprise_acu_gated_x25519_mlkem768_composes_with_allowed_signers_and_legacy
     };
     let legacy_spec = DeliveryProfileSpec {
         recipient: legacy_r,
+        recipient_psk_binding: None,
+        recipient_response_base_binding: None,
+        recipient_key_revocations: Vec::new(),
         archive: legacy_a.clone(),
         acu_gate_base: AcuGateKey::generate_legacy_x25519().unwrap().public(),
         acu_signer: ed(45),

@@ -218,6 +218,18 @@ impl VerifiedRevocationState {
     ) -> Result<(), RecipientKeyError> {
         let signed: SignedRecipientKeyRevocation =
             parse_canonical(bytes, MAX_SIGNED_REVOCATION_BYTES)?;
+        self.ingest_signed_revocation_struct(&signed, signers)
+    }
+
+    pub(crate) fn ingest_signed_revocation_struct(
+        &mut self,
+        signed: &SignedRecipientKeyRevocation,
+        signers: &SeatSignerDirectory,
+    ) -> Result<(), RecipientKeyError> {
+        let reencoded = serde_json::to_vec(signed).map_err(|_| RecipientKeyError::Rejected)?;
+        if reencoded.is_empty() || reencoded.len() > MAX_SIGNED_REVOCATION_BYTES {
+            return Err(RecipientKeyError::Rejected);
+        }
         let s = &signed.statement;
         if s.schema != RECIPIENT_REVOCATION_SCHEMA_V1
             || s.version != 1
@@ -404,7 +416,7 @@ fn revocation_signing_bytes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn sign_public_key_enrollment(
+pub fn sign_public_key_enrollment_descriptor(
     seat: &str,
     kid: &str,
     epoch: u64,
@@ -413,7 +425,7 @@ pub fn sign_public_key_enrollment(
     issued_unix: u64,
     expires_unix: u64,
     signer: &SigningKey,
-) -> Result<Vec<u8>, RecipientKeyError> {
+) -> Result<SignedRecipientKey, RecipientKeyError> {
     if !valid_seat(seat)
         || !valid_kid(kid)
         || epoch == 0
@@ -448,11 +460,34 @@ pub fn sign_public_key_enrollment(
         revoked: false,
     };
     let sig = signer.sign(&descriptor_signing_bytes(&descriptor)?);
-    serde_json::to_vec(&SignedRecipientKey {
+    Ok(SignedRecipientKey {
         descriptor,
         signature_hex: hex::encode(sig.to_bytes()),
     })
-    .map_err(|_| RecipientKeyError::Rejected)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sign_public_key_enrollment(
+    seat: &str,
+    kid: &str,
+    epoch: u64,
+    purpose: RecipientKeyPurpose,
+    public_key: &KemPublicKey,
+    issued_unix: u64,
+    expires_unix: u64,
+    signer: &SigningKey,
+) -> Result<Vec<u8>, RecipientKeyError> {
+    let signed = sign_public_key_enrollment_descriptor(
+        seat,
+        kid,
+        epoch,
+        purpose,
+        public_key,
+        issued_unix,
+        expires_unix,
+        signer,
+    )?;
+    serde_json::to_vec(&signed).map_err(|_| RecipientKeyError::Rejected)
 }
 
 pub fn sign_revocation_statement(
@@ -506,6 +541,19 @@ pub fn verify_signed_recipient_key(
     now_unix: u64,
 ) -> Result<VerifiedRecipientKey, RecipientKeyError> {
     let signed: SignedRecipientKey = parse_canonical(bytes, MAX_SIGNED_KEY_BYTES)?;
+    verify_signed_recipient_key_struct(&signed, signers, revocations, Some(now_unix))
+}
+
+pub(crate) fn verify_signed_recipient_key_struct(
+    signed: &SignedRecipientKey,
+    signers: &SeatSignerDirectory,
+    revocations: &VerifiedRevocationState,
+    now_unix: Option<u64>,
+) -> Result<VerifiedRecipientKey, RecipientKeyError> {
+    let reencoded = serde_json::to_vec(signed).map_err(|_| RecipientKeyError::Rejected)?;
+    if reencoded.is_empty() || reencoded.len() > MAX_SIGNED_KEY_BYTES {
+        return Err(RecipientKeyError::Rejected);
+    }
     let d = &signed.descriptor;
     if d.schema != RECIPIENT_KEY_SCHEMA_V1
         || d.version != 1
@@ -541,23 +589,28 @@ pub fn verify_signed_recipient_key(
     if d.revoked || revocations.is_revoked_for_purpose(&d.seat, d.purpose, &d.kid, d.epoch) {
         return Err(RecipientKeyError::Revoked);
     }
-    if now_unix < d.issued_unix || now_unix >= d.expires_unix {
+    if let Some(now) = now_unix
+        && (now < d.issued_unix || now >= d.expires_unix)
+    {
         return Err(RecipientKeyError::Lifetime);
     }
     let public_key_sha256 = public_key.sha256();
     Ok(VerifiedRecipientKey {
-        descriptor: signed.descriptor,
+        descriptor: signed.descriptor.clone(),
         public_key,
         public_key_sha256,
     })
 }
 
 /// Stateful registry enforcing initial enrollment, strict monotonic epoch
-/// rotation (distinct `kid`, distinct `KemPublicKey`, strictly advancing `epoch`),
-/// and automatic supersession of prior epochs in `VerifiedRevocationState`.
+/// rotation (distinct `kid`, distinct `KemPublicKey`, strictly advancing `epoch`
+/// even across active-key revocations), and automatic supersession of prior
+/// epochs in `VerifiedRevocationState`.
 #[derive(Default)]
 pub struct RecipientKeyRegistry {
     active: BTreeMap<(String, RecipientKeyPurpose), VerifiedRecipientKey>,
+    highest_epoch: BTreeMap<(String, RecipientKeyPurpose), u64>,
+    latest_issued_unix: BTreeMap<(String, RecipientKeyPurpose), u64>,
     seen_kids: BTreeMap<String, BTreeSet<String>>,
     seen_pubkeys: Vec<[u8; 32]>,
     revocations: VerifiedRevocationState,
@@ -576,7 +629,13 @@ impl RecipientKeyRegistry {
     ) -> Result<VerifiedRecipientKey, RecipientKeyError> {
         let verified = verify_signed_recipient_key(bytes, signers, &self.revocations, now_unix)?;
         let slot = (verified.seat().to_owned(), verified.purpose());
-        if self.active.contains_key(&slot) || self.has_seen_kid_or_pubkey(&verified) {
+        let prev_epoch = self.highest_epoch.get(&slot).copied().unwrap_or(0);
+        let prev_issued = self.latest_issued_unix.get(&slot).copied().unwrap_or(0);
+        if self.active.contains_key(&slot)
+            || verified.epoch() <= prev_epoch
+            || verified.issued_unix() < prev_issued
+            || self.has_seen_kid_or_pubkey(&verified)
+        {
             return Err(RecipientKeyError::Rejected);
         }
         self.record_seen(&verified);
@@ -595,8 +654,18 @@ impl RecipientKeyRegistry {
         let Some(prev) = self.active.get(&slot) else {
             return Err(RecipientKeyError::Rejected);
         };
-        if verified.epoch() <= prev.epoch()
-            || verified.issued_unix() < prev.issued_unix()
+        let prev_epoch = self
+            .highest_epoch
+            .get(&slot)
+            .copied()
+            .unwrap_or(prev.epoch());
+        let prev_issued = self
+            .latest_issued_unix
+            .get(&slot)
+            .copied()
+            .unwrap_or(prev.issued_unix());
+        if verified.epoch() <= prev_epoch
+            || verified.issued_unix() < prev_issued
             || verified.kid() == prev.kid()
             || verified.public_key() == prev.public_key()
             || self.has_seen_kid_or_pubkey(&verified)
@@ -621,10 +690,31 @@ impl RecipientKeyRegistry {
         signers: &SeatSignerDirectory,
     ) -> Result<(), RecipientKeyError> {
         self.revocations.ingest_signed_revocation(bytes, signers)?;
-        let revocations = &self.revocations;
-        self.active.retain(|_, key| {
-            !revocations.is_revoked_for_purpose(key.seat(), key.purpose(), key.kid(), key.epoch())
-        });
+        let evicted: Vec<(String, RecipientKeyPurpose, String, u64)> = self
+            .active
+            .values()
+            .filter(|key| {
+                self.revocations.is_revoked_for_purpose(
+                    key.seat(),
+                    key.purpose(),
+                    key.kid(),
+                    key.epoch(),
+                )
+            })
+            .map(|key| {
+                (
+                    key.seat().to_owned(),
+                    key.purpose(),
+                    key.kid().to_owned(),
+                    key.epoch(),
+                )
+            })
+            .collect();
+        for (seat, purpose, kid, epoch) in evicted {
+            self.revocations
+                .record_superseded_key(&seat, purpose, &kid, epoch.saturating_add(1));
+            self.active.remove(&(seat, purpose));
+        }
         Ok(())
     }
 
@@ -661,6 +751,15 @@ impl RecipientKeyRegistry {
     }
 
     fn record_seen(&mut self, verified: &VerifiedRecipientKey) {
+        let slot = (verified.seat().to_owned(), verified.purpose());
+        self.highest_epoch
+            .entry(slot.clone())
+            .and_modify(|e| *e = (*e).max(verified.epoch()))
+            .or_insert(verified.epoch());
+        self.latest_issued_unix
+            .entry(slot)
+            .and_modify(|t| *t = (*t).max(verified.issued_unix()))
+            .or_insert(verified.issued_unix());
         self.seen_kids
             .entry(verified.seat().to_owned())
             .or_default()
