@@ -75,6 +75,11 @@ impl LsssMatrix {
                 if !is_valid_seat_id(seat_id) {
                     return Err(AcuError::InvalidSeatId);
                 }
+                if out_rows.len() >= MAX_SERIALIZED_ROWS {
+                    return Err(AcuError::SerializationError(
+                        "invalid AcuCiphertext dimensions",
+                    ));
+                }
                 out_rows.push((seat_id.clone(), parent_vec));
                 Ok(())
             }
@@ -126,7 +131,12 @@ impl LsssMatrix {
         // Pad parent's label vector with zeros up to the current global column count `c`.
         parent_vec.resize(*cols, Scalar::ZERO);
         let extra_cols = threshold - 1;
-        *cols += extra_cols;
+        *cols = cols
+            .checked_add(extra_cols)
+            .filter(|&c| c <= MAX_SERIALIZED_COLS)
+            .ok_or(AcuError::SerializationError(
+                "invalid AcuCiphertext dimensions",
+            ))?;
 
         for (idx, child) in children.iter().enumerate() {
             let x = Scalar::from((idx + 1) as u64);
@@ -161,6 +171,9 @@ impl LsssMatrix {
                     expected: self.cols,
                     actual: row.len(),
                 });
+            }
+            if row.iter().all(|s| bool::from(s.is_zero())) {
+                return Err(AcuError::InvalidAccessTree("LSSS row cannot be all zero"));
             }
         }
         Ok(())

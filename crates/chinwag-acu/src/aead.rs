@@ -46,7 +46,7 @@ pub(crate) fn is_valid_metadata_token(value: &str) -> bool {
 /// target-group secret $K \in \mathbb{G}_T$, the [`AcuCiphertext`] header can dynamically
 /// evolve its access policy across epochs (`insert_key`, `insert_sibling_key`, `escalate_threshold`,
 /// `revoke_and_rerandomize`) by the ACU operator without ever decrypting or re-encrypting `aead_ciphertext`,
-/// while keeping the basis commitments $V_0, \dots, V_{k-1}$ sealed exclusively under `pk_ACU`.
+/// while keeping the basis commitments $V_0, \dots, V_{k-1}$ and row scalars sealed exclusively under `pk_ACU`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedCiPayload {
     /// Dynamic ACU header (`CHWGACU2`) encapsulating $K \in \mathbb{G}_T$.

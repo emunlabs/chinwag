@@ -1,18 +1,29 @@
 // Copyright (c) 2026 Emun Labs, Inc. (1401 Lavaca St STE 81335, Austin, TX 78701)
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pairing-based Access Control Unit (`ACU`) core encryption, partial decryption, share verification,
-//! combiner, deterministic `CHWGACU2` binary serialization with ACU-sealed basis commitments, and all 4
-//! dynamic policy evolution operations (`insert_key`, `insert_sibling_key`, `escalate_threshold`,
-//! and `revoke_and_rerandomize`).
+//! Pairing-based Access Control Unit (`ACU`) core encryption, partial decryption, Chaum–Pedersen
+//! DLEQ share verification across $(\mathbb{G}_1, \mathbb{G}_T)$, combiner, deterministic `CHWGACU2`
+//! binary serialization with ACU-sealed basis commitments + row randomness scalars, and all 4 dynamic
+//! policy evolution operations (`insert_key`, `insert_sibling_key`, `escalate_threshold`, and
+//! `revoke_and_rerandomize`).
 //!
 //! Dynamic policy evolution mechanics are derived from the pairing-based DASTE paper:
 //! *Decentralized Ad-Hoc Access-Structured Threshold Encryption with Dynamic Policy Evolution*
-//! (ePrint 2026/1141), hardened for Chinwag (`CHWG-0271`) so basis commitments
-//! $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ (including $V_0 = g_1^s$) are **sealed exclusively
-//! under the ACU operator's key (`pk_ACU`)** via ephemeral `BLS12-381` $\mathbb{G}_1$ KEM +
-//! `HKDF-SHA256` + `ChaCha20-Poly1305` bound via injective binary AAD to `policy_epoch`,
-//! `acu_seat_id`, `c0_g1`, and the LSSS matrix/rows.
+//! (ePrint 2026/1141), hardened under SXDH on `BLS12-381` for Chinwag (`CHWG-0271`):
+//! 1. **Zero $\mathbb{G}_2$ Secret-Key / Row-Randomness Leakage (`[P0-R2-1]` Fix):**
+//!    Seat public keys (`pk_1 = g_1^{sk}`) and row ciphertexts `(c_1 = g_1^{\lambda_j} + pk_1^{r_j}, c_3 = g_1^{r_j})`
+//!    live strictly in $\mathbb{G}_1$, preserving Decisional Diffie–Hellman in $\mathbb{G}_1$ so no passive
+//!    observer can use the pairing as an unmasking oracle.
+//! 2. **Chaum–Pedersen NIZK DLEQ Share Verification across $(\mathbb{G}_1, \mathbb{G}_T)$:**
+//!    Each partial decryption share $D_j = e(c_{j,1} - c_{j,3} \cdot sk_j, g_2) = e(g_1, g_2)^{\lambda_j} \in \mathbb{G}_T$
+//!    carries a Fiat–Shamir Chaum–Pedersen DLEQ proof $(c, z)$ proving
+//!    $\log_{g_1}(pk_{j,1}) = \log_{e(c_{j,3}, g_2)}(e(c_{j,1}, g_2) - D_j)$ without exposing $g_2^{sk_j}$
+//!    or cleartext basis commitments.
+//! 3. **ACU-Sealed Basis Commitments & Algebraic Row Witnesses (`[P1-R2-2]` Fix):**
+//!    Both $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ (including $V_0 = g_1^s$) and cumulative row
+//!    randomness scalars $r_0, \dots, r_{\ell-1} \in (\mathbb{F}_r^*)^\ell$ are sealed exclusively under
+//!    `pk_ACU` via ephemeral `BLS12-381` $\mathbb{G}_1$ KEM + `HKDF-SHA256` + `ChaCha20-Poly1305` with
+//!    injective binary AAD and verified algebraically against `ct.rows` on every unseal.
 
 use crate::AcuError;
 use crate::keys::{
@@ -22,14 +33,15 @@ use crate::lsss::{
     LsssMatrix, MAX_SERIALIZED_COLS, MAX_SERIALIZED_ROWS, find_reconstruction_weights,
     submatrix_rank,
 };
-use bls12_381::{G1Affine, G1Projective, G2Affine, G2Projective, Gt, Scalar, pairing};
+use bls12_381::{G1Affine, G1Projective, G2Affine, Gt, Scalar, pairing};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ff::Field;
 use hkdf::Hkdf;
 use rand_core::{CryptoRng, RngCore};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 const LEGACY_ACU_CT_MAGIC: &[u8; 8] = b"CHWGACU1";
@@ -38,28 +50,42 @@ const BASIS_SEAL_HKDF_SALT: &[u8] = b"chinwag-acu/v2/basis-seal-hkdf-salt";
 const BASIS_SEAL_HKDF_INFO: &[u8] = b"chinwag-acu/v2/basis-seal-chacha20poly1305-key";
 const BASIS_SEAL_AAD_DOMAIN: &[u8] = b"chinwag-acu/v2/basis-seal-aad";
 
+const DLEQ_NONCE_SALT: &[u8] = b"chinwag-acu/v2/partial-share-dleq-nonce-salt";
+const DLEQ_NONCE_INFO: &[u8] = b"chinwag-acu/v2/partial-share-dleq-nonce-wide";
+const DLEQ_CHALLENGE_DOMAIN: &[u8] = b"chinwag-acu/v2/partial-share-dleq-challenge";
+const DLEQ_CHALLENGE_SALT: &[u8] = b"chinwag-acu/v2/partial-share-dleq-challenge-salt";
+const DLEQ_CHALLENGE_INFO: &[u8] = b"chinwag-acu/v2/partial-share-dleq-challenge-wide";
+
 const G1_COMPRESSED_BYTES: usize = 48;
-const G2_COMPRESSED_BYTES: usize = 96;
+const SCALAR_BYTES: usize = 32;
 const POLY1305_TAG_BYTES: usize = 16;
 
-/// RAII wrapper zeroizing transient $\mathbb{G}_1$ basis commitment vectors on drop across all exit paths.
-struct ZeroizeG1Vec(Vec<G1Projective>);
+/// RAII wrapper zeroizing transient $\mathbb{G}_1$ basis commitments and $\mathbb{F}_r$ row scalars on drop.
+struct UnsealedBasisState {
+    basis: Vec<G1Projective>,
+    row_scalars: Vec<Scalar>,
+}
 
-impl Drop for ZeroizeG1Vec {
+impl Drop for UnsealedBasisState {
     fn drop(&mut self) {
-        for elem in &mut self.0 {
+        for elem in &mut self.basis {
             elem.zeroize();
+        }
+        for scalar in &mut self.row_scalars {
+            scalar.zeroize();
         }
     }
 }
 
-/// Basis commitments $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ (where $V_0 = g_1^s$)
-/// encrypted exclusively to the ACU operator's BLS12-381 public key (`pk_ACU`) via
-/// ephemeral `BLS12-381` $\mathbb{G}_1$ KEM + `HKDF-SHA256` + `ChaCha20-Poly1305`.
+/// Basis commitments $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ (where $V_0 = g_1^s$) and cumulative
+/// row randomness scalars $r_0, \dots, r_{\ell-1} \in (\mathbb{F}_r^*)^\ell$ encrypted exclusively
+/// to the ACU operator's BLS12-381 $\mathbb{G}_1$ public key (`pk_ACU`) via ephemeral `BLS12-381`
+/// $\mathbb{G}_1$ KEM + `HKDF-SHA256` + `ChaCha20-Poly1305`.
 ///
-/// Bound via injective binary AAD to `policy_epoch`, `acu_seat_id`, `cols`, `c0_g1`, and the
-/// full LSSS matrix and row ciphertexts so untrusted relays, storage buckets, and single-branch
-/// holders never observe cleartext $V_0 = g_1^s$ and cannot maul policy headers across epochs.
+/// Bound via injective binary AAD to `policy_epoch`, `acu_seat_id`, `cols`, `num_rows`, `c0_g1`,
+/// and the full LSSS matrix and row ciphertexts, and algebraically verified against `ct.rows` upon
+/// unsealing so untrusted relays, storage buckets, and unauthorized seats never observe cleartext
+/// $V_0 = g_1^s$ and cannot forge synthetic cut-and-paste ciphertexts against `CisoAcuFatClient`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedBasisCommitments {
     /// Canonical seat identifier of the ACU operator whose `pk_ACU` seals these commitments.
@@ -68,11 +94,11 @@ pub struct SealedBasisCommitments {
     pub ephemeral_pk1: G1Projective,
     /// 96-bit ChaCha20-Poly1305 nonce.
     pub nonce: [u8; 12],
-    /// ChaCha20-Poly1305 ciphertext + 16-byte Poly1305 tag encrypting $48 \cdot k$ compressed $\mathbb{G}_1$ bytes.
+    /// ChaCha20-Poly1305 ciphertext + 16-byte Poly1305 tag encrypting $48 \cdot k + 32 \cdot \ell$ bytes.
     pub ciphertext: Vec<u8>,
 }
 
-/// A single row of an [`AcuCiphertext`] bound to recipient seat `seat_id`.
+/// A single row of an [`AcuCiphertext`] bound to recipient seat `seat_id` in $\mathbb{G}_1$.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiphertextRow {
     /// Zero-based row index inside [`AcuCiphertext::rows`].
@@ -81,17 +107,15 @@ pub struct CiphertextRow {
     pub seat_id: String,
     /// LSSS matrix row vector $M_j \in \mathbb{F}_r^k$.
     pub matrix_row: Vec<Scalar>,
-    /// Share ciphertext component $c_{j,1} = g_1^{\lambda_j} \cdot pk_{\rho(j),1}^{r_j} \in \mathbb{G}_1$.
+    /// Share ciphertext component $c_{j,1} = g_1^{\lambda_j} + pk_{\rho(j),1}^{r_j} \in \mathbb{G}_1$.
     pub c1: G1Projective,
-    /// Ephemeral randomness component $c_{j,2} = g_2^{r_j} \in \mathbb{G}_2$.
-    pub c2: G2Projective,
-    /// Ephemeral randomness witness $c_{j,3} = g_1^{r_j} \in \mathbb{G}_1$.
+    /// Ephemeral randomness component $c_{j,3} = g_1^{r_j} \in \mathbb{G}_1^*$.
     pub c3: G1Projective,
 }
 
 /// Pairing-based ACU header ciphertext (`CHWGACU2`) supporting in-place dynamic policy evolution
 /// by the ACU operator without decrypting $c_0$ or exposing cleartext basis commitments $V_m = g_1^{v_m}$
-/// on the wire or to untrusted relays/buckets.
+/// or $\mathbb{G}_2$ blinding witnesses on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcuCiphertext {
     /// Monotonically increasing policy epoch counter (starts at `1` upon initial encryption).
@@ -102,7 +126,8 @@ pub struct AcuCiphertext {
     pub c0_g1: G1Projective,
     /// Masked target-group payload key $c_0 = K + e(g_1, g_2)^s \in \mathbb{G}_T$.
     pub c0: Gt,
-    /// Basis commitments $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ sealed exclusively under `pk_ACU`.
+    /// Basis commitments $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ and row scalars $r_0, \dots, r_{\ell-1}$
+    /// sealed exclusively under `pk_ACU`.
     pub sealed_basis: SealedBasisCommitments,
     /// Current LSSS policy matrix $(M, \rho)$ over $\mathbb{F}_r$.
     pub matrix: LsssMatrix,
@@ -139,9 +164,8 @@ impl AcuCiphertext {
     }
 
     /// Serialize this [`AcuCiphertext`] into a deterministic, self-framing binary format
-    /// (`CHWGACU2`) using canonical Zcash/IETF compressed BLS12-381 points (`48` bytes for $\mathbb{G}_1$,
-    /// `96` bytes for $\mathbb{G}_2$), `32`-byte little-endian $\mathbb{F}_r$ scalars, and
-    /// ACU-sealed basis commitments (`SealedBasisCommitments`).
+    /// (`CHWGACU2`) using canonical Zcash/IETF compressed BLS12-381 $\mathbb{G}_1$ points (`48` bytes),
+    /// `32`-byte little-endian $\mathbb{F}_r$ scalars, and ACU-sealed basis commitments + row scalars.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -168,7 +192,6 @@ impl AcuCiphertext {
                 out.extend_from_slice(&scalar.to_bytes());
             }
             out.extend_from_slice(&G1Affine::from(row.c1).to_compressed());
-            out.extend_from_slice(&G2Affine::from(row.c2).to_compressed());
             out.extend_from_slice(&G1Affine::from(row.c3).to_compressed());
         }
         out
@@ -222,7 +245,7 @@ impl AcuCiphertext {
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(nonce_slice);
 
-        let expected_sealed_len = expected_sealed_basis_len(cols)?;
+        let expected_sealed_len = expected_sealed_basis_len(cols, num_rows)?;
         let sealed_ct_len = read_u32_be(bytes, &mut cursor)? as usize;
         if sealed_ct_len != expected_sealed_len {
             return Err(AcuError::SerializationError(
@@ -261,7 +284,6 @@ impl AcuCiphertext {
                 matrix_row.push(read_scalar(bytes, &mut cursor)?);
             }
             let c1 = read_g1_compressed(bytes, &mut cursor)?;
-            let c2 = read_nonidentity_g2_compressed(bytes, &mut cursor)?;
             let c3 = read_nonidentity_g1_compressed(bytes, &mut cursor)?;
 
             matrix_rows.push((seat_id.clone(), matrix_row.clone()));
@@ -270,7 +292,6 @@ impl AcuCiphertext {
                 seat_id,
                 matrix_row,
                 c1,
-                c2,
                 c3,
             });
         }
@@ -298,7 +319,8 @@ impl AcuCiphertext {
     }
 }
 
-/// Partial decryption share $D_j = e(g_1, g_2)^{\lambda_j} \in \mathbb{G}_T$ emitted by seat $\rho(j)$.
+/// Partial decryption share $D_j = e(g_1, g_2)^{\lambda_j} \in \mathbb{G}_T$ emitted by seat $\rho(j)$,
+/// accompanied by a Chaum–Pedersen NIZK DLEQ proof across $(\mathbb{G}_1, \mathbb{G}_T)$.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialDecryptionShare {
     /// Row index $j$ in [`AcuCiphertext::rows`] that this partial share decrypts.
@@ -307,13 +329,17 @@ pub struct PartialDecryptionShare {
     pub seat_id: String,
     /// Policy epoch of the ciphertext when this share was computed (`>= 1`).
     pub policy_epoch: u64,
-    /// Unblinded pairing share $D_j = e(c_{j,1}, g_2) + e(g_1, c_{j,2} \cdot (-sk_j)) = e(g_1, g_2)^{\lambda_j} \in \mathbb{G}_T$.
+    /// Unblinded pairing share $D_j = e(c_{j,1} - c_{j,3} \cdot sk_j, g_2) = e(g_1, g_2)^{\lambda_j} \in \mathbb{G}_T$.
     pub value: Gt,
+    /// Chaum–Pedersen DLEQ Fiat–Shamir challenge $c \in \mathbb{F}_r^*$.
+    pub dleq_challenge: Scalar,
+    /// Chaum–Pedersen DLEQ response $z = k + c \cdot sk_j \in \mathbb{F}_r^*$.
+    pub dleq_response: Scalar,
 }
 
 /// Sample a fresh target-group secret $K = e(K_{\mathbb{G}_1}, g_2) \in \mathbb{G}_T$ and encrypt it
-/// under `matrix` and `seat_keys`, sealing the basis commitments $V_0, \dots, V_{k-1}$ exclusively
-/// under `acu_pk` (`CHWGACU2`).
+/// under `matrix` and `seat_keys`, sealing the basis commitments $V_0, \dots, V_{k-1}$ and row scalars
+/// exclusively under `acu_pk` (`CHWGACU2`).
 pub fn acu_encrypt(
     matrix: &LsssMatrix,
     seat_keys: &BTreeMap<String, SeatPublicKey>,
@@ -331,10 +357,11 @@ pub fn acu_encrypt(
 /// Encrypt a target-group element $K = e(K_{\mathbb{G}_1}, g_2) \in \mathbb{G}_T$ (given its
 /// non-identity $\mathbb{G}_1$ preimage `payload_g1`) under an [`LsssMatrix`] and a directory of
 /// verified [`SeatPublicKey`]s, sealing the basis commitments $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$
-/// exclusively under `acu_pk` (`CHWGACU2`).
+/// and row randomness scalars $r_0, \dots, r_{\ell-1} \in (\mathbb{F}_r^*)^\ell$ exclusively under
+/// `acu_pk` (`CHWGACU2`).
 ///
 /// Every referenced [`SeatPublicKey`] and `acu_pk` is verified via [`SeatPublicKey::verify_consistency`]
-/// before encryption proceeds; any missing, inconsistent, or rogue key fails closed.
+/// before encryption proceeds; any missing, malformed, or rogue key fails closed.
 pub fn acu_encrypt_with_g1(
     payload_g1: &G1Projective,
     matrix: &LsssMatrix,
@@ -343,7 +370,8 @@ pub fn acu_encrypt_with_g1(
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(AcuCiphertext, Gt), AcuError> {
     matrix.validate()?;
-    if bool::from(payload_g1.is_identity()) {
+    let payload_aff = G1Affine::from(*payload_g1);
+    if bool::from(payload_aff.is_identity()) || !bool::from(payload_aff.is_torsion_free()) {
         return Err(AcuError::InvalidSecretKey);
     }
     if !acu_pk.verify_consistency() {
@@ -355,7 +383,7 @@ pub fn acu_encrypt_with_g1(
         return Err(AcuError::InvalidPublicKey(acu_pk.seat_id.clone()));
     }
 
-    // Pre-verify every recipient seat's public key consistency (ALISTAIR rogue-key gate).
+    // Pre-verify every recipient seat's Schnorr Proof-of-Possession (ALISTAIR rogue-key gate).
     for (seat_id, _) in &matrix.rows {
         let pk = seat_keys
             .get(seat_id)
@@ -366,7 +394,6 @@ pub fn acu_encrypt_with_g1(
     }
 
     let g1 = G1Projective::generator();
-    let g2 = G2Projective::generator();
     let g2_aff = G2Affine::generator();
 
     // Sample secret column vector v = (s, v_1, ..., v_{k-1}) in (F_r^*)^k ensuring c0_g1 != O.
@@ -384,32 +411,33 @@ pub fn acu_encrypt_with_g1(
         v.push(sample_nonzero_scalar(rng));
     }
 
-    let payload_key = pairing(&G1Affine::from(*payload_g1), &g2_aff);
+    let payload_key = pairing(&payload_aff, &g2_aff);
     let c0 = pairing(&G1Affine::from(c0_g1), &g2_aff);
 
-    // Transient basis commitments V_m = g1^(v_m) for m = 0..k (zeroized automatically on drop).
-    let basis_commitments = ZeroizeG1Vec(v.iter().map(|vm| g1 * vm).collect());
+    // Transient basis commitments V_m = g1^(v_m) and row scalars r_j (zeroized automatically on drop).
+    let mut unsealed_state = UnsealedBasisState {
+        basis: v.iter().map(|vm| g1 * vm).collect(),
+        row_scalars: Vec::with_capacity(matrix.rows.len()),
+    };
 
-    // Construct per-row ciphertexts
+    // Construct per-row ciphertexts strictly in G1
     let mut rows = Vec::with_capacity(matrix.rows.len());
     for (row_index, (seat_id, matrix_row)) in matrix.rows.iter().enumerate() {
         let pk = &seat_keys[seat_id];
         let mut lambda_j = inner_product(matrix_row, &v);
-        let mut r_j = sample_nonzero_scalar(rng);
+        let r_j = sample_nonzero_scalar(rng);
 
         let c1 = g1 * lambda_j + pk.pk1 * r_j;
-        let c2 = g2 * r_j;
         let c3 = g1 * r_j;
 
         lambda_j.zeroize();
-        r_j.zeroize();
+        unsealed_state.row_scalars.push(r_j);
 
         rows.push(CiphertextRow {
             row_index,
             seat_id: seat_id.clone(),
             matrix_row: matrix_row.clone(),
             c1,
-            c2,
             c3,
         });
     }
@@ -417,7 +445,8 @@ pub fn acu_encrypt_with_g1(
 
     let policy_epoch = 1u64;
     let sealed_basis = seal_basis_commitments(
-        &basis_commitments.0,
+        &unsealed_state.basis,
+        &unsealed_state.row_scalars,
         &acu_pk.seat_id,
         &acu_pk.pk1,
         policy_epoch,
@@ -442,11 +471,11 @@ pub fn acu_encrypt_with_g1(
 /// **Dynamic Policy Operation 1 — Semantically Neutral Key Insertion (`insert_key`)**:
 ///
 /// Executed exclusively by the ACU operator holding `acu_sk`:
-/// 1. Unseals $\{V_m\}$ from `ct.sealed_basis` (verifying `ct`'s AAD binding and `acu_sk`).
+/// 1. Unseals `({V_m}, {r_j})` from `ct.sealed_basis` (verifying AAD binding, `acu_sk`, and algebraic row witnesses).
 /// 2. Evaluates $g_1^{\lambda_{\text{new}}} = \sum_{m=0}^{k-1} V_m \cdot r_{\text{new},m}$ homomorphically
-///    in $\mathbb{G}_1$ without knowing $s$ or decrypting $c_0$.
+///    in $\mathbb{G}_1$ without decrypting $c_0$.
 /// 3. Blinds with fresh row randomness $r_{\text{new}} \xleftarrow{\$} \mathbb{F}_r^*$, appends the row,
-///    and re-seals $\{V_m\}$ under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
+///    and re-seals `({V_m}, {r_j})` under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
 pub fn insert_key(
     ct: &mut AcuCiphertext,
     acu_sk: &SeatSecretKey,
@@ -455,7 +484,7 @@ pub fn insert_key(
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<usize, AcuError> {
     ct.validate_structure()?;
-    let basis_commitments = unseal_basis_commitments(ct, acu_sk)?;
+    let mut state = unseal_basis_commitments(ct, acu_sk)?;
 
     if new_row.len() != ct.matrix.cols {
         return Err(AcuError::DimensionMismatch {
@@ -463,21 +492,21 @@ pub fn insert_key(
             actual: new_row.len(),
         });
     }
+    if new_row.iter().all(|s| bool::from(s.is_zero())) {
+        return Err(AcuError::InvalidAccessTree("LSSS row cannot be all zero"));
+    }
     if !new_seat.verify_consistency() {
         return Err(AcuError::InvalidPublicKey(new_seat.seat_id.clone()));
     }
 
-    let mut g1_lambda_new = commit_row_in_g1(&basis_commitments.0, &new_row);
+    let mut g1_lambda_new = commit_row_in_g1(&state.basis, &new_row);
 
     let g1 = G1Projective::generator();
-    let g2 = G2Projective::generator();
-    let mut r_new = sample_nonzero_scalar(rng);
+    let r_new = sample_nonzero_scalar(rng);
 
     let c1 = g1_lambda_new + new_seat.pk1 * r_new;
-    let c2 = g2 * r_new;
     let c3 = g1 * r_new;
     g1_lambda_new.zeroize();
-    r_new.zeroize();
 
     let row_index = ct.rows.len();
     if row_index >= MAX_SERIALIZED_ROWS {
@@ -496,13 +525,14 @@ pub fn insert_key(
         seat_id: new_seat.seat_id.clone(),
         matrix_row: new_row.clone(),
         c1,
-        c2,
         c3,
     });
+    state.row_scalars.push(r_new);
 
     let mut acu_pk1 = g1 * acu_sk.sk;
     let re_sealed_res = seal_basis_commitments(
-        &basis_commitments.0,
+        &state.basis,
+        &state.row_scalars,
         &ct.sealed_basis.acu_seat_id,
         &acu_pk1,
         new_epoch,
@@ -523,7 +553,7 @@ pub fn insert_key(
 
 /// Convenience helper for Shadow-KV warm-forking: unseals `ct.sealed_basis` with `acu_sk`,
 /// inserts `new_seat` as a disjunctive (`OR`) sibling of `sibling_row_index`, and re-seals
-/// `basis_commitments` with fresh randomness at `policy_epoch + 1`.
+/// `basis_commitments` and `row_scalars` with fresh randomness at `policy_epoch + 1`.
 pub fn insert_sibling_key(
     ct: &mut AcuCiphertext,
     acu_sk: &SeatSecretKey,
@@ -544,15 +574,15 @@ pub fn insert_sibling_key(
 /// **Dynamic Policy Operation 2 — Threshold Escalation (`escalate_threshold`)**:
 ///
 /// Executed exclusively by the ACU operator holding `acu_sk` without decrypting $c_0$:
-/// 1. Unseals $\{V_m\}$ from `ct.sealed_basis` and verifies that `affected_row_indices` form a valid
-///    sibling `OR` or `Threshold(t-of-n)` gate, extracting each row's exact Vandermonde abscissa $x_j \in \mathbb{F}_r^*$
+/// 1. Unseals `({V_m}, {r_j})` from `ct.sealed_basis`, verifies algebraic row commitments across all
+///    rows against `seat_keys`, and extracts each affected row's exact Vandermonde abscissa $x_j \in \mathbb{F}_r^*$
 ///    (preserving true abscissas even if intermediate siblings were pruned in an earlier revocation).
 /// 2. Samples $\Delta t$ fresh non-zero column secrets $u_1, \dots, u_{\Delta t} \xleftarrow{\$} \mathbb{F}_r^*$,
 ///    extends affected rows with $x_j^t, \dots, x_j^{t + \Delta t - 1}$, and zero-pads unaffected rows.
 /// 3. Rotates $c_{0,\mathbb{G}_1}$, $c_0$, $\{V_m'\}$, and **all** rows (affected and unaffected) by a fresh
 ///    blinding delta $\Delta v = (\Delta s, \Delta v_1, \dots, \Delta v_{\text{new\_cols}-1}) \in (\mathbb{F}_r^*)^{\text{new\_cols}}$
-///    so shares issued at `policy_epoch + 1` cannot be downgraded onto cached prior-epoch ciphertexts,
-///    then re-seals $\{V_m'\}$ under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
+///    and non-canceling row randomness $r'_j$ (`r_j + r'_j != 0`), then re-seals `({V_m'}, {r_j'})` under
+///    `pk_ACU` with fresh randomness at `policy_epoch + 1`.
 pub fn escalate_threshold(
     ct: &mut AcuCiphertext,
     acu_sk: &SeatSecretKey,
@@ -562,7 +592,7 @@ pub fn escalate_threshold(
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(), AcuError> {
     ct.validate_structure()?;
-    let mut basis_commitments = unseal_basis_commitments(ct, acu_sk)?;
+    let mut state = unseal_basis_commitments(ct, acu_sk)?;
 
     if delta_t == 0 {
         return Err(AcuError::InvalidThreshold {
@@ -679,25 +709,30 @@ pub fn escalate_threshold(
             "invalid AcuCiphertext dimensions",
         ))?;
 
-    // Verify public keys for ALL rows in `ct.rows` so every row can be freshly rerandomized.
-    for row in &ct.rows {
+    // Verify public keys and algebraic row commitments for ALL rows in `ct.rows`.
+    for (row, &r_j) in ct.rows.iter().zip(state.row_scalars.iter()) {
         let pk = seat_keys
             .get(&row.seat_id)
             .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
         if pk.seat_id != row.seat_id || !pk.verify_consistency() {
             return Err(AcuError::InvalidPublicKey(row.seat_id.clone()));
         }
+        let mut expected_c1 = commit_row_in_g1(&state.basis, &row.matrix_row) + pk.pk1 * r_j;
+        let matches = expected_c1 == row.c1;
+        expected_c1.zeroize();
+        if !matches {
+            return Err(AcuError::BasisUnsealFailed);
+        }
     }
 
     let g1 = G1Projective::generator();
-    let g2 = G2Projective::generator();
     let g2_aff = G2Affine::generator();
 
-    // Sample delta_t fresh column secrets u_1..u_{delta_t} and extend basis_commitments.
+    // Sample delta_t fresh column secrets u_1..u_{delta_t} and extend state.basis.
     let mut u = Zeroizing::new(Vec::with_capacity(delta_t));
     for _ in 0..delta_t {
         let u_m = sample_nonzero_scalar(rng);
-        basis_commitments.0.push(g1 * u_m);
+        state.basis.push(g1 * u_m);
         u.push(u_m);
     }
 
@@ -733,21 +768,21 @@ pub fn escalate_threshold(
     u.zeroize();
     new_matrix.cols = new_cols;
 
-    // Rotate c0_g1, c0, basis_commitments[0..new_cols], and ALL rows by fresh blinding delta_v
+    // Rotate c0_g1, c0, state.basis[0..new_cols], and ALL rows by fresh blinding delta_v
     // so new-epoch shares (e.g. D_ACU) cannot be downgraded onto cached prior-epoch ciphertexts.
     let mut delta_v = Zeroizing::new(Vec::with_capacity(new_cols));
     let (delta_s, new_c0_g1) = loop {
         let candidate_ds = sample_nonzero_scalar(rng);
         let candidate_c0_g1 = ct.c0_g1 + g1 * candidate_ds;
-        let candidate_v0 = basis_commitments.0[0] + g1 * candidate_ds;
+        let candidate_v0 = state.basis[0] + g1 * candidate_ds;
         if !bool::from(candidate_c0_g1.is_identity()) && !bool::from(candidate_v0.is_identity()) {
             break (candidate_ds, candidate_c0_g1);
         }
     };
     delta_v.push(delta_s);
-    basis_commitments.0[0] += g1 * delta_s;
+    state.basis[0] += g1 * delta_s;
 
-    for vm in basis_commitments.0.iter_mut().skip(1) {
+    for vm in state.basis.iter_mut().skip(1) {
         let dv_m = loop {
             let candidate = sample_nonzero_scalar(rng);
             if !bool::from((*vm + g1 * candidate).is_identity()) {
@@ -760,14 +795,19 @@ pub fn escalate_threshold(
 
     let new_c0 = pairing(&G1Affine::from(new_c0_g1), &g2_aff);
 
-    for row in &mut new_rows {
+    for (row, r_j) in new_rows.iter_mut().zip(state.row_scalars.iter_mut()) {
         let pk = &seat_keys[&row.seat_id];
         let mut rot_lambda = inner_product(&row.matrix_row, &delta_v);
-        let mut r_prime = sample_nonzero_scalar(rng);
+        let mut r_prime = loop {
+            let candidate = sample_nonzero_scalar(rng);
+            if !bool::from((*r_j + candidate).is_zero()) {
+                break candidate;
+            }
+        };
 
         row.c1 += g1 * rot_lambda + pk.pk1 * r_prime;
-        row.c2 += g2 * r_prime;
         row.c3 += g1 * r_prime;
+        *r_j += r_prime;
 
         rot_lambda.zeroize();
         r_prime.zeroize();
@@ -781,7 +821,8 @@ pub fn escalate_threshold(
 
     let mut acu_pk1 = g1 * acu_sk.sk;
     let re_sealed_res = seal_basis_commitments(
-        &basis_commitments.0,
+        &state.basis,
+        &state.row_scalars,
         &ct.sealed_basis.acu_seat_id,
         &acu_pk1,
         new_epoch,
@@ -804,13 +845,14 @@ pub fn escalate_threshold(
 /// **Dynamic Policy Operation 3 & 4 — Subtree Revocation + Ciphertext Rerandomization (`revoke_and_rerandomize`)**:
 ///
 /// Executed exclusively by the ACU operator holding `acu_sk`:
-/// 1. Unseals $\{V_m\}$ from `ct.sealed_basis`.
-/// 2. Prunes all rows matching `revoked_seat_ids` and re-indexes surviving rows.
+/// 1. Unseals `({V_m}, {r_j})` from `ct.sealed_basis`.
+/// 2. Prunes all rows matching `revoked_seat_ids`, re-indexes surviving rows, and verifies algebraic
+///    commitments for all surviving rows against `seat_keys`.
 /// 3. Samples a fresh blinding vector $\Delta v = (\Delta s, \Delta v_1, \dots, \Delta v_{k-1}) \in (\mathbb{F}_r^*)^k$.
 /// 4. Rotates $c_{0,\mathbb{G}_1} \mathrel{+}= g_1 \cdot \Delta s$, $c_0 = e(c_{0,\mathbb{G}_1}', g_2)$,
 ///    and $V_m' = V_m + g_1 \cdot \Delta v_m$.
-/// 5. Shifts every surviving row $j$ by $\Delta \lambda_j = \langle M_j, \Delta v \rangle$ and fresh $r'_j$,
-///    then re-seals $\{V_m'\}$ under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
+/// 5. Shifts every surviving row $j$ by $\Delta \lambda_j = \langle M_j, \Delta v \rangle$ and non-canceling $r'_j$,
+///    then re-seals `({V_m'}, {r_j'})` under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
 pub fn revoke_and_rerandomize(
     ct: &mut AcuCiphertext,
     acu_sk: &SeatSecretKey,
@@ -819,19 +861,21 @@ pub fn revoke_and_rerandomize(
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(), AcuError> {
     ct.validate_structure()?;
-    let mut basis_commitments = unseal_basis_commitments(ct, acu_sk)?;
+    let mut state = unseal_basis_commitments(ct, acu_sk)?;
 
     let revoked_set: BTreeSet<&str> = revoked_seat_ids.iter().copied().collect();
 
-    // Retain only non-revoked rows.
+    // Retain only non-revoked rows and their corresponding cumulative row scalars.
     let mut surviving_rows = Vec::new();
     let mut surviving_matrix_rows = Vec::new();
-    for row in &ct.rows {
+    let mut surviving_scalars = Zeroizing::new(Vec::new());
+    for (row, &r_j) in ct.rows.iter().zip(state.row_scalars.iter()) {
         if !revoked_set.contains(row.seat_id.as_str()) {
             let mut cloned = row.clone();
             cloned.row_index = surviving_rows.len();
             surviving_matrix_rows.push((cloned.seat_id.clone(), cloned.matrix_row.clone()));
             surviving_rows.push(cloned);
+            surviving_scalars.push(r_j);
         }
     }
 
@@ -839,18 +883,23 @@ pub fn revoke_and_rerandomize(
         return Err(AcuError::EmptyPolicy);
     }
 
-    // Verify all surviving seats have valid public keys in `seat_keys`.
-    for row in &surviving_rows {
+    // Verify all surviving seats have valid public keys in `seat_keys` and match the unsealed commitments.
+    for (row, &r_j) in surviving_rows.iter().zip(surviving_scalars.iter()) {
         let pk = seat_keys
             .get(&row.seat_id)
             .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
         if pk.seat_id != row.seat_id || !pk.verify_consistency() {
             return Err(AcuError::InvalidPublicKey(row.seat_id.clone()));
         }
+        let mut expected_c1 = commit_row_in_g1(&state.basis, &row.matrix_row) + pk.pk1 * r_j;
+        let matches = expected_c1 == row.c1;
+        expected_c1.zeroize();
+        if !matches {
+            return Err(AcuError::BasisUnsealFailed);
+        }
     }
 
     let g1 = G1Projective::generator();
-    let g2 = G2Projective::generator();
     let g2_aff = G2Affine::generator();
     let k = ct.matrix.cols;
 
@@ -860,15 +909,15 @@ pub fn revoke_and_rerandomize(
     let (delta_s, new_c0_g1) = loop {
         let candidate_ds = sample_nonzero_scalar(rng);
         let candidate_c0_g1 = ct.c0_g1 + g1 * candidate_ds;
-        let candidate_v0 = basis_commitments.0[0] + g1 * candidate_ds;
+        let candidate_v0 = state.basis[0] + g1 * candidate_ds;
         if !bool::from(candidate_c0_g1.is_identity()) && !bool::from(candidate_v0.is_identity()) {
             break (candidate_ds, candidate_c0_g1);
         }
     };
     delta_v.push(delta_s);
-    basis_commitments.0[0] += g1 * delta_s;
+    state.basis[0] += g1 * delta_s;
 
-    for vm in basis_commitments.0.iter_mut().skip(1) {
+    for vm in state.basis.iter_mut().skip(1) {
         let dv_m = loop {
             let candidate = sample_nonzero_scalar(rng);
             if !bool::from((*vm + g1 * candidate).is_identity()) {
@@ -881,15 +930,20 @@ pub fn revoke_and_rerandomize(
 
     let new_c0 = pairing(&G1Affine::from(new_c0_g1), &g2_aff);
 
-    // Rerandomize all surviving rows with delta_lambda_j = <M_j, delta_v> and fresh r'_j.
-    for row in &mut surviving_rows {
+    // Rerandomize all surviving rows with delta_lambda_j = <M_j, delta_v> and non-canceling r'_j.
+    for (row, r_j) in surviving_rows.iter_mut().zip(surviving_scalars.iter_mut()) {
         let pk = &seat_keys[&row.seat_id];
         let mut delta_lambda = inner_product(&row.matrix_row, &delta_v);
-        let mut r_prime = sample_nonzero_scalar(rng);
+        let mut r_prime = loop {
+            let candidate = sample_nonzero_scalar(rng);
+            if !bool::from((*r_j + candidate).is_zero()) {
+                break candidate;
+            }
+        };
 
         row.c1 += g1 * delta_lambda + pk.pk1 * r_prime;
-        row.c2 += g2 * r_prime;
         row.c3 += g1 * r_prime;
+        *r_j += r_prime;
 
         delta_lambda.zeroize();
         r_prime.zeroize();
@@ -903,7 +957,8 @@ pub fn revoke_and_rerandomize(
 
     let mut acu_pk1 = g1 * acu_sk.sk;
     let re_sealed_res = seal_basis_commitments(
-        &basis_commitments.0,
+        &state.basis,
+        &surviving_scalars,
         &ct.sealed_basis.acu_seat_id,
         &acu_pk1,
         new_epoch,
@@ -923,10 +978,10 @@ pub fn revoke_and_rerandomize(
     Ok(())
 }
 
-/// Compute a partial decryption share $D_j \in \mathbb{G}_T$ for `ct.rows[row_index]` bound
-/// to `ct.policy_epoch` using seat secret key `sk`:
+/// Compute a partial decryption share $D_j \in \mathbb{G}_T$ with its Chaum–Pedersen DLEQ proof for
+/// `ct.rows[row_index]` bound to `ct.policy_epoch` using seat secret key `sk`:
 ///
-/// $$D_j = e(c_{j,1}, g_2) + e(g_1, c_{j,2} \cdot (-sk)) = e(g_1, g_2)^{\lambda_j}$$
+/// $$D_j = e(c_{j,1} - c_{j,3} \cdot sk, g_2) = e(g_1, g_2)^{\lambda_j}$$
 pub fn acu_partial_decrypt(
     ct: &AcuCiphertext,
     row_index: usize,
@@ -942,78 +997,137 @@ pub fn acu_partial_decrypt(
     Ok(acu_partial_decrypt_at_epoch(row, sk, ct.policy_epoch))
 }
 
-/// Compute a partial decryption share $D_j \in \mathbb{G}_T$ bound to a specific `policy_epoch`.
+/// Compute a partial decryption share $D_j \in \mathbb{G}_T$ and Chaum–Pedersen NIZK DLEQ proof
+/// bound to a specific `policy_epoch`.
 #[must_use]
 pub fn acu_partial_decrypt_at_epoch(
     row: &CiphertextRow,
     sk: &SeatSecretKey,
     policy_epoch: u64,
 ) -> PartialDecryptionShare {
-    let g1_aff = G1Affine::generator();
     let g2_aff = G2Affine::generator();
-    let mut neg_sk = -sk.sk;
-    let c2_neg_sk = G2Affine::from(row.c2 * neg_sk);
-    neg_sk.zeroize();
-    let value = pairing(&G1Affine::from(row.c1), &g2_aff) + pairing(&g1_aff, &c2_neg_sk);
+    let mut unmasked_g1 = row.c1 - row.c3 * sk.sk;
+    let value = pairing(&G1Affine::from(unmasked_g1), &g2_aff);
+    unmasked_g1.zeroize();
+
+    let mut pk1_proj = G1Projective::generator() * sk.sk;
+    let pk1_aff = G1Affine::from(pk1_proj);
+    pk1_proj.zeroize();
+
+    let c1_aff = G1Affine::from(row.c1);
+    let c3_aff = G1Affine::from(row.c3);
+    let b_t = pairing(&c3_aff, &g2_aff);
+    let y_t = pairing(&c1_aff, &g2_aff) - value;
+
+    let (dleq_challenge, dleq_response) = prove_partial_share_dleq(
+        row.row_index,
+        &row.seat_id,
+        policy_epoch,
+        &sk.sk,
+        &pk1_aff,
+        &c1_aff,
+        &c3_aff,
+        &value,
+        &b_t,
+        &y_t,
+    );
 
     PartialDecryptionShare {
         row_index: row.row_index,
         seat_id: row.seat_id.clone(),
         policy_epoch,
         value,
+        dleq_challenge,
+        dleq_response,
     }
 }
 
 /// Verify that a [`PartialDecryptionShare`] $D_j$ is well-formed with respect to `row` and `pk`:
-/// 1. Checks `row.row_index == share.row_index`, `row.seat_id == share.seat_id == pk.seat_id`,
-///    and [`SeatPublicKey::verify_consistency`].
-/// 2. Checks non-identity row randomness witness: $e(c_{j,3}, g_2) = e(g_1, c_{j,2})$.
-/// 3. Checks bilinear decryption soundness: $D_j = e(c_{j,1}, g_2) + e(c_{j,3}, -pk_{\rho(j),2})$.
+/// 1. Checks `policy_epoch >= 1`, `row.row_index == share.row_index`,
+///    `row.seat_id == share.seat_id == pk.seat_id`, [`verify_row_randomness_witness`], and
+///    [`SeatPublicKey::verify_consistency`].
+/// 2. Verifies the Chaum–Pedersen NIZK DLEQ proof $(c, z)$ across $(\mathbb{G}_1, \mathbb{G}_T)$ proving:
 ///
-/// Because $c_{j,1} = g_1^{\lambda_j} + pk_{\rho(j),1}^{r_j}$ and $c_{j,3} = g_1^{r_j}$, this equation
-/// uniquely pins $D_j = e(g_1, g_2)^{\lambda_j}$ for `row`'s current epoch **without requiring
-/// cleartext `basis_commitments`**.
+/// $$\log_{g_1}(pk_{\rho(j),1}) = \log_{e(c_{j,3}, g_2)}\!\big(e(c_{j,1}, g_2) - D_j\big)$$
+///
+/// Because $c_{j,1} = g_1^{\lambda_j} + pk_{\rho(j),1}^{r_j}$ and $c_{j,3} = g_1^{r_j} \in \mathbb{G}_1^*$,
+/// special soundness of DLEQ uniquely pins $D_j = e(g_1, g_2)^{\lambda_j}$ for `row`'s current epoch
+/// **without exposing $g_2^{sk_j}$ or cleartext `basis_commitments`**.
 #[must_use]
 pub fn acu_verify_partial_share(
     row: &CiphertextRow,
     pk: &SeatPublicKey,
     share: &PartialDecryptionShare,
 ) -> bool {
-    if row.row_index != share.row_index || row.seat_id != share.seat_id || row.seat_id != pk.seat_id
+    if share.policy_epoch == 0
+        || row.row_index != share.row_index
+        || row.seat_id != share.seat_id
+        || row.seat_id != pk.seat_id
     {
         return false;
     }
-    if bool::from(row.c2.is_identity()) || bool::from(row.c3.is_identity()) {
+    if !verify_row_randomness_witness(row) || !pk.verify_consistency() {
         return false;
     }
-    if !pk.verify_consistency() {
+    if bool::from(share.dleq_challenge.is_zero()) || bool::from(share.dleq_response.is_zero()) {
         return false;
     }
-    let g1_aff = G1Affine::generator();
+
     let g2_aff = G2Affine::generator();
+    let pk1_aff = G1Affine::from(pk.pk1);
+    let c1_aff = G1Affine::from(row.c1);
+    let c3_aff = G1Affine::from(row.c3);
 
-    // Check row randomness witness: e(c3, g2) == e(g1, c2)
-    let row_witness_ok =
-        pairing(&G1Affine::from(row.c3), &g2_aff) == pairing(&g1_aff, &G2Affine::from(row.c2));
-    if !row_witness_ok {
+    let b_t = pairing(&c3_aff, &g2_aff);
+    if b_t == Gt::identity() {
+        return false;
+    }
+    let y_t = pairing(&c1_aff, &g2_aff) - share.value;
+
+    let r1 = G1Projective::generator() * share.dleq_response - pk.pk1 * share.dleq_challenge;
+    let r1_aff = G1Affine::from(r1);
+    let r_t = b_t * share.dleq_response - y_t * share.dleq_challenge;
+    if bool::from(r1_aff.is_identity()) || r_t == Gt::identity() {
         return false;
     }
 
-    // Check D_j == e(c1, g2) + e(c3, -pk2)
-    let expected = pairing(&G1Affine::from(row.c1), &g2_aff)
-        + pairing(&G1Affine::from(row.c3), &G2Affine::from(-pk.pk2));
-    share.value == expected
+    let expected_c = compute_partial_share_dleq_challenge(
+        share.row_index,
+        &share.seat_id,
+        share.policy_epoch,
+        &pk1_aff,
+        &c1_aff,
+        &c3_aff,
+        &share.value,
+        &b_t,
+        &y_t,
+        &r1_aff,
+        &r_t,
+    );
+    bool::from(
+        share
+            .dleq_challenge
+            .to_bytes()
+            .ct_eq(&expected_c.to_bytes()),
+    )
 }
 
-/// Check that a [`CiphertextRow`]'s randomness components `(c2, c3)` are non-identity and
-/// satisfy the bilinear witness equation $e(c_3, g_2) = e(g_1, c_2)$.
+/// Check that a [`CiphertextRow`]'s $\mathbb{G}_1$ components `(c1, c3)` and LSSS row vector
+/// are structurally valid, prime-order torsion-free, and have non-identity `c3`.
 #[must_use]
 pub fn verify_row_randomness_witness(row: &CiphertextRow) -> bool {
-    if bool::from(row.c2.is_identity()) || bool::from(row.c3.is_identity()) {
+    if !is_valid_seat_id(&row.seat_id)
+        || row.matrix_row.is_empty()
+        || row.matrix_row.len() > MAX_SERIALIZED_COLS
+        || row.matrix_row.iter().all(|s| bool::from(s.is_zero()))
+    {
         return false;
     }
-    pairing(&G1Affine::from(row.c3), &G2Affine::generator())
-        == pairing(&G1Affine::generator(), &G2Affine::from(row.c2))
+    let c1_aff = G1Affine::from(row.c1);
+    let c3_aff = G1Affine::from(row.c3);
+    !bool::from(c3_aff.is_identity())
+        && bool::from(c1_aff.is_torsion_free())
+        && bool::from(c3_aff.is_torsion_free())
 }
 
 /// Combine a set of [`PartialDecryptionShare`]s for `ct` using exact LSSS Gaussian elimination
@@ -1034,8 +1148,8 @@ pub fn acu_combine(
 }
 
 /// Perform pure LSSS linear combination $K = c_0 - \sum_{j \in S} \omega_j D_j$ enforcing
-/// `policy_epoch` and row/seat binding without pairing-verifying individual shares upfront
-/// (used in tests to prove that even if pairing verification is skipped, stale epoch-1 shares
+/// `policy_epoch` and row/seat binding without DLEQ-verifying individual shares upfront
+/// (used in tests to prove that even if share verification is skipped, stale epoch-1 shares
 /// cannot cancel the rotated $c_0^{(2)}$ blinding factor and fail ChaCha20-Poly1305 AEAD authentication).
 pub fn acu_combine_unverified(
     ct: &AcuCiphertext,
@@ -1053,7 +1167,7 @@ fn combine_inner(
     if ct.policy_epoch == 0 {
         return Err(AcuError::SerializationError("policy_epoch must be >= 1"));
     }
-    let expected_sealed_len = expected_sealed_basis_len(ct.matrix.cols)?;
+    let expected_sealed_len = expected_sealed_basis_len(ct.matrix.cols, ct.rows.len())?;
     if ct.sealed_basis.ciphertext.len() != expected_sealed_len {
         return Err(AcuError::SerializationError(
             "invalid sealed_basis ciphertext length",
@@ -1099,7 +1213,11 @@ fn combine_inner(
                 available_indices.push(share.row_index);
             }
             std::collections::btree_map::Entry::Occupied(existing) => {
-                if existing.get().value != share.value {
+                let prev = existing.get();
+                if prev.value != share.value
+                    || prev.dleq_challenge != share.dleq_challenge
+                    || prev.dleq_response != share.dleq_response
+                {
                     return Err(AcuError::InvalidPartialShare {
                         row_index: share.row_index,
                         seat_id: share.seat_id.clone(),
@@ -1119,13 +1237,137 @@ fn combine_inner(
     Ok(ct.c0 - blinding_gt)
 }
 
-pub(crate) fn expected_sealed_basis_len(cols: usize) -> Result<usize, AcuError> {
-    if cols == 0 || cols > MAX_SERIALIZED_COLS {
+#[allow(clippy::too_many_arguments)]
+fn prove_partial_share_dleq(
+    row_index: usize,
+    seat_id: &str,
+    policy_epoch: u64,
+    sk: &Scalar,
+    pk1_aff: &G1Affine,
+    c1_aff: &G1Affine,
+    c3_aff: &G1Affine,
+    value: &Gt,
+    b_t: &Gt,
+    y_t: &Gt,
+) -> (Scalar, Scalar) {
+    if bool::from(c3_aff.is_identity()) || *b_t == Gt::identity() || policy_epoch == 0 {
+        return (Scalar::ZERO, Scalar::ZERO);
+    }
+
+    let mut sk_bytes = Zeroizing::new(sk.to_bytes());
+    let mut ikm = Zeroizing::new(Vec::with_capacity(32 + 8 + 4 + 4 + seat_id.len() + 48 * 3));
+    ikm.extend_from_slice(&*sk_bytes);
+    sk_bytes.zeroize();
+    ikm.extend_from_slice(&policy_epoch.to_be_bytes());
+    ikm.extend_from_slice(&(row_index as u32).to_be_bytes());
+    ikm.extend_from_slice(&(seat_id.len() as u32).to_be_bytes());
+    ikm.extend_from_slice(seat_id.as_bytes());
+    ikm.extend_from_slice(&pk1_aff.to_compressed());
+    ikm.extend_from_slice(&c1_aff.to_compressed());
+    ikm.extend_from_slice(&c3_aff.to_compressed());
+
+    let hk = Hkdf::<Sha256>::new(Some(DLEQ_NONCE_SALT), &ikm);
+    let g1 = G1Projective::generator();
+
+    for ctr in 0u32.. {
+        let mut info = Vec::with_capacity(DLEQ_NONCE_INFO.len() + 4);
+        info.extend_from_slice(DLEQ_NONCE_INFO);
+        info.extend_from_slice(&ctr.to_be_bytes());
+
+        let mut wide = Zeroizing::new([0u8; 64]);
+        hk.expand(&info, &mut *wide)
+            .expect("64-byte HKDF-SHA256 output is always valid");
+        let mut k = Scalar::from_bytes_wide(&wide);
+        wide.zeroize();
+        if bool::from(k.is_zero()) {
+            continue;
+        }
+        let r1_aff = G1Affine::from(g1 * k);
+        let r_t = *b_t * k;
+        if bool::from(r1_aff.is_identity()) || r_t == Gt::identity() {
+            k.zeroize();
+            continue;
+        }
+        let c = compute_partial_share_dleq_challenge(
+            row_index,
+            seat_id,
+            policy_epoch,
+            pk1_aff,
+            c1_aff,
+            c3_aff,
+            value,
+            b_t,
+            y_t,
+            &r1_aff,
+            &r_t,
+        );
+        if bool::from(c.is_zero()) {
+            k.zeroize();
+            continue;
+        }
+        let z = k + c * *sk;
+        k.zeroize();
+        if !bool::from(z.is_zero()) {
+            return (c, z);
+        }
+    }
+    unreachable!("unbounded u32 counter finds valid DLEQ nonce on ctr = 0 w.h.p.")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_partial_share_dleq_challenge(
+    row_index: usize,
+    seat_id: &str,
+    policy_epoch: u64,
+    pk1_aff: &G1Affine,
+    c1_aff: &G1Affine,
+    c3_aff: &G1Affine,
+    value: &Gt,
+    b_t: &Gt,
+    y_t: &Gt,
+    r1_aff: &G1Affine,
+    r_t: &Gt,
+) -> Scalar {
+    let mut hasher = Sha256::new();
+    hasher.update(DLEQ_CHALLENGE_DOMAIN);
+    hasher.update(policy_epoch.to_be_bytes());
+    hasher.update((row_index as u32).to_be_bytes());
+    hasher.update((seat_id.len() as u32).to_be_bytes());
+    hasher.update(seat_id.as_bytes());
+    hasher.update(G1Affine::generator().to_compressed());
+    hasher.update(G2Affine::generator().to_compressed());
+    hasher.update(pk1_aff.to_compressed());
+    hasher.update(c1_aff.to_compressed());
+    hasher.update(c3_aff.to_compressed());
+    hasher.update(r1_aff.to_compressed());
+    for gt_elem in [value, b_t, y_t, r_t] {
+        let repr = Zeroizing::new(format!("{gt_elem:?}"));
+        hasher.update((repr.len() as u32).to_be_bytes());
+        hasher.update(repr.as_bytes());
+    }
+    let digest = hasher.finalize();
+
+    let hk = Hkdf::<Sha256>::new(Some(DLEQ_CHALLENGE_SALT), &digest);
+    let mut wide = [0u8; 64];
+    hk.expand(DLEQ_CHALLENGE_INFO, &mut wide)
+        .expect("64-byte HKDF-SHA256 output is always valid");
+    Scalar::from_bytes_wide(&wide)
+}
+
+pub(crate) fn expected_sealed_basis_len(cols: usize, num_rows: usize) -> Result<usize, AcuError> {
+    if cols == 0 || cols > MAX_SERIALIZED_COLS || num_rows == 0 || num_rows > MAX_SERIALIZED_ROWS {
         return Err(AcuError::SerializationError(
             "invalid AcuCiphertext dimensions",
         ));
     }
-    cols.checked_mul(G1_COMPRESSED_BYTES)
+    let basis_bytes = cols
+        .checked_mul(G1_COMPRESSED_BYTES)
+        .ok_or(AcuError::SerializationError("sealed_basis length overflow"))?;
+    let scalar_bytes = num_rows
+        .checked_mul(SCALAR_BYTES)
+        .ok_or(AcuError::SerializationError("sealed_basis length overflow"))?;
+    basis_bytes
+        .checked_add(scalar_bytes)
         .and_then(|n| n.checked_add(POLY1305_TAG_BYTES))
         .ok_or(AcuError::SerializationError("sealed_basis length overflow"))
 }
@@ -1171,14 +1413,15 @@ fn encode_basis_seal_aad(
             aad.extend_from_slice(&scalar.to_bytes());
         }
         aad.extend_from_slice(&G1Affine::from(row.c1).to_compressed());
-        aad.extend_from_slice(&G2Affine::from(row.c2).to_compressed());
         aad.extend_from_slice(&G1Affine::from(row.c3).to_compressed());
     }
     aad
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seal_basis_commitments(
     basis_commitments: &[G1Projective],
+    row_scalars: &[Scalar],
     acu_seat_id: &str,
     acu_pk1: &G1Projective,
     policy_epoch: u64,
@@ -1189,12 +1432,20 @@ fn seal_basis_commitments(
     if !is_valid_seat_id(acu_seat_id) {
         return Err(AcuError::InvalidSeatId);
     }
-    if bool::from(acu_pk1.is_identity()) || basis_commitments.is_empty() {
+    let acu_pk1_aff = G1Affine::from(*acu_pk1);
+    if bool::from(acu_pk1_aff.is_identity())
+        || !bool::from(acu_pk1_aff.is_torsion_free())
+        || basis_commitments.is_empty()
+        || row_scalars.len() != rows.len()
+        || rows.is_empty()
+    {
         return Err(AcuError::InvalidPublicKey(acu_seat_id.to_string()));
     }
 
     let cols = basis_commitments.len();
-    let mut plaintext = Zeroizing::new(Vec::with_capacity(cols * G1_COMPRESSED_BYTES));
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(
+        cols * G1_COMPRESSED_BYTES + row_scalars.len() * SCALAR_BYTES,
+    ));
     for vm in basis_commitments {
         if bool::from(vm.is_identity()) {
             return Err(AcuError::SerializationError("identity basis commitment"));
@@ -1202,6 +1453,14 @@ fn seal_basis_commitments(
         let mut compressed = G1Affine::from(*vm).to_compressed();
         plaintext.extend_from_slice(&compressed);
         compressed.zeroize();
+    }
+    for r_j in row_scalars {
+        if bool::from(r_j.is_zero()) {
+            return Err(AcuError::SerializationError("zero row randomness scalar"));
+        }
+        let mut s_bytes = r_j.to_bytes();
+        plaintext.extend_from_slice(&s_bytes);
+        s_bytes.zeroize();
     }
 
     let g1 = G1Projective::generator();
@@ -1236,22 +1495,38 @@ fn seal_basis_commitments(
     })
 }
 
-/// Cryptographically authenticate `ct` against `acu_sk` by unsealing `ct.sealed_basis`
-/// (verifying its ChaCha20-Poly1305 tag and injective binary AAD over `policy_epoch`,
-/// `acu_seat_id`, `cols`, `c0_g1`, and all `rows`) and immediately zeroizing the unsealed commitments.
-pub(crate) fn verify_sealed_basis(
+/// Cryptographically authenticate `ct` against `acu_sk` AND verify that every row `j` in `ct.rows`
+/// algebraically matches `commit_row_in_g1(&basis, &row.matrix_row) + pk_j.pk1 * r_j == row.c1`
+/// and `g_1 * r_j == row.c3` against the caller-supplied public-key directory lookup, zeroizing
+/// unsealed secrets immediately on return.
+pub(crate) fn verify_sealed_basis_with_lookup<'a, F>(
     ct: &AcuCiphertext,
     acu_sk: &SeatSecretKey,
-) -> Result<(), AcuError> {
-    let unsealed = unseal_basis_commitments(ct, acu_sk)?;
-    drop(unsealed);
+    mut lookup_pk: F,
+) -> Result<(), AcuError>
+where
+    F: FnMut(&str) -> Option<&'a SeatPublicKey>,
+{
+    let state = unseal_basis_commitments(ct, acu_sk)?;
+    for (row, &r_j) in ct.rows.iter().zip(state.row_scalars.iter()) {
+        let pk = lookup_pk(&row.seat_id).ok_or(AcuError::BasisUnsealFailed)?;
+        if pk.seat_id != row.seat_id || !pk.verify_consistency() {
+            return Err(AcuError::BasisUnsealFailed);
+        }
+        let mut expected_c1 = commit_row_in_g1(&state.basis, &row.matrix_row) + pk.pk1 * r_j;
+        let matches = expected_c1 == row.c1;
+        expected_c1.zeroize();
+        if !matches {
+            return Err(AcuError::BasisUnsealFailed);
+        }
+    }
     Ok(())
 }
 
 fn unseal_basis_commitments(
     ct: &AcuCiphertext,
     acu_sk: &SeatSecretKey,
-) -> Result<ZeroizeG1Vec, AcuError> {
+) -> Result<UnsealedBasisState, AcuError> {
     if ct.policy_epoch == 0
         || !is_valid_seat_id(&ct.sealed_basis.acu_seat_id)
         || acu_sk.seat_id != ct.sealed_basis.acu_seat_id
@@ -1260,16 +1535,22 @@ fn unseal_basis_commitments(
     }
     ct.validate_structure()
         .map_err(|_| AcuError::BasisUnsealFailed)?;
-    if bool::from(ct.sealed_basis.ephemeral_pk1.is_identity()) || bool::from(ct.c0_g1.is_identity())
+    let eph_aff = G1Affine::from(ct.sealed_basis.ephemeral_pk1);
+    let c0_aff = G1Affine::from(ct.c0_g1);
+    if bool::from(eph_aff.is_identity())
+        || !bool::from(eph_aff.is_torsion_free())
+        || bool::from(c0_aff.is_identity())
+        || !bool::from(c0_aff.is_torsion_free())
+        || !ct.rows.iter().all(verify_row_randomness_witness)
     {
         return Err(AcuError::BasisUnsealFailed);
     }
-    let expected_len =
-        expected_sealed_basis_len(ct.matrix.cols).map_err(|_| AcuError::BasisUnsealFailed)?;
+    let expected_len = expected_sealed_basis_len(ct.matrix.cols, ct.rows.len())
+        .map_err(|_| AcuError::BasisUnsealFailed)?;
     if ct.sealed_basis.ciphertext.len() != expected_len {
         return Err(AcuError::BasisUnsealFailed);
     }
-    if ct.c0 != pairing(&G1Affine::from(ct.c0_g1), &G2Affine::generator()) {
+    if ct.c0 != pairing(&c0_aff, &G2Affine::generator()) {
         return Err(AcuError::BasisUnsealFailed);
     }
 
@@ -1306,12 +1587,18 @@ fn unseal_basis_commitments(
             .map_err(|_| AcuError::BasisUnsealFailed)?,
     );
 
-    if decrypted.len() != ct.matrix.cols * G1_COMPRESSED_BYTES {
+    let basis_bytes_len = ct.matrix.cols * G1_COMPRESSED_BYTES;
+    let scalar_bytes_len = ct.rows.len() * SCALAR_BYTES;
+    if decrypted.len() != basis_bytes_len + scalar_bytes_len {
         return Err(AcuError::BasisUnsealFailed);
     }
 
-    let mut basis = ZeroizeG1Vec(Vec::with_capacity(ct.matrix.cols));
-    for chunk in decrypted.chunks_exact(G1_COMPRESSED_BYTES) {
+    let mut state = UnsealedBasisState {
+        basis: Vec::with_capacity(ct.matrix.cols),
+        row_scalars: Vec::with_capacity(ct.rows.len()),
+    };
+
+    for chunk in decrypted[..basis_bytes_len].chunks_exact(G1_COMPRESSED_BYTES) {
         let mut arr = [0u8; G1_COMPRESSED_BYTES];
         arr.copy_from_slice(chunk);
         let aff_opt: Option<G1Affine> = G1Affine::from_compressed(&arr).into();
@@ -1319,14 +1606,47 @@ fn unseal_basis_commitments(
         let Some(aff) = aff_opt else {
             return Err(AcuError::BasisUnsealFailed);
         };
-        let proj = G1Projective::from(aff);
-        if bool::from(proj.is_identity()) {
+        if bool::from(aff.is_identity()) || !bool::from(aff.is_torsion_free()) {
             return Err(AcuError::BasisUnsealFailed);
         }
-        basis.0.push(proj);
+        state.basis.push(G1Projective::from(aff));
     }
 
-    Ok(basis)
+    for chunk in decrypted[basis_bytes_len..].chunks_exact(SCALAR_BYTES) {
+        let mut arr = [0u8; SCALAR_BYTES];
+        arr.copy_from_slice(chunk);
+        let sc_opt: Option<Scalar> = Scalar::from_bytes(&arr).into();
+        arr.zeroize();
+        let Some(sc) = sc_opt else {
+            return Err(AcuError::BasisUnsealFailed);
+        };
+        if bool::from(sc.is_zero()) {
+            return Err(AcuError::BasisUnsealFailed);
+        }
+        state.row_scalars.push(sc);
+    }
+
+    // Algebraic cut-and-paste & forged-basis defense (`[P1-R2-2]`):
+    // 1. Every row's randomness point `c3` MUST equal `g1 * r_j` (prevents wrapping any foreign row
+    //    with unknown discrete-log randomness `r_victim` into a synthetic `AcuCiphertext`).
+    // 2. Every row assigned to `acu_sk.seat_id` MUST unblind under `acu_sk.sk` to the exact LSSS
+    //    linear commitment `commit_row_in_g1(&state.basis, &row.matrix_row)`.
+    for (row, &r_j) in ct.rows.iter().zip(state.row_scalars.iter()) {
+        if g1 * r_j != row.c3 {
+            return Err(AcuError::BasisUnsealFailed);
+        }
+        if row.seat_id == acu_sk.seat_id {
+            let mut unmasked = row.c1 - row.c3 * acu_sk.sk;
+            let expected = commit_row_in_g1(&state.basis, &row.matrix_row);
+            let ok = unmasked == expected;
+            unmasked.zeroize();
+            if !ok {
+                return Err(AcuError::BasisUnsealFailed);
+            }
+        }
+    }
+
+    Ok(state)
 }
 
 fn inner_product(a: &[Scalar], b: &[Scalar]) -> Scalar {
@@ -1392,6 +1712,11 @@ fn read_g1_compressed(bytes: &[u8], cursor: &mut usize) -> Result<G1Projective, 
     let aff = aff.ok_or(AcuError::SerializationError(
         "invalid compressed G1Affine point",
     ))?;
+    if !bool::from(aff.is_torsion_free()) {
+        return Err(AcuError::SerializationError(
+            "non-torsion-free G1Affine point",
+        ));
+    }
     Ok(G1Projective::from(aff))
 }
 
@@ -1403,30 +1728,6 @@ fn read_nonidentity_g1_compressed(
     if bool::from(pt.is_identity()) {
         return Err(AcuError::SerializationError(
             "identity G1 point rejected in AcuCiphertext",
-        ));
-    }
-    Ok(pt)
-}
-
-fn read_g2_compressed(bytes: &[u8], cursor: &mut usize) -> Result<G2Projective, AcuError> {
-    let s = take_slice(bytes, cursor, G2_COMPRESSED_BYTES)?;
-    let mut arr = [0u8; G2_COMPRESSED_BYTES];
-    arr.copy_from_slice(s);
-    let aff: Option<G2Affine> = G2Affine::from_compressed(&arr).into();
-    let aff = aff.ok_or(AcuError::SerializationError(
-        "invalid compressed G2Affine point",
-    ))?;
-    Ok(G2Projective::from(aff))
-}
-
-fn read_nonidentity_g2_compressed(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<G2Projective, AcuError> {
-    let pt = read_g2_compressed(bytes, cursor)?;
-    if bool::from(pt.is_identity()) {
-        return Err(AcuError::SerializationError(
-            "identity G2 point rejected in AcuCiphertext",
         ));
     }
     Ok(pt)
