@@ -1290,7 +1290,7 @@ enum DaemonOutcome {
     Exit(u8),
     Reexec {
         install_path: PathBuf,
-        expected_sha256: [u8; 32],
+        prepared: chinwag_cli::release_sync::PreparedImmutableReexec,
     },
 }
 
@@ -1779,7 +1779,10 @@ async fn run_daemon_loop_inner(
     .await
     {
         DaemonOutcome::Exit(code) => code,
-        DaemonOutcome::Reexec { .. } => 0,
+        DaemonOutcome::Reexec { prepared, .. } => {
+            chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+            0
+        }
     }
 }
 
@@ -2030,7 +2033,9 @@ async fn run_daemon_loop_reexecable(
     let mut forwarding_original = None;
     let (state_error_tx, mut state_error_rx) = tokio::sync::mpsc::channel::<()>(1);
     let mut exit_code = 0;
-    let mut reexec_target: Option<(PathBuf, [u8; 32])> = None;
+    let mut pinned_reexec: Option<(PathBuf, chinwag_cli::release_sync::PreparedImmutableReexec)> =
+        None;
+    let mut reexec_prep_retries: u32 = 0;
     let mut reexec_requested = false;
     let mut pending_reexec: Option<(PathBuf, [u8; 32], Instant)> = None;
     let reexec_sleep = tokio::time::sleep(Duration::from_secs(86_400));
@@ -2193,13 +2198,14 @@ async fn run_daemon_loop_reexecable(
                     false,
                     &mut pending_reexec,
                 ) {
+                    reexec_prep_retries = 0;
                     reexec_sleep
                         .as_mut()
                         .reset(tokio::time::Instant::now() + Duration::from_millis(350));
                 }
             }
             () = &mut reexec_sleep, if pending_reexec.is_some() => {
-                if let Some((_, _, armed_at)) = &pending_reexec {
+                if let Some((target_path, expected_sha, armed_at)) = pending_reexec.clone() {
                     let release_worker_idle =
                         pending_release_jobs.load(std::sync::atomic::Ordering::SeqCst) == 0
                             && release_done_rx.is_empty();
@@ -2209,8 +2215,85 @@ async fn run_daemon_loop_reexecable(
                         release_worker_idle,
                         armed_at.elapsed(),
                     ) {
-                        reexec_requested = true;
-                        break;
+                        // Refresh the authoritative verified release and pin an immutable
+                        // executable snapshot under `$HOME/.chinwag/release_sync.lock`
+                        // BEFORE closing the daemon so concurrent same-HOME installers
+                        // (`chinwag release publish` / `chinwag release sync`) in their
+                        // post-install, pre-publication window never trigger `DigestMismatch`.
+                        let target_for_prep = target_path.clone();
+                        let prep_res = tokio::task::spawn_blocking(move || {
+                            let home_dir = chinwag_cli::release_sync::resolve_home_dir()?;
+                            chinwag_cli::release_sync::prepare_immutable_reexec_binary(
+                                &home_dir,
+                                &target_for_prep,
+                                &expected_sha,
+                            )
+                        })
+                        .await;
+                        match prep_res {
+                            Ok(Ok(prepared)) => {
+                                if Some(prepared.sha256) == startup_chinwag_sha256 {
+                                    chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
+                                    pending_reexec = None;
+                                    reexec_prep_retries = 0;
+                                } else {
+                                    pinned_reexec = Some((target_path, prepared));
+                                    reexec_requested = true;
+                                    break;
+                                }
+                            }
+                            Ok(Err(err))
+                                if err.is_transient_retryable()
+                                    && reexec_prep_retries
+                                        < chinwag_cli::release_sync::MAX_RELEASE_SYNC_TRANSIENT_RETRIES =>
+                            {
+                                let delay =
+                                    ReleaseDaemonScheduler::backoff_for_attempt(reexec_prep_retries);
+                                reexec_prep_retries = reexec_prep_retries.saturating_add(1);
+                                let _ = writeln!(
+                                    stdout,
+                                    "{}",
+                                    json!({
+                                        "event": "native_daemon_reexec_retry",
+                                        "binary": target_path.to_string_lossy(),
+                                        "reason": err.to_string(),
+                                        "next_retry_secs": delay.as_secs()
+                                    })
+                                );
+                                let _ = stdout.flush();
+                                reexec_sleep
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + delay);
+                            }
+                            Ok(Err(err)) => {
+                                let _ = writeln!(
+                                    stdout,
+                                    "{}",
+                                    json!({
+                                        "event": "native_daemon_reexec_refused",
+                                        "binary": target_path.to_string_lossy(),
+                                        "reason": err.to_string()
+                                    })
+                                );
+                                let _ = stdout.flush();
+                                pending_reexec = None;
+                                reexec_prep_retries = 0;
+                            }
+                            Err(_) => {
+                                let _ = writeln!(
+                                    stdout,
+                                    "{}",
+                                    json!({
+                                        "event": "native_daemon_reexec_refused",
+                                        "binary": target_path.to_string_lossy(),
+                                        "reason": "reexec preparation worker panicked"
+                                    })
+                                );
+                                let _ = stdout.flush();
+                                pending_reexec = None;
+                                reexec_prep_retries = 0;
+                            }
+                        }
                     } else {
                         reexec_sleep
                             .as_mut()
@@ -2510,13 +2593,14 @@ async fn run_daemon_loop_reexecable(
     // an in-flight `spawn_blocking` installation) and drain all final events so
     // `pending_reexec` reflects the exact latest binary installed on disk.
     let tearing_down_for_reexec = reexec_requested && exit_code == 0;
+    let mut teardown_updated_reexec = false;
     quiesce_release_worker_and_drain_events(
         &mut release_job_tx,
         &mut release_done_tx_keepalive,
         &mut release_worker_handle,
         &mut release_done_rx,
         |release_event| {
-            let _ = process_release_daemon_event(
+            if process_release_daemon_event(
                 release_event,
                 stdout,
                 &repo_root,
@@ -2529,34 +2613,76 @@ async fn run_daemon_loop_reexecable(
                 startup_chinwag_sha256,
                 tearing_down_for_reexec,
                 &mut pending_reexec,
-            );
+            ) {
+                teardown_updated_reexec = true;
+            }
         },
     )
     .await;
     forwards.shutdown().await;
     drop(publications);
-    if reexec_requested
-        && exit_code == 0
-        && let Some((target_path, expected_sha256, _)) = pending_reexec.take()
-    {
-        let _ = writeln!(
-            stdout,
-            "{}",
-            json!({
-                "event": "native_daemon_reexec",
-                "binary": target_path.to_string_lossy()
+    if reexec_requested && exit_code == 0 {
+        if teardown_updated_reexec
+            && let Some((latest_path, latest_sha, _)) = pending_reexec.take()
+            && pinned_reexec
+                .as_ref()
+                .is_none_or(|(_, p)| p.sha256 != latest_sha)
+        {
+            if let Some((_, old_prepared)) = pinned_reexec.take() {
+                chinwag_cli::release_sync::cleanup_prepared_reexec(old_prepared);
+            }
+            let refresh_path = latest_path.clone();
+            let refreshed = tokio::task::spawn_blocking(move || {
+                let home_dir = chinwag_cli::release_sync::resolve_home_dir()?;
+                chinwag_cli::release_sync::prepare_immutable_reexec_binary(
+                    &home_dir,
+                    &refresh_path,
+                    &latest_sha,
+                )
             })
-        );
-        let _ = stdout.flush();
-        reexec_target = Some((target_path, expected_sha256));
+            .await;
+            match refreshed {
+                Ok(Ok(prepared)) => {
+                    pinned_reexec = Some((latest_path, prepared));
+                }
+                Ok(Err(err)) => {
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        json!({
+                            "event": "native_daemon_reexec_refused",
+                            "binary": latest_path.to_string_lossy(),
+                            "reason": err.to_string()
+                        })
+                    );
+                    let _ = stdout.flush();
+                    return DaemonOutcome::Exit(1);
+                }
+                Err(_) => {
+                    return DaemonOutcome::Exit(1);
+                }
+            }
+        }
+        if let Some((install_path, prepared)) = pinned_reexec.take() {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "event": "native_daemon_reexec",
+                    "binary": install_path.to_string_lossy()
+                })
+            );
+            let _ = stdout.flush();
+            return DaemonOutcome::Reexec {
+                install_path,
+                prepared,
+            };
+        }
     }
-    match reexec_target {
-        Some((install_path, expected_sha256)) => DaemonOutcome::Reexec {
-            install_path,
-            expected_sha256,
-        },
-        None => DaemonOutcome::Exit(exit_code),
+    if let Some((_, prepared)) = pinned_reexec.take() {
+        chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
     }
+    DaemonOutcome::Exit(exit_code)
 }
 
 /// Fallback is possible only when no selected-daemon exchange was attempted.
@@ -3583,38 +3709,13 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 DaemonOutcome::Exit(code) => code,
                 DaemonOutcome::Reexec {
                     install_path,
-                    expected_sha256,
+                    prepared,
                 } => {
                     use std::os::unix::process::CommandExt;
-                    let home_dir = match chinwag_cli::release_sync::resolve_home_dir() {
-                        Ok(dir) => dir,
-                        Err(err) => {
-                            let _ = writeln!(stderr, "chinwag bus daemon: re-exec refused ({err})");
-                            return 1;
-                        }
-                    };
-                    let prepared = match chinwag_cli::release_sync::prepare_immutable_reexec_binary(
-                        &home_dir,
-                        &install_path,
-                        &expected_sha256,
-                    ) {
-                        Ok(prepared) => prepared,
-                        Err(err) => {
-                            let _ = writeln!(
-                                stderr,
-                                "chinwag bus daemon: re-exec refused for {}: {err}",
-                                install_path.display()
-                            );
-                            return 1;
-                        }
-                    };
                     if let Err(err) = rustix::process::fchdir(&prepared.dir_fd) {
                         let _ =
                             writeln!(stderr, "chinwag bus daemon: re-exec fchdir refused: {err}");
-                        drop(prepared.dir_fd);
-                        chinwag_cli::release_sync::clear_and_remove_immutable_dir(
-                            &prepared.dir_path,
-                        );
+                        chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
                         return 1;
                     }
                     let reexec_args = build_canonical_daemon_reexec_args(args, &repo_root);
@@ -3631,9 +3732,10 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                         .args(&reexec_args)
                         .exec();
                     let _ = writeln!(stderr, "chinwag bus daemon: re-exec failed: {err}");
-                    let _ = std::env::set_current_dir(&home_dir);
-                    drop(prepared.dir_fd);
-                    chinwag_cli::release_sync::clear_and_remove_immutable_dir(&prepared.dir_path);
+                    if let Ok(home_dir) = chinwag_cli::release_sync::resolve_home_dir() {
+                        let _ = std::env::set_current_dir(&home_dir);
+                    }
+                    chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
                     1
                 }
             }

@@ -253,6 +253,7 @@ pub struct PreparedImmutableReexec {
     pub dir_fd: File,
     pub dir_path: PathBuf,
     pub binary_path: PathBuf,
+    pub sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -952,16 +953,20 @@ fn acquire_release_sync_lock(home_dir: &Path) -> Result<File, ReleaseSyncError> 
 }
 
 fn ensure_private_dir(dir: &Path) -> Result<PathBuf, ReleaseSyncError> {
-    if let Ok(meta) = fs::symlink_metadata(dir) {
-        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-            return Err(ReleaseSyncError::SafePathViolation("symlink_or_non_dir"));
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(ReleaseSyncError::SafePathViolation("symlink_or_non_dir"));
+            }
         }
-    } else {
-        fs::create_dir_all(dir).map_err(|_| ReleaseSyncError::SafePathViolation("mkdir_failed"))?;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir).map_err(|e| classify_state_io_error("mkdir_failed", &e))?;
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+        Err(err) => return Err(classify_state_io_error("dir_stat_failed", &err)),
     }
-    let meta = fs::symlink_metadata(dir)
-        .map_err(|_| ReleaseSyncError::SafePathViolation("dir_stat_failed"))?;
+    let meta =
+        fs::symlink_metadata(dir).map_err(|e| classify_state_io_error("dir_stat_failed", &e))?;
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return Err(ReleaseSyncError::SafePathViolation("symlink_or_non_dir"));
     }
@@ -970,23 +975,31 @@ fn ensure_private_dir(dir: &Path) -> Result<PathBuf, ReleaseSyncError> {
 
 fn ensure_bin_and_staging_dirs(home_dir: &Path) -> Result<(PathBuf, PathBuf), ReleaseSyncError> {
     let local_dir = home_dir.join(".local");
-    if let Ok(meta) = fs::symlink_metadata(&local_dir) {
-        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-            return Err(ReleaseSyncError::SafePathViolation("invalid_dot_local"));
+    match fs::symlink_metadata(&local_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(ReleaseSyncError::SafePathViolation("invalid_dot_local"));
+            }
         }
-    } else {
-        fs::create_dir_all(&local_dir)
-            .map_err(|_| ReleaseSyncError::SafePathViolation("mkdir_dot_local"))?;
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&local_dir)
+                .map_err(|e| classify_state_io_error("mkdir_dot_local", &e))?;
+        }
+        Err(err) => return Err(classify_state_io_error("stat_dot_local", &err)),
     }
     let bin_dir = local_dir.join("bin");
-    if let Ok(meta) = fs::symlink_metadata(&bin_dir) {
-        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-            return Err(ReleaseSyncError::SafePathViolation("invalid_local_bin"));
+    match fs::symlink_metadata(&bin_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(ReleaseSyncError::SafePathViolation("invalid_local_bin"));
+            }
         }
-    } else {
-        fs::create_dir_all(&bin_dir)
-            .map_err(|_| ReleaseSyncError::SafePathViolation("mkdir_local_bin"))?;
-        let _ = fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o755));
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&bin_dir)
+                .map_err(|e| classify_state_io_error("mkdir_local_bin", &e))?;
+            let _ = fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o755));
+        }
+        Err(err) => return Err(classify_state_io_error("stat_local_bin", &err)),
     }
     let staging_dir = bin_dir.join(".staging");
     ensure_private_dir(&staging_dir)?;
@@ -1037,18 +1050,32 @@ pub fn load_release_sync_state(home_dir: &Path) -> Result<ReleaseSyncStateV1, Re
     Ok(state)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_INJECTED_SAVE_STATE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
 pub fn save_release_sync_state(
     home_dir: &Path,
     state: &ReleaseSyncStateV1,
 ) -> Result<(), ReleaseSyncError> {
     let chinwag_dir = ensure_private_dir(&home_dir.join(".chinwag"))?;
     let final_path = chinwag_dir.join("release_sync_state.json");
-    if let Ok(meta) = fs::symlink_metadata(&final_path)
-        && meta.file_type().is_symlink()
-    {
-        return Err(ReleaseSyncError::SafePathViolation(
-            "state_target_is_symlink",
-        ));
+    match fs::symlink_metadata(&final_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "state_target_is_symlink",
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(classify_state_io_error("stat_final", &err)),
+    }
+    #[cfg(test)]
+    if let Some(raw_errno) = TEST_INJECTED_SAVE_STATE_ERRNO.with(|c| c.take()) {
+        let injected = std::io::Error::from_raw_os_error(raw_errno);
+        return Err(classify_state_io_error("open_tmp", &injected));
     }
     let nonce = csprng_hex_16()?;
     let tmp_path = chinwag_dir.join(format!(
@@ -1063,13 +1090,12 @@ pub fn save_release_sync_state(
             .create_new(true)
             .mode(0o600)
             .open(&tmp_path)
-            .map_err(|_| ReleaseSyncError::StatePersistenceFailed("open_tmp".into()))?;
+            .map_err(|e| classify_state_io_error("open_tmp", &e))?;
         file.write_all(&serialized)
-            .map_err(|_| ReleaseSyncError::StatePersistenceFailed("write_tmp".into()))?;
+            .map_err(|e| classify_state_io_error("write_tmp", &e))?;
         file.sync_all()
-            .map_err(|_| ReleaseSyncError::StatePersistenceFailed("sync_tmp".into()))?;
-        fs::rename(&tmp_path, &final_path)
-            .map_err(|_| ReleaseSyncError::StatePersistenceFailed("rename".into()))?;
+            .map_err(|e| classify_state_io_error("sync_tmp", &e))?;
+        fs::rename(&tmp_path, &final_path).map_err(|e| classify_state_io_error("rename", &e))?;
         if let Ok(dir_file) = File::open(&chinwag_dir) {
             let _ = dir_file.sync_all();
         }
@@ -1612,12 +1638,20 @@ pub fn cleanup_stale_reexec_dirs(home_dir: &Path) {
     }
 }
 
-/// Copies `install_path` into a private per-process `0700` staging directory,
-/// verifies `expected_sha256` in constant time + strict macOS `codesign` while
-/// non-executable (`0600`), promotes to `0755`, locks BOTH the binary and its
-/// parent directory with kernel `UF_IMMUTABLE` (`uchg`), and re-verifies the
-/// pinned FD via `openat` so `fchdir(&dir_fd)` + `exec("./chinwag")` executes
-/// the exact verified vnode with zero ancestor or pathname TOCTOU window.
+pub fn cleanup_prepared_reexec(prepared: PreparedImmutableReexec) {
+    let dir_path = prepared.dir_path;
+    drop(prepared.dir_fd);
+    clear_and_remove_immutable_dir(&dir_path);
+}
+
+/// Atomically refreshes the authoritative verified `chinwag` release under
+/// `$HOME/.chinwag/release_sync.lock` (so concurrent `chinwag release publish` or
+/// `chinwag release sync` updates sharing `HOME` never cause stale-digest `DigestMismatch`
+/// while unauthorized on-disk tampering without matching verified state still fails closed),
+/// copies `install_path` into a private per-process `0700` staging directory under the lock,
+/// verifies digests in constant time + strict macOS `codesign` while non-executable (`0600`),
+/// promotes to `0755`, locks BOTH the binary and its parent directory with kernel
+/// `UF_IMMUTABLE` (`uchg`), and re-verifies the pinned FD via `openat`.
 pub fn prepare_immutable_reexec_binary(
     home_dir: &Path,
     install_path: &Path,
@@ -1626,42 +1660,84 @@ pub fn prepare_immutable_reexec_binary(
     let (_, staging_dir) = ensure_bin_and_staging_dirs(home_dir)?;
     let nonce = csprng_hex_16()?;
     let reexec_dir = staging_dir.join(format!("reexec.{}.{nonce}", std::process::id()));
-    fs::create_dir(&reexec_dir)
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("reexec mkdir: {e}")))?;
+    fs::create_dir(&reexec_dir).map_err(|e| classify_state_io_error("reexec mkdir", &e))?;
     fs::set_permissions(&reexec_dir, fs::Permissions::from_mode(0o700))
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("reexec chmod dir: {e}")))?;
+        .map_err(|e| classify_state_io_error("reexec chmod dir", &e))?;
     let binary_path = reexec_dir.join("chinwag");
     let mut guard = StagedOpGuard::new(reexec_dir.clone(), "chinwag");
 
     let (dir_fd, dir_id) = open_dir_nofollow(&reexec_dir)?;
     guard.bind_dir_fd(&dir_fd, dir_id);
-    let (mut src, src_fstat) = open_regular_file_nofollow(install_path, false, true)?;
-    if src_fstat.len() == 0 {
-        return Err(ReleaseSyncError::SourceUnavailable(
-            "reexec target is empty".into(),
-        ));
-    }
 
-    let dst_fd = rustix::fs::openat(
-        &dir_fd,
-        "chinwag",
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )
-    .map_err(|e| ReleaseSyncError::InstallFailed(format!("reexec stage create: {e}")))?;
-    let mut dst = File::from(dst_fd);
-    std::io::copy(&mut src, &mut dst)
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("reexec stage copy: {e}")))?;
-    dst.sync_all()
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("reexec stage sync: {e}")))?;
-    drop(dst);
-    drop(src);
+    let (target_sha256, verified_state_meta, copied_len) = {
+        let _lock = acquire_release_sync_lock(home_dir)?;
+        let canonical_chinwag_path = home_dir.join(".local/bin/chinwag");
+        let (target_sha256, verified_state_meta) = if install_path == canonical_chinwag_path {
+            let sync_state = load_release_sync_state(home_dir)?;
+            if let Some(st) = sync_state.binaries.get("chinwag") {
+                if st.binary != "chinwag"
+                    || st.target_triple != CURRENT_TARGET_TRIPLE
+                    || st.size_bytes == 0
+                    || st.size_bytes > MAX_RELEASE_BINARY_BYTES
+                {
+                    return Err(ReleaseSyncError::StatePersistenceFailed(
+                        "invalid_chinwag_sync_state".into(),
+                    ));
+                }
+                let st_sha = decode_lowercase_hex_32(&st.sha256).ok_or_else(|| {
+                    ReleaseSyncError::StatePersistenceFailed("invalid_chinwag_sha256".into())
+                })?;
+                let st_blake3 = decode_lowercase_hex_32(&st.blake3).ok_or_else(|| {
+                    ReleaseSyncError::StatePersistenceFailed("invalid_chinwag_blake3".into())
+                })?;
+                (st_sha, Some((st_blake3, st.size_bytes)))
+            } else {
+                (*expected_sha256, None)
+            }
+        } else {
+            (*expected_sha256, None)
+        };
+
+        let (mut src, src_fstat) = open_regular_file_nofollow(install_path, false, true)?;
+        if src_fstat.len() == 0 {
+            return Err(ReleaseSyncError::SourceUnavailable(
+                "reexec target is empty".into(),
+            ));
+        }
+
+        let dst_fd = rustix::fs::openat(
+            &dir_fd,
+            "chinwag",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|e| {
+            if is_transient_errno(e) {
+                ReleaseSyncError::TransientIo(format!("reexec stage create: {e}"))
+            } else {
+                ReleaseSyncError::InstallFailed(format!("reexec stage create: {e}"))
+            }
+        })?;
+        let mut dst = File::from(dst_fd);
+        std::io::copy(&mut src, &mut dst)
+            .map_err(|e| classify_state_io_error("reexec stage copy", &e))?;
+        dst.sync_all()
+            .map_err(|e| classify_state_io_error("reexec stage sync", &e))?;
+        drop(dst);
+        drop(src);
+        (target_sha256, verified_state_meta, src_fstat.len())
+    };
 
     let (mut pre_ro, pre_fstat) = open_regular_at_dir_nofollow(&dir_fd, "chinwag", true, true)?;
     let staged_id = (pre_fstat.dev(), pre_fstat.ino());
-    let (_, actual_sha, _) =
-        compute_digests_from_open_file(&mut pre_ro, src_fstat.len(), staged_id)?;
-    if !bool::from(actual_sha.ct_eq(expected_sha256)) {
+    let (actual_size, actual_sha, actual_blake3) =
+        compute_digests_from_open_file(&mut pre_ro, copied_len, staged_id)?;
+    if !bool::from(actual_sha.ct_eq(&target_sha256)) {
+        return Err(ReleaseSyncError::DigestMismatch);
+    }
+    if let Some((expected_blake3, expected_size)) = verified_state_meta
+        && (actual_size != expected_size || !bool::from(actual_blake3.ct_eq(&expected_blake3)))
+    {
         return Err(ReleaseSyncError::DigestMismatch);
     }
     verify_codesign_strict_in_dir(&dir_fd, "chinwag")?;
@@ -1686,9 +1762,14 @@ pub fn prepare_immutable_reexec_binary(
         return Err(ReleaseSyncError::SafePathViolation("reexec_bin_inode_swap"));
     }
     verify_fd_immutable(&pinned_ro)?;
-    let (_, post_sha, _) =
-        compute_digests_from_open_file(&mut pinned_ro, src_fstat.len(), staged_id)?;
-    if !bool::from(post_sha.ct_eq(expected_sha256)) {
+    let (post_size, post_sha, post_blake3) =
+        compute_digests_from_open_file(&mut pinned_ro, copied_len, staged_id)?;
+    if !bool::from(post_sha.ct_eq(&target_sha256)) {
+        return Err(ReleaseSyncError::DigestMismatch);
+    }
+    if let Some((expected_blake3, expected_size)) = verified_state_meta
+        && (post_size != expected_size || !bool::from(post_blake3.ct_eq(&expected_blake3)))
+    {
         return Err(ReleaseSyncError::DigestMismatch);
     }
 
@@ -1697,6 +1778,7 @@ pub fn prepare_immutable_reexec_binary(
         dir_fd,
         dir_path: reexec_dir,
         binary_path,
+        sha256: target_sha256,
     })
 }
 
@@ -2294,9 +2376,22 @@ fn apply_release_built_message_inner(
     // and already-installed publisher/peer binaries short-circuit in 0ms without R2 I/O.
     {
         let _lock = acquire_release_sync_lock(home_dir)?;
-        let local_matches = local_binary_sha256(&install_path)
-            .is_some_and(|actual| bool::from(actual.ct_eq(&expected_sha256)));
+        let local_matches = compute_file_digests(&install_path).is_ok_and(|(sz, sha, b3)| {
+            sz == manifest.size_bytes
+                && bool::from(sha.ct_eq(&expected_sha256))
+                && bool::from(b3.ct_eq(&expected_blake3))
+        });
         let mut sync_state = load_release_sync_state(home_dir)?;
+        let was_recorded = sync_state
+            .binaries
+            .get(&manifest.binary)
+            .is_some_and(|prev| {
+                decode_lowercase_hex_32(&prev.sha256)
+                    .is_some_and(|p| bool::from(p.ct_eq(&expected_sha256)))
+                    && prev.commit_epoch == manifest.commit_epoch
+                    && prev.built_at_ms == manifest.built_at_ms
+                    && prev.rollback == manifest.rollback
+            });
         let already_satisfied = check_monotonic_gate(
             sync_state.binaries.get(&manifest.binary),
             &manifest,
@@ -2311,6 +2406,23 @@ fn apply_release_built_message_inner(
                 Some(msg.id.clone()),
                 observed_max_epoch,
             )?;
+            if !was_recorded {
+                let receipt_message = build_release_installed_bus_message(
+                    home_dir,
+                    &manifest,
+                    local_iroh_endpoint.unwrap_or("unknown"),
+                    roots,
+                    receipt_key_override,
+                )
+                .ok()
+                .map(Box::new);
+                return Ok(ReleaseApplyOutcome::Installed {
+                    manifest,
+                    install_path,
+                    previous_backup_path: None,
+                    receipt_message,
+                });
+            }
             return Ok(ReleaseApplyOutcome::AlreadyInstalled {
                 manifest,
                 install_path,
@@ -6373,5 +6485,250 @@ mod tests {
                 .should_dispatch_catchup(t0 + Duration::from_secs(3600)),
             "unsafe symlinked journal path must fail closed without scheduling retries"
         );
+    }
+
+    #[test]
+    fn transient_state_persistence_failure_after_binary_replacement_retries_and_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let sub_home = temp.path().join("sub-home");
+        let build_dir = temp.path().join("build");
+        for d in [&pub_home, &sub_home, &build_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let journal = temp.path().join("messages.jsonl");
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = InMemoryArtifactStore::new();
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let src_bin = build_macho_test_binary(&build_dir, "state_retry_chinwag_v1");
+
+        let published = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &src_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("abcdef0123456789".into(), 700)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        fs::write(
+            &journal,
+            format!(
+                "{}\n",
+                serde_json::to_string(&published.release_built_message).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let sched = Mutex::new(ReleaseDaemonScheduler::default());
+        let t0 = Instant::now();
+
+        // 1. Inject a one-shot `EMFILE` inside `save_release_sync_state` AFTER
+        //    `atomic_install_staged_binary` has already replaced `~/.local/bin/chinwag`!
+        let emfile_errno = rustix::io::Errno::MFILE.raw_os_error();
+        TEST_INJECTED_SAVE_STATE_ERRNO.with(|c| c.set(Some(emfile_errno)));
+
+        let ev1 = execute_release_daemon_job_inner(
+            &sub_home,
+            &journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::LiveMessage(Box::new(published.release_built_message.clone())),
+            &mut || t0,
+        );
+        assert!(
+            matches!(
+                ev1.as_slice(),
+                [ReleaseDaemonEvent::Rejected {
+                    binary,
+                    retryable: true,
+                    next_retry_secs: Some(10),
+                    ..
+                }] if binary == "chinwag"
+            ),
+            "post-install EMFILE during state save MUST be retryable (`next_retry_secs: Some(10)`), got {ev1:?}"
+        );
+        // Binary on disk was already replaced, while `release_sync_state.json` was not persisted yet.
+        let expected_sha = decode_lowercase_hex_32(&published.manifest.sha256).unwrap();
+        assert_eq!(
+            local_binary_sha256(&sub_home.join(".local/bin/chinwag")),
+            Some(expected_sha)
+        );
+        assert!(!release_sync_state_path(&sub_home).exists());
+
+        // 2. Scheduler dispatches retry at `t0 + 10s`, persists state, and emits `Applied { Installed }`
+        //    with a signed `#ops` receipt so the daemon arms `pending_reexec` cleanly!
+        assert!(
+            sched
+                .lock()
+                .unwrap()
+                .poll_catchup_dispatch(false, t0 + Duration::from_secs(10))
+        );
+        let t_retry = t0 + Duration::from_secs(10);
+        let ev2 = execute_release_daemon_job_inner(
+            &sub_home,
+            &journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::StartupCatchup,
+            &mut || t_retry,
+        );
+        match ev2.as_slice() {
+            [ReleaseDaemonEvent::Applied { binary, outcome }] => {
+                assert_eq!(binary, "chinwag");
+                match outcome.as_ref() {
+                    ReleaseApplyOutcome::Installed {
+                        manifest,
+                        receipt_message,
+                        ..
+                    } => {
+                        assert_eq!(manifest.sha256, published.manifest.sha256);
+                        assert!(
+                            receipt_message.is_some(),
+                            "recovery install MUST emit signed #ops receipt"
+                        );
+                    }
+                    other => {
+                        panic!("expected Installed on post-rename state recovery, got {other:?}")
+                    }
+                }
+            }
+            other => panic!("expected Applied event on retry recovery, got {other:?}"),
+        }
+        let persisted = load_release_sync_state(&sub_home).unwrap();
+        assert_eq!(
+            persisted.binaries["chinwag"].sha256,
+            published.manifest.sha256
+        );
+    }
+
+    #[test]
+    fn concurrent_publisher_post_install_pre_publication_window_refreshes_and_pins_reexec_under_lock()
+     {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let shared_home = temp.path().join("shared-home");
+        let build_dir = temp.path().join("build");
+        fs::create_dir_all(&shared_home).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = Arc::new(InMemoryArtifactStore::new());
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+
+        let src_a = build_macho_test_binary(&build_dir, "concurrent_pub_a");
+        let src_b = build_macho_test_binary(&build_dir, "concurrent_pub_b");
+
+        // 1. Daemon / initial publisher installs release A in `shared_home` and retains `sha_a`.
+        let pub_a = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &shared_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &src_a,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("1111111111111111".into(), 100)),
+            },
+            store.as_ref(),
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        let sha_a = decode_lowercase_hex_32(&pub_a.manifest.sha256).unwrap();
+
+        // 2. Spawn a concurrent `chinwag release publish` for release B sharing `shared_home`,
+        //    and pause it inside `publish_bus` (simulating the post-install, pre-publication
+        //    window while crate-memory sync runs BEFORE B's bus message exists)!
+        let entered_pre_pub = Arc::new(Barrier::new(2));
+        let allow_finish_pub = Arc::new(Barrier::new(2));
+        let entered_clone = entered_pre_pub.clone();
+        let finish_clone = allow_finish_pub.clone();
+        let home_for_pub = shared_home.clone();
+        let build_for_pub = build_dir.clone();
+        let src_b_for_pub = src_b.clone();
+        let actor_for_pub = actor_str.clone();
+        let store_for_pub = store.clone();
+        let key_for_pub = infrajr_key.clone();
+
+        let pub_b_handle = std::thread::spawn(move || {
+            let local_table = [("INFRAJR", key_for_pub.verifying_key().to_bytes())];
+            let local_roots = ReleaseTrustRoots {
+                seat_pubkeys: &local_table,
+                allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            };
+            publish_release_inner(
+                PublishReleaseRequest {
+                    home_dir: &home_for_pub,
+                    repo_root: &build_for_pub,
+                    binary: "chinwag",
+                    source_binary_path: &src_b_for_pub,
+                    explicit_from: Some(&actor_for_pub),
+                    rollback: false,
+                    commit_override: Some(("2222222222222222".into(), 200)),
+                },
+                store_for_pub.as_ref(),
+                |_| {
+                    entered_clone.wait();
+                    finish_clone.wait();
+                    Ok(2)
+                },
+                &local_roots,
+                Some(&key_for_pub),
+            )
+            .unwrap()
+        });
+
+        // Wait until concurrent publisher B has replaced `~/.local/bin/chinwag` under lock
+        // and entered its pre-publication window (before B's bus message is published!).
+        entered_pre_pub.wait();
+
+        // 3. Daemon prepares re-exec while still holding stale `sha_a` from its own event loop:
+        //    `prepare_immutable_reexec_binary` MUST refresh under `release_sync.lock` to `B`
+        //    and pin an immutable `UF_IMMUTABLE` executable snapshot of `B` with zero `DigestMismatch`!
+        let install_path = shared_home.join(".local/bin/chinwag");
+        let prepared =
+            prepare_immutable_reexec_binary(&shared_home, &install_path, &sha_a).unwrap();
+
+        allow_finish_pub.wait();
+        let pub_b = pub_b_handle.join().unwrap();
+        let sha_b = decode_lowercase_hex_32(&pub_b.manifest.sha256).unwrap();
+        assert_ne!(sha_a, sha_b);
+        assert_eq!(
+            prepared.sha256, sha_b,
+            "re-exec preparation under lock MUST refresh to concurrent publisher B's verified digest"
+        );
+        assert_eq!(
+            local_binary_sha256(&prepared.binary_path),
+            Some(sha_b),
+            "pinned immutable re-exec binary must match release B byte-for-byte"
+        );
+        cleanup_prepared_reexec(prepared);
     }
 }
