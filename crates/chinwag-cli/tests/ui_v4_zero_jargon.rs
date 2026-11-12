@@ -1652,3 +1652,554 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to_end() {
+    let raw_temp_repo: PathBuf = std::env::temp_dir().join(format!(
+        "chinwag-ui-v44-d2-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(raw_temp_repo.join(".chinwag/bus")).unwrap();
+    let temp_repo = fs::canonicalize(&raw_temp_repo).unwrap();
+
+    fs::write(
+        temp_repo.join("TASKS.md"),
+        format!(
+            "### **`[IN_PROGRESS]`** `CHWG-4201` — Scope retry guard with DELIVERY-2 and {} on {}\n",
+            concat!("WORK", "HORSE#inst9"),
+            concat!("state.", "crdb"),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        temp_repo.join(".chinwag/slack.json"),
+        r#"{"verified":true,"workspace":"emun-labs"}"#,
+    )
+    .unwrap();
+
+    let ui_port = reserve_ephemeral_port();
+    let ui_addr: SocketAddr = format!("127.0.0.1:{ui_port}").parse().unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+        .args([
+            "ui",
+            "serve",
+            "--port",
+            &ui_port.to_string(),
+            "--repo",
+            temp_repo.to_str().unwrap(),
+        ])
+        .env("CHINWAG_NO_TELEMETRY", "1")
+        .env_remove("LINEAR_API_KEY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn chinwag ui serve for Delivery-2 E2E");
+    let _guard = ChildKillGuard(child);
+
+    let boot_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if TcpStream::connect_timeout(&ui_addr, Duration::from_millis(100)).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < boot_deadline,
+            "timed out waiting for chinwag ui on {ui_addr}"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    // 1. Fetch root / and verify Delivery-2 shell DOM + zero Phase 2 Duplex Voice stubs
+    let root_raw = send_raw_http(
+        ui_addr,
+        &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{ui_port}\r\n\r\n"),
+    );
+    let (root_hdr, root_body_bytes) = split_headers_and_body(&root_raw);
+    assert!(root_hdr.starts_with("HTTP/1.1 200 OK"), "{root_hdr}");
+    let root_html = String::from_utf8_lossy(root_body_bytes);
+    for required_dom in [
+        r#"id="d2-rail""#,
+        r#"id="d2-track""#,
+        r#"id="d2-spine""#,
+        r#"id="d2-drawer-scrim""#,
+        r#"id="btn-d2-drawer""#,
+        r#"aria-label="Delivery-2""#,
+    ] {
+        assert!(
+            root_html.contains(required_dom),
+            "GET / missing Delivery-2 shell DOM marker '{required_dom}'"
+        );
+    }
+    for voice_stub in ["d2-btn-mic", "d2-voice", "voice-call", "Start voice"] {
+        assert!(
+            !root_html.contains(voice_stub),
+            "Phase 1 (CHWG-0254) must render zero Duplex Voice stubs ('{voice_stub}')"
+        );
+    }
+    let (cookie_pair, csrf) = extract_cookie_and_csrf(&root_hdr, &root_html, ui_port);
+
+    // 2. Verify CSRF & Cross-Origin protection on /api/v1/delivery2/message
+    let missing_csrf_raw = send_raw_http(
+        ui_addr,
+        &format!(
+            "POST /api/v1/delivery2/message HTTP/1.1\r\n\
+             Host: 127.0.0.1:{ui_port}\r\n\
+             Origin: http://127.0.0.1:{ui_port}\r\n\
+             Content-Type: application/json\r\n\
+             Cookie: {cookie_pair}\r\n\
+             Content-Length: 27\r\n\r\n{{\"prompt\":\"What did I miss?\"}}"
+        ),
+    );
+    let (missing_csrf_hdr, _) = split_headers_and_body(&missing_csrf_raw);
+    assert!(
+        missing_csrf_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+        "missing CSRF token must return 403: {missing_csrf_hdr}"
+    );
+
+    let evil_origin_raw = send_raw_http(
+        ui_addr,
+        &format!(
+            "POST /api/v1/delivery2/message HTTP/1.1\r\n\
+             Host: 127.0.0.1:{ui_port}\r\n\
+             Origin: https://evil.example\r\n\
+             Content-Type: application/json\r\n\
+             Cookie: {cookie_pair}\r\n\
+             X-Chinwag-Csrf: {csrf}\r\n\
+             Content-Length: 27\r\n\r\n{{\"prompt\":\"What did I miss?\"}}"
+        ),
+    );
+    let (evil_origin_hdr, _) = split_headers_and_body(&evil_origin_raw);
+    assert!(
+        evil_origin_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+        "cross-origin Origin must return 403: {evil_origin_hdr}"
+    );
+
+    // Also verify GET /api/v1/delivery2/state rejects unauthenticated GET without X-Chinwag-Csrf
+    let unauth_get_raw = send_raw_http(
+        ui_addr,
+        &format!(
+            "GET /api/v1/delivery2/state HTTP/1.1\r\n\
+             Host: 127.0.0.1:{ui_port}\r\n\
+             Sec-Fetch-Site: same-origin\r\n\
+             Cookie: {cookie_pair}\r\n\r\n"
+        ),
+    );
+    let (unauth_get_hdr, _) = split_headers_and_body(&unauth_get_raw);
+    assert!(
+        unauth_get_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+        "GET /api/v1/delivery2/state without CSRF header must return 403: {unauth_get_hdr}"
+    );
+
+    // Also verify all 4 remaining POST /api/v1/delivery2/* routes reject requests missing X-Chinwag-Csrf (`403 Forbidden`)
+    for (route_path, sample_body) in [
+        ("/api/v1/delivery2/cancel", r#"{"turn_id":"t1"}"#),
+        (
+            "/api/v1/delivery2/approval",
+            r#"{"id":"hitl-1","decision":"deny"}"#,
+        ),
+        (
+            "/api/v1/delivery2/memory",
+            r#"{"id":"mem_default","action":"undo"}"#,
+        ),
+        ("/api/v1/delivery2/thread", r#"{"action":"new"}"#),
+    ] {
+        let unauth_post_raw = send_raw_http(
+            ui_addr,
+            &format!(
+                "POST {route_path} HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{ui_port}\r\n\
+                 Sec-Fetch-Site: same-origin\r\n\
+                 Origin: http://127.0.0.1:{ui_port}\r\n\
+                 Content-Type: application/json\r\n\
+                 Cookie: {cookie_pair}\r\n\
+                 Content-Length: {}\r\n\r\n{sample_body}",
+                sample_body.len()
+            ),
+        );
+        let (unauth_post_hdr, _) = split_headers_and_body(&unauth_post_raw);
+        assert!(
+            unauth_post_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+            "{route_path} without CSRF header must return 403: {unauth_post_hdr}"
+        );
+    }
+
+    let get_auth_json = |path: &str| -> (String, String, Value) {
+        let req = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: 127.0.0.1:{ui_port}\r\n\
+             Sec-Fetch-Site: same-origin\r\n\
+             Cookie: {cookie_pair}\r\n\
+             X-Chinwag-Csrf: {csrf}\r\n\r\n"
+        );
+        let raw = send_raw_http(ui_addr, &req);
+        let (hdr, b) = split_headers_and_body(&raw);
+        let s = String::from_utf8_lossy(b).to_string();
+        let v: Value = serde_json::from_slice(b).unwrap_or_else(|_| json!({}));
+        (hdr, s, v)
+    };
+
+    let post_json = |path: &str, payload: Value| -> (String, String, Value) {
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: 127.0.0.1:{ui_port}\r\n\
+             Sec-Fetch-Site: same-origin\r\n\
+             Origin: http://127.0.0.1:{ui_port}\r\n\
+             Content-Type: application/json\r\n\
+             Cookie: {cookie_pair}\r\n\
+             X-Chinwag-Csrf: {csrf}\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body_bytes.len(),
+            String::from_utf8_lossy(&body_bytes)
+        );
+        let raw = send_raw_http(ui_addr, &req);
+        let (hdr, b) = split_headers_and_body(&raw);
+        let s = String::from_utf8_lossy(b).to_string();
+        let v: Value = serde_json::from_slice(b).unwrap_or_else(|_| json!({}));
+        (hdr, s, v)
+    };
+
+    // 3. GET /api/v1/delivery2/state — 4 surfaces, 3 deterministic Morning focus rows, 12-step run card, zero jargon
+    let (state_hdr, state_str, state_json) = get_auth_json("/api/v1/delivery2/state");
+    assert!(state_hdr.starts_with("HTTP/1.1 200 OK"), "{state_hdr}");
+    assert_zero_customer_jargon("/api/v1/delivery2/state", &state_str);
+    assert_verified_chinwag_sh_routes_and_no_404s("/api/v1/delivery2/state", &state_str);
+    assert_eq!(state_json["agent_name"], "Delivery-2");
+    assert_eq!(
+        state_json["sync_radar"]["surfaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        state_json["morning_focus"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let slack_surface = state_json["sync_radar"]["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "slack")
+        .expect("Slack surface in sync_radar");
+    assert_eq!(slack_surface["role_mode"], "ambient_status_only");
+    assert_eq!(
+        slack_surface["auth_status"],
+        "Connected · ambient status cards only"
+    );
+
+    // 4. POST /api/v1/delivery2/message — preserves "Delivery-2" allow-mask while scrubbing bare DELIVERY, seats, vendors & crypto
+    let mixed_prompt = format!(
+        "Ask DELIVERY-2 and delivery 2 how bare DELIVERY, {}, {}, and {} handled #CHWG-4201 on the eve of release",
+        concat!("WORK", "HORSE"),
+        concat!("state.", "crdb"),
+        concat!("Ver", "cel")
+    );
+    let (msg_hdr, msg_str, msg_json) = post_json(
+        "/api/v1/delivery2/message",
+        json!({ "prompt": mixed_prompt, "turn_id": "turn-e2e-1" }),
+    );
+    assert!(msg_hdr.starts_with("HTTP/1.1 200 OK"), "{msg_hdr}");
+    assert_zero_customer_jargon("POST /api/v1/delivery2/message", &msg_str);
+    assert!(
+        msg_str.contains("Delivery-2"),
+        "5-stage scrubber must preserve canonical 'Delivery-2': {msg_str}"
+    );
+    assert!(
+        !msg_str.contains("DELIVERY-2") && !msg_str.contains("delivery 2"),
+        "5-stage scrubber must canonicalize case/space variants to 'Delivery-2': {msg_str}"
+    );
+    assert_eq!(msg_json["entry"]["kind"], "qa_card");
+
+    // 5. Secret-shape rejection (400) + valid Remember memory save + edit/undo/restore by mem_<id>
+    let fake_secret = format!(
+        "Remember: api key {}{}",
+        "sk-", "live9876543210abcdef123456"
+    );
+    let (sec_hdr, _sec_str, sec_json) = post_json(
+        "/api/v1/delivery2/message",
+        json!({ "prompt": fake_secret }),
+    );
+    assert!(sec_hdr.starts_with("HTTP/1.1 400 Bad Request"), "{sec_hdr}");
+    assert_eq!(sec_json["error_code"], "secret_rejected");
+
+    let (mem_save_hdr, mem_save_str, mem_save_json) = post_json(
+        "/api/v1/delivery2/message",
+        json!({ "prompt": "Remember: Run payment webhook smoke checks before merging." }),
+    );
+    assert!(
+        mem_save_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{mem_save_hdr}"
+    );
+    assert_zero_customer_jargon("POST /api/v1/delivery2/message (memory)", &mem_save_str);
+    let mem_id = mem_save_json["memory"]["id"]
+        .as_str()
+        .expect("stable mem_<id>")
+        .to_string();
+    assert!(
+        mem_id.starts_with("mem_"),
+        "expected mem_ prefix, got {mem_id}"
+    );
+
+    let (mem_edit_hdr, _, mem_edit_json) = post_json(
+        "/api/v1/delivery2/memory",
+        json!({ "id": mem_id, "action": "edit", "note": "Run webhook and idempotency checks before merging." }),
+    );
+    assert!(
+        mem_edit_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{mem_edit_hdr}"
+    );
+    assert_eq!(
+        mem_edit_json["memory"]["note"],
+        "Run webhook and idempotency checks before merging."
+    );
+
+    let (mem_undo_hdr, _, mem_undo_json) = post_json(
+        "/api/v1/delivery2/memory",
+        json!({ "id": mem_id, "action": "undo" }),
+    );
+    assert!(
+        mem_undo_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{mem_undo_hdr}"
+    );
+    assert_eq!(mem_undo_json["memory"]["status"], "undone");
+
+    let (mem_restore_hdr, _, mem_restore_json) = post_json(
+        "/api/v1/delivery2/memory",
+        json!({ "id": mem_id, "action": "restore" }),
+    );
+    assert!(
+        mem_restore_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{mem_restore_hdr}"
+    );
+    assert_eq!(mem_restore_json["memory"]["status"], "saved");
+
+    // 6. POST /api/v1/delivery2/approval — blocks sample walkthrough (including hitl-sample-walkthrough without is_sample),
+    // enforces first-answer-wins HITL & verified-receipt OAuth pause-and-resume (zero hardcoded Slack or unverified JSON bypass)
+    for sample_payload in [
+        json!({ "id": "sample-walkthrough", "decision": "approve", "is_sample": true }),
+        json!({ "id": "hitl-sample-walkthrough", "decision": "approve" }),
+    ] {
+        let (sample_hitl_hdr, _, sample_hitl_json) =
+            post_json("/api/v1/delivery2/approval", sample_payload.clone());
+        assert!(
+            sample_hitl_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+            "expected 403 for {sample_payload}, got {sample_hitl_hdr}"
+        );
+        assert_eq!(
+            sample_hitl_json["error_code"],
+            "SampleWalkthroughShipForbidden"
+        );
+    }
+
+    let (hitl1_hdr, _, hitl1_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({ "id": "hitl-CHWG-4201", "item_id": "CHWG-4201", "decision": "approve" }),
+    );
+    assert!(hitl1_hdr.starts_with("HTTP/1.1 200 OK"), "{hitl1_hdr}");
+    assert_eq!(hitl1_json["decision"], "approved");
+    assert_eq!(hitl1_json["already_settled"], false);
+    assert_eq!(hitl1_json["credits_while_paused"], 0);
+
+    let (hitl2_hdr, _, hitl2_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({ "id": "hitl-CHWG-4201", "item_id": "CHWG-4201", "decision": "deny" }),
+    );
+    assert!(hitl2_hdr.starts_with("HTTP/1.1 200 OK"), "{hitl2_hdr}");
+    assert_eq!(
+        hitl2_json["decision"], "approved",
+        "first answer must win idempotently"
+    );
+    assert_eq!(hitl2_json["already_settled"], true);
+
+    let (oauth_conn_hdr, oauth_conn_str, oauth_conn_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({ "kind": "oauth", "surface": "linear", "decision": "connect" }),
+    );
+    assert!(
+        oauth_conn_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{oauth_conn_hdr}"
+    );
+    assert_verified_chinwag_sh_routes_and_no_404s("oauth connect", &oauth_conn_str);
+    assert_eq!(oauth_conn_json["credits_while_paused"], 0);
+    let oauth_card = oauth_conn_json["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "entry-oauth-linear")
+        .expect("entry-oauth-linear card mounted");
+    let oauth_nonce = oauth_card["oauth_state"]
+        .as_str()
+        .expect("oauth_state nonce on oauth_card")
+        .to_string();
+
+    // Legacy self-asserted 'authorize' bypass must be rejected (400 invalid_oauth_action)
+    let (oauth_legacy_hdr, _, oauth_legacy_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({ "kind": "oauth", "surface": "linear", "decision": "authorize" }),
+    );
+    assert!(
+        oauth_legacy_hdr.starts_with("HTTP/1.1 400 Bad Request"),
+        "{oauth_legacy_hdr}"
+    );
+    assert_eq!(oauth_legacy_json["error_code"], "invalid_oauth_action");
+
+    // 'verify' while Linear is not yet configured must fail closed (409 oauth_not_verified)
+    let (oauth_unlinked_hdr, _, oauth_unlinked_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "kind": "oauth",
+            "surface": "linear",
+            "decision": "verify",
+            "oauth_state": oauth_nonce,
+            "thread_id": "thr-main"
+        }),
+    );
+    assert!(
+        oauth_unlinked_hdr.starts_with("HTTP/1.1 409 Conflict"),
+        "{oauth_unlinked_hdr}"
+    );
+    assert_eq!(oauth_unlinked_json["error_code"], "oauth_not_verified");
+    assert_eq!(oauth_unlinked_json["authorized"], false);
+
+    // Unverified config file without `"verified": true` + matching `oauth_state` must ALSO fail closed (409 oauth_not_verified)
+    fs::write(temp_repo.join(".chinwag/linear.json"), r#"{"team":"ENG"}"#).unwrap();
+    let (oauth_unverified_file_hdr, _, oauth_unverified_file_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "kind": "oauth",
+            "surface": "linear",
+            "decision": "verify",
+            "oauth_state": oauth_nonce,
+            "thread_id": "thr-main"
+        }),
+    );
+    assert!(
+        oauth_unverified_file_hdr.starts_with("HTTP/1.1 409 Conflict"),
+        "{oauth_unverified_file_hdr}"
+    );
+    assert_eq!(
+        oauth_unverified_file_json["error_code"],
+        "oauth_not_verified"
+    );
+
+    // Unlinked Slack (no `.chinwag/slack.json` receipt) must ALSO fail closed (zero hardcoded `"slack" => true`)
+    fs::remove_file(temp_repo.join(".chinwag/slack.json")).unwrap();
+    let (_, _, slack_conn_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({ "kind": "oauth", "surface": "slack", "decision": "connect" }),
+    );
+    let slack_nonce = slack_conn_json["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == "entry-oauth-slack")
+        .unwrap()["oauth_state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (slack_unlinked_hdr, _, slack_unlinked_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "kind": "oauth",
+            "surface": "slack",
+            "decision": "verify",
+            "oauth_state": slack_nonce,
+            "thread_id": "thr-main"
+        }),
+    );
+    assert!(
+        slack_unlinked_hdr.starts_with("HTTP/1.1 409 Conflict"),
+        "{slack_unlinked_hdr}"
+    );
+    assert_eq!(slack_unlinked_json["error_code"], "oauth_not_verified");
+
+    // Once the workspace has a verified Linear receipt bound to `oauth_state`, 'verify' succeeds!
+    fs::write(
+        temp_repo.join(".chinwag/linear.json"),
+        format!(r#"{{"verified":true,"account":"emun-eng","oauth_state":"{oauth_nonce}"}}"#),
+    )
+    .unwrap();
+
+    let (oauth_verify_hdr, _, oauth_verify_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "kind": "oauth",
+            "surface": "linear",
+            "decision": "verify",
+            "oauth_state": oauth_nonce,
+            "thread_id": "thr-main"
+        }),
+    );
+    assert!(
+        oauth_verify_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{oauth_verify_hdr}"
+    );
+    assert_eq!(oauth_verify_json["authorized"], true);
+    assert_eq!(oauth_verify_json["decision"], "verified");
+
+    // 7. POST /api/v1/delivery2/cancel (clamping partial reply) + cursor ?since_seq= + /api/v1/delivery2/thread
+    let (_, _, long_msg_json) = post_json(
+        "/api/v1/delivery2/message",
+        json!({ "prompt": "What did I miss?", "turn_id": "turn-live-99" }),
+    );
+    let stop_eid = long_msg_json["entry"]["id"].as_str().unwrap().to_string();
+    let (cancel_hdr, _, cancel_json) = post_json(
+        "/api/v1/delivery2/cancel",
+        json!({ "turn_id": "turn-live-99", "entry_id": stop_eid, "truncated_len": 12 }),
+    );
+    assert!(cancel_hdr.starts_with("HTTP/1.1 200 OK"), "{cancel_hdr}");
+    assert_eq!(cancel_json["cancelled"], true);
+    assert_eq!(cancel_json["credits_charged"], 0);
+    let stopped_entry = cancel_json["state"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == stop_eid)
+        .expect("stopped qa_card persisted");
+    assert_eq!(
+        stopped_entry["body"].as_str().unwrap().chars().count(),
+        12,
+        "cancel truncated_len must clamp persisted qa_card body to displayed prefix"
+    );
+
+    let cursor_now = cancel_json["seq"].as_u64().unwrap();
+    let (cur_hdr, _, cur_json) =
+        get_auth_json(&format!("/api/v1/delivery2/state?since_seq={cursor_now}"));
+    assert!(cur_hdr.starts_with("HTTP/1.1 200 OK"), "{cur_hdr}");
+    assert_eq!(cur_json["unchanged"], true);
+    assert_eq!(cur_json["delta_entries"], json!([]));
+
+    let (thr_new_hdr, _, thr_new_json) =
+        post_json("/api/v1/delivery2/thread", json!({ "action": "new" }));
+    assert!(thr_new_hdr.starts_with("HTTP/1.1 200 OK"), "{thr_new_hdr}");
+    let new_tid = thr_new_json["active_thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(new_tid, "thr-main");
+
+    let (thr_sw_hdr, _, thr_sw_json) = post_json(
+        "/api/v1/delivery2/thread",
+        json!({ "action": "switch", "thread_id": "thr-main" }),
+    );
+    assert!(thr_sw_hdr.starts_with("HTTP/1.1 200 OK"), "{thr_sw_hdr}");
+    assert_eq!(thr_sw_json["active_thread_id"], "thr-main");
+
+    let (mf_hdr, _, mf_json) = post_json(
+        "/api/v1/delivery2/thread",
+        json!({ "action": "morning_focus", "seen": true, "collapsed": true }),
+    );
+    assert!(mf_hdr.starts_with("HTTP/1.1 200 OK"), "{mf_hdr}");
+    assert_eq!(mf_json["state"]["morning_focus"]["seen"], true);
+    assert_eq!(mf_json["state"]["morning_focus"]["collapsed"], true);
+
+    let _ = fs::remove_dir_all(&temp_repo);
+}

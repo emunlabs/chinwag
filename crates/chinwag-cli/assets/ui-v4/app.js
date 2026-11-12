@@ -104,7 +104,66 @@ const ICONS = {
     { d: "M9.5 2.5h4v4" },
     { d: "M13.5 2.5L7.5 8.5" },
   ], { className: "icon-svg sm" }),
+  rail: () => svgIcon([
+    { tag: "rect", x: "2", y: "2.5", width: "12", height: "11", rx: "2" },
+    { d: "M6 2.5v11" },
+  ], { className: "icon-svg sm" }),
+  plus: () => svgIcon([
+    { d: "M8 3.2v9.6M3.2 8h9.6" },
+  ], { className: "icon-svg sm" }),
+  clock: () => svgIcon([
+    { tag: "circle", cx: "8", cy: "8", r: "5.5" },
+    { d: "M8 5v3.3l2.2 1.4" },
+  ], { className: "icon-svg sm" }),
+  chevronRight: () => svgIcon([
+    { d: "M6 3.8L10.2 8 6 12.2" },
+  ], { className: "icon-svg sm d2-chevron" }),
+  compose: () => svgIcon([
+    { d: "M10.8 2.6l2.6 2.6-7.6 7.6H3.2v-2.6l7.6-7.6z" },
+  ], { className: "icon-svg sm" }),
+  send: () => svgIcon([
+    { d: "M8 12.5V3.5" },
+    { d: "M4.5 7L8 3.5 11.5 7" },
+  ], { className: "icon-svg sm" }),
+  stop: () => svgIcon([
+    { tag: "rect", x: "4.2", y: "4.2", width: "7.6", height: "7.6", rx: "1.4" },
+  ], { className: "icon-svg sm" }),
 };
+
+function healUnclosedInlineMarkdown(raw) {
+  let s = String(raw ?? "");
+  const tickCount = (s.match(/`/g) || []).length;
+  if (tickCount % 2 === 1) s += "`";
+  const boldCount = (s.match(/\*\*/g) || []).length;
+  if (boldCount % 2 === 1) s += "**";
+  return s;
+}
+
+function renderHealedInlineMarkdown(rawText) {
+  const healed = healUnclosedInlineMarkdown(rawText);
+  const nodes = [];
+  const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+  let lastIdx = 0;
+  for (const match of healed.matchAll(pattern)) {
+    const idx = match.index ?? 0;
+    if (idx > lastIdx) {
+      nodes.push(healed.slice(lastIdx, idx));
+    }
+    const token = match[0];
+    if (token.startsWith("**") && token.endsWith("**") && token.length > 4) {
+      nodes.push(el("strong", null, token.slice(2, -2)));
+    } else if (token.startsWith("`") && token.endsWith("`") && token.length > 2) {
+      nodes.push(el("code", { className: "pill-code" }, token.slice(1, -1)));
+    } else {
+      nodes.push(token);
+    }
+    lastIdx = idx + token.length;
+  }
+  if (lastIdx < healed.length) {
+    nodes.push(healed.slice(lastIdx));
+  }
+  return nodes;
+}
 
 function fact(value, format = (x) => String(x), extraClass = "") {
   if (isAbsent(value)) return null;
@@ -629,12 +688,15 @@ export function trackUiEvent(event, props = {}) {
   }).catch(() => {});
 }
 
-async function apiRequest(method, path, bodyObj = null) {
+async function apiRequest(method, path, bodyObj = null, extraOpts = null) {
   const init = {
     method,
     headers: buildSecurityHeaders(bodyObj !== null || method === "POST"),
     credentials: "same-origin",
   };
+  if (extraOpts && extraOpts.signal) {
+    init.signal = extraOpts.signal;
+  }
   if (bodyObj !== null) {
     init.body = JSON.stringify(bodyObj);
   } else if (method === "POST") {
@@ -775,6 +837,21 @@ const PUBLISHED_COST_SCHEDULE = [
   { label: "GitHub Projects, Linear sync, and local CLI commands", detail: "Board status sync and terminal commands never use credits", cost: "0 Cr" },
 ];
 
+const DELIVERY2_DEFAULT_STEPS = [
+  ["01", "Queued"],
+  ["02", "Understood"],
+  ["03", "Plan ready"],
+  ["04", "Estimate ready"],
+  ["05", "Writing changes"],
+  ["06", "Tests added"],
+  ["07", "Checks running"],
+  ["08", "Fixing checks"],
+  ["09", "Independent review"],
+  ["10", "Waiting for you"],
+  ["11", "Final checks"],
+  ["12", "Passed · Merge-ready"],
+];
+
 const state = {
   booted: false,
   bootstrapOk: false,
@@ -802,6 +879,30 @@ const state = {
   activeMinutes: 1,
   transportMode: "sse",
   reconnectCount: 0,
+  d2Popover: null,
+  d2PopoverSeq: 0,
+  d2FocusedSurface: null,
+  d2DrawerOpen: false,
+  d2DrawerTriggerEl: null,
+  d2AutoCollapsedForSheet: false,
+  d2PreSheetRail: null,
+  d2ComposerDraft: "",
+  d2ComposerError: null,
+  d2Sending: false,
+  d2ActiveTurnId: null,
+  d2ActiveTurnThreadId: null,
+  d2CancelledTurnIds: new Set(),
+  d2CancelledTurns: new Map(),
+  d2ActiveAbort: null,
+  d2ActiveStreamer: null,
+  d2StreamingEntryId: null,
+  d2StreamingText: "",
+  d2LastCursorSeq: 0,
+  d2Loaded: false,
+  d2ExpandedSteps: new Set(),
+  d2ExpandedSources: new Set(),
+  d2EditingMemId: null,
+  d2EditingMemDraft: "",
   data: createEmptyData(),
 };
 
@@ -888,6 +989,181 @@ function createEmptyData() {
       join_command: "npx chinwag join",
       referral_url: "https://chinwag.sh/pricing?source=local_ui_referral",
       bonus_credits: 250,
+    },
+    delivery2: createDefaultDelivery2State(),
+  };
+}
+
+function buildDefaultStepLadder(activeOneBased = 10, completedAll = false) {
+  return DELIVERY2_DEFAULT_STEPS.map(([num, label], idx) => {
+    const stepNo = idx + 1;
+    let stepState = "pending";
+    if (completedAll || stepNo < activeOneBased) stepState = "done";
+    else if (stepNo === activeOneBased) stepState = stepNo === 10 ? "waiting" : "active";
+    return {
+      num,
+      label,
+      display: `${num} · ${label}`,
+      state: stepState,
+    };
+  });
+}
+
+function createDefaultDelivery2State() {
+  const portNum = Number(SERVER_PORT) || 5487;
+  return {
+    agent_name: "Delivery-2",
+    seq: 1,
+    status: "waiting_for_you",
+    status_label: "Waiting for you",
+    active_thread_id: "thr-main",
+    sync_radar: {
+      latency_ms: 42,
+      latency_label: "<200ms",
+      surfaces: [
+        {
+          id: "local",
+          label: "Local",
+          authorized: true,
+          in_thread: true,
+          locked_in_thread: true,
+          role_mode: "workspace",
+          auth_status: `Loopback workspace · 127.0.0.1:${portNum}`,
+          connect_url: null,
+          policy_note: null,
+        },
+        {
+          id: "github",
+          label: "GitHub",
+          authorized: false,
+          in_thread: false,
+          locked_in_thread: false,
+          role_mode: "full",
+          auth_status: "Needs sign-in · pauses at 0 Cr",
+          connect_url: "https://chinwag.sh/open?connect=github&source=local_ui",
+          policy_note: null,
+        },
+        {
+          id: "linear",
+          label: "Linear",
+          authorized: false,
+          in_thread: false,
+          locked_in_thread: false,
+          role_mode: "full",
+          auth_status: "Needs sign-in · pauses at 0 Cr",
+          connect_url: "https://chinwag.sh/open?connect=linear&source=local_ui",
+          policy_note: null,
+        },
+        {
+          id: "slack",
+          label: "Slack",
+          authorized: false,
+          in_thread: false,
+          locked_in_thread: false,
+          role_mode: "ambient_status_only",
+          auth_status: "Needs sign-in · pauses at 0 Cr",
+          connect_url: "https://chinwag.sh/open?connect=slack&source=local_ui",
+          policy_note:
+            "Slack posts ambient status cards with [Open in Chinwag ↗] deep-links only — Delivery-2 lives here in Chinwag.",
+        },
+      ],
+    },
+    morning_focus: {
+      seen: false,
+      collapsed: false,
+      rows: [
+        { id: "mf-inbox", badge: "1", label: "diff ready for your review", cta: "Inbox", target_tab: "inbox", hash: "#inbox" },
+        { id: "mf-board", badge: "0", label: "queued tasks on Board", cta: "Board", target_tab: "board", hash: "#board" },
+        { id: "mf-credits", badge: "500 Cr", label: "available in workspace pool", cta: "Credits", target_tab: "credits", hash: "#credits" },
+      ],
+    },
+    entries: [
+      {
+        id: "entry-seed-qa",
+        kind: "qa_card",
+        seq: 1,
+        role: "assistant",
+        author: "Delivery-2",
+        body: "Workspace **chinwag** on `main` has **1** change ready for review, **0** queued board tasks, and **500 Cr** available. Pairing uses **Claude Code** with independent review by **Codex CLI**.",
+        sources: [
+          { label: "Inbox · 1 waiting", target_tab: "inbox", hash: "#inbox" },
+          { label: "Board · 0 active / 0 queued", target_tab: "board", hash: "#board" },
+          { label: "Safety rules · 4 protected globs", target_tab: "agents", hash: "#agents" },
+          { label: "Credits · 500 Cr available", target_tab: "credits", hash: "#credits" },
+        ],
+      },
+      {
+        id: "entry-run-run-local-1",
+        kind: "run_card",
+        seq: 1,
+        run_id: "run-local-1",
+        title: "Verify protected-path safety & test checks before merge",
+        current_step_num: "10",
+        current_step_label: "Waiting for you",
+        current_step_display: "10 · Waiting for you",
+        completed: false,
+        verb_summary: "Searched 8 items · Read 4 files · Ran 3 checks",
+        diff_target_id: "sample-walkthrough",
+        steps: buildDefaultStepLadder(10, false),
+      },
+      {
+        id: "entry-hitl-run-local-1",
+        kind: "approval_card",
+        seq: 1,
+        approval_id: "hitl-run-local-1",
+        item_id: "run-local-1",
+        is_sample: false,
+        status_badge: "Waiting for you",
+        pause_badge: "Paused · 0 Cr",
+        estimate_badge: "~20 Cr to finish",
+        title: "Verify protected-path safety & test checks before merge",
+        question: "Review workspace guardrails on `main` (open View diff → for safe sample preview)?",
+        diff_summary: "No local diff recorded yet · Sample preview available",
+        check_proof: "Automated test receipt not yet recorded · Independent review not yet recorded",
+        diff_hash: "#walkthrough",
+        settled: false,
+        settled_decision: null,
+        settled_receipt: null,
+      },
+      {
+        id: "entry-mem-seed",
+        kind: "memory_card",
+        seq: 1,
+        memory_id: "mem_default",
+        note: "Run unit tests in an isolated sandbox before opening a review.",
+        status: "saved",
+      },
+    ],
+    history: {
+      today: [
+        {
+          id: "thr-main",
+          title: "Workspace scope & morning review",
+          status: "Waiting for you",
+          active: true,
+          updated_at: "Today",
+        },
+      ],
+      earlier: [],
+    },
+    memories: [
+      {
+        id: "mem_default",
+        note: "Run unit tests in an isolated sandbox before opening a review.",
+        status: "saved",
+        updated_at: "Saved",
+      },
+    ],
+    steering_chips: [
+      { id: "chip-missed", label: "What did I miss?", prompt: "What did I miss?" },
+      { id: "chip-why", label: "Why #sample?", prompt: "Why #sample-walkthrough?" },
+      { id: "chip-credits", label: "Today's Credits", prompt: "Today's Credits" },
+    ],
+    links: {
+      security_url: "https://chinwag.sh/security",
+      founders_url: "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
+      open_url: "https://chinwag.sh/open",
+      pricing_url: "https://chinwag.sh/pricing",
     },
   };
 }
@@ -1232,7 +1508,277 @@ function normalizeBootstrap(raw) {
     if (Number.isFinite(Number(raw.invite.bonus_credits))) next.invite.bonus_credits = Number(raw.invite.bonus_credits);
   }
 
+  next.delivery2 = normalizeDelivery2State(raw.delivery2, next);
+
   return next;
+}
+
+function safeChinwagOutboundUrl(raw, fallback = "https://chinwag.sh/open") {
+  const s = String(raw ?? "").trim();
+  if (!s || /[\u0000-\u001F\u007F\s]/.test(s)) return fallback;
+  const allowedPrefix =
+    s === "https://chinwag.sh/security" ||
+    s === "https://chinwag.sh/pricing" ||
+    s.startsWith("https://chinwag.sh/pricing?") ||
+    s.startsWith("https://chinwag.sh/pricing#") ||
+    s === "https://chinwag.sh/open" ||
+    s.startsWith("https://chinwag.sh/open?");
+  if (!allowedPrefix) return fallback;
+  const tailLower = s.slice("https://chinwag.sh/".length).toLowerCase();
+  if (
+    tailLower.includes("://") ||
+    tailLower.includes("//") ||
+    tailLower.includes("\\") ||
+    tailLower.includes("@") ||
+    tailLower.includes("javascript:") ||
+    tailLower.includes("data:") ||
+    tailLower.includes("%2f") ||
+    tailLower.includes("%5c") ||
+    tailLower.includes("%25") ||
+    tailLower.includes("%3a") ||
+    tailLower.includes("%40")
+  ) {
+    return fallback;
+  }
+  return s;
+}
+
+function reconcileCancelledDelivery2State(d2) {
+  if (!d2 || typeof d2 !== "object" || !Array.isArray(d2.entries)) return d2;
+  const cancelledMap = state.d2CancelledTurns instanceof Map ? state.d2CancelledTurns : null;
+  const cancelledSet = state.d2CancelledTurnIds instanceof Set ? state.d2CancelledTurnIds : null;
+  if ((!cancelledMap || cancelledMap.size === 0) && (!cancelledSet || cancelledSet.size === 0)) {
+    return d2;
+  }
+  d2.entries = d2.entries
+    .filter((entry) => {
+      if (!entry || typeof entry !== "object") return false;
+      const tId = entry.turn_id ? String(entry.turn_id) : "";
+      if (entry.kind === "run_card" && tId) {
+        const rec = cancelledMap ? cancelledMap.get(tId) : null;
+        const isCancelled = Boolean(rec) || Boolean(cancelledSet && cancelledSet.has(tId));
+        if (isCancelled && (!rec || rec.truncatedLen === 0)) {
+          return false;
+        }
+      }
+      return true;
+    })
+    .map((entry) => {
+      const tId = entry.turn_id ? String(entry.turn_id) : "";
+      const recByTurn = tId && cancelledMap ? cancelledMap.get(tId) : null;
+      let recByEntry = null;
+      if (!recByTurn && cancelledMap && entry.id) {
+        for (const candidate of cancelledMap.values()) {
+          if (candidate && candidate.entryId && String(candidate.entryId) === String(entry.id)) {
+            recByEntry = candidate;
+            break;
+          }
+        }
+      }
+      const rec = recByTurn || recByEntry;
+      const isCancelled = Boolean(rec) || Boolean(tId && cancelledSet && cancelledSet.has(tId));
+      if (!isCancelled) return entry;
+      if (entry.kind === "run_card") {
+        const stepNum = entry.current_step_num ? String(entry.current_step_num) : "04";
+        return {
+          ...entry,
+          stopped: true,
+          completed: false,
+          current_step_label: "Stopped",
+          current_step_display: `${stepNum} · Stopped`,
+        };
+      }
+      if (entry.kind !== "qa_card") return entry;
+      const maxChars = rec && typeof rec.truncatedLen === "number" ? rec.truncatedLen : 0;
+      let clampedBody = "[Stopped]";
+      if (maxChars > 0) {
+        if (rec && rec.partialBody && rec.partialBody.trim()) {
+          clampedBody = rec.partialBody;
+        } else {
+          const sliced = healUnclosedInlineMarkdown(
+            Array.from(String(entry.body || ""))
+              .slice(0, maxChars)
+              .join(""),
+          );
+          if (sliced.trim()) clampedBody = sliced;
+        }
+      }
+      return {
+        ...entry,
+        body: clampedBody,
+        stopped: true,
+        sources: maxChars === 0 ? [] : Array.isArray(entry.sources) ? entry.sources : [],
+      };
+    });
+  return d2;
+}
+
+function normalizeDelivery2State(rawD2, baseData = null) {
+  const def = createDefaultDelivery2State();
+  if (baseData && baseData.inbox && baseData.board && baseData.credits) {
+    const ready = Math.max(0, Number(baseData.inbox.counts.needs_decision) || 0);
+    const active =
+      (Array.isArray(baseData.board.columns.in_progress) ? baseData.board.columns.in_progress.length : 0) +
+      (Array.isArray(baseData.board.columns.queued) ? baseData.board.columns.queued.length : 0);
+    const availCr = baseData.credits.available_credits !== null ? baseData.credits.available_credits : 500;
+    def.morning_focus.rows = [
+      {
+        id: "mf-inbox",
+        badge: String(ready),
+        label: ready === 1 ? "diff ready for your review" : "diffs ready for your review",
+        cta: "Inbox",
+        target_tab: "inbox",
+        hash: "#inbox",
+      },
+      {
+        id: "mf-board",
+        badge: String(active),
+        label: active === 1 ? "active task on Board" : "active tasks on Board",
+        cta: "Board",
+        target_tab: "board",
+        hash: "#board",
+      },
+      {
+        id: "mf-credits",
+        badge: `${formatInt(availCr) || "500"} Cr`,
+        label: "available in workspace pool",
+        cta: "Credits",
+        target_tab: "credits",
+        hash: "#credits",
+      },
+    ];
+  }
+
+  if (!rawD2 || typeof rawD2 !== "object") return def;
+
+  const out = { ...def };
+  out.agent_name = "Delivery-2";
+  out.seq = Math.max(1, Number(rawD2.seq) || 1);
+  out.status = !isAbsent(rawD2.status) ? String(rawD2.status) : def.status;
+  out.status_label = !isAbsent(rawD2.status_label) ? String(rawD2.status_label) : def.status_label;
+  out.active_thread_id = !isAbsent(rawD2.active_thread_id) ? String(rawD2.active_thread_id) : "thr-main";
+
+  if (rawD2.sync_radar && typeof rawD2.sync_radar === "object") {
+    const sr = rawD2.sync_radar;
+    out.sync_radar = {
+      latency_ms: Number(sr.latency_ms) || 1,
+      latency_label: !isAbsent(sr.latency_label) ? String(sr.latency_label) : "<200ms",
+      surfaces: Array.isArray(sr.surfaces) && sr.surfaces.length === 4
+        ? sr.surfaces.map((s, idx) => {
+            const fb = def.sync_radar.surfaces[idx] || def.sync_radar.surfaces[0];
+            const id = String(s.id || fb.id);
+            const fallbackUrl = fb.connect_url || "https://chinwag.sh/open";
+            const authorized =
+              id === "local" ? true : typeof s.authorized === "boolean" ? s.authorized : fb.authorized;
+            const inThread =
+              id === "local"
+                ? true
+                : !authorized || id === "slack"
+                  ? false
+                  : typeof s.in_thread === "boolean"
+                    ? s.in_thread
+                    : fb.in_thread;
+            const authStatus =
+              id === "local"
+                ? String(s.auth_status || fb.auth_status)
+                : !authorized
+                  ? "Needs sign-in · pauses at 0 Cr"
+                  : id === "slack"
+                    ? "Connected · ambient status cards only"
+                    : String(
+                        s.auth_status && !String(s.auth_status).startsWith("Needs sign-in")
+                          ? s.auth_status
+                          : "Connected · your account",
+                      );
+            return {
+              id,
+              label: String(s.label || fb.label),
+              authorized,
+              in_thread: inThread,
+              locked_in_thread: Boolean(s.locked_in_thread ?? fb.locked_in_thread),
+              role_mode: String(s.role_mode || fb.role_mode),
+              auth_status: authStatus,
+              connect_url:
+                id === "local"
+                  ? null
+                  : safeChinwagOutboundUrl(!isAbsent(s.connect_url) ? s.connect_url : fallbackUrl, fallbackUrl),
+              policy_note: !isAbsent(s.policy_note) ? String(s.policy_note) : fb.policy_note,
+            };
+          })
+        : def.sync_radar.surfaces,
+    };
+  }
+
+  if (rawD2.morning_focus && typeof rawD2.morning_focus === "object") {
+    const mf = rawD2.morning_focus;
+    out.morning_focus = {
+      seen: Boolean(mf.seen),
+      collapsed: Boolean(mf.collapsed),
+      rows:
+        Array.isArray(mf.rows) && mf.rows.length === 3
+          ? mf.rows.map((r, idx) => {
+              const fb = def.morning_focus.rows[idx];
+              return {
+                id: String(r.id || fb.id),
+                badge: String(r.badge ?? fb.badge),
+                label: String(r.label || fb.label),
+                cta: String(r.cta || fb.cta),
+                target_tab: String(r.target_tab || fb.target_tab),
+                hash: String(r.hash || fb.hash),
+              };
+            })
+          : def.morning_focus.rows,
+    };
+  }
+
+  if (Array.isArray(rawD2.entries)) {
+    out.entries = rawD2.entries.filter((e) => e && typeof e === "object").map((e, i) => {
+      const normalizedEntry = {
+        ...e,
+        id: String(e.id || `entry-${i}`),
+        kind: String(e.kind || "qa_card"),
+        seq: Math.max(1, Number(e.seq) || 1),
+      };
+      if (normalizedEntry.kind === "oauth_card") {
+        normalizedEntry.challenge_url = safeChinwagOutboundUrl(
+          e.challenge_url,
+          "https://chinwag.sh/open",
+        );
+      }
+      return normalizedEntry;
+    });
+  }
+
+  if (rawD2.history && typeof rawD2.history === "object") {
+    out.history = {
+      today: Array.isArray(rawD2.history.today) ? rawD2.history.today : def.history.today,
+      earlier: Array.isArray(rawD2.history.earlier) ? rawD2.history.earlier : [],
+    };
+  }
+
+  if (Array.isArray(rawD2.memories)) {
+    out.memories = rawD2.memories;
+  }
+
+  if (Array.isArray(rawD2.steering_chips) && rawD2.steering_chips.length > 0) {
+    out.steering_chips = rawD2.steering_chips.map((c, idx) => ({
+      id: String(c.id || `chip-${idx}`),
+      label: String(c.label || "Prompt"),
+      prompt: String(c.prompt || c.label || ""),
+    }));
+  }
+
+  if (rawD2.links && typeof rawD2.links === "object") {
+    out.links = {
+      security_url: safeChinwagOutboundUrl(rawD2.links.security_url, def.links.security_url),
+      founders_url: safeChinwagOutboundUrl(rawD2.links.founders_url, def.links.founders_url),
+      open_url: safeChinwagOutboundUrl(rawD2.links.open_url, def.links.open_url),
+      pricing_url: safeChinwagOutboundUrl(rawD2.links.pricing_url, def.links.pricing_url),
+    };
+  }
+
+  reconcileCancelledDelivery2State(out);
+  return out;
 }
 
 function parseHunkLines(hunk) {
@@ -1362,6 +1908,13 @@ const dom = {
   iconSun: () => document.getElementById("theme-icon-sun"),
   btnPrivacy: () => document.getElementById("btn-privacy"),
   btnMobileMenu: () => document.getElementById("btn-mobile-menu"),
+  btnD2Drawer: () => document.getElementById("btn-d2-drawer"),
+  d2DrawerScrim: () => document.getElementById("d2-drawer-scrim"),
+  d2Rail: () => document.getElementById("d2-rail"),
+  d2RailToggleFixed: () => document.getElementById("d2-rail-toggle-fixed"),
+  d2Track: () => document.getElementById("d2-track"),
+  d2Spine: () => document.getElementById("d2-spine"),
+  d2ComposerInput: () => document.getElementById("d2-composer-input"),
   main: () => document.getElementById("main"),
   sessionAlert: () => document.getElementById("session-alert-host"),
   viewRoot: () => (typeof document !== "undefined" ? document.getElementById("view-root") : null),
@@ -5088,24 +5641,1668 @@ function renderCreditsView(root) {
   root.appendChild(container);
 }
 
+// ── 9B · Persistent Left-Hand Delivery-2 Panel (v4.4 Phase 1) ────────────────
+
+function isNarrowDrawerViewport() {
+  return typeof window !== "undefined" && Number(window.innerWidth) > 0 && window.innerWidth < 960;
+}
+
+function isExpandedRailByDefault() {
+  if (typeof window === "undefined") return true;
+  const w = Number(window.innerWidth);
+  return !Number.isFinite(w) || w === 0 || w >= 1440;
+}
+
+function isDelivery2RailExpanded() {
+  if (isNarrowDrawerViewport()) return Boolean(state.d2DrawerOpen);
+  if (typeof document === "undefined" || !document.documentElement) return true;
+  const attr = document.documentElement.getAttribute("data-rail");
+  if (attr === "expanded") return true;
+  if (attr === "collapsed") return false;
+  return isExpandedRailByDefault();
+}
+
+function syncDelivery2DrawerDom() {
+  if (typeof document === "undefined" || !document.documentElement) return;
+  const scrim = dom.d2DrawerScrim();
+  const btn = dom.btnD2Drawer();
+  const rail = dom.d2Rail();
+  const narrow = isNarrowDrawerViewport();
+  const open = Boolean(state.d2DrawerOpen && narrow);
+  if (open) {
+    document.documentElement.setAttribute("data-d2-drawer", "open");
+  } else {
+    document.documentElement.removeAttribute("data-d2-drawer");
+  }
+  if (scrim) scrim.hidden = !open;
+  if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+  if (rail) {
+    if (narrow && !open) {
+      rail.inert = true;
+      rail.setAttribute("aria-hidden", "true");
+    } else {
+      rail.inert = false;
+      rail.removeAttribute("aria-hidden");
+    }
+  }
+}
+
+function setDelivery2RailExpanded(nextExpanded, { persist = true, animate = true } = {}) {
+  const expand = Boolean(nextExpanded);
+  if (isNarrowDrawerViewport()) {
+    if (expand && !state.d2DrawerOpen) {
+      state.d2DrawerTriggerEl =
+        typeof document !== "undefined" && document.activeElement
+          ? document.activeElement
+          : dom.btnD2Drawer();
+    }
+    state.d2DrawerOpen = expand;
+    if (!expand && state.d2Popover) {
+      state.d2Popover = null;
+      state.d2FocusedSurface = null;
+    }
+    syncDelivery2DrawerDom();
+    renderDelivery2Panel();
+    if (expand) {
+      requestAnimationFrame(() => {
+        const input = dom.d2ComposerInput();
+        if (input) input.focus();
+      });
+    } else {
+      const restoreEl = state.d2DrawerTriggerEl || dom.btnD2Drawer();
+      state.d2DrawerTriggerEl = null;
+      if (restoreEl && typeof restoreEl.focus === "function") {
+        restoreEl.focus();
+      }
+    }
+    return Promise.resolve();
+  }
+
+  const prev = isDelivery2RailExpanded();
+  if (!expand && state.d2Popover) {
+    state.d2Popover = null;
+    state.d2FocusedSurface = null;
+  }
+  const applyAttr = () => {
+    if (typeof document !== "undefined" && document.documentElement) {
+      document.documentElement.setAttribute("data-rail", expand ? "expanded" : "collapsed");
+    }
+    if (persist) {
+      try {
+        localStorage.setItem("chinwag.ui.rail", expand ? "expanded" : "collapsed");
+      } catch (e) {}
+    }
+  };
+
+  if (prev === expand || !animate) {
+    applyAttr();
+    renderDelivery2Panel();
+    return Promise.resolve();
+  }
+
+  const railEl = dom.d2Rail();
+  const trackEl = dom.d2Track();
+  const spineEl = dom.d2Spine();
+  const mainEl = dom.main();
+  const p = Motion.animateRailToggle(railEl, trackEl, spineEl, mainEl, expand, applyAttr);
+  renderDelivery2Panel();
+  return Promise.resolve(p);
+}
+
+function toggleDelivery2Rail(trigger = "button") {
+  const next = !isDelivery2RailExpanded();
+  state.d2AutoCollapsedForSheet = false;
+  state.d2PreSheetRail = null;
+  trackUiEvent("ui_delivery2_rail_toggled", {
+    next_state: next ? "expanded" : "collapsed",
+    trigger,
+  });
+  return setDelivery2RailExpanded(next, { persist: true, animate: true });
+}
+
+function syncRailForOverlaySheet() {
+  if (isNarrowDrawerViewport()) return;
+  const vw = typeof window !== "undefined" && Number(window.innerWidth) > 0 ? Number(window.innerWidth) : 1440;
+  const mainWithExpandedRail = vw - 320;
+  if (state.openItemId && mainWithExpandedRail < 1120 && isDelivery2RailExpanded()) {
+    state.d2PreSheetRail = "expanded";
+    state.d2AutoCollapsedForSheet = true;
+    setDelivery2RailExpanded(false, { persist: false, animate: true });
+  } else if (state.d2AutoCollapsedForSheet && (!state.openItemId || mainWithExpandedRail >= 1120)) {
+    const shouldRestore = state.d2PreSheetRail === "expanded";
+    state.d2AutoCollapsedForSheet = false;
+    state.d2PreSheetRail = null;
+    if (shouldRestore) {
+      setDelivery2RailExpanded(true, { persist: false, animate: true });
+    }
+  }
+}
+
+function isNodeInsideD2Rail(node) {
+  let cur = node;
+  while (cur) {
+    if (cur.id === "d2-rail") return true;
+    cur = cur.parentNode || null;
+  }
+  return false;
+}
+
+function focusDelivery2Composer() {
+  const wasExpanded = isDelivery2RailExpanded();
+  if (!wasExpanded) {
+    setDelivery2RailExpanded(true, { persist: true, animate: true });
+  }
+  requestAnimationFrame(() => {
+    const input = dom.d2ComposerInput();
+    if (input) input.focus();
+  });
+}
+
+function openD2Popover(kind, focusedSurface = null) {
+  state.d2PopoverSeq += 1;
+  if (state.d2Popover === kind && (!focusedSurface || state.d2FocusedSurface === focusedSurface)) {
+    return closeD2Popover({ restoreFocus: true });
+  }
+  state.d2Popover = kind;
+  state.d2FocusedSurface = focusedSurface;
+  renderDelivery2Panel();
+  return Promise.resolve();
+}
+
+async function closeD2Popover(options = {}) {
+  const opts = options && typeof options === "object" ? options : {};
+  const immediate = Boolean(opts.immediate);
+  const restoreFocus = opts.restoreFocus !== undefined ? Boolean(opts.restoreFocus) : !immediate;
+  if (!state.d2Popover) return;
+  const prevKind = state.d2Popover;
+  const seq = ++state.d2PopoverSeq;
+  const track = dom.d2Track();
+  const pop = track ? track.querySelector(".d2-pop") : null;
+  if (!immediate && pop) {
+    pop.dataset.state = "closing";
+    await Motion.settled(pop);
+    if (seq !== state.d2PopoverSeq) return;
+  }
+  state.d2Popover = null;
+  state.d2FocusedSurface = null;
+  renderDelivery2Panel();
+  if (restoreFocus && typeof document !== "undefined") {
+    const triggerId = prevKind === "history" ? "d2-btn-history" : "d2-btn-connections";
+    const btn = document.getElementById(triggerId);
+    if (btn) btn.focus();
+  }
+}
+
+function applyDelivery2ServerPayload(rawD2, { forceInitial = false } = {}) {
+  if (!rawD2 || typeof rawD2 !== "object") return false;
+  const normalized = normalizeDelivery2State(rawD2, state.data);
+  const incomingSeq = Math.max(1, Number(normalized.seq) || 1);
+  const currentSeq = Number(state.d2LastCursorSeq) || 0;
+  if (state.d2Loaded && !forceInitial && incomingSeq < currentSeq) {
+    return false;
+  }
+  state.data.delivery2 = normalized;
+  state.d2LastCursorSeq = Math.max(currentSeq, incomingSeq);
+  state.d2Loaded = true;
+  return true;
+}
+
+async function resumeDelivery2FromCursor() {
+  const sinceSeq = Math.max(0, Number(state.d2LastCursorSeq) || 0);
+  try {
+    const raw = await apiRequest(
+      "GET",
+      `/api/v1/delivery2/state?since_seq=${encodeURIComponent(String(sinceSeq))}`,
+    );
+    if (!raw || typeof raw !== "object") return false;
+    const liveSeq = Number(state.d2LastCursorSeq) || 0;
+    const incomingSeq = Math.max(1, Number(raw.seq ?? raw.cursor_seq) || 1);
+    if (state.d2Loaded && incomingSeq < liveSeq) {
+      return false;
+    }
+    if (raw.unchanged && state.d2Loaded) {
+      // Arbitrate strictly against the CURRENT live cursor immediately before committing!
+      if (incomingSeq !== liveSeq || sinceSeq !== liveSeq) {
+        return false;
+      }
+      if (raw.sync_radar && state.data.delivery2) {
+        const norm = normalizeDelivery2State(raw, state.data);
+        state.data.delivery2.sync_radar = norm.sync_radar;
+        state.data.delivery2.status = norm.status;
+        state.data.delivery2.status_label = norm.status_label;
+        if (!state.d2Sending && !state.d2EditingMemId) {
+          renderDelivery2Panel();
+        }
+      }
+      return true;
+    }
+    const applied = applyDelivery2ServerPayload(raw);
+    if (applied && !state.d2Sending && !state.d2EditingMemId) {
+      renderDelivery2Panel();
+    }
+    return applied;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function startNewDelivery2Thread() {
+  try {
+    const res = await apiRequest("POST", "/api/v1/delivery2/thread", { action: "new" });
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    state.d2Popover = null;
+    state.d2ComposerError = null;
+    renderDelivery2Panel();
+    focusDelivery2Composer();
+  } catch (err) {
+    toaster.show(err && err.message ? err.message : "Could not create a new thread.");
+  }
+}
+
+async function switchDelivery2Thread(threadId) {
+  if (isAbsent(threadId)) return;
+  try {
+    const res = await apiRequest("POST", "/api/v1/delivery2/thread", {
+      action: "switch",
+      thread_id: threadId,
+    });
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    await closeD2Popover({ immediate: true, restoreFocus: false });
+    renderDelivery2Panel();
+  } catch (err) {
+    toaster.show(err && err.message ? err.message : "Could not switch threads.");
+  }
+}
+
+async function updateMorningFocus(patch) {
+  const mf = state.data.delivery2.morning_focus;
+  if (typeof patch.seen === "boolean") mf.seen = patch.seen;
+  if (typeof patch.collapsed === "boolean") mf.collapsed = patch.collapsed;
+  renderDelivery2Panel();
+  try {
+    const res = await apiRequest("POST", "/api/v1/delivery2/thread", {
+      action: "morning_focus",
+      ...patch,
+    });
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    renderDelivery2Panel();
+  } catch (err) {
+    toaster.show("Could not save Morning focus preference.");
+  }
+}
+
+async function toggleSurfaceInThread(surfaceId, nextInThread) {
+  const res = await apiRequest("POST", "/api/v1/delivery2/thread", {
+    action: "connection",
+    surface: surfaceId,
+    in_thread: Boolean(nextInThread),
+  });
+  if (res && res.state) applyDelivery2ServerPayload(res.state);
+  renderDelivery2Panel();
+}
+
+async function triggerSurfaceOAuthFlow(surfaceId, decision = "connect", cardNode = null, oauthMeta = null) {
+  try {
+    const reqBody = {
+      kind: "oauth",
+      surface: surfaceId,
+      decision,
+    };
+    if (oauthMeta && typeof oauthMeta === "object") {
+      if (!isAbsent(oauthMeta.oauth_state)) reqBody.oauth_state = String(oauthMeta.oauth_state);
+      if (!isAbsent(oauthMeta.thread_id)) reqBody.thread_id = String(oauthMeta.thread_id);
+    }
+    const res = await apiRequest("POST", "/api/v1/delivery2/approval", reqBody);
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    if (decision === "connect" || decision === "retry") {
+      state.d2Popover = null;
+      state.d2FocusedSurface = null;
+      renderDelivery2Panel();
+      const thr = typeof document !== "undefined" ? document.getElementById("d2-thread") : null;
+      if (thr && typeof thr.scrollTo === "function") {
+        thr.scrollTo({ top: thr.scrollHeight, behavior: "auto" });
+      }
+      return;
+    }
+    if (cardNode && (decision === "verify" || decision === "skip")) {
+      const label = res && res.surface_label ? res.surface_label : surfaceId;
+      const receiptText =
+        decision === "verify"
+          ? `${label} verified · 0 Cr while paused`
+          : `Skipped ${label} sign-in for now · 0 Cr while paused`;
+      await Motion.resolveBanner(cardNode, () => {
+        clearNode(cardNode);
+        cardNode.setAttribute("data-resolved", "");
+        cardNode.append(ICONS.check(), el("span", null, receiptText));
+      });
+    }
+    renderDelivery2Panel();
+  } catch (err) {
+    toaster.show(err && err.message ? err.message : "Connection verification failed.");
+  }
+}
+
+async function submitDelivery2Approval(cardNode, btnEl, groupEl, entry, decision) {
+  const approvalId = entry.approval_id || entry.id;
+  const itemId = entry.item_id || approvalId;
+  try {
+    const wrapped = await Motion.guardAction(
+      btnEl,
+      () =>
+        apiRequest("POST", "/api/v1/delivery2/approval", {
+          id: approvalId,
+          item_id: itemId,
+          decision,
+          is_sample: Boolean(entry.is_sample),
+        }),
+      { group: groupEl, busyLabel: decision === "approve" ? "Approving…" : "Denying…" },
+    );
+    if (!wrapped) return;
+    const res = wrapped.value;
+    const receipt =
+      (res && res.receipt) ||
+      (decision === "approve"
+        ? "Approved by you · 0 Cr while paused"
+        : "Denied by you · 0 Cr while paused");
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    await Motion.resolveBanner(cardNode, () => {
+      clearNode(cardNode);
+      cardNode.setAttribute("data-resolved", "");
+      cardNode.append(ICONS.check(), el("span", null, receipt));
+    });
+    renderDelivery2Panel();
+    await refreshBootstrapQuietly();
+  } catch (err) {
+    toaster.show(err && err.message ? err.message : "Could not record approval decision.");
+  }
+}
+
+async function mutateDelivery2Memory(memId, action, note = null) {
+  try {
+    const payload = { id: memId, action };
+    if (note !== null) payload.note = note;
+    const res = await apiRequest("POST", "/api/v1/delivery2/memory", payload);
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    state.d2EditingMemId = null;
+    state.d2EditingMemDraft = "";
+    state.d2ComposerError = null;
+    renderDelivery2Panel();
+    return true;
+  } catch (err) {
+    const msg = err && err.message ? err.message : "Could not update workspace memory.";
+    state.d2ComposerError = msg;
+    toaster.show(msg);
+    renderDelivery2Panel();
+    return false;
+  }
+}
+
+async function submitDelivery2Prompt(rawPrompt) {
+  const prompt = String(rawPrompt ?? "").trim();
+  if (!prompt || state.d2Sending) return false;
+
+  const turnId = `turn-${uuidv4().slice(0, 8)}`;
+  const turnThreadId = String(
+    (state.data && state.data.delivery2 && state.data.delivery2.active_thread_id) || "thr-main",
+  );
+  const abortCtrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  state.d2ComposerError = null;
+  state.d2Sending = true;
+  state.d2ActiveTurnId = turnId;
+  state.d2ActiveTurnThreadId = turnThreadId;
+  state.d2ActiveAbort = abortCtrl;
+  renderDelivery2Panel();
+
+  try {
+    const res = await apiRequest(
+      "POST",
+      "/api/v1/delivery2/message",
+      { prompt, turn_id: turnId, thread_id: turnThreadId },
+      abortCtrl ? { signal: abortCtrl.signal } : null,
+    );
+    if (
+      state.d2ActiveTurnId !== turnId ||
+      (state.d2CancelledTurnIds && state.d2CancelledTurnIds.has(turnId))
+    ) {
+      return false;
+    }
+
+    state.d2ComposerDraft = "";
+    state.d2ActiveAbort = null;
+    if (res && res.state) {
+      applyDelivery2ServerPayload(res.state);
+    }
+
+    const entry = res && res.entry && typeof res.entry === "object" ? res.entry : null;
+    if (entry && entry.kind === "qa_card" && !entry.stopped && !isAbsent(entry.body)) {
+      const fullBody = String(entry.body);
+      state.d2StreamingEntryId = String(entry.id);
+      state.d2StreamingText = "";
+      renderDelivery2Panel();
+
+      const streamer = Motion.createProportionalStreamer({
+        onTick: (slice) => {
+          state.d2StreamingText = slice;
+          const bodyNode =
+            typeof document !== "undefined"
+              ? document.getElementById(`d2-qa-body-${entry.id}`)
+              : null;
+          if (bodyNode) {
+            clearNode(bodyNode);
+            appendChildren(bodyNode, renderHealedInlineMarkdown(slice));
+          }
+        },
+        onFinish: () => {
+          if (state.d2ActiveTurnId === turnId) {
+            state.d2Sending = false;
+            state.d2ActiveTurnId = null;
+            state.d2ActiveTurnThreadId = null;
+          }
+          state.d2ActiveStreamer = null;
+          state.d2StreamingEntryId = null;
+          state.d2StreamingText = "";
+          renderDelivery2Panel();
+        },
+      });
+
+      if (streamer && typeof streamer.push === "function" && typeof streamer.markDone === "function") {
+        state.d2ActiveStreamer = streamer;
+        streamer.push(fullBody);
+        streamer.markDone();
+      } else {
+        state.d2Sending = false;
+        state.d2ActiveTurnId = null;
+        state.d2ActiveTurnThreadId = null;
+        state.d2StreamingEntryId = null;
+        renderDelivery2Panel();
+      }
+    } else {
+      state.d2Sending = false;
+      state.d2ActiveTurnId = null;
+      state.d2ActiveTurnThreadId = null;
+      renderDelivery2Panel();
+    }
+
+    const thr = typeof document !== "undefined" ? document.getElementById("d2-thread") : null;
+    if (thr && typeof thr.scrollTo === "function") {
+      thr.scrollTo({ top: thr.scrollHeight, behavior: "auto" });
+    }
+    return true;
+  } catch (err) {
+    if (state.d2ActiveTurnId !== turnId) {
+      return false;
+    }
+    state.d2Sending = false;
+    state.d2ActiveTurnId = null;
+    state.d2ActiveTurnThreadId = null;
+    state.d2ActiveAbort = null;
+    const msg = err && err.message ? err.message : "Delivery-2 could not process that message.";
+    state.d2ComposerError = msg;
+    toaster.show(msg);
+    renderDelivery2Panel();
+    return false;
+  }
+}
+
+async function cancelDelivery2Turn() {
+  if (!state.d2Sending && !state.d2ActiveStreamer) return false;
+  const turnId = state.d2ActiveTurnId || "active";
+  const turnThreadId = String(
+    state.d2ActiveTurnThreadId ||
+      (state.data && state.data.delivery2 && state.data.delivery2.active_thread_id) ||
+      "thr-main",
+  );
+  const stoppedEntryId = state.d2StreamingEntryId || null;
+  const partialText = String(state.d2StreamingText || "");
+  const healedPartial = healUnclosedInlineMarkdown(partialText);
+  const truncatedLen = stoppedEntryId ? Array.from(partialText).length : 0;
+
+  if (turnId && turnId !== "active") {
+    if (state.d2CancelledTurnIds) {
+      state.d2CancelledTurnIds.add(turnId);
+      if (state.d2CancelledTurnIds.size > 64) {
+        const oldest = state.d2CancelledTurnIds.values().next().value;
+        if (oldest) {
+          state.d2CancelledTurnIds.delete(oldest);
+          if (state.d2CancelledTurns instanceof Map) state.d2CancelledTurns.delete(oldest);
+        }
+      }
+    }
+    if (state.d2CancelledTurns instanceof Map) {
+      state.d2CancelledTurns.set(turnId, {
+        truncatedLen,
+        partialBody: stoppedEntryId && healedPartial.trim() ? healedPartial : "",
+        entryId: stoppedEntryId,
+      });
+    }
+  }
+
+  state.d2Sending = false;
+  state.d2ActiveTurnId = null;
+  state.d2ActiveTurnThreadId = null;
+  if (state.d2ActiveAbort && typeof state.d2ActiveAbort.abort === "function") {
+    try {
+      state.d2ActiveAbort.abort();
+    } catch (e) {}
+  }
+  state.d2ActiveAbort = null;
+  if (state.d2ActiveStreamer && typeof state.d2ActiveStreamer.cancel === "function") {
+    state.d2ActiveStreamer.cancel();
+  }
+  state.d2ActiveStreamer = null;
+
+  if (state.data && state.data.delivery2) {
+    reconcileCancelledDelivery2State(state.data.delivery2);
+  }
+
+  state.d2StreamingEntryId = null;
+  state.d2StreamingText = "";
+  renderDelivery2Panel();
+
+  try {
+    const cancelPayload = {
+      turn_id: turnId,
+      truncated_len: truncatedLen,
+      thread_id: turnThreadId,
+    };
+    if (stoppedEntryId) {
+      cancelPayload.entry_id = stoppedEntryId;
+    }
+    const res = await apiRequest("POST", "/api/v1/delivery2/cancel", cancelPayload);
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    renderDelivery2Panel();
+  } catch (err) {
+    // Keep clean stopped UI state even if network cancel races completion
+  }
+  return true;
+}
+
+function surfacePillState(surf) {
+  if (!surf.authorized) return "needs_auth";
+  if (surf.role_mode === "ambient_status_only") return "ambient";
+  return "connected";
+}
+
+function buildDelivery2HistoryPopover(d2) {
+  const todayList = Array.isArray(d2.history && d2.history.today) ? d2.history.today : [];
+  const earlierList = Array.isArray(d2.history && d2.history.earlier) ? d2.history.earlier : [];
+
+  const renderItem = (item) =>
+    el(
+      "button",
+      {
+        type: "button",
+        className: "d2-history-item",
+        "aria-current": item.active ? "true" : null,
+        onClick: () => switchDelivery2Thread(item.id),
+      },
+      el("span", { className: "d2-history-title" }, item.title || "Thread"),
+      el("span", { className: "d2-history-meta" }, item.status || item.updated_at || "Live"),
+    );
+
+  return el(
+    "div",
+    {
+      className: "d2-history-pop d2-pop",
+      id: "d2-history-popover",
+      role: "dialog",
+      "aria-label": "Recent threads",
+      dataset: { state: "open" },
+    },
+    todayList.length > 0
+      ? [el("div", { className: "d2-pop-group-label" }, "Today"), ...todayList.map(renderItem)]
+      : null,
+    earlierList.length > 0
+      ? [el("div", { className: "d2-pop-group-label" }, "Earlier"), ...earlierList.map(renderItem)]
+      : null,
+  );
+}
+
+function buildDelivery2ConnectionsPopover(d2) {
+  const surfaces = d2.sync_radar && Array.isArray(d2.sync_radar.surfaces) ? d2.sync_radar.surfaces : [];
+  const rows = surfaces.map((surf) => {
+    const isFocused = state.d2FocusedSurface === surf.id;
+    let rightControl = null;
+    if (surf.locked_in_thread) {
+      rightControl = el("span", { className: "pill-fn" }, "Always in thread");
+    } else if (!surf.authorized) {
+      rightControl = actionBtn({
+        label: "Connect",
+        variant: "primary",
+        size: "sm",
+        onClick: () => triggerSurfaceOAuthFlow(surf.id, "connect"),
+      });
+    } else {
+      rightControl = switchControl({
+        checked: Boolean(surf.in_thread),
+        label: `Include ${surf.label} in this thread`,
+        disabled: false,
+        onToggle: (next) => toggleSurfaceInThread(surf.id, next),
+      });
+    }
+
+    return el(
+      "div",
+      {
+        className: "d2-conn-row",
+        dataset: {
+          surface: surf.id,
+          focused: isFocused ? "true" : null,
+        },
+      },
+      el(
+        "div",
+        { className: "d2-conn-row-top" },
+        el("span", { className: "d2-conn-name" }, surf.label),
+        rightControl,
+      ),
+      el("div", { className: "d2-conn-auth" }, surf.auth_status),
+      surf.policy_note ? el("div", { className: "d2-conn-policy" }, surf.policy_note) : null,
+    );
+  });
+
+  return el(
+    "div",
+    {
+      className: "d2-conn-pop d2-pop",
+      id: "d2-connections-popover",
+      role: "dialog",
+      "aria-label": "Connections",
+      dataset: { state: "open" },
+    },
+    el(
+      "div",
+      { className: "d2-conn-head" },
+      el("span", { className: "d2-conn-title" }, "Connections"),
+      el("span", { className: "d2-conn-sub" }, "Account auth · In thread"),
+    ),
+    el("div", { className: "d2-conn-list" }, rows),
+    el(
+      "div",
+      { className: "d2-conn-foot" },
+      el(
+        "a",
+        {
+          href: safeChinwagOutboundUrl(
+            d2.links && d2.links.security_url,
+            "https://chinwag.sh/security",
+          ),
+          target: "_blank",
+          rel: "noopener noreferrer",
+          className: "d2-conn-link",
+        },
+        "Security ↗",
+      ),
+      el(
+        "a",
+        {
+          href: safeChinwagOutboundUrl(
+            d2.links && d2.links.founders_url,
+            "https://chinwag.sh/pricing?talk=1&source=local_ui#founders",
+          ),
+          target: "_blank",
+          rel: "noopener noreferrer",
+          className: "d2-conn-link",
+        },
+        "Talk to Founders ↗",
+      ),
+    ),
+  );
+}
+
+function renderDelivery2Entry(entry) {
+  const kind = entry.kind;
+
+  if (kind === "user_message") {
+    return el("div", { className: "d2-user-msg", dataset: { entryId: entry.id } }, entry.body || "");
+  }
+
+  if (kind === "cancel_receipt") {
+    return el(
+      "div",
+      { className: "d2-cancel-receipt", dataset: { entryId: entry.id } },
+      entry.receipt || "Reply stopped by you · 0 Cr",
+    );
+  }
+
+  if (kind === "run_card") {
+    const runId = String(entry.run_id || "run-local-1");
+    const steps = Array.isArray(entry.steps) && entry.steps.length === 12
+      ? entry.steps
+      : buildDefaultStepLadder(10, Boolean(entry.completed));
+    const expanded = state.d2ExpandedSteps.has(entry.id);
+    const diffHash =
+      entry.diff_target_id && entry.diff_target_id !== "sample-walkthrough"
+        ? `#diff/${encodeURIComponent(entry.diff_target_id)}`
+        : "#walkthrough";
+
+    const disclosureBody = el(
+      "div",
+      {
+        className: "d2-disclosure-body",
+        "aria-hidden": expanded ? "false" : "true",
+        dataset: { open: expanded ? "true" : "false" },
+      },
+      el(
+        "div",
+        { className: "d2-disclosure-inner" },
+        el(
+          "div",
+          { className: "d2-steps-list" },
+          steps.map((st) =>
+            el(
+              "div",
+              { className: "d2-step-row", dataset: { state: st.state || "pending" } },
+              el("span", null, st.display || `${st.num} · ${st.label}`),
+              el(
+                "span",
+                null,
+                st.state === "done"
+                  ? "Done"
+                  : st.state === "waiting"
+                    ? "Paused · 0 Cr"
+                    : st.state === "active"
+                      ? "Running"
+                      : "",
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    disclosureBody.inert = !expanded;
+
+    const stepsBtn = el(
+      "button",
+      {
+        type: "button",
+        className: "d2-disclosure-btn",
+        "aria-expanded": expanded ? "true" : "false",
+        onClick: () => {
+          const next = !state.d2ExpandedSteps.has(entry.id);
+          if (next) state.d2ExpandedSteps.add(entry.id);
+          else state.d2ExpandedSteps.delete(entry.id);
+          stepsBtn.setAttribute("aria-expanded", next ? "true" : "false");
+          disclosureBody.dataset.open = next ? "true" : "false";
+          disclosureBody.inert = !next;
+          disclosureBody.setAttribute("aria-hidden", next ? "false" : "true");
+        },
+      },
+      ICONS.chevronRight(),
+      el("span", null, "Steps"),
+    );
+
+    return el(
+      "article",
+      {
+        className: "d2-card d2-run-card",
+        dataset: { entryId: entry.id, runId },
+      },
+      el(
+        "div",
+        { className: "d2-run-head" },
+        el("span", { className: "d2-run-title" }, entry.title || "Scoped task"),
+        el("span", { className: "d2-step-badge" }, entry.current_step_display || "10 · Waiting for you"),
+      ),
+      el(
+        "div",
+        { className: "d2-seg-bar", "aria-hidden": "true" },
+        steps.map((st) => el("span", { className: "d2-seg", dataset: { state: st.state || "pending" } })),
+      ),
+      el(
+        "div",
+        { className: "d2-run-meta" },
+        el("span", { className: "d2-verb-summary" }, entry.verb_summary || "Searched 8 items · Read 4 files · Ran 3 checks"),
+        el(
+          "div",
+          { className: "d2-head-actions" },
+          stepsBtn,
+          el(
+            "button",
+            {
+              type: "button",
+              className: "d2-micro-btn",
+              onClick: () => navigate(diffHash, "delivery2_run_card"),
+            },
+            "Diff →",
+          ),
+        ),
+      ),
+      disclosureBody,
+    );
+  }
+
+  if (kind === "approval_card") {
+    const cardNode = el("article", {
+      className: "d2-card d2-hitl-card",
+      dataset: {
+        entryId: entry.id,
+        approvalId: entry.approval_id || entry.id,
+        runId: entry.item_id || "run-local-1",
+      },
+    });
+    if (entry.settled) {
+      cardNode.setAttribute("data-resolved", "");
+      cardNode.append(
+        ICONS.check(),
+        el("span", null, entry.settled_receipt || "Approved by you · 0 Cr while paused"),
+      );
+      return cardNode;
+    }
+
+    const actionsGroup = el("div", { className: "d2-hitl-actions" });
+    const approveBtn = actionBtn({
+      label: "Approve & merge",
+      variant: "primary",
+      size: "sm",
+      extraClass: "d2-hitl-primary",
+      onClick: () => submitDelivery2Approval(cardNode, approveBtn, actionsGroup, entry, "approve"),
+    });
+    const denyBtn = actionBtn({
+      label: "Deny",
+      variant: "secondary",
+      size: "sm",
+      onClick: () => submitDelivery2Approval(cardNode, denyBtn, actionsGroup, entry, "deny"),
+    });
+    const viewDiffBtn = actionBtn({
+      label: "View diff →",
+      variant: "ghost",
+      size: "sm",
+      onClick: () => navigate(entry.diff_hash || "#walkthrough", "delivery2_hitl"),
+    });
+    actionsGroup.append(approveBtn, denyBtn, viewDiffBtn);
+
+    cardNode.append(
+      el(
+        "div",
+        { className: "d2-hitl-top" },
+        el("span", { className: "d2-hitl-status" }, entry.status_badge || "Waiting for you"),
+        el("span", { className: "d2-zero-cr-pill" }, entry.pause_badge || "Paused · 0 Cr"),
+        entry.estimate_badge ? el("span", { className: "d2-zero-cr-pill" }, entry.estimate_badge) : null,
+      ),
+      el("div", { className: "d2-hitl-question" }, renderHealedInlineMarkdown(entry.question || entry.title || "")),
+      el(
+        "div",
+        { className: "d2-hitl-proof" },
+        entry.diff_summary ? el("span", null, entry.diff_summary) : null,
+        entry.check_proof ? el("span", null, entry.check_proof) : null,
+      ),
+      actionsGroup,
+    );
+    return cardNode;
+  }
+
+  if (kind === "oauth_card") {
+    const cardNode = el("article", {
+      className: "d2-card d2-oauth-card",
+      dataset: { entryId: entry.id, surface: entry.surface || "linear" },
+    });
+    if (entry.settled) {
+      cardNode.setAttribute("data-resolved", "");
+      cardNode.append(
+        ICONS.check(),
+        el("span", null, entry.settled_receipt || "Connection updated · 0 Cr while paused"),
+      );
+      return cardNode;
+    }
+
+    const safeChallengeUrl = safeChinwagOutboundUrl(
+      entry.challenge_url,
+      "https://chinwag.sh/open",
+    );
+    const activeThreadId =
+      entry.thread_id ||
+      (state.data && state.data.delivery2 && state.data.delivery2.active_thread_id) ||
+      "thr-main";
+
+    const actions = el(
+      "div",
+      { className: "d2-hitl-actions" },
+      el(
+        "a",
+        {
+          href: safeChallengeUrl,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          className: "btn-primary btn-sm",
+        },
+        el("span", { className: "btn-label" }, `Connect ${entry.surface_label || "account"} ↗`),
+      ),
+      actionBtn({
+        label: "Re-check connection",
+        variant: "secondary",
+        size: "sm",
+        onClick: () =>
+          triggerSurfaceOAuthFlow(entry.surface, "verify", cardNode, {
+            oauth_state: entry.oauth_state || "",
+            thread_id: activeThreadId,
+          }),
+      }),
+      actionBtn({
+        label: "Skip",
+        variant: "ghost",
+        size: "sm",
+        onClick: () => triggerSurfaceOAuthFlow(entry.surface, "skip", cardNode),
+      }),
+    );
+
+    cardNode.append(
+      el(
+        "div",
+        { className: "d2-hitl-top" },
+        el("span", { className: "d2-hitl-status" }, entry.title || "Sign in required"),
+        el("span", { className: "d2-zero-cr-pill" }, entry.pause_badge || "Paused · 0 Cr"),
+      ),
+      el("div", { className: "d2-hitl-proof" }, entry.body || "Paused safely at 0 Cr until sign-in finishes."),
+      actions,
+    );
+    return cardNode;
+  }
+
+  if (kind === "memory_card") {
+    const memId = String(entry.memory_id || "mem_default");
+    const cardNode = el("div", {
+      className: "d2-mem-card",
+      dataset: { entryId: entry.id, memoryId: memId },
+    });
+
+    if (state.d2EditingMemId === memId) {
+      const inputEl = el("input", {
+        type: "text",
+        className: "input d2-mem-edit-input",
+        value: state.d2EditingMemDraft,
+        "aria-label": "Edit saved memory note",
+        dataset: { memEditInput: memId },
+        onInput: (ev) => {
+          state.d2EditingMemDraft = ev.target.value;
+        },
+        onKeydown: (ev) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            if (typeof ev.stopPropagation === "function") ev.stopPropagation();
+            mutateDelivery2Memory(memId, "edit", state.d2EditingMemDraft);
+          } else if (ev.key === "Escape") {
+            ev.preventDefault();
+            if (typeof ev.stopPropagation === "function") ev.stopPropagation();
+            state.d2EditingMemId = null;
+            state.d2EditingMemDraft = "";
+            renderDelivery2Panel();
+          }
+        },
+      });
+      cardNode.appendChild(
+        el(
+          "div",
+          { className: "d2-mem-edit-row" },
+          inputEl,
+          actionBtn({
+            label: "Save",
+            variant: "primary",
+            size: "sm",
+            onClick: () => mutateDelivery2Memory(memId, "edit", state.d2EditingMemDraft),
+          }),
+          actionBtn({
+            label: "Cancel",
+            variant: "ghost",
+            size: "sm",
+            onClick: () => {
+              state.d2EditingMemId = null;
+              state.d2EditingMemDraft = "";
+              renderDelivery2Panel();
+            },
+          }),
+        ),
+      );
+      return cardNode;
+    }
+
+    if (entry.status === "undone") {
+      cardNode.appendChild(
+        el(
+          "div",
+          { className: "d2-mem-line" },
+          el("span", { className: "muted" }, "Removed saved note"),
+          el(
+            "div",
+            { className: "d2-mem-actions" },
+            el(
+              "button",
+              {
+                type: "button",
+                className: "d2-micro-btn",
+                onClick: () => mutateDelivery2Memory(memId, "restore"),
+              },
+              "Restore",
+            ),
+          ),
+        ),
+      );
+      return cardNode;
+    }
+
+    cardNode.appendChild(
+      el(
+        "div",
+        { className: "d2-mem-line" },
+        el(
+          "span",
+          { className: "d2-mem-text" },
+          el("strong", { className: "w600" }, "Saved: "),
+          entry.note || "",
+        ),
+        el(
+          "div",
+          { className: "d2-mem-actions" },
+          el(
+            "button",
+            {
+              type: "button",
+              className: "d2-micro-btn",
+              onClick: async () => {
+                await Motion.dipSwap(cardNode, () => {
+                  state.d2EditingMemId = memId;
+                  state.d2EditingMemDraft = String(entry.note || "");
+                  renderDelivery2Panel();
+                });
+                const track = dom.d2Track();
+                if (track) {
+                  const inputs = Array.from(track.querySelectorAll(".d2-mem-edit-input"));
+                  const inp =
+                    inputs.find((n) => n.dataset && n.dataset.memEditInput === memId) ||
+                    inputs[0] ||
+                    null;
+                  if (inp && typeof inp.focus === "function") {
+                    inp.focus();
+                  }
+                }
+              },
+            },
+            "Edit",
+          ),
+          el(
+            "button",
+            {
+              type: "button",
+              className: "d2-micro-btn",
+              onClick: () => mutateDelivery2Memory(memId, "undo"),
+            },
+            "Undo",
+          ),
+        ),
+      ),
+    );
+    return cardNode;
+  }
+
+  // Card 3C: Grounded Board/Repo Q&A Card + Collapsed Provenance
+  const sources = Array.isArray(entry.sources) ? entry.sources : [];
+  const srcOpen = state.d2ExpandedSources.has(entry.id);
+  const shownBody =
+    state.d2StreamingEntryId === entry.id ? state.d2StreamingText : String(entry.body || "");
+
+  let provToggle = null;
+  let provDisclosure = null;
+  if (sources.length > 0) {
+    provDisclosure = el(
+      "div",
+      {
+        className: "d2-disclosure-body",
+        "aria-hidden": srcOpen ? "false" : "true",
+        dataset: { open: srcOpen ? "true" : "false" },
+      },
+      el(
+        "div",
+        { className: "d2-disclosure-inner" },
+        el(
+          "div",
+          { className: "d2-prov-list" },
+          sources.map((src) =>
+            el(
+              "button",
+              {
+                type: "button",
+                className: "d2-prov-link",
+                onClick: () => navigate(src.hash || "#inbox", "delivery2_provenance"),
+              },
+              el("span", { className: "truncate" }, src.label || "Workspace source"),
+              el("span", { className: "muted" }, "Open →"),
+            ),
+          ),
+        ),
+      ),
+    );
+    provDisclosure.inert = !srcOpen;
+
+    provToggle = el(
+      "button",
+      {
+        type: "button",
+        className: "d2-disclosure-btn",
+        "aria-expanded": srcOpen ? "true" : "false",
+        onClick: () => {
+          const next = !state.d2ExpandedSources.has(entry.id);
+          if (next) state.d2ExpandedSources.add(entry.id);
+          else state.d2ExpandedSources.delete(entry.id);
+          provToggle.setAttribute("aria-expanded", next ? "true" : "false");
+          provDisclosure.dataset.open = next ? "true" : "false";
+          provDisclosure.inert = !next;
+          provDisclosure.setAttribute("aria-hidden", next ? "false" : "true");
+        },
+      },
+      ICONS.chevronRight(),
+      el("span", null, `Verified sources · ${sources.length} ${sources.length === 1 ? "item" : "items"}`),
+    );
+  }
+
+  return el(
+    "article",
+    { className: "d2-card d2-qa-card", dataset: { entryId: entry.id } },
+    el(
+      "div",
+      { className: "d2-qa-head" },
+      el("span", { className: "d2-qa-author" }, entry.author || "Delivery-2"),
+    ),
+    el("div", { className: "d2-qa-body", id: `d2-qa-body-${entry.id}` }, renderHealedInlineMarkdown(shownBody)),
+    provToggle,
+    provDisclosure,
+  );
+}
+
+function renderDelivery2Panel() {
+  const track = dom.d2Track();
+  const spine = dom.d2Spine();
+  const fixedToggle = dom.d2RailToggleFixed();
+  if (fixedToggle) {
+    const expandedNow = isDelivery2RailExpanded();
+    fixedToggle.setAttribute("aria-expanded", expandedNow ? "true" : "false");
+    fixedToggle.setAttribute(
+      "aria-label",
+      expandedNow ? "Collapse Delivery-2 panel (⌘B)" : "Expand Delivery-2 panel (⌘B)",
+    );
+    fixedToggle.setAttribute(
+      "title",
+      expandedNow ? "Collapse Delivery-2 (⌘B)" : "Expand Delivery-2 (⌘B)",
+    );
+  }
+  if (!track && !spine) return;
+
+  const d2 = state.data.delivery2 || createDefaultDelivery2State();
+  const prevActiveId =
+    typeof document !== "undefined" && document.activeElement ? document.activeElement.id : null;
+
+  const isReconnecting = state.transportMode === "poll_fallback" && state.reconnectCount > 0;
+  const liveWord = state.d2Sending
+    ? "Working"
+    : isReconnecting
+      ? "Reconnecting…"
+      : d2.status_label || "Live";
+  const statusTone = state.d2Sending
+    ? "working"
+    : isReconnecting || d2.status === "waiting_for_you"
+      ? "warning"
+      : "ok";
+
+  const surfaces = d2.sync_radar && Array.isArray(d2.sync_radar.surfaces) ? d2.sync_radar.surfaces : [];
+  const activeRunEntry = (d2.entries || []).find((e) => e && e.kind === "run_card") || null;
+  const spineSteps =
+    activeRunEntry && Array.isArray(activeRunEntry.steps) && activeRunEntry.steps.length === 12
+      ? activeRunEntry.steps
+      : buildDefaultStepLadder(10, false);
+
+  // 1. Render 44px Vertical Spine (.d2-spine)
+  if (spine) {
+    clearNode(spine);
+    spine.append(
+      el(
+        "div",
+        { className: "d2-spine-top" },
+        el(
+          "button",
+          {
+            type: "button",
+            className: "d2-rail-toggle",
+            id: "d2-spine-toggle",
+            "aria-expanded": "false",
+            "aria-controls": "d2-rail",
+            "aria-label": "Expand Delivery-2 panel (⌘B)",
+            title: "Expand Delivery-2 (⌘B)",
+            onClick: () => toggleDelivery2Rail("spine_toggle"),
+          },
+          ICONS.rail(),
+        ),
+        el(
+          "div",
+          { className: "d2-spine-dots", "aria-label": "Connected surfaces" },
+          surfaces.map((s) =>
+            el("span", {
+              className: "d2-spine-dot",
+              title: `${s.label}: ${s.auth_status}`,
+              dataset: { state: surfacePillState(s) },
+            }),
+          ),
+        ),
+      ),
+      el(
+        "div",
+        { className: "d2-spine-ladder", "aria-label": "Active run progress" },
+        spineSteps.map((st) =>
+          el("span", {
+            className: "d2-spine-seg",
+            title: st.display,
+            dataset: { stepState: st.state || "pending" },
+          }),
+        ),
+      ),
+      el(
+        "div",
+        { className: "d2-spine-bottom" },
+        el(
+          "button",
+          {
+            type: "button",
+            className: "d2-spine-compose",
+            id: "d2-spine-compose",
+            "aria-label": "Ask Delivery-2 (⌘J)",
+            title: "Ask Delivery-2 (⌘J)",
+            onClick: () => focusDelivery2Composer(),
+          },
+          ICONS.compose(),
+        ),
+      ),
+    );
+  }
+
+  if (!track) return;
+  clearNode(track);
+
+  // 2. Render Zone 1: Header & 4-Surface <200ms Sync Radar (Zero voice stubs in Phase 1)
+  const liveDot = el("span", {
+    className: "d2-status-dot",
+    "aria-hidden": "true",
+    dataset: {
+      tone: statusTone !== "ok" ? statusTone : null,
+      live: state.d2Sending || statusTone === "ok" ? true : null,
+    },
+  });
+  if (state.d2Sending || statusTone === "ok") {
+    Motion.observeLoop(liveDot);
+  }
+
+  const zoneHead = el(
+    "header",
+    { className: "d2-zone-head" },
+    el(
+      "div",
+      { className: "d2-head" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "d2-rail-toggle",
+          id: "d2-head-toggle",
+          "aria-expanded": "true",
+          "aria-controls": "d2-rail",
+          "aria-label": "Collapse Delivery-2 panel (⌘B)",
+          title: "Toggle Delivery-2 (⌘B)",
+          onClick: () => toggleDelivery2Rail("header_toggle"),
+        },
+        ICONS.rail(),
+      ),
+      el(
+        "div",
+        { className: "d2-title-group" },
+        el("span", { className: "d2-title" }, "Delivery-2"),
+        el(
+          "span",
+          { className: "d2-status-wrap" },
+          liveDot,
+          el("span", { className: "d2-status-word", id: "d2-status-word" }, liveWord),
+        ),
+      ),
+      el(
+        "div",
+        { className: "d2-head-actions" },
+        el(
+          "button",
+          {
+            type: "button",
+            className: "d2-icon-btn",
+            id: "d2-btn-new-thread",
+            "aria-label": "New thread",
+            title: "New thread",
+            onClick: () => startNewDelivery2Thread(),
+          },
+          ICONS.plus(),
+        ),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "d2-icon-btn",
+            id: "d2-btn-history",
+            "aria-haspopup": "dialog",
+            "aria-expanded": state.d2Popover === "history" ? "true" : "false",
+            "aria-label": "Recent threads",
+            title: "Recent threads",
+            onClick: () => openD2Popover("history"),
+          },
+          ICONS.clock(),
+        ),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "d2-icon-btn",
+            id: "d2-btn-collapse",
+            "aria-label": "Collapse Delivery-2 (⌘B)",
+            title: "Collapse (⌘B)",
+            onClick: () => setDelivery2RailExpanded(false, { persist: true, animate: true }),
+          },
+          ICONS.chevronLeft(),
+        ),
+      ),
+    ),
+    el(
+      "div",
+      { className: "d2-sync-radar", "aria-label": "Workspace sync radar" },
+      el(
+        "div",
+        { className: "d2-sync-pills" },
+        surfaces.map((surf) =>
+          el(
+            "button",
+            {
+              type: "button",
+              className: "d2-sync-pill",
+              dataset: {
+                surface: surf.id,
+                state: surfacePillState(surf),
+              },
+              title: `${surf.label} · ${surf.auth_status}`,
+              onClick: () => openD2Popover("connections", surf.id),
+            },
+            el("span", { className: "d2-sync-dot", "aria-hidden": "true" }),
+            el("span", null, surf.label),
+          ),
+        ),
+      ),
+      el("span", { className: "d2-sync-latency" }, (d2.sync_radar && d2.sync_radar.latency_label) || "<200ms"),
+    ),
+    state.d2Popover === "history" ? buildDelivery2HistoryPopover(d2) : null,
+  );
+
+  // 3. Render Zone 2: Morning Focus 3-Row Deterministic Digest Card
+  const mf = d2.morning_focus || { seen: false, collapsed: false, rows: [] };
+  const zoneDigest = el(
+    "section",
+    { className: "d2-zone-digest", "aria-label": "Morning focus" },
+    el(
+      "div",
+      { className: "d2-digest" },
+      el(
+        "div",
+        { className: "d2-digest-head" },
+        el(
+          "span",
+          { className: "d2-digest-title" },
+          "Morning focus",
+          mf.seen ? el("span", { className: "d2-digest-seen-tag" }, "Seen") : null,
+        ),
+        el(
+          "div",
+          { className: "d2-digest-controls" },
+          !mf.seen
+            ? el(
+                "button",
+                {
+                  type: "button",
+                  className: "d2-micro-btn",
+                  id: "d2-btn-morning-seen",
+                  onClick: () => updateMorningFocus({ seen: true }),
+                },
+                "Seen",
+              )
+            : null,
+          el(
+            "button",
+            {
+              type: "button",
+              className: "d2-micro-btn",
+              id: "d2-btn-morning-toggle",
+              "aria-expanded": mf.collapsed ? "false" : "true",
+              onClick: () => updateMorningFocus({ collapsed: !mf.collapsed }),
+            },
+            mf.collapsed ? "Show" : "Hide",
+          ),
+        ),
+      ),
+      !mf.collapsed
+        ? el(
+            "div",
+            { className: "d2-digest-rows" },
+            (mf.rows || []).map((row) =>
+              el(
+                "button",
+                {
+                  type: "button",
+                  className: "d2-digest-row",
+                  dataset: { targetTab: row.target_tab },
+                  onClick: () => navigate(row.hash || `#${row.target_tab}`, "delivery2_morning_focus"),
+                },
+                el(
+                  "span",
+                  { className: "d2-digest-row-left" },
+                  el("span", { className: "d2-digest-count" }, row.badge),
+                  el("span", { className: "d2-digest-label" }, row.label),
+                ),
+                el("span", { className: "d2-digest-cta" }, `${row.cta} →`),
+              ),
+            ),
+          )
+        : null,
+    ),
+  );
+
+  // 4. Render Zone 3: Cursor-Resumed Durable Stream Thread (role="log")
+  const entries = Array.isArray(d2.entries) ? d2.entries : [];
+  const zoneThread = el(
+    "div",
+    {
+      className: "d2-thread",
+      id: "d2-thread",
+      role: "log",
+      "aria-live": "polite",
+      "aria-label": "Delivery-2 thread",
+      dataset: { cursorSeq: String(d2.seq || 1) },
+    },
+    entries.length > 0
+      ? entries.map((entry) => renderDelivery2Entry(entry))
+      : el(
+          "div",
+          { className: "d2-card d2-qa-card" },
+          el("div", { className: "d2-qa-author" }, "Delivery-2"),
+          el(
+            "div",
+            { className: "d2-qa-body" },
+            "Fresh thread ready. Ask Delivery-2 to scope a change, explain a diff, or save a repository note with ",
+            el("code", { className: "pill-code" }, "Remember:"),
+            ".",
+          ),
+        ),
+  );
+
+  // 5. Render Zone 4: Composer, Steering Chips & 2-Axis + Connections Popover
+  const chips = Array.isArray(d2.steering_chips) ? d2.steering_chips : [];
+  const composerInput = el("textarea", {
+    id: "d2-composer-input",
+    className: "d2-composer-input",
+    rows: "2",
+    placeholder: "Ask Delivery-2 to scope, explain, or steer… (⌘J)",
+    "aria-label": "Ask Delivery-2",
+    value: state.d2ComposerDraft,
+    onInput: (ev) => {
+      state.d2ComposerDraft = ev.target.value;
+      if (state.d2ComposerError) state.d2ComposerError = null;
+    },
+    onKeydown: (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey && !ev.metaKey && !ev.ctrlKey) {
+        ev.preventDefault();
+        submitDelivery2Prompt(composerInput.value);
+      }
+    },
+  });
+
+  const actionButton = state.d2Sending
+    ? el(
+        "button",
+        {
+          type: "button",
+          id: "d2-btn-stop",
+          className: "d2-stop-btn",
+          "aria-label": "Stop Delivery-2 reply (⌘.)",
+          title: "Stop reply (⌘.)",
+          onClick: () => cancelDelivery2Turn(),
+        },
+        ICONS.stop(),
+        el("span", null, "Stop"),
+        el("kbd", { className: "keycap", "aria-hidden": "true" }, "⌘."),
+      )
+    : el(
+        "button",
+        {
+          type: "button",
+          id: "d2-btn-send",
+          className: "d2-send-btn",
+          "aria-label": "Send message to Delivery-2",
+          onClick: () => submitDelivery2Prompt(composerInput.value),
+        },
+        ICONS.send(),
+        el("span", null, "Send"),
+      );
+
+  const zoneComposer = el(
+    "footer",
+    { className: "d2-zone-composer" },
+    state.d2Popover === "connections" ? buildDelivery2ConnectionsPopover(d2) : null,
+    el(
+      "div",
+      { className: "d2-chip-strip", "aria-label": "Quick questions" },
+      chips.map((ch) =>
+        el(
+          "button",
+          {
+            type: "button",
+            className: "d2-chip",
+            onClick: () => {
+              state.d2ComposerDraft = ch.prompt;
+              submitDelivery2Prompt(ch.prompt);
+            },
+          },
+          ch.label,
+        ),
+      ),
+    ),
+    el(
+      "div",
+      { className: "d2-composer-box" },
+      composerInput,
+      el(
+        "div",
+        { className: "d2-composer-foot" },
+        el(
+          "button",
+          {
+            type: "button",
+            id: "d2-btn-connections",
+            className: "d2-conn-btn",
+            "aria-haspopup": "dialog",
+            "aria-expanded": state.d2Popover === "connections" ? "true" : "false",
+            onClick: () => openD2Popover("connections"),
+          },
+          "+ Connections",
+        ),
+        el("div", { className: "d2-composer-right" }, actionButton),
+      ),
+    ),
+    state.d2ComposerError
+      ? el("div", { className: "d2-composer-error", role: "alert" }, state.d2ComposerError)
+      : null,
+  );
+
+  track.append(zoneHead, zoneDigest, zoneThread, zoneComposer);
+
+  if (prevActiveId === "d2-composer-input") {
+    composerInput.focus();
+  }
+}
+
+function bounceToDelivery2Run(runId = null) {
+  setDelivery2RailExpanded(true, { persist: true, animate: true });
+  renderDelivery2Panel();
+  const track = dom.d2Track();
+  let targetCard = null;
+  if (track) {
+    const cards = Array.from(track.querySelectorAll(".d2-card"));
+    if (runId) {
+      targetCard = cards.find((c) => c.dataset && c.dataset.runId === runId) || null;
+    }
+    if (!targetCard) {
+      targetCard = track.querySelector(".d2-run-card") || cards[0] || null;
+    }
+  }
+  if (targetCard) {
+    Motion.flashDeliveryCard(targetCard);
+  }
+  const input = dom.d2ComposerInput();
+  if (input) input.focus();
+  trackUiEvent("ui_delivery2_deeplink_bounced", {
+    target_found: Boolean(targetCard),
+  });
+  return Boolean(targetCard);
+}
+
 // ── 10 · Deep-Link Hash Router, Keyboard Shortcuts & Live Stream ─────────────
 
 function parseHashRoute(hashStr) {
   const raw = String(hashStr || "").replace(/^#\/?/, "").trim();
-  if (!raw || raw === "inbox") return { view: "inbox", itemId: null, entryRoute: "inbox" };
-  if (raw === "walkthrough") return { view: "inbox", itemId: "sample-walkthrough", entryRoute: "walkthrough" };
+  if (!raw || raw === "inbox") {
+    return { view: "inbox", itemId: null, entryRoute: "inbox", focusDelivery2: false, runId: null };
+  }
+  if (raw === "delivery2" || raw === "focus=delivery2") {
+    return { view: state.view || "inbox", itemId: null, entryRoute: "delivery2", focusDelivery2: true, runId: null };
+  }
+  if (raw.includes("focus=delivery2") || raw.startsWith("run=")) {
+    let view = state.view || "inbox";
+    let runId = null;
+    for (const part of raw.split("&")) {
+      const seg = part.trim();
+      if (seg === "inbox" || seg === "board" || seg === "agents" || seg === "credits") {
+        view = seg;
+      } else if (seg.startsWith("run=")) {
+        runId = decodeURIComponent(seg.slice(4)) || null;
+      }
+    }
+    return { view, itemId: null, entryRoute: "delivery2", focusDelivery2: true, runId };
+  }
+  if (raw === "walkthrough") {
+    return { view: "inbox", itemId: "sample-walkthrough", entryRoute: "walkthrough", focusDelivery2: false, runId: null };
+  }
   if (raw.startsWith("diff/")) {
     const id = decodeURIComponent(raw.slice(5));
-    return { view: "inbox", itemId: id || null, entryRoute: "diff" };
+    return { view: "inbox", itemId: id || null, entryRoute: "diff", focusDelivery2: false, runId: null };
   }
   if (raw.startsWith("inbox/")) {
     const id = decodeURIComponent(raw.slice(6));
-    return { view: "inbox", itemId: id || null, entryRoute: "diff" };
+    return { view: "inbox", itemId: id || null, entryRoute: "diff", focusDelivery2: false, runId: null };
   }
-  if (raw === "board") return { view: "board", itemId: null, entryRoute: "board" };
-  if (raw === "agents" || raw === "rules") return { view: "agents", itemId: null, entryRoute: "agents" };
-  if (raw === "credits" || raw === "billing") return { view: "credits", itemId: null, entryRoute: "credits" };
-  return { view: "inbox", itemId: null, entryRoute: "inbox" };
+  if (raw === "board") return { view: "board", itemId: null, entryRoute: "board", focusDelivery2: false, runId: null };
+  if (raw === "agents" || raw === "rules") {
+    return { view: "agents", itemId: null, entryRoute: "agents", focusDelivery2: false, runId: null };
+  }
+  if (raw === "credits" || raw === "billing") {
+    return { view: "credits", itemId: null, entryRoute: "credits", focusDelivery2: false, runId: null };
+  }
+  return { view: "inbox", itemId: null, entryRoute: "inbox", focusDelivery2: false, runId: null };
 }
 
 function navigate(hash, navTrigger = "top_tab") {
@@ -5134,6 +7331,10 @@ function applyRouteFromLocation(trigger = pendingNavTrigger) {
   state.openItemId = parsed.itemId;
   if (parsed.itemId) state.sheetOpenedAtMs = Date.now();
 
+  if (!parsed.focusDelivery2) {
+    syncRailForOverlaySheet();
+  }
+
   if (viewChanged) {
     trackUiEvent("ui_view_navigated", {
       previous_view: prevView,
@@ -5143,6 +7344,10 @@ function applyRouteFromLocation(trigger = pendingNavTrigger) {
   }
   syncHeaderChrome();
   renderCurrentView();
+
+  if (parsed.focusDelivery2) {
+    bounceToDelivery2Run(parsed.runId);
+  }
 }
 
 function renderCurrentView() {
@@ -5162,34 +7367,132 @@ function renderCurrentView() {
   Motion.contentIn(root);
 }
 
-// Keyboard navigation: j/k, Enter, Escape, Cmd/Ctrl+K, Cmd/Ctrl+Enter, g+i/b/a/c
+// Keyboard navigation: Cmd+B, Cmd+J, Cmd+., Cmd+K, region-scoped Cmd+Enter, Esc, j/k, g+i/b/a/c
 let chordPrefixGAt = 0;
 
 function isEditableTarget(target) {
-  if (!target || !(target instanceof Element)) return false;
-  const tag = target.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+  if (!target || typeof target.tagName !== "string") return false;
+  const tag = target.tagName.toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || Boolean(target.isContentEditable);
 }
 
-function wireKeyboardShortcuts() {
-  document.addEventListener("keydown", (ev) => {
-    const mod = ev.metaKey || ev.ctrlKey;
+function findAncestorWithClass(node, cls) {
+  let cur = node;
+  while (cur) {
+    if (cur.className && typeof cur.className === "string") {
+      const parts = cur.className.split(/\s+/);
+      if (parts.includes(cls)) return cur;
+    }
+    cur = cur.parentNode || null;
+  }
+  return null;
+}
 
-    // Cmd/Ctrl + K -> Focus New engineering task input
-    if (mod && (ev.key === "k" || ev.key === "K")) {
-      ev.preventDefault();
-      if (state.view !== "inbox") {
-        navigate("#inbox", "keyboard");
+function isFocusableInD2Drawer(node, rootTrack) {
+  if (!node || node.hidden || node.disabled || node.inert) return false;
+  if (node.getAttribute("aria-disabled") === "true") return false;
+  if (node.getAttribute("aria-hidden") === "true") return false;
+  if (node.getAttribute("tabindex") === "-1") return false;
+  let cur = node.parentNode || null;
+  while (cur && cur !== rootTrack) {
+    if (cur.hidden || cur.inert || cur.getAttribute("aria-hidden") === "true") return false;
+    if (cur.dataset && cur.dataset.open === "false") return false;
+    cur = cur.parentNode || null;
+  }
+  return true;
+}
+
+function handleGlobalKeydown(ev) {
+  if (ev.defaultPrevented) return;
+  const mod = Boolean(ev.metaKey || ev.ctrlKey);
+  const activeNode = ev.target || (typeof document !== "undefined" ? document.activeElement : null);
+
+  // Focus trap when < 960px Delivery-2 drawer is open
+  if (ev.key === "Tab" && state.d2DrawerOpen && isNarrowDrawerViewport()) {
+    const track = dom.d2Track();
+    if (track) {
+      const focusables = Array.from(
+        track.querySelectorAll("button, a, textarea, input, select"),
+      ).filter((n) => isFocusableInD2Drawer(n, track));
+      if (focusables.length > 0) {
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const cur = typeof document !== "undefined" ? document.activeElement : null;
+        if (ev.shiftKey && (cur === first || !focusables.includes(cur))) {
+          ev.preventDefault();
+          last.focus();
+          return;
+        }
+        if (!ev.shiftKey && (cur === last || !focusables.includes(cur))) {
+          ev.preventDefault();
+          first.focus();
+          return;
+        }
       }
-      requestAnimationFrame(() => {
-        const input = document.getElementById("ask-pm-input");
-        if (input) input.focus();
-      });
+    }
+  }
+
+  // Cmd/Ctrl + B -> Toggle Persistent Left-Hand Delivery-2 Panel
+  if (mod && !ev.altKey && (ev.key === "b" || ev.key === "B")) {
+    ev.preventDefault();
+    toggleDelivery2Rail("keyboard");
+    return;
+  }
+
+  // Cmd/Ctrl + J -> Expand Delivery-2 (if collapsed) & focus Delivery-2 composer
+  if (mod && !ev.altKey && (ev.key === "j" || ev.key === "J")) {
+    ev.preventDefault();
+    focusDelivery2Composer();
+    return;
+  }
+
+  // Cmd/Ctrl + . -> Cancel active Delivery-2 reply
+  if (mod && !ev.altKey && ev.key === ".") {
+    if (state.d2Sending || state.d2ActiveStreamer) {
+      ev.preventDefault();
+      cancelDelivery2Turn();
+    }
+    return;
+  }
+
+  // Cmd/Ctrl + K -> Untouched Inbox Queue task launcher
+  if (mod && (ev.key === "k" || ev.key === "K")) {
+    ev.preventDefault();
+    if (state.view !== "inbox") {
+      navigate("#inbox", "keyboard");
+    }
+    requestAnimationFrame(() => {
+      const input = document.getElementById("ask-pm-input");
+      if (input) input.focus();
+    });
+    return;
+  }
+
+  // Cmd/Ctrl + Enter -> Region-scoped! Inside #d2-rail acts ONLY on Delivery-2, never Inbox sheet merge.
+  if (mod && ev.key === "Enter") {
+    if (isNodeInsideD2Rail(activeNode)) {
+      if (activeNode && activeNode.id === "d2-composer-input") {
+        ev.preventDefault();
+        const draft = String(activeNode.value || state.d2ComposerDraft || "").trim();
+        if (draft) {
+          submitDelivery2Prompt(draft);
+        }
+        return;
+      }
+      if (isEditableTarget(activeNode)) {
+        return;
+      }
+      const hitlCard = findAncestorWithClass(activeNode, "d2-hitl-card");
+      if (hitlCard) {
+        const hitlBtn = hitlCard.querySelector(".d2-hitl-primary");
+        if (hitlBtn && hitlBtn.getAttribute("aria-disabled") !== "true" && !Motion.isArming(hitlBtn)) {
+          ev.preventDefault();
+          hitlBtn.click();
+        }
+      }
       return;
     }
-
-    // Cmd/Ctrl + Enter -> Trigger enabled primary action in open sheet
-    if (mod && ev.key === "Enter" && state.openItemId) {
+    if (state.openItemId) {
       const primary = document.getElementById("sheet-primary-action");
       if (primary && primary.getAttribute("aria-disabled") !== "true" && !Motion.isArming(primary)) {
         ev.preventDefault();
@@ -5197,79 +7500,100 @@ function wireKeyboardShortcuts() {
       }
       return;
     }
+  }
 
-    // Escape -> Close topmost overlay (popover -> modal -> sheet)
-    if (ev.key === "Escape") {
-      const popLayer = dom.popoverLayer();
-      if (popLayer && !popLayer.hidden) {
-        ev.preventDefault();
-        closePopover();
-        return;
-      }
-      const modLayer = dom.modalLayer();
-      if (modLayer && !modLayer.hidden) {
-        ev.preventDefault();
-        closeModal();
-        return;
-      }
-      if (state.openItemId) {
-        ev.preventDefault();
-        closeReviewSheetAndNavigate();
-      }
+  // Escape -> Close topmost overlay (d2Popover -> d2EditingMemId -> d2Drawer -> popover -> modal -> sheet)
+  if (ev.key === "Escape") {
+    if (state.d2Popover) {
+      ev.preventDefault();
+      closeD2Popover();
       return;
     }
-
-    if (isEditableTarget(ev.target) || mod || ev.altKey) return;
-
-    // g + i / b / a / c navigation chords
-    const now = performance.now();
-    if (ev.key === "g") {
-      chordPrefixGAt = now;
+    if (state.d2EditingMemId) {
+      ev.preventDefault();
+      state.d2EditingMemId = null;
+      state.d2EditingMemDraft = "";
+      renderDelivery2Panel();
       return;
     }
-    if (now - chordPrefixGAt < 700) {
-      chordPrefixGAt = 0;
-      if (ev.key === "i") { ev.preventDefault(); navigate("#inbox", "keyboard"); return; }
-      if (ev.key === "b") { ev.preventDefault(); navigate("#board", "keyboard"); return; }
-      if (ev.key === "a") { ev.preventDefault(); navigate("#agents", "keyboard"); return; }
-      if (ev.key === "c") { ev.preventDefault(); navigate("#credits", "keyboard"); return; }
+    if (state.d2DrawerOpen && isNarrowDrawerViewport()) {
+      ev.preventDefault();
+      setDelivery2RailExpanded(false, { persist: false, animate: true });
+      return;
     }
-
-    if (state.view !== "inbox") return;
-
-    if (ev.key === "j" || ev.key === "ArrowDown") {
+    const popLayer = dom.popoverLayer();
+    if (popLayer && !popLayer.hidden) {
       ev.preventDefault();
-      if (state.openItemId) {
-        stepOpenSheetItem(1, ev.repeat);
-      } else {
-        const items = filteredInboxItems();
-        if (items.length > 0) {
-          state.selectedIndex = Math.min(items.length - 1, state.selectedIndex + 1);
-          renderCurrentView();
-        }
-      }
-    } else if (ev.key === "k" || ev.key === "ArrowUp") {
+      closePopover();
+      return;
+    }
+    const modLayer = dom.modalLayer();
+    if (modLayer && !modLayer.hidden) {
       ev.preventDefault();
-      if (state.openItemId) {
-        stepOpenSheetItem(-1, ev.repeat);
-      } else {
-        const items = filteredInboxItems();
-        if (items.length > 0) {
-          state.selectedIndex = Math.max(0, state.selectedIndex - 1);
-          renderCurrentView();
-        }
-      }
-    } else if (ev.key === "Enter" && !state.openItemId) {
-      const targetTag = ev.target && ev.target.tagName;
-      if (targetTag === "BUTTON" || targetTag === "A") return;
+      closeModal();
+      return;
+    }
+    if (state.openItemId) {
+      ev.preventDefault();
+      closeReviewSheetAndNavigate();
+    }
+    return;
+  }
+
+  if (isEditableTarget(activeNode) || isNodeInsideD2Rail(activeNode) || mod || ev.altKey) return;
+
+  // g + i / b / a / c navigation chords
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  if (ev.key === "g") {
+    chordPrefixGAt = now;
+    return;
+  }
+  if (now - chordPrefixGAt < 700) {
+    chordPrefixGAt = 0;
+    if (ev.key === "i") { ev.preventDefault(); navigate("#inbox", "keyboard"); return; }
+    if (ev.key === "b") { ev.preventDefault(); navigate("#board", "keyboard"); return; }
+    if (ev.key === "a") { ev.preventDefault(); navigate("#agents", "keyboard"); return; }
+    if (ev.key === "c") { ev.preventDefault(); navigate("#credits", "keyboard"); return; }
+  }
+
+  if (state.view !== "inbox") return;
+
+  if (ev.key === "j" || ev.key === "ArrowDown") {
+    ev.preventDefault();
+    if (state.openItemId) {
+      stepOpenSheetItem(1, ev.repeat);
+    } else {
       const items = filteredInboxItems();
-      const sel = items[state.selectedIndex];
-      if (sel) {
-        ev.preventDefault();
-        navigate(sel.is_sample ? "#walkthrough" : `#diff/${encodeURIComponent(sel.id)}`, "keyboard");
+      if (items.length > 0) {
+        state.selectedIndex = Math.min(items.length - 1, state.selectedIndex + 1);
+        renderCurrentView();
       }
     }
-  });
+  } else if (ev.key === "k" || ev.key === "ArrowUp") {
+    ev.preventDefault();
+    if (state.openItemId) {
+      stepOpenSheetItem(-1, ev.repeat);
+    } else {
+      const items = filteredInboxItems();
+      if (items.length > 0) {
+        state.selectedIndex = Math.max(0, state.selectedIndex - 1);
+        renderCurrentView();
+      }
+    }
+  } else if (ev.key === "Enter" && !state.openItemId) {
+    const targetTag = activeNode && activeNode.tagName;
+    if (targetTag === "BUTTON" || targetTag === "A") return;
+    const items = filteredInboxItems();
+    const sel = items[state.selectedIndex];
+    if (sel) {
+      ev.preventDefault();
+      navigate(sel.is_sample ? "#walkthrough" : `#diff/${encodeURIComponent(sel.id)}`, "keyboard");
+    }
+  }
+}
+
+function wireKeyboardShortcuts() {
+  document.addEventListener("keydown", handleGlobalKeydown);
 }
 
 // Single-use ticket stream (/api/bus/stream-ticket -> /api/bus/stream?ticket=...) + polling fallback
@@ -5292,9 +7616,24 @@ async function refreshBootstrapQuietly() {
     } else {
       state.committedWorkflow = snapshotWorkflowState(fresh.agents);
     }
+    // Read the CURRENT Delivery-2 cursor & snapshot AFTER `await` resolves so delayed
+    // bootstrap responses can never roll back newer mutations applied while in flight.
+    const livePrevD2 = state.data ? state.data.delivery2 : null;
+    const livePrevSeq = Number(state.d2LastCursorSeq) || 0;
+    const incomingSeq = Math.max(1, Number(fresh.delivery2 && fresh.delivery2.seq) || 1);
+    if (state.d2Loaded && livePrevD2 && incomingSeq < livePrevSeq) {
+      fresh.delivery2 = livePrevD2;
+    } else {
+      reconcileCancelledDelivery2State(fresh.delivery2);
+      state.d2LastCursorSeq = Math.max(livePrevSeq, incomingSeq);
+      state.d2Loaded = true;
+    }
     state.data = fresh;
     state.bootstrapOk = true;
     syncHeaderChrome();
+    if (!state.d2Sending && !state.d2EditingMemId) {
+      renderDelivery2Panel();
+    }
     return true;
   } catch (e) {
     return false;
@@ -5306,7 +7645,7 @@ function startPollingFallback() {
   state.transportMode = "poll_fallback";
   pollIntervalId = window.setInterval(() => {
     if (!document.hidden) {
-      refreshBootstrapQuietly().then((ok) => {
+      Promise.all([resumeDelivery2FromCursor(), refreshBootstrapQuietly()]).then(([, ok]) => {
         if (ok && !state.openItemId && state.view === "inbox") {
           renderCurrentView();
         }
@@ -5340,7 +7679,7 @@ async function connectLiveStream(attempt = 1) {
       if (streamRefreshInFlight) return;
       streamRefreshInFlight = true;
       try {
-        const ok = await refreshBootstrapQuietly();
+        const [, ok] = await Promise.all([resumeDelivery2FromCursor(), refreshBootstrapQuietly()]);
         if (ok && !state.openItemId && (state.view === "inbox" || state.view === "board")) {
           renderCurrentView();
         }
@@ -5348,6 +7687,11 @@ async function connectLiveStream(attempt = 1) {
         streamRefreshInFlight = false;
       }
     };
+    es.addEventListener("open", () => {
+      if (state.reconnectCount > 0) {
+        resumeDelivery2FromCursor();
+      }
+    });
     es.addEventListener("message", handleStreamNotification);
     es.addEventListener("bus_update", handleStreamNotification);
 
@@ -5418,6 +7762,53 @@ async function boot() {
   const btnMobileMenu = dom.btnMobileMenu();
   if (btnMobileMenu) btnMobileMenu.addEventListener("click", () => openMobileMenuPopover(btnMobileMenu));
 
+  const btnD2Drawer = dom.btnD2Drawer();
+  if (btnD2Drawer) btnD2Drawer.addEventListener("click", () => toggleDelivery2Rail("mobile_drawer_btn"));
+
+  const fixedRailBtn = dom.d2RailToggleFixed();
+  if (fixedRailBtn) {
+    clearNode(fixedRailBtn);
+    fixedRailBtn.appendChild(ICONS.rail());
+    fixedRailBtn.addEventListener("click", () => toggleDelivery2Rail("fixed_rail_toggle"));
+  }
+
+  const d2Scrim = dom.d2DrawerScrim();
+  if (d2Scrim) {
+    d2Scrim.addEventListener("click", () => setDelivery2RailExpanded(false, { persist: false, animate: true }));
+  }
+
+  syncDelivery2DrawerDom();
+
+  document.addEventListener("click", (ev) => {
+    if (!state.d2Popover) return;
+    const t = ev.target;
+    let cur = t;
+    while (cur) {
+      if (
+        cur.id === "d2-history-popover" ||
+        cur.id === "d2-connections-popover" ||
+        cur.id === "d2-btn-history" ||
+        cur.id === "d2-btn-connections" ||
+        (cur.className && typeof cur.className === "string" && cur.className.includes("d2-sync-pill"))
+      ) {
+        return;
+      }
+      cur = cur.parentNode || null;
+    }
+    closeD2Popover({ restoreFocus: false });
+  });
+
+  window.addEventListener("resize", () => {
+    syncDelivery2DrawerDom();
+    syncRailForOverlaySheet();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.booted) {
+      resumeDelivery2FromCursor();
+    }
+  });
+
   const creditPill = dom.creditPill();
   if (creditPill) {
     creditPill.addEventListener("click", () => {
@@ -5455,8 +7846,15 @@ async function boot() {
 
   await refreshBootstrapQuietly();
 
+  if (!initialRoute.focusDelivery2) {
+    syncRailForOverlaySheet();
+  }
   syncHeaderChrome();
+  renderDelivery2Panel();
   renderCurrentView();
+  if (initialRoute.focusDelivery2) {
+    bounceToDelivery2Run(initialRoute.runId);
+  }
   state.booted = true;
 
   const bootElapsed = typeof performance !== "undefined" ? performance.now() - BOOT_PERF_MS : 120;
