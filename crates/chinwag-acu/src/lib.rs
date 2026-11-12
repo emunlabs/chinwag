@@ -2950,6 +2950,7 @@ mod tests {
 
         let partition = HivePartitionKey::new("emunlabs", 2026, 11, 12).unwrap();
         let mut store = AcuParquetArchiveStore::new();
+        let _ = store.load_channel_window("emunlabs", "#eng", None, 10);
         let _authentic = store
             .append_signed_message(
                 partition,
@@ -2965,6 +2966,10 @@ mod tests {
                 &mut rng,
             )
             .unwrap();
+        let (cache_hit_after_append, cached_rows) =
+            store.load_channel_window("emunlabs", "#eng", None, 10);
+        assert_eq!(cache_hit_after_append, CacheHit::R2ParquetRangeFetch);
+        assert_eq!(cached_rows.len(), 1);
 
         // Revoke "branch:8687872" and ensure a revoked seat CANNOT spoof `sender_seat = "branch:bystander"`
         // by setting `rerandomized_by_seat = Some("branch:8687872")` at epoch 1 or epoch 2!

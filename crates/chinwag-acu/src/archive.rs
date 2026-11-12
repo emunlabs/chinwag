@@ -689,10 +689,12 @@ impl AcuParquetArchiveStore {
             acu_ciphertext,
         };
 
+        let cache_key = (partition.org_id.clone(), row.room.clone());
         self.partitions
             .entry(partition)
             .or_default()
             .push(row.clone());
+        self.active_channel_cache.remove(&cache_key);
         Ok(row)
     }
 
