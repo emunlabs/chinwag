@@ -263,6 +263,7 @@ pub enum ReleaseSyncError {
     UnauthorizedSigner,
     SignatureInvalid,
     DowngradeOrReplayRejected,
+    TransientIo(String),
     SourceUnavailable(String),
     SafePathViolation(&'static str),
     ArtifactStoreFailed(String),
@@ -301,6 +302,7 @@ impl std::fmt::Display for ReleaseSyncError {
                     "release manifest rejected by monotonic anti-downgrade / replay gate"
                 )
             }
+            Self::TransientIo(reason) => write!(f, "transient filesystem I/O error: {reason}"),
             Self::SourceUnavailable(reason) => write!(f, "release source unavailable: {reason}"),
             Self::SafePathViolation(reason) => {
                 write!(f, "unsafe filesystem path rejected ({reason})")
@@ -333,13 +335,13 @@ impl std::fmt::Display for ReleaseSyncError {
 impl std::error::Error for ReleaseSyncError {}
 
 impl ReleaseSyncError {
-    /// True only for transient storage/transport errors where reconciling later
-    /// from the durable bus journal can succeed without sacrificing fail-closed
-    /// rejection of invalid signatures, digests, codesign checks, or downgrades.
+    /// True only for transient storage/transport/OS-resource errors where reconciling
+    /// later from the durable bus journal can succeed without sacrificing fail-closed
+    /// rejection of unsafe paths, invalid state, signatures, digests, or downgrades.
     pub fn is_transient_retryable(&self) -> bool {
         matches!(
             self,
-            Self::ArtifactStoreFailed(_) | Self::BusPublishFailed(_)
+            Self::TransientIo(_) | Self::ArtifactStoreFailed(_) | Self::BusPublishFailed(_)
         )
     }
 }
@@ -724,6 +726,55 @@ fn iso_now_string() -> String {
     now_unix_secs().to_string()
 }
 
+fn is_transient_errno(errno: rustix::io::Errno) -> bool {
+    matches!(
+        errno,
+        rustix::io::Errno::IO
+            | rustix::io::Errno::MFILE
+            | rustix::io::Errno::NFILE
+            | rustix::io::Errno::NOMEM
+            | rustix::io::Errno::NOBUFS
+            | rustix::io::Errno::AGAIN
+            | rustix::io::Errno::INTR
+            | rustix::io::Errno::BUSY
+            | rustix::io::Errno::TIMEDOUT
+            | rustix::io::Errno::STALE
+    )
+}
+
+fn is_transient_io_error(err: &std::io::Error) -> bool {
+    if let Some(errno) = rustix::io::Errno::from_io_error(err)
+        && is_transient_errno(errno)
+    {
+        return true;
+    }
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::OutOfMemory
+    )
+}
+
+fn classify_journal_io_error(context: &str, err: &std::io::Error) -> ReleaseSyncError {
+    let msg = format!("{context}: {err}");
+    if is_transient_io_error(err) {
+        ReleaseSyncError::TransientIo(msg)
+    } else {
+        ReleaseSyncError::SourceUnavailable(msg)
+    }
+}
+
+fn classify_state_io_error(context: &str, err: &std::io::Error) -> ReleaseSyncError {
+    let msg = format!("{context}: {err}");
+    if is_transient_io_error(err) {
+        ReleaseSyncError::TransientIo(msg)
+    } else {
+        ReleaseSyncError::StatePersistenceFailed(msg)
+    }
+}
+
 /// Opens `path` strictly with `O_NOFOLLOW | O_CLOEXEC`, cross-checking `lstat`
 /// and `fstat` `(dev, ino)` to eliminate symlink/TOCTOU swap races.
 fn open_regular_file_nofollow(
@@ -731,8 +782,8 @@ fn open_regular_file_nofollow(
     require_single_link: bool,
     require_owner: bool,
 ) -> Result<(File, fs::Metadata), ReleaseSyncError> {
-    let lstat = fs::symlink_metadata(path)
-        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("lstat failed: {e}")))?;
+    let lstat =
+        fs::symlink_metadata(path).map_err(|e| classify_journal_io_error("lstat failed", &e))?;
     if lstat.file_type().is_symlink() || !lstat.file_type().is_file() {
         return Err(ReleaseSyncError::SafePathViolation(
             "non_regular_binary_file",
@@ -747,6 +798,9 @@ fn open_regular_file_nofollow(
         Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
             return Err(ReleaseSyncError::SafePathViolation("symlink_open_refused"));
         }
+        Err(err) if is_transient_errno(err) => {
+            return Err(ReleaseSyncError::TransientIo(format!("open failed: {err}")));
+        }
         Err(err) => {
             return Err(ReleaseSyncError::SourceUnavailable(format!(
                 "open failed: {err}"
@@ -756,7 +810,7 @@ fn open_regular_file_nofollow(
     let file = File::from(fd);
     let fstat = file
         .metadata()
-        .map_err(|e| ReleaseSyncError::SourceUnavailable(format!("fstat failed: {e}")))?;
+        .map_err(|e| classify_journal_io_error("fstat failed", &e))?;
     if fstat.file_type().is_symlink() || !fstat.file_type().is_file() {
         return Err(ReleaseSyncError::SafePathViolation(
             "non_regular_binary_file",
@@ -858,6 +912,9 @@ fn acquire_release_sync_lock(home_dir: &Path) -> Result<File, ReleaseSyncError> 
         Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
             return Err(ReleaseSyncError::SafePathViolation("lock_file_symlink"));
         }
+        Err(err) if is_transient_errno(err) => {
+            return Err(ReleaseSyncError::TransientIo(format!("lock open: {err}")));
+        }
         Err(err) => {
             return Err(ReleaseSyncError::StatePersistenceFailed(format!(
                 "lock open: {err}"
@@ -867,7 +924,7 @@ fn acquire_release_sync_lock(home_dir: &Path) -> Result<File, ReleaseSyncError> 
     let file = File::from(fd);
     let meta = file
         .metadata()
-        .map_err(|_| ReleaseSyncError::StatePersistenceFailed("lock_fstat".into()))?;
+        .map_err(|e| classify_state_io_error("lock_fstat", &e))?;
     if meta.file_type().is_symlink()
         || !meta.file_type().is_file()
         || meta.nlink() != 1
@@ -880,6 +937,11 @@ fn acquire_release_sync_lock(home_dir: &Path) -> Result<File, ReleaseSyncError> 
         match flock(&file, FlockOperation::LockExclusive) {
             Ok(()) => return Ok(file),
             Err(err) if err == rustix::io::Errno::INTR => continue,
+            Err(err) if is_transient_errno(err) => {
+                return Err(ReleaseSyncError::TransientIo(format!(
+                    "flock failed: {err}"
+                )));
+            }
             Err(err) => {
                 return Err(ReleaseSyncError::StatePersistenceFailed(format!(
                     "flock failed: {err}"
@@ -943,7 +1005,7 @@ pub fn load_release_sync_state(home_dir: &Path) -> Result<ReleaseSyncStateV1, Re
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ReleaseSyncStateV1::default());
         }
-        Err(_) => return Err(ReleaseSyncError::StatePersistenceFailed("stat".into())),
+        Err(err) => return Err(classify_state_io_error("stat", &err)),
     };
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return Err(ReleaseSyncError::SafePathViolation(
@@ -959,7 +1021,7 @@ pub fn load_release_sync_state(home_dir: &Path) -> Result<ReleaseSyncStateV1, Re
     let mut bytes = Vec::with_capacity(fstat.len() as usize);
     file.take(MAX_STATE_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| ReleaseSyncError::StatePersistenceFailed("read".into()))?;
+        .map_err(|e| classify_state_io_error("read", &e))?;
     if bytes.len() as u64 > MAX_STATE_FILE_BYTES {
         return Err(ReleaseSyncError::StatePersistenceFailed(
             "state_too_large".into(),
@@ -2823,6 +2885,59 @@ fn sync_releases_from_journal_per_binary_inner(
     .executed_reports)
 }
 
+fn open_regular_journal_if_present(
+    messages_jsonl_path: &Path,
+) -> Result<Option<File>, ReleaseSyncError> {
+    let lstat = match fs::symlink_metadata(messages_jsonl_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(classify_journal_io_error("journal stat failed", &err)),
+        Ok(meta) => meta,
+    };
+    if lstat.file_type().is_symlink() || !lstat.file_type().is_file() {
+        return Err(ReleaseSyncError::SafePathViolation(
+            "non_regular_journal_file",
+        ));
+    }
+    let fd = match rustix_open(
+        messages_jsonl_path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(err) if err == rustix::io::Errno::NOENT => return Ok(None),
+        Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
+            return Err(ReleaseSyncError::SafePathViolation("symlink_open_refused"));
+        }
+        Err(err) if is_transient_errno(err) => {
+            return Err(ReleaseSyncError::TransientIo(format!(
+                "journal open failed: {err}"
+            )));
+        }
+        Err(err) => {
+            return Err(ReleaseSyncError::SourceUnavailable(format!(
+                "journal open failed: {err}"
+            )));
+        }
+    };
+    let file = File::from(fd);
+    let fstat = file
+        .metadata()
+        .map_err(|e| classify_journal_io_error("journal fstat failed", &e))?;
+    if fstat.file_type().is_symlink() || !fstat.file_type().is_file() {
+        return Err(ReleaseSyncError::SafePathViolation(
+            "non_regular_journal_file",
+        ));
+    }
+    if (fstat.dev(), fstat.ino()) != (lstat.dev(), lstat.ino()) {
+        // Atomic journal rotation mid-open is transient; symlinks and non-regular
+        // files were already refused via `O_NOFOLLOW` + `fstat.is_file()`.
+        return Err(ReleaseSyncError::TransientIo(
+            "journal rotated during open".to_owned(),
+        ));
+    }
+    Ok(Some(file))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sync_releases_from_journal_per_binary_filtered_inner(
     home_dir: &Path,
@@ -2834,36 +2949,60 @@ fn sync_releases_from_journal_per_binary_filtered_inner(
     eligibility: Option<&ReleaseEligibilityFilter>,
     clock: &mut dyn FnMut() -> Instant,
 ) -> Result<JournalCatchupBatch, ReleaseSyncError> {
+    sync_releases_from_journal_per_binary_filtered_with_opener(
+        home_dir,
+        messages_jsonl_path,
+        store,
+        local_iroh_endpoint,
+        roots,
+        receipt_key_override,
+        eligibility,
+        clock,
+        &mut open_regular_journal_if_present,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_releases_from_journal_per_binary_filtered_with_opener(
+    home_dir: &Path,
+    messages_jsonl_path: &Path,
+    store: &dyn ReleaseArtifactStore,
+    local_iroh_endpoint: Option<&str>,
+    roots: &ReleaseTrustRoots<'_>,
+    receipt_key_override: Option<&SigningKey>,
+    eligibility: Option<&ReleaseEligibilityFilter>,
+    clock: &mut dyn FnMut() -> Instant,
+    journal_opener: &mut dyn FnMut(&Path) -> Result<Option<File>, ReleaseSyncError>,
+) -> Result<JournalCatchupBatch, ReleaseSyncError> {
     let mut candidates_per_binary: BTreeMap<String, Vec<(BusMessage, ReleaseManifestV1)>> =
         BTreeMap::new();
 
-    match fs::symlink_metadata(messages_jsonl_path) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(ReleaseSyncError::SourceUnavailable(format!(
-                "journal stat failed: {err}"
-            )));
-        }
-        Ok(_) => {
-            let (file, _) = open_regular_file_nofollow(messages_jsonl_path, false, false)?;
-            let reader = BufReader::new(file);
-            for line_res in reader.lines() {
-                let line = line_res.map_err(|e| {
-                    ReleaseSyncError::SourceUnavailable(format!("journal read failed: {e}"))
-                })?;
-                let trimmed = line.trim();
-                if !trimmed.contains(RELEASE_BUILT_PREFIX) {
-                    continue;
-                }
-                if let Ok(msg) = serde_json::from_str::<BusMessage>(trimmed)
-                    && let Ok(manifest) = verify_release_built_message_with_roots(&msg, roots)
-                    && manifest.target_triple == CURRENT_TARGET_TRIPLE
-                {
-                    candidates_per_binary
-                        .entry(manifest.binary.clone())
-                        .or_default()
-                        .push((msg, manifest));
-                }
+    if let Some(file) = journal_opener(messages_jsonl_path)? {
+        let mut reader = BufReader::new(file);
+        let mut raw_line = Vec::new();
+        loop {
+            raw_line.clear();
+            let bytes_read = reader
+                .read_until(b'\n', &mut raw_line)
+                .map_err(|e| classify_journal_io_error("journal read failed", &e))?;
+            if bytes_read == 0 {
+                break;
+            }
+            let Ok(line) = std::str::from_utf8(&raw_line) else {
+                continue;
+            };
+            let trimmed = line.trim();
+            if !trimmed.contains(RELEASE_BUILT_PREFIX) {
+                continue;
+            }
+            if let Ok(msg) = serde_json::from_str::<BusMessage>(trimmed)
+                && let Ok(manifest) = verify_release_built_message_with_roots(&msg, roots)
+                && manifest.target_triple == CURRENT_TARGET_TRIPLE
+            {
+                candidates_per_binary
+                    .entry(manifest.binary.clone())
+                    .or_default()
+                    .push((msg, manifest));
             }
         }
     }
@@ -3037,7 +3176,7 @@ impl ReleaseDaemonScheduler {
     pub fn new_with_initial_catchup() -> Self {
         Self {
             initial_catchup_pending: true,
-            catchup_queued: true,
+            catchup_queued: false,
             ..Self::default()
         }
     }
@@ -3162,18 +3301,6 @@ impl ReleaseDaemonScheduler {
     }
 
     fn on_catchup_failed(&mut self, retryable: bool, now: Instant) -> Option<Duration> {
-        for st in self.per_binary.values_mut() {
-            if st.in_flight {
-                st.in_flight = false;
-                if retryable && st.retryable && st.attempts < MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
-                    let delay = Self::backoff_for_attempt(st.attempts);
-                    st.attempts = st.attempts.saturating_add(1);
-                    st.next_due_at = Some(now + delay);
-                } else {
-                    st.next_due_at = None;
-                }
-            }
-        }
         let jr = self
             .journal_open_retry
             .get_or_insert(JournalOpenRetryState {
@@ -3184,14 +3311,33 @@ impl ReleaseDaemonScheduler {
             });
         jr.in_flight = false;
         jr.retryable = retryable;
-        if !retryable || jr.attempts >= MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
+        let jr_next_delay = if retryable && jr.attempts < MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
+            let delay = Self::backoff_for_attempt(jr.attempts);
+            jr.attempts = jr.attempts.saturating_add(1);
+            jr.next_due_at = Some(now + delay);
+            Some(delay)
+        } else {
             jr.next_due_at = None;
-            return None;
+            None
+        };
+        for st in self.per_binary.values_mut() {
+            if st.in_flight {
+                st.in_flight = false;
+                // Because top-level catch-up failed before per-binary execution ran,
+                // preserve `st.attempts` and re-arm `st.next_due_at` iff catch-up itself
+                // remains retryable within budget.
+                if jr_next_delay.is_some()
+                    && st.retryable
+                    && st.attempts <= MAX_RELEASE_SYNC_TRANSIENT_RETRIES
+                {
+                    let delay = Self::backoff_for_attempt(st.attempts.saturating_sub(1));
+                    st.next_due_at = Some(now + delay);
+                } else {
+                    st.next_due_at = None;
+                }
+            }
         }
-        let delay = Self::backoff_for_attempt(jr.attempts);
-        jr.attempts = jr.attempts.saturating_add(1);
-        jr.next_due_at = Some(now + delay);
-        Some(delay)
+        jr_next_delay
     }
 
     fn precheck_live_eligibility(
@@ -3397,6 +3543,33 @@ fn execute_release_daemon_job_inner(
     job: ReleaseDaemonJob,
     clock: &mut dyn FnMut() -> Instant,
 ) -> Vec<ReleaseDaemonEvent> {
+    execute_release_daemon_job_with_hooks(
+        home_dir,
+        messages_jsonl_path,
+        store,
+        local_iroh_endpoint,
+        roots,
+        receipt_key_override,
+        scheduler,
+        job,
+        clock,
+        &mut open_regular_journal_if_present,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_release_daemon_job_with_hooks(
+    home_dir: &Path,
+    messages_jsonl_path: &Path,
+    store: &dyn ReleaseArtifactStore,
+    local_iroh_endpoint: &str,
+    roots: &ReleaseTrustRoots<'_>,
+    receipt_key_override: Option<&SigningKey>,
+    scheduler: &Mutex<ReleaseDaemonScheduler>,
+    job: ReleaseDaemonJob,
+    clock: &mut dyn FnMut() -> Instant,
+    journal_opener: &mut dyn FnMut(&Path) -> Result<Option<File>, ReleaseSyncError>,
+) -> Vec<ReleaseDaemonEvent> {
     match job {
         ReleaseDaemonJob::StartupCatchup => {
             let started_at = clock();
@@ -3407,7 +3580,7 @@ fn execute_release_daemon_job_inner(
             let Some(filter) = eligibility else {
                 return Vec::new();
             };
-            match sync_releases_from_journal_per_binary_filtered_inner(
+            match sync_releases_from_journal_per_binary_filtered_with_opener(
                 home_dir,
                 messages_jsonl_path,
                 store,
@@ -3416,6 +3589,7 @@ fn execute_release_daemon_job_inner(
                 receipt_key_override,
                 Some(&filter),
                 clock,
+                journal_opener,
             ) {
                 Ok(batch) => {
                     let mut sched = scheduler.lock().unwrap_or_else(|e| e.into_inner());
@@ -6037,5 +6211,167 @@ mod tests {
         if let Ok((live_fd, _)) = open_dir_nofollow(&live_dir) {
             let _ = set_dir_and_entry_immutable(&live_fd, "chinwag", false);
         }
+    }
+
+    #[test]
+    fn transient_journal_io_retries_and_recovers_while_unsafe_path_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let sub_home = temp.path().join("sub-home");
+        let build_dir = temp.path().join("build");
+        for d in [&pub_home, &sub_home, &build_dir] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let journal = temp.path().join("messages.jsonl");
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = InMemoryArtifactStore::new();
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let src_bin = build_macho_test_binary(&build_dir, "journal_retry_v1");
+
+        let published = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag-ci",
+                source_binary_path: &src_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("1234567812345678".into(), 600)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+        fs::write(
+            &journal,
+            format!(
+                "{}\n",
+                serde_json::to_string(&published.release_built_message).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let sched = Mutex::new(ReleaseDaemonScheduler::new_with_initial_catchup());
+        let t0 = Instant::now();
+
+        // Verify `new_with_initial_catchup` dispatches cleanly on first poll (`FLINT` R5 check)
+        // and does not double-enqueue while queued.
+        assert!(sched.lock().unwrap().poll_catchup_dispatch(false, t0));
+        assert!(!sched.lock().unwrap().poll_catchup_dispatch(false, t0));
+
+        // 1. Inject one transient `EMFILE` journal-open failure through `classify_journal_io_error`.
+        let mut injected_emfile_once = false;
+        let ev1 = execute_release_daemon_job_with_hooks(
+            &sub_home,
+            &journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::StartupCatchup,
+            &mut || t0,
+            &mut |path| {
+                if !injected_emfile_once {
+                    injected_emfile_once = true;
+                    let io_err = std::io::Error::from(rustix::io::Errno::MFILE);
+                    return Err(classify_journal_io_error("journal open failed", &io_err));
+                }
+                open_regular_journal_if_present(path)
+            },
+        );
+        assert!(matches!(
+            ev1.as_slice(),
+            [ReleaseDaemonEvent::Rejected {
+                binary,
+                retryable: true,
+                next_retry_secs: Some(10),
+                ..
+            }] if binary == "all"
+        ));
+        assert!(
+            !sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(9))
+        );
+        assert!(
+            sched
+                .lock()
+                .unwrap()
+                .poll_catchup_dispatch(false, t0 + Duration::from_secs(10)),
+            "healthy heartbeat at +10s MUST dispatch scheduled journal retry"
+        );
+
+        // 2. Retry at `t0 + 10s` succeeds against the real journal and installs `chinwag-ci`.
+        let t_retry = t0 + Duration::from_secs(10);
+        let ev2 = execute_release_daemon_job_with_hooks(
+            &sub_home,
+            &journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::StartupCatchup,
+            &mut || t_retry,
+            &mut open_regular_journal_if_present,
+        );
+        assert!(matches!(
+            ev2.as_slice(),
+            [ReleaseDaemonEvent::Applied { outcome, .. }]
+                if matches!(**outcome, ReleaseApplyOutcome::Installed { .. })
+        ));
+        assert!(
+            !sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(600))
+        );
+
+        // 3. Unsafe symlinked journal path MUST fail closed (`retryable: false`, `next_retry_secs: None`)!
+        let symlink_journal = temp.path().join("symlink_messages.jsonl");
+        std::os::unix::fs::symlink(&journal, &symlink_journal).unwrap();
+        assert!(
+            sched
+                .lock()
+                .unwrap()
+                .poll_catchup_dispatch(true, t0 + Duration::from_secs(20))
+        );
+        let t_sym = t0 + Duration::from_secs(20);
+        let ev_sym = execute_release_daemon_job_inner(
+            &sub_home,
+            &symlink_journal,
+            &store,
+            "sub-ep",
+            &roots,
+            Some(&infrajr_key),
+            &sched,
+            ReleaseDaemonJob::StartupCatchup,
+            &mut || t_sym,
+        );
+        assert!(matches!(
+            ev_sym.as_slice(),
+            [ReleaseDaemonEvent::Rejected {
+                retryable: false,
+                next_retry_secs: None,
+                ..
+            }]
+        ));
+        assert!(
+            !sched
+                .lock()
+                .unwrap()
+                .should_dispatch_catchup(t0 + Duration::from_secs(3600)),
+            "unsafe symlinked journal path must fail closed without scheduling retries"
+        );
     }
 }
