@@ -473,6 +473,21 @@ impl OwnerCustody {
         };
         crate::authorization::certify(admission, signer).map_err(|_| CustodyError::Held)
     }
+    /// Certifies a challenge-bound live recipient-revocation snapshot for this
+    /// admitted plan's exact intent and initiating seat.
+    pub fn certify_revocation_status(
+        &self,
+        intent: &crate::intent::VerifiedIntent,
+        nonce: [u8; 32],
+        statements: Vec<crate::recipient_key::SignedRecipientKeyRevocation>,
+    ) -> Result<Vec<u8>, CustodyError> {
+        self.guard.check()?;
+        let Keys::Admission { signer } = &self.keys else {
+            return Err(CustodyError::Role);
+        };
+        crate::authorization::certify_revocation_status(intent, nonce, statements, signer)
+            .map_err(|_| CustodyError::Held)
+    }
     fn assemble(
         guard: Arc<Guard>,
         material: Material,

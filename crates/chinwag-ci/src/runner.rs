@@ -23,6 +23,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -122,6 +123,8 @@ pub struct RunnerConfiguration {
     pub expected_oidc_subject: String,
     pub dispatch: Dispatch,
     pub checkout: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_revocations: Option<PathBuf>,
 }
 #[derive(Serialize)]
 pub struct RunnerObservation {
@@ -223,6 +226,43 @@ async fn post<T: Serialize>(
 ) -> Result<Vec<u8>> {
     runtime::request_owner_post(c, &format!("{origin}{path}"), ser(v)?, 128 * 1024).await
 }
+#[allow(clippy::too_many_arguments)]
+async fn refresh_live_revocations(
+    client: &reqwest::Client,
+    config: &RunnerConfiguration,
+    plan: &Plan,
+    intent: &crate::intent::VerifiedIntent,
+    admission_signer: [u8; 32],
+    signers: &crate::recipient_key::SeatSignerDirectory,
+    state: &mut crate::recipient_key::VerifiedRevocationState,
+) -> Result<()> {
+    let (local, _) =
+        runtime::load_revocation_statements(config.recipient_revocations.as_deref(), plan)?;
+    for rev in &local {
+        ck(state.ingest_signed_revocation_struct(rev, signers))?;
+    }
+    let mut nonce = [0_u8; 32];
+    ck(getrandom::fill(&mut nonce))?;
+    if bool::from(nonce[..].ct_eq(&[0_u8; 32][..])) {
+        return Err(RuntimeError::Refused);
+    }
+    let raw = post(
+        client,
+        &config.admission_origin,
+        "v1/revocations",
+        &runtime::RevocationStatusRequest { nonce },
+    )
+    .await?;
+    ck(authorization::verify_revocation_status(
+        &raw,
+        admission_signer,
+        *intent.original_digest(),
+        &plan.scope.instance,
+        nonce,
+        signers,
+        state,
+    ))
+}
 /// Return 1 for a fully delivered red workload, 0 only for a fully delivered
 /// eligible green workload. Any missing admission/receipt/closure stays held.
 pub async fn run(path: &Path) -> std::result::Result<(RunnerObservation, bool), RunnerError> {
@@ -277,10 +317,32 @@ async fn run_phased(path: &Path, trace: &mut Trace) -> Result<(RunnerObservation
     {
         return Err(RuntimeError::Refused);
     }
-    let profiles = plan.profiles()?;
-    if profiles.delivery().spec().admission_origin != config.admission_origin {
+    let intent = plan.intent()?;
+    let pinned_signers = plan.pinned_seat_signers()?;
+    let raw_delivery = ck(crate::profile::DeliveryProfile::parse(
+        plan.delivery_profile.as_bytes(),
+    ))?;
+    let delivery_digest = hex::encode(Sha256::digest(plan.delivery_profile.as_bytes()));
+    if !bool::from(
+        delivery_digest
+            .as_bytes()
+            .ct_eq(intent.spec().delivery_profile_sha256.as_bytes()),
+    ) || raw_delivery.spec().admission_origin != config.admission_origin
+    {
         return Err(RuntimeError::Refused);
     }
+    let mut live_revocations = crate::recipient_key::VerifiedRevocationState::new();
+    refresh_live_revocations(
+        &client,
+        &config,
+        &plan,
+        &intent,
+        raw_delivery.spec().admission_signer,
+        &pinned_signers,
+        &mut live_revocations,
+    )
+    .await?;
+    let profiles = plan.profiles_with_revocations(&live_revocations)?;
     trace.enter(Phase::FixturePreparation);
     let fixture = ck(preparation::prepare(&profiles, &config.checkout).await)?;
     trace.enter(Phase::ImagePreparation);
@@ -361,12 +423,34 @@ async fn run_phased(path: &Path, trace: &mut Trace) -> Result<(RunnerObservation
     .require_current(runtime::now()?))?;
     ck(profiles.validate_admission(&admission, &job.registered(), runtime::now()?))?;
     trace.enter(Phase::CaptureExecution);
+    refresh_live_revocations(
+        &client,
+        &config,
+        &plan,
+        &intent,
+        d.admission_signer,
+        &pinned_signers,
+        &mut live_revocations,
+    )
+    .await?;
+    ck(profiles.reverify_recipient_keys(&pinned_signers, &live_revocations, runtime::now()?))?;
     let captured =
         ck(execution::execute(&profiles, fixture, &image, &admission, &job.registered()).await)?;
     let green = captured.eligible_for_green();
     let complete = captured.output_is_complete();
     let plaintext = ck(captured.plaintext_for_sealing())?;
     trace.enter(Phase::ArtifactSealing);
+    refresh_live_revocations(
+        &client,
+        &config,
+        &plan,
+        &intent,
+        d.admission_signer,
+        &pinned_signers,
+        &mut live_revocations,
+    )
+    .await?;
+    ck(profiles.reverify_recipient_keys(&pinned_signers, &live_revocations, runtime::now()?))?;
     let claims =
         ck(admission.expected_provenance(d.original_policy_sha256, d.original_policy_epoch))?;
     let sealed =

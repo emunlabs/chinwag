@@ -495,6 +495,16 @@ impl BoundProfiles {
     pub fn delivery(&self) -> &DeliveryProfile {
         &self.delivery
     }
+    pub fn reverify_recipient_keys(
+        &self,
+        signers: &SeatSignerDirectory,
+        revocations: &VerifiedRevocationState,
+        now: u64,
+    ) -> Result<(), ProfileError> {
+        self.delivery
+            .verify_authenticated_recipient_keys(signers, revocations, now)
+            .map(|_| ())
+    }
     pub(crate) fn intended_source(&self) -> &str {
         &self.intent.source_commit
     }

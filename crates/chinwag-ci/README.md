@@ -47,9 +47,11 @@ event-only probe are excluded from that controlled payload run.
    and signed revocation checks) verified against the bijective seat directory.
    Every `0x647a` `DeliveryProfile` embeds signed `recipient_psk_binding` and
    `recipient_response_base_binding` descriptors, and `BoundProfiles::resolve`
-    plus `Plan` (`runtime.rs` / `runner.rs`) verify them against the authenticated
-   initiating seat's pinned Ed25519 key and live revocation state before
-   execution, sealing, storage, or release.
+   plus `Plan` (`runtime.rs`, `runner.rs`, `idle_agent.rs`, and Root's
+   challenge-bound `POST /v1/revocations` admission-signed status) verify them
+   against the authenticated initiating seat's pinned Ed25519 key and live
+   revocation state immediately before admission, execution, sealing, durable
+   storage, release, and wake.
    When ACU custody is not enabled, [`envelope.rs`](src/envelope.rs) also supports
    direct offline-capable Base-mode `.cwcard` (`CWCARD01`) sealing to a verified
    `cwcard:offline-base-v1` recipient key with mandatory runner Ed25519 origin

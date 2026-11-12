@@ -9,13 +9,18 @@
 use crate::{
     admission::{AdmissionRecord, CommittedAdmission},
     envelope::{self, AuthenticatedEnvelope, ClaimedProvenance, KeyPins, SealedEnvelope},
+    intent::VerifiedIntent,
+    recipient_key::{SeatSignerDirectory, SignedRecipientKeyRevocation, VerifiedRevocationState},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 const CERTIFICATE_DOMAIN: &[u8] = b"chinwag-ci-owner-admission-certificate-v1\0";
+const REVOCATION_STATUS_DOMAIN: &[u8] = b"chinwag-ci-owner-revocation-status-v1\0";
 pub(crate) const MAX_AUTH_BYTES: usize = 64 * 1024;
+const MAX_REVOCATION_STATUS_BYTES: usize = 128 * 1024;
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuthorizationError {
     #[error("CI owner authorization is malformed, out of scope or unauthenticated")]
@@ -377,6 +382,99 @@ fn provenance(
         policy_epoch,
     })
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevocationStatusStatement {
+    schema: String,
+    version: u16,
+    signer: [u8; 32],
+    intent_digest: [u8; 32],
+    initiating_instance: String,
+    nonce: [u8; 32],
+    statements: Vec<SignedRecipientKeyRevocation>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedRevocationStatus {
+    statement: RevocationStatusStatement,
+    signature_hex: String,
+}
+pub(crate) fn certify_revocation_status(
+    intent: &VerifiedIntent,
+    nonce: [u8; 32],
+    statements: Vec<SignedRecipientKeyRevocation>,
+    signer: &iroh::SecretKey,
+) -> Result<Vec<u8>, AuthorizationError> {
+    if bool::from(nonce[..].ct_eq(&[0_u8; 32][..])) {
+        return Err(AuthorizationError::Rejected);
+    }
+    let statement = RevocationStatusStatement {
+        schema: "chinwag.ci-revocation-status.v1".into(),
+        version: 1,
+        signer: *signer.public().as_bytes(),
+        intent_digest: *intent.original_digest(),
+        initiating_instance: intent.initiating_instance().to_owned(),
+        nonce,
+        statements,
+    };
+    let signature_hex = hex::encode(
+        signer
+            .sign(&signing_bytes(REVOCATION_STATUS_DOMAIN, &statement)?)
+            .to_bytes(),
+    );
+    let encoded = canonical(&SignedRevocationStatus {
+        statement,
+        signature_hex,
+    })?;
+    if encoded.len() > MAX_REVOCATION_STATUS_BYTES {
+        return Err(AuthorizationError::Rejected);
+    }
+    Ok(encoded)
+}
+pub fn verify_revocation_status(
+    bytes: &[u8],
+    owner_public_pin: [u8; 32],
+    expected_intent_digest: [u8; 32],
+    expected_initiating_instance: &str,
+    expected_nonce: [u8; 32],
+    signers: &SeatSignerDirectory,
+    into_state: &mut VerifiedRevocationState,
+) -> Result<(), AuthorizationError> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_REVOCATION_STATUS_BYTES
+        || bool::from(expected_nonce[..].ct_eq(&[0_u8; 32][..]))
+    {
+        return Err(AuthorizationError::Rejected);
+    }
+    let status: SignedRevocationStatus =
+        serde_json::from_slice(bytes).map_err(|_| AuthorizationError::Rejected)?;
+    if canonical(&status)? != bytes {
+        return Err(AuthorizationError::Rejected);
+    }
+    let s = &status.statement;
+    if s.schema != "chinwag.ci-revocation-status.v1"
+        || s.version != 1
+        || !bool::from(s.signer[..].ct_eq(&owner_public_pin[..]))
+        || !bool::from(s.intent_digest[..].ct_eq(&expected_intent_digest[..]))
+        || s.initiating_instance != expected_initiating_instance
+        || !bool::from(s.nonce[..].ct_eq(&expected_nonce[..]))
+    {
+        return Err(AuthorizationError::Rejected);
+    }
+    verify_signature(
+        REVOCATION_STATUS_DOMAIN,
+        s,
+        &status.signature_hex,
+        owner_public_pin,
+    )?;
+    for rev in &s.statements {
+        into_state
+            .ingest_signed_revocation_struct(rev, signers)
+            .map_err(|_| AuthorizationError::Rejected)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn assert_canonical_certificate_tampering_is_refused(bytes: &[u8], pin: [u8; 32]) {
     for case in 0..4 {
