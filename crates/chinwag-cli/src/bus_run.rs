@@ -7364,9 +7364,36 @@ mod tests {
             vec!["127.0.0.1:45441".to_owned()]
         );
 
+        // 5b. Harmless `include` substrings in comments or remote URLs on the primary
+        //     checkout `.git/config` remain accepted, whereas actual `[include]` /
+        //     `[includeIf "..."]` directives fail closed (`PublicationRejected`).
+        fs::remove_file(daemon_json_path(&linked)).unwrap();
+        let primary_cfg_path = primary.join(".git/config");
+        let baseline_primary_cfg = fs::read(&primary_cfg_path).unwrap();
+        let mut harmless_cfg = baseline_primary_cfg.clone();
+        harmless_cfg.extend_from_slice(
+            b"\n# This clone includes generated files\n[remote \"origin\"]\n\turl = https://example.com/include-chinwag.git\n",
+        );
+        fs::write(&primary_cfg_path, &harmless_cfg).unwrap();
+        let harmless_ok =
+            resolve_release_publish_daemon_route_with_env(&linked_sel, None, None).unwrap();
+        assert_eq!(
+            harmless_ok.daemon.unwrap().bound_sockets,
+            common_state.bound_sockets
+        );
+
+        let mut includeif_cfg = baseline_primary_cfg.clone();
+        includeif_cfg
+            .extend_from_slice(b"\n[includeIf \"gitdir:**\"]\n\tpath = /never-read-config\n");
+        fs::write(&primary_cfg_path, &includeif_cfg).unwrap();
+        assert!(matches!(
+            resolve_release_publish_daemon_route_with_env(&linked_sel, None, None),
+            Err(InstanceError::PublicationRejected)
+        ));
+        fs::write(&primary_cfg_path, &baseline_primary_cfg).unwrap();
+
         // 6. Real daemon startup state (`run_daemon_loop_inner` writing `endpoint.bound_sockets()`)
         //    is accepted by `read_daemon_state_strict` and discovered from `linked_sel`.
-        fs::remove_file(daemon_json_path(&linked)).unwrap();
         fs::remove_file(daemon_json_path(&primary)).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

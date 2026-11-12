@@ -530,6 +530,44 @@ fn p009_local_git_include_is_refused_before_any_execution_effect() {
     ));
 }
 #[test]
+fn p009_git_config_allows_harmless_include_substrings_and_rejects_includeif_directives() {
+    use std::io::Write;
+    let f = BindingFixture::new();
+    let b = f.bind();
+    let config_path = f.root().join(".git/config");
+    let baseline_cfg = fs::read(&config_path).unwrap();
+
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(&config_path)
+        .unwrap();
+    config
+        .write_all(
+            b"\n# This clone includes generated files\n; include comment\n[remote \"origin\"]\n\turl = https://example.com/include-chinwag.git\n\tnote = \"[include]\"\n",
+        )
+        .unwrap();
+    drop(config);
+    b.revalidate(&f.authority()).unwrap();
+    f.selection().verify_effective_toplevel().unwrap();
+
+    for directive in [
+        b"\n[includeIf \"gitdir:~/work/\"]\n\tpath = /never-read\n".as_slice(),
+        b"\n[Include.sub]\n\tpath = /never-read\n".as_slice(),
+    ] {
+        let mut next = baseline_cfg.clone();
+        next.extend_from_slice(directive);
+        fs::write(&config_path, &next).unwrap();
+        assert!(matches!(
+            b.revalidate(&f.authority()),
+            Err(BindingError::UnsupportedGitConfig)
+        ));
+        assert!(matches!(
+            f.selection().verify_effective_toplevel(),
+            Err(BindingError::UnsupportedGitConfig)
+        ));
+    }
+}
+#[test]
 fn p009_wrong_native_application_schema_and_site_refuse_before_effects() {
     for variant in 0..3 {
         let mut f = BindingFixture::new();
