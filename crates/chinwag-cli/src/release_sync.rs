@@ -67,10 +67,14 @@ pub const R2_ARTIFACT_PREFIX: &str = "chinwag-artifacts/releases";
 const MAX_RELEASE_MANIFEST_JSON_BYTES: usize = 16 * 1024;
 const MAX_RELEASE_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
+const MAX_CLOUDFLARE_ENV_BYTES: u64 = 64 * 1024;
+const MAX_CLOUDFLARE_TOKEN_BYTES: usize = 512;
 const MAX_APPLIED_RELEASE_HISTORY: usize = 64;
 const VERSION_SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRANGLER_R2_TIMEOUT: Duration = Duration::from_secs(120);
 const CRATE_MEMORY_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const WRANGLER_SAFE_BASE_PATH: &str =
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const CURRENT_TARGET_TRIPLE: &str = "aarch64-apple-darwin";
@@ -360,6 +364,260 @@ pub trait ReleaseArtifactStore: Send + Sync {
     ) -> Result<(), ReleaseSyncError>;
 }
 
+struct CloudflareR2Credentials {
+    api_token: Option<zeroize::Zeroizing<String>>,
+    account_id: Option<String>,
+}
+
+fn classify_cloudflare_env_io(context: &str, err: &std::io::Error) -> ReleaseSyncError {
+    if is_transient_io_error(err) {
+        ReleaseSyncError::TransientIo(format!("{context}: {err}"))
+    } else {
+        ReleaseSyncError::SafePathViolation("cloudflare_env_io_failed")
+    }
+}
+
+fn validate_cloudflare_api_token(raw: &str, key_name: &str) -> Result<(), ReleaseSyncError> {
+    if raw.is_empty()
+        || raw.len() > MAX_CLOUDFLARE_TOKEN_BYTES
+        || !raw.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(ReleaseSyncError::ArtifactStoreFailed(format!(
+            "invalid {key_name} format in Cloudflare R2 credentials"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cloudflare_account_id(raw: &str) -> Result<String, ReleaseSyncError> {
+    if raw.len() != 32 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ReleaseSyncError::ArtifactStoreFailed(
+            "invalid 32-hex CLOUDFLARE_ACCOUNT_ID in Cloudflare R2 credentials".into(),
+        ));
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+fn parse_dotenv_value<'a>(raw_val: &'a str, key_name: &str) -> Result<&'a str, ReleaseSyncError> {
+    let trimmed = raw_val.trim();
+    if let Some(after_quote) = trimmed.strip_prefix('"') {
+        let Some(close_idx) = after_quote.find('"') else {
+            return Err(ReleaseSyncError::ArtifactStoreFailed(format!(
+                "unterminated double-quoted {key_name} in cloudflare.env"
+            )));
+        };
+        let rest = after_quote[close_idx + 1..].trim();
+        if !rest.is_empty() && !rest.starts_with('#') {
+            return Err(ReleaseSyncError::ArtifactStoreFailed(format!(
+                "unexpected trailing tokens after double-quoted {key_name} in cloudflare.env"
+            )));
+        }
+        return Ok(&after_quote[..close_idx]);
+    }
+    if let Some(after_quote) = trimmed.strip_prefix('\'') {
+        let Some(close_idx) = after_quote.find('\'') else {
+            return Err(ReleaseSyncError::ArtifactStoreFailed(format!(
+                "unterminated single-quoted {key_name} in cloudflare.env"
+            )));
+        };
+        let rest = after_quote[close_idx + 1..].trim();
+        if !rest.is_empty() && !rest.starts_with('#') {
+            return Err(ReleaseSyncError::ArtifactStoreFailed(format!(
+                "unexpected trailing tokens after single-quoted {key_name} in cloudflare.env"
+            )));
+        }
+        return Ok(&after_quote[..close_idx]);
+    }
+    let bytes = trimmed.as_bytes();
+    let mut cut = trimmed.len();
+    for idx in 1..bytes.len() {
+        if bytes[idx] == b'#' && bytes[idx - 1].is_ascii_whitespace() {
+            cut = idx;
+            break;
+        }
+    }
+    Ok(trimmed[..cut].trim_end())
+}
+
+fn parse_cloudflare_dotenv(content: &str) -> Result<CloudflareR2Credentials, ReleaseSyncError> {
+    let body = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut r2_token: Option<zeroize::Zeroizing<String>> = None;
+    let mut api_token: Option<zeroize::Zeroizing<String>> = None;
+    let mut account_id: Option<String> = None;
+
+    for line in body.lines() {
+        let mut s = line.trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("export")
+            && rest.starts_with(|c: char| c.is_ascii_whitespace())
+        {
+            s = rest.trim_start();
+        }
+        let Some((raw_key, raw_val)) = s.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        match key {
+            "CLOUDFLARE_R2_API_TOKEN" => {
+                let parsed = parse_dotenv_value(raw_val, key)?;
+                if parsed.is_empty() {
+                    r2_token = None;
+                } else {
+                    validate_cloudflare_api_token(parsed, key)?;
+                    r2_token = Some(zeroize::Zeroizing::new(parsed.to_owned()));
+                }
+            }
+            "CLOUDFLARE_API_TOKEN" => {
+                let parsed = parse_dotenv_value(raw_val, key)?;
+                if parsed.is_empty() {
+                    api_token = None;
+                } else {
+                    validate_cloudflare_api_token(parsed, key)?;
+                    api_token = Some(zeroize::Zeroizing::new(parsed.to_owned()));
+                }
+            }
+            "CLOUDFLARE_ACCOUNT_ID" => {
+                let parsed = parse_dotenv_value(raw_val, key)?;
+                if parsed.is_empty() {
+                    account_id = None;
+                } else {
+                    account_id = Some(validate_cloudflare_account_id(parsed)?);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(CloudflareR2Credentials {
+        api_token: r2_token.or(api_token),
+        account_id,
+    })
+}
+
+fn load_cloudflare_r2_credentials_with_env<F>(
+    chinwag_dir_fd: &File,
+    allow_ambient_env: bool,
+    env_lookup: F,
+) -> Result<CloudflareR2Credentials, ReleaseSyncError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match rustix::fs::openat(
+        chinwag_dir_fd,
+        "cloudflare.env",
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let mut file = File::from(fd);
+            let fstat = file
+                .metadata()
+                .map_err(|e| classify_cloudflare_env_io("fstat cloudflare.env", &e))?;
+            if fstat.file_type().is_symlink() || !fstat.file_type().is_file() {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_not_regular",
+                ));
+            }
+            if fstat.nlink() != 1 {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_hardlink",
+                ));
+            }
+            let euid = rustix::process::geteuid().as_raw();
+            if fstat.uid() != euid {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_owner_mismatch",
+                ));
+            }
+            if (fstat.mode() & 0o077) != 0 {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_permissions",
+                ));
+            }
+            if fstat.len() > MAX_CLOUDFLARE_ENV_BYTES {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_too_large",
+                ));
+            }
+            let cap = usize::try_from(fstat.len()).unwrap_or(0);
+            let mut raw = zeroize::Zeroizing::new(Vec::with_capacity(cap));
+            (&mut file)
+                .take(MAX_CLOUDFLARE_ENV_BYTES + 1)
+                .read_to_end(&mut raw)
+                .map_err(|e| classify_cloudflare_env_io("read cloudflare.env", &e))?;
+            if raw.len() as u64 > MAX_CLOUDFLARE_ENV_BYTES {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_too_large",
+                ));
+            }
+            let post = file
+                .metadata()
+                .map_err(|e| classify_cloudflare_env_io("post-fstat cloudflare.env", &e))?;
+            if (post.dev(), post.ino()) != (fstat.dev(), fstat.ino())
+                || post.nlink() != 1
+                || post.uid() != euid
+                || (post.mode() & 0o077) != 0
+            {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "cloudflare_env_mutated",
+                ));
+            }
+            let text = std::str::from_utf8(&raw).map_err(|_| {
+                ReleaseSyncError::ArtifactStoreFailed("cloudflare.env is not valid UTF-8".into())
+            })?;
+            parse_cloudflare_dotenv(text)
+        }
+        Err(rustix::io::Errno::NOENT) => {
+            if !allow_ambient_env {
+                return Ok(CloudflareR2Credentials {
+                    api_token: None,
+                    account_id: None,
+                });
+            }
+            let lookup_trimmed = |k: &str| {
+                env_lookup(k)
+                    .map(|v| zeroize::Zeroizing::new(v.trim().to_owned()))
+                    .filter(|v| !v.is_empty())
+            };
+            let api_token = if let Some(tok) = lookup_trimmed("CLOUDFLARE_R2_API_TOKEN") {
+                validate_cloudflare_api_token(&tok, "CLOUDFLARE_R2_API_TOKEN")?;
+                Some(tok)
+            } else if let Some(tok) = lookup_trimmed("CLOUDFLARE_API_TOKEN") {
+                validate_cloudflare_api_token(&tok, "CLOUDFLARE_API_TOKEN")?;
+                Some(tok)
+            } else {
+                None
+            };
+            let account_id = match lookup_trimmed("CLOUDFLARE_ACCOUNT_ID") {
+                Some(acct) => Some(validate_cloudflare_account_id(&acct)?),
+                None => None,
+            };
+            Ok(CloudflareR2Credentials {
+                api_token,
+                account_id,
+            })
+        }
+        Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => Err(
+            ReleaseSyncError::SafePathViolation("cloudflare_env_symlink"),
+        ),
+        Err(err) if is_transient_errno(err) => Err(ReleaseSyncError::TransientIo(format!(
+            "open cloudflare.env: {err}"
+        ))),
+        Err(_) => Err(ReleaseSyncError::SafePathViolation(
+            "cloudflare_env_unreadable",
+        )),
+    }
+}
+
+fn scrub_secret_from_diagnostic(msg: &str, secret: Option<&str>) -> String {
+    match secret {
+        Some(tok) if !tok.is_empty() && msg.contains(tok) => msg.replace(tok, "[REDACTED]"),
+        _ => msg.to_owned(),
+    }
+}
+
 pub struct WranglerR2ArtifactStore {
     home_dir: PathBuf,
     bucket: String,
@@ -389,13 +647,14 @@ impl WranglerR2ArtifactStore {
     fn resolve_wrangler_bin(&self) -> Result<PathBuf, ReleaseSyncError> {
         #[cfg(test)]
         if let Some(ref candidate) = self.wrangler_bin_override
+            && candidate.is_absolute()
             && is_resolvable_host_cli_binary(candidate)
         {
             return Ok(candidate.clone());
         }
         if let Some(override_bin) = std::env::var_os("CHINWAG_WRANGLER_BIN") {
             let candidate = PathBuf::from(override_bin);
-            if is_resolvable_host_cli_binary(&candidate) {
+            if candidate.is_absolute() && is_resolvable_host_cli_binary(&candidate) {
                 return Ok(candidate);
             }
         }
@@ -407,6 +666,9 @@ impl WranglerR2ArtifactStore {
         }
         if let Some(path_os) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path_os) {
+                if !dir.is_absolute() {
+                    continue;
+                }
                 let candidate = dir.join("wrangler");
                 if is_resolvable_host_cli_binary(&candidate) {
                     return Ok(candidate);
@@ -423,40 +685,81 @@ impl WranglerR2ArtifactStore {
         args: &[&str],
         stdin_source: Option<&File>,
     ) -> Result<(), ReleaseSyncError> {
+        if !self.home_dir.is_absolute() {
+            return Err(ReleaseSyncError::SafePathViolation("relative_home"));
+        }
+        let _ = open_dir_nofollow(&self.home_dir)?;
         let wrangler = self.resolve_wrangler_bin()?;
         let chinwag_dir = ensure_private_dir(&self.home_dir.join(".chinwag"))?;
+        let (chinwag_dir_fd, _) = open_dir_nofollow(&chinwag_dir)?;
+        let allow_ambient_env = std::env::var_os("HOME")
+            .is_some_and(|ambient_home| Path::new(&ambient_home) == self.home_dir);
+        let creds =
+            load_cloudflare_r2_credentials_with_env(&chinwag_dir_fd, allow_ambient_env, |key| {
+                std::env::var(key).ok()
+            })?;
         let stdin_cfg = match stdin_source {
             Some(file) => {
                 let mut dup_fd = file.try_clone().map_err(|e| {
-                    ReleaseSyncError::ArtifactStoreFailed(format!("dup upload fd: {e}"))
+                    if is_transient_io_error(&e) {
+                        ReleaseSyncError::TransientIo(format!("dup upload fd: {e}"))
+                    } else {
+                        ReleaseSyncError::ArtifactStoreFailed(format!("dup upload fd: {e}"))
+                    }
                 })?;
                 dup_fd.seek(SeekFrom::Start(0)).map_err(|e| {
-                    ReleaseSyncError::ArtifactStoreFailed(format!("rewind upload fd: {e}"))
+                    if is_transient_io_error(&e) {
+                        ReleaseSyncError::TransientIo(format!("rewind upload fd: {e}"))
+                    } else {
+                        ReleaseSyncError::ArtifactStoreFailed(format!("rewind upload fd: {e}"))
+                    }
                 })?;
                 Stdio::from(dup_fd)
             }
             None => Stdio::null(),
         };
-        let mut cmd = Command::new(wrangler);
-        // Critical under launchd (where default cwd is `/`): running wrangler in
-        // `$HOME/.chinwag` ensures `.wrangler/cache` resolves inside a writable
-        // private directory rather than failing on `/.wrangler/cache`.
-        cmd.args(args)
+        let mut safe_path = std::ffi::OsString::from(WRANGLER_SAFE_BASE_PATH);
+        if let Some(parent) = wrangler.parent()
+            && parent.is_absolute()
+            && !parent.as_os_str().as_encoded_bytes().contains(&b':')
+            && !std::env::split_paths(WRANGLER_SAFE_BASE_PATH).any(|p| p == parent)
+        {
+            safe_path.push(":");
+            safe_path.push(parent.as_os_str());
+        }
+        let mut cmd = Command::new(&wrangler);
+        // Critical under launchd (where default cwd is `/` and ambient CLOUDFLARE_*
+        // variables are absent): scrub the child environment via `env_clear()`, set
+        // cwd to `$HOME/.chinwag` so `.wrangler/cache` resolves inside a writable
+        // private `0700` directory, and inject verified non-interactive R2 credentials
+        // from `$HOME/.chinwag/cloudflare.env` (`0600`).
+        cmd.env_clear()
+            .args(args)
             .current_dir(&chinwag_dir)
             .env("HOME", &self.home_dir)
-            .env(
-                "PATH",
-                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-            )
+            .env("PATH", safe_path)
+            .env("LC_ALL", "C")
             .env("CI", "1")
+            .env("WRANGLER_SEND_METRICS", "false")
             .stdin(stdin_cfg)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(ref tok) = creds.api_token {
+            cmd.env("CLOUDFLARE_API_TOKEN", tok.as_str());
+        }
+        if let Some(ref acct) = creds.account_id {
+            cmd.env("CLOUDFLARE_ACCOUNT_ID", acct.as_str());
+        }
         run_bounded_command(&mut cmd, WRANGLER_R2_TIMEOUT).map_err(|failure| {
-            ReleaseSyncError::ArtifactStoreFailed(format!(
-                "wrangler r2 failed: {}",
-                failure.message
-            ))
+            let scrubbed = scrub_secret_from_diagnostic(
+                &failure.message,
+                creds.api_token.as_deref().map(String::as_str),
+            );
+            if failure.transient_io {
+                ReleaseSyncError::TransientIo(format!("wrangler r2 failed: {scrubbed}"))
+            } else {
+                ReleaseSyncError::ArtifactStoreFailed(format!("wrangler r2 failed: {scrubbed}"))
+            }
         })
     }
 }
@@ -7678,6 +7981,185 @@ mod tests {
             fs::read(&selected_source).unwrap(),
             b"stale-decoy-bytes",
             "must never select stale decoy bytes"
+        );
+    }
+
+    #[test]
+    fn wrangler_r2_store_loads_cloudflare_env_scrubs_ambient_and_redacts_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let chinwag_dir = home.join(".chinwag");
+        let bin_dir = temp.path().join("custom-bin");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::set_permissions(&chinwag_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let cf_env_path = chinwag_dir.join("cloudflare.env");
+        fs::write(
+            &cf_env_path,
+            "\u{feff}# Vaulted Cloudflare R2 credentials\n\
+             export CLOUDFLARE_ACCOUNT_ID = \"A9DCE15CE0193DA7D7F1D5DD3A53022B\" # acct\n\
+             CLOUDFLARE_API_TOKEN=\"general_tok_should_be_overridden\"\n\
+             export CLOUDFLARE_R2_API_TOKEN='r2_scoped_secret_tok_999' # dedicated R2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cf_env_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let captured_env = temp.path().join("captured_env.txt");
+        let mock_wrangler = bin_dir.join("mock-wrangler.sh");
+        let script = format!(
+            "#!/bin/sh\nset -eu\n\
+             {{\n\
+               printf 'TOKEN=%s\\n' \"${{CLOUDFLARE_API_TOKEN:-}}\"\n\
+               printf 'R2_RAW=%s\\n' \"${{CLOUDFLARE_R2_API_TOKEN:-}}\"\n\
+               printf 'ACCT=%s\\n' \"${{CLOUDFLARE_ACCOUNT_ID:-}}\"\n\
+               printf 'CI=%s\\n' \"${{CI:-}}\"\n\
+               printf 'METRICS=%s\\n' \"${{WRANGLER_SEND_METRICS:-}}\"\n\
+               printf 'CARGO_PKG=%s\\n' \"${{CARGO_PKG_NAME:-}}\"\n\
+               printf 'PATH=%s\\n' \"${{PATH:-}}\"\n\
+             }} > \"{}\"\n\
+             cat >/dev/null\n",
+            captured_env.display()
+        );
+        fs::write(&mock_wrangler, script).unwrap();
+        fs::set_permissions(&mock_wrangler, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let payload_path = temp.path().join("payload.bin");
+        fs::write(&payload_path, b"payload").unwrap();
+        let payload_file = File::open(&payload_path).unwrap();
+
+        let key = format!(
+            "chinwag-artifacts/releases/chinwag/{CURRENT_TARGET_TRIPLE}/{}",
+            "ab".repeat(32)
+        );
+        let store = WranglerR2ArtifactStore::with_wrangler_bin(home.clone(), mock_wrangler.clone());
+        store.upload_artifact(&key, &payload_file).unwrap();
+
+        let env_dump = fs::read_to_string(&captured_env).unwrap();
+        assert!(env_dump.contains("TOKEN=r2_scoped_secret_tok_999\n"));
+        assert!(env_dump.contains("R2_RAW=\n"));
+        assert!(env_dump.contains("ACCT=a9dce15ce0193da7d7f1d5dd3a53022b\n"));
+        assert!(env_dump.contains("CI=1\n"));
+        assert!(env_dump.contains("METRICS=false\n"));
+        assert!(
+            env_dump.contains("CARGO_PKG=\n"),
+            "env_clear() must scrub ambient cargo test env vars, got: {env_dump}"
+        );
+        assert!(
+            env_dump.contains(&format!(":{}", bin_dir.display())),
+            "custom wrangler parent dir must be appended after system PATH: {env_dump}"
+        );
+
+        // Verify diagnostic scrubbing if wrangler ever echoes token to stderr on failure.
+        let leak_wrangler = bin_dir.join("leak-wrangler.sh");
+        fs::write(
+            &leak_wrangler,
+            "#!/bin/sh\necho \"fatal auth echo: ${CLOUDFLARE_API_TOKEN}\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&leak_wrangler, fs::Permissions::from_mode(0o755)).unwrap();
+        let leak_store = WranglerR2ArtifactStore::with_wrangler_bin(home, leak_wrangler);
+        let err = leak_store.upload_artifact(&key, &payload_file).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("r2_scoped_secret_tok_999"),
+            "secret token must never appear in error diagnostic: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn wrangler_r2_store_rejects_insecure_cloudflare_env_modes_symlinks_and_hardlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let chinwag_dir = home.join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::set_permissions(&chinwag_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mock_wrangler = temp.path().join("noop-wrangler.sh");
+        fs::write(&mock_wrangler, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+        fs::set_permissions(&mock_wrangler, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let payload_path = temp.path().join("payload.bin");
+        fs::write(&payload_path, b"payload").unwrap();
+        let payload_file = File::open(&payload_path).unwrap();
+        let key = format!(
+            "chinwag-artifacts/releases/chinwag/{CURRENT_TARGET_TRIPLE}/{}",
+            "cd".repeat(32)
+        );
+        let store = WranglerR2ArtifactStore::with_wrangler_bin(home.clone(), mock_wrangler);
+
+        // 1. Group/world-readable 0644 cloudflare.env must fail closed with SafePathViolation.
+        let cf_env = chinwag_dir.join("cloudflare.env");
+        fs::write(&cf_env, "CLOUDFLARE_API_TOKEN=tok_ok\n").unwrap();
+        fs::set_permissions(&cf_env, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = store.upload_artifact(&key, &payload_file).unwrap_err();
+        assert_eq!(
+            err,
+            ReleaseSyncError::SafePathViolation("cloudflare_env_permissions")
+        );
+        assert!(!err.is_transient_retryable());
+
+        // 2. Hardlinked 0600 cloudflare.env (nlink > 1) must fail closed.
+        fs::set_permissions(&cf_env, fs::Permissions::from_mode(0o600)).unwrap();
+        let hardlink = temp.path().join("cloudflare.env.link");
+        fs::hard_link(&cf_env, &hardlink).unwrap();
+        let err = store.upload_artifact(&key, &payload_file).unwrap_err();
+        assert_eq!(
+            err,
+            ReleaseSyncError::SafePathViolation("cloudflare_env_hardlink")
+        );
+        fs::remove_file(&hardlink).unwrap();
+        fs::remove_file(&cf_env).unwrap();
+
+        // 3. Symlink cloudflare.env must fail closed with O_NOFOLLOW.
+        let target = temp.path().join("external.env");
+        fs::write(&target, "CLOUDFLARE_API_TOKEN=tok_ok\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &cf_env).unwrap();
+        let err = store.upload_artifact(&key, &payload_file).unwrap_err();
+        assert_eq!(
+            err,
+            ReleaseSyncError::SafePathViolation("cloudflare_env_symlink")
+        );
+        fs::remove_file(&cf_env).unwrap();
+
+        // 4. Malformed 32-hex account ID or unterminated quote fails closed without leaking value.
+        fs::write(
+            &cf_env,
+            "CLOUDFLARE_ACCOUNT_ID=not_32_hex\nCLOUDFLARE_API_TOKEN=secret_val_777\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cf_env, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = store.upload_artifact(&key, &payload_file).unwrap_err();
+        assert!(matches!(err, ReleaseSyncError::ArtifactStoreFailed(_)));
+        assert!(!err.to_string().contains("secret_val_777"));
+    }
+
+    #[test]
+    fn cloudflare_r2_credentials_fallback_env_only_when_vault_absent_and_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let chinwag_dir = temp.path().join(".chinwag");
+        fs::create_dir_all(&chinwag_dir).unwrap();
+        fs::set_permissions(&chinwag_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let (dir_fd, _) = open_dir_nofollow(&chinwag_dir).unwrap();
+
+        let fake_env = |key: &str| match key {
+            "CLOUDFLARE_R2_API_TOKEN" => Some("ci_r2_tok_123".to_owned()),
+            "CLOUDFLARE_API_TOKEN" => Some("ci_general_tok_456".to_owned()),
+            "CLOUDFLARE_ACCOUNT_ID" => Some("0123456789ABCDEF0123456789ABCDEF".to_owned()),
+            _ => None,
+        };
+
+        let disallowed = load_cloudflare_r2_credentials_with_env(&dir_fd, false, fake_env).unwrap();
+        assert!(disallowed.api_token.is_none());
+        assert!(disallowed.account_id.is_none());
+
+        let allowed = load_cloudflare_r2_credentials_with_env(&dir_fd, true, fake_env).unwrap();
+        assert_eq!(allowed.api_token.as_deref().unwrap(), "ci_r2_tok_123");
+        assert_eq!(
+            allowed.account_id.as_deref().unwrap(),
+            "0123456789abcdef0123456789abcdef"
         );
     }
 }
