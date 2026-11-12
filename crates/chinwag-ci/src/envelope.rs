@@ -103,9 +103,14 @@ impl KemSuite {
     }
 }
 
-/// Pre-sampled single-use OS CSPRNG buffer so `hpke::setup_sender_with_rng`
-/// never panics on OS RNG failure and zeroizes ephemeral randomness on drop.
-struct PreSampledEntropy<const N: usize>(Option<Zeroizing<[u8; N]>>);
+/// Pre-sampled cursor-backed OS CSPRNG buffer so `hpke::setup_sender_with_rng`
+/// never panics on OS RNG failure, never panics on split draws, and zeroizes
+/// ephemeral randomness both slice-by-slice and on drop.
+struct PreSampledEntropy<const N: usize> {
+    buf: Zeroizing<[u8; N]>,
+    offset: usize,
+    overflowed: bool,
+}
 
 impl<const N: usize> PreSampledEntropy<N> {
     fn sample() -> Result<Self, EnvelopeError> {
@@ -114,7 +119,18 @@ impl<const N: usize> PreSampledEntropy<N> {
         if bool::from(buf[..].ct_eq(&[0_u8; N])) {
             return Err(EnvelopeError::Entropy);
         }
-        Ok(Self(Some(buf)))
+        Ok(Self {
+            buf,
+            offset: 0,
+            overflowed: false,
+        })
+    }
+
+    fn finish(self) -> Result<(), EnvelopeError> {
+        if self.overflowed || self.offset != N {
+            return Err(EnvelopeError::Entropy);
+        }
+        Ok(())
     }
 }
 
@@ -134,12 +150,16 @@ impl<const N: usize> TryRng for PreSampledEntropy<N> {
     }
 
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
-        let buf = self
-            .0
-            .take()
-            .expect("single-use pre-sampled HPKE entropy buffer");
-        assert_eq!(dst.len(), N);
-        dst.copy_from_slice(&buf[..]);
+        let available = N.saturating_sub(self.offset);
+        if self.overflowed || dst.len() > available {
+            self.overflowed = true;
+            dst.fill(0);
+            return Ok(());
+        }
+        let end = self.offset + dst.len();
+        dst.copy_from_slice(&self.buf[self.offset..end]);
+        self.buf[self.offset..end].fill(0);
+        self.offset = end;
         Ok(())
     }
 }
@@ -649,7 +669,15 @@ pub(crate) fn checked_x25519_public(bytes: &[u8; 32]) -> Result<LegacyPublic, En
     let mut entropy = PreSampledEntropy::<32>::sample()?;
     let _ = <X25519HkdfSha256 as KemTrait>::encap_with_rng(&public, None, &mut entropy)
         .map_err(|_| EnvelopeError::Rejected)?;
+    entropy.finish()?;
     Ok(public)
+}
+
+pub(crate) fn checked_legacy_x25519_encapped(
+    bytes: &[u8; X25519_KEY_BYTES],
+) -> Result<LegacyEncapped, EnvelopeError> {
+    let _ = checked_x25519_public(bytes)?;
+    LegacyEncapped::from_bytes(&bytes[..]).map_err(|_| EnvelopeError::Rejected)
 }
 
 pub(crate) fn checked_xwing_public(
@@ -702,7 +730,7 @@ fn checked_encapped(enc: &EncappedBytes) -> Result<(), EnvelopeError> {
             Ok(())
         }
         EncappedInner::X25519Legacy(bytes) => {
-            let _ = checked_x25519_public(bytes)?;
+            let _ = checked_legacy_x25519_encapped(bytes)?;
             Ok(())
         }
     }
@@ -772,7 +800,8 @@ pub(crate) fn validate_key_pins(
     ];
     ed.extend_from_slice(additional_signers);
     for (i, key) in kem.iter().enumerate() {
-        if kem[..i].contains(key)
+        if bool::from(key.x25519_component()[..].ct_eq(&[0_u8; 32]))
+            || kem[..i].contains(key)
             || ed
                 .iter()
                 .any(|s| bool::from(s[..].ct_eq(&key.x25519_component()[..])))
@@ -782,9 +811,10 @@ pub(crate) fn validate_key_pins(
         checked_kem_public(key)?;
     }
     for (i, key) in ed.iter().enumerate() {
-        if ed[..i]
-            .iter()
-            .any(|prev| bool::from(prev[..].ct_eq(&key[..])))
+        if bool::from(key[..].ct_eq(&[0_u8; 32]))
+            || ed[..i]
+                .iter()
+                .any(|prev| bool::from(prev[..].ct_eq(&key[..])))
             || VerifyingKey::from_bytes(key)
                 .map_err(|_| EnvelopeError::Rejected)?
                 .is_weak()
@@ -832,6 +862,7 @@ fn wrap(
                 &mut entropy,
             )
             .map_err(|_| EnvelopeError::Rejected)?;
+            entropy.finish()?;
             let ciphertext = sender
                 .seal(value, context)
                 .map_err(|_| EnvelopeError::Rejected)?;
@@ -858,6 +889,7 @@ fn wrap(
                 X25519HkdfSha256,
             >(&op_mode, &pk, context, &mut entropy)
             .map_err(|_| EnvelopeError::Rejected)?;
+            entropy.finish()?;
             let ciphertext = sender
                 .seal(value, context)
                 .map_err(|_| EnvelopeError::Rejected)?;
@@ -933,9 +965,7 @@ fn unwrap(
             Ok(value)
         }
         (KemPrivate::X25519Legacy(sk), EncappedInner::X25519Legacy(raw_enc)) => {
-            let _ = checked_x25519_public(raw_enc)?;
-            let enc =
-                LegacyEncapped::from_bytes(&raw_enc[..]).map_err(|_| EnvelopeError::Rejected)?;
+            let enc = checked_legacy_x25519_encapped(raw_enc)?;
             let op_mode = match mode {
                 WrapMode::Base => OpModeR::Base,
                 WrapMode::Psk { gate, id } => OpModeR::Psk(psk(gate, id)?),
@@ -1335,6 +1365,7 @@ pub(crate) fn seal_cwcard_offline(
         &mut entropy,
     )
     .map_err(|_| EnvelopeError::Rejected)?;
+    entropy.finish()?;
     let mut enc_arr = Box::new([0_u8; XWING_ENCAPPED_KEY_BYTES]);
     enc_arr.copy_from_slice(&enc.to_bytes());
     let header = CwcardHeader {

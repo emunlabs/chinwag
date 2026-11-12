@@ -22,6 +22,7 @@ use crate::envelope::{
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hpke::{Kem as KemTrait, Serializable, kem::XWing};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -204,6 +205,7 @@ pub struct VerifiedRevocationState {
     purpose_min_epoch: BTreeMap<(String, RecipientKeyPurpose), u64>,
     revoked_kids: BTreeMap<String, BTreeSet<String>>,
     latest_issued_unix: BTreeMap<String, u64>,
+    seen_statements: BTreeSet<[u8; 32]>,
 }
 
 impl VerifiedRevocationState {
@@ -256,11 +258,16 @@ impl VerifiedRevocationState {
             &revocation_signing_bytes(s)?,
             &signed.signature_hex,
         )?;
+        let stmt_digest: [u8; 32] = Sha256::digest(&reencoded).into();
+        if self.seen_statements.contains(&stmt_digest) {
+            return Ok(());
+        }
         if let Some(&prev_unix) = self.latest_issued_unix.get(&s.seat)
             && s.issued_unix < prev_unix
         {
             return Err(RecipientKeyError::Rejected);
         }
+        self.seen_statements.insert(stmt_digest);
         self.latest_issued_unix
             .insert(s.seat.clone(), s.issued_unix);
         let floor = self.seat_min_epoch.entry(s.seat.clone()).or_insert(1);
@@ -270,6 +277,32 @@ impl VerifiedRevocationState {
             set.insert(kid.clone());
         }
         Ok(())
+    }
+
+    /// Monotonically merges another verified snapshot into this grow-only state,
+    /// allowing repeated cumulative snapshots (`[r1(t1), r2(t2)]`) to refresh
+    /// idempotently without ever lowering epoch floors or un-revoking a `kid`.
+    pub(crate) fn merge_verified(&mut self, other: &Self) {
+        for (seat, &epoch) in &other.seat_min_epoch {
+            let floor = self.seat_min_epoch.entry(seat.clone()).or_insert(1);
+            *floor = (*floor).max(epoch);
+        }
+        for (slot, &epoch) in &other.purpose_min_epoch {
+            let floor = self.purpose_min_epoch.entry(slot.clone()).or_insert(1);
+            *floor = (*floor).max(epoch);
+        }
+        for (seat, kids) in &other.revoked_kids {
+            self.revoked_kids
+                .entry(seat.clone())
+                .or_default()
+                .extend(kids.iter().cloned());
+        }
+        for (seat, &unix) in &other.latest_issued_unix {
+            let prev = self.latest_issued_unix.entry(seat.clone()).or_insert(0);
+            *prev = (*prev).max(unix);
+        }
+        self.seen_statements
+            .extend(other.seen_statements.iter().copied());
     }
 
     pub fn is_revoked(&self, seat: &str, kid: &str, epoch: u64) -> bool {
@@ -628,6 +661,9 @@ impl RecipientKeyRegistry {
         now_unix: u64,
     ) -> Result<VerifiedRecipientKey, RecipientKeyError> {
         let verified = verify_signed_recipient_key(bytes, signers, &self.revocations, now_unix)?;
+        if now_unix < verified.issued_unix() || now_unix >= verified.expires_unix() {
+            return Err(RecipientKeyError::Lifetime);
+        }
         let slot = (verified.seat().to_owned(), verified.purpose());
         let prev_epoch = self.highest_epoch.get(&slot).copied().unwrap_or(0);
         let prev_issued = self.latest_issued_unix.get(&slot).copied().unwrap_or(0);
@@ -650,6 +686,9 @@ impl RecipientKeyRegistry {
         now_unix: u64,
     ) -> Result<VerifiedRecipientKey, RecipientKeyError> {
         let verified = verify_signed_recipient_key(bytes, signers, &self.revocations, now_unix)?;
+        if now_unix < verified.issued_unix() || now_unix >= verified.expires_unix() {
+            return Err(RecipientKeyError::Lifetime);
+        }
         let slot = (verified.seat().to_owned(), verified.purpose());
         let Some(prev) = self.active.get(&slot) else {
             return Err(RecipientKeyError::Rejected);

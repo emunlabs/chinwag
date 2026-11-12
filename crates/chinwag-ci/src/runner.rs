@@ -236,11 +236,9 @@ async fn refresh_live_revocations(
     signers: &crate::recipient_key::SeatSignerDirectory,
     state: &mut crate::recipient_key::VerifiedRevocationState,
 ) -> Result<()> {
-    let (local, _) =
+    let (_, local_state) =
         runtime::load_revocation_statements(config.recipient_revocations.as_deref(), plan)?;
-    for rev in &local {
-        ck(state.ingest_signed_revocation_struct(rev, signers))?;
-    }
+    state.merge_verified(&local_state);
     let mut nonce = [0_u8; 32];
     ck(getrandom::fill(&mut nonce))?;
     if bool::from(nonce[..].ct_eq(&[0_u8; 32][..])) {

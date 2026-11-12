@@ -467,11 +467,13 @@ pub fn verify_revocation_status(
         &status.signature_hex,
         owner_public_pin,
     )?;
+    let mut snapshot = VerifiedRevocationState::new();
     for rev in &s.statements {
-        into_state
+        snapshot
             .ingest_signed_revocation_struct(rev, signers)
             .map_err(|_| AuthorizationError::Rejected)?;
     }
+    into_state.merge_verified(&snapshot);
     Ok(())
 }
 

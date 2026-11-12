@@ -166,8 +166,10 @@ pub(crate) struct ReadAuthorization {
     policy: [u8; 32],
     epoch: u64,
     signer: [u8; 32],
+    revocation_gate: Option<(runtime::Plan, Option<PathBuf>)>,
 }
 impl ReadAuthorization {
+    #[cfg(test)]
     pub(crate) fn qualified(grant_until: u64, p: &acu::CurrentPolicy) -> Self {
         Self {
             grant_until,
@@ -175,6 +177,22 @@ impl ReadAuthorization {
             policy: p.digest(),
             epoch: p.epoch(),
             signer: p.signer(),
+            revocation_gate: None,
+        }
+    }
+    pub(crate) fn qualified_for_plan(
+        grant_until: u64,
+        p: &acu::CurrentPolicy,
+        plan: runtime::Plan,
+        recipient_revocations: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            grant_until,
+            policy_until: p.expires_unix(),
+            policy: p.digest(),
+            epoch: p.epoch(),
+            signer: p.signer(),
+            revocation_gate: Some((plan, recipient_revocations)),
         }
     }
     pub(crate) fn until(&self) -> u64 {
@@ -193,6 +211,11 @@ impl ReadAuthorization {
         sample: crate::agent_deadline::Sample,
     ) -> Result<Instant, ReadError> {
         self.verify_current(raw, sample.unix())?;
+        if let Some((plan, revocations_path)) = &self.revocation_gate {
+            let revocations =
+                checked(runtime::load_revocations(revocations_path.as_deref(), plan))?;
+            let _ = checked(plan.delivery_with_revocations(&revocations))?;
+        }
         checked(sample.until(self.until()))
     }
     pub(crate) async fn current(&self, origin: &str) -> Result<Instant, ReadError> {

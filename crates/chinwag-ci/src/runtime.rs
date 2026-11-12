@@ -919,6 +919,8 @@ struct QualifiedCapture {
 #[allow(clippy::too_many_arguments)]
 fn qualified_output(
     owner: &OwnerCustody,
+    plan: &Plan,
+    revocations_path: Option<&Path>,
     envelope: &authorization::AdmissionBoundEnvelope,
     policy: &acu::CurrentPolicy,
     profile: &crate::profile::CommandProfile,
@@ -954,9 +956,11 @@ fn qualified_output(
         observation: obs,
         verified,
         plaintext,
-        read_authorization: crate::agent_read::ReadAuthorization::qualified(
+        read_authorization: crate::agent_read::ReadAuthorization::qualified_for_plan(
             grant.expires_unix(),
             policy,
+            plan.clone(),
+            revocations_path.map(Path::to_path_buf),
         ),
     })
 }
@@ -1023,6 +1027,8 @@ async fn recipient_read(
     ))?;
     qualified_output(
         owner,
+        plan,
+        revocations_path,
         &e,
         &current,
         &checked(crate::profile::CommandProfile::parse(
@@ -1370,6 +1376,8 @@ pub async fn serve_studio(path: &Path) -> Result<()> {
         ))?;
         qualified_output(
             &archive,
+            &plan,
+            s.config.recipient_revocations.as_deref(),
             &e,
             &current,
             &checked(crate::profile::CommandProfile::parse(
@@ -1949,6 +1957,104 @@ mod tests {
         assert!(
             initial_profiles
                 .reverify_recipient_keys(&signers, &runner_rev, t)
+                .is_err()
+        );
+
+        // Repeated cumulative multi-entry snapshots `[r1(t1), r2(t2)]` (`t1 < t2`) for retired
+        // keys refresh idempotently across multiple runner phases without rejecting `r1(t1)`:
+        let r1: SignedRecipientKeyRevocation = serde_json::from_slice(
+            &sign_revocation_statement("WORKHORSE", 1, &["wh-retired-1".into()], t - 20, &seat_sk)
+                .unwrap(),
+        )
+        .unwrap();
+        let r2: SignedRecipientKeyRevocation = serde_json::from_slice(
+            &sign_revocation_statement("WORKHORSE", 1, &["wh-retired-2".into()], t - 10, &seat_sk)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut cumulative_rev = crate::recipient_key::VerifiedRevocationState::new();
+        for n in [[81_u8; 32], [82_u8; 32], [83_u8; 32]] {
+            let snap = crate::authorization::certify_revocation_status(
+                &intent,
+                n,
+                vec![r1.clone(), r2.clone()],
+                &adm_secret,
+            )
+            .unwrap();
+            assert!(
+                crate::authorization::verify_revocation_status(
+                    &snap,
+                    adm_pin,
+                    *intent.original_digest(),
+                    &plan.scope.instance,
+                    n,
+                    &signers,
+                    &mut cumulative_rev,
+                )
+                .is_ok()
+            );
+            assert!(
+                initial_profiles
+                    .reverify_recipient_keys(&signers, &cumulative_rev, t)
+                    .is_ok()
+            );
+        }
+
+        // ReadAuthorization::qualified_for_plan enforces live recipient revocations after ACU
+        // policy fetch (`current_until`), refusing wake/spawn/FIFO read once revoked:
+        let acu_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(acu_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let acu_canon = acu_dir.path().canonicalize().unwrap();
+        let acu_owner =
+            OwnerCustody::create_new(&acu_canon, crate::custody::OwnerRole::Acu, [55; 32], None)
+                .unwrap();
+        let acu_pin = match acu_owner.public_enrollment().unwrap() {
+            PublicEnrollment::Acu { signer, .. } => signer,
+            _ => unreachable!(),
+        };
+        let pol_spec = acu::PolicySpec {
+            version: 1,
+            epoch: 1,
+            issued_unix: t - 10,
+            expires_unix: t + 900,
+            active: true,
+            allow_recipient: true,
+            allow_archive: true,
+            repository_id: 42,
+            initiating_instance: plan.scope.instance.clone(),
+            key_pins_sha256: [33; 32],
+            recipient_store_id: [1; 32],
+            archive_store_id: [6; 32],
+            allowed_historical_envelopes: Vec::new(),
+        };
+        let pol_raw = acu_owner.sign_release_policy(&pol_spec).unwrap();
+        let cur_pol = acu::verify_current_policy(&pol_raw, acu_pin, t).unwrap();
+        let live_rev_path = canonical_dir.join("wake-live-revocations.json");
+        write_new(&live_rev_path, b"[]").unwrap();
+        let read_auth = crate::agent_read::ReadAuthorization::qualified_for_plan(
+            t + 600,
+            &cur_pol,
+            plan.clone(),
+            Some(live_rev_path.clone()),
+        );
+        let monotonic = tokio::time::Instant::now();
+        assert!(
+            read_auth
+                .current_until(
+                    &pol_raw,
+                    crate::agent_deadline::Sample::fixture(monotonic, t)
+                )
+                .is_ok()
+        );
+        let live_rev_tmp = canonical_dir.join("wake-live-revocations.tmp");
+        write_new(&live_rev_tmp, &std::fs::read(&rev_path).unwrap()).unwrap();
+        std::fs::rename(&live_rev_tmp, &live_rev_path).unwrap();
+        assert!(
+            read_auth
+                .current_until(
+                    &pol_raw,
+                    crate::agent_deadline::Sample::fixture(monotonic, t)
+                )
                 .is_err()
         );
     }
