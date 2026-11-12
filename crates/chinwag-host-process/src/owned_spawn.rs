@@ -186,7 +186,6 @@ impl Drop for Attributes {
 /// in child-only file actions and closed there before exec. No parent directory
 /// or original descriptor flags change. A timeout policy belongs to the caller;
 /// it must retain this handle and its operation guard on an unknown outcome.
-#[allow(unsafe_code)]
 pub fn spawn_at(
     program: &CStr,
     args: &[CString],
@@ -194,9 +193,81 @@ pub fn spawn_at(
     directory: BorrowedFd<'_>,
     stdio: SpawnStdio<'_>,
 ) -> io::Result<OwnedChild> {
+    spawn_at_group(program, args, env, directory, stdio, false)
+}
+
+/// Spawn an absolute program inside `directory` via child-only `fchdir`,
+/// optionally placing the child in its own new process group (`pgid == pid`).
+pub fn spawn_at_group(
+    program: &CStr,
+    args: &[CString],
+    env: &[CString],
+    directory: BorrowedFd<'_>,
+    stdio: SpawnStdio<'_>,
+    own_process_group: bool,
+) -> io::Result<OwnedChild> {
     if program.to_bytes().first() != Some(&b'/') {
         return Err(io::ErrorKind::InvalidInput.into());
     }
+    spawn_inner(
+        program,
+        program,
+        args,
+        env,
+        directory,
+        stdio,
+        own_process_group,
+    )
+}
+
+/// Spawn `./<entry_name>` resolved directly inside `directory` via child-only
+/// `fchdir`, setting `argv[0]` to `argv0` and passing only `env`.
+///
+/// Because kernel pathname lookup starts from the child's descriptor-pinned
+/// current working directory after `posix_spawn_file_actions_addfchdir_np`,
+/// renaming or substituting mutable ancestors above `directory` cannot redirect
+/// execution to another file.
+pub fn spawn_relative_in_dir(
+    entry_name: &CStr,
+    argv0: &CStr,
+    args: &[CString],
+    env: &[CString],
+    directory: BorrowedFd<'_>,
+    stdio: SpawnStdio<'_>,
+    own_process_group: bool,
+) -> io::Result<OwnedChild> {
+    let raw = entry_name.to_bytes();
+    if raw.is_empty() || raw.contains(&b'/') || raw == b"." || raw == b".." {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    if argv0.to_bytes().is_empty() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut rel = Vec::with_capacity(2 + raw.len());
+    rel.extend_from_slice(b"./");
+    rel.extend_from_slice(raw);
+    let exec_path = CString::new(rel).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    spawn_inner(
+        &exec_path,
+        argv0,
+        args,
+        env,
+        directory,
+        stdio,
+        own_process_group,
+    )
+}
+
+#[allow(unsafe_code)]
+fn spawn_inner(
+    exec_path: &CStr,
+    argv0: &CStr,
+    args: &[CString],
+    env: &[CString],
+    directory: BorrowedFd<'_>,
+    stdio: SpawnStdio<'_>,
+    own_process_group: bool,
+) -> io::Result<OwnedChild> {
     let cwd = duplicate(directory)?;
     let sources = [
         duplicate(stdio.input)?,
@@ -227,12 +298,14 @@ pub fn spawn_at(
                 fd.as_raw_fd(),
             ))?;
         }
-        result(libc::posix_spawnattr_setflags(
-            &mut attributes.0,
-            libc::POSIX_SPAWN_CLOEXEC_DEFAULT as i16,
-        ))?;
+        let mut flags = libc::POSIX_SPAWN_CLOEXEC_DEFAULT as i16;
+        if own_process_group {
+            flags |= libc::POSIX_SPAWN_SETPGROUP as i16;
+            result(libc::posix_spawnattr_setpgroup(&mut attributes.0, 0))?;
+        }
+        result(libc::posix_spawnattr_setflags(&mut attributes.0, flags))?;
     }
-    let mut argv: Vec<*mut libc::c_char> = std::iter::once(program.as_ptr().cast_mut())
+    let mut argv: Vec<*mut libc::c_char> = std::iter::once(argv0.as_ptr().cast_mut())
         .chain(args.iter().map(|s| s.as_ptr().cast_mut()))
         .collect();
     argv.push(std::ptr::null_mut());
@@ -247,7 +320,7 @@ pub fn spawn_at(
     result(unsafe {
         libc::posix_spawn(
             &mut pid,
-            program.as_ptr(),
+            exec_path.as_ptr(),
             &actions.0,
             &attributes.0,
             argv.as_ptr(),

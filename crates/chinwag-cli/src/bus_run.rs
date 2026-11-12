@@ -1294,143 +1294,11 @@ enum DaemonOutcome {
     },
 }
 
-enum ReleaseDaemonJob {
-    StartupCatchup,
-    LiveMessage(Box<BusMessage>),
-}
+use chinwag_cli::release_sync::{
+    ReleaseDaemonEvent, ReleaseDaemonJob, ReleaseDaemonScheduler, execute_release_daemon_job,
+};
 
-enum ReleaseWorkerEvent {
-    CatchupOpened {
-        present_binaries: Vec<String>,
-    },
-    BinaryResult {
-        binary: String,
-        release_key: Option<String>,
-        outcome: Result<
-            Box<chinwag_cli::release_sync::ReleaseApplyOutcome>,
-            chinwag_cli::release_sync::ReleaseSyncError,
-        >,
-    },
-    CatchupFailed(chinwag_cli::release_sync::ReleaseSyncError),
-}
-
-const MAX_RELEASE_SYNC_TRANSIENT_RETRIES: u32 = 12;
 const PENDING_REEXEC_MAX_DRAIN_WAIT: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct PerBinaryRetryState {
-    release_key: Option<String>,
-    attempts: u32,
-    next_due_at: Option<Instant>,
-    in_flight: bool,
-}
-
-#[derive(Debug, Default)]
-struct ReleaseRetryScheduler {
-    per_binary: std::collections::BTreeMap<String, PerBinaryRetryState>,
-    overflow_reconcile_pending: bool,
-}
-
-impl ReleaseRetryScheduler {
-    fn backoff_for_attempt(attempt: u32) -> Duration {
-        let secs = 10u64.saturating_mul(1u64 << attempt.min(5)).min(300);
-        Duration::from_secs(secs)
-    }
-
-    fn mark_queue_overflow(&mut self) {
-        self.overflow_reconcile_pending = true;
-    }
-
-    fn on_catchup_opened(&mut self, present_binaries: &[String]) {
-        self.per_binary.remove("all");
-        self.per_binary.remove("worker");
-        self.per_binary.retain(|binary, state| {
-            if state.in_flight && !present_binaries.iter().any(|b| b == binary) {
-                return false;
-            }
-            true
-        });
-    }
-
-    fn on_succeeded(&mut self, binary: &str) {
-        self.per_binary.remove(binary);
-    }
-
-    fn on_failed(
-        &mut self,
-        binary: &str,
-        release_key: Option<&str>,
-        retryable: bool,
-        now: Instant,
-    ) -> Option<Duration> {
-        if binary == "unknown" || (release_key.is_none() && !retryable) {
-            return None;
-        }
-        if !retryable {
-            if let Some(entry) = self.per_binary.get_mut(binary)
-                && (release_key.is_none() || entry.release_key.as_deref() == release_key)
-            {
-                entry.in_flight = false;
-                entry.next_due_at = None;
-            }
-            return None;
-        }
-        let entry = self.per_binary.entry(binary.to_owned()).or_default();
-        if let Some(new_key) = release_key
-            && entry.release_key.as_deref() != Some(new_key)
-        {
-            entry.release_key = Some(new_key.to_owned());
-            entry.attempts = 0;
-        }
-        entry.in_flight = false;
-        if entry.attempts >= MAX_RELEASE_SYNC_TRANSIENT_RETRIES {
-            entry.next_due_at = None;
-            return None;
-        }
-        let delay = Self::backoff_for_attempt(entry.attempts);
-        entry.attempts = entry.attempts.saturating_add(1);
-        entry.next_due_at = Some(now + delay);
-        Some(delay)
-    }
-
-    fn on_catchup_failed(&mut self, retryable: bool, now: Instant) -> Option<Duration> {
-        let in_flight_keys: Vec<(String, Option<String>)> = self
-            .per_binary
-            .iter()
-            .filter(|(_, st)| st.in_flight)
-            .map(|(k, st)| (k.clone(), st.release_key.clone()))
-            .collect();
-        if in_flight_keys.is_empty() {
-            return self.on_failed("all", None, retryable, now);
-        }
-        let mut earliest: Option<Duration> = None;
-        for (binary, key) in in_flight_keys {
-            if let Some(delay) = self.on_failed(&binary, key.as_deref(), retryable, now) {
-                earliest = Some(earliest.map_or(delay, |prev| prev.min(delay)));
-            }
-        }
-        earliest
-    }
-
-    fn should_dispatch_catchup(&self, now: Instant) -> bool {
-        if self.overflow_reconcile_pending {
-            return true;
-        }
-        self.per_binary
-            .values()
-            .any(|st| !st.in_flight && st.next_due_at.is_some_and(|due| now >= due))
-    }
-
-    fn mark_catchup_dispatched(&mut self, now: Instant) {
-        self.overflow_reconcile_pending = false;
-        for st in self.per_binary.values_mut() {
-            if !st.in_flight && st.next_due_at.is_some_and(|due| now >= due) {
-                st.in_flight = true;
-                st.next_due_at = None;
-            }
-        }
-    }
-}
 
 fn should_complete_pending_reexec(
     forwards_empty: bool,
@@ -1950,16 +1818,19 @@ async fn run_daemon_loop_reexecable(
         .and_then(|exe| chinwag_cli::release_sync::local_binary_sha256(&exe));
 
     let release_reconcile_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut retry_scheduler = ReleaseRetryScheduler::default();
+    let retry_scheduler = Arc::new(Mutex::new(
+        ReleaseDaemonScheduler::new_with_initial_catchup(),
+    ));
 
     let (release_done_tx, mut release_done_rx) =
-        tokio::sync::mpsc::channel::<ReleaseWorkerEvent>(32);
+        tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(32);
     let release_job_tx = if !no_governors && controlled_local_driver.is_none() {
         let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(32);
         let _ = job_tx.try_send(ReleaseDaemonJob::StartupCatchup);
         let journal_for_worker = messages_jsonl_path(&repo_root);
         let ep_for_worker = endpoint_id.clone();
         let done_tx = release_done_tx.clone();
+        let sched_for_worker = retry_scheduler.clone();
         handlers.spawn(async move {
             let Ok(home_dir) = chinwag_cli::release_sync::resolve_home_dir() else {
                 return;
@@ -1969,56 +1840,19 @@ async fn run_daemon_loop_reexecable(
                 let home_clone = home_dir.clone();
                 let journal_clone = journal_for_worker.clone();
                 let ep_clone = ep_for_worker.clone();
+                let sched_clone = sched_for_worker.clone();
                 let events = tokio::task::spawn_blocking(move || {
                     let store =
                         chinwag_cli::release_sync::WranglerR2ArtifactStore::new(home_clone.clone());
-                    match job {
-                        ReleaseDaemonJob::StartupCatchup => match chinwag_cli::release_sync::sync_releases_from_journal_per_binary(
-                            &home_clone,
-                            &journal_clone,
-                            &store,
-                            Some(&ep_clone),
-                        ) {
-                            Ok(reports) => {
-                                let present_binaries: Vec<String> =
-                                    reports.iter().map(|r| r.binary.clone()).collect();
-                                let mut out =
-                                    vec![ReleaseWorkerEvent::CatchupOpened { present_binaries }];
-                                for report in reports {
-                                    out.push(ReleaseWorkerEvent::BinaryResult {
-                                        binary: report.binary,
-                                        release_key: Some(report.release_key),
-                                        outcome: report.outcome.map(Box::new),
-                                    });
-                                }
-                                out
-                            }
-                            Err(err) => vec![ReleaseWorkerEvent::CatchupFailed(err)],
-                        },
-                        ReleaseDaemonJob::LiveMessage(msg) => {
-                            let verified =
-                                chinwag_cli::release_sync::verify_release_built_message(&msg).ok();
-                            let binary = verified
-                                .as_ref()
-                                .map(|m| m.binary.clone())
-                                .unwrap_or_else(|| "unknown".to_owned());
-                            let release_key = verified.as_ref().map(
-                                chinwag_cli::release_sync::InstalledBinaryState::release_history_key,
-                            );
-                            let outcome = chinwag_cli::release_sync::apply_release_built_message(
-                                &home_clone,
-                                &store,
-                                &msg,
-                                Some(&ep_clone),
-                            )
-                            .map(Box::new);
-                            vec![ReleaseWorkerEvent::BinaryResult {
-                                binary,
-                                release_key,
-                                outcome,
-                            }]
-                        }
-                    }
+                    execute_release_daemon_job(
+                        &home_clone,
+                        &journal_clone,
+                        &store,
+                        &ep_clone,
+                        &sched_clone,
+                        job,
+                        Instant::now(),
+                    )
                 })
                 .await;
                 match events {
@@ -2028,15 +1862,15 @@ async fn run_daemon_loop_reexecable(
                         }
                     }
                     Err(_) => {
+                        if let Ok(mut sched) = sched_for_worker.lock() {
+                            sched.on_worker_panic();
+                        }
                         let _ = done_tx
-                            .send(ReleaseWorkerEvent::BinaryResult {
+                            .send(ReleaseDaemonEvent::Rejected {
                                 binary: "worker".to_owned(),
-                                release_key: None,
-                                outcome: Err(
-                                    chinwag_cli::release_sync::ReleaseSyncError::InstallFailed(
-                                        "release sync worker panicked".to_owned(),
-                                    ),
-                                ),
+                                reason: "release sync worker panicked".to_owned(),
+                                retryable: false,
+                                next_retry_secs: None,
                             })
                             .await;
                     }
@@ -2103,32 +1937,7 @@ async fn run_daemon_loop_reexecable(
             }
             Some(release_event) = release_done_rx.recv() => {
                 match release_event {
-                    ReleaseWorkerEvent::CatchupOpened { present_binaries } => {
-                        retry_scheduler.on_catchup_opened(&present_binaries);
-                    }
-                    ReleaseWorkerEvent::CatchupFailed(err) => {
-                        let retryable = err.is_transient_retryable();
-                        let next_delay =
-                            retry_scheduler.on_catchup_failed(retryable, Instant::now());
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            json!({
-                                "event": "native_release_sync_rejected",
-                                "binary": "all",
-                                "reason": err.to_string(),
-                                "retryable": retryable,
-                                "next_retry_secs": next_delay.map(|d| d.as_secs())
-                            })
-                        );
-                        let _ = stdout.flush();
-                    }
-                    ReleaseWorkerEvent::BinaryResult {
-                        binary,
-                        release_key: _,
-                        outcome: Ok(outcome),
-                    } => {
-                        retry_scheduler.on_succeeded(&binary);
+                    ReleaseDaemonEvent::Applied { binary, outcome } => {
                         match *outcome {
                             chinwag_cli::release_sync::ReleaseApplyOutcome::Installed {
                                 manifest,
@@ -2241,27 +2050,38 @@ async fn run_daemon_loop_reexecable(
                             }
                         }
                     }
-                    ReleaseWorkerEvent::BinaryResult {
+                    ReleaseDaemonEvent::Rejected {
                         binary,
-                        release_key,
-                        outcome: Err(err),
+                        reason,
+                        retryable,
+                        next_retry_secs,
                     } => {
-                        let retryable = err.is_transient_retryable();
-                        let next_delay = retry_scheduler.on_failed(
-                            &binary,
-                            release_key.as_deref(),
-                            retryable,
-                            Instant::now(),
-                        );
                         let _ = writeln!(
                             stdout,
                             "{}",
                             json!({
                                 "event": "native_release_sync_rejected",
                                 "binary": binary,
-                                "reason": err.to_string(),
+                                "reason": reason,
                                 "retryable": retryable,
-                                "next_retry_secs": next_delay.map(|d| d.as_secs())
+                                "next_retry_secs": next_retry_secs
+                            })
+                        );
+                        let _ = stdout.flush();
+                    }
+                    ReleaseDaemonEvent::Suppressed {
+                        binary,
+                        release_key,
+                        reason,
+                    } => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            json!({
+                                "event": "native_release_sync_suppressed",
+                                "binary": binary,
+                                "release_key": release_key,
+                                "reason": reason
                             })
                         );
                         let _ = stdout.flush();
@@ -2360,14 +2180,17 @@ async fn run_daemon_loop_reexecable(
                     break;
                 }
                 if let Some(job_tx) = &release_job_tx {
-                    if release_reconcile_needed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                        retry_scheduler.mark_queue_overflow();
-                    }
-                    let now = Instant::now();
-                    if retry_scheduler.should_dispatch_catchup(now)
-                        && job_tx.try_send(ReleaseDaemonJob::StartupCatchup).is_ok()
-                    {
-                        retry_scheduler.mark_catchup_dispatched(now);
+                    let overflow_seen =
+                        release_reconcile_needed.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    let should_send = retry_scheduler
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .poll_catchup_dispatch(overflow_seen, Instant::now());
+                    if should_send && job_tx.try_send(ReleaseDaemonJob::StartupCatchup).is_err() {
+                        retry_scheduler
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .on_catchup_send_full();
                     }
                 }
             }
@@ -5416,29 +5239,81 @@ mod tests {
 
     #[test]
     fn per_binary_retry_scheduler_bounds_chinwag_ci_despite_chinwag_success() {
-        let mut sched = ReleaseRetryScheduler::default();
+        use chinwag_cli::release_sync::{
+            CURRENT_TARGET_TRIPLE, MAX_RELEASE_SYNC_TRANSIENT_RETRIES, RELEASE_MANIFEST_SCHEMA,
+            ReleaseApplyOutcome, ReleaseManifestV1, ReleaseSyncError, expected_artifact_key,
+        };
+
+        let sample_manifest =
+            |binary: &str, target: &str, sha_byte: u8, epoch: u64, built_at_ms: u64| {
+                let sha256 = format!("{sha_byte:02x}").repeat(32);
+                let blake3 = format!("{:02x}", sha_byte.wrapping_add(1)).repeat(32);
+                let artifact_key = expected_artifact_key(binary, target, &sha256);
+                ReleaseManifestV1 {
+                    schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+                    binary: binary.to_owned(),
+                    target_triple: target.to_owned(),
+                    git_commit: "abcd1234abcd1234".to_owned(),
+                    commit_epoch: epoch,
+                    built_at_ms,
+                    sha256,
+                    blake3,
+                    size_bytes: 4096,
+                    artifact_key,
+                    rollback: false,
+                }
+            };
+
+        let mut sched = ReleaseDaemonScheduler::default();
         let mut now = Instant::now();
         let expected_delays = [10u64, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300, 300];
         let mut scheduled_delays = Vec::new();
 
-        for cycle in 0..20usize {
-            sched.on_catchup_opened(&["chinwag".to_owned(), "chinwag-ci".to_owned()]);
-            // Healthy `chinwag` succeeds (`AlreadyInstalled`) on every single catchup batch,
-            // AND unauthenticated `#all` noise arrives alongside it — neither may reset
-            // `chinwag-ci`'s exponential backoff or retry cap!
-            sched.on_succeeded("chinwag");
-            assert_eq!(sched.on_failed("unknown", None, false, now), None);
+        let cw_installed = sample_manifest("chinwag", CURRENT_TARGET_TRIPLE, 0x11, 100, 1000);
+        let ci_old_installed =
+            sample_manifest("chinwag-ci", CURRENT_TARGET_TRIPLE, 0x21, 100, 1000);
+        let ci_failing = sample_manifest("chinwag-ci", CURRENT_TARGET_TRIPLE, 0x22, 200, 2000);
+        let transient_err = ReleaseSyncError::ArtifactStoreFailed("r2 timeout".to_owned());
 
-            let delay = sched.on_failed("chinwag-ci", Some("sha-v1:100:1000:0"), true, now);
+        for cycle in 0..20usize {
+            // Healthy `chinwag` succeeds (`AlreadyInstalled`) on every cycle, AND foreign-target
+            // `SkippedTargetMismatch` + older `AlreadyInstalled` replays for `chinwag-ci` arrive
+            // alongside it — NONE may clear or reset `ci_failing`'s retry state!
+            sched.on_outcome(&ReleaseApplyOutcome::AlreadyInstalled {
+                manifest: cw_installed.clone(),
+                install_path: PathBuf::from("/tmp/chinwag"),
+            });
+            sched.on_outcome(&ReleaseApplyOutcome::SkippedTargetMismatch {
+                manifest_target: "x86_64-apple-darwin".to_owned(),
+                local_target: CURRENT_TARGET_TRIPLE.to_owned(),
+            });
+            sched.on_outcome(&ReleaseApplyOutcome::AlreadyInstalled {
+                manifest: ci_old_installed.clone(),
+                install_path: PathBuf::from("/tmp/chinwag-ci"),
+            });
+
+            let delay = sched.on_manifest_failed(&ci_failing, &transient_err, now);
             if cycle < MAX_RELEASE_SYNC_TRANSIENT_RETRIES as usize {
                 let d = delay.expect("expected scheduled retry within 12-attempt cap");
                 scheduled_delays.push(d.as_secs());
                 assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(1)));
                 now += d;
-                assert!(sched.should_dispatch_catchup(now));
-                sched.mark_catchup_dispatched(now);
-                // While in-flight, duplicate heartbeat ticks do not re-dispatch.
-                assert!(!sched.should_dispatch_catchup(now));
+                assert!(sched.poll_catchup_dispatch(false, now));
+                // Duplicate heartbeat ticks while catchup is queued do not enqueue twice.
+                assert!(!sched.poll_catchup_dispatch(false, now));
+                // Reset `catchup_queued` as worker execution would:
+                let _ = chinwag_cli::release_sync::execute_release_daemon_job(
+                    Path::new("/nonexistent"),
+                    Path::new("/nonexistent/messages.jsonl"),
+                    &chinwag_cli::release_sync::WranglerR2ArtifactStore::new(PathBuf::from(
+                        "/nonexistent",
+                    )),
+                    "ep-test",
+                    &Mutex::new(ReleaseDaemonScheduler::default()),
+                    ReleaseDaemonJob::StartupCatchup,
+                    now,
+                );
+                sched.on_catchup_send_full();
             } else {
                 assert_eq!(delay, None, "must stop retrying after 12 attempts");
                 assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(3600)));
@@ -5446,25 +5321,30 @@ mod tests {
         }
         assert_eq!(scheduled_delays, expected_delays);
 
-        // Publishing a genuinely NEW `chinwag-ci` release (`sha-v2:...`) grants a fresh budget.
-        let fresh = sched.on_failed("chinwag-ci", Some("sha-v2:200:2000:0"), true, now);
+        // Publishing a genuinely NEW `chinwag-ci` release grants a fresh budget.
+        let ci_newer = sample_manifest("chinwag-ci", CURRENT_TARGET_TRIPLE, 0x23, 300, 3000);
+        let fresh = sched.on_manifest_failed(&ci_newer, &transient_err, now);
         assert_eq!(fresh, Some(Duration::from_secs(10)));
-        sched.on_succeeded("chinwag-ci");
+        sched.on_outcome(&ReleaseApplyOutcome::Installed {
+            manifest: ci_newer,
+            install_path: PathBuf::from("/tmp/chinwag-ci"),
+            previous_backup_path: None,
+            receipt_message: None,
+        });
         assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(600)));
     }
 
     #[test]
     fn retry_scheduler_queue_overflow_persists_until_catchup_dispatched() {
-        let mut sched = ReleaseRetryScheduler::default();
+        let mut sched = ReleaseDaemonScheduler::default();
         let now = Instant::now();
         assert!(!sched.should_dispatch_catchup(now));
-        sched.mark_queue_overflow();
-        assert!(sched.should_dispatch_catchup(now));
-        // If `job_tx.try_send` is still full on heartbeat 1, `mark_catchup_dispatched`
-        // is not called and `should_dispatch_catchup` remains true on heartbeat 2.
+        assert!(sched.poll_catchup_dispatch(true, now));
+        // Simulate `job_tx.try_send` full on heartbeat 1: `on_catchup_send_full` re-arms
+        // dispatch while keeping `overflow_reconcile_pending` true for heartbeat 2.
+        sched.on_catchup_send_full();
         assert!(sched.should_dispatch_catchup(now + Duration::from_secs(10)));
-        sched.mark_catchup_dispatched(now + Duration::from_secs(10));
-        assert!(!sched.should_dispatch_catchup(now + Duration::from_secs(20)));
+        assert!(sched.poll_catchup_dispatch(false, now + Duration::from_secs(10)));
     }
 
     #[test]

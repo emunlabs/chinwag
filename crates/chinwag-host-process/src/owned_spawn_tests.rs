@@ -351,3 +351,86 @@ fn interruption_repeats_only_the_same_wait_then_caches_the_terminal_result() {
         Some(Exit::Code(0))
     );
 }
+
+#[test]
+fn spawn_relative_in_dir_executes_verified_directory_entry_after_ancestor_rename() {
+    let fixture = Fixture::new();
+    let staging = fixture.root.join("staging");
+    let op_dir = staging.join("op.1");
+    fs::create_dir_all(&op_dir).unwrap();
+
+    // Copy the current test binary into `staging/op.1/chinwag` and pin `op.1` via open FD.
+    let current_exe = std::env::current_exe().unwrap();
+    fs::copy(&current_exe, op_dir.join("chinwag")).unwrap();
+    fs::set_permissions(op_dir.join("chinwag"), fs::Permissions::from_mode(0o755)).unwrap();
+    let op_dir_fd = File::open(&op_dir).unwrap();
+    let expected_meta = op_dir_fd.metadata().unwrap();
+
+    // Displace the mutable `staging` ancestor and plant a `/usr/bin/false` replacement
+    // at the original pathname `staging/op.1/chinwag`.
+    let displaced = fixture.root.join("staging.displaced");
+    fs::rename(&staging, &displaced).unwrap();
+    let fake_op = staging.join("op.1");
+    fs::create_dir_all(&fake_op).unwrap();
+    fs::copy("/usr/bin/false", fake_op.join("chinwag")).unwrap();
+    fs::set_permissions(fake_op.join("chinwag"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ambient = ambient(&fixture.output);
+    let env = strings(&[
+        "CHINWAG_SPAWN_TEST=inspect",
+        "PAYLOAD=literal spaces = preserved",
+        &format!("AMBIENT_FD={}", ambient.as_raw_fd()),
+    ]);
+    let mut child = spawn_relative_in_dir(
+        c"chinwag",
+        c"chinwag",
+        &strings(&[
+            "--ignored",
+            "--exact",
+            "owned_spawn::tests::fixture_child",
+            "--nocapture",
+        ]),
+        &env,
+        op_dir_fd.as_fd(),
+        fixture.stdio(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(wait(&mut child), Exit::Code(0), "{}", fixture.output());
+    assert!(fixture.output().contains(&format!(
+        "INSPECT_OK {} {}",
+        expected_meta.dev(),
+        expected_meta.ino()
+    )));
+
+    // Invalid relative entry names and empty argv0 fail closed before spawning.
+    for bad in [c"", c".", c"..", c"sub/chinwag", c"/usr/bin/true"] {
+        let err = spawn_relative_in_dir(
+            bad,
+            c"chinwag",
+            &[],
+            &[],
+            op_dir_fd.as_fd(),
+            fixture.stdio(),
+            false,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+    assert_eq!(
+        spawn_relative_in_dir(
+            c"chinwag",
+            c"",
+            &[],
+            &[],
+            op_dir_fd.as_fd(),
+            fixture.stdio(),
+            false,
+        )
+        .err()
+        .unwrap()
+        .kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
