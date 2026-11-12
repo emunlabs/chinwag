@@ -88,19 +88,65 @@ if [[ -z "$REPO_ROOT" ]]; then
 fi
 
 TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+BUILD_META_DIR=""
+cleanup_build_meta() {
+  if [[ -n "${BUILD_META_DIR:-}" && -d "${BUILD_META_DIR}" ]]; then
+    rm -rf "${BUILD_META_DIR}"
+  fi
+}
+trap cleanup_build_meta EXIT
 
 if [[ -z "$SOURCE_BIN" ]]; then
+  umask 077
+  BUILD_META_DIR="$(mktemp -d "${TMPDIR:-/tmp}/chinwag-release-build.XXXXXX")"
+  CARGO_JSON_LOG="${BUILD_META_DIR}/cargo-messages.jsonl"
   cargo build \
     --manifest-path "${REPO_ROOT}/Cargo.toml" \
     --target-dir "${TARGET_DIR}" \
     --release \
     --bin "${BINARY}" \
-    --locked >&2
-  SOURCE_BIN="${TARGET_DIR}/release/${BINARY}"
+    --locked \
+    --message-format=json-render-diagnostics >"$CARGO_JSON_LOG"
+  SOURCE_BIN="$(python3 - "$CARGO_JSON_LOG" "$BINARY" <<'PY'
+import json
+import sys
+
+log_path, want_bin = sys.argv[1], sys.argv[2]
+matches = []
+with open(log_path, "r", encoding="utf-8") as fh:
+    for raw in fh:
+        raw = raw.strip()
+        if not raw:
+            continue
+        obj = json.loads(raw)
+        if obj.get("reason") != "compiler-artifact":
+            continue
+        target = obj.get("target") or {}
+        kinds = target.get("kind") or []
+        exe = obj.get("executable")
+        if (
+            target.get("name") == want_bin
+            and "bin" in kinds
+            and isinstance(exe, str)
+            and exe
+        ):
+            matches.append(exe)
+
+if len(matches) != 1:
+    sys.stderr.write(
+        f"chinwag-release-publish: expected exactly 1 executable artifact for {want_bin}, got {len(matches)}\n"
+    )
+    sys.exit(1)
+
+print(matches[0])
+PY
+)"
+  rm -rf "$BUILD_META_DIR"
+  BUILD_META_DIR=""
 fi
 
-if [[ ! -f "$SOURCE_BIN" ]]; then
-  echo "chinwag-release-publish: compiled binary not found at ${SOURCE_BIN}" >&2
+if [[ ! -f "$SOURCE_BIN" || -L "$SOURCE_BIN" ]]; then
+  echo "chinwag-release-publish: compiled binary not found or is a symlink at ${SOURCE_BIN}" >&2
   exit 1
 fi
 
@@ -126,9 +172,9 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
 fi
 
 SCRIPT_SELF="${REPO_ROOT}/scripts/chinwag-release-publish"
-if [[ -f "$SCRIPT_SELF" && ! -L "$SCRIPT_SELF" ]]; then
+if [[ -f "$SCRIPT_SELF" && ! -L "$SCRIPT_SELF" && ! -L "${HOME}/.local" && ! -L "${HOME}/.local/bin" && ! -L "${HOME}/.local/bin/chinwag-release-publish" ]]; then
   mkdir -p "${HOME}/.local/bin"
-  WRAPPER_TMP="${HOME}/.local/bin/.chinwag-release-publish.tmp.$$"
+  WRAPPER_TMP="$(mktemp "${HOME}/.local/bin/.chinwag-release-publish.tmp.XXXXXX")"
   cp "$SCRIPT_SELF" "$WRAPPER_TMP"
   chmod 0755 "$WRAPPER_TMP"
   mv -f "$WRAPPER_TMP" "${HOME}/.local/bin/chinwag-release-publish"

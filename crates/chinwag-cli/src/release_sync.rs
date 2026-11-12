@@ -452,8 +452,11 @@ impl WranglerR2ArtifactStore {
             .stdin(stdin_cfg)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        run_bounded_command(&mut cmd, WRANGLER_R2_TIMEOUT).map_err(|reason| {
-            ReleaseSyncError::ArtifactStoreFailed(format!("wrangler r2 failed: {reason}"))
+        run_bounded_command(&mut cmd, WRANGLER_R2_TIMEOUT).map_err(|failure| {
+            ReleaseSyncError::ArtifactStoreFailed(format!(
+                "wrangler r2 failed: {}",
+                failure.message
+            ))
         })
     }
 }
@@ -1148,6 +1151,7 @@ std::thread_local! {
     static TEST_INJECTED_SAVE_STATE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static TEST_INJECTED_PREPARE_REEXEC_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static TEST_INJECTED_SUBSCRIBER_STAGE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static TEST_INJECTED_BOUNDED_CMD_THREAD_ERRNO: std::cell::Cell<Option<(usize, i32)>> = const { std::cell::Cell::new(None) };
 }
 
 fn create_staged_file_at(
@@ -1184,17 +1188,33 @@ pub fn save_release_sync_state(
 ) -> Result<(), ReleaseSyncError> {
     let chinwag_dir = ensure_private_dir(&home_dir.join(".chinwag"))?;
     let (chinwag_dir_fd, _) = open_dir_nofollow(&chinwag_dir)?;
-    let final_path = chinwag_dir.join("release_sync_state.json");
-    match fs::symlink_metadata(&final_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+    match rustix::fs::statat(
+        &chinwag_dir_fd,
+        "release_sync_state.json",
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) => {
+            let ft = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+            if ft.is_symlink() || !ft.is_file() {
                 return Err(ReleaseSyncError::SafePathViolation(
                     "state_target_is_symlink",
                 ));
             }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(classify_state_io_error("stat_final", &err)),
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
+            return Err(ReleaseSyncError::SafePathViolation(
+                "state_target_is_symlink",
+            ));
+        }
+        Err(err) if is_transient_errno(err) => {
+            return Err(ReleaseSyncError::TransientIo(format!("stat_final: {err}")));
+        }
+        Err(err) => {
+            return Err(ReleaseSyncError::StatePersistenceFailed(format!(
+                "stat_final: {err}"
+            )));
+        }
     }
     #[cfg(test)]
     if let Some(raw_errno) = TEST_INJECTED_SAVE_STATE_ERRNO.with(|c| c.take()) {
@@ -1228,6 +1248,10 @@ pub fn save_release_sync_state(
             .map_err(|e| classify_state_io_error("write_tmp", &e))?;
         file.sync_all()
             .map_err(|e| classify_state_io_error("sync_tmp", &e))?;
+        let tmp_meta = file
+            .metadata()
+            .map_err(|e| classify_state_io_error("fstat_tmp", &e))?;
+        let expected_tmp_id = (tmp_meta.dev(), tmp_meta.ino());
         drop(file);
         rustix::fs::renameat(
             &chinwag_dir_fd,
@@ -1245,6 +1269,39 @@ pub fn save_release_sync_state(
         chinwag_dir_fd
             .sync_all()
             .map_err(|e| classify_state_io_error("sync_state_dir", &e))?;
+        let post_fd = rustix::fs::openat(
+            &chinwag_dir_fd,
+            "release_sync_state.json",
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|err| {
+            if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK {
+                ReleaseSyncError::SafePathViolation("state_post_symlink")
+            } else if is_transient_errno(err) {
+                ReleaseSyncError::TransientIo(format!("open_post_state: {err}"))
+            } else {
+                ReleaseSyncError::StatePersistenceFailed(format!("open_post_state: {err}"))
+            }
+        })?;
+        let post_meta = File::from(post_fd)
+            .metadata()
+            .map_err(|e| classify_state_io_error("fstat_post_state", &e))?;
+        if post_meta.file_type().is_symlink()
+            || !post_meta.file_type().is_file()
+            || post_meta.nlink() != 1
+            || post_meta.uid() != rustix::process::geteuid().as_raw()
+            || (post_meta.dev(), post_meta.ino()) != expected_tmp_id
+        {
+            return Err(ReleaseSyncError::SafePathViolation(
+                "state_post_inode_or_type_invalid",
+            ));
+        }
+        if (post_meta.mode() & 0o777) != 0o600 {
+            return Err(ReleaseSyncError::StatePersistenceFailed(
+                "state_post_mode_not_0600".into(),
+            ));
+        }
         Ok(())
     })();
     if write_res.is_err() {
@@ -1265,31 +1322,96 @@ fn kill_process_group_best_effort(raw_pid_u32: u32) {
     }
 }
 
-fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), String> {
+#[derive(Debug)]
+struct BoundedCommandFailure {
+    message: String,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    transient_io: bool,
+}
+
+fn spawn_pipe_drainer<F>(f: F, slot_index: usize) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    if let Some((want_idx, raw_errno)) = TEST_INJECTED_BOUNDED_CMD_THREAD_ERRNO.with(|c| c.get())
+        && want_idx == slot_index
+    {
+        TEST_INJECTED_BOUNDED_CMD_THREAD_ERRNO.with(|c| c.set(None));
+        return Err(std::io::Error::from_raw_os_error(raw_errno));
+    }
+    let _ = slot_index;
+    std::thread::Builder::new().spawn(f)
+}
+
+fn terminate_and_reap_std_child(child: &mut std::process::Child, child_pid: u32) {
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    kill_process_group_best_effort(child_pid);
+    let _ = child.kill();
+    for _ in 0..50 {
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), BoundedCommandFailure> {
     // Spawn in a dedicated process group (`pgid == child_pid`) so any background
     // descendant holding inherited stdout/stderr pipes can be terminated cleanly
     // at the deadline without stalling the release worker.
     cmd.process_group(0);
-    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| BoundedCommandFailure {
+        message: format!("spawn failed: {e}"),
+        transient_io: is_transient_io_error(&e),
+    })?;
     let child_pid = child.id();
-    let stdout_rx = child.stdout.take().map(|mut out_pipe| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut out_pipe, &mut std::io::sink());
-            let _ = tx.send(());
-        });
-        rx
-    });
-    let stderr_rx = child.stderr.take().map(|mut err_pipe| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let mut preview = Vec::with_capacity(512);
-            let _ = (&mut err_pipe).take(512).read_to_end(&mut preview);
-            let _ = std::io::copy(&mut err_pipe, &mut std::io::sink());
-            let _ = tx.send(preview);
-        });
-        rx
-    });
+    let stdout_rx = match child.stdout.take() {
+        Some(mut out_pipe) => {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            if let Err(err) = spawn_pipe_drainer(
+                move || {
+                    let _ = std::io::copy(&mut out_pipe, &mut std::io::sink());
+                    let _ = tx.send(());
+                },
+                0,
+            ) {
+                terminate_and_reap_std_child(&mut child, child_pid);
+                return Err(BoundedCommandFailure {
+                    message: format!("stdout reader thread spawn failed: {err}"),
+                    transient_io: is_transient_io_error(&err),
+                });
+            }
+            Some(rx)
+        }
+        None => None,
+    };
+    let stderr_rx = match child.stderr.take() {
+        Some(mut err_pipe) => {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            if let Err(err) = spawn_pipe_drainer(
+                move || {
+                    let mut preview = Vec::with_capacity(512);
+                    let _ = (&mut err_pipe).take(512).read_to_end(&mut preview);
+                    let _ = std::io::copy(&mut err_pipe, &mut std::io::sink());
+                    let _ = tx.send(preview);
+                },
+                1,
+            ) {
+                terminate_and_reap_std_child(&mut child, child_pid);
+                if let Some(rx) = &stdout_rx {
+                    let _ = rx.recv_timeout(Duration::from_millis(100));
+                }
+                return Err(BoundedCommandFailure {
+                    message: format!("stderr reader thread spawn failed: {err}"),
+                    transient_io: is_transient_io_error(&err),
+                });
+            }
+            Some(rx)
+        }
+        None => None,
+    };
     let started = Instant::now();
     loop {
         match child.try_wait() {
@@ -1299,10 +1421,13 @@ fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), Stri
                     if rx.recv_timeout(remaining).is_err() {
                         kill_process_group_best_effort(child_pid);
                         let _ = rx.recv_timeout(Duration::from_millis(50));
-                        return Err(format!(
-                            "timed out waiting for stdout pipe EOF after {}ms",
-                            deadline.as_millis()
-                        ));
+                        return Err(BoundedCommandFailure {
+                            message: format!(
+                                "timed out waiting for stdout pipe EOF after {}ms",
+                                deadline.as_millis()
+                            ),
+                            transient_io: false,
+                        });
                     }
                 }
                 let stderr_buf = if let Some(rx) = stderr_rx {
@@ -1312,10 +1437,13 @@ fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), Stri
                         Err(_) => {
                             kill_process_group_best_effort(child_pid);
                             let _ = rx.recv_timeout(Duration::from_millis(50));
-                            return Err(format!(
-                                "timed out waiting for stderr pipe EOF after {}ms",
-                                deadline.as_millis()
-                            ));
+                            return Err(BoundedCommandFailure {
+                                message: format!(
+                                    "timed out waiting for stderr pipe EOF after {}ms",
+                                    deadline.as_millis()
+                                ),
+                                transient_io: false,
+                            });
                         }
                     }
                 } else {
@@ -1325,10 +1453,13 @@ fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), Stri
                     return Ok(());
                 }
                 let snippet = String::from_utf8_lossy(&stderr_buf).trim().to_owned();
-                return Err(if snippet.is_empty() {
-                    format!("exit status {status}")
-                } else {
-                    format!("exit status {status}: {snippet}")
+                return Err(BoundedCommandFailure {
+                    message: if snippet.is_empty() {
+                        format!("exit status {status}")
+                    } else {
+                        format!("exit status {status}: {snippet}")
+                    },
+                    transient_io: false,
                 });
             }
             Ok(None) => {
@@ -1336,12 +1467,18 @@ fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), Stri
                     kill_process_group_best_effort(child_pid);
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("timed out after {}ms", deadline.as_millis()));
+                    return Err(BoundedCommandFailure {
+                        message: format!("timed out after {}ms", deadline.as_millis()),
+                        transient_io: false,
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(err) => {
-                return Err(format!("wait failed: {err}"));
+                return Err(BoundedCommandFailure {
+                    message: format!("wait failed: {err}"),
+                    transient_io: is_transient_io_error(&err),
+                });
             }
         }
     }
@@ -2167,7 +2304,13 @@ fn smoke_test_binary_version(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    run_bounded_command(&mut cmd, VERSION_SMOKE_TIMEOUT).map_err(ReleaseSyncError::SmokeTestFailed)
+    run_bounded_command(&mut cmd, VERSION_SMOKE_TIMEOUT).map_err(|failure| {
+        if failure.transient_io {
+            ReleaseSyncError::TransientIo(failure.message)
+        } else {
+            ReleaseSyncError::SmokeTestFailed(failure.message)
+        }
+    })
 }
 
 /// Preserves `<bin_dir>/<binary>.prev` via an APFS hard-link + atomic rename
@@ -5681,11 +5824,43 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let err_msg = run_bounded_command(&mut fail_cmd, Duration::from_secs(5)).unwrap_err();
+        let err_msg = run_bounded_command(&mut fail_cmd, Duration::from_secs(5))
+            .unwrap_err()
+            .message;
         assert!(
             err_msg.contains("synthetic-r2-auth-error"),
             "got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn bounded_command_handles_reader_thread_spawn_eagain_without_panicking_and_reaps_child() {
+        for slot_idx in [0usize, 1usize] {
+            TEST_INJECTED_BOUNDED_CMD_THREAD_ERRNO
+                .with(|c| c.set(Some((slot_idx, rustix::io::Errno::AGAIN.raw_os_error()))));
+            let mut cmd = Command::new("/bin/sleep");
+            cmd.arg("10")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let started = Instant::now();
+            let failure = run_bounded_command(&mut cmd, Duration::from_secs(5))
+                .expect_err("injected EAGAIN on reader thread spawn must fail cleanly");
+            assert!(
+                failure.transient_io,
+                "EAGAIN thread creation failure must be marked transient_io: {}",
+                failure.message
+            );
+            assert!(
+                failure.message.contains("reader thread spawn failed"),
+                "unexpected failure message for slot {slot_idx}: {}",
+                failure.message
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "spawned sleep child must be killed and reaped promptly on thread spawn failure"
+            );
+        }
     }
 
     #[test]
@@ -5701,7 +5876,8 @@ mod tests {
             .stderr(Stdio::piped());
         let started = Instant::now();
         let err = run_bounded_command(&mut leak_cmd, Duration::from_millis(250))
-            .expect_err("descendant holding pipe past deadline must time out");
+            .expect_err("descendant holding pipe past deadline must time out")
+            .message;
         let elapsed = started.elapsed();
         assert!(
             err.contains("timed out"),
@@ -7396,6 +7572,112 @@ mod tests {
         assert!(
             !classify_stage_openat_errno("stage create failed", rustix::io::Errno::ACCESS)
                 .is_transient_retryable()
+        );
+    }
+
+    #[test]
+    fn release_publish_wrapper_selects_cargo_compiler_artifact_executable_under_explicit_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path().join("home");
+        let fake_bin_dir = fake_home.join(".local/bin");
+        fs::create_dir_all(&fake_bin_dir).unwrap();
+
+        let captured_args = tmp.path().join("captured-chinwag-args.txt");
+        let stub_chinwag = fake_bin_dir.join("chinwag");
+        fs::write(
+            &stub_chinwag,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                captured_args.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub_chinwag, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mini_repo = tmp.path().join("mini-repo");
+        fs::create_dir_all(mini_repo.join("src")).unwrap();
+        fs::write(
+            mini_repo.join("Cargo.toml"),
+            "[package]\nname = \"mini-release-wrapper-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"chinwag-ci\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        fs::write(
+            mini_repo.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"mini-release-wrapper-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            mini_repo.join("src/main.rs"),
+            "fn main() { println!(\"chinwag-ci 0.1.0\"); }\n",
+        )
+        .unwrap();
+
+        let target_dir = tmp.path().join("target-out");
+        let stale_default_dir = target_dir.join("release");
+        fs::create_dir_all(&stale_default_dir).unwrap();
+        let stale_decoy = stale_default_dir.join("chinwag-ci");
+        fs::write(&stale_decoy, b"stale-decoy-bytes").unwrap();
+        fs::set_permissions(&stale_decoy, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let wrapper_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("scripts/chinwag-release-publish");
+        let host_triple = CURRENT_TARGET_TRIPLE;
+
+        let mut cmd = Command::new("/bin/bash");
+        cmd.arg(&wrapper_script)
+            .args([
+                "--binary",
+                "chinwag-ci",
+                "--repo",
+                mini_repo.to_str().unwrap(),
+            ])
+            .env("HOME", &fake_home)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .env("CARGO_BUILD_TARGET", host_triple);
+        if let Some(real_home) = std::env::var_os("HOME") {
+            let real_home = PathBuf::from(real_home);
+            if std::env::var_os("RUSTUP_HOME").is_none() {
+                cmd.env("RUSTUP_HOME", real_home.join(".rustup"));
+            }
+            if std::env::var_os("CARGO_HOME").is_none() {
+                cmd.env("CARGO_HOME", real_home.join(".cargo"));
+            }
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "wrapper failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let args_lines: Vec<String> = fs::read_to_string(&captured_args)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let source_idx = args_lines
+            .iter()
+            .position(|a| a == "--source")
+            .expect("--source argument must be passed to chinwag release publish");
+        let selected_source = PathBuf::from(&args_lines[source_idx + 1]);
+        let expected_target_exe = target_dir
+            .join(host_triple)
+            .join("release")
+            .join("chinwag-ci");
+        assert_eq!(
+            fs::canonicalize(&selected_source).unwrap(),
+            fs::canonicalize(&expected_target_exe).unwrap(),
+            "wrapper must select Cargo's target-qualified executable instead of stale default release/chinwag-ci"
+        );
+        assert_ne!(
+            fs::read(&selected_source).unwrap(),
+            b"stale-decoy-bytes",
+            "must never select stale decoy bytes"
         );
     }
 }
