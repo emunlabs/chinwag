@@ -1,0 +1,24 @@
+[package]
+name = "chinwag-acu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Chinwag Access Control Unit (ACU) pairing-based encryption with dynamic policy evolution (derived from ePrint 2026/1141) over BLS12-381 + Ed25519 for CISO fat-client iroh P2P share issuance, Zero-Plaintext-At-Rest inboxes, CI/CD root-cause payload encryption, instant revocation, and Shadow-KV warm forks."
+
+[dependencies]
+bls12_381 = { version = "=0.8.0", features = ["zeroize"] }
+chacha20poly1305.workspace = true
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["alloc", "fast", "zeroize"] }
+ff = "=0.13.1"
+group = "=0.13.0"
+hkdf = "=0.12.4"
+pairing = "=0.23.0"
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "1"
+sha2.workspace = true
+subtle = "=2.6.1"
+thiserror.workspace = true
+zeroize.workspace = true
