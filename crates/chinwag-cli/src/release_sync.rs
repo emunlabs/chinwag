@@ -703,7 +703,7 @@ fn csprng_hex_16() -> Result<String, ReleaseSyncError> {
     let mut bytes = [0u8; 8];
     OsRng
         .try_fill_bytes(&mut bytes)
-        .map_err(|_| ReleaseSyncError::InstallFailed("os_csprng_unavailable".into()))?;
+        .map_err(|e| ReleaseSyncError::TransientIo(format!("os_csprng_unavailable: {e}")))?;
     Ok(encode_hex(&bytes))
 }
 
@@ -787,6 +787,25 @@ fn classify_install_io_error(context: &str, err: &std::io::Error) -> ReleaseSync
         ReleaseSyncError::TransientIo(msg)
     } else {
         ReleaseSyncError::InstallFailed(msg)
+    }
+}
+
+fn classify_stage_openat_errno(context: &str, err: rustix::io::Errno) -> ReleaseSyncError {
+    if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK {
+        ReleaseSyncError::SafePathViolation("symlink_open_refused")
+    } else if is_transient_errno(err) {
+        ReleaseSyncError::TransientIo(format!("{context}: {err}"))
+    } else {
+        ReleaseSyncError::InstallFailed(format!("{context}: {err}"))
+    }
+}
+
+fn classify_smoke_spawn_io(context: &str, err: &std::io::Error) -> ReleaseSyncError {
+    let msg = format!("{context}: {err}");
+    if is_transient_io_error(err) {
+        ReleaseSyncError::TransientIo(msg)
+    } else {
+        ReleaseSyncError::SmokeTestFailed(msg)
     }
 }
 
@@ -905,6 +924,24 @@ pub fn compute_blake3_bytes(data: &[u8]) -> [u8; 32] {
 pub fn local_binary_sha256(path: &Path) -> Option<[u8; 32]> {
     let (_, sha256, _) = compute_file_digests(path).ok()?;
     Some(sha256)
+}
+
+fn check_installed_binary_matches(
+    install_path: &Path,
+    expected_size: u64,
+    expected_sha256: &[u8; 32],
+    expected_blake3: &[u8; 32],
+) -> Result<bool, ReleaseSyncError> {
+    match compute_file_digests(install_path) {
+        Ok((sz, sha, b3)) => Ok(sz == expected_size
+            && bool::from(sha.ct_eq(expected_sha256))
+            && bool::from(b3.ct_eq(expected_blake3))),
+        Err(ReleaseSyncError::TransientIo(msg)) => Err(ReleaseSyncError::TransientIo(msg)),
+        Err(ReleaseSyncError::SafePathViolation(reason)) => {
+            Err(ReleaseSyncError::SafePathViolation(reason))
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 /// Used solely to locate host `wrangler` CLI (which on Homebrew is a symlink
@@ -1110,6 +1147,35 @@ pub fn load_release_sync_state(home_dir: &Path) -> Result<ReleaseSyncStateV1, Re
 std::thread_local! {
     static TEST_INJECTED_SAVE_STATE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static TEST_INJECTED_PREPARE_REEXEC_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static TEST_INJECTED_SUBSCRIBER_STAGE_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+fn create_staged_file_at(
+    dir_fd: &File,
+    entry_name: &str,
+    raw_mode: rustix::fs::RawMode,
+    context: &str,
+    allow_subscriber_test_inject: bool,
+) -> Result<File, ReleaseSyncError> {
+    #[cfg(test)]
+    if allow_subscriber_test_inject
+        && let Some(raw_errno) = TEST_INJECTED_SUBSCRIBER_STAGE_ERRNO.with(|c| c.take())
+    {
+        return Err(classify_stage_openat_errno(
+            context,
+            rustix::io::Errno::from_raw_os_error(raw_errno),
+        ));
+    }
+    #[cfg(not(test))]
+    let _ = allow_subscriber_test_inject;
+    let fd = rustix::fs::openat(
+        dir_fd,
+        entry_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(raw_mode),
+    )
+    .map_err(|err| classify_stage_openat_errno(context, err))?;
+    Ok(File::from(fd))
 }
 
 pub fn save_release_sync_state(
@@ -1285,6 +1351,7 @@ fn run_bounded_command(cmd: &mut Command, deadline: Duration) -> Result<(), Stri
 struct BoundedOwnedSpawnFailure {
     message: String,
     process_group_quiesced: bool,
+    transient_io: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1297,24 +1364,60 @@ fn run_bounded_owned_spawn(
     use chinwag_host_process::owned_spawn::Exit;
 
     let child_pid = child.pid();
-    let stdout_rx = stdout_reader.map(|mut out_pipe| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut out_pipe, &mut std::io::sink());
-            let _ = tx.send(());
-        });
-        rx
-    });
-    let stderr_rx = stderr_reader.map(|mut err_pipe| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let mut preview = Vec::with_capacity(512);
-            let _ = (&mut err_pipe).take(512).read_to_end(&mut preview);
-            let _ = std::io::copy(&mut err_pipe, &mut std::io::sink());
-            let _ = tx.send(preview);
-        });
-        rx
-    });
+    let stdout_rx = match stdout_reader {
+        Some(mut out_pipe) => {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            if let Err(err) = std::thread::Builder::new().spawn(move || {
+                let _ = std::io::copy(&mut out_pipe, &mut std::io::sink());
+                let _ = tx.send(());
+            }) {
+                kill_process_group_best_effort(child_pid);
+                let mut reaped = false;
+                for _ in 0..50 {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        reaped = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return Err(BoundedOwnedSpawnFailure {
+                    message: format!("stdout reader thread spawn failed: {err}"),
+                    process_group_quiesced: reaped,
+                    transient_io: is_transient_io_error(&err),
+                });
+            }
+            Some(rx)
+        }
+        None => None,
+    };
+    let stderr_rx = match stderr_reader {
+        Some(mut err_pipe) => {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            if let Err(err) = std::thread::Builder::new().spawn(move || {
+                let mut preview = Vec::with_capacity(512);
+                let _ = (&mut err_pipe).take(512).read_to_end(&mut preview);
+                let _ = std::io::copy(&mut err_pipe, &mut std::io::sink());
+                let _ = tx.send(preview);
+            }) {
+                kill_process_group_best_effort(child_pid);
+                let mut reaped = false;
+                for _ in 0..50 {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        reaped = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return Err(BoundedOwnedSpawnFailure {
+                    message: format!("stderr reader thread spawn failed: {err}"),
+                    process_group_quiesced: reaped,
+                    transient_io: is_transient_io_error(&err),
+                });
+            }
+            Some(rx)
+        }
+        None => None,
+    };
 
     let started = Instant::now();
     loop {
@@ -1334,6 +1437,7 @@ fn run_bounded_owned_spawn(
                                 deadline.as_millis()
                             ),
                             process_group_quiesced: stdout_eof && stderr_eof,
+                            transient_io: false,
                         });
                     }
                 }
@@ -1350,6 +1454,7 @@ fn run_bounded_owned_spawn(
                                     deadline.as_millis()
                                 ),
                                 process_group_quiesced: stderr_eof,
+                                transient_io: false,
                             });
                         }
                     }
@@ -1371,6 +1476,7 @@ fn run_bounded_owned_spawn(
                         format!("{status_desc}: {snippet}")
                     },
                     process_group_quiesced: true,
+                    transient_io: false,
                 });
             }
             Ok(None) => {
@@ -1396,6 +1502,7 @@ fn run_bounded_owned_spawn(
                     return Err(BoundedOwnedSpawnFailure {
                         message: format!("timed out after {}ms", deadline.as_millis()),
                         process_group_quiesced: child_reaped && stdout_eof && stderr_eof,
+                        transient_io: false,
                     });
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -1405,6 +1512,7 @@ fn run_bounded_owned_spawn(
                 return Err(BoundedOwnedSpawnFailure {
                     message: format!("wait failed: {err}"),
                     process_group_quiesced: false,
+                    transient_io: is_transient_io_error(&err),
                 });
             }
         }
@@ -1463,8 +1571,13 @@ fn spawn_tool_in_dir(
     )
     .map_err(|e| classify_tool_spawn_io("spawn_at failed", &e))?;
     drop(stderr_writer);
-    run_bounded_owned_spawn(child, None, Some(stderr_reader), deadline)
-        .map_err(|e| ToolRunError::Failed(e.message))
+    run_bounded_owned_spawn(child, None, Some(stderr_reader), deadline).map_err(|e| {
+        if e.transient_io {
+            ToolRunError::TransientIo(e.message)
+        } else {
+            ToolRunError::Failed(e.message)
+        }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1853,20 +1966,8 @@ pub fn prepare_immutable_reexec_binary(
             ));
         }
 
-        let dst_fd = rustix::fs::openat(
-            &dir_fd,
-            "chinwag",
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )
-        .map_err(|e| {
-            if is_transient_errno(e) {
-                ReleaseSyncError::TransientIo(format!("reexec stage create: {e}"))
-            } else {
-                ReleaseSyncError::InstallFailed(format!("reexec stage create: {e}"))
-            }
-        })?;
-        let mut dst = File::from(dst_fd);
+        let mut dst =
+            create_staged_file_at(&dir_fd, "chinwag", 0o600, "reexec stage create", false)?;
         std::io::copy(&mut src, &mut dst)
             .map_err(|e| classify_state_io_error("reexec stage copy", &e))?;
         dst.sync_all()
@@ -2008,12 +2109,12 @@ fn smoke_test_binary_version(
         CString::new("PATH=/usr/bin:/bin").unwrap(),
         CString::new("LC_ALL=C").unwrap(),
     ];
-    let dev_null = File::open("/dev/null")
-        .map_err(|e| ReleaseSyncError::SmokeTestFailed(format!("open /dev/null: {e}")))?;
+    let dev_null =
+        File::open("/dev/null").map_err(|e| classify_smoke_spawn_io("open /dev/null", &e))?;
     let (stdout_reader, stdout_writer) =
-        std::io::pipe().map_err(|e| ReleaseSyncError::SmokeTestFailed(format!("pipe: {e}")))?;
+        std::io::pipe().map_err(|e| classify_smoke_spawn_io("pipe", &e))?;
     let (stderr_reader, stderr_writer) =
-        std::io::pipe().map_err(|e| ReleaseSyncError::SmokeTestFailed(format!("pipe: {e}")))?;
+        std::io::pipe().map_err(|e| classify_smoke_spawn_io("pipe", &e))?;
     // Anchor execution directly to `op_dir_fd` via child-only `fchdir` + `./<binary_name>`
     // while preserving exact `argv[0]` basename (`chinwag` / `chinwag-ci`).
     let child = spawn_relative_in_dir(
@@ -2029,7 +2130,7 @@ fn smoke_test_binary_version(
         },
         true,
     )
-    .map_err(|e| ReleaseSyncError::SmokeTestFailed(format!("spawn failed: {e}")))?;
+    .map_err(|e| classify_smoke_spawn_io("spawn failed", &e))?;
     drop(stdout_writer);
     drop(stderr_writer);
     run_bounded_owned_spawn(
@@ -2042,7 +2143,11 @@ fn smoke_test_binary_version(
         if !failure.process_group_quiesced {
             op_guard.quarantine();
         }
-        ReleaseSyncError::SmokeTestFailed(failure.message)
+        if failure.transient_io {
+            ReleaseSyncError::TransientIo(failure.message)
+        } else {
+            ReleaseSyncError::SmokeTestFailed(failure.message)
+        }
     })
 }
 
@@ -2084,22 +2189,63 @@ fn atomic_install_staged_binary(
     }
 
     let install_path = bin_dir.join(binary);
-    if let Ok(meta) = fs::symlink_metadata(&install_path)
-        && meta.file_type().is_symlink()
-    {
-        return Err(ReleaseSyncError::SafePathViolation(
-            "install_target_symlink",
-        ));
-    }
+    let has_existing_target =
+        match rustix::fs::statat(&bin_dir_fd, binary, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                let ft = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+                if ft.is_symlink() || !ft.is_file() {
+                    return Err(ReleaseSyncError::SafePathViolation(
+                        "install_target_symlink",
+                    ));
+                }
+                true
+            }
+            Err(rustix::io::Errno::NOENT) => false,
+            Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
+                return Err(ReleaseSyncError::SafePathViolation(
+                    "install_target_symlink",
+                ));
+            }
+            Err(err) if is_transient_errno(err) => {
+                return Err(ReleaseSyncError::TransientIo(format!(
+                    "stat install target: {err}"
+                )));
+            }
+            Err(err) => {
+                return Err(ReleaseSyncError::InstallFailed(format!(
+                    "stat install target: {err}"
+                )));
+            }
+        };
 
-    let previous_backup = if fs::symlink_metadata(&install_path)
-        .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink())
-    {
-        let prev_path = bin_dir.join(format!("{binary}.prev"));
-        if let Ok(meta) = fs::symlink_metadata(&prev_path)
-            && meta.file_type().is_symlink()
-        {
-            return Err(ReleaseSyncError::SafePathViolation("prev_target_symlink"));
+    let previous_backup = if has_existing_target {
+        let prev_name = format!("{binary}.prev");
+        let prev_path = bin_dir.join(&prev_name);
+        match rustix::fs::statat(
+            &bin_dir_fd,
+            &prev_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => {
+                let ft = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+                if ft.is_symlink() || !ft.is_file() {
+                    return Err(ReleaseSyncError::SafePathViolation("prev_target_symlink"));
+                }
+            }
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(err) if err == rustix::io::Errno::LOOP || err == rustix::io::Errno::MLINK => {
+                return Err(ReleaseSyncError::SafePathViolation("prev_target_symlink"));
+            }
+            Err(err) if is_transient_errno(err) => {
+                return Err(ReleaseSyncError::TransientIo(format!(
+                    "stat backup target: {err}"
+                )));
+            }
+            Err(err) => {
+                return Err(ReleaseSyncError::InstallFailed(format!(
+                    "stat backup target: {err}"
+                )));
+            }
         }
         let nonce = csprng_hex_16()?;
         let prev_tmp_name = format!(".{binary}.prev.tmp.{}.{nonce}", std::process::id());
@@ -2113,20 +2259,8 @@ fn atomic_install_staged_binary(
         .is_err()
         {
             let (mut cur_src, _) = open_regular_at_dir_nofollow(&bin_dir_fd, binary, false, true)?;
-            let prev_fd = rustix::fs::openat(
-                &bin_dir_fd,
-                &prev_tmp_name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o755),
-            )
-            .map_err(|err| {
-                if is_transient_errno(err) {
-                    ReleaseSyncError::TransientIo(format!("backup openat: {err}"))
-                } else {
-                    ReleaseSyncError::InstallFailed(format!("backup openat: {err}"))
-                }
-            })?;
-            let mut prev_file = File::from(prev_fd);
+            let mut prev_file =
+                create_staged_file_at(&bin_dir_fd, &prev_tmp_name, 0o755, "backup openat", false)?;
             std::io::copy(&mut cur_src, &mut prev_file)
                 .map_err(|e| classify_install_io_error("backup copy", &e))?;
             prev_file
@@ -2136,12 +2270,8 @@ fn atomic_install_staged_binary(
                 .sync_all()
                 .map_err(|e| classify_install_io_error("backup sync", &e))?;
         }
-        if let Err(err) = rustix::fs::renameat(
-            &bin_dir_fd,
-            &prev_tmp_name,
-            &bin_dir_fd,
-            format!("{binary}.prev"),
-        ) {
+        if let Err(err) = rustix::fs::renameat(&bin_dir_fd, &prev_tmp_name, &bin_dir_fd, &prev_name)
+        {
             let _ = rustix::fs::unlinkat(&bin_dir_fd, &prev_tmp_name, rustix::fs::AtFlags::empty());
             if is_transient_errno(err) {
                 return Err(ReleaseSyncError::TransientIo(format!(
@@ -2234,22 +2364,36 @@ fn load_verified_seat_signing_key(
         return Err(ReleaseSyncError::SigningIdentityUnavailable("invalid_seat"));
     }
     let signing_dir = home_dir.join(".chinwag").join("signing");
-    let dir_meta = fs::symlink_metadata(&signing_dir)
-        .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("signing_dir_missing"))?;
+    let dir_meta = fs::symlink_metadata(&signing_dir).map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("signing_dir stat: {err}"))
+        } else {
+            ReleaseSyncError::SigningIdentityUnavailable("signing_dir_missing")
+        }
+    })?;
     if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
         return Err(ReleaseSyncError::SafePathViolation("signing_dir_symlink"));
     }
     let key_path = signing_dir.join(format!("{slug}_ed25519"));
-    if fs::symlink_metadata(&key_path).is_err() {
-        return Err(ReleaseSyncError::SigningIdentityUnavailable(
-            "key_file_missing",
-        ));
+    match fs::symlink_metadata(&key_path) {
+        Ok(_) => {}
+        Err(err) if is_transient_io_error(&err) => {
+            return Err(ReleaseSyncError::TransientIo(format!(
+                "signing_key stat: {err}"
+            )));
+        }
+        Err(_) => {
+            return Err(ReleaseSyncError::SigningIdentityUnavailable(
+                "key_file_missing",
+            ));
+        }
     }
     let (_pinned_key_file, key_fstat) =
         open_regular_file_nofollow(&key_path, true, true).map_err(|err| match err {
             ReleaseSyncError::SafePathViolation(_) => {
                 ReleaseSyncError::SafePathViolation("signing_key_symlink")
             }
+            ReleaseSyncError::TransientIo(msg) => ReleaseSyncError::TransientIo(msg),
             _ => ReleaseSyncError::SigningIdentityUnavailable("key_file_missing"),
         })?;
     if (key_fstat.permissions().mode() & 0o077) != 0 {
@@ -2259,8 +2403,13 @@ fn load_verified_seat_signing_key(
     }
     let identity = Identity::from_ssh_signing_file(&key_path)
         .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("invalid_openssh_key"))?;
-    let post_meta = fs::symlink_metadata(&key_path)
-        .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("key_file_missing"))?;
+    let post_meta = fs::symlink_metadata(&key_path).map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("signing_key post-stat: {err}"))
+        } else {
+            ReleaseSyncError::SigningIdentityUnavailable("key_file_missing")
+        }
+    })?;
     if post_meta.file_type().is_symlink()
         || (post_meta.dev(), post_meta.ino()) != (key_fstat.dev(), key_fstat.ino())
     {
@@ -2567,11 +2716,12 @@ fn apply_release_built_message_inner(
     // and already-installed publisher/peer binaries short-circuit in 0ms without R2 I/O.
     {
         let _lock = acquire_release_sync_lock(home_dir)?;
-        let local_matches = compute_file_digests(&install_path).is_ok_and(|(sz, sha, b3)| {
-            sz == manifest.size_bytes
-                && bool::from(sha.ct_eq(&expected_sha256))
-                && bool::from(b3.ct_eq(&expected_blake3))
-        });
+        let local_matches = check_installed_binary_matches(
+            &install_path,
+            manifest.size_bytes,
+            &expected_sha256,
+            &expected_blake3,
+        )?;
         let mut sync_state = load_release_sync_state(home_dir)?;
         let was_recorded = sync_state
             .binaries
@@ -2623,23 +2773,23 @@ fn apply_release_built_message_inner(
 
     let nonce = csprng_hex_16()?;
     let op_dir = staging_dir.join(format!("op.{}.{nonce}", std::process::id()));
-    fs::create_dir(&op_dir)
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("op_dir create failed: {e}")))?;
-    fs::set_permissions(&op_dir, fs::Permissions::from_mode(0o700))
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("op_dir chmod failed: {e}")))?;
+    fs::create_dir(&op_dir).map_err(|e| classify_install_io_error("op_dir create failed", &e))?;
     let staged_path = op_dir.join(&manifest.binary);
     let mut op_guard = StagedOpGuard::new(op_dir.clone(), &manifest.binary);
 
     let (op_dir_fd, op_dir_id) = open_dir_nofollow(&op_dir)?;
     op_guard.bind_dir_fd(&op_dir_fd, op_dir_id);
-    let pre_created_fd = rustix::fs::openat(
+    op_dir_fd
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|e| classify_install_io_error("op_dir chmod failed", &e))?;
+    let pre_created = create_staged_file_at(
         &op_dir_fd,
         manifest.binary.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )
-    .map_err(|e| ReleaseSyncError::InstallFailed(format!("stage create failed: {e}")))?;
-    drop(File::from(pre_created_fd));
+        0o600,
+        "stage create failed",
+        true,
+    )?;
+    drop(pre_created);
 
     store.download_artifact(&manifest.artifact_key, &staged_path)?;
     let (mut staged_file, staged_fstat) =
@@ -2649,7 +2799,7 @@ fn apply_release_built_message_inner(
     // BEFORE computing and comparing digests in constant time (`INV-HASH-BEFORE-EXEC-01`).
     staged_file
         .set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|_| ReleaseSyncError::InstallFailed("chmod_0600_failed".into()))?;
+        .map_err(|e| classify_install_io_error("chmod_0600_failed", &e))?;
 
     let (actual_size, actual_sha256, actual_blake3) =
         compute_digests_from_open_file(&mut staged_file, staged_fstat.len(), staged_id)?;
@@ -2663,9 +2813,13 @@ fn apply_release_built_message_inner(
     // Verify macOS code signature strictly inside `op_dir_fd` while still non-executable (never `-f`!).
     verify_codesign_strict_in_dir(&op_dir_fd, &manifest.binary)?;
 
-    let post_codesign = staged_file
-        .metadata()
-        .map_err(|_| ReleaseSyncError::SafePathViolation("staged_stat_failed"))?;
+    let post_codesign = staged_file.metadata().map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("staged_stat_failed: {err}"))
+        } else {
+            ReleaseSyncError::SafePathViolation("staged_stat_failed")
+        }
+    })?;
     if post_codesign.nlink() != 1 || (post_codesign.dev(), post_codesign.ino()) != staged_id {
         return Err(ReleaseSyncError::SafePathViolation("staged_inode_swap"));
     }
@@ -2675,14 +2829,18 @@ fn apply_release_built_message_inner(
     // and re-verify digests on the immutable vnode before executing `--version`.
     staged_file
         .set_permissions(fs::Permissions::from_mode(0o755))
-        .map_err(|_| ReleaseSyncError::InstallFailed("chmod_0755_failed".into()))?;
+        .map_err(|e| classify_install_io_error("chmod_0755_failed", &e))?;
     drop(staged_file);
 
     set_dir_and_entry_immutable(&op_dir_fd, &manifest.binary, true)?;
 
-    let op_dir_post = op_dir_fd
-        .metadata()
-        .map_err(|_| ReleaseSyncError::SafePathViolation("op_dir_fstat_failed"))?;
+    let op_dir_post = op_dir_fd.metadata().map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("op_dir_fstat_failed: {err}"))
+        } else {
+            ReleaseSyncError::SafePathViolation("op_dir_fstat_failed")
+        }
+    })?;
     if (op_dir_post.dev(), op_dir_post.ino()) != op_dir_id {
         return Err(ReleaseSyncError::SafePathViolation("op_dir_inode_swap"));
     }
@@ -2719,8 +2877,12 @@ fn apply_release_built_message_inner(
     // concurrently by `chinwag release sync` or `chinwag release publish`.
     let (install_path, previous_backup_path) = {
         let _lock = acquire_release_sync_lock(home_dir)?;
-        let local_matches = local_binary_sha256(&install_path)
-            .is_some_and(|actual| bool::from(actual.ct_eq(&expected_sha256)));
+        let local_matches = check_installed_binary_matches(
+            &install_path,
+            manifest.size_bytes,
+            &expected_sha256,
+            &expected_blake3,
+        )?;
         let mut sync_state = load_release_sync_state(home_dir)?;
         let already_satisfied = check_monotonic_gate(
             sync_state.binaries.get(&manifest.binary),
@@ -3003,26 +3165,18 @@ fn publish_release_inner(
     let (bin_dir, staging_dir) = ensure_bin_and_staging_dirs(req.home_dir)?;
     let nonce = csprng_hex_16()?;
     let op_dir = staging_dir.join(format!("op.{}.pub.{nonce}", std::process::id()));
-    fs::create_dir(&op_dir)
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("pub op_dir create: {e}")))?;
-    fs::set_permissions(&op_dir, fs::Permissions::from_mode(0o700))
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("pub op_dir chmod: {e}")))?;
+    fs::create_dir(&op_dir).map_err(|e| classify_install_io_error("pub op_dir create", &e))?;
     let mut op_guard = StagedOpGuard::new(op_dir.clone(), req.binary);
 
     let (op_dir_fd, op_dir_id) = open_dir_nofollow(&op_dir)?;
     op_guard.bind_dir_fd(&op_dir_fd, op_dir_id);
-    let dst_fd = rustix::fs::openat(
-        &op_dir_fd,
-        req.binary,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o755),
-    )
-    .map_err(|e| ReleaseSyncError::InstallFailed(format!("stage create: {e}")))?;
-    let mut dst = File::from(dst_fd);
-    std::io::copy(&mut src, &mut dst)
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("stage copy: {e}")))?;
+    op_dir_fd
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|e| classify_install_io_error("pub op_dir chmod", &e))?;
+    let mut dst = create_staged_file_at(&op_dir_fd, req.binary, 0o755, "stage create", false)?;
+    std::io::copy(&mut src, &mut dst).map_err(|e| classify_install_io_error("stage copy", &e))?;
     dst.sync_all()
-        .map_err(|e| ReleaseSyncError::InstallFailed(format!("stage sync: {e}")))?;
+        .map_err(|e| classify_install_io_error("stage sync", &e))?;
     drop(dst);
     drop(src);
 
@@ -3033,9 +3187,13 @@ fn publish_release_inner(
 
     set_dir_and_entry_immutable(&op_dir_fd, req.binary, true)?;
 
-    let op_dir_post = op_dir_fd
-        .metadata()
-        .map_err(|_| ReleaseSyncError::SafePathViolation("pub_op_dir_fstat"))?;
+    let op_dir_post = op_dir_fd.metadata().map_err(|err| {
+        if is_transient_io_error(&err) {
+            ReleaseSyncError::TransientIo(format!("pub_op_dir_fstat: {err}"))
+        } else {
+            ReleaseSyncError::SafePathViolation("pub_op_dir_fstat")
+        }
+    })?;
     if (op_dir_post.dev(), op_dir_post.ino()) != op_dir_id {
         return Err(ReleaseSyncError::SafePathViolation("pub_op_dir_inode_swap"));
     }
@@ -7084,6 +7242,160 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn subscriber_staging_transient_openat_failure_retries_and_recovers_same_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let pub_home = temp.path().join("pub-home");
+        let sub_home = temp.path().join("sub-home");
+        let build_dir = temp.path().join("build");
+        fs::create_dir_all(&pub_home).unwrap();
+        fs::create_dir_all(&sub_home).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+
+        let infrajr_key = random_signing_key();
+        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: &seat_table,
+            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+        };
+        let store = InMemoryArtifactStore::new();
+        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let src_bin = build_macho_test_binary(&build_dir, "sub_stage_transient_retry");
+
+        let published = publish_release_inner(
+            PublishReleaseRequest {
+                home_dir: &pub_home,
+                repo_root: &build_dir,
+                binary: "chinwag",
+                source_binary_path: &src_bin,
+                explicit_from: Some(&actor_str),
+                rollback: false,
+                commit_override: Some(("4444444444444444".into(), 400)),
+            },
+            &store,
+            |_| Ok(1),
+            &roots,
+            Some(&infrajr_key),
+        )
+        .unwrap();
+
+        let journal_path = temp.path().join("messages.jsonl");
+        let mut line = serde_json::to_vec(&published.release_built_message).unwrap();
+        line.push(b'\n');
+        fs::write(&journal_path, &line).unwrap();
+
+        let scheduler = Mutex::new(ReleaseDaemonScheduler::default());
+        let t0 = Instant::now();
+
+        // 1. Inject one-shot EMFILE (`Errno::MFILE`) directly at subscriber staging `openat`:
+        //    must classify as retryable `TransientIo` (`next_retry_secs == Some(10)`) and
+        //    clean up its per-op `.staging/op.*` directory!
+        TEST_INJECTED_SUBSCRIBER_STAGE_ERRNO
+            .with(|c| c.set(Some(rustix::io::Errno::MFILE.raw_os_error())));
+        let mut now_1 = t0;
+        let ev1 = execute_release_daemon_job_inner(
+            &sub_home,
+            &journal_path,
+            &store,
+            "peer-ep-stage-retry",
+            &roots,
+            Some(&infrajr_key),
+            &scheduler,
+            ReleaseDaemonJob::LiveMessage(Box::new(published.release_built_message.clone())),
+            &mut || now_1,
+        );
+        match ev1.as_slice() {
+            [
+                ReleaseDaemonEvent::Rejected {
+                    binary,
+                    retryable,
+                    next_retry_secs,
+                    reason,
+                },
+            ] => {
+                assert_eq!(binary, "chinwag");
+                assert!(
+                    *retryable,
+                    "subscriber staging EMFILE must be retryable, got reason={reason}"
+                );
+                assert_eq!(*next_retry_secs, Some(10));
+            }
+            other => panic!("expected retryable Rejected event on staging EMFILE, got {other:?}"),
+        }
+        let leftover_ops: Vec<_> = fs::read_dir(sub_home.join(".local/bin/.staging"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(
+            leftover_ops.is_empty(),
+            "failed staging attempt must clean up op.* directory, found {leftover_ops:?}"
+        );
+
+        // Before the 10s backoff elapses, catch-up is not yet due.
+        assert!(
+            !scheduler
+                .lock()
+                .unwrap()
+                .poll_catchup_dispatch(false, t0 + Duration::from_secs(5))
+        );
+        // At t0 + 10s, scheduled retry becomes due!
+        let t_retry = t0 + Duration::from_secs(10);
+        assert!(
+            scheduler
+                .lock()
+                .unwrap()
+                .poll_catchup_dispatch(false, t_retry)
+        );
+        now_1 = t_retry;
+        let ev2 = execute_release_daemon_job_inner(
+            &sub_home,
+            &journal_path,
+            &store,
+            "peer-ep-stage-retry",
+            &roots,
+            Some(&infrajr_key),
+            &scheduler,
+            ReleaseDaemonJob::StartupCatchup,
+            &mut || now_1,
+        );
+        match ev2.as_slice() {
+            [ReleaseDaemonEvent::Applied { binary, outcome }] => {
+                assert_eq!(binary, "chinwag");
+                match outcome.as_ref() {
+                    ReleaseApplyOutcome::Installed {
+                        manifest,
+                        install_path,
+                        receipt_message,
+                        ..
+                    } => {
+                        assert_eq!(manifest.sha256, published.manifest.sha256);
+                        assert_eq!(
+                            encode_hex(&local_binary_sha256(install_path).unwrap()),
+                            published.manifest.sha256
+                        );
+                        assert!(receipt_message.is_some());
+                    }
+                    other => panic!("expected Installed on scheduled retry, got {other:?}"),
+                }
+            }
+            other => panic!("expected Applied event on scheduled retry, got {other:?}"),
+        }
+
+        // 2. Verify actual path/symlink violations at staging still fail closed terminally (`retryable == false`)!
+        assert_eq!(
+            classify_stage_openat_errno("stage create failed", rustix::io::Errno::LOOP),
+            ReleaseSyncError::SafePathViolation("symlink_open_refused")
+        );
+        assert!(
+            !classify_stage_openat_errno("stage create failed", rustix::io::Errno::LOOP)
+                .is_transient_retryable()
+        );
+        assert!(
+            !classify_stage_openat_errno("stage create failed", rustix::io::Errno::ACCESS)
+                .is_transient_retryable()
         );
     }
 }

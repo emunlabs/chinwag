@@ -1345,9 +1345,61 @@ type ReexecPrepResult = Result<
     chinwag_cli::release_sync::ReleaseSyncError,
 >;
 
+#[derive(Clone, Debug)]
+struct PendingReexecTarget {
+    install_path: PathBuf,
+    expected_sha: [u8; 32],
+    armed_at: Instant,
+    generation: u64,
+}
+
+#[derive(Default, Debug)]
+struct PendingReexecSlot {
+    current: Option<PendingReexecTarget>,
+    next_generation: u64,
+}
+
+impl PendingReexecSlot {
+    fn arm(&mut self, install_path: PathBuf, expected_sha: [u8; 32]) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.current = Some(PendingReexecTarget {
+            install_path,
+            expected_sha,
+            armed_at: Instant::now(),
+            generation,
+        });
+        generation
+    }
+
+    fn arm_if_changed(&mut self, install_path: PathBuf, expected_sha: [u8; 32]) -> bool {
+        if let Some(ref cur) = self.current
+            && cur.install_path == install_path
+            && cur.expected_sha == expected_sha
+        {
+            return false;
+        }
+        self.arm(install_path, expected_sha);
+        true
+    }
+
+    fn clear(&mut self) {
+        self.current = None;
+    }
+
+    fn is_some(&self) -> bool {
+        self.current.is_some()
+    }
+
+    fn current(&self) -> Option<&PendingReexecTarget> {
+        self.current.as_ref()
+    }
+}
+
 struct InFlightReexecPrep {
     target_path: PathBuf,
     expected_sha: [u8; 32],
+    generation: u64,
     handle: tokio::task::JoinHandle<ReexecPrepResult>,
 }
 
@@ -1356,13 +1408,19 @@ async fn poll_reexec_prep(
 ) -> (
     PathBuf,
     [u8; 32],
+    u64,
     Result<ReexecPrepResult, tokio::task::JoinError>,
 ) {
     match slot.as_mut() {
         Some(in_flight) => {
             let res = (&mut in_flight.handle).await;
             let finished = slot.take().expect("in_flight reexec prep must be present");
-            (finished.target_path, finished.expected_sha, res)
+            (
+                finished.target_path,
+                finished.expected_sha,
+                finished.generation,
+                res,
+            )
         }
         None => std::future::pending().await,
     }
@@ -1381,6 +1439,7 @@ enum ReexecPrepStepOutcome {
 fn complete_reexec_prep_step(
     prep_path: PathBuf,
     prep_sha: [u8; 32],
+    prep_generation: u64,
     prep_res: Result<ReexecPrepResult, tokio::task::JoinError>,
     stdout: &mut dyn Write,
     startup_chinwag_sha256: Option<[u8; 32]>,
@@ -1388,7 +1447,7 @@ fn complete_reexec_prep_step(
     forward_queue_empty: bool,
     release_done_rx: &tokio::sync::mpsc::Receiver<ReleaseDaemonEvent>,
     release_job_gate: &Arc<Mutex<ReleaseJobQueueGate>>,
-    pending_reexec: &mut Option<(PathBuf, [u8; 32], Instant)>,
+    pending_reexec: &mut PendingReexecSlot,
     reexec_prep_retries: &mut u32,
     backoff_fn: impl FnOnce(u32) -> Duration,
 ) -> ReexecPrepStepOutcome {
@@ -1397,28 +1456,40 @@ fn complete_reexec_prep_step(
             chinwag_cli::release_sync::cleanup_prepared_reexec(prepared);
         }));
     };
+    let cleanup_if_prepared = |res: Result<ReexecPrepResult, tokio::task::JoinError>| {
+        if let Ok(Ok(prepared)) = res {
+            cleanup_async(prepared);
+        }
+    };
+
+    // Authoritative generation + target freshness gate BEFORE any result branch
+    // can disarm `pending_reexec` or mutate `reexec_prep_retries`: if `pending_reexec`
+    // was cleared or superseded by a newer generation while this preparation ran,
+    // discard this stale completion without disturbing the active target.
+    let Some(cur) = pending_reexec.current().cloned() else {
+        cleanup_if_prepared(prep_res);
+        *reexec_prep_retries = 0;
+        return ReexecPrepStepOutcome::StayOnlineDisarmed;
+    };
+    if cur.generation != prep_generation
+        || cur.install_path != prep_path
+        || cur.expected_sha != prep_sha
+    {
+        cleanup_if_prepared(prep_res);
+        *reexec_prep_retries = 0;
+        let settle_remaining = Duration::from_millis(350).saturating_sub(cur.armed_at.elapsed());
+        return ReexecPrepStepOutcome::RescheduleTimer(
+            settle_remaining.max(Duration::from_millis(50)),
+        );
+    }
 
     match prep_res {
         Ok(Ok(prepared)) => {
             if Some(prepared.sha256) == startup_chinwag_sha256 {
                 cleanup_async(prepared);
-                *pending_reexec = None;
+                pending_reexec.clear();
                 *reexec_prep_retries = 0;
                 return ReexecPrepStepOutcome::StayOnlineDisarmed;
-            }
-            let Some((cur_path, cur_sha, cur_armed_at)) = pending_reexec.clone() else {
-                cleanup_async(prepared);
-                *reexec_prep_retries = 0;
-                return ReexecPrepStepOutcome::StayOnlineDisarmed;
-            };
-            if cur_path != prep_path || cur_sha != prep_sha {
-                cleanup_async(prepared);
-                *reexec_prep_retries = 0;
-                let settle_remaining =
-                    Duration::from_millis(350).saturating_sub(cur_armed_at.elapsed());
-                return ReexecPrepStepOutcome::RescheduleTimer(
-                    settle_remaining.max(Duration::from_millis(50)),
-                );
             }
             // Linearizable quiescence + freeze: evaluate `active_jobs == 0` AND
             // `release_done_rx.is_empty()` while holding `release_job_gate` so no worker
@@ -1429,7 +1500,7 @@ fn complete_reexec_prep_step(
                 forwards_empty,
                 forward_queue_empty,
                 worker_idle,
-                cur_armed_at.elapsed(),
+                cur.armed_at.elapsed(),
             ) {
                 drop(gate_guard);
                 cleanup_async(prepared);
@@ -1474,7 +1545,7 @@ fn complete_reexec_prep_step(
                 })
             );
             let _ = stdout.flush();
-            *pending_reexec = None;
+            pending_reexec.clear();
             *reexec_prep_retries = 0;
             ReexecPrepStepOutcome::StayOnlineDisarmed
         }
@@ -1489,7 +1560,7 @@ fn complete_reexec_prep_step(
                 })
             );
             let _ = stdout.flush();
-            *pending_reexec = None;
+            pending_reexec.clear();
             *reexec_prep_retries = 0;
             ReexecPrepStepOutcome::StayOnlineDisarmed
         }
@@ -1540,7 +1611,7 @@ fn process_release_daemon_event(
     state: &Mutex<DaemonState>,
     startup_chinwag_sha256: Option<[u8; 32]>,
     tearing_down_for_reexec: bool,
-    pending_reexec: &mut Option<(PathBuf, [u8; 32], Instant)>,
+    pending_reexec: &mut PendingReexecSlot,
 ) -> bool {
     match release_event {
         ReleaseDaemonEvent::Applied { binary, outcome } => match *outcome {
@@ -1581,12 +1652,12 @@ fn process_release_daemon_event(
                         chinwag_cli::release_sync::decode_lowercase_hex_32(&manifest.sha256)
                 {
                     if Some(manifest_sha) != startup_chinwag_sha256 || tearing_down_for_reexec {
-                        *pending_reexec = Some((install_path, manifest_sha, Instant::now()));
+                        pending_reexec.arm(install_path, manifest_sha);
                         return true;
                     }
                     // Rollback back to the running process's own startup digest while still
                     // in the live loop disarms any stale prior `pending_reexec` target.
-                    *pending_reexec = None;
+                    pending_reexec.clear();
                 }
                 false
             }
@@ -1634,13 +1705,11 @@ fn process_release_daemon_event(
                                 let _ = write_daemon_state(repo_root, &guard);
                             }
                         }
-                        *pending_reexec = Some((install_path, manifest_sha, Instant::now()));
-                        return true;
+                        return pending_reexec.arm_if_changed(install_path, manifest_sha);
                     } else if tearing_down_for_reexec {
-                        *pending_reexec = Some((install_path, manifest_sha, Instant::now()));
-                        return true;
+                        return pending_reexec.arm_if_changed(install_path, manifest_sha);
                     } else {
-                        *pending_reexec = None;
+                        pending_reexec.clear();
                     }
                 }
                 false
@@ -2213,7 +2282,7 @@ async fn run_daemon_loop_reexecable(
     let mut reexec_prep_task: Option<InFlightReexecPrep> = None;
     let mut reexec_prep_retries: u32 = 0;
     let mut reexec_requested = false;
-    let mut pending_reexec: Option<(PathBuf, [u8; 32], Instant)> = None;
+    let mut pending_reexec = PendingReexecSlot::default();
     let reexec_sleep = tokio::time::sleep(Duration::from_secs(86_400));
     tokio::pin!(reexec_sleep);
     let startup_chinwag_sha256: Option<[u8; 32]> = std::env::current_exe()
@@ -2399,7 +2468,7 @@ async fn run_daemon_loop_reexecable(
                 }
             }
             () = &mut reexec_sleep, if pending_reexec.is_some() && reexec_prep_task.is_none() => {
-                if let Some((target_path, expected_sha, armed_at)) = pending_reexec.clone() {
+                if let Some(cur) = pending_reexec.current().cloned() {
                     let release_worker_idle = {
                         let guard = release_job_gate.lock().unwrap_or_else(|e| e.into_inner());
                         guard.active_jobs == 0 && release_done_rx.is_empty()
@@ -2408,13 +2477,14 @@ async fn run_daemon_loop_reexecable(
                         forwards.is_empty(),
                         forward_rx.is_empty(),
                         release_worker_idle,
-                        armed_at.elapsed(),
+                        cur.armed_at.elapsed(),
                     ) {
                         // Launch immutable snapshot preparation asynchronously in `spawn_blocking`
                         // and select on `reexec_prep_task` completion so the live daemon's owner
                         // loop NEVER suspends polling new connections, heartbeat, shutdown, or
                         // room presence while preparing or checking `release_sync.lock`.
-                        let target_for_prep = target_path.clone();
+                        let target_for_prep = cur.install_path.clone();
+                        let expected_sha = cur.expected_sha;
                         let handle = tokio::task::spawn_blocking(move || {
                             let home_dir = chinwag_cli::release_sync::resolve_home_dir()?;
                             chinwag_cli::release_sync::prepare_immutable_reexec_binary(
@@ -2424,8 +2494,9 @@ async fn run_daemon_loop_reexecable(
                             )
                         });
                         reexec_prep_task = Some(InFlightReexecPrep {
-                            target_path,
+                            target_path: cur.install_path,
                             expected_sha,
+                            generation: cur.generation,
                             handle,
                         });
                     } else {
@@ -2435,10 +2506,11 @@ async fn run_daemon_loop_reexecable(
                     }
                 }
             }
-            (prep_path, prep_sha, prep_res) = poll_reexec_prep(&mut reexec_prep_task), if reexec_prep_task.is_some() => {
+            (prep_path, prep_sha, prep_generation, prep_res) = poll_reexec_prep(&mut reexec_prep_task), if reexec_prep_task.is_some() => {
                 match complete_reexec_prep_step(
                     prep_path,
                     prep_sha,
+                    prep_generation,
                     prep_res,
                     stdout,
                     startup_chinwag_sha256,
@@ -5949,7 +6021,7 @@ mod tests {
                 }
             }));
 
-            let mut pending_reexec: Option<(PathBuf, [u8; 32], Instant)> = None;
+            let mut pending_reexec = PendingReexecSlot::default();
             let repo_dir = temp.path().join("repo");
             fs::create_dir_all(repo_dir.join(".chinwag/bus")).unwrap();
             let (bcast_tx, _) = broadcast::channel::<BusMessage>(16);
@@ -5988,7 +6060,7 @@ mod tests {
                 false,
                 &mut pending_reexec,
             ));
-            assert_eq!(pending_reexec.as_ref().unwrap().1, sha_a);
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_a);
 
             // Wait until release B is actively inside `spawn_blocking` and 360ms (> 350ms) has elapsed.
             b_entered_blocking.notified().await;
@@ -6041,7 +6113,8 @@ mod tests {
             let mut rollback_manifest =
                 make_manifest(&sha_startup_hex, 50, 1_700_000_300, &bin_startup);
             rollback_manifest.rollback = true;
-            let mut live_pending = Some((install_path.clone(), sha_a, Instant::now()));
+            let mut live_pending = PendingReexecSlot::default();
+            live_pending.arm(install_path.clone(), sha_a);
             assert!(!process_release_daemon_event(
                 ReleaseDaemonEvent::Applied {
                     binary: "chinwag".to_owned(),
@@ -6065,10 +6138,11 @@ mod tests {
                 &mut live_pending,
             ));
             assert!(
-                live_pending.is_none(),
+                !live_pending.is_some(),
                 "rollback to startup digest in live loop must disarm stale pending_reexec"
             );
-            let mut teardown_pending = Some((install_path.clone(), sha_a, Instant::now()));
+            let mut teardown_pending = PendingReexecSlot::default();
+            teardown_pending.arm(install_path.clone(), sha_a);
             assert!(process_release_daemon_event(
                 ReleaseDaemonEvent::Applied {
                     binary: "chinwag".to_owned(),
@@ -6091,10 +6165,10 @@ mod tests {
                 true,
                 &mut teardown_pending,
             ));
-            assert_eq!(teardown_pending.unwrap().1, sha_startup);
+            assert_eq!(teardown_pending.current().unwrap().expected_sha, sha_startup);
 
-            let (path, sha, _) = pending_reexec.take().unwrap();
-            (path, sha)
+            let selected = pending_reexec.current().cloned().unwrap();
+            (selected.install_path, selected.expected_sha)
         });
         drop(rt);
 
@@ -6237,8 +6311,8 @@ mod tests {
                 }
             });
 
-            let mut pending_reexec: Option<(PathBuf, [u8; 32], Instant)> =
-                Some((install_path.clone(), sha_a, Instant::now()));
+            let mut pending_reexec = PendingReexecSlot::default();
+            pending_reexec.arm(install_path.clone(), sha_a);
             let mut reexec_prep_task: Option<InFlightReexecPrep> = None;
             let mut reexec_prep_retries = 0u32;
             let mut sink = Vec::new();
@@ -6299,7 +6373,7 @@ mod tests {
                         }
                     }
                     () = &mut reexec_sleep, if pending_reexec.is_some() && reexec_prep_task.is_none() => {
-                        let (target_path, expected_sha, _) = pending_reexec.clone().unwrap();
+                        let cur = pending_reexec.current().cloned().unwrap();
                         let idle = {
                             let g = job_gate.lock().unwrap();
                             g.active_jobs == 0 && done_rx.is_empty()
@@ -6308,7 +6382,8 @@ mod tests {
                             prep_attempt += 1;
                             let attempt = prep_attempt;
                             let home_for_prep = home_dir.clone();
-                            let target_for_prep = target_path.clone();
+                            let target_for_prep = cur.install_path.clone();
+                            let expected_sha = cur.expected_sha;
                             let started_notify = prep_a_started.clone();
                             let barrier_a = release_prep_a.clone();
                             let handle = tokio::task::spawn_blocking(move || {
@@ -6335,8 +6410,9 @@ mod tests {
                                 }
                             });
                             reexec_prep_task = Some(InFlightReexecPrep {
-                                target_path,
+                                target_path: cur.install_path,
                                 expected_sha,
+                                generation: cur.generation,
                                 handle,
                             });
                         } else {
@@ -6347,10 +6423,11 @@ mod tests {
                                 .reset(tokio::time::Instant::now() + Duration::from_millis(15));
                         }
                     }
-                    (prep_path, prep_sha, prep_res) = poll_reexec_prep(&mut reexec_prep_task), if reexec_prep_task.is_some() => {
+                    (prep_path, prep_sha, prep_gen, prep_res) = poll_reexec_prep(&mut reexec_prep_task), if reexec_prep_task.is_some() => {
                         match complete_reexec_prep_step(
                             prep_path,
                             prep_sha,
+                            prep_gen,
                             prep_res,
                             &mut sink,
                             Some(sha_startup),
@@ -6495,6 +6572,286 @@ mod tests {
             .await;
             assert_eq!(calls3, 1);
             assert!(matches!(refused, ReconnectLoopOutcome::FatalRefusal(_)));
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_reexec_prep_errors_and_startup_shortcuts_never_disarm_newer_release_b() {
+        use chinwag_cli::release_sync::{
+            CURRENT_TARGET_TRIPLE, RELEASE_MANIFEST_SCHEMA, ReleaseApplyOutcome, ReleaseManifestV1,
+            ReleaseSyncError, cleanup_prepared_reexec, expected_artifact_key, local_binary_sha256,
+            prepare_immutable_reexec_binary,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let home_dir = temp.path().join("home");
+        let bin_dir = home_dir.join(".local/bin");
+        let build_dir = temp.path().join("build");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&build_dir).unwrap();
+
+        let compile_signed_macho = |label: &str| -> (PathBuf, [u8; 32], String) {
+            let src = build_dir.join(format!("{label}.c"));
+            let out = build_dir.join(format!("chinwag-{label}"));
+            fs::write(
+                &src,
+                format!("int main(void) {{ const char *v = \"{label}\"; (void)v; return 0; }}\n"),
+            )
+            .unwrap();
+            let st = std::process::Command::new("/usr/bin/clang")
+                .args(["-O2", "-o"])
+                .arg(&out)
+                .arg(&src)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let cs = std::process::Command::new("/usr/bin/codesign")
+                .args(["-s", "-", "--force"])
+                .arg(&out)
+                .status()
+                .unwrap();
+            assert!(cs.success());
+            let sha = local_binary_sha256(&out).unwrap();
+            let sha_hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+            (out, sha, sha_hex)
+        };
+
+        let (bin_startup, sha_startup, _) = compile_signed_macho("stale_startup");
+        let (bin_a, sha_a, _) = compile_signed_macho("stale_a");
+        let (bin_b, sha_b, sha_b_hex) = compile_signed_macho("stale_b");
+        let install_path = bin_dir.join("chinwag");
+        fs::copy(&bin_a, &install_path).unwrap();
+
+        let manifest_b = ReleaseManifestV1 {
+            schema: RELEASE_MANIFEST_SCHEMA.to_owned(),
+            binary: "chinwag".to_owned(),
+            target_triple: CURRENT_TARGET_TRIPLE.to_owned(),
+            git_commit: "bbbbbbbbbbbbbbbb".to_owned(),
+            commit_epoch: 200,
+            built_at_ms: 1_700_000_200,
+            sha256: sha_b_hex.clone(),
+            blake3: "bb".repeat(32),
+            size_bytes: fs::metadata(&bin_b).unwrap().len(),
+            artifact_key: expected_artifact_key("chinwag", CURRENT_TARGET_TRIPLE, &sha_b_hex),
+            rollback: false,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let repo_dir = temp.path().join("repo");
+            fs::create_dir_all(repo_dir.join(".chinwag/bus")).unwrap();
+            let (bcast_tx, _) = broadcast::channel::<BusMessage>(16);
+            let (fwd_tx, _) = tokio::sync::mpsc::channel::<BusMessage>(16);
+            let (_done_tx, done_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(8);
+            let job_gate = Arc::new(Mutex::new(ReleaseJobQueueGate::default()));
+            let publications = Mutex::new(NativePublication::open(&repo_dir).unwrap());
+            let daemon_state = Mutex::new(DaemonState {
+                ok: true,
+                pid: 1,
+                endpoint_id: "ep".into(),
+                bound_sockets: vec![],
+                alpns: vec![],
+                repo_root: repo_dir.to_string_lossy().into_owned(),
+                tasks_md: String::new(),
+                messages_jsonl: String::new(),
+                started_at: 0,
+                last_heartbeat: 0,
+                total_messages: 0,
+                product_governor: String::new(),
+                delivery_router: String::new(),
+            });
+
+            let mut pending_reexec = PendingReexecSlot::default();
+            let gen_a = pending_reexec.arm(install_path.clone(), sha_a);
+            let mut retries = 0u32;
+            let mut sink = Vec::new();
+
+            // Prepare a startup-digest snapshot up front before B replaces `install_path`.
+            let startup_copy = build_dir.join("startup_snapshot_src");
+            fs::copy(&bin_startup, &startup_copy).unwrap();
+            let stale_startup_prepared =
+                prepare_immutable_reexec_binary(&home_dir, &startup_copy, &sha_startup).unwrap();
+
+            // Simulate B completing and being processed by the responsive daemon loop
+            // BEFORE A's preparation returns its result!
+            fs::copy(&bin_b, &install_path).unwrap();
+            assert!(process_release_daemon_event(
+                ReleaseDaemonEvent::Applied {
+                    binary: "chinwag".to_owned(),
+                    outcome: Box::new(ReleaseApplyOutcome::Installed {
+                        manifest: manifest_b,
+                        install_path: install_path.clone(),
+                        previous_backup_path: None,
+                        receipt_message: None,
+                    }),
+                },
+                &mut sink,
+                &repo_dir,
+                "ep",
+                false,
+                &fwd_tx,
+                &publications,
+                &bcast_tx,
+                &daemon_state,
+                Some(sha_startup),
+                false,
+                &mut pending_reexec,
+            ));
+            let gen_b = pending_reexec.current().unwrap().generation;
+            assert!(gen_b > gen_a);
+
+            // 1. Stale terminal error from A (e.g. codesign timeout after releasing lock)
+            //    MUST NOT disarm B or emit terminal refusal for the active target!
+            let out_terminal = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                gen_a,
+                Ok(Err(ReleaseSyncError::CodesignFailed(
+                    "timed out after 5000ms".into(),
+                ))),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(
+                out_terminal,
+                ReexecPrepStepOutcome::RescheduleTimer(_)
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_b);
+            assert_eq!(pending_reexec.current().unwrap().generation, gen_b);
+            assert_eq!(retries, 0);
+
+            // 2. Stale worker panic from A MUST NOT disarm B!
+            let panic_join =
+                tokio::spawn(async move { panic!("simulated stale prep panic") }).await;
+            let out_panic = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                gen_a,
+                panic_join,
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(
+                out_panic,
+                ReexecPrepStepOutcome::RescheduleTimer(_)
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_b);
+            assert_eq!(retries, 0);
+
+            // 3. Stale transient error from A MUST NOT consume B's retry budget!
+            let out_transient = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                gen_a,
+                Ok(Err(ReleaseSyncError::TransientIo("stale EMFILE".into()))),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(
+                out_transient,
+                ReexecPrepStepOutcome::RescheduleTimer(_)
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_b);
+            assert_eq!(retries, 0);
+
+            // 4. Stale `Ok(Ok(prepared))` matching `startup_chinwag_sha256` MUST NOT
+            //    trigger the startup-digest shortcut to disarm B!
+            let out_startup_shortcut = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                gen_a,
+                Ok(Ok(stale_startup_prepared)),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(
+                out_startup_shortcut,
+                ReexecPrepStepOutcome::RescheduleTimer(_)
+            ));
+            assert_eq!(pending_reexec.current().unwrap().expected_sha, sha_b);
+
+            // 5. Same-digest ABA (`A` gen_1 -> cleared -> `A` gen_3): stale terminal error
+            //    from `gen_1` MUST NOT disarm `gen_3` even though `(install_path, sha_a)` matches!
+            let mut aba_slot = PendingReexecSlot::default();
+            let aba_gen_1 = aba_slot.arm(install_path.clone(), sha_a);
+            aba_slot.clear();
+            let aba_gen_2 = aba_slot.arm(install_path.clone(), sha_a);
+            assert!(aba_gen_2 > aba_gen_1);
+            let out_aba = complete_reexec_prep_step(
+                install_path.clone(),
+                sha_a,
+                aba_gen_1,
+                Ok(Err(ReleaseSyncError::CodesignFailed("stale gen_1".into()))),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut aba_slot,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            );
+            assert!(matches!(out_aba, ReexecPrepStepOutcome::RescheduleTimer(_)));
+            assert_eq!(aba_slot.current().unwrap().generation, aba_gen_2);
+
+            // 6. Finally, B's own current-generation preparation prepares and commits cleanly!
+            let prepared_b =
+                prepare_immutable_reexec_binary(&home_dir, &install_path, &sha_b).unwrap();
+            match complete_reexec_prep_step(
+                install_path.clone(),
+                sha_b,
+                gen_b,
+                Ok(Ok(prepared_b)),
+                &mut sink,
+                Some(sha_startup),
+                true,
+                true,
+                &done_rx,
+                &job_gate,
+                &mut pending_reexec,
+                &mut retries,
+                |_| Duration::from_secs(10),
+            ) {
+                ReexecPrepStepOutcome::CommitReexec { prepared, .. } => {
+                    assert_eq!(prepared.sha256, sha_b);
+                    cleanup_prepared_reexec(prepared);
+                }
+                _ => panic!("expected CommitReexec for current generation B"),
+            }
         });
     }
 }
