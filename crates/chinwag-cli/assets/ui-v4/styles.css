@@ -3232,10 +3232,7 @@ col.diff-col-split-code {
   #d2-spine-toggle {
     display: none;
   }
-  .d2-head {
-    padding-left: 41px;
-  }
-  .d2-spine-top {
+  .d2-rail .d2-spine-top {
     padding-top: 36px;
   }
 }
@@ -3401,11 +3398,18 @@ col.diff-col-split-code {
   padding: 8px var(--rail-inset) 6px;
 }
 
+@media (min-width: 960px) {
+  .d2-rail .d2-head {
+    padding-left: 42px;
+  }
+}
+
 .d2-title-group {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
+  overflow: hidden;
   flex: 1 1 auto;
 }
 

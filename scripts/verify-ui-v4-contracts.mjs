@@ -1571,10 +1571,612 @@ for (const badUrl of [
   );
 }
 
+// ============================================================================
+// Suite L: Deterministic CSS Cascade + 2D Bounding-Box Non-Overlap Ratchet
+// Guarantees stationary/in-flow rail toggles & action icons NEVER collide with
+// `.d2-title` ("Delivery-2"), `#d2-status-word`, or `.d2-spine-dots` across
+// 1440x900 expanded, 1280x900 spine/expanded, and 390x844 mobile drawer.
+// ============================================================================
+function parseCssRulesForCascade(cssText) {
+  const clean = cssText.replace(/\/\*[\s\S]*?\*\//g, "");
+  const rules = [];
+  let order = 0;
+
+  function parseDecls(body) {
+    const out = [];
+    for (const rawDecl of body.split(";")) {
+      const idx = rawDecl.indexOf(":");
+      if (idx <= 0) continue;
+      const prop = rawDecl.slice(0, idx).trim().toLowerCase();
+      let val = rawDecl.slice(idx + 1).trim();
+      if (!prop || !val) continue;
+      let important = false;
+      if (/!important\s*$/i.test(val)) {
+        important = true;
+        val = val.replace(/!important\s*$/i, "").trim();
+      }
+      if (prop === "padding" || prop === "margin") {
+        const parts = val.split(/\s+/).filter(Boolean);
+        const top = parts[0] || "0px";
+        const right = parts[1] || top;
+        const bottom = parts[2] || top;
+        const left = parts[3] || right;
+        out.push({ prop: `${prop}-top`, val: top, important });
+        out.push({ prop: `${prop}-right`, val: right, important });
+        out.push({ prop: `${prop}-bottom`, val: bottom, important });
+        out.push({ prop: `${prop}-left`, val: left, important });
+      } else {
+        out.push({ prop, val, important });
+      }
+    }
+    return out;
+  }
+
+  let i = 0;
+  while (i < clean.length) {
+    while (i < clean.length && /\s/.test(clean[i])) i += 1;
+    if (i >= clean.length) break;
+    const openBrace = clean.indexOf("{", i);
+    if (openBrace < 0) break;
+    const prelude = clean.slice(i, openBrace).trim();
+    let depth = 1;
+    let j = openBrace + 1;
+    while (j < clean.length && depth > 0) {
+      if (clean[j] === "{") depth += 1;
+      else if (clean[j] === "}") depth -= 1;
+      j += 1;
+    }
+    const inner = clean.slice(openBrace + 1, j - 1);
+    if (prelude.startsWith("@media")) {
+      const nested = parseCssRulesForCascade(inner);
+      for (const nr of nested) {
+        rules.push({
+          media: prelude,
+          selectors: nr.selectors,
+          decls: nr.decls,
+          order: (order += 1),
+        });
+      }
+    } else if (!prelude.startsWith("@")) {
+      rules.push({
+        media: null,
+        selectors: prelude
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+        decls: parseDecls(inner),
+        order: (order += 1),
+      });
+    }
+    i = j;
+  }
+  return rules;
+}
+
+function evalMediaPrelude(media, vw) {
+  if (!media) return true;
+  for (const m of media.matchAll(/\(\s*(min-width|max-width)\s*:\s*([0-9.]+)px\s*\)/gi)) {
+    const kind = m[1].toLowerCase();
+    const bound = Number(m[2]);
+    if (kind === "min-width" && !(vw >= bound)) return false;
+    if (kind === "max-width" && !(vw <= bound)) return false;
+  }
+  return true;
+}
+
+function matchCompoundSelector(compound, node) {
+  let s = compound.trim();
+  if (!s) return null;
+  let ids = 0;
+  let cls = 0;
+  let tags = 0;
+
+  while (s.includes(":not(")) {
+    const start = s.indexOf(":not(");
+    let depth = 1;
+    let k = start + 5;
+    while (k < s.length && depth > 0) {
+      if (s[k] === "(") depth += 1;
+      else if (s[k] === ")") depth -= 1;
+      k += 1;
+    }
+    const innerSel = s.slice(start + 5, k - 1);
+    const innerMatch = matchCompoundSelector(innerSel, node);
+    if (innerMatch) return null;
+    if (innerSel.includes("#")) ids += 1;
+    else if (innerSel.includes(".") || innerSel.includes("[")) cls += 1;
+    else tags += 1;
+    s = s.slice(0, start) + s.slice(k);
+  }
+
+  for (const attrMatch of s.matchAll(/\[([a-zA-Z0-9_-]+)(?:="([^"]*)")?\]/g)) {
+    cls += 1;
+    const attrName = attrMatch[1];
+    const expected = attrMatch[2];
+    const actual = node.attrs && Object.prototype.hasOwnProperty.call(node.attrs, attrName) ? node.attrs[attrName] : null;
+    if (actual === null || actual === undefined) return null;
+    if (expected !== undefined && String(actual) !== expected) return null;
+  }
+  s = s.replace(/\[[^\]]+\]/g, "");
+
+  for (const pseudoMatch of s.matchAll(/:([a-zA-Z0-9_-]+)/g)) {
+    const pName = pseudoMatch[1];
+    if (pName === "hover" || pName === "focus" || pName === "focus-visible" || pName === "active") {
+      return null;
+    }
+    if (pName === "root") {
+      cls += 1;
+      if (node.tag !== "html") return null;
+    } else {
+      return null;
+    }
+  }
+  s = s.replace(/:[a-zA-Z0-9_-]+/g, "");
+
+  for (const idMatch of s.matchAll(/#([a-zA-Z0-9_-]+)/g)) {
+    ids += 1;
+    if (node.id !== idMatch[1]) return null;
+  }
+  s = s.replace(/#[a-zA-Z0-9_-]+/g, "");
+
+  const classSet = new Set((node.className || "").split(/\s+/).filter(Boolean));
+  for (const clsMatch of s.matchAll(/\.([a-zA-Z0-9_-]+)/g)) {
+    cls += 1;
+    if (!classSet.has(clsMatch[1])) return null;
+  }
+  s = s.replace(/\.[a-zA-Z0-9_-]+/g, "").trim();
+
+  if (s && s !== "*") {
+    tags += 1;
+    if ((node.tag || "").toLowerCase() !== s.toLowerCase()) return null;
+  }
+  return [ids, cls, tags];
+}
+
+function matchSelectorChain(selector, chain) {
+  if (selector.includes(">") || selector.includes("+") || selector.includes("~")) return null;
+  const parts = selector.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return null;
+  const lastSpec = matchCompoundSelector(parts[parts.length - 1], chain[chain.length - 1]);
+  if (!lastSpec) return null;
+  let totalIds = lastSpec[0];
+  let totalCls = lastSpec[1];
+  let totalTags = lastSpec[2];
+
+  let ancIdx = chain.length - 2;
+  for (let p = parts.length - 2; p >= 0; p -= 1) {
+    let matchedSpec = null;
+    while (ancIdx >= 0) {
+      matchedSpec = matchCompoundSelector(parts[p], chain[ancIdx]);
+      ancIdx -= 1;
+      if (matchedSpec) break;
+    }
+    if (!matchedSpec) return null;
+    totalIds += matchedSpec[0];
+    totalCls += matchedSpec[1];
+    totalTags += matchedSpec[2];
+  }
+  return [totalIds, totalCls, totalTags];
+}
+
+function compareCascadeRank(a, b) {
+  for (let idx = 0; idx < a.length; idx += 1) {
+    if (a[idx] !== b[idx]) return a[idx] - b[idx];
+  }
+  return 0;
+}
+
+function evalArithmeticExpr(src) {
+  const tokens = src.match(/[0-9.]+|[+\-*/()]/g) || [];
+  let pos = 0;
+  function parseAddSub() {
+    let val = parseMulDiv();
+    while (pos < tokens.length && (tokens[pos] === "+" || tokens[pos] === "-")) {
+      const op = tokens[pos++];
+      const rhs = parseMulDiv();
+      val = op === "+" ? val + rhs : val - rhs;
+    }
+    return val;
+  }
+  function parseMulDiv() {
+    let val = parsePrimary();
+    while (pos < tokens.length && (tokens[pos] === "*" || tokens[pos] === "/")) {
+      const op = tokens[pos++];
+      const rhs = parsePrimary();
+      val = op === "*" ? val * rhs : rhs !== 0 ? val / rhs : 0;
+    }
+    return val;
+  }
+  function parsePrimary() {
+    if (tokens[pos] === "-") {
+      pos += 1;
+      return -parsePrimary();
+    }
+    if (tokens[pos] === "+") {
+      pos += 1;
+      return parsePrimary();
+    }
+    if (tokens[pos] === "(") {
+      pos += 1;
+      const inner = parseAddSub();
+      if (tokens[pos] === ")") pos += 1;
+      return inner;
+    }
+    return Number(tokens[pos++] || 0);
+  }
+  return parseAddSub();
+}
+
+function resolvePxExpr(rawVal, vars, vw) {
+  if (rawVal === undefined || rawVal === null) return 0;
+  let v = String(rawVal).trim();
+  for (let depth = 0; depth < 5 && v.includes("var("); depth += 1) {
+    v = v.replace(/var\(\s*(--[a-zA-Z0-9_-]+)(?:\s*,\s*([^)]+))?\)/g, (_, name, fb) =>
+      vars[name] !== undefined ? vars[name] : fb || "0px",
+    );
+  }
+  v = v.replace(/([0-9.]+)vw/g, (_, n) => `${(Number(n) * vw) / 100}px`);
+  if (v.startsWith("min(") && v.endsWith(")")) {
+    const args = v
+      .slice(4, -1)
+      .split(",")
+      .map((part) => resolvePxExpr(part.trim(), vars, vw));
+    return Math.min(...args);
+  }
+  if (v.startsWith("calc(") && v.endsWith(")")) {
+    const expr = v
+      .slice(5, -1)
+      .replace(/px/g, "")
+      .trim();
+    if (/^[0-9.+\-*/()\s]+$/.test(expr)) {
+      return evalArithmeticExpr(expr);
+    }
+  }
+  const m = v.match(/^(-?[0-9.]+)(px)?$/);
+  return m ? Number(m[1]) : 0;
+}
+
+function computeDelivery2HeaderBoxes(cssText, vw, htmlAttrs, statusText = "Waiting for you") {
+  const rules = parseCssRulesForCascade(cssText);
+  const htmlNode = { tag: "html", id: "", className: "", attrs: htmlAttrs };
+  const bodyNode = { tag: "body", id: "doc-body", className: "", attrs: {} };
+  const appBodyNode = { tag: "div", id: "app-body", className: "app-body", attrs: {} };
+  const railNode = { tag: "aside", id: "d2-rail", className: "d2-rail", attrs: {} };
+
+  function styleFor(chain) {
+    const winners = new Map();
+    for (const r of rules) {
+      if (!evalMediaPrelude(r.media, vw)) continue;
+      let bestSpec = null;
+      for (const sel of r.selectors) {
+        const sp = matchSelectorChain(sel, chain);
+        if (sp && (!bestSpec || compareCascadeRank(sp, bestSpec) > 0)) {
+          bestSpec = sp;
+        }
+      }
+      if (!bestSpec) continue;
+      for (const d of r.decls) {
+        const rank = [d.important ? 1 : 0, bestSpec[0], bestSpec[1], bestSpec[2], r.order];
+        const prev = winners.get(d.prop);
+        if (!prev || compareCascadeRank(rank, prev.rank) >= 0) {
+          winners.set(d.prop, { val: d.val, rank });
+        }
+      }
+    }
+    const out = {};
+    for (const [k, v] of winners.entries()) out[k] = v.val;
+    return out;
+  }
+
+  const rootStyle = styleFor([htmlNode]);
+  const vars = {};
+  for (const [k, v] of Object.entries(rootStyle)) {
+    if (k.startsWith("--")) vars[k] = v;
+  }
+
+  const railChain = [htmlNode, bodyNode, appBodyNode, railNode];
+  const railStyle = styleFor(railChain);
+  const railWidth =
+    railStyle.width && railStyle.width !== "var(--rail-current)"
+      ? resolvePxExpr(railStyle.width, vars, vw)
+      : vw >= 1440
+        ? htmlAttrs["data-rail"] === "collapsed"
+          ? resolvePxExpr("var(--rail-spine-w)", vars, vw)
+          : resolvePxExpr("var(--rail-w)", vars, vw)
+        : vw >= 960
+          ? htmlAttrs["data-rail"] === "expanded"
+            ? resolvePxExpr("var(--rail-w)", vars, vw)
+            : resolvePxExpr("var(--rail-spine-w)", vars, vw)
+          : resolvePxExpr(railStyle.width || "320px", vars, vw);
+
+  const toggleFixedStyle = styleFor([
+    ...railChain,
+    { tag: "button", id: "d2-rail-toggle-fixed", className: "d2-rail-toggle d2-rail-toggle-fixed", attrs: {} },
+  ]);
+  const trackChain = [...railChain, { tag: "div", id: "d2-track", className: "d2-track", attrs: {} }];
+  const trackStyle = styleFor(trackChain);
+  const spineChain = [...railChain, { tag: "div", id: "d2-spine", className: "d2-spine", attrs: {} }];
+  const spineStyle = styleFor(spineChain);
+
+  const headChain = [
+    ...trackChain,
+    { tag: "header", id: "", className: "d2-zone-head", attrs: {} },
+    { tag: "div", id: "", className: "d2-head", attrs: {} },
+  ];
+  const headStyle = styleFor(headChain);
+  const headToggleStyle = styleFor([
+    ...headChain,
+    { tag: "button", id: "d2-head-toggle", className: "d2-rail-toggle", attrs: {} },
+  ]);
+  const titleGroupChain = [...headChain, { tag: "div", id: "", className: "d2-title-group", attrs: {} }];
+  const titleGroupStyle = styleFor(titleGroupChain);
+  const titleStyle = styleFor([...titleGroupChain, { tag: "span", id: "", className: "d2-title", attrs: {} }]);
+  const statusWrapChain = [...titleGroupChain, { tag: "span", id: "", className: "d2-status-wrap", attrs: {} }];
+  const statusWrapStyle = styleFor(statusWrapChain);
+  const statusDotStyle = styleFor([...statusWrapChain, { tag: "span", id: "", className: "d2-status-dot", attrs: {} }]);
+  const statusWordStyle = styleFor([
+    ...statusWrapChain,
+    { tag: "span", id: "d2-status-word", className: "d2-status-word", attrs: {} },
+  ]);
+  const actionsChain = [...headChain, { tag: "div", id: "", className: "d2-head-actions", attrs: {} }];
+  const actionsStyle = styleFor(actionsChain);
+  const actionBtnStyle = styleFor([
+    ...actionsChain,
+    { tag: "button", id: "d2-btn-new-thread", className: "d2-icon-btn", attrs: {} },
+  ]);
+
+  const spineTopChain = [...spineChain, { tag: "div", id: "", className: "d2-spine-top", attrs: {} }];
+  const spineTopStyle = styleFor(spineTopChain);
+  const spineToggleStyle = styleFor([
+    ...spineTopChain,
+    { tag: "button", id: "d2-spine-toggle", className: "d2-rail-toggle", attrs: {} },
+  ]);
+  const spineComposeStyle = styleFor([
+    ...spineChain,
+    { tag: "div", id: "", className: "d2-spine-bottom", attrs: {} },
+    { tag: "button", id: "d2-spine-compose", className: "d2-spine-compose", attrs: {} },
+  ]);
+
+  const visibleButtons = [];
+  if ((toggleFixedStyle.display || "inline-flex") !== "none") {
+    const left = resolvePxExpr(toggleFixedStyle.left, vars, vw);
+    const top = resolvePxExpr(toggleFixedStyle.top, vars, vw);
+    const w = resolvePxExpr(toggleFixedStyle.width, vars, vw);
+    const h = resolvePxExpr(toggleFixedStyle.height, vars, vw);
+    visibleButtons.push({ id: "d2-rail-toggle-fixed", left, top, right: left + w, bottom: top + h });
+  }
+
+  const trackVisible = (trackStyle.display || "grid") !== "none";
+  const spineVisible = (spineStyle.display || "none") !== "none";
+  let titleRect = null;
+  let statusWordRect = null;
+
+  if (trackVisible) {
+    const trackW =
+      trackStyle.width === "100%" ? railWidth : resolvePxExpr(trackStyle.width || `${railWidth - 1}px`, vars, vw);
+    const padTop = resolvePxExpr(headStyle["padding-top"], vars, vw);
+    const padRight = resolvePxExpr(headStyle["padding-right"], vars, vw);
+    const padBottom = resolvePxExpr(headStyle["padding-bottom"], vars, vw);
+    const padLeft = resolvePxExpr(headStyle["padding-left"], vars, vw);
+    const headGap = resolvePxExpr(headStyle.gap, vars, vw);
+    const btnH = resolvePxExpr(actionBtnStyle.height, vars, vw) || 26;
+    const btnW = resolvePxExpr(actionBtnStyle.width, vars, vw) || 26;
+    const actGap = resolvePxExpr(actionsStyle.gap, vars, vw);
+    const contentTop = padTop;
+    const contentH = btnH;
+
+    let cursorX = padLeft;
+    if ((headToggleStyle.display || "inline-flex") !== "none") {
+      const ml = resolvePxExpr(headToggleStyle["margin-left"], vars, vw);
+      const tw = resolvePxExpr(headToggleStyle.width, vars, vw) || 26;
+      const th = resolvePxExpr(headToggleStyle.height, vars, vw) || 26;
+      const tLeft = cursorX + ml;
+      visibleButtons.push({
+        id: "d2-head-toggle",
+        left: tLeft,
+        top: contentTop,
+        right: tLeft + tw,
+        bottom: contentTop + th,
+      });
+      cursorX = tLeft + tw + headGap;
+    }
+
+    // 3 right-aligned header action buttons: New thread (+), History (clock), Collapse (<)
+    const actionsTotalW = 3 * btnW + 2 * actGap;
+    const actionsLeft = trackW - padRight - actionsTotalW;
+    ["d2-btn-new-thread", "d2-btn-history", "d2-btn-collapse"].forEach((id, idx) => {
+      const bLeft = actionsLeft + idx * (btnW + actGap);
+      visibleButtons.push({
+        id,
+        left: bLeft,
+        top: contentTop,
+        right: bLeft + btnW,
+        bottom: contentTop + btnH,
+      });
+    });
+
+    const titleGroupMaxRight = Math.max(cursorX, actionsLeft - headGap);
+    const titleFontPx = resolvePxExpr(titleStyle["font-size"], vars, vw) || 13;
+    const titleLineH = resolvePxExpr(titleStyle["line-height"], vars, vw) || 18;
+    const rawTitleW = Math.ceil("Delivery-2".length * titleFontPx * 0.56);
+    const titleRight = Math.min(titleGroupMaxRight, cursorX + rawTitleW);
+    const titleTop = contentTop + (contentH - titleLineH) / 2;
+    titleRect = {
+      id: "d2-title",
+      left: cursorX,
+      top: titleTop,
+      right: titleRight,
+      bottom: titleTop + titleLineH,
+      padBottom,
+    };
+
+    const tgGap = resolvePxExpr(titleGroupStyle.gap, vars, vw) || 6;
+    const swGap = resolvePxExpr(statusWrapStyle.gap, vars, vw) || 5;
+    const dotW = resolvePxExpr(statusDotStyle.width, vars, vw) || 6;
+    const wordFontPx = resolvePxExpr(statusWordStyle["font-size"], vars, vw) || 11;
+    const wordLineH = resolvePxExpr(statusWordStyle["line-height"], vars, vw) || 16;
+    const wordLeft = Math.min(titleGroupMaxRight, titleRight + tgGap + dotW + swGap);
+    const rawWordW = Math.ceil(statusText.length * wordFontPx * 0.54);
+    const wordRight = Math.min(titleGroupMaxRight, wordLeft + rawWordW);
+    const wordTop = contentTop + (contentH - wordLineH) / 2;
+    statusWordRect = {
+      id: "d2-status-word",
+      left: wordLeft,
+      top: wordTop,
+      right: wordRight,
+      bottom: wordTop + wordLineH,
+    };
+  }
+
+  let spineDotsRect = null;
+  if (spineVisible) {
+    const spinePadTop = resolvePxExpr(spineStyle["padding-top"], vars, vw);
+    const spineTopPad = resolvePxExpr(spineTopStyle["padding-top"], vars, vw);
+    let spineCursorY = spinePadTop + spineTopPad;
+    if ((spineToggleStyle.display || "inline-flex") !== "none") {
+      const sw = resolvePxExpr(spineToggleStyle.width, vars, vw) || 26;
+      const sh = resolvePxExpr(spineToggleStyle.height, vars, vw) || 26;
+      const sLeft = (railWidth - 1 - sw) / 2;
+      visibleButtons.push({
+        id: "d2-spine-toggle",
+        left: sLeft,
+        top: spineCursorY,
+        right: sLeft + sw,
+        bottom: spineCursorY + sh,
+      });
+      spineCursorY += sh + (resolvePxExpr(spineTopStyle.gap, vars, vw) || 10);
+    }
+    spineDotsRect = {
+      id: "d2-spine-dots",
+      left: (railWidth - 1 - 6) / 2,
+      top: spineCursorY,
+      right: (railWidth - 1 + 6) / 2,
+      bottom: spineCursorY + 4 * 6 + 3 * 6 + 8,
+    };
+    const cw = resolvePxExpr(spineComposeStyle.width, vars, vw) || 28;
+    const ch = resolvePxExpr(spineComposeStyle.height, vars, vw) || 28;
+    visibleButtons.push({
+      id: "d2-spine-compose",
+      left: (railWidth - 1 - cw) / 2,
+      top: 900 - 12 - ch,
+      right: (railWidth - 1 + cw) / 2,
+      bottom: 900 - 12,
+    });
+  }
+
+  return { visibleButtons, titleRect, statusWordRect, spineDotsRect, trackVisible, spineVisible };
+}
+
+function rectsOverlap(a, b) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+// L1: Verify DOM rendered by `renderDelivery2Panel()` contains exact single `.d2-title` ("Delivery-2") & expected header buttons
+T.renderDelivery2Panel();
+const renderedTitleEl = d2Track.querySelector(".d2-title");
+assert.ok(renderedTitleEl, "Rendered Delivery-2 header must contain .d2-title");
+assert.equal(renderedTitleEl.textContent, "Delivery-2");
+assert.ok(d2RailToggleFixed.id === "d2-rail-toggle-fixed", "Fixed rail toggle must exist on #d2-rail");
+const renderedHeadEl = d2Track.querySelector(".d2-head");
+assert.ok(renderedHeadEl, "Rendered Delivery-2 header must contain .d2-head");
+const renderedActionIds = Array.from(renderedHeadEl.querySelector(".d2-head-actions").children).map((b) => b.id);
+assert.deepEqual(
+  renderedActionIds,
+  ["d2-btn-new-thread", "d2-btn-history", "d2-btn-collapse"],
+  "Rendered .d2-head-actions buttons must match bounded layout model IDs",
+);
+assert.ok(d2Track.querySelector("#d2-head-toggle"), "In-flow #d2-head-toggle must exist for <960px drawer");
+assert.ok(d2Spine.querySelector("#d2-spine-toggle"), "In-flow #d2-spine-toggle must exist in .d2-spine");
+
+// L2: 1440x900 Expanded (`data-rail="expanded"`) — zero overlap between every visible button and `.d2-title` / `#d2-status-word`
+const layoutDesktopExpanded = computeDelivery2HeaderBoxes(stylesCss, 1440, { "data-rail": "expanded" });
+assert.equal(layoutDesktopExpanded.trackVisible, true);
+assert.equal(layoutDesktopExpanded.spineVisible, false);
+assert.equal(
+  layoutDesktopExpanded.visibleButtons.some((b) => b.id === "d2-head-toggle" || b.id === "d2-spine-toggle"),
+  false,
+  "Desktop >=960px must hide in-flow #d2-head-toggle and #d2-spine-toggle so only stationary #d2-rail-toggle-fixed is visible",
+);
+const desktopFixedToggle = layoutDesktopExpanded.visibleButtons.find((b) => b.id === "d2-rail-toggle-fixed");
+assert.ok(desktopFixedToggle, "Stationary #d2-rail-toggle-fixed must be visible at 1440x900");
+assert.ok(
+  layoutDesktopExpanded.titleRect.left - desktopFixedToggle.right >= 6,
+  `Delivery-2 .d2-title (left=${layoutDesktopExpanded.titleRect.left}px) must clear #d2-rail-toggle-fixed (right=${desktopFixedToggle.right}px) by >=6px`,
+);
+for (const btn of layoutDesktopExpanded.visibleButtons) {
+  assert.equal(
+    rectsOverlap(btn, layoutDesktopExpanded.titleRect),
+    false,
+    `1440x900 expanded: button #${btn.id} (${JSON.stringify(btn)}) overlaps .d2-title (${JSON.stringify(layoutDesktopExpanded.titleRect)})`,
+  );
+  assert.equal(
+    rectsOverlap(btn, layoutDesktopExpanded.statusWordRect),
+    false,
+    `1440x900 expanded: button #${btn.id} (${JSON.stringify(btn)}) overlaps #d2-status-word (${JSON.stringify(layoutDesktopExpanded.statusWordRect)})`,
+  );
+}
+
+// L3: 1200x900 Collapsed 44px Spine & 1200x900 User-Expanded — zero overlap in both states
+const layoutSpineCollapsed = computeDelivery2HeaderBoxes(stylesCss, 1200, {});
+assert.equal(layoutSpineCollapsed.trackVisible, false);
+assert.equal(layoutSpineCollapsed.spineVisible, true);
+for (const btn of layoutSpineCollapsed.visibleButtons) {
+  assert.equal(
+    rectsOverlap(btn, layoutSpineCollapsed.spineDotsRect),
+    false,
+    `1200x900 spine: button #${btn.id} overlaps .d2-spine-dots`,
+  );
+}
+const layoutLaptopExpanded = computeDelivery2HeaderBoxes(stylesCss, 1200, { "data-rail": "expanded" });
+for (const btn of layoutLaptopExpanded.visibleButtons) {
+  assert.equal(rectsOverlap(btn, layoutLaptopExpanded.titleRect), false, `1200x900 expanded overlap on #${btn.id}`);
+  assert.equal(rectsOverlap(btn, layoutLaptopExpanded.statusWordRect), false, `1200x900 status overlap on #${btn.id}`);
+}
+
+// L4: 390x844 Mobile Open Drawer — `#d2-rail-toggle-fixed` hidden, in-flow `#d2-head-toggle` clears `.d2-title`
+const layoutMobileDrawer = computeDelivery2HeaderBoxes(stylesCss, 390, { "data-d2-drawer": "open" });
+assert.equal(
+  layoutMobileDrawer.visibleButtons.some((b) => b.id === "d2-rail-toggle-fixed"),
+  false,
+  "<960px mobile drawer must hide #d2-rail-toggle-fixed",
+);
+const mobileHeadToggle = layoutMobileDrawer.visibleButtons.find((b) => b.id === "d2-head-toggle");
+assert.ok(mobileHeadToggle, "<960px mobile drawer must show in-flow #d2-head-toggle");
+for (const btn of layoutMobileDrawer.visibleButtons) {
+  assert.equal(
+    rectsOverlap(btn, layoutMobileDrawer.titleRect),
+    false,
+    `390x844 mobile drawer: button #${btn.id} overlaps .d2-title`,
+  );
+  assert.equal(
+    rectsOverlap(btn, layoutMobileDrawer.statusWordRect),
+    false,
+    `390x844 mobile drawer: button #${btn.id} overlaps #d2-status-word`,
+  );
+}
+
+// L5: Mutant Canary Self-Test — prove this cascade + AABB engine catches the exact `padding` shorthand override bug!
+const mutatedBuggyCss = stylesCss.replace(
+  /@media\s*\(min-width:\s*960px\)\s*\{\s*\.d2-rail\s+\.d2-head\s*\{\s*padding-left:\s*42px;\s*\}\s*\}/,
+  "",
+);
+assert.notEqual(mutatedBuggyCss, stylesCss, "Mutant canary regex must match the production .d2-rail .d2-head rule");
+const buggyLayout = computeDelivery2HeaderBoxes(
+  `@media (min-width: 960px) { .d2-head { padding-left: 41px; } }\n${mutatedBuggyCss}`,
+  1440,
+  { "data-rail": "expanded" },
+);
+const buggyToggle = buggyLayout.visibleButtons.find((b) => b.id === "d2-rail-toggle-fixed");
+assert.equal(
+  rectsOverlap(buggyToggle, buggyLayout.titleRect),
+  true,
+  "Mutant canary MUST detect overlap when a later `.d2-head { padding: ... }` shorthand resets `padding-left`",
+);
+
 console.log(
   JSON.stringify({
     ok: true,
     script: "verify-ui-v4-contracts.mjs",
-    suites_passed: 11,
+    suites_passed: 12,
   }),
 );
