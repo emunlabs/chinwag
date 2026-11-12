@@ -2897,4 +2897,188 @@ mod tests {
         assert_eq!(archived_row.policy_epoch, 2);
         archived_row.verify_row_signature(&registry).unwrap();
     }
+
+    #[test]
+    fn test_21_chwg_0271_archive_sender_non_repudiation_and_impersonation_rejection() {
+        use ed25519_dalek::Signer;
+
+        let mut rng = OsRng;
+        let (acu_sk, acu_pk) = SeatSecretKey::generate(DEFAULT_CISO_ACU_ID, &mut rng).unwrap();
+        let acu_ed25519_sk = SigningKey::from_bytes(&[0xA1u8; 32]);
+
+        let (_agent_sk, agent_pk) =
+            SeatSecretKey::generate(DEFAULT_AGENT_BRANCH_ID, &mut rng).unwrap();
+        let agent_ed25519_sk = SigningKey::from_bytes(&[0xA2u8; 32]);
+
+        let (_bystander_sk, bystander_pk) =
+            SeatSecretKey::generate("branch:bystander", &mut rng).unwrap();
+        let bystander_ed25519_sk = SigningKey::from_bytes(&[0xA3u8; 32]);
+
+        let (archive_sk, archive_pk) =
+            SeatSecretKey::generate(DEFAULT_MESSAGE_ARCHIVE_ID, &mut rng).unwrap();
+        let archive_ed25519_sk = SigningKey::from_bytes(&[0xA4u8; 32]);
+
+        let mut registry = AllowedSignersRegistry::new();
+        registry
+            .register_seat(
+                DEFAULT_CISO_ACU_ID,
+                acu_ed25519_sk.verifying_key(),
+                acu_pk.clone(),
+            )
+            .unwrap();
+        registry
+            .register_seat(
+                DEFAULT_AGENT_BRANCH_ID,
+                agent_ed25519_sk.verifying_key(),
+                agent_pk,
+            )
+            .unwrap();
+        registry
+            .register_seat(
+                "branch:bystander",
+                bystander_ed25519_sk.verifying_key(),
+                bystander_pk.clone(),
+            )
+            .unwrap();
+        registry
+            .register_seat(
+                DEFAULT_MESSAGE_ARCHIVE_ID,
+                archive_ed25519_sk.verifying_key(),
+                archive_pk.clone(),
+            )
+            .unwrap();
+
+        let partition = HivePartitionKey::new("emunlabs", 2026, 11, 12).unwrap();
+        let mut store = AcuParquetArchiveStore::new();
+        let _authentic = store
+            .append_signed_message(
+                partition,
+                "msg-impersonation-target-21",
+                1_793_804_001_000,
+                DEFAULT_AGENT_BRANCH_ID,
+                "branch:bystander",
+                "#eng",
+                "CHWG-0271-IMPERSONATION",
+                b"authentic message from branch:8687872",
+                &agent_ed25519_sk,
+                &registry,
+                &mut rng,
+            )
+            .unwrap();
+
+        // Revoke "branch:8687872" and ensure a revoked seat CANNOT spoof `sender_seat = "branch:bystander"`
+        // by setting `rerandomized_by_seat = Some("branch:8687872")` at epoch 1 or epoch 2!
+        registry.revoke_seat(DEFAULT_AGENT_BRANCH_ID).unwrap();
+        let mut ciso_fat_client =
+            CisoAcuFatClient::new(acu_sk, acu_pk.clone(), acu_ed25519_sk.clone());
+        ciso_fat_client.instant_revoke(DEFAULT_AGENT_BRANCH_ID);
+
+        let forged_payload = EncryptedCiPayload::encrypt_with_acu_and_archive(
+            b"forged payload impersonating branch:bystander",
+            &acu_pk,
+            &bystander_pk,
+            &archive_pk,
+            "emunlabs",
+            "CHWG-0271-IMPERSONATION",
+            &mut rng,
+        )
+        .unwrap();
+        let forged_ct_bytes = forged_payload.to_bytes();
+        let fake_sender_sig = agent_ed25519_sk
+            .sign(&archive::ArchivedMessageRow::sender_body_signing_preimage(
+                "msg-impersonation-target-21",
+                1_793_804_001_000,
+                "branch:bystander",
+                "branch:bystander",
+                "#eng",
+                "CHWG-0271-IMPERSONATION",
+                &forged_payload.nonce,
+                &forged_payload.associated_data,
+                &forged_payload.aead_ciphertext,
+            ))
+            .to_bytes()
+            .to_vec();
+
+        // Attack A: Revoked agent sets `rerandomized_by_seat = Some("branch:8687872")` at epoch 2.
+        store.update_row_by_id("msg-impersonation-target-21", |r| {
+            r.sender_seat = "branch:bystander".to_string();
+            r.recipient_seat = "branch:bystander".to_string();
+            r.policy_epoch = 2;
+            r.rerandomized_by_seat = Some(DEFAULT_AGENT_BRANCH_ID.to_string());
+            r.sender_ed25519_sig.clone_from(&fake_sender_sig);
+            r.acu_ciphertext.clone_from(&forged_ct_bytes);
+            let preimage = archive::ArchivedMessageRow::signing_preimage(
+                &r.message_id,
+                r.timestamp_utc,
+                &r.sender_seat,
+                &r.recipient_seat,
+                &r.room,
+                &r.task_id,
+                r.policy_epoch,
+                r.rerandomized_by_seat.as_deref(),
+                &r.sender_ed25519_sig,
+                &r.acu_ciphertext,
+            );
+            r.ed25519_sig = agent_ed25519_sk.sign(&preimage).to_bytes().to_vec();
+        });
+        let filter = ArchiveSearchFilter::new("emunlabs");
+        assert_eq!(
+            store.ciso_investigate_and_decrypt(
+                &filter,
+                "INCIDENT-IMPERSONATION-A",
+                &mut ciso_fat_client,
+                &archive_ed25519_sk,
+                &archive_sk,
+                &registry,
+            ),
+            Err(AcuError::SignatureVerificationFailed(
+                "unauthorized_re_signer"
+            ))
+        );
+
+        // Attack B: Even if `acu_ed25519_sk` signs a rerandomized epoch-2 row (`rerandomized_by_seat = Some("acu:98939834")`),
+        // spoofing `sender_seat = "branch:bystander"` without `bystander_ed25519_sk`'s `sender_ed25519_sig` fails closed!
+        let mut epoch2_payload = forged_payload;
+        revoke_and_rerandomize(
+            &mut epoch2_payload.acu_ciphertext,
+            ciso_fat_client.acu_secret_key(),
+            &[],
+            &registry.active_acu_keys(),
+            &mut rng,
+        )
+        .unwrap();
+        let epoch2_ct_bytes = epoch2_payload.to_bytes();
+        store.update_row_by_id("msg-impersonation-target-21", |r| {
+            r.sender_seat = "branch:bystander".to_string();
+            r.recipient_seat = "branch:bystander".to_string();
+            r.policy_epoch = 2;
+            r.rerandomized_by_seat = Some(DEFAULT_CISO_ACU_ID.to_string());
+            r.sender_ed25519_sig.clone_from(&fake_sender_sig);
+            r.acu_ciphertext = epoch2_ct_bytes;
+            let preimage = archive::ArchivedMessageRow::signing_preimage(
+                &r.message_id,
+                r.timestamp_utc,
+                &r.sender_seat,
+                &r.recipient_seat,
+                &r.room,
+                &r.task_id,
+                r.policy_epoch,
+                r.rerandomized_by_seat.as_deref(),
+                &r.sender_ed25519_sig,
+                &r.acu_ciphertext,
+            );
+            r.ed25519_sig = acu_ed25519_sk.sign(&preimage).to_bytes().to_vec();
+        });
+        assert_eq!(
+            store.ciso_investigate_and_decrypt(
+                &filter,
+                "INCIDENT-IMPERSONATION-B",
+                &mut ciso_fat_client,
+                &archive_ed25519_sk,
+                &archive_sk,
+                &registry,
+            ),
+            Err(AcuError::SignatureVerificationFailed("archive_sender_body"))
+        );
+    }
 }

@@ -21,7 +21,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-const ARCHIVE_ROW_SIG_DOMAIN: &[u8] = b"chinwag-parquet-archive-row/v3";
+const ARCHIVE_ROW_SIG_DOMAIN: &[u8] = b"chinwag-parquet-archive-row/v4";
+const ARCHIVE_SENDER_BODY_SIG_DOMAIN: &[u8] = b"chinwag-parquet-archive-sender-body/v1";
 
 /// Default DuckDB background worker thread cap on the CISO/developer fat client so GPUI / local
 /// web workbench UI rendering threads are never starved.
@@ -102,10 +103,10 @@ impl HivePartitionKey {
 /// A single row in the Cloudflare R2 Parquet Message Archive table.
 ///
 /// Routing metadata columns (`message_id`, `timestamp_utc`, `sender_seat`, `recipient_seat`,
-/// `room`, `task_id`, `policy_epoch`, `rerandomized_by_seat`, `ed25519_sig`) are stored in cleartext Parquet columns
-/// for sub-second DuckDB predicate pushdown and min/max row-group pruning, while the message
-/// body is sealed inside the `acu_ciphertext` BLOB column (`CHWGAEAD` / `CHWGACU2`) under
-/// `ACU AND (Recipient OR Archive)` with zero cleartext basis commitments.
+/// `room`, `task_id`, `policy_epoch`, `rerandomized_by_seat`, `sender_ed25519_sig`, `ed25519_sig`)
+/// are stored in cleartext Parquet columns for sub-second DuckDB predicate pushdown and min/max
+/// row-group pruning, while the message body is sealed inside the `acu_ciphertext` BLOB column
+/// (`CHWGAEAD` / `CHWGACU2`) under `ACU AND (Recipient OR Archive)` with zero cleartext basis commitments.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchivedMessageRow {
     /// Unique message identifier.
@@ -122,26 +123,35 @@ pub struct ArchivedMessageRow {
     pub task_id: String,
     /// Current ACU policy epoch of `acu_ciphertext`.
     pub policy_epoch: u64,
-    /// Optional CISO ACU seat that re-signed this row after in-place `revoke_and_rerandomize`.
+    /// Optional CISO ACU seat (`acu:98939834`) that re-signed this row after in-place `revoke_and_rerandomize`.
     pub rerandomized_by_seat: Option<String>,
-    /// Ed25519 signature over the canonical row metadata and `SHA-256(acu_ciphertext)`.
+    /// Immutable Ed25519 non-repudiation signature by `sender_seat` over the canonical
+    /// routing metadata and immutable AEAD envelope `(nonce, associated_data, SHA-256(aead_ciphertext))`.
+    pub sender_ed25519_sig: Vec<u8>,
+    /// Ed25519 signature over the canonical row metadata, `sender_ed25519_sig`, and `SHA-256(acu_ciphertext)`.
     pub ed25519_sig: Vec<u8>,
     /// Deterministic binary serialization (`EncryptedCiPayload::to_bytes`) of the message payload.
     pub acu_ciphertext: Vec<u8>,
 }
 
 impl ArchivedMessageRow {
-    /// Verify the cleartext `ed25519_sig` over the row metadata and `SHA-256(acu_ciphertext)`
-    /// against `.chinwag/allowed_signers` BEFORE attempting pairing or AEAD decryption.
+    /// Verify both the outer `ed25519_sig` (over the row metadata, `sender_ed25519_sig`, and
+    /// `SHA-256(acu_ciphertext)`) AND the immutable `sender_ed25519_sig` (by `sender_seat` over
+    /// the routing metadata and immutable AEAD envelope) against `.chinwag/allowed_signers`
+    /// BEFORE attempting pairing or AEAD decryption.
     pub fn verify_row_signature(&self, registry: &AllowedSignersRegistry) -> Result<(), AcuError> {
-        if self.ed25519_sig.len() != 64 {
+        if !is_valid_metadata_token(&self.message_id)
+            || !is_valid_seat_id(&self.sender_seat)
+            || !is_valid_seat_id(&self.recipient_seat)
+            || !is_valid_metadata_token(&self.room)
+            || !is_valid_metadata_token(&self.task_id)
+        {
+            return Err(AcuError::InvalidMetadata);
+        }
+        if self.ed25519_sig.len() != 64 || self.sender_ed25519_sig.len() != 64 {
             return Err(AcuError::SignatureVerificationFailed("archive_row_sig_len"));
         }
-        let verifying_seat = self
-            .rerandomized_by_seat
-            .as_deref()
-            .unwrap_or(&self.sender_seat);
-        let signer_rec = registry.get_any(verifying_seat)?;
+
         let preimage = Self::signing_preimage(
             &self.message_id,
             self.timestamp_utc,
@@ -151,22 +161,87 @@ impl ArchivedMessageRow {
             &self.task_id,
             self.policy_epoch,
             self.rerandomized_by_seat.as_deref(),
+            &self.sender_ed25519_sig,
             &self.acu_ciphertext,
         );
         let mut sig_bytes = [0u8; 64];
         sig_bytes.copy_from_slice(&self.ed25519_sig);
         let sig = Signature::from_bytes(&sig_bytes);
-        signer_rec
+
+        match self.rerandomized_by_seat.as_deref() {
+            None => {
+                if self.policy_epoch != 1 {
+                    return Err(AcuError::SignatureVerificationFailed("archive_row_epoch"));
+                }
+                let sender_rec = registry.get_any(&self.sender_seat)?;
+                sender_rec
+                    .ed25519_verifying_key
+                    .verify_strict(&preimage, &sig)
+                    .map_err(|_| AcuError::SignatureVerificationFailed("archive_row"))?;
+            }
+            Some(re_signer) => {
+                if self.policy_epoch < 2 {
+                    return Err(AcuError::SignatureVerificationFailed("archive_row_epoch"));
+                }
+                if re_signer != DEFAULT_CISO_ACU_ID {
+                    return Err(AcuError::SignatureVerificationFailed(
+                        "unauthorized_re_signer",
+                    ));
+                }
+                let acu_signer_rec = registry.get_active(re_signer)?;
+                acu_signer_rec
+                    .ed25519_verifying_key
+                    .verify_strict(&preimage, &sig)
+                    .map_err(|_| AcuError::SignatureVerificationFailed("archive_row"))?;
+            }
+        }
+
+        let payload = EncryptedCiPayload::from_bytes(&self.acu_ciphertext)?;
+        if payload.acu_ciphertext.policy_epoch != self.policy_epoch {
+            return Err(AcuError::EpochMismatch {
+                expected: self.policy_epoch,
+                actual: payload.acu_ciphertext.policy_epoch,
+            });
+        }
+        if payload.acu_ciphertext.sealed_basis.acu_seat_id != DEFAULT_CISO_ACU_ID {
+            return Err(AcuError::SignatureVerificationFailed(
+                "unauthorized_re_signer",
+            ));
+        }
+        if let Some(re_signer) = self.rerandomized_by_seat.as_deref()
+            && re_signer != payload.acu_ciphertext.sealed_basis.acu_seat_id
+        {
+            return Err(AcuError::SignatureVerificationFailed(
+                "unauthorized_re_signer",
+            ));
+        }
+
+        let sender_rec = registry.get_any(&self.sender_seat)?;
+        let sender_body_preimage = Self::sender_body_signing_preimage(
+            &self.message_id,
+            self.timestamp_utc,
+            &self.sender_seat,
+            &self.recipient_seat,
+            &self.room,
+            &self.task_id,
+            &payload.nonce,
+            &payload.associated_data,
+            &payload.aead_ciphertext,
+        );
+        let mut sender_sig_bytes = [0u8; 64];
+        sender_sig_bytes.copy_from_slice(&self.sender_ed25519_sig);
+        let sender_sig = Signature::from_bytes(&sender_sig_bytes);
+        sender_rec
             .ed25519_verifying_key
-            .verify_strict(&preimage, &sig)
-            .map_err(|_| AcuError::SignatureVerificationFailed("archive_row"))
+            .verify_strict(&sender_body_preimage, &sender_sig)
+            .map_err(|_| AcuError::SignatureVerificationFailed("archive_sender_body"))
     }
 
     /// Prune `revoked_seat_ids` and cryptographically rerandomize this archived row's
     /// `acu_ciphertext` BLOB in-place using the ACU operator's `acu_sk` (verifying the existing
-    /// row signature first so tampered metadata cannot be laundered, unsealing and re-sealing
-    /// `basis_commitments` with fresh randomness at `policy_epoch + 1`, preserving `sender_seat`,
-    /// and re-signing with `re_signer_ed25519_sk`).
+    /// row and sender non-repudiation signatures first so tampered metadata cannot be laundered,
+    /// unsealing and re-sealing `basis_commitments` with fresh randomness at `policy_epoch + 1`,
+    /// preserving `sender_seat` + `sender_ed25519_sig`, and re-signing with `re_signer_ed25519_sk`).
     pub fn revoke_and_rerandomize_in_place(
         &mut self,
         acu_sk: &SeatSecretKey,
@@ -177,11 +252,13 @@ impl ArchivedMessageRow {
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<(), AcuError> {
         self.verify_row_signature(registry)?;
+        if re_signer_seat_id != acu_sk.seat_id() {
+            return Err(AcuError::SignatureVerificationFailed("re_signer_mismatch"));
+        }
         let signer_rec = registry.get_active(re_signer_seat_id)?;
         if signer_rec.ed25519_verifying_key != re_signer_ed25519_sk.verifying_key() {
             return Err(AcuError::SignatureVerificationFailed("re_signer_mismatch"));
         }
-        let _acu_rec = registry.get_active(acu_sk.seat_id())?;
         let mut payload = EncryptedCiPayload::from_bytes(&self.acu_ciphertext)?;
         let active_keys = registry.active_acu_keys();
         revoke_and_rerandomize(
@@ -191,6 +268,13 @@ impl ArchivedMessageRow {
             &active_keys,
             rng,
         )?;
+        if re_signer_seat_id != DEFAULT_CISO_ACU_ID
+            || re_signer_seat_id != payload.acu_ciphertext.sealed_basis.acu_seat_id
+        {
+            return Err(AcuError::SignatureVerificationFailed(
+                "unauthorized_re_signer",
+            ));
+        }
         let new_epoch = payload.acu_ciphertext.policy_epoch;
         let new_ciphertext = payload.to_bytes();
         let preimage = Self::signing_preimage(
@@ -202,6 +286,7 @@ impl ArchivedMessageRow {
             &self.task_id,
             new_epoch,
             Some(re_signer_seat_id),
+            &self.sender_ed25519_sig,
             &new_ciphertext,
         );
         let sig: Signature = re_signer_ed25519_sk.sign(&preimage);
@@ -210,6 +295,33 @@ impl ArchivedMessageRow {
         self.rerandomized_by_seat = Some(re_signer_seat_id.to_string());
         self.ed25519_sig = sig.to_bytes().to_vec();
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sender_body_signing_preimage(
+        message_id: &str,
+        timestamp_utc: u64,
+        sender_seat: &str,
+        recipient_seat: &str,
+        room: &str,
+        task_id: &str,
+        nonce: &[u8; 12],
+        associated_data: &[u8],
+        aead_ciphertext: &[u8],
+    ) -> Vec<u8> {
+        let aead_hash = Sha256::digest(aead_ciphertext);
+        let mut out = Vec::new();
+        out.extend_from_slice(ARCHIVE_SENDER_BODY_SIG_DOMAIN);
+        push_len_prefixed(&mut out, message_id.as_bytes());
+        out.extend_from_slice(&timestamp_utc.to_be_bytes());
+        push_len_prefixed(&mut out, sender_seat.as_bytes());
+        push_len_prefixed(&mut out, recipient_seat.as_bytes());
+        push_len_prefixed(&mut out, room.as_bytes());
+        push_len_prefixed(&mut out, task_id.as_bytes());
+        out.extend_from_slice(nonce);
+        push_len_prefixed(&mut out, associated_data);
+        out.extend_from_slice(&aead_hash);
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -222,6 +334,7 @@ impl ArchivedMessageRow {
         task_id: &str,
         policy_epoch: u64,
         rerandomized_by_seat: Option<&str>,
+        sender_ed25519_sig: &[u8],
         acu_ciphertext: &[u8],
     ) -> Vec<u8> {
         let blob_hash = Sha256::digest(acu_ciphertext);
@@ -241,6 +354,7 @@ impl ArchivedMessageRow {
             }
             None => out.push(0u8),
         }
+        push_len_prefixed(&mut out, sender_ed25519_sig);
         out.extend_from_slice(&blob_hash);
         out
     }
@@ -389,7 +503,7 @@ impl DuckDbArchiveConfig {
         };
 
         let sql = format!(
-            "SELECT message_id, timestamp_utc, sender_seat, recipient_seat, room, task_id, policy_epoch, ed25519_sig, acu_ciphertext\nFROM read_parquet('{glob_uri}', hive_partitioning = true){where_sql}\nORDER BY timestamp_utc DESC\nLIMIT {limit};"
+            "SELECT message_id, timestamp_utc, sender_seat, recipient_seat, room, task_id, policy_epoch, rerandomized_by_seat, sender_ed25519_sig, ed25519_sig, acu_ciphertext\nFROM read_parquet('{glob_uri}', hive_partitioning = true){where_sql}\nORDER BY timestamp_utc DESC\nLIMIT {limit};"
         );
         Ok((sql, params))
     }
@@ -405,7 +519,7 @@ impl DuckDbArchiveConfig {
         let glob_uri = HivePartitionKey::s3_glob_uri(&self.bucket, org_id)?;
         let clamped_limit = limit.clamp(1, 1000);
         let sql = format!(
-            "CREATE TEMP TABLE IF NOT EXISTS active_channel_cache AS\nSELECT message_id, timestamp_utc, sender_seat, recipient_seat, room, task_id, policy_epoch, ed25519_sig, acu_ciphertext\nFROM read_parquet('{glob_uri}', hive_partitioning = true)\nWHERE room = $1\nORDER BY timestamp_utc DESC\nLIMIT {clamped_limit};"
+            "CREATE TEMP TABLE IF NOT EXISTS active_channel_cache AS\nSELECT message_id, timestamp_utc, sender_seat, recipient_seat, room, task_id, policy_epoch, rerandomized_by_seat, sender_ed25519_sig, ed25519_sig, acu_ciphertext\nFROM read_parquet('{glob_uri}', hive_partitioning = true)\nWHERE room = $1\nORDER BY timestamp_utc DESC\nLIMIT {clamped_limit};"
         );
         Ok((sql, vec![room.to_string()]))
     }
@@ -422,7 +536,7 @@ impl DuckDbArchiveConfig {
         let glob_uri = HivePartitionKey::s3_glob_uri(&self.bucket, org_id)?;
         let clamped_limit = limit.clamp(1, 1000);
         let sql = format!(
-            "SELECT message_id, timestamp_utc, sender_seat, recipient_seat, room, task_id, policy_epoch, ed25519_sig, acu_ciphertext\nFROM read_parquet('{glob_uri}', hive_partitioning = true)\nWHERE room = $1 AND timestamp_utc < $2\nORDER BY timestamp_utc DESC\nLIMIT {clamped_limit};"
+            "SELECT message_id, timestamp_utc, sender_seat, recipient_seat, room, task_id, policy_epoch, rerandomized_by_seat, sender_ed25519_sig, ed25519_sig, acu_ciphertext\nFROM read_parquet('{glob_uri}', hive_partitioning = true)\nWHERE room = $1 AND timestamp_utc < $2\nORDER BY timestamp_utc DESC\nLIMIT {clamped_limit};"
         );
         Ok((
             sql,
@@ -478,8 +592,9 @@ impl AcuParquetArchiveStore {
 
     /// Encrypt a bus message or CI/CD alert under the canonical Zero-Plaintext-At-Rest policy
     /// (`ACU AND (recipient_seat OR archive:vault)`), sealing basis commitments exclusively under `pk_ACU`,
-    /// serialize to `acu_ciphertext` (`CHWGAEAD` / `CHWGACU3`), sign cleartext routing metadata +
-    /// `SHA-256(acu_ciphertext)` with `sender_ed25519_sk`, and append to its R2 Hive partition.
+    /// serialize to `acu_ciphertext` (`CHWGAEAD` / `CHWGACU2`), sign both the immutable sender body
+    /// commitment (`sender_ed25519_sig`) and cleartext routing metadata + `SHA-256(acu_ciphertext)`
+    /// (`ed25519_sig`) with `sender_ed25519_sk`, and append to its R2 Hive partition.
     #[allow(clippy::too_many_arguments)]
     pub fn append_signed_message(
         &mut self,
@@ -531,6 +646,19 @@ impl AcuParquetArchiveStore {
         )?;
 
         let policy_epoch = encrypted_payload.acu_ciphertext.policy_epoch;
+        let sender_body_preimage = ArchivedMessageRow::sender_body_signing_preimage(
+            &message_id,
+            timestamp_utc,
+            &sender_seat,
+            &recipient_seat,
+            &room,
+            &task_id,
+            &encrypted_payload.nonce,
+            &encrypted_payload.associated_data,
+            &encrypted_payload.aead_ciphertext,
+        );
+        let sender_sig: Signature = sender_ed25519_sk.sign(&sender_body_preimage);
+        let sender_ed25519_sig = sender_sig.to_bytes().to_vec();
         let acu_ciphertext = encrypted_payload.to_bytes();
 
         let preimage = ArchivedMessageRow::signing_preimage(
@@ -542,6 +670,7 @@ impl AcuParquetArchiveStore {
             &task_id,
             policy_epoch,
             None,
+            &sender_ed25519_sig,
             &acu_ciphertext,
         );
         let sig: Signature = sender_ed25519_sk.sign(&preimage);
@@ -555,6 +684,7 @@ impl AcuParquetArchiveStore {
             task_id,
             policy_epoch,
             rerandomized_by_seat: None,
+            sender_ed25519_sig,
             ed25519_sig: sig.to_bytes().to_vec(),
             acu_ciphertext,
         };
@@ -666,8 +796,8 @@ impl AcuParquetArchiveStore {
 
     /// Execute a CISO forensic investigation query:
     /// 1. Filters Parquet rows using cleartext metadata predicates (`search_metadata`).
-    /// 2. Verifies each matching row's `ed25519_sig` against `.chinwag/allowed_signers` (Verify-Before-Decrypt).
-    /// 3. Deserializes the `acu_ciphertext` BLOB (`EncryptedCiPayload::from_bytes`, requiring `CHWGACU3`).
+    /// 2. Verifies each matching row's `ed25519_sig` and `sender_ed25519_sig` against `.chinwag/allowed_signers` (Verify-Before-Decrypt).
+    /// 3. Deserializes the `acu_ciphertext` BLOB (`EncryptedCiPayload::from_bytes`, requiring `CHWGACU2`).
     /// 4. Requests $D_{\text{ACU}}$ from `ciso_acu.authorize_archive_investigation(...)` (logging
     ///    `AcuAuditDecision::GrantedArchiveInvestigation`).
     /// 5. Combines $D_{\text{ACU}} + D_{\text{Archive}}$ strictly via [`crate::acu::acu_verify_partial_share`]
