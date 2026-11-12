@@ -161,6 +161,27 @@ impl BusDirectory {
         directories.verify()?;
         Ok(directories)
     }
+    pub(crate) fn open_existing(path: &Path) -> Result<Option<Self>> {
+        let root = Directory::root(path)?;
+        let chinwag = match Directory::below(&root, ".chinwag") {
+            Ok(dir) => dir,
+            Err(IdentityError::Io(std::io::ErrorKind::NotFound)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let bus = match Directory::below(&chinwag, "bus") {
+            Ok(dir) => dir,
+            Err(IdentityError::Io(std::io::ErrorKind::NotFound)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let directories = Self {
+            path: path.into(),
+            root,
+            chinwag,
+            bus,
+        };
+        directories.verify()?;
+        Ok(Some(directories))
+    }
     pub(crate) fn verify(&self) -> Result<()> {
         self.root.verify(&Directory::root(&self.path)?)?;
         self.chinwag

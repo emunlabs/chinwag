@@ -327,6 +327,16 @@ impl RepositorySelection {
     pub fn execution_root(&self) -> &Path {
         self.root()
     }
+    pub fn common_worktree_root(&self) -> Option<&Path> {
+        if self.git.common.path.file_name() == Some(OsStr::new(".git")) {
+            self.git.common.path.parent()
+        } else {
+            None
+        }
+    }
+    pub fn same_common_git_identity(&self, other: &Self) -> bool {
+        self.git.common.id == other.git.common.id
+    }
     pub fn revalidate(&self) -> BindingResult<()> {
         self.root.verify()?;
         self.git.verify()

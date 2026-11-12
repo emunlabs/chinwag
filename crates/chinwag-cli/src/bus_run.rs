@@ -630,6 +630,18 @@ fn explicit_daemon_route(
     })
 }
 
+fn is_live_positive_daemon_pid(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 fn read_daemon_state(repo_root: &Path) -> Option<DaemonState> {
     let address = std::env::var("CHINWAG_BUS_ADDR").ok();
     let endpoint = std::env::var("CHINWAG_BUS_ENDPOINT_ID").ok();
@@ -638,13 +650,24 @@ fn read_daemon_state(repo_root: &Path) -> Option<DaemonState> {
     }
     let raw = fs::read_to_string(daemon_json_path(repo_root)).ok()?;
     let state: DaemonState = serde_json::from_str(&raw).ok()?;
-    let status = Command::new("/bin/kill")
-        .args(["-0", &state.pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    if status.success() { Some(state) } else { None }
+    if is_live_positive_daemon_pid(state.pid) {
+        Some(state)
+    } else {
+        None
+    }
+}
+
+fn read_verified_daemon_state_from_disk(repo_root: &Path) -> Result<Option<DaemonState>, ()> {
+    let Some(bytes) = chinwag_cli::bus_state::read_daemon_state_bytes(repo_root).map_err(|_| ())?
+    else {
+        return Ok(None);
+    };
+    let state: DaemonState = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    if is_live_positive_daemon_pid(state.pid) {
+        Ok(Some(state))
+    } else {
+        Ok(None)
+    }
 }
 
 fn write_daemon_state(repo_root: &Path, state: &DaemonState) -> Result<(), ()> {
@@ -2016,6 +2039,7 @@ async fn run_daemon_loop_inner(
         port,
         network_selection,
         no_governors,
+        false,
         stdout,
         shutdown,
         controlled_local_driver,
@@ -2030,11 +2054,13 @@ async fn run_daemon_loop_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon_loop_reexecable(
     repo_root: PathBuf,
     port: u16,
     network_selection: Option<NetworkSelection>,
     no_governors: bool,
+    enable_release_sync: bool,
     stdout: &mut dyn Write,
     shutdown: impl std::future::Future<Output = ()>,
     controlled_local_driver: Option<RoomOwnerFuture<'static>>,
@@ -2299,7 +2325,7 @@ async fn run_daemon_loop_reexecable(
         tokio::sync::mpsc::channel::<ReleaseDaemonEvent>(32);
     let mut release_done_tx_keepalive = Some(release_done_tx.clone());
     let mut release_worker_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let mut release_job_tx = if !no_governors && controlled_local_driver.is_none() {
+    let mut release_job_tx = if enable_release_sync && controlled_local_driver.is_none() {
         let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<ReleaseDaemonJob>(32);
         if retry_scheduler
             .lock()
@@ -2979,21 +3005,82 @@ pub fn send_bus_message_sync(
         sig_verified: false,
     };
     sign_bus_message(&mut msg, &signing_secret);
-    publish_prebuilt_bus_message_sync_with_transport(repo_root, msg, transport_secret)
+    publish_prebuilt_bus_message_sync_with_transport(repo_root, msg, transport_secret, None)
 }
 
 pub fn publish_prebuilt_bus_message_sync(
     repo_root: &Path,
     msg: BusMessage,
 ) -> Result<(BusMessage, BusAck), InstanceError> {
+    publish_prebuilt_bus_message_sync_with_fallback_daemon(repo_root, msg, None)
+}
+
+fn publish_prebuilt_bus_message_sync_with_fallback_daemon(
+    repo_root: &Path,
+    msg: BusMessage,
+    fallback_daemon: Option<DaemonState>,
+) -> Result<(BusMessage, BusAck), InstanceError> {
     let transport_secret = actor_transport_secret(&msg.sender);
-    publish_prebuilt_bus_message_sync_with_transport(repo_root, msg, transport_secret)
+    publish_prebuilt_bus_message_sync_with_transport(
+        repo_root,
+        msg,
+        transport_secret,
+        fallback_daemon,
+    )
+}
+
+fn resolve_linked_worktree_common_daemon(
+    selected: &chinwag_cli::execution_binding::RepositorySelection,
+) -> Option<DaemonState> {
+    let address = std::env::var("CHINWAG_BUS_ADDR").ok();
+    let endpoint = std::env::var("CHINWAG_BUS_ENDPOINT_ID").ok();
+    resolve_linked_worktree_common_daemon_with_env(
+        selected,
+        address.as_deref(),
+        endpoint.as_deref(),
+    )
+}
+
+fn resolve_linked_worktree_common_daemon_with_env(
+    selected: &chinwag_cli::execution_binding::RepositorySelection,
+    explicit_address: Option<&str>,
+    explicit_endpoint: Option<&str>,
+) -> Option<DaemonState> {
+    if explicit_address.is_some() || explicit_endpoint.is_some() {
+        return None;
+    }
+    selected.revalidate().ok()?;
+    let exec_root = selected.execution_root();
+    match read_verified_daemon_state_from_disk(exec_root) {
+        Ok(Some(_)) | Err(()) => return None,
+        Ok(None) => {}
+    }
+    let common_root = selected.common_worktree_root()?;
+    if common_root == exec_root {
+        return None;
+    }
+    let common_selected = chinwag_cli::execution_binding::select_repository(
+        chinwag_cli::execution_binding::RepoSelectors {
+            explicit_repo: Some(common_root),
+            environment_repo: None,
+            cwd: common_root,
+        },
+    )
+    .ok()?;
+    common_selected.revalidate().ok()?;
+    if !selected.same_common_git_identity(&common_selected) {
+        return None;
+    }
+    read_verified_daemon_state_from_disk(common_selected.execution_root())
+        .ok()
+        .flatten()
 }
 
 fn publish_prebuilt_bus_message_sync_with_transport(
     repo_root: &Path,
     mut msg: BusMessage,
     transport_secret: SecretKey,
+    fallback_daemon: Option<DaemonState>,
 ) -> Result<(BusMessage, BusAck), InstanceError> {
     if !verify_detached_bus_signature(repo_root, &mut msg) {
         return Err(InstanceError::SigningIdentityUnavailable);
@@ -3001,7 +3088,7 @@ fn publish_prebuilt_bus_message_sync_with_transport(
 
     let msg_id = msg.id.clone();
     let room_norm = msg.room.clone();
-    let daemon = read_daemon_state(repo_root);
+    let daemon = read_daemon_state(repo_root).or(fallback_daemon);
     let explicit_route = std::env::var_os("CHINWAG_BUS_ADDR").is_some()
         || std::env::var_os("CHINWAG_BUS_ENDPOINT_ID").is_some();
     complete_publication(
@@ -3047,7 +3134,7 @@ fn print_bus_help(stdout: &mut dyn Write) -> u8 {
   chinwag bus recovery sop --json
   chinwag bus network-status [--repo <path>] --json
   chinwag bus receipt --id <ORIGINAL-ID> --digest <SHA256> [--repo <path>] --json
-  chinwag bus daemon [--port <44330>] [--repo <path>] [--no-governors]
+  chinwag bus daemon [--port <44330>] [--repo <path>] [--no-governors] [--no-release-sync]
   chinwag bus daemon --network-room-origin <HTTPS> --network-coordinator <PUBLIC-ID> --network-peer <PUBLIC-ID>
     --relay-origin <HTTPS> --expected-relay-origin <HTTPS> --network-configuration <ID> --network-generation <U64> [--relay-only]
   chinwag bus send --from <SEAT#INSTANCE> [--room <ROOM>] [--to <ADDRESS,...>] [--task <TASK-ID>] [--json] --message <BODY>
@@ -3217,6 +3304,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     let mut network_args = std::collections::BTreeMap::<String, String>::new();
     let mut relay_only = false;
     let mut no_governors = false;
+    let mut no_release_sync = false;
     let mut repo_arg: Option<String> = None;
     let mut from_arg: Option<String> = None;
     let mut instance_arg: Option<String> = None;
@@ -3296,6 +3384,14 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     return 2;
                 }
                 no_governors = true;
+                i += 1;
+            }
+            "--no-release-sync" => {
+                if no_release_sync {
+                    let _ = writeln!(stderr, "chinwag bus: duplicate_network_selection");
+                    return 2;
+                }
+                no_release_sync = true;
                 i += 1;
             }
             "--repo" => {
@@ -3442,7 +3538,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             }
         }
     };
-    if no_governors && sub != "daemon" {
+    if (no_governors || no_release_sync) && sub != "daemon" {
         let _ = writeln!(stderr, "chinwag bus: invalid_arguments");
         return 2;
     }
@@ -3902,6 +3998,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 port_arg,
                 network_selection,
                 no_governors,
+                !no_release_sync,
                 stdout,
                 async {
                     let _ = tokio::signal::ctrl_c().await;
@@ -4534,9 +4631,17 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
                 commit_override: None,
             };
             match chinwag_cli::release_sync::publish_release(req, &store, |msg| {
-                publish_prebuilt_bus_message_sync(&repo_root, msg.clone())
-                    .map(|(_, ack)| ack.seq)
-                    .map_err(|e| e.to_string())
+                selected
+                    .revalidate()
+                    .map_err(|e| format!("repository selection invalidated: {e}"))?;
+                let fallback_daemon = resolve_linked_worktree_common_daemon(&selected);
+                publish_prebuilt_bus_message_sync_with_fallback_daemon(
+                    &repo_root,
+                    msg.clone(),
+                    fallback_daemon,
+                )
+                .map(|(_, ack)| ack.seq)
+                .map_err(|e| e.to_string())
             }) {
                 Ok(outcome) => {
                     if is_json {
@@ -6853,6 +6958,206 @@ mod tests {
                 _ => panic!("expected CommitReexec for current generation B"),
             }
         });
+    }
+
+    #[test]
+    fn no_release_sync_flag_validates_daemon_scope_and_reexec_arg_preservation() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        // `--no-release-sync` on a non-daemon subcommand must fail closed with exit 2.
+        let code = run_bus_cli(
+            &["status".to_owned(), "--no-release-sync".to_owned()],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 2);
+
+        // Duplicate `--no-release-sync` must fail closed with exit 2.
+        out.clear();
+        err.clear();
+        let dup_code = run_bus_cli(
+            &[
+                "daemon".to_owned(),
+                "--no-release-sync".to_owned(),
+                "--no-release-sync".to_owned(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(dup_code, 2);
+
+        // Canonical re-exec arg builder preserves both `--no-governors` and `--no-release-sync`.
+        let canonical = Path::new("/tmp/canonical-repo");
+        let args = vec![
+            "daemon".to_owned(),
+            "--repo".to_owned(),
+            "/tmp/old-repo".to_owned(),
+            "--port".to_owned(),
+            "44330".to_owned(),
+            "--no-governors".to_owned(),
+            "--no-release-sync".to_owned(),
+        ];
+        let rebuilt: Vec<String> = build_canonical_daemon_reexec_args(&args, canonical)
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rebuilt,
+            vec![
+                "bus",
+                "daemon",
+                "--repo",
+                "/tmp/canonical-repo",
+                "--port",
+                "44330",
+                "--no-governors",
+                "--no-release-sync",
+            ]
+        );
+    }
+
+    #[test]
+    fn linked_worktree_release_publish_discovers_active_common_repo_daemon() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let primary = base.join("primary-repo");
+        fs::create_dir_all(&primary).unwrap();
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(["init", "-q"])
+                .current_dir(&primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(primary.join("README.md"), "seed\n").unwrap();
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(["add", "README.md"])
+                .current_dir(&primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "seed",
+                ])
+                .current_dir(&primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let linked = base.join("linked-worktree");
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "wt-branch",
+                    linked.to_str().unwrap(),
+                ])
+                .current_dir(&primary)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let common_state = DaemonState {
+            ok: true,
+            pid: std::process::id(),
+            endpoint_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            bound_sockets: vec!["127.0.0.1:44330".to_owned()],
+            alpns: vec!["chinwag/bus/1".to_owned()],
+            repo_root: primary.to_string_lossy().into_owned(),
+            tasks_md: primary.join("TASKS.md").to_string_lossy().into_owned(),
+            messages_jsonl: messages_jsonl_path(&primary).to_string_lossy().into_owned(),
+            started_at: 1,
+            last_heartbeat: 1,
+            total_messages: 42,
+            product_governor: "DISABLED_CONTROLLED_INSTANCE".to_owned(),
+            delivery_router: "QUALIFIED_ADMISSION_REQUIRED".to_owned(),
+        };
+        write_daemon_state(&primary, &common_state).unwrap();
+
+        let primary_sel = chinwag_cli::execution_binding::select_repository(
+            chinwag_cli::execution_binding::RepoSelectors {
+                explicit_repo: Some(&primary),
+                environment_repo: None,
+                cwd: &primary,
+            },
+        )
+        .unwrap();
+        assert!(resolve_linked_worktree_common_daemon_with_env(&primary_sel, None, None).is_none());
+
+        let linked_sel = chinwag_cli::execution_binding::select_repository(
+            chinwag_cli::execution_binding::RepoSelectors {
+                explicit_repo: Some(&linked),
+                environment_repo: None,
+                cwd: &linked,
+            },
+        )
+        .unwrap();
+        let discovered = resolve_linked_worktree_common_daemon_with_env(&linked_sel, None, None)
+            .expect("linked worktree without local daemon must discover primary repo daemon");
+        assert_eq!(discovered.endpoint_id, common_state.endpoint_id);
+        assert_eq!(discovered.bound_sockets, common_state.bound_sockets);
+        // Clean worktree was not mutated by daemon discovery.
+        assert!(!linked.join(".chinwag").exists());
+
+        // Explicit env route suppresses fallback discovery.
+        assert!(
+            resolve_linked_worktree_common_daemon_with_env(
+                &linked_sel,
+                Some("127.0.0.1:44330"),
+                None
+            )
+            .is_none()
+        );
+
+        // Dead local daemon PID (and `pid == 0`) falls back cleanly to primary daemon.
+        let mut zero_pid_state = common_state.clone();
+        zero_pid_state.pid = 0;
+        write_daemon_state(&linked, &zero_pid_state).unwrap();
+        assert!(!is_live_positive_daemon_pid(0));
+        assert!(resolve_linked_worktree_common_daemon_with_env(&linked_sel, None, None).is_some());
+
+        // Active local daemon in linked worktree takes precedence.
+        let mut local_state = common_state.clone();
+        local_state.bound_sockets = vec!["127.0.0.1:45441".to_owned()];
+        write_daemon_state(&linked, &local_state).unwrap();
+        assert!(resolve_linked_worktree_common_daemon_with_env(&linked_sel, None, None).is_none());
+
+        // Symlinked local `daemon.json` fails closed (`None`) instead of silently masking tampering.
+        fs::remove_file(daemon_json_path(&linked)).unwrap();
+        let outside = base.join("outside-daemon.json");
+        let mut f = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&outside)
+            .unwrap();
+        f.write_all(b"{}").unwrap();
+        drop(f);
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&outside, daemon_json_path(&linked)).unwrap();
+        assert!(resolve_linked_worktree_common_daemon_with_env(&linked_sel, None, None).is_none());
     }
 }
 
