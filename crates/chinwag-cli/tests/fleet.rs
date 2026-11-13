@@ -397,3 +397,102 @@ fn explicit_native_store_cannot_be_authorized_by_a_fleet_manifest() {
     assert!(!temp.path().join("marker").exists());
     assert!(!store.exists());
 }
+
+#[test]
+fn fleet_launch_passes_prompt_timeout_and_json_via_argv_template() {
+    let (temp, mut manifest, path) = fixture("printf '%s' \"$1\"");
+    if let DriverSpec::CliSubprocess {
+        argv_template,
+        framing,
+        ..
+    } = &mut manifest.seats[0].driver
+    {
+        *framing = "argv".into();
+        *argv_template = vec!["{prompt}".into()];
+    }
+    save(&manifest, &path);
+    let output = cli(
+        temp.path(),
+        &[
+            "fleet",
+            "launch",
+            "--seat",
+            "default",
+            "--prompt",
+            "hello rust fleet",
+            "--timeout",
+            "15",
+            "--manifest",
+            path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["stdout"], "hello rust fleet");
+    assert_eq!(response["timed_out"], false);
+}
+
+#[test]
+fn multicall_seat_agent_symlink_dispatches_pure_rust_fleet_launch_and_status() {
+    let (temp, mut manifest, _path) = fixture("printf 'reply:%s' \"$1\"");
+    manifest.seats[0].id = chinwag_fleet::SeatId::new("CUSTOM-SEAT").unwrap();
+    if let DriverSpec::CliSubprocess {
+        argv_template,
+        framing,
+        ..
+    } = &mut manifest.seats[0].driver
+    {
+        *framing = "argv".into();
+        *argv_template = vec!["{composed_prompt}".into()];
+    }
+    let root = temp.path().canonicalize().unwrap();
+    let profile = root.join("profile");
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(profile.join("SOUL.md"), "Custom seat identity\n").unwrap();
+    manifest.seats[0].profile_dir = Some(profile);
+    manifest.seats[0].boot_files = vec!["SOUL.md".into()];
+    fs::create_dir_all(root.join(".chinwag")).unwrap();
+    let toml_path = root.join(".chinwag/fleet.toml");
+    fs::write(&toml_path, manifest.to_toml().unwrap()).unwrap();
+
+    let symlink_bin = root.join("custom-seat-agent");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_chinwag"), &symlink_bin).unwrap();
+
+    let status_out = Command::new(&symlink_bin)
+        .args(["status", "--json"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert!(
+        status_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status_json["seat"], "CUSTOM-SEAT");
+
+    let run_out = Command::new(&symlink_bin)
+        .args(["run", "--cwd", root.to_str().unwrap(), "perform", "task"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        run_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(stdout.contains("Custom seat identity"), "{stdout}");
+    assert!(stdout.contains("perform task"), "{stdout}");
+}

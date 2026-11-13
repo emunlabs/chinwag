@@ -22,7 +22,7 @@ fn main() -> ExitCode {
         .and_then(|p| std::path::Path::new(p).file_name())
         .and_then(|n| n.to_str())
         == Some("chinwag");
-    if let (true, Some(raw_args)) = (is_chinwag_prog, all_utf8) {
+    if let (true, Some(raw_args)) = (is_chinwag_prog, all_utf8.as_ref()) {
         if raw_args.get(1).map(|s| s.as_str()) == Some("onboard") {
             let identity = relay_run::resolve_identity_config();
             let mut mission_control_url = identity.mission_control_url.clone();
@@ -200,6 +200,23 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(code);
         }
+    }
+
+    if let Some(seat_slug) = raw_os
+        .first()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .and_then(|name| name.strip_suffix("-agent"))
+        .filter(|slug| !slug.is_empty() && *slug != "chinwag")
+        && let Some(raw_args) = all_utf8.as_ref()
+    {
+        let code = chinwag_cli::fleet_cmd::run_multicall_agent_cli(
+            seat_slug,
+            &raw_args[1..],
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        );
+        return ExitCode::from(code);
     }
 
     let mut args = std::env::args_os();

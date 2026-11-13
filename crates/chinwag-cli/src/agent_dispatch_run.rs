@@ -30,6 +30,7 @@ use chinwag_snapshot_session_private::replacement::{
 use chinwag_snapshot_session_private::{SnapshotSession, Value};
 use serde::Deserialize;
 use serde_json::json;
+#[cfg(test)]
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1076,35 +1077,10 @@ fn run_manifest_exchange(
     let definition = manifest.seat(seat).ok_or("UnknownSeat")?;
     let mut persona = load_persona(seat, custom);
     let workspace = cwd.canonicalize().map_err(|error| error.to_string())?;
-    for relative_path in &definition.boot_files {
-        let mut path = workspace.clone();
-        for component in Path::new(relative_path).components() {
-            if !matches!(component, std::path::Component::Normal(_)) {
-                return Err("boot_file_invalid".into());
-            }
-            path.push(component);
-            if fs::symlink_metadata(&path)
-                .map_err(|error| format!("boot_file_unavailable: {error}"))?
-                .file_type()
-                .is_symlink()
-            {
-                return Err("boot_file_invalid".into());
-            }
-        }
-        if !path
-            .canonicalize()
-            .map_err(|error| error.to_string())?
-            .starts_with(&workspace)
-        {
-            return Err("boot_file_invalid".into());
-        }
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("boot_file_unavailable: {error}"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err("boot_file_invalid".into());
-        }
-        let text =
-            fs::read_to_string(&path).map_err(|error| format!("boot_file_unavailable: {error}"))?;
+    let boot_base = plan.profile_dir.as_deref().unwrap_or(&workspace);
+    for (path, text) in chinwag_fleet::load_seat_boot_files(boot_base, &definition.boot_files)
+        .map_err(|error| error.to_string())?
+    {
         persona.push_str(&format!("\n--- {} ---\n{text}", path.display()));
     }
     let prompt = assemble_dispatch_prompt(

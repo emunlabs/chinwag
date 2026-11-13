@@ -6,10 +6,7 @@
 #![forbid(unsafe_code)]
 use crate::{FleetManifest, FleetPolicyError, FleetResult, SeatDefinition};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +15,8 @@ pub struct SkillPolicyRef {
     pub allowed_skills: Vec<String>,
     #[serde(default)]
     pub forbidden_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_invocation: Option<usize>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +27,8 @@ pub struct SkillConfig {
     pub paths: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub forbidden_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_invocation: Option<usize>,
 }
 pub struct SkillResolver;
 impl SkillResolver {
@@ -37,7 +38,19 @@ impl SkillResolver {
         requested: &[String],
         cwd: &std::path::Path,
     ) -> FleetResult<Vec<String>> {
-        let mut resolved = BTreeSet::new();
+        Ok(Self::resolve_files(manifest, seat, requested, cwd)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    pub fn resolve_files(
+        manifest: &FleetManifest,
+        seat: &SeatDefinition,
+        requested: &[String],
+        cwd: &std::path::Path,
+    ) -> FleetResult<Vec<(String, PathBuf)>> {
+        let mut resolved = BTreeMap::new();
         for name in requested {
             if name.is_empty()
                 || !name
@@ -64,7 +77,7 @@ impl SkillResolver {
                     .map(|root| manifest.resolve_path(root, cwd).join(name).join("SKILL.md"))
                     .collect()
             };
-            let mut found = false;
+            let mut found_path = None;
             for path in candidates {
                 if !path.exists() {
                     continue;
@@ -82,14 +95,25 @@ impl SkillResolver {
                     }
                 }
                 if path.is_file() {
-                    found = true;
+                    found_path = Some(path.canonicalize()?);
                     break;
                 }
             }
-            if !found {
+            let Some(resolved_path) = found_path else {
                 return Err(FleetPolicyError::MissingSkill(name.clone()));
-            }
-            resolved.insert(name.clone());
+            };
+            resolved.insert(name.clone(), resolved_path);
+        }
+        if let Some(limit) = seat
+            .skills
+            .max_per_invocation
+            .or(manifest.skills.max_per_invocation)
+            && resolved.len() > limit
+        {
+            return Err(FleetPolicyError::ForbiddenSkill(format!(
+                "requested {} skills exceeds max_per_invocation ({limit})",
+                resolved.len()
+            )));
         }
         Ok(resolved.into_iter().collect())
     }

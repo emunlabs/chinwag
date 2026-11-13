@@ -14,10 +14,10 @@ use chinwag_fleet::{
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-const HELP: &str = "Usage: chinwag fleet init --profile <solo|mesh|airgapped|cloud-pool>\n       chinwag fleet validate [--manifest <PATH>] [--strict-keys] [--json]\n       chinwag fleet status [--manifest <PATH>] [--json]\n       chinwag fleet explain --seat <SEAT> [--room <ROOM>] [--task-profile <NAME>] [--manifest <PATH>] [--json]\n       chinwag fleet launch --seat <SEAT> [--cwd <PATH>] [--skill <NAME>...] [--mode <interactive|headless>] [--manifest <PATH>]\n";
+const HELP: &str = "Usage: chinwag fleet init --profile <solo|mesh|airgapped|cloud-pool>\n       chinwag fleet validate [--manifest <PATH>] [--strict-keys] [--json]\n       chinwag fleet status [--manifest <PATH>] [--json]\n       chinwag fleet explain --seat <SEAT> [--room <ROOM>] [--task-profile <NAME>] [--cwd <PATH>] [--skill <NAME>...] [--manifest <PATH>] [--json]\n       chinwag fleet launch --seat <SEAT> [--room <ROOM>] [--task-profile <NAME>] [--cwd <PATH>] [--skill <NAME>...] [--prompt <TEXT>] [--timeout <SECS>] [--mode <interactive|headless>] [--manifest <PATH>] [--json]\n";
 
 /// Explicit path, then process configuration, then the current workspace.
 pub fn manifest_path(explicit: Option<&Path>, cwd: &Path) -> PathBuf {
@@ -58,10 +58,16 @@ impl Options {
         let mut options = Self::default();
         let mut index = 0;
         while index < args.len() {
-            let flag = args[index].as_str();
+            let raw_flag = args[index].as_str();
+            let flag = if raw_flag == "-p" {
+                "--prompt"
+            } else {
+                raw_flag
+            };
             match flag {
                 "--json"
-                    if matches!(command, "validate" | "status" | "explain") && !options.json =>
+                    if matches!(command, "validate" | "status" | "explain" | "launch")
+                        && !options.json =>
                 {
                     options.json = true
                 }
@@ -69,24 +75,26 @@ impl Options {
                     options.strict_keys = true
                 }
                 "--manifest" | "--fleet-manifest" | "--profile" | "--seat" | "--room"
-                | "--task-profile" | "--cwd" | "--mode" | "--skill" => {
+                | "--task-profile" | "--cwd" | "--mode" | "--skill" | "--prompt" | "--timeout" => {
                     let permitted = match flag {
                         "--manifest" | "--fleet-manifest" => true,
                         "--profile" => command == "init",
-                        "--seat" | "--room" | "--task-profile" => {
+                        "--seat" | "--room" | "--task-profile" | "--cwd" | "--skill" => {
                             matches!(command, "explain" | "launch")
                         }
-                        "--cwd" | "--mode" | "--skill" => command == "launch",
+                        "--mode" | "--prompt" | "--timeout" => command == "launch",
                         _ => false,
                     };
                     if !permitted {
-                        return Err(format!("invalid_arguments: {flag}"));
+                        return Err(format!("invalid_arguments: {raw_flag}"));
                     }
                     index += 1;
                     let value = args
                         .get(index)
-                        .filter(|value| !value.is_empty() && !value.starts_with("--"))
-                        .ok_or_else(|| format!("missing_argument: {flag}"))?;
+                        .filter(|value| {
+                            !value.is_empty() && (flag == "--prompt" || !value.starts_with("--"))
+                        })
+                        .ok_or_else(|| format!("missing_argument: {raw_flag}"))?;
                     if flag == "--skill" {
                         options.skills.push(value.clone());
                     } else if options
@@ -94,10 +102,10 @@ impl Options {
                         .insert(flag.to_owned(), value.clone())
                         .is_some()
                     {
-                        return Err(format!("duplicate_argument: {flag}"));
+                        return Err(format!("duplicate_argument: {raw_flag}"));
                     }
                 }
-                _ => return Err(format!("invalid_arguments: {flag}")),
+                _ => return Err(format!("invalid_arguments: {raw_flag}")),
             }
             index += 1;
         }
@@ -261,32 +269,373 @@ fn run_command(args: &[String], cwd: &Path) -> Result<(Value, bool, u8), String>
         "headless" => false,
         _ => return Err("invalid_mode".into()),
     };
-    let instance = crate::agent_instance::new_instance_id().map_err(|error| error.to_string())?;
-    let actor = format!("{}#{instance}", plan.seat.as_str());
+    let timeout_override_secs = options
+        .value("--timeout")
+        .map(|raw| {
+            raw.parse::<u64>()
+                .ok()
+                .filter(|secs| *secs > 0)
+                .ok_or_else(|| "invalid_timeout".to_owned())
+        })
+        .transpose()?;
+    let (actor, instance) = allocate_child_actor(plan.seat.as_str())?;
     let mut context = ExecutionContext {
         interactive,
+        prompt: options.value("--prompt").map(str::to_owned),
+        timeout_override_secs,
         ..Default::default()
     };
-    context.env.insert("CHINWAG_ACTOR".into(), actor.clone());
-    context.env.insert("CHINWAG_INSTANCE_ID".into(), instance);
+    install_actor_lineage(&mut context, &actor, &instance)?;
+    let outcome = execute_plan(&manifest, &plan, &context, &actor)?;
+    let code = if outcome.success { 0 } else { 1 };
+    Ok((
+        json!({
+            "ok": outcome.success,
+            "seat": plan.seat,
+            "actor": actor,
+            "model": plan.model,
+            "exit_code": outcome.exit_code,
+            "timed_out": outcome.timed_out,
+            "stdout": outcome.stdout,
+            "stderr": outcome.stderr
+        }),
+        options.json,
+        code,
+    ))
+}
+
+fn allocate_child_actor(seat: &str) -> Result<(String, String), String> {
+    let instance = crate::agent_instance::new_instance_id().map_err(|error| error.to_string())?;
+    Ok((format!("{seat}#{instance}"), instance))
+}
+
+fn install_actor_lineage(
+    context: &mut ExecutionContext,
+    actor: &str,
+    instance: &str,
+) -> Result<(), String> {
+    context.env.insert("CHINWAG_ACTOR".into(), actor.to_owned());
+    context
+        .env
+        .insert("CHINWAG_INSTANCE_ID".into(), instance.to_owned());
     if let Ok(caller) = std::env::var("CHINWAG_ACTOR") {
         let (seat, _) = caller.split_once('#').ok_or("BareSeatAddressRejected")?;
         let seat = chinwag_fleet::SeatId::new(seat).map_err(|error| error.to_string())?;
         chinwag_fleet::validate_actor(&seat, &caller).map_err(|error| error.to_string())?;
-        context
-            .env
-            .insert("CHINWAG_CALLER".into(), caller.to_string());
-        context
-            .env
-            .insert("CHINWAG_PARENT_INSTANCE".into(), caller.to_string());
+        context.env.insert("CHINWAG_CALLER".into(), caller.clone());
+        context.env.insert("CHINWAG_PARENT_INSTANCE".into(), caller);
     }
-    let outcome = execute_plan(&manifest, &plan, &context, &actor)?;
+    Ok(())
+}
+
+fn discover_multicall_manifest(explicit: Option<&Path>, cwd: &Path) -> PathBuf {
+    if let Some(path) = explicit {
+        return if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+    }
+    if let Some(env_path) = std::env::var_os("CHINWAG_FLEET_MANIFEST").filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(env_path);
+        return if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+    }
+    let workspace_manifest = cwd.join(".chinwag/fleet.toml");
+    if workspace_manifest.is_file() {
+        return workspace_manifest;
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        let home_manifest = PathBuf::from(home).join(".chinwag/fleet.toml");
+        if home_manifest.is_file() {
+            return home_manifest;
+        }
+    }
+    workspace_manifest
+}
+
+/// Dispatch symlinked `<seat>-agent` binaries through the declarative fleet manifest.
+pub fn run_multicall_agent_cli(
+    seat_slug: &str,
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            let _ = writeln!(err, "{seat_slug}-agent: {error}");
+            return 2;
+        }
+    };
+    let mut stdin = std::io::stdin();
+    let is_tty = stdin.is_terminal();
+    run_multicall_agent_cli_at(seat_slug, args, &cwd, &mut stdin, is_tty, out, err)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_multicall_agent_cli_at(
+    seat_slug: &str,
+    args: &[String],
+    cwd: &Path,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        let usage = format!(
+            "Usage: {seat_slug}-agent [run] [--cwd <PATH>] [--skill <NAME>...] [--room <ROOM>] [--task-profile <NAME>] [--timeout <SECS>] [--mode <interactive|headless>] [--manifest <PATH>] [--json] [-p|--prompt <TEXT> | <PROMPT...>]\n       {seat_slug}-agent status [--manifest <PATH>] [--json]\n       {seat_slug}-agent explain [--cwd <PATH>] [--skill <NAME>...] [--room <ROOM>] [--task-profile <NAME>] [--manifest <PATH>] [--json]\n"
+        );
+        return if out.write_all(usage.as_bytes()).is_ok() {
+            0
+        } else {
+            1
+        };
+    }
+
+    let (subcommand, rest) = match args.first().map(String::as_str) {
+        Some("status") => ("status", &args[1..]),
+        Some("explain") => ("explain", &args[1..]),
+        Some("run") => ("run", &args[1..]),
+        _ => ("run", args),
+    };
+
+    let mut values: BTreeMap<String, String> = BTreeMap::new();
+    let mut skills = Vec::new();
+    let mut positional = Vec::new();
+    let mut json_mode = false;
+    let mut idx = 0;
+    let mut after_double_dash = false;
+    while idx < rest.len() {
+        let raw = rest[idx].as_str();
+        if after_double_dash {
+            positional.push(raw.to_owned());
+            idx += 1;
+            continue;
+        }
+        if raw == "--" {
+            after_double_dash = true;
+            idx += 1;
+            continue;
+        }
+        let flag = if raw == "-p" { "--prompt" } else { raw };
+        match flag {
+            "--json" if !json_mode => json_mode = true,
+            "--manifest" | "--fleet-manifest" | "--cwd" | "--skill" | "--room"
+            | "--task-profile" | "--timeout" | "--mode" | "--prompt" => {
+                idx += 1;
+                let Some(val) = rest
+                    .get(idx)
+                    .filter(|v| !v.is_empty() && (flag == "--prompt" || !v.starts_with("--")))
+                else {
+                    let _ = writeln!(err, "{seat_slug}-agent: missing_argument: {raw}");
+                    return 2;
+                };
+                if flag == "--skill" {
+                    skills.push(val.clone());
+                } else if values.insert(flag.to_owned(), val.clone()).is_some() {
+                    let _ = writeln!(err, "{seat_slug}-agent: duplicate_argument: {raw}");
+                    return 2;
+                }
+            }
+            _ if raw.starts_with('-') => {
+                let _ = writeln!(err, "{seat_slug}-agent: invalid_arguments: {raw}");
+                return 2;
+            }
+            _ => positional.push(raw.to_owned()),
+        }
+        idx += 1;
+    }
+
+    let explicit_manifest = values
+        .get("--manifest")
+        .or_else(|| values.get("--fleet-manifest"))
+        .map(PathBuf::from);
+    let manifest_file = discover_multicall_manifest(explicit_manifest.as_deref(), cwd);
+    let manifest = match FleetManifest::load(&manifest_file) {
+        Ok(m) => m,
+        Err(error) => {
+            if json_mode {
+                let _ = writeln!(out, "{}", json!({"ok": false, "error": error.to_string()}));
+            }
+            let _ = writeln!(err, "{seat_slug}-agent: {error}");
+            return 2;
+        }
+    };
+    let Some(seat_def) = manifest
+        .seats
+        .iter()
+        .find(|seat| seat.id.as_str().eq_ignore_ascii_case(seat_slug))
+    else {
+        let msg = format!("UnknownSeat: {seat_slug}");
+        if json_mode {
+            let _ = writeln!(out, "{}", json!({"ok": false, "error": msg}));
+        }
+        let _ = writeln!(err, "{seat_slug}-agent: {msg}");
+        return 2;
+    };
+
+    if subcommand == "status" {
+        let payload = json!({
+            "ok": true,
+            "manifest": manifest_file,
+            "seat": seat_def.id,
+            "display_name": seat_def.display_name,
+            "lifecycle": seat_def.lifecycle,
+            "model": seat_def.model,
+            "target": seat_def.target_selector,
+            "profile_dir": seat_def.profile_dir,
+            "allowed_skills": seat_def.skills.allowed_skills,
+        });
+        let rendered = if json_mode {
+            serde_json::to_string(&payload)
+        } else {
+            serde_json::to_string_pretty(&payload)
+        };
+        return match rendered {
+            Ok(text) if writeln!(out, "{text}").is_ok() => 0,
+            _ => 1,
+        };
+    }
+
+    let execution_cwd = match values.get("--cwd").map(PathBuf::from) {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => cwd.join(path),
+        None => cwd.to_path_buf(),
+    };
+    let request = DispatchRequest {
+        seat: seat_def.id.as_str().to_owned(),
+        room: values.get("--room").cloned(),
+        task_profile: values.get("--task-profile").cloned(),
+        cwd: execution_cwd,
+        requested_skills: skills,
+        requested_write_globs: seat_def.allowed_write_roots.clone(),
+        ..Default::default()
+    };
+    let plan = match resolve_dispatch_plan(&manifest, &request) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if json_mode {
+                let _ = writeln!(out, "{}", json!({"ok": false, "error": error.to_string()}));
+            }
+            let _ = writeln!(err, "{seat_slug}-agent: {error}");
+            return 2;
+        }
+    };
+    if subcommand == "explain" {
+        let payload = json!({"ok": true, "manifest": manifest_file, "plan": plan});
+        let rendered = if json_mode {
+            serde_json::to_string(&payload)
+        } else {
+            serde_json::to_string_pretty(&payload)
+        };
+        return match rendered {
+            Ok(text) if writeln!(out, "{text}").is_ok() => 0,
+            _ => 1,
+        };
+    }
+
+    let interactive = match values
+        .get("--mode")
+        .map(String::as_str)
+        .unwrap_or("headless")
+    {
+        "interactive" => true,
+        "headless" => false,
+        _ => {
+            let _ = writeln!(err, "{seat_slug}-agent: invalid_mode");
+            return 2;
+        }
+    };
+    let timeout_override_secs = match values
+        .get("--timeout")
+        .map(|raw| {
+            raw.parse::<u64>()
+                .ok()
+                .filter(|secs| *secs > 0)
+                .ok_or_else(|| "invalid_timeout".to_owned())
+        })
+        .transpose()
+    {
+        Ok(val) => val,
+        Err(msg) => {
+            let _ = writeln!(err, "{seat_slug}-agent: {msg}");
+            return 2;
+        }
+    };
+
+    let mut prompt = values.get("--prompt").cloned();
+    if prompt.is_none() && !positional.is_empty() {
+        prompt = Some(positional.join(" "));
+    }
+    if prompt.is_none() && !stdin_is_terminal {
+        let mut buf = String::new();
+        if stdin.read_to_string(&mut buf).is_ok() && !buf.trim().is_empty() {
+            prompt = Some(buf);
+        }
+    }
+
+    let (actor, instance) = match allocate_child_actor(plan.seat.as_str()) {
+        Ok(ids) => ids,
+        Err(msg) => {
+            let _ = writeln!(err, "{seat_slug}-agent: {msg}");
+            return 2;
+        }
+    };
+    let mut context = ExecutionContext {
+        interactive,
+        prompt,
+        timeout_override_secs,
+        ..Default::default()
+    };
+    if let Err(msg) = install_actor_lineage(&mut context, &actor, &instance) {
+        let _ = writeln!(err, "{seat_slug}-agent: {msg}");
+        return 2;
+    }
+    let outcome = match execute_plan(&manifest, &plan, &context, &actor) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if json_mode {
+                let _ = writeln!(out, "{}", json!({"ok": false, "error": error}));
+            }
+            let _ = writeln!(err, "{seat_slug}-agent: {error}");
+            return 2;
+        }
+    };
     let code = if outcome.success { 0 } else { 1 };
-    Ok((
-        json!({"ok": outcome.success, "seat": plan.seat, "exit_code": outcome.exit_code, "stdout": outcome.stdout, "stderr": outcome.stderr}),
-        false,
-        code,
-    ))
+    if json_mode {
+        let payload = json!({
+            "ok": outcome.success,
+            "seat": plan.seat,
+            "actor": actor,
+            "model": plan.model,
+            "exit_code": outcome.exit_code,
+            "timed_out": outcome.timed_out,
+            "stdout": outcome.stdout,
+            "stderr": outcome.stderr,
+        });
+        if writeln!(out, "{payload}").is_err() {
+            return 1;
+        }
+        return code;
+    }
+    if !outcome.stdout.is_empty() && out.write_all(outcome.stdout.as_bytes()).is_err() {
+        return 1;
+    }
+    if !outcome.stdout.is_empty() && !outcome.stdout.ends_with('\n') {
+        let _ = out.write_all(b"\n");
+    }
+    if !outcome.stderr.is_empty() {
+        let _ = err.write_all(outcome.stderr.as_bytes());
+    }
+    code
 }
 
 /// Every mutating launch passes the same path lease and isolation gate as wakes.

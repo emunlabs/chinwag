@@ -118,6 +118,12 @@ pub struct ResolvedDispatchPlan {
     pub cwd: PathBuf,
     pub manifest_digest: String,
     pub resolved_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_dir: Option<PathBuf>,
+    #[serde(skip)]
+    pub resolved_skill_files: Vec<(String, PathBuf)>,
+    #[serde(skip)]
+    pub boot_files: Vec<String>,
     #[serde(skip)]
     resolved_cwd: PathBuf,
     #[serde(skip)]
@@ -233,8 +239,17 @@ pub fn resolve_dispatch_plan(
             "room is required by policy".into(),
         ));
     }
-    let allowed_skills =
-        SkillResolver::resolve(manifest, seat, &request.requested_skills, &request.cwd)?;
+    let resolved_skill_files =
+        SkillResolver::resolve_files(manifest, seat, &request.requested_skills, &request.cwd)?;
+    let allowed_skills = resolved_skill_files
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let profile_dir = seat
+        .profile_dir
+        .as_ref()
+        .map(|dir| resolve_clean_directory(&manifest.resolve_path(dir, &request.cwd)))
+        .transpose()?;
     crate::isolation::authorize_write_roots(
         &request.requested_write_globs,
         &seat.allowed_write_roots,
@@ -337,6 +352,9 @@ pub fn resolve_dispatch_plan(
         cwd: cwd.clone(),
         manifest_digest: manifest.digest()?,
         resolved_node,
+        profile_dir,
+        resolved_skill_files,
+        boot_files: seat.boot_files.clone(),
         resolved_cwd: cwd,
         policy_digest: String::new(),
         execution_lease: None,
@@ -415,6 +433,7 @@ pub struct ExecutionContext {
     pub interactive: bool,
     /// Remove ambient/manifest credential namespaces before trusted context is installed.
     pub scrub_env_prefixes: Vec<String>,
+    pub timeout_override_secs: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionOutcome {
@@ -477,10 +496,25 @@ impl ProcessExecutionDriver {
                 "HTTP driver requires a registered implementation".into(),
             ));
         };
+        if context.timeout_override_secs == Some(0) {
+            return Err(FleetPolicyError::InvalidManifest(
+                "timeout_secs must be positive".into(),
+            ));
+        }
+        let effective_timeout = context.timeout_override_secs.unwrap_or(*timeout_secs);
+        let needs_composed_prompt = argv_template
+            .iter()
+            .any(|arg| arg.contains("{composed_prompt}"))
+            || framing == "composed_stdin";
+        let composed_prompt = if needs_composed_prompt {
+            Some(compose_prompt(plan, context)?)
+        } else {
+            None
+        };
         let executable = resolve_binary(executable)?;
         let mut command = Command::new(executable);
         for arg in argv_template {
-            command.arg(expand(arg, plan, context)?);
+            command.arg(expand(arg, plan, context, composed_prompt.as_deref())?);
         }
         command.current_dir(&plan.cwd);
         configure_env(
@@ -515,7 +549,7 @@ impl ProcessExecutionDriver {
                 env_overrides,
             )?;
             let mut child = preflight.spawn()?;
-            let (status, _, _) = wait_timeout(&mut child, *timeout_secs, None, true)?;
+            let (status, _, _) = wait_timeout(&mut child, effective_timeout, None, true)?;
             if !status.success() {
                 return Err(FleetPolicyError::DriverExecutionFailed(
                     "authentication preflight failed".into(),
@@ -535,6 +569,8 @@ impl ProcessExecutionDriver {
             let mut input = tempfile::tempfile()?;
             if framing == "stdin" {
                 input.write_all(context.prompt.as_deref().unwrap_or("").as_bytes())?;
+            } else if framing == "composed_stdin" {
+                input.write_all(composed_prompt.as_deref().unwrap_or("").as_bytes())?;
             }
             input.seek(SeekFrom::Start(0))?;
             command
@@ -551,7 +587,7 @@ impl ProcessExecutionDriver {
         on_started(child.id());
         let (status, timed_out, output_limit_exceeded) = wait_timeout(
             &mut child,
-            *timeout_secs,
+            effective_timeout,
             Some((&stdout, &stderr)),
             !context.interactive,
         )?;
@@ -618,33 +654,173 @@ fn wait_timeout(
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+/// Verify every path component is free of symlinks and resolves to a directory.
+pub fn resolve_clean_directory(path: &Path) -> FleetResult<PathBuf> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            return Err(FleetPolicyError::InvalidManifest(format!(
+                "symlink profile_dir: {}",
+                path.display()
+            )));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(FleetPolicyError::InvalidManifest(format!(
+            "profile_dir must be a regular directory: {}",
+            path.display()
+        )));
+    }
+    Ok(path.canonicalize()?)
+}
+
+/// Load workspace-relative boot files while rejecting symlinks and traversal escapes.
+pub fn load_seat_boot_files(
+    base_dir: &Path,
+    boot_files: &[String],
+) -> FleetResult<Vec<(PathBuf, String)>> {
+    let canonical_base = base_dir.canonicalize()?;
+    let mut loaded = Vec::with_capacity(boot_files.len());
+    for relative_path in boot_files {
+        let mut path = canonical_base.clone();
+        for component in Path::new(relative_path).components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(FleetPolicyError::InvalidManifest(
+                    "boot_file_invalid".into(),
+                ));
+            }
+            path.push(component);
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                FleetPolicyError::InvalidManifest(format!("boot_file_unavailable: {error}"))
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(FleetPolicyError::InvalidManifest(
+                    "boot_file_invalid".into(),
+                ));
+            }
+        }
+        if !path.canonicalize()?.starts_with(&canonical_base) {
+            return Err(FleetPolicyError::InvalidManifest(
+                "boot_file_invalid".into(),
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            FleetPolicyError::InvalidManifest(format!("boot_file_unavailable: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(FleetPolicyError::InvalidManifest(
+                "boot_file_invalid".into(),
+            ));
+        }
+        let text = std::fs::read_to_string(&path).map_err(|error| {
+            FleetPolicyError::InvalidManifest(format!("boot_file_unavailable: {error}"))
+        })?;
+        loaded.push((path, text));
+    }
+    Ok(loaded)
+}
+
+fn compose_prompt(plan: &ResolvedDispatchPlan, context: &ExecutionContext) -> FleetResult<String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "Seat: {}", plan.seat.as_str());
+    let _ = writeln!(
+        out,
+        "Model: {}/{}",
+        plan.model.provider, plan.model.model_id
+    );
+    let _ = writeln!(out, "Working directory: {}", plan.cwd.display());
+    if let Some(profile_dir) = &plan.profile_dir {
+        let _ = writeln!(out, "Profile directory: {}", profile_dir.display());
+    }
+    let boot_base = plan.profile_dir.as_deref().unwrap_or(&plan.cwd);
+    for (path, text) in load_seat_boot_files(boot_base, &plan.boot_files)? {
+        let _ = write!(out, "\n--- {} ---\n{}", path.display(), text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    for (skill_name, skill_path) in &plan.resolved_skill_files {
+        let text = std::fs::read_to_string(skill_path)?;
+        let _ = write!(
+            out,
+            "\n--- skill: {skill_name} ({}) ---\n{}",
+            skill_path.display(),
+            text
+        );
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if let Some(prompt) = context.prompt.as_deref().filter(|p| !p.is_empty()) {
+        let _ = write!(out, "\n## Task\n\n{prompt}");
+    }
+    Ok(out)
+}
+
 fn expand(
     arg: &str,
     plan: &ResolvedDispatchPlan,
     context: &ExecutionContext,
+    composed_prompt: Option<&str>,
 ) -> FleetResult<String> {
-    let mut arg = arg
-        .replace("{model}", &plan.model.model_id)
-        .replace("{provider}", &plan.model.provider)
-        .replace("{seat}", plan.seat.as_str())
-        .replace("{cwd}", &plan.cwd.to_string_lossy())
-        .replace("{prompt}", context.prompt.as_deref().unwrap_or(""));
-    for (key, value) in &plan.model.params {
-        arg = arg.replace(
-            &format!("{{param:{key}}}"),
-            value
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| value.to_string())
-                .as_str(),
-        );
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            out.push_str(&rest[open..]);
+            rest = "";
+            break;
+        };
+        let token = &after_open[..close];
+        let replacement: Option<String> = match token {
+            "model" => Some(plan.model.model_id.clone()),
+            "provider" => Some(plan.model.provider.clone()),
+            "seat" => Some(plan.seat.as_str().to_owned()),
+            "cwd" => Some(plan.cwd.to_string_lossy().into_owned()),
+            "profile_dir" => {
+                let dir = plan.profile_dir.as_ref().ok_or_else(|| {
+                    FleetPolicyError::InvalidManifest("unbound profile_dir template".into())
+                })?;
+                Some(dir.to_string_lossy().into_owned())
+            }
+            "composed_prompt" => Some(
+                composed_prompt
+                    .unwrap_or_else(|| context.prompt.as_deref().unwrap_or(""))
+                    .to_owned(),
+            ),
+            "prompt" => Some(context.prompt.as_deref().unwrap_or("").to_owned()),
+            _ if token.starts_with("param:") => {
+                let key = &token["param:".len()..];
+                let value = plan.model.params.get(key).ok_or_else(|| {
+                    FleetPolicyError::InvalidManifest("unbound model parameter template".into())
+                })?;
+                Some(
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string()),
+                )
+            }
+            _ => None,
+        };
+        match replacement {
+            Some(value) => out.push_str(&value),
+            None => {
+                out.push('{');
+                out.push_str(token);
+                out.push('}');
+            }
+        }
+        rest = &after_open[close + 1..];
     }
-    if arg.contains("{param:") {
-        return Err(FleetPolicyError::InvalidManifest(
-            "unbound model parameter template".into(),
-        ));
-    }
-    Ok(arg)
+    out.push_str(rest);
+    Ok(out)
 }
 fn configure_env(
     command: &mut Command,
@@ -738,6 +914,7 @@ fn configure_env(
     }
     command
         .env("CHINWAG_ALLOWED_SKILLS", plan.allowed_skills.join(","))
+        .env("CHINWAG_SELECTED_SKILLS", plan.allowed_skills.join(","))
         .env(
             "CHINWAG_TARGET",
             serde_json::to_string(&plan.target)
@@ -751,6 +928,9 @@ fn configure_env(
                 .map_err(|e| FleetPolicyError::InvalidManifest(e.to_string()))?,
         )
         .env("CHINWAG_FLEET_DIGEST", &plan.manifest_digest);
+    if let Some(profile_dir) = &plan.profile_dir {
+        command.env("CHINWAG_PROFILE_DIR", profile_dir);
+    }
     if let Some(node) = &plan.resolved_node {
         command.env("CHINWAG_TARGET_NODE", node);
     }

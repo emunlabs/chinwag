@@ -949,3 +949,99 @@ fn interactive_children_keep_foreground_process_group_and_headless_children_isol
         }
     }
 }
+
+#[test]
+fn max_skills_per_invocation_enforces_cap_and_seat_override() {
+    let mut f = Fixture::new();
+    f.manifest.skills.max_per_invocation = Some(3);
+    for idx in 1..=4 {
+        let name = format!("skill-{idx}");
+        let dir = f.root.join("skills").join(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), format!("Skill {idx}\n")).unwrap();
+        f.manifest.seats[0].skills.allowed_skills.push(name);
+    }
+    f.manifest.skills.roots = vec![f.root.join("skills")];
+
+    let mut req = f.request();
+    req.requested_skills = vec![
+        "skill-1".into(),
+        "skill-2".into(),
+        "skill-3".into(),
+        "skill-1".into(),
+    ];
+    assert_eq!(
+        resolve_dispatch_plan(&f.manifest, &req)
+            .unwrap()
+            .allowed_skills
+            .len(),
+        3
+    );
+
+    req.requested_skills.push("skill-4".into());
+    assert!(matches!(
+        resolve_dispatch_plan(&f.manifest, &req),
+        Err(FleetPolicyError::ForbiddenSkill(_))
+    ));
+
+    f.manifest.seats[0].skills.max_per_invocation = Some(1);
+    req.requested_skills = vec!["skill-1".into(), "skill-2".into()];
+    assert!(matches!(
+        resolve_dispatch_plan(&f.manifest, &req),
+        Err(FleetPolicyError::ForbiddenSkill(_))
+    ));
+}
+
+#[test]
+fn profile_dir_and_composed_prompt_expand_boot_and_selected_skills_and_reject_symlinks() {
+    use std::os::unix::fs::symlink;
+    let mut f = Fixture::new();
+    let profile = f.root.join("seat-profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("SOUL.md"), "Generic seat persona\n").unwrap();
+    let skill_dir = f.root.join("skills/alpha");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "Alpha domain procedure\n").unwrap();
+    f.manifest.skills.roots = vec![f.root.join("skills")];
+    f.manifest.seats[0].skills.allowed_skills = vec!["alpha".into()];
+    f.manifest.seats[0].profile_dir = Some(profile.clone());
+    f.manifest.seats[0].boot_files = vec!["SOUL.md".into()];
+    if let DriverSpec::CliSubprocess {
+        argv_template,
+        framing,
+        ..
+    } = &mut f.manifest.seats[0].driver
+    {
+        *framing = "argv".into();
+        *argv_template = vec![
+            "-c".into(),
+            "printf '%s|%s|%s' \"$CHINWAG_PROFILE_DIR\" \"$CHINWAG_SELECTED_SKILLS\" \"$1\"".into(),
+            "worker".into(),
+            "{composed_prompt}".into(),
+        ];
+    }
+
+    let mut req = f.request();
+    req.requested_skills = vec!["alpha".into()];
+    let plan = resolve_dispatch_plan(&f.manifest, &req).unwrap();
+    let context = ExecutionContext {
+        env: BTreeMap::from([("CHINWAG_ACTOR".into(), "default#run".into())]),
+        prompt: Some("Literal {model} stays unexpanded".into()),
+        ..Default::default()
+    };
+    let outcome = ProcessExecutionDriver.execute(&plan, &context).unwrap();
+    assert!(outcome.success, "{}", outcome.stderr);
+    assert!(outcome.stdout.contains(&profile.display().to_string()));
+    assert!(outcome.stdout.contains("|alpha|"));
+    assert!(outcome.stdout.contains("Generic seat persona"));
+    assert!(outcome.stdout.contains("Alpha domain procedure"));
+    assert!(outcome.stdout.contains("Literal {model} stays unexpanded"));
+
+    let symlink_profile = f.root.join("symlink-profile");
+    symlink(&profile, &symlink_profile).unwrap();
+    f.manifest.seats[0].profile_dir = Some(symlink_profile);
+    assert!(matches!(
+        resolve_dispatch_plan(&f.manifest, &req),
+        Err(FleetPolicyError::InvalidManifest(_))
+    ));
+}

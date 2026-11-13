@@ -120,6 +120,8 @@ pub struct SeatDefinition {
     pub skills: SkillPolicyRef,
     #[serde(default)]
     pub boot_files: Vec<PathTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +347,19 @@ impl FleetManifest {
                     "boot files must be workspace relative".into(),
                 ));
             }
+            if let Some(profile_dir) = &seat.profile_dir {
+                let raw = profile_dir.to_string_lossy();
+                if profile_dir.as_os_str().is_empty()
+                    || raw.contains(['\0', '\n'])
+                    || profile_dir
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(FleetPolicyError::InvalidManifest(
+                        "invalid seat profile_dir".into(),
+                    ));
+                }
+            }
         }
         let mut nodes = BTreeSet::new();
         for node in &self.nodes {
@@ -469,6 +484,7 @@ impl FleetManifest {
             allowed_rooms: None,
             skills: SkillPolicyRef::default(),
             boot_files: vec![],
+            profile_dir: None,
         });
         manifest.validate()?;
         Ok(manifest)
