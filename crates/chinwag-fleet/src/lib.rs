@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod driver;
+pub mod http_driver;
 pub mod isolation;
 pub mod keys;
 pub mod manifest;
@@ -17,6 +18,7 @@ pub mod skills;
 pub mod topology;
 
 pub use driver::*;
+pub use http_driver::*;
 pub use isolation::*;
 pub use keys::*;
 pub use manifest::*;

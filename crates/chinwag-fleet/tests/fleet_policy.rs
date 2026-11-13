@@ -283,6 +283,8 @@ fn http_egress_denies_all_and_prefix_confusion() {
         wire_mode: "responses".into(),
         stream_mode: "none".into(),
         timeout_secs: 5,
+        auth_isolation: CredentialIsolation::NoneLocal,
+        tools: Default::default(),
     };
     for policy in [
         EgressPolicy::DenyAll,

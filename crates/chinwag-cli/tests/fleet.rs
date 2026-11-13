@@ -496,3 +496,741 @@ fn multicall_seat_agent_symlink_dispatches_pure_rust_fleet_launch_and_status() {
     assert!(stdout.contains("Custom seat identity"), "{stdout}");
     assert!(stdout.contains("perform task"), "{stdout}");
 }
+
+fn spawn_mock_json_server(responses: Vec<String>) -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for body in responses {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn multicall_status_flag_and_prompt_file_and_locked_model_effort_enforced() {
+    let (temp, mut manifest, _) = fixture("printf 'got:%s' \"$1\"");
+    manifest.seats[0].id = chinwag_fleet::SeatId::new("LOCKED-SEAT").unwrap();
+    manifest.seats[0].model.model_id = "locked-model-v2".into();
+    manifest.seats[0].model.params = BTreeMap::from([
+        ("effort".into(), Value::String("high".into())),
+        ("lock_effort".into(), Value::Bool(true)),
+        (
+            "logical_model".into(),
+            Value::String("vendor/locked-model-v2".into()),
+        ),
+    ]);
+    if let DriverSpec::CliSubprocess {
+        argv_template,
+        framing,
+        ..
+    } = &mut manifest.seats[0].driver
+    {
+        *framing = "argv".into();
+        *argv_template = vec!["{composed_prompt}".into()];
+    }
+    let root = temp.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".chinwag")).unwrap();
+    fs::write(root.join(".chinwag/fleet.toml"), manifest.to_toml().unwrap()).unwrap();
+    let prompt_file = root.join("task_prompt.txt");
+    fs::write(&prompt_file, "prompt loaded from file\n").unwrap();
+
+    let symlink_bin = root.join("locked-seat-agent");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_chinwag"), &symlink_bin).unwrap();
+
+    // --status --json reports credentials_ready: true
+    let status_out = Command::new(&symlink_bin)
+        .args(["--status", "--json"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert!(
+        status_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status_json["ok"], true);
+    assert_eq!(status_json["credentials_ready"], true);
+
+    // --prompt-file reads prompt text cleanly
+    let run_out = Command::new(&symlink_bin)
+        .args([
+            "-m",
+            "vendor/locked-model-v2",
+            "--effort",
+            "high",
+            "--prompt-file",
+            prompt_file.to_str().unwrap(),
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        run_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_out.stdout).contains("prompt loaded from file"),
+        "{}",
+        String::from_utf8_lossy(&run_out.stdout)
+    );
+
+    // Fail-closed unauthorized model
+    let bad_model = Command::new(&symlink_bin)
+        .args(["-m", "unauthorized-model", "-p", "ping"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert_eq!(bad_model.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad_model.stderr).contains("ModelSwitchDenied"),
+        "{}",
+        String::from_utf8_lossy(&bad_model.stderr)
+    );
+
+    // Fail-closed effort override when lock_effort = true
+    let bad_effort = Command::new(&symlink_bin)
+        .args(["--effort", "xhigh", "-p", "ping"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert_eq!(bad_effort.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad_effort.stderr).contains("EffortSwitchDenied"),
+        "{}",
+        String::from_utf8_lossy(&bad_effort.stderr)
+    );
+}
+
+#[test]
+fn multicall_aliases_and_anti_spoofing_and_seat_actions_work_via_manifest() {
+    let base_url = spawn_mock_json_server(vec![
+        r#"{"success":true,"result":{"answers":{"flag":0.05}}}"#.to_owned(),
+        r#"{"success":true,"result":{"answers":{"dora_complexity_tier":"S"}}}"#.to_owned(),
+    ]);
+    let (temp, mut manifest, _) = fixture("printf 'target:%s' \"$1\"");
+    manifest.seats[0].id = chinwag_fleet::SeatId::new("TARGET-SEAT").unwrap();
+    if let DriverSpec::CliSubprocess {
+        argv_template,
+        framing,
+        ..
+    } = &mut manifest.seats[0].driver
+    {
+        *framing = "argv".into();
+        *argv_template = vec!["{composed_prompt}".into()];
+    }
+    let root = temp.path().canonicalize().unwrap();
+    let env_path = root.join("cf.env");
+    fs::write(&env_path, "CF_TOKEN=test-token\n").unwrap();
+    fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    manifest.extensions.insert(
+        "multicall_aliases".into(),
+        serde_json::json!({ "mercury": "*" }),
+    );
+    manifest.extensions.insert(
+        "seat_actions".into(),
+        serde_json::json!({
+            "TARGET-SEAT": {
+                "clef": {
+                    "kind": "workers_ai_structured",
+                    "base_url": base_url,
+                    "account_id": "0123456789abcdef0123456789abcdef",
+                    "secret_env_file": env_path,
+                    "secret_key": "CF_TOKEN",
+                    "model": "@cf/example/clef",
+                    "payload_mode": "clef_state",
+                    "questions": {"flag": {"type": "noul"}}
+                },
+                "clairic": {
+                    "kind": "workers_ai_structured",
+                    "base_url": base_url,
+                    "account_id": "0123456789abcdef0123456789abcdef",
+                    "secret_env_file": env_path,
+                    "secret_key": "CF_TOKEN",
+                    "model": "@cf/example/clairic",
+                    "payload_mode": "clairic_text",
+                    "fields": {"dora_complexity_tier": {"type": "text"}}
+                }
+            }
+        }),
+    );
+
+    fs::create_dir_all(root.join(".chinwag")).unwrap();
+    fs::write(root.join(".chinwag/fleet.toml"), manifest.to_toml().unwrap()).unwrap();
+
+    let alias_bin = root.join("mercury-agent");
+    let direct_bin = root.join("target-seat-agent");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_chinwag"), &alias_bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_chinwag"), &direct_bin).unwrap();
+
+    // Alias resolves --seat TARGET-SEAT cleanly
+    let alias_run = Command::new(&alias_bin)
+        .args(["--seat", "TARGET-SEAT", "-p", "hello alias"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        alias_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&alias_run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&alias_run.stdout).contains("hello alias"),
+        "{}",
+        String::from_utf8_lossy(&alias_run.stdout)
+    );
+
+    // Direct seat launcher rejects mismatched --seat (SeatMismatch)
+    let spoof = Command::new(&direct_bin)
+        .args(["--seat", "OTHER-SEAT", "status"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert_eq!(spoof.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&spoof.stderr).contains("SeatMismatch"),
+        "{}",
+        String::from_utf8_lossy(&spoof.stderr)
+    );
+
+    // Manifest-driven custom seat_actions: clef + clairic
+    let clef_out = Command::new(&direct_bin)
+        .args(["clef", "--json", "--prompt", "{\"task\":\"CHWG-1\"}"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert!(
+        clef_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clef_out.stderr)
+    );
+    let clef_json: Value = serde_json::from_slice(&clef_out.stdout).unwrap();
+    assert_eq!(clef_json["result"]["answers"]["flag"], 0.05);
+
+    let clairic_out = Command::new(&alias_bin)
+        .args([
+            "--seat",
+            "TARGET-SEAT",
+            "clairic",
+            "--json",
+            "--prompt",
+            "Estimate this slice",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert!(
+        clairic_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clairic_out.stderr)
+    );
+    let clairic_json: Value = serde_json::from_slice(&clairic_out.stdout).unwrap();
+    assert_eq!(
+        clairic_json["result"]["answers"]["dora_complexity_tier"],
+        "S"
+    );
+}
+
+fn spawn_mock_status_server(
+    responses: Vec<(u16, String)>,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let cap_clone = Arc::clone(&captured);
+    let handle = std::thread::spawn(move || {
+        for (status, body) in responses {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            };
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw.extend_from_slice(&buf[..n]);
+                        if let Some(hdr_end) =
+                            raw.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let headers_str =
+                                String::from_utf8_lossy(&raw[..hdr_end]);
+                            let content_len = headers_str
+                                .lines()
+                                .find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    k.trim()
+                                        .eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if raw.len() >= hdr_end + 4 + content_len {
+                                let json_bytes =
+                                    &raw[hdr_end + 4..hdr_end + 4 + content_len];
+                                if let Ok(v) =
+                                    serde_json::from_slice::<Value>(json_bytes)
+                                {
+                                    cap_clone.lock().unwrap().push(v);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let reason = if status == 400 { "Bad Request" } else { "OK" };
+            let reply = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    (format!("http://{addr}/v1"), captured, handle)
+}
+
+fn setup_openai_http_manifest(
+    root: &Path,
+    base_url: &str,
+    lock_effort: bool,
+) -> (PathBuf, PathBuf) {
+    let mut manifest = FleetManifest::starter_profile("solo").unwrap();
+    let seat = &mut manifest.seats[0];
+    seat.id = chinwag_fleet::SeatId::new("QA").unwrap();
+    seat.lifecycle = chinwag_fleet::SeatLifecycle::ActiveStanding;
+    seat.model.provider = "vercel-ai-gateway".into();
+    seat.model.model_id = "inception/mercury-3".into();
+    seat.model.params = BTreeMap::from([
+        ("effort".into(), Value::String("high".into())),
+        ("reasoning_effort".into(), Value::String("high".into())),
+        ("lock_effort".into(), Value::Bool(lock_effort)),
+    ]);
+    let env_path = root.join("vercel.env");
+    fs::write(&env_path, "VERCEL_API_KEY=test-vercel-key\n").unwrap();
+    fs::set_permissions(&env_path, fs::Permissions::from_mode(0o600)).unwrap();
+    seat.driver = DriverSpec::OpenAiCompatibleHttp {
+        base_url: base_url.to_owned(),
+        api_key_env: "VERCEL_API_KEY".into(),
+        wire_mode: "chat_completions".into(),
+        stream_mode: "none".into(),
+        timeout_secs: 30,
+        auth_isolation: CredentialIsolation::SecretEnvFile {
+            path: env_path,
+            key_map: BTreeMap::new(),
+        },
+        tools: chinwag_fleet::HttpToolConfig {
+            enabled: true,
+            allowed_write_roots: Vec::new(),
+            auth_fetches: Vec::new(),
+            env_injections: Vec::new(),
+            max_turns: Some(8),
+            max_tool_calls: Some(8),
+            max_output_tokens: Some(1024),
+        },
+    };
+    manifest.pubkey_map = BTreeMap::from([(
+        seat.id.clone(),
+        "01".repeat(32),
+    )]);
+    manifest.allowed_signers = manifest.pubkey_map.clone();
+    fs::create_dir_all(root.join(".chinwag")).unwrap();
+    let manifest_path = root.join(".chinwag/fleet.toml");
+    fs::write(&manifest_path, manifest.to_toml().unwrap()).unwrap();
+    let symlink_bin = root.join("qa-agent");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_chinwag"), &symlink_bin).unwrap();
+    (manifest_path, symlink_bin)
+}
+
+#[test]
+fn http_usage_multiturn_counted_and_readonly_tools_and_receipt_file() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let target_file = root.join("sample.txt");
+    fs::write(&target_file, "hello readonly qa\n").unwrap();
+
+    let turn1 = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "tc_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"sample.txt\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_tokens_details": {"cached_tokens": 10},
+            "completion_tokens_details": {"reasoning_tokens": 5}
+        }
+    })
+    .to_string();
+    let turn2 = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "VERIFIED"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 150,
+            "completion_tokens": 30,
+            "total_tokens": 180,
+            "prompt_tokens_details": {"cached_tokens": 25},
+            "completion_tokens_details": {"reasoning_tokens": 7}
+        }
+    })
+    .to_string();
+
+    let (base_url, captured, handle) =
+        spawn_mock_status_server(vec![(200, turn1), (200, turn2)]);
+    let (_manifest_path, qa_bin) = setup_openai_http_manifest(&root, &base_url, true);
+    let receipt_path = root.join("usage-receipt.json");
+
+    let out = Command::new(&qa_bin)
+        .args(["--cwd", root.to_str().unwrap(), "--json", "-p", "check"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("CHINWAG_USAGE_RECEIPT_PATH", &receipt_path)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let _ = handle.join();
+
+    let payload: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["usage"]["usage_status"], "COUNTED");
+    assert_eq!(payload["usage"]["turns"], 2);
+    assert_eq!(payload["usage"]["tool_calls"], 1);
+    assert_eq!(payload["usage"]["prompt_tokens"], 250);
+    assert_eq!(payload["usage"]["completion_tokens"], 50);
+    assert_eq!(payload["usage"]["cached_tokens"], 35);
+    assert_eq!(payload["usage"]["reasoning_tokens"], 12);
+    assert_eq!(payload["usage"]["gross_tokens"], 300);
+
+    let receipt: Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["usage_status"], "COUNTED");
+    assert_eq!(receipt["gross_tokens"], 300);
+
+    let reqs = captured.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    let tool_names: Vec<&str> = reqs[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(tool_names, vec!["read_file", "fetch_url", "run_command"]);
+    assert_eq!(reqs[0]["reasoning_effort"], "high");
+}
+
+#[test]
+fn http_usage_missing_turn2_fails_closed_to_unknown() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::write(root.join("sample.txt"), "hello\n").unwrap();
+
+    let turn1 = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "tc_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"sample.txt\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+        }
+    })
+    .to_string();
+    let turn2_no_usage = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "DONE"
+            }
+        }]
+    })
+    .to_string();
+
+    let (base_url, _captured, handle) =
+        spawn_mock_status_server(vec![(200, turn1), (200, turn2_no_usage)]);
+    let (_manifest_path, qa_bin) = setup_openai_http_manifest(&root, &base_url, true);
+
+    let out = Command::new(&qa_bin)
+        .args(["--cwd", root.to_str().unwrap(), "--json", "-p", "check"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let _ = handle.join();
+
+    let payload: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["usage"]["usage_status"], "UNKNOWN");
+    assert_eq!(payload["usage"]["turns"], 2);
+    assert_eq!(payload["usage"]["tool_calls"], 1);
+    assert_eq!(payload["usage"]["prompt_tokens"], Value::Null);
+    assert_eq!(payload["usage"]["completion_tokens"], Value::Null);
+    assert_eq!(payload["usage"]["gross_tokens"], Value::Null);
+    assert_eq!(payload["usage"]["observed_partial_gross_tokens"], 120);
+}
+
+#[test]
+fn http_lock_effort_refuses_400_strip_and_env_override() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let receipt_path = root.join("failed-receipt.json");
+
+    let err_400 = r#"{"error":{"message":"unsupported parameter: reasoning_effort"}}"#.to_owned();
+    let (base_url, captured, handle) = spawn_mock_status_server(vec![(400, err_400)]);
+    let (_manifest_path, qa_bin) = setup_openai_http_manifest(&root, &base_url, true);
+
+    let out = Command::new(&qa_bin)
+        .args(["--cwd", root.to_str().unwrap(), "--json", "-p", "check"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("CHINWAG_USAGE_RECEIPT_PATH", &receipt_path)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let _ = handle.join();
+    // Locked effort must NEVER retry without reasoning_effort
+    assert_eq!(captured.lock().unwrap().len(), 1);
+    let err_payload: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(err_payload["ok"], false);
+    assert_eq!(err_payload["usage"]["usage_status"], "UNKNOWN");
+    assert_eq!(err_payload["usage"]["turns"], 1);
+    let receipt: Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["usage_status"], "UNKNOWN");
+
+    // CHINWAG_EFFORT_OVERRIDE mismatch fails before egress
+    let override_out = Command::new(&qa_bin)
+        .args(["--cwd", root.to_str().unwrap(), "--json", "-p", "check"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("CHINWAG_EFFORT_OVERRIDE", "low")
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert_eq!(override_out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&override_out.stderr).contains("EffortSwitchDenied"),
+        "{}",
+        String::from_utf8_lossy(&override_out.stderr)
+    );
+}
+
+#[test]
+fn multicall_explain_does_not_read_nontty_stdin() {
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let (temp, mut manifest, _) = fixture("echo unused");
+    manifest.seats[0].id = chinwag_fleet::SeatId::new("MOTION").unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".chinwag")).unwrap();
+    fs::write(root.join(".chinwag/fleet.toml"), manifest.to_toml().unwrap()).unwrap();
+    let motion_bin = root.join("motion-agent");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_chinwag"), &motion_bin).unwrap();
+
+    // Open stdin pipe that stays open until child exits (simulating SSH without -n)
+    let mut child = Command::new(&motion_bin)
+        .args(["explain", "--json"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _held_stdin = child.stdin.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("motion-agent explain hung reading non-TTY open stdin")
+        .unwrap();
+    drop(_held_stdin);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["plan"]["seat"], "MOTION");
+}
+
+#[test]
+fn explicit_bound_actor_preserved_in_launch_and_multicall_and_rejects_mismatch() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let reply = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    })
+    .to_string();
+    let (base_url, _cap, handle) =
+        spawn_mock_status_server(vec![(200, reply.clone()), (200, reply)]);
+    let (manifest_path, qa_bin) = setup_openai_http_manifest(&root, &base_url, true);
+
+    let bound = "QA#2427c46641e272de554b8e82a04af0d8";
+    let launch_out = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+        .args([
+            "fleet",
+            "launch",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--seat",
+            "QA",
+            "--actor",
+            bound,
+            "--cwd",
+            root.to_str().unwrap(),
+            "--json",
+            "-p",
+            "ping",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        launch_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launch_out.stderr)
+    );
+    let launch_json: Value = serde_json::from_slice(&launch_out.stdout).unwrap();
+    assert_eq!(launch_json["actor"], bound);
+    assert_eq!(launch_json["usage"]["usage_status"], "COUNTED");
+
+    let multi_out = Command::new(&qa_bin)
+        .args([
+            "--actor",
+            bound,
+            "--cwd",
+            root.to_str().unwrap(),
+            "--json",
+            "-p",
+            "ping",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        multi_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&multi_out.stderr)
+    );
+    let _ = handle.join();
+    let multi_json: Value = serde_json::from_slice(&multi_out.stdout).unwrap();
+    assert_eq!(multi_json["actor"], bound);
+    assert_eq!(multi_json["usage"]["gross_tokens"], 12);
+
+    // Mismatched actor seat fails closed
+    let mismatch = Command::new(&qa_bin)
+        .args([
+            "--actor",
+            "OTHER#2427c46641e272de554b8e82a04af0d8",
+            "--cwd",
+            root.to_str().unwrap(),
+            "-p",
+            "ping",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert_eq!(mismatch.status.code(), Some(2));
+}

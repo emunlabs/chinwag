@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 use crate::{
     EgressPolicy, ExecutionTarget, FleetManifest, FleetPolicyError, FleetResult, IsolationSpec,
-    ModelBinding, NodeTransport, SeatId, SkillResolver, WriteMode, pattern_matches,
+    ModelBinding, NodeTransport, RemoteProtocol, SeatId, SkillResolver, WriteMode, pattern_matches,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -42,12 +42,22 @@ pub enum DriverSpec {
         wire_mode: String,
         stream_mode: String,
         timeout_secs: u64,
+        #[serde(default)]
+        auth_isolation: CredentialIsolation,
+        #[serde(default)]
+        tools: crate::http_driver::HttpToolConfig,
     },
     GoogleGenAiHttp {
         endpoint_mode: String,
         base_url_or_region: String,
         auth_env: String,
         stream_mode: String,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
+        #[serde(default)]
+        auth_isolation: CredentialIsolation,
+        #[serde(default)]
+        tools: crate::http_driver::HttpToolConfig,
     },
     AnthropicMessagesHttp {
         base_url: String,
@@ -55,6 +65,12 @@ pub enum DriverSpec {
         #[serde(default)]
         beta_headers: Vec<String>,
         stream_mode: String,
+        #[serde(default = "default_timeout")]
+        timeout_secs: u64,
+        #[serde(default)]
+        auth_isolation: CredentialIsolation,
+        #[serde(default)]
+        tools: crate::http_driver::HttpToolConfig,
     },
 }
 fn stdin_framing() -> String {
@@ -331,13 +347,43 @@ pub fn resolve_dispatch_plan(
                 crate::keys::validate_private_key_path(path)?;
             }
         }
-        DriverSpec::OpenAiCompatibleHttp { base_url, .. }
-        | DriverSpec::AnthropicMessagesHttp { base_url, .. } => {
-            check_egress(&manifest.policy.egress_policy, base_url)?
+        DriverSpec::OpenAiCompatibleHttp {
+            base_url,
+            timeout_secs,
+            auth_isolation,
+            tools,
+            ..
+        }
+        | DriverSpec::AnthropicMessagesHttp {
+            base_url,
+            timeout_secs,
+            auth_isolation,
+            tools,
+            ..
+        } => {
+            if *timeout_secs == 0 {
+                return Err(FleetPolicyError::InvalidManifest(
+                    "timeout_secs must be positive".into(),
+                ));
+            }
+            check_egress(&manifest.policy.egress_policy, base_url)?;
+            resolve_driver_credentials(manifest, &request.cwd, auth_isolation, tools)?;
         }
         DriverSpec::GoogleGenAiHttp {
-            base_url_or_region, ..
-        } => check_egress(&manifest.policy.egress_policy, base_url_or_region)?,
+            base_url_or_region,
+            timeout_secs,
+            auth_isolation,
+            tools,
+            ..
+        } => {
+            if *timeout_secs == 0 {
+                return Err(FleetPolicyError::InvalidManifest(
+                    "timeout_secs must be positive".into(),
+                ));
+            }
+            check_egress(&manifest.policy.egress_policy, base_url_or_region)?;
+            resolve_driver_credentials(manifest, &request.cwd, auth_isolation, tools)?;
+        }
     }
     let cwd = request.cwd.canonicalize()?;
     let mut plan = ResolvedDispatchPlan {
@@ -434,7 +480,26 @@ pub struct ExecutionContext {
     /// Remove ambient/manifest credential namespaces before trusted context is installed.
     pub scrub_env_prefixes: Vec<String>,
     pub timeout_override_secs: Option<u64>,
+    pub max_turns_override: Option<usize>,
+    pub max_output_tokens_override: Option<u32>,
+    pub tools_disabled: bool,
+    pub seat_docs_disabled: bool,
 }
+/// Fail-closed token accounting across HTTP driver turns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpUsageSummary {
+    pub usage_status: String,
+    pub turns: u32,
+    pub tool_calls: u32,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub gross_tokens: Option<u64>,
+    #[serde(default)]
+    pub observed_partial_gross_tokens: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionOutcome {
     pub exit_code: Option<i32>,
@@ -444,6 +509,8 @@ pub struct ExecutionOutcome {
     pub timed_out: bool,
     pub termination_signal: Option<i32>,
     pub output_limit_exceeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<HttpUsageSummary>,
 }
 pub trait ExecutionDriver {
     fn execute(
@@ -477,10 +544,23 @@ impl ProcessExecutionDriver {
                 "mutating execution requires an active sandbox lease".into(),
             ));
         }
-        if !matches!(plan.target, ExecutionTarget::LocalProcess) {
-            return Err(FleetPolicyError::UnsupportedDriver(
-                "no execution backend registered for selected target".into(),
+        if context.timeout_override_secs == Some(0) {
+            return Err(FleetPolicyError::InvalidManifest(
+                "timeout_secs must be positive".into(),
             ));
+        }
+        match &plan.driver {
+            DriverSpec::OpenAiCompatibleHttp { .. }
+            | DriverSpec::GoogleGenAiHttp { .. }
+            | DriverSpec::AnthropicMessagesHttp { .. } => {
+                if !matches!(plan.target, ExecutionTarget::LocalProcess) {
+                    return Err(FleetPolicyError::UnsupportedDriver(
+                        "HTTP drivers require a local execution point".into(),
+                    ));
+                }
+                return crate::http_driver::execute_http_driver(plan, context, on_started);
+            }
+            DriverSpec::CliSubprocess { .. } => {}
         }
         let DriverSpec::CliSubprocess {
             executable,
@@ -492,15 +572,8 @@ impl ProcessExecutionDriver {
             timeout_secs,
         } = &plan.driver
         else {
-            return Err(FleetPolicyError::UnsupportedDriver(
-                "HTTP driver requires a registered implementation".into(),
-            ));
+            unreachable!();
         };
-        if context.timeout_override_secs == Some(0) {
-            return Err(FleetPolicyError::InvalidManifest(
-                "timeout_secs must be positive".into(),
-            ));
-        }
         let effective_timeout = context.timeout_override_secs.unwrap_or(*timeout_secs);
         let needs_composed_prompt = argv_template
             .iter()
@@ -511,51 +584,78 @@ impl ProcessExecutionDriver {
         } else {
             None
         };
-        let executable = resolve_binary(executable)?;
-        let mut command = Command::new(executable);
-        for arg in argv_template {
-            command.arg(expand(arg, plan, context, composed_prompt.as_deref())?);
-        }
-        command.current_dir(&plan.cwd);
-        configure_env(
-            &mut command,
-            plan,
-            context,
-            auth_isolation,
-            env_allowlist,
-            env_overrides,
-        )?;
-        if let CredentialIsolation::FirstPartyCliOauth { preflight_cmd, .. } = auth_isolation
-            && let Some((binary, args)) = preflight_cmd.split_first()
-        {
-            let mut preflight = Command::new(resolve_binary(binary)?);
-            preflight
-                .args(args)
-                .current_dir(&plan.cwd)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                preflight.process_group(0);
+        let mut command = match &plan.target {
+            ExecutionTarget::LocalProcess => {
+                let executable = resolve_binary(executable)?;
+                let mut cmd = Command::new(executable);
+                for arg in argv_template {
+                    cmd.arg(expand(arg, plan, context, composed_prompt.as_deref())?);
+                }
+                cmd.current_dir(&plan.cwd);
+                configure_env(
+                    &mut cmd,
+                    plan,
+                    context,
+                    auth_isolation,
+                    env_allowlist,
+                    env_overrides,
+                )?;
+                if let CredentialIsolation::FirstPartyCliOauth { preflight_cmd, .. } =
+                    auth_isolation
+                    && let Some((binary, args)) = preflight_cmd.split_first()
+                {
+                    let mut preflight = Command::new(resolve_binary(binary)?);
+                    preflight
+                        .args(args)
+                        .current_dir(&plan.cwd)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::CommandExt;
+                        preflight.process_group(0);
+                    }
+                    configure_env(
+                        &mut preflight,
+                        plan,
+                        context,
+                        auth_isolation,
+                        env_allowlist,
+                        env_overrides,
+                    )?;
+                    let mut child = preflight.spawn()?;
+                    let (status, _, _) = wait_timeout(&mut child, effective_timeout, None, true)?;
+                    if !status.success() {
+                        return Err(FleetPolicyError::DriverExecutionFailed(
+                            "authentication preflight failed".into(),
+                        ));
+                    }
+                }
+                cmd
             }
-            configure_env(
-                &mut preflight,
+            ExecutionTarget::RemoteExec {
+                protocol: RemoteProtocol::Ssh,
+                endpoint_template,
+                workdir_template,
+            } => build_ssh_command(
                 plan,
                 context,
+                endpoint_template,
+                workdir_template,
+                executable,
+                argv_template,
                 auth_isolation,
                 env_allowlist,
                 env_overrides,
-            )?;
-            let mut child = preflight.spawn()?;
-            let (status, _, _) = wait_timeout(&mut child, effective_timeout, None, true)?;
-            if !status.success() {
-                return Err(FleetPolicyError::DriverExecutionFailed(
-                    "authentication preflight failed".into(),
+                composed_prompt.as_deref(),
+            )?,
+            _ => {
+                return Err(FleetPolicyError::UnsupportedDriver(
+                    "no execution backend registered for selected target".into(),
                 ));
             }
-        }
+        };
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
         if context.interactive {
@@ -608,6 +708,7 @@ impl ProcessExecutionDriver {
             timed_out,
             termination_signal,
             output_limit_exceeded,
+            usage: None,
         })
     }
 }
@@ -723,7 +824,10 @@ pub fn load_seat_boot_files(
     Ok(loaded)
 }
 
-fn compose_prompt(plan: &ResolvedDispatchPlan, context: &ExecutionContext) -> FleetResult<String> {
+pub(crate) fn compose_prompt(
+    plan: &ResolvedDispatchPlan,
+    context: &ExecutionContext,
+) -> FleetResult<String> {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "Seat: {}", plan.seat.as_str());
@@ -736,29 +840,232 @@ fn compose_prompt(plan: &ResolvedDispatchPlan, context: &ExecutionContext) -> Fl
     if let Some(profile_dir) = &plan.profile_dir {
         let _ = writeln!(out, "Profile directory: {}", profile_dir.display());
     }
-    let boot_base = plan.profile_dir.as_deref().unwrap_or(&plan.cwd);
-    for (path, text) in load_seat_boot_files(boot_base, &plan.boot_files)? {
-        let _ = write!(out, "\n--- {} ---\n{}", path.display(), text);
-        if !text.ends_with('\n') {
-            out.push('\n');
-        }
+    if let Some(directive) = plan
+        .model
+        .params
+        .get("system_directive")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        let _ = writeln!(out, "\nDirective: {}", directive.trim());
     }
-    for (skill_name, skill_path) in &plan.resolved_skill_files {
-        let text = std::fs::read_to_string(skill_path)?;
-        let _ = write!(
-            out,
-            "\n--- skill: {skill_name} ({}) ---\n{}",
-            skill_path.display(),
-            text
-        );
-        if !text.ends_with('\n') {
-            out.push('\n');
+    if !context.seat_docs_disabled {
+        let boot_base = plan.profile_dir.as_deref().unwrap_or(&plan.cwd);
+        for (path, text) in load_seat_boot_files(boot_base, &plan.boot_files)? {
+            let _ = write!(out, "\n--- {} ---\n{}", path.display(), text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        for (skill_name, skill_path) in &plan.resolved_skill_files {
+            let text = std::fs::read_to_string(skill_path)?;
+            let _ = write!(
+                out,
+                "\n--- skill: {skill_name} ({}) ---\n{}",
+                skill_path.display(),
+                text
+            );
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
         }
     }
     if let Some(prompt) = context.prompt.as_deref().filter(|p| !p.is_empty()) {
         let _ = write!(out, "\n## Task\n\n{prompt}");
     }
     Ok(out)
+}
+
+pub(crate) fn resolve_driver_credentials(
+    manifest: &FleetManifest,
+    cwd: &Path,
+    auth_isolation: &mut CredentialIsolation,
+    tools: &mut crate::http_driver::HttpToolConfig,
+) -> FleetResult<()> {
+    if let CredentialIsolation::SecretEnvFile { path, .. } = auth_isolation {
+        *path = manifest.resolve_path(path, cwd);
+        crate::keys::validate_private_key_path(path)?;
+    }
+    for rule in &mut tools.auth_fetches {
+        rule.secret_env_file = manifest.resolve_path(&rule.secret_env_file, cwd);
+        crate::keys::validate_private_key_path(&rule.secret_env_file)?;
+    }
+    for rule in &mut tools.env_injections {
+        if let Some(path) = &mut rule.secret_env_file {
+            *path = manifest.resolve_path(path, cwd);
+            crate::keys::validate_private_key_path(path)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_ssh_endpoint(endpoint_template: &str) -> FleetResult<(String, Option<String>)> {
+    let Some(rest) = endpoint_template.strip_prefix("ssh://") else {
+        return Err(FleetPolicyError::InvalidManifest(
+            "remote_exec endpoint_template must start with ssh://".into(),
+        ));
+    };
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty()
+        || rest.starts_with('-')
+        || rest
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#'))
+    {
+        return Err(FleetPolicyError::InvalidManifest(format!(
+            "invalid ssh endpoint: {endpoint_template}"
+        )));
+    }
+    if let Some((host_part, port)) = rest.rsplit_once(':') {
+        if host_part.is_empty() || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            return Err(FleetPolicyError::InvalidManifest(format!(
+                "invalid ssh port in endpoint: {endpoint_template}"
+            )));
+        }
+        Ok((host_part.to_owned(), Some(port.to_owned())))
+    } else {
+        Ok((rest.to_owned(), None))
+    }
+}
+
+fn posix_shell_quote(value: &str) -> FleetResult<String> {
+    if value.contains('\0') {
+        return Err(FleetPolicyError::InvalidManifest(
+            "NUL byte not permitted in remote shell argument".into(),
+        ));
+    }
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    Ok(quoted)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_ssh_command(
+    plan: &ResolvedDispatchPlan,
+    context: &ExecutionContext,
+    endpoint_template: &str,
+    workdir_template: &str,
+    executable: &str,
+    argv_template: &[String],
+    auth_isolation: &CredentialIsolation,
+    env_allowlist: &[String],
+    env_overrides: &BTreeMap<String, String>,
+    composed_prompt: Option<&str>,
+) -> FleetResult<Command> {
+    if matches!(auth_isolation, CredentialIsolation::SecretEnvFile { .. }) {
+        return Err(FleetPolicyError::InvalidManifest(
+            "SecretEnvFile credentials cannot be forwarded over SSH remote_exec".into(),
+        ));
+    }
+    let (target, port) = parse_ssh_endpoint(endpoint_template)?;
+    let expanded_workdir = expand(workdir_template, plan, context, composed_prompt)?;
+    if expanded_workdir.contains(['\0', '\n', '\r']) {
+        return Err(FleetPolicyError::InvalidManifest(
+            "invalid remote workdir template".into(),
+        ));
+    }
+    if executable.trim().is_empty() || executable.contains(['\0', '\n', '\r']) {
+        return Err(FleetPolicyError::InvalidManifest(
+            "invalid remote executable".into(),
+        ));
+    }
+
+    let mut remote_env: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in env_overrides {
+        remote_env.insert(k.clone(), v.clone());
+    }
+    for (k, v) in &context.env {
+        remote_env.insert(k.clone(), v.clone());
+    }
+    for key in [
+        "CHINWAG_ALLOWED_SKILLS",
+        "CHINWAG_SELECTED_SKILLS",
+        "CHINWAG_MODEL_PROVIDER",
+        "CHINWAG_MODEL_ID",
+        "CHINWAG_FLEET_DIGEST",
+    ] {
+        let val = match key {
+            "CHINWAG_ALLOWED_SKILLS" | "CHINWAG_SELECTED_SKILLS" => plan.allowed_skills.join(","),
+            "CHINWAG_MODEL_PROVIDER" => plan.model.provider.clone(),
+            "CHINWAG_MODEL_ID" => plan.model.model_id.clone(),
+            "CHINWAG_FLEET_DIGEST" => plan.manifest_digest.clone(),
+            _ => unreachable!(),
+        };
+        remote_env.insert(key.to_owned(), val);
+    }
+
+    let mut remote_parts = Vec::new();
+    if !expanded_workdir.is_empty() && expanded_workdir != "." {
+        remote_parts.push(format!("cd -- {} &&", posix_shell_quote(&expanded_workdir)?));
+    }
+    if !remote_env.is_empty() {
+        remote_parts.push("env".to_owned());
+        for (k, v) in &remote_env {
+            if k.is_empty()
+                || !k
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(FleetPolicyError::InvalidManifest(format!(
+                    "invalid remote env var name: {k}"
+                )));
+            }
+            remote_parts.push(posix_shell_quote(&format!("{k}={v}"))?);
+        }
+    }
+    remote_parts.push(posix_shell_quote(executable)?);
+    for arg in argv_template {
+        let expanded = expand(arg, plan, context, composed_prompt)?;
+        remote_parts.push(posix_shell_quote(&expanded)?);
+    }
+    let remote_cmdline = remote_parts.join(" ");
+
+    let ssh_bin = resolve_binary("ssh")?;
+    let mut cmd = Command::new(ssh_bin);
+    cmd.env_clear();
+    for key in [
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "SSH_AUTH_SOCK",
+    ]
+    .into_iter()
+    .chain(env_allowlist.iter().map(String::as_str))
+    {
+        if let Some(val) = std::env::var_os(key) {
+            cmd.env(key, val);
+        }
+    }
+    cmd.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+    ]);
+    if let Some(port) = port {
+        cmd.args(["-p", &port]);
+    }
+    cmd.args(["--", &target, &remote_cmdline]);
+    Ok(cmd)
 }
 
 fn expand(
@@ -935,4 +1242,64 @@ fn configure_env(
         command.env("CHINWAG_TARGET_NODE", node);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_remote_exec_rejects_leading_dash_host_and_quotes_remote_command() {
+        let mut manifest = FleetManifest::starter_profile("solo").unwrap();
+        manifest.seats[0].lifecycle = crate::SeatLifecycle::ActiveStanding;
+        manifest.seats[0].target_selector = ExecutionTarget::RemoteExec {
+            protocol: RemoteProtocol::Ssh,
+            endpoint_template: "ssh://-oProxyCommand=evil".into(),
+            workdir_template: "/tmp/work".into(),
+        };
+        let plan = resolve_dispatch_plan(
+            &manifest,
+            &DispatchRequest {
+                seat: "default".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = build_ssh_command(
+            &plan,
+            &ExecutionContext::default(),
+            "ssh://-oProxyCommand=evil",
+            "/tmp/work",
+            "/usr/bin/true",
+            &[],
+            &CredentialIsolation::NoneLocal,
+            &[],
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("InvalidManifest"));
+
+        let cmd = build_ssh_command(
+            &plan,
+            &ExecutionContext::default(),
+            "ssh://operator@example.internal:2222",
+            "/srv/work",
+            "/usr/local/bin/worker",
+            &["--prompt".into(), "hi 'there'".into()],
+            &CredentialIsolation::NoneLocal,
+            &[],
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"-p".to_owned()));
+        assert!(args.contains(&"2222".to_owned()));
+        assert!(args.contains(&"operator@example.internal".to_owned()));
+        assert!(args.last().unwrap().contains("hi '\\''there'\\''"));
+    }
 }
