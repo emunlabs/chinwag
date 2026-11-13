@@ -20,30 +20,45 @@
 
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use tempfile::TempDir;
 
-static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
-
-fn fixture_dir(tag: &str) -> PathBuf {
-    let n = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "chinwag-board-cli-integ-{tag}-{}-{n}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    root
+fn chinwag(root: &Path, manifest: Option<&Path>) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chinwag"));
+    command
+        .current_dir(root)
+        .env("HOME", root)
+        .env_remove("CHINWAG_FLEET_MANIFEST");
+    if let Some(manifest) = manifest {
+        command.env("CHINWAG_FLEET_MANIFEST", manifest);
+    }
+    command
 }
 
 #[test]
 fn cli_tasks_init_board_push_and_ci_report_lifecycle() {
-    let dir = fixture_dir("lifecycle");
+    let temporary = TempDir::new().unwrap();
+    let dir = fs::canonicalize(temporary.path()).unwrap();
+    let mut manifest = chinwag_fleet::FleetManifest::starter_profile("solo").unwrap();
+    let template = manifest.seats.remove(0);
+    for id in ["builder", "reviewer", "triage"] {
+        let mut seat = template.clone();
+        seat.id = chinwag_fleet::SeatId::new(id).unwrap();
+        manifest.seats.push(seat);
+    }
+    manifest.extensions.insert(
+        "board".into(),
+        serde_json::json!({
+            "review_partners": {"builder": "reviewer"}, "triage_seat": "triage"
+        }),
+    );
+    let manifest_path = dir.join("fleet.json");
+    fs::write(&manifest_path, manifest.to_canonical_json().unwrap()).unwrap();
     let dir_str = dir.to_string_lossy().to_string();
 
     // 1. chinwag tasks init
-    let init_out = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+    let init_out = chinwag(&dir, Some(&manifest_path))
         .args([
             "tasks",
             "init",
@@ -56,7 +71,7 @@ fn cli_tasks_init_board_push_and_ci_report_lifecycle() {
             "--tier",
             "L",
             "--author",
-            "RUST#integ-thread-01",
+            "builder#integ-thread-01",
             "--json",
         ])
         .output()
@@ -67,7 +82,7 @@ fn cli_tasks_init_board_push_and_ci_report_lifecycle() {
     assert_eq!(init_json["seed_issue_id"], "CHWG-0500");
 
     // 2. chinwag board push --dry-run
-    let push_out = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+    let push_out = chinwag(&dir, Some(&manifest_path))
         .args(["board", "push", "--tasks-dir", &dir_str, "--dry-run"])
         .output()
         .unwrap();
@@ -77,7 +92,7 @@ fn cli_tasks_init_board_push_and_ci_report_lifecycle() {
     assert_eq!(push_json["issue_count"], 1);
 
     // 3. chinwag ci-report --status pass --push-boards (with INV-TIER-LOCK-01 downgrade L -> S on 64 LOC)
-    let pass_out = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+    let pass_out = chinwag(&dir, Some(&manifest_path))
         .args([
             "ci-report",
             "--issue",
@@ -103,7 +118,7 @@ fn cli_tasks_init_board_push_and_ci_report_lifecycle() {
     assert_eq!(pass_json["surv_status"], "PENDING_168H");
 
     // 4. chinwag ci-report --status fail (in-flight direct-to-author fast path vs main regression)
-    let fail_out = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+    let fail_out = chinwag(&dir, Some(&manifest_path))
         .args([
             "ci-report",
             "--issue",
@@ -127,19 +142,22 @@ fn cli_tasks_init_board_push_and_ci_report_lifecycle() {
     assert_eq!(fail_json["p0_regression_issue_id"], "CHWG-0500-CI-FAIL");
     assert_eq!(
         fail_json["routing"]["primary_recipient"],
-        "@RUST#integ-thread-01"
+        "@builder#integ-thread-01"
     );
-    assert_eq!(fail_json["routing"]["cc_recipients"][0], "@DELIVERY");
-
-    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(fail_json["routing"]["cc_recipients"][0], "@triage");
+    assert_eq!(
+        fail_json["routing"]["delivery_triage"]["pair_partner_seat"],
+        "reviewer"
+    );
 }
 
 #[test]
 fn cli_board_push_exits_78_on_zero_leak_violation() {
-    let dir = fixture_dir("leak-exit-78");
+    let temporary = TempDir::new().unwrap();
+    let dir = fs::canonicalize(temporary.path()).unwrap();
     let dir_str = dir.to_string_lossy().to_string();
 
-    let _ = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+    let _ = chinwag(&dir, None)
         .args([
             "tasks",
             "init",
@@ -153,10 +171,9 @@ fn cli_board_push_exits_78_on_zero_leak_violation() {
         .output()
         .unwrap();
 
-    let push_out = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+    let push_out = chinwag(&dir, None)
         .args(["board", "push", "--tasks-dir", &dir_str, "--dry-run"])
         .output()
         .unwrap();
     assert_eq!(push_out.status.code(), Some(78));
-    let _ = fs::remove_dir_all(&dir);
 }

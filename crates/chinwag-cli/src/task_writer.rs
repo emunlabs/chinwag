@@ -6881,7 +6881,7 @@ mod tests {
                 nonce: a.nonce,
                 sender_full_actor_address: a.reviewer_full_instance.clone(),
                 parent_full_actor_address: None,
-                recipient_full_actor_addresses: vec!["WORKHORSE#fixture-writer".into()],
+                recipient_full_actor_addresses: vec!["FIXTURE-A#fixture-writer".into()],
                 room: "#fixture".into(),
                 message_kind: kind,
                 receiver_authority_id: "fixture-authority".into(),
@@ -6920,7 +6920,7 @@ mod tests {
                     &roster,
                     &TaskVerificationContext {
                         receiver_authority_id: "fixture-authority",
-                        recipient_full_actor_address: "WORKHORSE#fixture-writer",
+                        recipient_full_actor_address: "FIXTURE-A#fixture-writer",
                         current_task_ref: &a.task_ref,
                         config_digest: Sha256Digest(self.writer.lease.config_digest),
                         task_control_digest: a.task_control_digest,

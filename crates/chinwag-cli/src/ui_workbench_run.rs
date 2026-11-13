@@ -955,7 +955,7 @@ fn mutate_ui_v4_state(
         );
     }
     // Guarantee bounded history stays strictly under `UI_V4_MAX_STATE_BYTES` even with dense entries,
-    // without ever discarding unsettled approval/OAuth cards (`ARCHITECT-R5-1`).
+    // without ever discarding unsettled approval/OAuth cards (`FIXTURE-B-R5-1`).
     while matches!(serde_json::to_string(&state), Ok(s) if s.len() > UI_V4_MAX_STATE_BYTES) {
         let active_tid = if state.delivery2.active_thread_id.trim().is_empty() {
             "thr-main".to_string()
@@ -1041,67 +1041,95 @@ fn mutate_ui_v4_state(
 const D2_ALLOW_SENTINEL: &str = "\u{E000}D2\u{E001}";
 
 const SCRUB_SUBSTRINGS: &[(&str, &str)] = &[
-    (concat!("inception/mer", "cury-3"), "Coding Agent"),
-    (concat!("mer", "cury-3"), "Coding Agent"),
-    (concat!("mer", "cury 3"), "Coding Agent"),
-    (concat!("mer", "cury_3"), "Coding Agent"),
-    (concat!("vercel-ai", "-gateway"), "cloud gateway"),
-    (concat!("vercel ai", " gateway"), "cloud gateway"),
-    (concat!("@cf/cloudflare/cl", "ef-flash"), "Fast Check"),
-    (concat!("@cf/cloudflare/cl", "ef"), "Fast Check"),
-    (concat!("@cf/cloudflare/cl", "airic"), "Fast Check"),
-    (concat!("cl", "ef-flash"), "Fast Check"),
-    (concat!("@cf/openai/gpt-", "oss-120b"), "Coding Agent"),
-    (concat!("gpt-oss", "-120b"), "Coding Agent"),
-    (
-        concat!("@cf/deep", "seek-ai/deep", "seek-v4.1-flash-1017"),
-        "Coding Agent",
-    ),
-    (concat!("deep", "seek-v4"), "Coding Agent"),
-    (concat!("deep", "seek"), "Coding Agent"),
-    (concat!("cloud", "flareos-ai"), "cloud gateway"),
-    (concat!("cloud", "flare-workers-ai"), "cloud gateway"),
-    (concat!("cloud", "flare workers ai"), "cloud gateway"),
-    (concat!("claude-fa", "ble-5-2"), "Claude Code"),
-    (concat!("claude-fa", "ble-5-1"), "Claude Code"),
-    (concat!("claude-", "fable"), "Claude Code"),
-    (concat!("claude ", "fable"), "Claude Code"),
-    (concat!("claude-op", "us-5"), "Claude Code"),
-    (concat!("op", "us 5"), "Claude Code"),
-    (concat!("gemini-4-", "argon-high"), "Gemini CLI"),
-    (concat!("gemini-4-", "carbon-high"), "Gemini CLI"),
-    (concat!("gemini 4 ", "argon"), "Gemini CLI"),
-    (concat!("gemini 4 ", "carbon"), "Gemini CLI"),
-    (concat!("gp", "t-6.1-sol"), "Codex CLI"),
-    (concat!("gp", "t-6.1"), "Codex CLI"),
-    (concat!("gp", "t-6"), "Codex CLI"),
-    (concat!("gr", "ok-4.7"), "Assistant"),
-    (concat!("gr", "ok 4"), "Assistant"),
-    (concat!("recursive fl", "int"), "Independent Reviewer"),
-    (concat!("fl", "int-int4"), "Independent Reviewer"),
-    (concat!("node 1 · mac st", "udio"), "Local Workstation"),
-    (concat!("node 2 · macbook", " pro"), "Local Workstation"),
-    (concat!("node 3 · macbook", " pro"), "Local Workstation"),
-    (concat!("mac st", "udio"), "Local Workstation"),
-    (concat!("nicolas-", "macbook-pro"), "Local Workstation"),
-    (concat!("emunlabs/", "chinwag"), "local-repo"),
-    (concat!("/users/brian", "spector"), "~"),
-    (concat!("memory.cr", "db.le", "ann"), "Memory search"),
-    (concat!("state.cr", "db"), "workspace history"),
-    (concat!("cr-", "sqlite"), "workspace history"),
-    (concat!("cr", "sqlite"), "workspace history"),
-    (concat!("chinwag-bus-", "sig-v2"), "local-verification"),
-    (concat!("allowed_", "signers"), "trusted-tools"),
-    (concat!("signature_ed25", "519"), "verified_signature"),
-    (concat!("pubkey_ed25", "519"), "verified_key"),
-    (concat!("ed25", "519"), "verified"),
-    (concat!("x25519ml", "kem768"), "end-to-end encrypted"),
-    (concat!("bb", "s+"), "privacy-proof"),
-    (concat!("cp-", "omp"), "workspace-policy"),
-    (concat!("a.", "509"), "agent-profile"),
-    (concat!("neon.", "tech"), "managed database"),
-    (concat!("@neon", "database"), "managed database"),
+    ("memory.crdb.leann", "Memory search"),
+    ("state.crdb", "workspace history"),
+    ("cr-sqlite", "workspace history"),
+    ("crsqlite", "workspace history"),
+    ("chinwag-bus-sig-v2", "local-verification"),
+    ("allowed_signers", "trusted-tools"),
+    ("signature_ed25519", "verified_signature"),
+    ("pubkey_ed25519", "verified_key"),
+    ("ed25519", "verified"),
+    ("x25519mlkem768", "end-to-end encrypted"),
+    ("bbs+", "privacy-proof"),
+    ("cp-omp", "workspace-policy"),
+    ("a.509", "agent-profile"),
 ];
+
+/// Redact path, endpoint, and versioned provider/model syntax without a machine roster.
+fn scrub_topology_syntax(input: &str) -> String {
+    let parts: Vec<_> = input.split_inclusive(char::is_whitespace).collect();
+    let mut out = String::with_capacity(input.len());
+    let mut skip_node_number = false;
+    for (index, part) in parts.iter().enumerate() {
+        let word = part.trim_end_matches(char::is_whitespace);
+        let whitespace = &part[word.len()..];
+        if skip_node_number {
+            skip_node_number = false;
+            out.push_str(whitespace);
+            continue;
+        }
+        if word.eq_ignore_ascii_case("node")
+            && parts
+                .get(index + 1)
+                .is_some_and(|next| next.trim().parse::<u64>().is_ok())
+        {
+            out.push_str("workstation");
+            out.push_str(whitespace);
+            skip_node_number = true;
+            continue;
+        }
+        let core = word.trim_matches(['"', '\'', '(', ')', '[', ']', ',', ';']);
+        let address = core
+            .rsplit_once(':')
+            .filter(|(_, port)| port.parse::<u16>().is_ok())
+            .map_or(core, |(host, _)| host);
+        let network = core.parse::<std::net::IpAddr>().is_ok()
+            || address.parse::<std::net::IpAddr>().is_ok()
+            || address.ends_with(".local")
+            || address.ends_with(".internal");
+        let model_parts: Vec<_> = core.split('/').collect();
+        let provider_model = model_parts.len() >= 2
+            && model_parts[..model_parts.len() - 1].iter().all(|provider| {
+                let provider = provider.trim_start_matches('@');
+                !provider.is_empty()
+                    && provider
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+            && model_parts.last().is_some_and(|model| {
+                model.contains('-')
+                    && !model.rsplit_once('.').is_some_and(|(_, extension)| {
+                        !extension.is_empty()
+                            && extension.bytes().all(|byte| byte.is_ascii_alphabetic())
+                    })
+                    && model.bytes().any(|byte| byte.is_ascii_digit())
+                    && model.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            });
+        let replacement =
+            if (core.starts_with('/') && core.len() > 1) || core.starts_with("file://") {
+                Some("local path")
+            } else if network {
+                Some("network endpoint")
+            } else if provider_model {
+                Some("Coding Agent")
+            } else {
+                None
+            };
+        if let Some(replacement) = replacement {
+            let start = word.find(core).unwrap_or(0);
+            out.push_str(&word[..start]);
+            out.push_str(replacement);
+            out.push_str(&word[start + core.len()..]);
+        } else {
+            out.push_str(word);
+        }
+        out.push_str(whitespace);
+    }
+    out
+}
 
 fn fold_math_alpha_char(ch: char) -> Option<char> {
     let u = ch as u32;
@@ -1310,7 +1338,7 @@ fn allow_mask_delivery2_stage2(input: &str) -> String {
             if i + 11 <= chars.len()
                 && input.len() >= start_b + 11
                 && input.is_char_boundary(start_b + 11)
-                && input[start_b..start_b + 11].eq_ignore_ascii_case(concat!("useeve", "agent"))
+                && input[start_b..start_b + 11].eq_ignore_ascii_case("useeveagent")
             {
                 let next_ok = if i + 11 < chars.len() {
                     !is_word_char(chars[i + 11].1)
@@ -1326,7 +1354,7 @@ fn allow_mask_delivery2_stage2(input: &str) -> String {
             if i + 7 <= chars.len()
                 && input.len() >= start_b + 7
                 && input.is_char_boundary(start_b + 7)
-                && input[start_b..start_b + 7].eq_ignore_ascii_case(concat!("eve", ".dev"))
+                && input[start_b..start_b + 7].eq_ignore_ascii_case("eve.dev")
             {
                 let next_ok = if i + 7 < chars.len() {
                     !is_word_char(chars[i + 7].1)
@@ -1377,181 +1405,62 @@ fn allow_mask_delivery2_stage2(input: &str) -> String {
     out
 }
 
-fn map_internal_seat_token(token: &str) -> Option<&'static str> {
+fn map_internal_seat_token(
+    token: &str,
+    manifest: Option<&chinwag_fleet::FleetManifest>,
+) -> Option<String> {
     let had_sigil = token.starts_with(['@', '■', '◆', '●', '⚡']);
-    let trimmed = token
-        .trim_start_matches('@')
-        .trim_start_matches(['■', '◆', '●', '⚡']);
-    let has_instance = trimmed.contains('#');
-    let base = trimmed.split_once('#').map(|(s, _)| s).unwrap_or(trimmed);
+    let trimmed = token.trim_start_matches(['@', '■', '◆', '●', '⚡']);
+    let (base, instance) = trimmed
+        .split_once('#')
+        .map_or((trimmed, None), |(base, instance)| (base, Some(instance)));
+    if let Some(manifest) = manifest {
+        if let Some(seat) = manifest.seat(base) {
+            return Some(
+                seat.display_name
+                    .clone()
+                    .unwrap_or_else(|| "Coding Agent".into()),
+            );
+        }
+        if manifest.nodes.iter().any(|node| node.node_id == base) {
+            return Some("workstation".into());
+        }
+    }
+    if (had_sigil || instance.is_some()) && chinwag_fleet::SeatId::new(base).is_ok() {
+        return Some("Coding Agent".into());
+    }
     let lower = base.to_ascii_lowercase();
-
-    // Known vendor domains as single compound tokens
-    if matches!(
-        lower.as_str(),
-        s if s == concat!("ver", "cel.com")
-            || s == concat!("ver", "cel.app")
-            || s == concat!("ver", "cel.sh")
-            || s == concat!("cloud", "flare.com")
-            || s == concat!("workers", ".dev")
-    ) {
-        return Some("cloud gateway");
-    }
-    if lower == concat!("cl", "erk.com") || lower == concat!("cl", "erk.dev") {
-        return Some("sign-in provider");
-    }
-    if lower == concat!("up", "stash.io") || lower == concat!("up", "stash.com") {
-        return Some("managed cache");
-    }
-    if lower == concat!("fl", "ue.sh") || lower == concat!("fl", "ue.dev") {
-        return Some("local runtime");
-    }
-
-    // Preserve canonical customer-facing `Delivery-2` even if Stage 4 sees an isolated/qualified token
-    if lower == concat!("deli", "very-2") || lower == concat!("deli", "very_2") {
-        return Some("Delivery-2");
-    }
-
-    // Case-insensitive unambiguous internal seat / vendor / protocol tokens
-    if lower == concat!("gemini", "-pm")
-        || lower == concat!("deli", "very-agent")
-        || lower == concat!("deli", "very-1")
-        || lower == concat!("deli", "very_1")
-        || (lower == concat!("deli", "very")
-            && (had_sigil || has_instance || base.chars().all(|c| !c.is_ascii_lowercase())))
-    {
-        return Some("Chinwag PM");
-    }
-    if lower == concat!("work", "horse")
-        || lower == concat!("game", "dev")
-        || lower == concat!("infra", "jr")
-        || lower == concat!("house", "keeping")
-        || lower == concat!("h-", "swarm")
-        || lower == concat!("ephemeral", "-dev")
-        || lower.starts_with(concat!("ephemeral-", "dev-"))
-        || lower == concat!("ephemeral", "-analyst")
-        || lower == concat!("ephemeral", "-sdr")
-        || lower == concat!("ephemeral", "-support")
-        || lower == concat!("summa", "rizer")
-        || lower == concat!("fa", "ble")
-        || lower == concat!("ar", "gon")
-        || lower == concat!("gr", "ok")
-        || lower == concat!("mer", "cury")
-    {
-        return Some("Coding Agent");
-    }
-    if lower == concat!("clair", "ic") || lower == concat!("cl", "ef") {
-        return Some("Fast Check");
-    }
-    if lower == concat!("ver", "cel") || lower == concat!("cloud", "flare") {
-        return Some("cloud gateway");
-    }
-    if lower == concat!("fl", "ue") {
-        return Some("local runtime");
-    }
-    if lower == concat!("ne", "on") {
-        return Some("managed database");
-    }
-    if lower == concat!("up", "stash") {
-        return Some("managed cache");
-    }
-    if lower == concat!("cl", "erk") {
-        return Some("sign-in provider");
-    }
-    if lower == concat!("alis", "tair")
-        || lower == concat!("fl", "int")
-        || lower == concat!("eagle", "-eye")
-        || lower == concat!("ephemeral", "-qa")
-        || lower.starts_with(concat!("ephemeral-", "qa-"))
-    {
-        return Some("Independent Reviewer");
-    }
-    if lower == concat!("aus", "dra") {
-        return Some("Workspace Advisor");
-    }
-    if lower == concat!("cr", "dt") || lower == concat!("cr", "dts") {
-        return Some("sync");
-    }
-    if lower == concat!("cr", "db") {
-        return Some("workspace history");
-    }
-    if lower == concat!("le", "ann") {
-        return Some("Memory search");
-    }
-    if lower == concat!("hp", "ke") {
-        return Some("end-to-end encrypted");
-    }
-    if lower == concat!("do", "ra") {
-        return Some("delivery metrics");
-    }
-    if lower == concat!("ss", "e") {
-        return Some("live updates");
-    }
-    if lower == concat!("a5", "09") {
-        return Some("agent-profile");
-    }
-
-    // Qualified `<SEAT>#<INSTANCE>`, sigil-prefixed, or ALL-CAPS internal seat names
-    // (preserves normal English lowercase prose such as "rust", "motion", "type", "docs", "mo")
-    let is_all_caps = (!base.is_empty() && base == "H")
-        || (base.len() >= 2
-            && base
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-' || b == b'_'));
-    if had_sigil || has_instance || is_all_caps {
-        let upper = base.to_ascii_uppercase();
-        if upper == concat!("DELI", "VERY") {
-            return Some("Chinwag PM");
+    let brand = lower.split('.').next().unwrap_or_default();
+    let mapped = match brand {
+        "vercel" | "cloudflare" => "cloud gateway",
+        "clerk" => "sign-in provider",
+        "upstash" => "managed cache",
+        "flue" => "local runtime",
+        "neon" => "managed database",
+        "crdt" | "crdts" => "sync",
+        "crdb" => "workspace history",
+        "leann" => "Memory search",
+        "hpke" => "end-to-end encrypted",
+        "dora" => "delivery metrics",
+        "sse" => "live updates",
+        "a509" => "agent-profile",
+        _ if ["gpt-", "claude-", "gemini-", "grok-", "deepseek-"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix)) =>
+        {
+            "Coding Agent"
         }
-        match upper.as_str() {
-            s if s == concat!("ARCHI", "TECT")
-                || s == concat!("RU", "ST")
-                || s == concat!("TY", "PE")
-                || s == concat!("IND", "EX")
-                || s == concat!("SPA", "RK")
-                || s == concat!("MOT", "ION")
-                || s == concat!("FREQU", "ENCY")
-                || s == concat!("SCR", "IBE")
-                || s == concat!("VEN", "TURE")
-                || s == "MO"
-                || s == concat!("DE", "X")
-                || s == concat!("DECLAR", "ATION")
-                || s == concat!("PAT", "ENT")
-                || s == concat!("DO", "CS")
-                || s == concat!("SOC", "IAL")
-                || s == concat!("GRO", "WTH")
-                || s == concat!("SAL", "ES")
-                || s == "H"
-                || s == "SKILL"
-                || s == "SUPPORT" =>
-            {
-                return Some("Coding Agent");
-            }
-            "QA" | "QA-1" | "QA-2" | "QA-3" | "QA-4" | "QA-5" | "QA-6" | "QA-7" | "QA-8"
-            | "QA-9" | "QA-10" => {
-                return Some("Independent Reviewer");
-            }
-            "DEV-1" | "DEV-2" | "DEV-3" | "DEV-4" | "DEV-5" | "DEV-6" | "DEV-7" | "DEV-8"
-            | "DEV-9" | "DEV-10" => {
-                return Some("Coding Agent");
-            }
-            _ => {}
-        }
-    }
-    if has_instance
-        && (lower == concat!("bri", "an")
-            || lower == concat!("ni", "c")
-            || lower == concat!("nic", "ola"))
-    {
-        return Some("You");
-    }
-
-    None
+        _ => return None,
+    };
+    Some(mapped.into())
 }
 
-fn scrub_compound_token(token_slice: &str) -> String {
-    if let Some(mapped) = map_internal_seat_token(token_slice) {
-        return mapped.to_string();
+fn scrub_compound_token(
+    token_slice: &str,
+    manifest: Option<&chinwag_fleet::FleetManifest>,
+) -> String {
+    if let Some(mapped) = map_internal_seat_token(token_slice, manifest) {
+        return mapped;
     }
     // If token contains `.` or `_`, scrub each `.` / `_`-delimited sub-segment
     // (skipping single-char sub-segments like `_H_` so identifiers like `WIDTH_H_2` stay intact)
@@ -1563,9 +1472,9 @@ fn scrub_compound_token(token_slice: &str) -> String {
             if matches!(ch, '.' | '_') {
                 let seg = &token_slice[seg_start..b_idx];
                 if seg.len() >= 2
-                    && let Some(mapped) = map_internal_seat_token(seg)
+                    && let Some(mapped) = map_internal_seat_token(seg, manifest)
                 {
-                    rebuilt.push_str(mapped);
+                    rebuilt.push_str(&mapped);
                     changed = true;
                 } else {
                     rebuilt.push_str(seg);
@@ -1576,9 +1485,9 @@ fn scrub_compound_token(token_slice: &str) -> String {
         }
         let tail = &token_slice[seg_start..];
         if tail.len() >= 2
-            && let Some(mapped) = map_internal_seat_token(tail)
+            && let Some(mapped) = map_internal_seat_token(tail, manifest)
         {
-            rebuilt.push_str(mapped);
+            rebuilt.push_str(&mapped);
             changed = true;
         } else {
             rebuilt.push_str(tail);
@@ -1628,16 +1537,23 @@ fn replace_case_insensitive(haystack: &str, needle_lower: &str, replacement: &st
 ///   2. Allow-mask `(?i)\bdelivery[\s-]?2\b` (and word-bounded `eve.dev` / `useEveAgent` / `eve[\s_-]+agent`)
 ///      -> sentinel FIRST so `"DELIVERY-2"`, `"delivery-2"`, and `"Delivery 2"` canonicalize to `"Delivery-2"`
 ///      without colliding with bare `"DELIVERY"` or corrupting `"retrieve agent"` / `"the eve of release"`.
-///   3. Boundary deny-scan & customer rewrite-map across all 30 internal seats, cloud/model vendors,
+///   3. Redact arbitrary marked actors, declared fleet seats, cloud/model vendors,
 ///      and crypto/protocol jargon (`CRDT`, `state.crdb`, `Ed25519`, `HPKE`, `SSE`, `LEANN`, `DORA`).
 ///   4. Token-level & dotted/underscore sub-token boundary rewrite preserving normal English prose.
 ///   5. Unmask sentinel -> `"Delivery-2"`.
 pub fn scrub_customer_ui_text(input: &str) -> String {
+    scrub_customer_ui_text_with_manifest(input, None)
+}
+
+pub fn scrub_customer_ui_text_with_manifest(
+    input: &str,
+    manifest: Option<&chinwag_fleet::FleetManifest>,
+) -> String {
     if input.is_empty() {
         return String::new();
     }
     // Stage 1: Normalize
-    let stage1 = normalize_scrubber_stage1(input);
+    let stage1 = scrub_topology_syntax(&normalize_scrubber_stage1(input));
     // Stage 2: Allow-mask "Delivery-2"
     let mut current = allow_mask_delivery2_stage2(&stage1);
     // Stage 3: Substring rewrite-map
@@ -1652,6 +1568,20 @@ pub fn scrub_customer_ui_text(input: &str) -> String {
     let mut idx = 0usize;
     while idx < chars.len() {
         let (start_byte, ch) = chars[idx];
+        // Query values and fragments in actual hyperlinks are not actor addresses.
+        if current[start_byte..].starts_with("https://")
+            || current[start_byte..].starts_with("http://")
+        {
+            let length = current[start_byte..]
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '`'))
+                .unwrap_or(current.len() - start_byte);
+            let end_byte = start_byte + length;
+            out.push_str(&current[start_byte..end_byte]);
+            while idx < chars.len() && chars[idx].0 < end_byte {
+                idx += 1;
+            }
+            continue;
+        }
         // Preserve Stage 2 sentinel verbatim through Stage 4 using exact char length
         if ch == '\u{E000}'
             && current[start_byte..].starts_with(D2_ALLOW_SENTINEL)
@@ -1687,10 +1617,13 @@ pub fn scrub_customer_ui_text(input: &str) -> String {
             };
             let word_slice = &current[chars[idx + 2].0..end_byte];
             let qualified = format!("■{word_slice}");
-            if let Some(mapped) = map_internal_seat_token(&qualified) {
-                out.push_str(mapped);
+            if let Some(mapped) = map_internal_seat_token(&qualified, manifest) {
+                out.push_str(&mapped);
             } else {
-                out.push_str(&scrub_compound_token(&current[start_byte..end_byte]));
+                out.push_str(&scrub_compound_token(
+                    &current[start_byte..end_byte],
+                    manifest,
+                ));
             }
             idx = end_idx;
             continue;
@@ -1727,7 +1660,7 @@ pub fn scrub_customer_ui_text(input: &str) -> String {
             current.len()
         };
         let token_slice = &current[start_byte..end_byte];
-        out.push_str(&scrub_compound_token(token_slice));
+        out.push_str(&scrub_compound_token(token_slice, manifest));
         idx = end_idx;
     }
 
@@ -1745,31 +1678,39 @@ pub fn scrub_customer_text(input: &str) -> String {
 
 fn is_forbidden_internal_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    lower.contains(concat!("ed25", "519"))
-        || lower.contains(concat!("cr", "db"))
-        || lower.contains(concat!("cr", "sqlite"))
-        || lower.contains(concat!("le", "ann"))
-        || lower.contains(concat!("hp", "ke"))
-        || lower.contains(concat!("allowed_", "signers"))
+    lower.contains("ed25519")
+        || lower.contains("crdb")
+        || lower.contains("crsqlite")
+        || lower.contains("leann")
+        || lower.contains("hpke")
+        || lower.contains("allowed_signers")
         || lower == "dual_brain"
         || lower == "sender_endpoint_id"
         || lower == "daemon_endpoint_id"
 }
 
 pub fn scrub_customer_ui_json(val: &mut Value) {
-    scrub_customer_ui_json_inner(val, false);
+    let manifest = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| chinwag_cli::fleet_cmd::load_manifest(None, &cwd).ok())
+        .map(|(_, manifest)| manifest);
+    scrub_customer_ui_json_inner(val, false, manifest.as_ref());
 }
 
-fn scrub_customer_ui_json_inner(val: &mut Value, preserve_code_lines: bool) {
+fn scrub_customer_ui_json_inner(
+    val: &mut Value,
+    preserve_code_lines: bool,
+    manifest: Option<&chinwag_fleet::FleetManifest>,
+) {
     match val {
         Value::String(s) => {
             if !preserve_code_lines {
-                *s = scrub_customer_text(s);
+                *s = scrub_customer_ui_text_with_manifest(s, manifest);
             }
         }
         Value::Array(items) => {
             for item in items {
-                scrub_customer_ui_json_inner(item, preserve_code_lines);
+                scrub_customer_ui_json_inner(item, preserve_code_lines, manifest);
             }
         }
         Value::Object(map) => {
@@ -1787,18 +1728,18 @@ fn scrub_customer_ui_json_inner(val: &mut Value, preserve_code_lines: bool) {
             let derived_tool = map
                 .get("sender")
                 .and_then(Value::as_str)
-                .map(friendly_actor_label);
+                .map(|actor| friendly_actor_label_with_manifest(actor, manifest));
             for (k, v) in map.iter_mut() {
                 if matches!(
                     k.as_str(),
                     "sender" | "sender_cast" | "to" | "seat" | "console_actor"
                 ) && let Value::String(raw_actor) = v
                 {
-                    *raw_actor = friendly_actor_label(raw_actor);
+                    *raw_actor = friendly_actor_label_with_manifest(raw_actor, manifest);
                     continue;
                 }
                 let child_preserve = preserve_code_lines || k == "hunks";
-                scrub_customer_ui_json_inner(v, child_preserve);
+                scrub_customer_ui_json_inner(v, child_preserve, manifest);
             }
             if let Some(label) = derived_tool {
                 map.entry("tool_label".to_string())
@@ -1812,20 +1753,22 @@ fn scrub_customer_ui_json_inner(val: &mut Value, preserve_code_lines: bool) {
 }
 
 fn friendly_actor_label(raw: &str) -> String {
+    friendly_actor_label_with_manifest(raw, None)
+}
+
+fn friendly_actor_label_with_manifest(
+    raw: &str,
+    manifest: Option<&chinwag_fleet::FleetManifest>,
+) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return "Local Tool".to_string();
     }
-    if let Some(mapped) = map_internal_seat_token(trimmed) {
-        return mapped.to_string();
+    if let Some(mapped) = map_internal_seat_token(trimmed, manifest) {
+        return mapped;
     }
     let lower = trimmed.to_ascii_lowercase();
-    if lower == concat!("bri", "an")
-        || lower == concat!("ni", "c")
-        || lower == concat!("nic", "ola")
-        || lower.starts_with("developer")
-        || lower == "you"
-    {
+    if lower.starts_with("developer") || lower == "you" {
         return "You".to_string();
     }
     if lower.contains("claude") {
@@ -1846,7 +1789,7 @@ fn friendly_actor_label(raw: &str) -> String {
     if lower.contains("aider") {
         return "Aider".to_string();
     }
-    scrub_customer_text(trimmed)
+    "Local Tool".into()
 }
 
 // ============================================================================
@@ -9730,36 +9673,37 @@ mod tests {
         let normal = "All 14 unit tests passed in session without issue.";
         assert_eq!(scrub_customer_text(normal), normal);
 
-        let leaked = format!(
-            "Dispatched {} on {} with {} and {} over {}",
-            concat!("WORK", "HORSE#abc123"),
-            concat!("Node 1 · Mac St", "udio"),
-            concat!("inception/mer", "cury-3"),
-            concat!("cr", "db"),
-            concat!("SS", "E")
-        );
-        let cleaned = scrub_customer_text(&leaked);
-        assert!(
-            !cleaned
-                .to_ascii_lowercase()
-                .contains(concat!("work", "horse"))
-        );
-        assert!(
-            !cleaned
-                .to_ascii_lowercase()
-                .contains(concat!("mac st", "udio"))
-        );
-        assert!(
-            !cleaned
-                .to_ascii_lowercase()
-                .contains(concat!("mer", "cury"))
-        );
-        assert!(!cleaned.to_ascii_lowercase().contains(concat!("cr", "db")));
+        let leaked = "Dispatched @agent.custom#abc123 on node 7 · worker-box.local with gpt-example and crdb over SSE";
+        let cleaned = scrub_customer_text(leaked);
+        for token in ["agent.custom", "worker-box.local", "gpt-example", "crdb"] {
+            assert!(!cleaned.to_ascii_lowercase().contains(token), "{cleaned}");
+        }
         assert!(cleaned.contains("live updates"));
+        assert!(cleaned.contains("network endpoint"));
+        let price_prose = "$0.0080 / Cr · paid packs remain valid for 12 months";
+        assert_eq!(scrub_customer_ui_text(price_prose), price_prose);
+        let linked_prose = "Read https://example.test/pricing?source=local_ui#founders and keep ordinary hyperlinks intact.";
+        assert_eq!(scrub_customer_ui_text(linked_prose), linked_prose);
+        assert_eq!(
+            scrub_customer_ui_text("Routed via custom-provider/future-model-7 today."),
+            "Routed via Coding Agent today."
+        );
+        assert_eq!(
+            scrub_customer_ui_text(
+                "Read https://docs.example/release-3 and preserve normal prose."
+            ),
+            "Read https://docs.example/release-3 and preserve normal prose."
+        );
+        assert_eq!(
+            scrub_customer_text(
+                "Write type definitions in rust docs; adjust motion and WIDTH_H_2."
+            ),
+            "Write type definitions in rust docs; adjust motion and WIDTH_H_2."
+        );
     }
 
     #[test]
-    fn five_stage_scrubber_preserves_delivery_2_and_scrubs_30_seats_vendors_and_crypto() {
+    fn five_stage_scrubber_preserves_delivery_2_and_scrubs_declared_seats_and_crypto() {
         // Stage 1 + 2: Canonicalize every Delivery-2 spelling, Unicode dash, fullwidth, & zero-width variant
         for variant in [
             "DELIVERY-2",
@@ -9778,91 +9722,47 @@ mod tests {
             );
         }
 
-        // Bare DELIVERY (not followed by -2) scrubs to Chinwag PM, while English "webhook delivery" stays intact
-        let bare = scrub_customer_ui_text(&format!(
-            "{} and @{} coordinated with DELIVERY-2 on duplicate webhook delivery.",
-            concat!("DELI", "VERY"),
-            concat!("deli", "very#inst1")
-        ));
+        let bare = scrub_customer_ui_text(
+            "@arbitrary#inst1 coordinated with DELIVERY-2 on duplicate webhook delivery.",
+        );
         assert!(bare.contains("Delivery-2"), "{bare}");
         assert!(bare.contains("duplicate webhook delivery."), "{bare}");
-        assert!(!bare.contains("DELIVERY "), "{bare}");
+        assert!(!bare.contains("arbitrary"), "{bare}");
         assert!(!bare.contains("#inst1"), "{bare}");
 
         // Context-aware eve.dev / useEveAgent / eve agent -> Delivery-2, while English "the eve of release" stays intact
         let eve_prose = scrub_customer_ui_text(&format!(
             "Migrated from {} and {} on the eve of release.",
-            concat!("eve", ".dev"),
-            concat!("useEve", "Agent")
+            "eve.dev", "useEveAgent"
         ));
         assert_eq!(
             eve_prose,
             "Migrated from Delivery-2 and Delivery-2 on the eve of release."
         );
 
-        // All 30 standing seats scrub cleanly when emitted as internal handles
-        let seats = [
-            concat!("GEMINI", "-PM"),
-            concat!("DELI", "VERY"),
-            concat!("ARCHI", "TECT"),
-            concat!("RU", "ST"),
-            concat!("IND", "EX"),
-            concat!("CLOUD", "FLARE"),
-            concat!("ALIS", "TAIR"),
-            "QA",
-            concat!("INFRA", "JR"),
-            concat!("HOUSE", "KEEPING"),
-            concat!("TY", "PE"),
-            concat!("GAME", "DEV"),
-            concat!("SPA", "RK"),
-            concat!("MOT", "ION"),
-            concat!("FREQU", "ENCY"),
-            concat!("SCR", "IBE"),
-            concat!("DO", "CS"),
-            "MO",
-            concat!("EAGLE", "-EYE"),
-            concat!("PAT", "ENT"),
-            concat!("VEN", "TURE"),
-            concat!("DE", "X"),
-            concat!("DECLAR", "ATION"),
-            concat!("GRO", "WTH"),
-            concat!("SAL", "ES"),
-            concat!("SOC", "IAL"),
-            concat!("WORK", "HORSE"),
-            concat!("FL", "INT"),
-            "H",
-            concat!("AUS", "DRA"),
-        ];
-        assert_eq!(seats.len(), 30);
-        for seat in seats {
-            let scrubbed = scrub_customer_ui_text(&format!("Routed via {seat} today."));
-            assert_ne!(
-                scrubbed,
-                format!("Routed via {seat} today."),
-                "internal seat `{seat}` must be scrubbed"
+        // Bare identifiers are classified only by declared membership, never a compiled roster.
+        let mut manifest = chinwag_fleet::FleetManifest::starter_profile("solo").unwrap();
+        let template = manifest.seats.remove(0);
+        for id in ["BUILD-ONE", "reviewer.blue", "M2", "custom_9"] {
+            let mut seat = template.clone();
+            seat.id = chinwag_fleet::SeatId::new(id).unwrap();
+            manifest.seats.push(seat);
+            let scrubbed = scrub_customer_ui_text_with_manifest(
+                &format!("Routed via {id} today."),
+                Some(&manifest),
             );
+            assert_eq!(scrubbed, "Routed via Coding Agent today.");
         }
-
-        // Cloud/model vendors and crypto/protocol jargon rewrite to plain English
-        let jargon = format!(
-            "{} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {}",
-            concat!("Ver", "cel"),
-            concat!("Cloud", "flare"),
-            concat!("Mer", "cury 3"),
-            concat!("Cl", "ef"),
-            concat!("Clair", "ic"),
-            concat!("Fl", "ue"),
-            concat!("Ne", "on"),
-            concat!("Up", "stash"),
-            concat!("Cl", "erk"),
-            concat!("CR", "DT"),
-            concat!("state.cr", "db"),
-            concat!("Ed25", "519"),
-            concat!("X25519ML", "KEM768"),
-            concat!("LE", "ANN"),
-            concat!("DO", "RA"),
+        manifest.seats[0].display_name = Some("Build Assistant".into());
+        assert_eq!(
+            scrub_customer_ui_text_with_manifest("BUILD-ONE", Some(&manifest)),
+            "Build Assistant"
         );
-        let rewritten = scrub_customer_ui_text(&jargon);
+        assert_eq!(scrub_customer_ui_text("UNLISTED-SEAT"), "UNLISTED-SEAT");
+
+        // Cloud vendors and crypto/protocol jargon rewrite to plain English.
+        let jargon = "Vercel + Cloudflare + gpt-example + Flue + Neon + Upstash + Clerk + CRDT + state.crdb + Ed25519 + X25519MLKEM768 + LEANN + DORA";
+        let rewritten = scrub_customer_ui_text(jargon);
         assert!(rewritten.contains("cloud gateway"), "{rewritten}");
         assert!(rewritten.contains("sync"), "{rewritten}");
         assert!(rewritten.contains("workspace history"), "{rewritten}");
@@ -10054,7 +9954,7 @@ mod tests {
 
     #[test]
     fn human_sender_guard_rejects_non_human_seats() {
-        let valid_human = concat!("Bri", "an");
+        let valid_human = "Brian";
         assert!(admit_human_ui_sender(valid_human, "ui-abcdef0123456789").is_ok());
 
         for non_human in [
@@ -10922,8 +10822,8 @@ mod tests {
 
     #[test]
     fn delivery2_five_stage_scrubber_secret_rejection_url_allowlist_and_arbitration_tests() {
-        // 1. Stage 1-5 scrubber: preserves "Delivery-2" without tail duplication (FLINT-1),
-        // preserves U+FE58 (FLINT-2), preserves "retrieve agent" / "achieve agent" / "believe.dev" (ALISTAIR-3),
+        // 1. Stage 1-5 scrubber: preserves "Delivery-2" without tail duplication (TESTA-1),
+        // preserves U+FE58 (TESTA-2), preserves "retrieve agent" / "achieve agent" / "believe.dev" (REVIEWER-3),
         // and strips bidi/format chars + Math Script/Double-Struck + dotted/underscore vendor/seat tokens!
         let preserved = scrub_customer_ui_text(
             "Ask DELIVERY-2, @DELIVERY-2#inst9, ■ DELIVERY-2#1, DELIVERY_2, and delivery 2 to retrieve agent logs, achieve agent parity on believe.dev, and check x Delivery-2 y \u{FE58}",
@@ -10942,25 +10842,25 @@ mod tests {
 
         let hostile_jargon = format!(
             "{} {} {} {} {} {} {} {}",
-            "WORK\u{202C}HORSE",
-            "GEMINI-\u{2066}PM\u{2069}",
+            "@AGENT\u{202C}.BLUE#instance",
+            "@CUSTOM-\u{2066}SEAT#two\u{2069}",
             "Ver\u{202A}cel",
             "𝕍𝕖𝕣𝕔𝕖𝕝",
             "ℂℝ𝔻𝕋",
             "vercel.com/index.leann",
-            "crdt_sync/hpke_seal/WORKHORSE_1",
-            "DELIVERY-1"
+            "crdt_sync/hpke_seal/@custom.seat#three",
+            "@arbitrary#four"
         );
         let scrubbed = scrub_customer_ui_text(&hostile_jargon);
         let lower = scrubbed.to_ascii_lowercase();
         for forbidden in [
-            "workhorse",
-            "gemini-pm",
+            "agent.blue",
+            "custom-seat",
             "vercel",
             "crdt",
             "leann",
             "hpke",
-            "delivery-1",
+            "arbitrary#",
             "\u{202C}",
             "\u{2066}",
             "\u{202A}",
@@ -10971,7 +10871,7 @@ mod tests {
             );
         }
 
-        // 2. Outbound URL sanitizer + open-redirect query guard (ALISTAIR-1 + Round-3)
+        // 2. Outbound URL sanitizer + open-redirect query guard (REVIEWER-1 + Round-3)
         assert_eq!(
             sanitize_chinwag_outbound_url("javascript:alert(1)", "https://chinwag.sh/open"),
             "https://chinwag.sh/open"
@@ -11020,7 +10920,7 @@ mod tests {
         );
 
         // 3. Secret-shape rejection across quoted, space-separated, `=`/`:`/`?`/`&` attached prefixes,
-        // _access_key/_key_id/_pat keys, zero-width obfuscation, digitless Bearer, PGP/Age, ASIA (ALISTAIR-2 + QA-R2-1)
+        // _access_key/_key_id/_pat keys, zero-width obfuscation, digitless Bearer, PGP/Age, ASIA (REVIEWER-2 + QA-R2-1)
         let stripe_live_sample = format!("STRIPE_KEY={}{}", "sk_live_", "1234567890abcdef");
         let slack_bot_sample = format!("SLACK_BOT={}{}", "xoxb-", "1234567890-abcdef");
         let openai_eq_sample = format!("OPENAI_KEY={}{}", "sk-proj-", "1234567890abcdef");
@@ -11100,7 +11000,7 @@ mod tests {
         assert!(missing_body.contains("not found"));
         assert_eq!(val_why_missing["entry"]["sources"], json!([]));
 
-        // ARCHITECT-R2-4 + ARCHITECT-R2-5: multi-byte UTF-8 before 'why' never panics, and
+        // FIXTURE-B-R2-4 + FIXTURE-B-R2-5: multi-byte UTF-8 before 'why' never panics, and
         // explicit `Why #<id>?` containing 'credit' or 'morning' resolves as Why-lookup (not generic summary)
         for why_edge in [
             r#"{"prompt":"a😀 why #?"}"#,
@@ -11122,7 +11022,7 @@ mod tests {
             }
         }
 
-        // ALISTAIR-R2-1: `id: "hitl-sample-walkthrough"` without `item_id` or `is_sample` must return 403 Forbidden
+        // REVIEWER-R2-1: `id: "hitl-sample-walkthrough"` without `item_id` or `is_sample` must return 403 Forbidden
         let (st_hitl_sample, val_hitl_sample) = handle_delivery2_approval(
             &repo,
             5487,
@@ -11134,7 +11034,7 @@ mod tests {
             "SampleWalkthroughShipForbidden"
         );
 
-        // ARCHITECT-R2-6: Pre-receipt `/cancel` matching `turn_id` without `entry_id` clamps unseen answer to `[Stopped]`
+        // FIXTURE-B-R2-6: Pre-receipt `/cancel` matching `turn_id` without `entry_id` clamps unseen answer to `[Stopped]`
         let (st_premsg, _) = handle_delivery2_message(
             &repo,
             5487,
@@ -11219,7 +11119,7 @@ mod tests {
         assert_eq!(val_d2_after_rej["already_settled"], true);
         assert_eq!(val_d2_after_rej["decision"], "denied");
 
-        // (c) ALISTAIR-R2-2 + ARCHITECT-R2-3: Unprefixed Delivery-2 `deny` blocks stale Inbox `approve` (409 already_rejected),
+        // (c) REVIEWER-R2-2 + FIXTURE-B-R2-3: Unprefixed Delivery-2 `deny` blocks stale Inbox `approve` (409 already_rejected),
         // and Inbox `undo_reject` clears both `hitl-<id>` and `<id>` so subsequent Delivery-2 `approve` succeeds!
         let (st_unpref_deny, val_unpref_deny) =
             handle_delivery2_approval(&repo, 5487, br#"{"id":"CHWG-779","decision":"deny"}"#);
@@ -11241,7 +11141,7 @@ mod tests {
         assert_eq!(val_reapprove["already_settled"], false);
         assert_eq!(val_reapprove["decision"], "approved");
 
-        // (d) ARCHITECT-R3-2: Cross-thread Stop — if another tab switches `active_thread_id` away from `thr-main`
+        // (d) FIXTURE-B-R3-2: Cross-thread Stop — if another tab switches `active_thread_id` away from `thr-main`
         // before `/cancel` arrives, `handle_delivery2_cancel` clamps the stopped turn in its OWNING thread (`thr-main`)!
         let (st_xmsg, _) = handle_delivery2_message(
             &repo,
@@ -11273,7 +11173,7 @@ mod tests {
         assert_eq!(xstopped_entry["body"], "[Stopped]");
         assert_eq!(xstopped_entry["sources"], json!([]));
 
-        // (e) ALISTAIR-R3-2: Descriptor-anchored `O_NOFOLLOW` OAuth receipt check rejects symlinked `.chinwag` directory!
+        // (e) REVIEWER-R3-2: Descriptor-anchored `O_NOFOLLOW` OAuth receipt check rejects symlinked `.chinwag` directory!
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
@@ -11290,7 +11190,7 @@ mod tests {
                 "symlinked .chinwag directory must be rejected by O_NOFOLLOW receipt check"
             );
 
-            // (f) ARCHITECT-R4-2: FIFO at `.chinwag/github-oauth.json` returns false promptly without blocking!
+            // (f) FIXTURE-B-R4-2: FIFO at `.chinwag/github-oauth.json` returns false promptly without blocking!
             let fifo_repo_dir = tempfile::tempdir().unwrap();
             let fifo_repo = fs::canonicalize(fifo_repo_dir.path()).unwrap();
             fs::create_dir_all(fifo_repo.join(".chinwag")).unwrap();
@@ -11307,7 +11207,7 @@ mod tests {
             );
         }
 
-        // (g) ARCHITECT-R4-1 + FLINT-R4-1:
+        // (g) FIXTURE-B-R4-1 + TESTA-R4-1:
         // 1) Oversized 180,000-char prompt is rejected cleanly (400 prompt_too_long) without touching state.
         let huge_prompt_body =
             serde_json::to_vec(&json!({ "prompt": "a".repeat(180_000) })).unwrap();
@@ -11374,7 +11274,7 @@ mod tests {
             "refused oversized save must leave prior valid .chinwag/ui-v4-state.json intact"
         );
 
-        // (h) ARCHITECT-R5-1: Pending workflow preservation across BOTH thread eviction and byte-budget shedding!
+        // (h) FIXTURE-B-R5-1: Pending workflow preservation across BOTH thread eviction and byte-budget shedding!
         let pend_dir = tempfile::tempdir().unwrap();
         let pend_repo = fs::canonicalize(pend_dir.path()).unwrap();
         init_test_repo(&pend_repo);

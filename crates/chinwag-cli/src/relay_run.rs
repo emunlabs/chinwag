@@ -10,107 +10,39 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[allow(dead_code)]
-pub struct GrokBotSeat {
-    pub seat: &'static str,
-    pub grokbot_uuid: &'static str,
-    pub grokbot_name: &'static str,
-    pub is_group: bool,
-    pub slack_channel: &'static str,
-    pub webhook_env: &'static str,
-    pub agentmail_inbox: &'static str,
-    pub direct_reports: &'static [&'static str],
+#[derive(Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RelayPolicy {
+    management_channel: String,
+    seats: Vec<GrokBotSeat>,
 }
 
-pub const MGMT_CHANNEL_UUID: &str = "c5a97346-e424-44bf-90d2-9caaa7594c11";
-pub const GROUP_INFRA_ENG_UUID: &str = "1e14427a-5234-4411-a3de-d0127f9bbf57";
-pub const GROUP_ENG_BRIAN_UUID: &str = "d8873fe8-ea86-4b19-92ae-402f290c422f";
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrokBotSeat {
+    pub seat: String,
+    pub grokbot_uuid: String,
+    pub grokbot_name: String,
+    pub slack_channel: String,
+    pub webhook_env: String,
+    pub agentmail_inbox: String,
+    #[serde(default)]
+    pub direct_reports: Vec<String>,
+}
 
-pub const GROKBOT_MGMT_ROSTER: &[GrokBotSeat] = &[
-    GrokBotSeat {
-        seat: "INFRA",
-        grokbot_uuid: "407d2c36-b5c3-491a-9e08-527ad7f18a06",
-        grokbot_name: "infra · Infrastructure",
-        is_group: false,
-        slack_channel: "#infra (C0AERHZ1XB4)",
-        webhook_env: "infra.env",
-        agentmail_inbox: "infra-bot@mail.grokbot.com",
-        direct_reports: &[
-            "QA",
-            "FLINT",
-            "ALISTAIR",
-            "DOCS",
-            "HOUSEKEEPING",
-            "EPHEMERAL-QA",
-        ],
-    },
-    GrokBotSeat {
-        seat: "BIZFIN",
-        grokbot_uuid: "e484d158-8f4d-41f3-a7c9-b2bf8167cbcb",
-        grokbot_name: "bizfin · BUSINESS, FINANCE, LEGAL",
-        is_group: false,
-        slack_channel: "#bizfin (C0C93BV4Q8Z)",
-        webhook_env: "bizfin.env",
-        agentmail_inbox: "bizfin@agentmail.to",
-        direct_reports: &["MO", "VENTURE", "EAGLE-EYE", "DEX", "EPHEMERAL-ANALYST"],
-    },
-    GrokBotSeat {
-        seat: "ENG",
-        grokbot_uuid: "a692d662-495c-4def-896b-6a787087de01",
-        grokbot_name: "eng · ENGINEERING MANAGER",
-        is_group: false,
-        slack_channel: "#eng (C0C8S2WDRHB)",
-        webhook_env: "eng.env",
-        agentmail_inbox: "spector-eng@agentmail.to",
-        direct_reports: &["ARCHITECT", "RUST", "INDEX", "EPHEMERAL-DEV"],
-    },
-    GrokBotSeat {
-        seat: "PRODUCT",
-        grokbot_uuid: "382e7010-ea4d-48f7-a1bb-96dca02a0921",
-        grokbot_name: "product · CREATIVE AND PRODUCT TEAM MANAGER/RELAY",
-        is_group: false,
-        slack_channel: "#product (C0C9VRFBFKJ)",
-        webhook_env: "product.env",
-        agentmail_inbox: "spector-product@agentmail.to",
-        direct_reports: &[
-            "GEMINI-PM",
-            "TYPE",
-            "SCRIBE",
-            "MOTION",
-            "FREQUENCY",
-            "DELIVERY",
-            "EPHEMERAL-RENDER",
-        ],
-    },
-    GrokBotSeat {
-        seat: "S-AND-M",
-        grokbot_uuid: "16593278-278d-4a2b-9e94-3a189bcaf599",
-        grokbot_name: "s-and-m · SALES AND MARKETING",
-        is_group: false,
-        slack_channel: "#s-and-m (C0C954LTM7W)",
-        webhook_env: "s-and-m.env",
-        agentmail_inbox: "spector-sm@agentmail.to",
-        direct_reports: &[
-            "DECLARATION",
-            "GROWTH",
-            "SALES",
-            "SUPPORT",
-            "SOCIAL",
-            "EPHEMERAL-SDR",
-            "EPHEMERAL-SUPPORT",
-        ],
-    },
-    GrokBotSeat {
-        seat: "PA",
-        grokbot_uuid: "419c9d1d-f01c-4d3c-9972-93e56f95c5d9",
-        grokbot_name: "personal-assistant",
-        is_group: false,
-        slack_channel: "#mgmt (MGMT c5a97346-e424-44bf-90d2-9caaa7594c11)",
-        webhook_env: "product.env",
-        agentmail_inbox: "brian@emunlabs.com",
-        direct_reports: &["FOUNDER-CHECKLIST", "VIP-CISO-CALENDAR", "APPLE-JOURNAL"],
-    },
-];
+fn relay_policy() -> Result<RelayPolicy, String> {
+    let Some(manifest) = chinwag_cli::canonical_seat_pubkeys::configured_manifest() else {
+        return Ok(RelayPolicy::default());
+    };
+    manifest
+        .extensions
+        .get("relay")
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid fleet relay policy: {error}"))
+        })
+        .unwrap_or_else(|| Ok(RelayPolicy::default()))
+}
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -143,15 +75,12 @@ fn detect_local_hostname() -> String {
             return h;
         }
     }
-    "brians-mac-studio-468".to_string()
+    "unconfigured".to_string()
 }
 
 pub fn resolve_identity_config() -> IdentityConfig {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let local_host = detect_local_hostname();
-    let is_studio_host = local_host
-        .to_ascii_lowercase()
-        .starts_with("brians-mac-studio");
 
     let identity_path = env::var("CHINWAG_IDENTITY_FILE")
         .ok()
@@ -248,30 +177,14 @@ pub fn resolve_identity_config() -> IdentityConfig {
         machine_name = local_host.clone();
     }
 
-    let effective_is_studio = is_studio_host
-        && !machine_name.to_ascii_lowercase().contains("nic")
-        && actor_id != "actor-nic";
-
     if actor_id.is_empty() {
-        actor_id = if effective_is_studio {
-            "actor-brian".to_string()
-        } else {
-            "actor-nic".to_string()
-        };
+        actor_id = handle.clone();
     }
     if handle.is_empty() {
-        handle = if actor_id == "actor-nic" {
-            "● Nic".to_string()
-        } else {
-            "● Brian".to_string()
-        };
+        handle = "unconfigured".into();
     }
     if display_name.is_empty() {
-        display_name = if actor_id == "actor-nic" {
-            "Nicola (Nic) Spector".to_string()
-        } else {
-            "Brian Spector".to_string()
-        };
+        display_name = handle.clone();
     }
 
     if let Ok(env_url) = env::var("CHINWAG_MISSION_CONTROL_URL")
@@ -286,22 +199,11 @@ pub fn resolve_identity_config() -> IdentityConfig {
         mission_control_url = cfg_studio_origin;
     }
     if mission_control_url.is_empty() {
-        mission_control_url = if effective_is_studio {
-            "http://127.0.0.1:5487".to_string()
-        } else {
-            env::var("CHINWAG_HUB_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "http://127.0.0.1:5487".to_string())
-        };
+        mission_control_url =
+            env::var("CHINWAG_HUB_URL").unwrap_or_else(|_| "http://127.0.0.1:5487".into());
     }
     mission_control_url = mission_control_url.trim_end_matches('/').to_string();
-
-    if fallback_hub_url.is_empty() {
-        fallback_hub_url = "http://192.168.1.166:5487".to_string();
-    } else {
-        fallback_hub_url = fallback_hub_url.trim_end_matches('/').to_string();
-    }
+    fallback_hub_url = fallback_hub_url.trim_end_matches('/').to_string();
 
     let mut api_key = env::var("CHINWAG_API_KEY")
         .ok()
@@ -390,7 +292,7 @@ fn curl_post_json_endpoint(
     endpoint_url: &str,
     payload_str: &str,
     identity: &IdentityConfig,
-    use_tailnet_resolve: bool,
+    _use_tailnet_resolve: bool,
 ) -> (bool, u16) {
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
@@ -408,12 +310,6 @@ fn curl_post_json_endpoint(
         "-H",
         "Content-Type: application/json",
     ]);
-    if use_tailnet_resolve && endpoint_url.contains("brians-mac-studio-468.tail23ad5.ts.net:5487") {
-        cmd.args([
-            "--resolve",
-            "brians-mac-studio-468.tail23ad5.ts.net:5487:100.66.156.76",
-        ]);
-    }
     if !identity.api_key.is_empty() {
         cmd.args(["-H", &format!("Authorization: Bearer {}", identity.api_key)]);
     }
@@ -464,19 +360,6 @@ fn post_mission_control_with_fallback(
             fallbacks.push((fb_ep, false));
         }
     }
-    for lan_base in [
-        "http://192.168.1.166:5487",
-        "http://192.168.1.161:5487",
-        "https://brians-mac-studio-468.tail23ad5.ts.net:5487",
-        "http://127.0.0.1:5487",
-    ] {
-        let ep = format!("{lan_base}{path}");
-        let use_resolve = lan_base.starts_with("https://");
-        if ep != primary_endpoint || use_resolve {
-            fallbacks.push((ep, use_resolve));
-        }
-    }
-
     let mut last_code = code;
     for (fb_url, use_resolve) in fallbacks {
         let (fb_ok, fb_code) = curl_post_json_endpoint(&fb_url, payload_str, identity, use_resolve);
@@ -658,7 +541,7 @@ fn beam_curl_exchange(
     hub_base: &str,
     request: &BeamRequest<'_>,
     identity: &IdentityConfig,
-    use_tailnet_resolve: bool,
+    _use_tailnet_resolve: bool,
 ) -> Option<BeamResponse> {
     use std::process::Stdio;
     let BeamRequest {
@@ -688,12 +571,6 @@ fn beam_curl_exchange(
         cmd.arg("-I");
     } else {
         cmd.args(["-X", method]);
-    }
-    if use_tailnet_resolve && url.contains("brians-mac-studio-468.tail23ad5.ts.net:5487") {
-        cmd.args([
-            "--resolve",
-            "brians-mac-studio-468.tail23ad5.ts.net:5487:100.66.156.76",
-        ]);
     }
     if !identity.api_key.is_empty() {
         cmd.args(["-H", &format!("Authorization: Bearer {}", identity.api_key)]);
@@ -801,23 +678,10 @@ fn forward_beam_http_request(
         }
     };
 
-    if !hub_url.contains("tail23ad5.ts.net") {
-        push_candidate(&mut candidates, hub_url, false);
-    }
+    push_candidate(&mut candidates, hub_url, false);
     if !fallback_hub_url.is_empty() {
         push_candidate(&mut candidates, fallback_hub_url, false);
     }
-    push_candidate(&mut candidates, "http://192.168.1.166:5487", false);
-    push_candidate(&mut candidates, "http://192.168.1.161:5487", false);
-    if hub_url.contains("tail23ad5.ts.net") {
-        push_candidate(&mut candidates, hub_url, true);
-        push_candidate(&mut candidates, hub_url, false);
-    }
-    push_candidate(
-        &mut candidates,
-        "https://brians-mac-studio-468.tail23ad5.ts.net:5487",
-        true,
-    );
 
     for (cand, use_resolve) in candidates {
         if let Some((status_line, headers, body)) =
@@ -980,11 +844,7 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
     let identity = resolve_identity_config();
     let mut listen_addr = "127.0.0.1:5487".to_string();
     let mut explicit_listen = false;
-    let mut hub_url = if identity.mission_control_url.contains("127.0.0.1:5487") {
-        "https://brians-mac-studio-468.tail23ad5.ts.net:5487".to_string()
-    } else {
-        identity.mission_control_url.clone()
-    };
+    let mut hub_url = identity.mission_control_url.clone();
     let mut is_status = false;
     let mut is_once = false;
 
@@ -1133,10 +993,7 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         Ok(l) => l,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::AddrInUse
-                && identity
-                    .machine_name
-                    .to_ascii_lowercase()
-                    .starts_with("brians-mac-studio")
+                && identity.machine_name.to_ascii_lowercase().is_empty()
             {
                 let msg = json!({
                     "ok": true,
@@ -1212,11 +1069,19 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         return 0;
     }
 
+    let relay = match relay_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            let _ = writeln!(stderr, "chinwag relay: {error}");
+            return 2;
+        }
+    };
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     match sub {
         "beam" => run_beam_cli(&args[1..], stdout, stderr),
         "status" => {
-            let seats: Vec<_> = GROKBOT_MGMT_ROSTER
+            let seats: Vec<_> = relay
+                .seats
                 .iter()
                 .map(|s| {
                     json!({
@@ -1234,22 +1099,14 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             let report = json!({
                 "ok": true,
                 "engine": "chinwag-rust-relay",
-                "binary": "/opt/homebrew/bin/chinwag",
+                "binary": "chinwag",
                 "legacy_python_bridge_retired": true,
                 "mgmt_group_channel": {
                     "name": "MGMT",
-                    "uuid": MGMT_CHANNEL_UUID,
-                    "member_count": 6,
-                    "member_uuids": GROKBOT_MGMT_ROSTER.iter().map(|s| s.grokbot_uuid).collect::<Vec<_>>()
+                    "uuid": relay.management_channel,
+                    "member_count": relay.seats.len(),
+                    "member_uuids": relay.seats.iter().map(|s| s.grokbot_uuid.as_str()).collect::<Vec<_>>()
                 },
-                "group_channels": [
-                    { "name": "MGMT", "uuid": MGMT_CHANNEL_UUID },
-                    { "name": "Brian Spector, infra, eng", "uuid": GROUP_INFRA_ENG_UUID },
-                    { "name": "eng, Brian Spector", "uuid": GROUP_ENG_BRIAN_UUID }
-                ],
-                "retired_bots": [
-                    { "name": "social (GrokBot)", "uuid": "5d325d18-24eb-4c37-a1c7-57a8abb50ecf", "status": "retired_moved_under_s_and_m" }
-                ],
                 "seats": seats
             });
             let _ = writeln!(
@@ -1260,114 +1117,13 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             0
         }
         "brief-mgmt" => {
-            let run_ts = now_ms();
-            let mut receipts = Vec::new();
-            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-            let planner_db = &format!("{home}/WORKSPACE/delivery-planner/data/planner.sqlite");
-            let crdb_path = &format!("{home}/WORKSPACE/chinwag/.chinwag/state.crdb");
-
-            for seat in GROKBOT_MGMT_ROSTER {
-                let run_id = format!("chinwag-rust-mgmt-{}-{}", seat.seat.to_lowercase(), run_ts);
-                let listener_prefix = if seat.seat == "INFRA" {
-                    "HOUSEKEEPING"
-                } else if seat.seat == "PA" {
-                    "PRODUCT"
-                } else {
-                    seat.seat
-                };
-                let subj = format!(
-                    "[Paperclip] {} | CHWG-MGMT-BRIEF: Management Charter, Direct Reports & Native Rust Relay Cutover",
-                    listener_prefix
-                );
-                let msg = format!(
-                    "{}\n\
-                    Run: {}   Wake reason: issue_assigned (chinwag-rust-relay)\n\
-                    Receipt marker (include in any receipt comment): [relay-receipt run={}]\n\n\
-                    ACTION REQUIRED FROM BRIAN SPECTOR & GEMINI-PM — POST YOUR RECEIPT IN GROK BOT `MGMT` GROUP CHANNEL ({}):\n\
-                    1. UNPAUSE YOUR SLACK CHANNEL LISTENER FOR CHINWAG RUST RELAY: Do NOT call the retired Paperclip HTTP API (:3110), DO keep your Slack channel listener ({}) and AgentMail listener ({}) ACTIVE for `[Paperclip] {} |` messages dispatched by our native Rust `/opt/homebrew/bin/chinwag relay` binary.\n\
-                    2. POST CONFIRMATION IN `MGMT` ({}): Immediately post a short confirmation message in the Grok Bot `MGMT` group room (`{}`) confirming your seat (`{}` / `{}`), your direct reports {:?}, and that you are running on Chinwag Mission Control (`https://brians-mac-studio-468.tail23ad5.ts.net:5487/`).\n\
-                    3. INFRA BOT (`407d2c36-b5c3-491a-9e08-527ad7f18a06`): Because `eng`, `bizfin`, `product`, and `s-and-m` paused their routines earlier today, please immediately post this Management Charter briefing directly into the Grok Bot `MGMT` group conversation (`c5a97346-e424-44bf-90d2-9caaa7594c11`) AND send a direct agent message to `eng` (`a692d662-495c-4def-896b-6a787087de01`), `bizfin` (`e484d158-8f4d-41f3-a7c9-b2bf8167cbcb`), `product` (`382e7010-ea4d-48f7-a1bb-96dca02a0921`), `s-and-m` (`16593278-278d-4a2b-9e94-3a189bcaf599`), and `Personal Bot` (`419c9d1d-f01c-4d3c-9972-93e56f95c5d9`) telling them to post their readiness check-in in `MGMT` (`c5a97346-e424-44bf-90d2-9caaa7594c11`)!\n\
-                    4. PURE CHINWAG STACK: Hindsight (:8888) and Wiki.js (:4320) are retired. Use `/opt/homebrew/bin/chinwag memory recall | retain | tombstone` (`.chinwag/state.crdb` + `.chinwag/memory.crdb.leann`) and Docus Wiki (`:8795` / `:5487` `Docs · Wiki`).\n\
-                    5. MANAGEMENT SLA: Always delegate to your specialist direct reports {:?}, triage blockers within 15m, post daily `#mgmt` standups (`What's working / What's not`), and enforce the 14-Slide Initiative Sign-Off Deck Gate (`INV-INIT-01`, including `INIT-07` Cloudflare Livestream Shorts + `chinwag.tv` `AXEL` vs `RANDO`) + `chinwag ui-gate` (`SOP-QA-02`).",
-                    subj,
-                    run_id,
-                    run_id,
-                    MGMT_CHANNEL_UUID,
-                    seat.slack_channel,
-                    seat.agentmail_inbox,
-                    listener_prefix,
-                    MGMT_CHANNEL_UUID,
-                    MGMT_CHANNEL_UUID,
-                    seat.seat,
-                    seat.grokbot_uuid,
-                    seat.direct_reports,
-                    seat.direct_reports
-                );
-
-                let (slack_delivered, slack_http_code) =
-                    if let Some(url) = read_webhook_url(seat.webhook_env) {
-                        post_slack_webhook(&url, &msg)
-                    } else {
-                        (false, 0)
-                    };
-
-                let (email_delivered, email_http_code) =
-                    if seat.agentmail_inbox.contains("@agentmail.to")
-                        || seat.agentmail_inbox.contains("@mail.grokbot.com")
-                    {
-                        send_agentmail(seat.agentmail_inbox, &subj, &msg)
-                    } else {
-                        (false, 0)
-                    };
-
-                let escaped_msg = msg.replace('\'', "''");
-                let sql = format!(
-                    "INSERT INTO agent_messages (id, agent_name, sender, role, item_key, body, created_at) VALUES ('msg-rust-relay-{}-{}', '{}', 'CHINWAG-RUST-RELAY', 'assistant', 'MGMT · {}', '{}', datetime('now'));",
-                    seat.seat.to_lowercase(),
-                    run_ts,
-                    seat.seat,
-                    MGMT_CHANNEL_UUID,
-                    escaped_msg
-                );
-                let _ = Command::new("sqlite3").arg(planner_db).arg(&sql).output();
-
-                receipts.push(json!({
-                    "seat": seat.seat,
-                    "listener_prefix": listener_prefix,
-                    "grokbot_uuid": seat.grokbot_uuid,
-                    "grokbot_name": seat.grokbot_name,
-                    "run_id": run_id,
-                    "slack_delivered": slack_delivered,
-                    "slack_http_status": slack_http_code,
-                    "agentmail_inbox": seat.agentmail_inbox,
-                    "agentmail_delivered": email_delivered,
-                    "agentmail_http_status": email_http_code,
-                    "direct_reports": seat.direct_reports
-                }));
-            }
-
-            let pin_sql = format!(
-                "INSERT OR REPLACE INTO context_pins (id, author_cast, author_handle, file_scope, summary, source_commit, created_at) VALUES ('chinwag-rust-relay-mgmt-brief-v1', 'infra', 'CHINWAG-RUST-RELAY', 'rust-comms/src/relay_run.rs', 'All 6 GrokBot MGMT seats in channel {} briefed via native Rust chinwag relay brief-mgmt (INFRA 407d2c36, BIZFIN e484d158, ENG a692d662, PRODUCT 382e7010, S-AND-M 16593278, PA 419c9d1d). SUPPORT + EPHEMERAL-SUPPORT spun up under S-AND-M.', 'b1745094d9cb9014361fca30c7de3535c140dd20', datetime('now'));",
-                MGMT_CHANNEL_UUID
-            );
-            let _ = Command::new("sqlite3")
-                .arg(crdb_path)
-                .arg(&pin_sql)
-                .output();
-
-            let out = json!({
-                "ok": true,
-                "action": "brief-mgmt",
-                "mgmt_channel_uuid": MGMT_CHANNEL_UUID,
-                "receipts": receipts
-            });
             let _ = writeln!(
-                stdout,
-                "{}",
-                serde_json::to_string_pretty(&out).unwrap_or_default()
+                stderr,
+                "chinwag relay: use an explicit configured recipient and message with relay send"
             );
-            0
+            2
         }
+
         "reply" | "post" => {
             let identity = resolve_identity_config();
             let mut channel = "#mgmt".to_string();
@@ -1578,23 +1334,16 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
 
             let run_ts = now_ms();
             let mut receipts = Vec::new();
-            for seat in GROKBOT_MGMT_ROSTER {
+            for seat in &relay.seats {
                 let seat_upper = seat.seat.to_uppercase();
                 let matches = target_seat == "ALL"
                     || target_seat == "#MGMT"
                     || target_seat == "MGMT"
-                    || target_seat == seat_upper
-                    || (target_seat == "HOUSEKEEPING" && seat_upper == "INFRA");
+                    || target_seat == seat_upper;
                 if !matches {
                     continue;
                 }
-                let listener_prefix = if seat_upper == "INFRA" {
-                    "HOUSEKEEPING"
-                } else if seat_upper == "PA" {
-                    "PRODUCT"
-                } else {
-                    seat.seat
-                };
+                let listener_prefix = seat.seat.as_str();
                 let run_id = format!(
                     "chinwag-ui-{}-{}-{}",
                     seat.seat.to_lowercase(),
@@ -1603,20 +1352,12 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 );
                 let subj = format!("[Paperclip] {} | {}: {}", listener_prefix, ticket, title);
                 let msg = format!(
-                    "{}\n\
-                    Run: {}   Wake reason: issue_assigned (chinwag-rust-relay)\n\
-                    Receipt marker (include in any receipt comment): [relay-receipt run={}]\n\
-                    Task: {} — https://brians-mac-studio-468.tail23ad5.ts.net:5487/\n\n\
-                    MESSAGE FROM BRIAN SPECTOR (CEO) IN CHINWAG MISSION CONTROL (:5487):\n\
-                    {}\n\n\
-                    HOW TO REPLY DIRECTLY IN CHINWAG UI (SO BRIAN DOES NOT HAVE TO OPEN GROK BOT):\n\
-                    Run this command on Mac Studio to post your reply directly into Chinwag Mission Control (:5487):\n\
-                    `/opt/homebrew/bin/chinwag reply --channel \"{}\" --from \"{}\" --run \"{}\" --ticket \"{}\" --message \"<your reply>\"`",
-                    subj, run_id, run_id, ticket, message, reply_channel, seat.seat, run_id, ticket
+                    "{subj}\nRun: {run_id}\nTask: {ticket}\n{message}\n\nReply with: chinwag reply --channel \"{reply_channel}\" --from \"{}\" --run \"{run_id}\" --ticket \"{ticket}\" --message \"<your reply>\"",
+                    seat.seat
                 );
 
                 let (slack_delivered, slack_http_code) =
-                    if let Some(url) = read_webhook_url(seat.webhook_env) {
+                    if let Some(url) = read_webhook_url(&seat.webhook_env) {
                         post_slack_webhook(&url, &msg)
                     } else {
                         (false, 0)
@@ -1626,7 +1367,7 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                     if seat.agentmail_inbox.contains("@agentmail.to")
                         || seat.agentmail_inbox.contains("@mail.grokbot.com")
                     {
-                        send_agentmail(seat.agentmail_inbox, &subj, &msg)
+                        send_agentmail(&seat.agentmail_inbox, &subj, &msg)
                     } else {
                         (false, 0)
                     };
@@ -1722,9 +1463,9 @@ mod tests {
             actor_id: "actor-brian".to_string(),
             handle: "● Brian".to_string(),
             display_name: "Brian Spector".to_string(),
-            machine_name: "brians-mac-studio-468".to_string(),
+            machine_name: "unconfigured".to_string(),
             mission_control_url: "http://127.0.0.1:5487".to_string(),
-            fallback_hub_url: "http://192.168.1.166:5487".to_string(),
+            fallback_hub_url: "http://127.0.0.1:5488".to_string(),
             api_key: "fallback-test-key".to_string(),
         };
         let infra_id = resolve_agent_relay_identity("INFRA", &base);

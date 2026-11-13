@@ -6,8 +6,8 @@
 //! Security & Reliability Properties:
 //! - Signer pinning: `RELEASE_BUILT` messages on `#all` must pass strict
 //!   `Ed25519` (`verify_strict`) over `chinwag-bus-sig-v2` against compiled-in
-//!   `CANONICAL_SEAT_PUBKEYS` AND originate from `ALLOWED_RELEASE_SIGNERS`
-//!   (`"INFRAJR"`). Valid signatures from any other seat fail closed.
+//!   the configured fleet key bijection AND its explicit release signer policy
+//!   (`"RELEASE-TEST"`). Valid signatures from any other seat fail closed.
 //! - Hash-before-exec: Subscriber downloads land in `$HOME/.local/bin/.staging/`
 //!   (`0700` directory, `0600` regular file). Exact `size_bytes`, `SHA-256`,
 //!   and `BLAKE3` digests are verified in constant time (plus macOS
@@ -26,7 +26,9 @@
 
 use crate::agent_instance::{self, ActorAddress};
 use crate::bus_federation::BusMessage;
-use crate::canonical_seat_pubkeys::CANONICAL_SEAT_PUBKEYS;
+use crate::canonical_seat_pubkeys::{
+    configured_manifest, configured_release_signers, manifest_seat_pubkeys,
+};
 use chinwag_swarm::identity::Identity;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::{TryRngCore, rngs::OsRng};
@@ -58,7 +60,8 @@ pub const RELEASE_SYNC_STATE_SCHEMA: &str = "chinwag.release-sync-state.v1";
 pub const RELEASE_BUILT_PREFIX: &str = "RELEASE_BUILT ";
 pub const RELEASE_INSTALLED_PREFIX: &str = "RELEASE_INSTALLED ";
 
-pub const ALLOWED_RELEASE_SIGNERS: &[&str] = &["INFRAJR"];
+#[cfg(test)]
+const ALLOWED_RELEASE_SIGNERS: &[&str] = &["RELEASE-TEST"];
 pub const ALLOWED_BINARIES: &[&str] = &["chinwag", "chinwag-ci"];
 
 pub const R2_BUCKET_NAME: &str = "emunlabs-backups";
@@ -76,8 +79,7 @@ const MAX_APPLIED_RELEASE_HISTORY: usize = 64;
 const VERSION_SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRANGLER_R2_TIMEOUT: Duration = Duration::from_secs(120);
 const CRATE_MEMORY_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-const WRANGLER_SAFE_BASE_PATH: &str =
-    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const WRANGLER_SAFE_BASE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const CURRENT_TARGET_TRIPLE: &str = "aarch64-apple-darwin";
@@ -295,7 +297,7 @@ impl std::fmt::Display for ReleaseSyncError {
             Self::UnauthorizedSigner => {
                 write!(
                     f,
-                    "release signer rejected: only pinned INFRAJR identity is authorized"
+                    "release signer rejected: only pinned RELEASE-TEST identity is authorized"
                 )
             }
             Self::SignatureInvalid => {
@@ -773,12 +775,6 @@ impl WranglerR2ArtifactStore {
                 return Ok(candidate);
             }
         }
-        for candidate in ["/opt/homebrew/bin/wrangler", "/usr/local/bin/wrangler"] {
-            let path = Path::new(candidate);
-            if is_resolvable_host_cli_binary(path) {
-                return Ok(path.to_path_buf());
-            }
-        }
         if let Some(path_os) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path_os) {
                 if !dir.is_absolute() {
@@ -791,7 +787,7 @@ impl WranglerR2ArtifactStore {
             }
         }
         Err(ReleaseSyncError::ArtifactStoreFailed(
-            "wrangler CLI not found in /opt/homebrew/bin, /usr/local/bin, or PATH".into(),
+            "wrangler CLI not found in configured path or PATH".into(),
         ))
     }
 
@@ -936,33 +932,32 @@ impl ReleaseArtifactStore for WranglerR2ArtifactStore {
     }
 }
 
-struct ReleaseTrustRoots<'a> {
-    seat_pubkeys: &'a [(&'a str, [u8; 32])],
-    allowed_signers: &'a [&'a str],
+struct ReleaseTrustRoots {
+    seat_pubkeys: BTreeMap<String, [u8; 32]>,
+    allowed_signers: Vec<String>,
 }
 
-impl ReleaseTrustRoots<'static> {
-    const fn production() -> Self {
+impl ReleaseTrustRoots {
+    fn production() -> Self {
+        let manifest = configured_manifest();
         Self {
-            seat_pubkeys: CANONICAL_SEAT_PUBKEYS,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: manifest
+                .as_ref()
+                .map(manifest_seat_pubkeys)
+                .unwrap_or_default(),
+            allowed_signers: manifest
+                .map(|manifest| manifest.policy.release_signers)
+                .unwrap_or_default(),
         }
     }
-}
 
-impl<'a> ReleaseTrustRoots<'a> {
     fn lookup_pubkey(&self, base_seat: &str) -> Option<[u8; 32]> {
-        for (seat, pubkey) in self.seat_pubkeys {
-            if (*seat).eq_ignore_ascii_case(base_seat) {
-                return Some(*pubkey);
-            }
-        }
-        None
+        self.seat_pubkeys.get(base_seat).copied()
     }
 
     fn is_allowed_release_signer(&self, base_seat: &str) -> bool {
         let mut matched = subtle::Choice::from(0u8);
-        for allowed in self.allowed_signers {
+        for allowed in &self.allowed_signers {
             matched |= allowed.as_bytes().ct_eq(base_seat.as_bytes());
         }
         bool::from(matched)
@@ -1372,7 +1367,7 @@ fn check_installed_binary_matches(
 }
 
 /// Used solely to locate host `wrangler` CLI (which on Homebrew is a symlink
-/// into `/opt/homebrew/Cellar/...`). Never used for release artifacts, state,
+/// into a package manager installation). Never used for release artifacts, state,
 /// or signing keys, all of which use `open_regular_file_nofollow` (`O_NOFOLLOW`).
 fn is_resolvable_host_cli_binary(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
@@ -2932,7 +2927,7 @@ fn compute_bus_message_digest_bytes(
 fn load_verified_seat_signing_key(
     home_dir: &Path,
     base_seat: &str,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
 ) -> Result<SigningKey, ReleaseSyncError> {
     let expected_pubkey = roots
         .lookup_pubkey(base_seat)
@@ -3069,7 +3064,7 @@ pub fn verify_release_built_message(
 
 fn verify_release_built_message_with_roots(
     msg: &BusMessage,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
 ) -> Result<ReleaseManifestV1, ReleaseSyncError> {
     if !is_release_built_candidate(msg) {
         return Err(ReleaseSyncError::NotAReleaseMessage);
@@ -3278,7 +3273,7 @@ fn apply_release_built_message_inner(
     store: &dyn ReleaseArtifactStore,
     msg: &BusMessage,
     local_iroh_endpoint: Option<&str>,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
     receipt_key_override: Option<&SigningKey>,
     observed_max_epoch: Option<u64>,
     before_smoke_exec: BeforeSmokeExecHook<'_>,
@@ -3539,20 +3534,20 @@ fn build_release_installed_bus_message(
     home_dir: &Path,
     manifest: &ReleaseManifestV1,
     local_iroh_endpoint: &str,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
     receipt_key_override: Option<&SigningKey>,
 ) -> Result<BusMessage, ReleaseSyncError> {
     let owned_key;
     let signing_key = match receipt_key_override {
         Some(key) => key,
         None => {
-            owned_key = load_verified_seat_signing_key(home_dir, "INFRAJR", roots)?;
+            owned_key = load_verified_seat_signing_key(home_dir, "RELEASE-TEST", roots)?;
             &owned_key
         }
     };
     let instance = agent_instance::new_instance_id()
         .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("instance_id"))?;
-    let actor = ActorAddress::parse(&format!("INFRAJR#{instance}"))
+    let actor = ActorAddress::parse(&format!("RELEASE-TEST#{instance}"))
         .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("actor_address"))?;
     let receipt = ReleaseInstalledReceiptV1 {
         schema: RELEASE_INSTALLED_SCHEMA.to_owned(),
@@ -3628,7 +3623,7 @@ fn resolve_publisher_actor(explicit_from: Option<&str>) -> Result<ActorAddress, 
         let addr = ActorAddress::parse(raw)
             .and_then(ActorAddress::require_instance)
             .map_err(|_| ReleaseSyncError::UnauthorizedSigner)?;
-        if !bool::from(addr.seat().as_bytes().ct_eq(b"INFRAJR")) {
+        if !bool::from(addr.seat().as_bytes().ct_eq(b"RELEASE-TEST")) {
             return Err(ReleaseSyncError::UnauthorizedSigner);
         }
         return Ok(addr);
@@ -3640,7 +3635,7 @@ fn resolve_publisher_actor(explicit_from: Option<&str>) -> Result<ActorAddress, 
             .and_then(ActorAddress::require_instance)
             .map_err(|_| ReleaseSyncError::UnauthorizedSigner)?;
         // Never spoof or override another bound seat (`INV-NO-SEAT-IMPERSONATION-01`).
-        if !bool::from(addr.seat().as_bytes().ct_eq(b"INFRAJR")) {
+        if !bool::from(addr.seat().as_bytes().ct_eq(b"RELEASE-TEST")) {
             return Err(ReleaseSyncError::UnauthorizedSigner);
         }
         return Ok(addr);
@@ -3650,7 +3645,7 @@ fn resolve_publisher_actor(explicit_from: Option<&str>) -> Result<ActorAddress, 
         _ => agent_instance::new_instance_id()
             .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("instance_id"))?,
     };
-    ActorAddress::parse(&format!("INFRAJR#{instance}"))
+    ActorAddress::parse(&format!("RELEASE-TEST#{instance}"))
         .and_then(ActorAddress::require_instance)
         .map_err(|_| ReleaseSyncError::SigningIdentityUnavailable("actor_address"))
 }
@@ -3706,7 +3701,7 @@ fn publish_release_inner(
     req: PublishReleaseRequest<'_>,
     store: &dyn ReleaseArtifactStore,
     publish_bus: impl FnOnce(&BusMessage) -> Result<u64, String>,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
     signing_key_override: Option<&SigningKey>,
 ) -> Result<ReleasePublishOutcome, ReleaseSyncError> {
     validate_binary_name(req.binary)?;
@@ -3715,7 +3710,7 @@ fn publish_release_inner(
     let signing_key = match signing_key_override {
         Some(key) => key,
         None => {
-            owned_key = load_verified_seat_signing_key(req.home_dir, "INFRAJR", roots)?;
+            owned_key = load_verified_seat_signing_key(req.home_dir, "RELEASE-TEST", roots)?;
             &owned_key
         }
     };
@@ -3888,7 +3883,7 @@ fn publish_release_inner(
 }
 
 /// Scans `.chinwag/bus/messages.jsonl` for the latest cryptographically verified
-/// `INFRAJR` `RELEASE_BUILT` per binary matching `CURRENT_TARGET_TRIPLE` and
+/// `RELEASE-TEST` `RELEASE_BUILT` per binary matching `CURRENT_TARGET_TRIPLE` and
 /// applies each binary independently from content-addressed R2 storage so one
 /// binary's transient failure never drops another binary's install receipt.
 pub fn sync_releases_from_journal_per_binary(
@@ -3912,7 +3907,7 @@ fn sync_releases_from_journal_per_binary_inner(
     messages_jsonl_path: &Path,
     store: &dyn ReleaseArtifactStore,
     local_iroh_endpoint: Option<&str>,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
     receipt_key_override: Option<&SigningKey>,
 ) -> Result<Vec<BinarySyncReport>, ReleaseSyncError> {
     Ok(sync_releases_from_journal_per_binary_filtered_inner(
@@ -3987,7 +3982,7 @@ fn sync_releases_from_journal_per_binary_filtered_inner(
     messages_jsonl_path: &Path,
     store: &dyn ReleaseArtifactStore,
     local_iroh_endpoint: Option<&str>,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
     receipt_key_override: Option<&SigningKey>,
     eligibility: Option<&ReleaseEligibilityFilter>,
     clock: &mut dyn FnMut() -> Instant,
@@ -4011,7 +4006,7 @@ fn sync_releases_from_journal_per_binary_filtered_with_opener(
     messages_jsonl_path: &Path,
     store: &dyn ReleaseArtifactStore,
     local_iroh_endpoint: Option<&str>,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
     receipt_key_override: Option<&SigningKey>,
     eligibility: Option<&ReleaseEligibilityFilter>,
     clock: &mut dyn FnMut() -> Instant,
@@ -4594,7 +4589,7 @@ fn execute_release_daemon_job_inner(
     messages_jsonl_path: &Path,
     store: &dyn ReleaseArtifactStore,
     local_iroh_endpoint: &str,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
     receipt_key_override: Option<&SigningKey>,
     scheduler: &Mutex<ReleaseDaemonScheduler>,
     job: ReleaseDaemonJob,
@@ -4620,7 +4615,7 @@ fn execute_release_daemon_job_with_hooks(
     messages_jsonl_path: &Path,
     store: &dyn ReleaseArtifactStore,
     local_iroh_endpoint: &str,
-    roots: &ReleaseTrustRoots<'_>,
+    roots: &ReleaseTrustRoots,
     receipt_key_override: Option<&SigningKey>,
     scheduler: &Mutex<ReleaseDaemonScheduler>,
     job: ReleaseDaemonJob,
@@ -4787,7 +4782,7 @@ fn execute_release_daemon_job_with_hooks(
 }
 
 /// Scans `.chinwag/bus/messages.jsonl` for the latest cryptographically verified
-/// `INFRAJR` `RELEASE_BUILT` per binary matching `CURRENT_TARGET_TRIPLE` and
+/// `RELEASE-TEST` `RELEASE_BUILT` per binary matching `CURRENT_TARGET_TRIPLE` and
 /// applies each monotonically.
 pub fn sync_releases_from_journal(
     home_dir: &Path,
@@ -4836,7 +4831,7 @@ pub fn collect_release_status_json(home_dir: &Path) -> Result<serde_json::Value,
         "ok": true,
         "schema": "chinwag.release-status.v1",
         "target_triple": CURRENT_TARGET_TRIPLE,
-        "allowed_release_signers": ALLOWED_RELEASE_SIGNERS,
+        "allowed_release_signers": configured_release_signers(),
         "allowed_binaries": ALLOWED_BINARIES,
         "state_path": release_sync_state_path(home_dir).to_string_lossy(),
         "recorded_state": state,
@@ -4847,7 +4842,6 @@ pub fn collect_release_status_json(home_dir: &Path) -> Result<serde_json::Value,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical_seat_pubkeys::canonical_seat_pubkey;
     use std::sync::Mutex;
 
     struct InMemoryArtifactStore {
@@ -4962,27 +4956,18 @@ mod tests {
     }
 
     #[test]
-    fn canonical_seat_pubkeys_table_is_sorted_bijective_and_pins_infrajr() {
-        assert_eq!(CANONICAL_SEAT_PUBKEYS.len(), 127);
-        let mut prev_seat = "";
-        let mut unique_keys = std::collections::BTreeSet::new();
-        for (seat, pubkey) in CANONICAL_SEAT_PUBKEYS {
-            assert!(
-                *seat > prev_seat,
-                "seats must be strictly sorted for binary_search"
-            );
-            prev_seat = seat;
-            assert!(
-                unique_keys.insert(*pubkey),
-                "duplicate Ed25519 public key in CANONICAL_SEAT_PUBKEYS"
-            );
-            assert!(VerifyingKey::from_bytes(pubkey).is_ok());
-        }
-        let infrajr = canonical_seat_pubkey("INFRAJR").expect("INFRAJR must be pinned");
+    fn release_trust_roots_are_explicit_and_have_no_default_privilege() {
+        let key = random_signing_key();
+        let roots = ReleaseTrustRoots {
+            seat_pubkeys: BTreeMap::from([("RELEASE-TEST".into(), key.verifying_key().to_bytes())]),
+            allowed_signers: vec!["RELEASE-TEST".into()],
+        };
         assert_eq!(
-            encode_hex(&infrajr),
-            "43773984f321fde6c85e1d8c55cf3bb02cd078ab08f81e3356b4c61ccc7a5109"
+            roots.lookup_pubkey("RELEASE-TEST"),
+            Some(key.verifying_key().to_bytes())
         );
+        assert!(roots.is_allowed_release_signer("RELEASE-TEST"));
+        assert!(!roots.is_allowed_release_signer("OTHER"));
     }
 
     #[test]
@@ -5060,12 +5045,18 @@ mod tests {
         fs::create_dir_all(&sub_home).unwrap();
         fs::create_dir_all(&build_dir).unwrap();
 
-        let infrajr_key = random_signing_key();
-        let infrajr_pub = infrajr_key.verifying_key().to_bytes();
-        let seat_table = [("INFRAJR", infrajr_pub)];
+        let release_key = random_signing_key();
+        let release_pub = release_key.verifying_key().to_bytes();
+        let seat_table = [("RELEASE-TEST", release_pub)];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
 
         let store = InMemoryArtifactStore::new();
@@ -5073,7 +5064,10 @@ mod tests {
         let v2_bin = build_macho_test_binary(&build_dir, "v2");
 
         // 1. Publish v1 from publisher peer.
-        let actor_v1 = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_v1 = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
         let pub_v1 = publish_release_inner(
             PublishReleaseRequest {
                 home_dir: &pub_home,
@@ -5087,7 +5081,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -5098,7 +5092,7 @@ mod tests {
             &pub_v1.release_built_message,
             Some("peer-pub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         )
@@ -5116,7 +5110,7 @@ mod tests {
             &pub_v1.release_built_message,
             Some("peer-sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         )
@@ -5148,7 +5142,7 @@ mod tests {
             &pub_v1.release_built_message,
             Some("peer-sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         )
@@ -5173,7 +5167,7 @@ mod tests {
             &store,
             |_| Ok(2),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -5183,7 +5177,7 @@ mod tests {
             &pub_v2.release_built_message,
             Some("peer-sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         )
@@ -5205,7 +5199,7 @@ mod tests {
             &pub_v1.release_built_message,
             Some("peer-sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         );
@@ -5229,7 +5223,7 @@ mod tests {
             &store,
             |_| Ok(3),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         let sub_rb = apply_release_built_message_inner(
@@ -5238,7 +5232,7 @@ mod tests {
             &pub_rb.release_built_message,
             Some("peer-sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         )
@@ -5249,22 +5243,28 @@ mod tests {
     }
 
     #[test]
-    fn non_infrajr_seats_with_valid_ed25519_signatures_are_rejected_fail_closed() {
+    fn unapproved_release_signers_with_valid_ed25519_signatures_are_rejected_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let sub_home = temp.path().join("sub-home");
         fs::create_dir_all(&sub_home).unwrap();
 
-        let infrajr_key = random_signing_key();
+        let release_key = random_signing_key();
         let sales_key = random_signing_key();
-        let workhorse_key = random_signing_key();
+        let executor_key = random_signing_key();
         let seat_table = [
-            ("INFRAJR", infrajr_key.verifying_key().to_bytes()),
-            ("SALES", sales_key.verifying_key().to_bytes()),
-            ("WORKHORSE", workhorse_key.verifying_key().to_bytes()),
+            ("RELEASE-TEST", release_key.verifying_key().to_bytes()),
+            ("OBSERVER-TEST", sales_key.verifying_key().to_bytes()),
+            ("EXECUTOR-TEST", executor_key.verifying_key().to_bytes()),
         ];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
 
@@ -5289,7 +5289,10 @@ mod tests {
         );
         let instance = agent_instance::new_instance_id().unwrap();
 
-        for (seat, key) in [("SALES", &sales_key), ("WORKHORSE", &workhorse_key)] {
+        for (seat, key) in [
+            ("OBSERVER-TEST", &sales_key),
+            ("EXECUTOR-TEST", &executor_key),
+        ] {
             let actor = ActorAddress::parse(&format!("{seat}#{instance}")).unwrap();
             let valid_signed_msg = sign_structured_bus_message(
                 &actor,
@@ -5311,8 +5314,8 @@ mod tests {
             assert_eq!(res.unwrap_err(), ReleaseSyncError::UnauthorizedSigner);
             assert_eq!(store.downloads(), 0);
 
-            // Also verify that INFRAJR sender signed by WORKHORSE/SALES key fails SignatureInvalid!
-            let spoofed_actor = ActorAddress::parse(&format!("INFRAJR#{instance}")).unwrap();
+            // Also verify that RELEASE-TEST sender signed by EXECUTOR-TEST/OBSERVER-TEST key fails SignatureInvalid!
+            let spoofed_actor = ActorAddress::parse(&format!("RELEASE-TEST#{instance}")).unwrap();
             let spoofed_msg = sign_structured_bus_message(
                 &spoofed_actor,
                 "#all",
@@ -5345,15 +5348,24 @@ mod tests {
         fs::create_dir_all(&sub_home).unwrap();
         fs::create_dir_all(&build_dir).unwrap();
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
         let v1_bin = build_macho_test_binary(&build_dir, "tamper");
-        let actor = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
         let pub_v1 = publish_release_inner(
             PublishReleaseRequest {
                 home_dir: &pub_home,
@@ -5367,7 +5379,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -5383,7 +5395,7 @@ mod tests {
             &pub_v1.release_built_message,
             None,
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         );
@@ -5443,11 +5455,17 @@ mod tests {
         let sub_home = temp.path().join("sub-home");
         fs::create_dir_all(&sub_home).unwrap();
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
 
@@ -5475,7 +5493,7 @@ mod tests {
             rollback: false,
         };
         let instance = agent_instance::new_instance_id().unwrap();
-        let actor = ActorAddress::parse(&format!("INFRAJR#{instance}")).unwrap();
+        let actor = ActorAddress::parse(&format!("RELEASE-TEST#{instance}")).unwrap();
         let msg = sign_structured_bus_message(
             &actor,
             "#all",
@@ -5484,7 +5502,7 @@ mod tests {
                 "{RELEASE_BUILT_PREFIX}{}",
                 serde_json::to_string(&manifest).unwrap()
             ),
-            &infrajr_key,
+            &release_key,
         );
 
         let res = apply_release_built_message_inner(
@@ -5493,7 +5511,7 @@ mod tests {
             &msg,
             None,
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         );
@@ -5519,18 +5537,27 @@ mod tests {
             fs::create_dir_all(d).unwrap();
         }
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
         let bin_100 = build_macho_test_binary(&build_dir, "ep100");
         let bin_150 = build_macho_test_binary(&build_dir, "ep150");
         let bin_200 = build_macho_test_binary(&build_dir, "ep200");
         let bin_210 = build_macho_test_binary(&build_dir, "ep210");
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
         let actor = ActorAddress::parse(&actor_str).unwrap();
 
         // Publish normal (epoch=200), then rollback (epoch=100).
@@ -5547,7 +5574,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -5564,7 +5591,7 @@ mod tests {
             &store,
             |_| Ok(2),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         assert!(pub_rb_100.manifest.built_at_ms > pub_200.manifest.built_at_ms);
@@ -5576,7 +5603,7 @@ mod tests {
             &pub_200.release_built_message,
             Some("sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         )
@@ -5587,7 +5614,7 @@ mod tests {
             &pub_rb_100.release_built_message,
             Some("sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         )
@@ -5600,7 +5627,7 @@ mod tests {
             &pub_200.release_built_message,
             Some("sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         );
@@ -5637,7 +5664,7 @@ mod tests {
                 "{RELEASE_BUILT_PREFIX}{}",
                 serde_json::to_string(&unflagged_150).unwrap()
             ),
-            &infrajr_key,
+            &release_key,
         );
         assert_eq!(
             apply_release_built_message_inner(
@@ -5646,7 +5673,7 @@ mod tests {
                 &msg_150,
                 Some("sub-ep"),
                 &roots,
-                Some(&infrajr_key),
+                Some(&release_key),
                 None,
                 None,
             )
@@ -5675,7 +5702,7 @@ mod tests {
             &store,
             Some("sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         assert_eq!(sub_sync.len(), 1);
@@ -5690,7 +5717,7 @@ mod tests {
             &store,
             Some("cold-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         let ReleaseApplyOutcome::Installed {
@@ -5721,7 +5748,7 @@ mod tests {
             &store,
             |_| Ok(3),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         assert!(matches!(
@@ -5731,7 +5758,7 @@ mod tests {
                 &pub_210.release_built_message,
                 Some("sub-ep"),
                 &roots,
-                Some(&infrajr_key),
+                Some(&release_key),
                 None,
                 None,
             )
@@ -5745,7 +5772,7 @@ mod tests {
                 &pub_rb_100.release_built_message,
                 Some("sub-ep"),
                 &roots,
-                Some(&infrajr_key),
+                Some(&release_key),
                 None,
                 None,
             )
@@ -5764,16 +5791,25 @@ mod tests {
             fs::create_dir_all(d).unwrap();
         }
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = std::sync::Arc::new(InMemoryArtifactStore::new());
         let bin_101 = build_macho_test_binary(&build_dir, "ep101");
         let bin_102 = build_macho_test_binary(&build_dir, "ep102");
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
 
         let pub_101 = publish_release_inner(
             PublishReleaseRequest {
@@ -5788,7 +5824,7 @@ mod tests {
             store.as_ref(),
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         let pub_102 = publish_release_inner(
@@ -5804,7 +5840,7 @@ mod tests {
             store.as_ref(),
             |_| Ok(2),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -5813,13 +5849,19 @@ mod tests {
         let sub_home_race = sub_home.clone();
         let store_race = store.clone();
         let msg_102 = pub_102.release_built_message.clone();
-        let key_race = infrajr_key.clone();
-        let pub_bytes_race = infrajr_key.verifying_key().to_bytes();
+        let key_race = release_key.clone();
+        let pub_bytes_race = release_key.verifying_key().to_bytes();
         store.set_on_download(move || {
-            let race_table = [("INFRAJR", pub_bytes_race)];
+            let race_table = [("RELEASE-TEST", pub_bytes_race)];
             let race_roots = ReleaseTrustRoots {
-                seat_pubkeys: &race_table,
-                allowed_signers: ALLOWED_RELEASE_SIGNERS,
+                seat_pubkeys: race_table
+                    .iter()
+                    .map(|(s, k)| ((*s).to_owned(), *k))
+                    .collect(),
+                allowed_signers: ALLOWED_RELEASE_SIGNERS
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
             };
             apply_release_built_message_inner(
                 &sub_home_race,
@@ -5840,7 +5882,7 @@ mod tests {
             &pub_101.release_built_message,
             Some("sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             None,
         );
@@ -5899,11 +5941,17 @@ mod tests {
 
         // Missing journal returns empty report, whereas symlinked journal fails closed!
         let store = InMemoryArtifactStore::new();
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         assert!(
             sync_releases_from_journal_per_binary_inner(
@@ -5942,16 +5990,25 @@ mod tests {
             fs::create_dir_all(d).unwrap();
         }
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
         let cw_bin = build_macho_test_binary(&build_dir, "cw");
         let ci_bin = build_macho_test_binary(&build_dir, "ci");
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
 
         let pub_cw = publish_release_inner(
             PublishReleaseRequest {
@@ -5966,7 +6023,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         let pub_ci = publish_release_inner(
@@ -5982,7 +6039,7 @@ mod tests {
             &store,
             |_| Ok(2),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -6006,7 +6063,7 @@ mod tests {
             &store,
             Some("sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         assert_eq!(outcomes.len(), 2);
@@ -6036,16 +6093,25 @@ mod tests {
             fs::create_dir_all(d).unwrap();
         }
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
         let good_bin = build_macho_test_binary(&build_dir, "good");
         let evil_bin = build_macho_test_binary(&build_dir, "evil");
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
 
         let pub_good = publish_release_inner(
             PublishReleaseRequest {
@@ -6060,7 +6126,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -6120,7 +6186,7 @@ mod tests {
             &pub_good.release_built_message,
             Some("sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             Some(&mut substitute_mutable_staging_ancestor),
         );
@@ -6180,7 +6246,7 @@ mod tests {
             &pub_good.release_built_message,
             Some("sub-ep"),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             None,
             Some(&mut attack_between_verify_and_exec),
         )
@@ -6416,14 +6482,23 @@ mod tests {
         }
         let journal = temp.path().join("messages.jsonl");
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = PerKeyFaultStore::new();
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
         let actor = ActorAddress::parse(&actor_str).unwrap();
 
         let ci_a_bin = build_macho_test_binary(&build_dir, "ci_a");
@@ -6445,7 +6520,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -6458,7 +6533,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_a.release_built_message.clone())),
             &mut || now,
@@ -6484,7 +6559,7 @@ mod tests {
             &store,
             |_| Ok(2),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         store.set_failing(&pub_ci_b.manifest.artifact_key, true);
@@ -6505,7 +6580,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_b.release_built_message.clone())),
             &mut || now,
@@ -6549,7 +6624,7 @@ mod tests {
                 "{RELEASE_BUILT_PREFIX}{}",
                 serde_json::to_string(&foreign_manifest).unwrap()
             ),
-            &infrajr_key,
+            &release_key,
         );
         let t_foreign = now + Duration::from_secs(1);
         let ev_foreign = execute_release_daemon_job_inner(
@@ -6558,7 +6633,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(foreign_msg)),
             &mut || t_foreign,
@@ -6585,7 +6660,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_a.release_built_message.clone())),
             &mut || t_replay_a,
@@ -6612,7 +6687,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_b.release_built_message.clone())),
             &mut || t_dup_b,
@@ -6638,7 +6713,7 @@ mod tests {
                 &store,
                 "sub-ep",
                 &roots,
-                Some(&infrajr_key),
+                Some(&release_key),
                 &sched,
                 ReleaseDaemonJob::StartupCatchup,
                 &mut || tick,
@@ -6661,7 +6736,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_b.release_built_message.clone())),
             &mut || t_exhausted,
@@ -6694,7 +6769,7 @@ mod tests {
             &store,
             |_| Ok(3),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         store.set_failing(&pub_cw_1.manifest.artifact_key, true);
@@ -6716,7 +6791,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_cw_1.release_built_message.clone())),
             &mut || tick_cw_1,
@@ -6732,7 +6807,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
             &mut || tick_cw_1_retry,
@@ -6760,7 +6835,7 @@ mod tests {
             &store,
             |_| Ok(4),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         store.set_failing(&pub_ci_c.manifest.artifact_key, true);
@@ -6782,7 +6857,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_c.release_built_message.clone())),
             &mut || tick_ci_c,
@@ -6800,7 +6875,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
             &mut || tick_plus_10,
@@ -6821,7 +6896,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
             &mut || tick_plus_20,
@@ -6849,14 +6924,23 @@ mod tests {
         }
         let journal = temp.path().join("messages.jsonl");
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
 
         let ci_a_bin = build_macho_test_binary(&build_dir, "flock_a");
         let ci_b_bin = build_macho_test_binary(&build_dir, "flock_b");
@@ -6874,7 +6958,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -6891,7 +6975,7 @@ mod tests {
             &store,
             |_| Ok(2),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -6912,7 +6996,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_a.release_built_message.clone())),
             &mut || t0,
@@ -6923,7 +7007,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_b.release_built_message.clone())),
             &mut || t0,
@@ -6949,7 +7033,7 @@ mod tests {
                     &store,
                     "sub-ep",
                     &roots,
-                    Some(&infrajr_key),
+                    Some(&release_key),
                     &sched,
                     ReleaseDaemonJob::LiveMessage(Box::new(pub_ci_a.release_built_message.clone())),
                     &mut || t0 + Duration::from_secs(1),
@@ -7031,14 +7115,23 @@ mod tests {
         fs::set_permissions(&mock_wrangler, fs::Permissions::from_mode(0o755)).unwrap();
 
         let store = WranglerR2ArtifactStore::with_wrangler_bin(pub_home.clone(), mock_wrangler);
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let src_bin = build_macho_test_binary(&build_dir, "pipe_upload_v1");
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
 
         let outcome = publish_release_inner(
             PublishReleaseRequest {
@@ -7053,7 +7146,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -7138,14 +7231,23 @@ mod tests {
             timeout_duration: Duration::from_secs(120),
         };
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let src_bin = build_macho_test_binary(&build_dir, "slow_r2_v1");
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
 
         let pub_v1 = publish_release_inner(
             PublishReleaseRequest {
@@ -7160,7 +7262,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         fs::write(
@@ -7184,7 +7286,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(pub_v1.release_built_message.clone())),
             &mut || *shared_clock.lock().unwrap(),
@@ -7222,7 +7324,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
             &mut || *shared_clock.lock().unwrap(),
@@ -7314,14 +7416,23 @@ mod tests {
         }
         let journal = temp.path().join("messages.jsonl");
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
         let src_bin = build_macho_test_binary(&build_dir, "journal_retry_v1");
 
         let published = publish_release_inner(
@@ -7337,7 +7448,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         fs::write(
@@ -7352,7 +7463,7 @@ mod tests {
         let sched = Mutex::new(ReleaseDaemonScheduler::new_with_initial_catchup());
         let t0 = Instant::now();
 
-        // Verify `new_with_initial_catchup` dispatches cleanly on first poll (`FLINT` R5 check)
+        // Verify `new_with_initial_catchup` dispatches cleanly on first poll (`TESTA` R5 check)
         // and does not double-enqueue while queued.
         assert!(sched.lock().unwrap().poll_catchup_dispatch(false, t0));
         assert!(!sched.lock().unwrap().poll_catchup_dispatch(false, t0));
@@ -7365,7 +7476,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
             &mut || t0,
@@ -7409,7 +7520,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
             &mut || t_retry,
@@ -7443,7 +7554,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
             &mut || t_sym,
@@ -7476,14 +7587,23 @@ mod tests {
         }
         let journal = temp.path().join("messages.jsonl");
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
         let src_bin = build_macho_test_binary(&build_dir, "state_retry_chinwag_v1");
 
         let published = publish_release_inner(
@@ -7499,7 +7619,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         fs::write(
@@ -7525,7 +7645,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::LiveMessage(Box::new(published.release_built_message.clone())),
             &mut || t0,
@@ -7565,7 +7685,7 @@ mod tests {
             &store,
             "sub-ep",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &sched,
             ReleaseDaemonJob::StartupCatchup,
             &mut || t_retry,
@@ -7610,14 +7730,23 @@ mod tests {
         fs::create_dir_all(&shared_home).unwrap();
         fs::create_dir_all(&build_dir).unwrap();
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = Arc::new(InMemoryArtifactStore::new());
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
 
         let src_a = build_macho_test_binary(&build_dir, "concurrent_pub_a");
         let src_b = build_macho_test_binary(&build_dir, "concurrent_pub_b");
@@ -7636,7 +7765,7 @@ mod tests {
             store.as_ref(),
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         let sha_a = decode_lowercase_hex_32(&pub_a.manifest.sha256).unwrap();
@@ -7653,13 +7782,19 @@ mod tests {
         let src_b_for_pub = src_b.clone();
         let actor_for_pub = actor_str.clone();
         let store_for_pub = store.clone();
-        let key_for_pub = infrajr_key.clone();
+        let key_for_pub = release_key.clone();
 
         let pub_b_handle = std::thread::spawn(move || {
-            let local_table = [("INFRAJR", key_for_pub.verifying_key().to_bytes())];
+            let local_table = [("RELEASE-TEST", key_for_pub.verifying_key().to_bytes())];
             let local_roots = ReleaseTrustRoots {
-                seat_pubkeys: &local_table,
-                allowed_signers: ALLOWED_RELEASE_SIGNERS,
+                seat_pubkeys: local_table
+                    .iter()
+                    .map(|(s, k)| ((*s).to_owned(), *k))
+                    .collect(),
+                allowed_signers: ALLOWED_RELEASE_SIGNERS
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
             };
             publish_release_inner(
                 PublishReleaseRequest {
@@ -7720,14 +7855,23 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&build_dir).unwrap();
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
         let src_bin = build_macho_test_binary(&build_dir, "nonblocking_reexec_lock");
 
         let published = publish_release_inner(
@@ -7743,7 +7887,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
         let expected_sha = decode_lowercase_hex_32(&published.manifest.sha256).unwrap();
@@ -7870,14 +8014,23 @@ mod tests {
         fs::create_dir_all(&sub_home).unwrap();
         fs::create_dir_all(&build_dir).unwrap();
 
-        let infrajr_key = random_signing_key();
-        let seat_table = [("INFRAJR", infrajr_key.verifying_key().to_bytes())];
+        let release_key = random_signing_key();
+        let seat_table = [("RELEASE-TEST", release_key.verifying_key().to_bytes())];
         let roots = ReleaseTrustRoots {
-            seat_pubkeys: &seat_table,
-            allowed_signers: ALLOWED_RELEASE_SIGNERS,
+            seat_pubkeys: seat_table
+                .iter()
+                .map(|(s, k)| ((*s).to_owned(), *k))
+                .collect(),
+            allowed_signers: ALLOWED_RELEASE_SIGNERS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         };
         let store = InMemoryArtifactStore::new();
-        let actor_str = format!("INFRAJR#{}", agent_instance::new_instance_id().unwrap());
+        let actor_str = format!(
+            "RELEASE-TEST#{}",
+            agent_instance::new_instance_id().unwrap()
+        );
         let src_bin = build_macho_test_binary(&build_dir, "sub_stage_transient_retry");
 
         let published = publish_release_inner(
@@ -7893,7 +8046,7 @@ mod tests {
             &store,
             |_| Ok(1),
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
         )
         .unwrap();
 
@@ -7917,7 +8070,7 @@ mod tests {
             &store,
             "peer-ep-stage-retry",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &scheduler,
             ReleaseDaemonJob::LiveMessage(Box::new(published.release_built_message.clone())),
             &mut || now_1,
@@ -7971,7 +8124,7 @@ mod tests {
             &store,
             "peer-ep-stage-retry",
             &roots,
-            Some(&infrajr_key),
+            Some(&release_key),
             &scheduler,
             ReleaseDaemonJob::StartupCatchup,
             &mut || now_1,
@@ -8037,7 +8190,7 @@ mod tests {
         fs::create_dir_all(mini_repo.join("src")).unwrap();
         fs::write(
             mini_repo.join("Cargo.toml"),
-            "[package]\nname = \"mini-release-wrapper-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"chinwag-ci\"\npath = \"src/main.rs\"\n",
+            "[workspace]\n\n[package]\nname = \"mini-release-wrapper-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"chinwag-ci\"\npath = \"src/main.rs\"\n",
         )
         .unwrap();
         fs::write(
@@ -8409,7 +8562,7 @@ mod tests {
 
     #[test]
     fn stderr_redaction_covers_cutoff_straddling_and_max_length_tokens() {
-        // 1. ARCHITECT exact reproducer: 473 diagnostic bytes + 40-byte token crossing byte 512.
+        // 1. FIXTURE-B exact reproducer: 473 diagnostic bytes + 40-byte token crossing byte 512.
         let tok40 = "cf_secret_token_0123456789abcdefABCDEF99";
         assert_eq!(tok40.len(), 40);
         let mut stream_513 = vec![b'x'; 473];

@@ -177,7 +177,7 @@ fn signed_legacy_fixture(
         sender: "RUST#historical-case".into(),
         sender_cast: "display-only".into(),
         sender_endpoint_id: "display-only".into(),
-        to: Some("WORKHORSE#historical-recipient".into()),
+        to: Some("FIXTURE-A#historical-recipient".into()),
         task_id: Some(task_id.into()),
         body: "COMPLETED is historical prose, not acceptance".into(),
         digest_sha256: "untrusted transported metadata".into(),
@@ -522,7 +522,7 @@ impl WriterRegistryFixture {
         let executor = document.tasks[0].owner_actor.clone().unwrap();
         let operation = "000000000000000000000000000000ad";
         let sender = "WRITER#registry-fixture";
-        let recipient = "WORKHORSE#registry-fixture";
+        let recipient = "FIXTURE-A#registry-fixture";
         let evidence = TransitionEvidenceV1 {
             admission_id: Some("fixture-admission".into()),
             assignment_id: Some("fixture-assignment".into()),

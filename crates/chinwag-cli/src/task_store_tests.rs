@@ -304,7 +304,7 @@ fn signed_frame(
 ) -> PublishTaskV1 {
     let mut transcript = TaskTranscriptV3 {
         message_id:id.into(), issued_at_unix:100, expires_at_unix:200, nonce:[9;32], sender_full_actor_address:"RUST#sender".into(),
-        parent_full_actor_address:Some("DELIVERY#parent".into()), recipient_full_actor_addresses:vec!["WORKHORSE#receiver".into()],
+        parent_full_actor_address:Some("DELIVERY#parent".into()), recipient_full_actor_addresses:vec!["FIXTURE-A#receiver".into()],
         room:"#eng".into(), message_kind:TaskMessageKind::Assignment, receiver_authority_id:"fixture-authority".into(),
         task_ref:fixture.reference.clone(), assignment_id:Some("assignment-1".into()), operation_id:Some("operation-1".into()),
         request_id:None, in_reply_to_message_id:None, config_digest:Sha256Digest([1;32]), task_control_digest:fixture.control.task_control_digest().unwrap(),
@@ -339,7 +339,7 @@ fn roster(secret: &SecretKey) -> Vec<SignerEnrollment> {
 fn context(fixture: &SourceFixture) -> TaskVerificationContext<'_> {
     TaskVerificationContext {
         receiver_authority_id: "fixture-authority",
-        recipient_full_actor_address: "WORKHORSE#receiver",
+        recipient_full_actor_address: "FIXTURE-A#receiver",
         current_task_ref: &fixture.reference,
         config_digest: Sha256Digest([1; 32]),
         task_control_digest: fixture.control.task_control_digest().unwrap(),
@@ -960,7 +960,7 @@ fn p010_exact_pinned_legacy_inference_is_separate_and_never_sender_qualified() {
         sender: "DEV#legacy".into(),
         sender_cast: "DEV".into(),
         sender_endpoint_id: secret.public().to_string(),
-        to: Some("WORKHORSE#receiver".into()),
+        to: Some("FIXTURE-A#receiver".into()),
         task_id: Some("TASK-1".into()),
         body: "Historical source-unqualified body".into(),
         digest_sha256: String::new(),

@@ -327,7 +327,7 @@ mod tests {
         // macOS TMPDIR commonly uses /var -> /private/var. Keep production's
         // no-symlink traversal intact and supply the fixture's physical path.
         let root = fs::canonicalize(repo.path()).unwrap();
-        let store = PrivateStore::open(&root, "cursors", "WORKHORSE#fixture").unwrap();
+        let store = PrivateStore::open(&root, "cursors", "FIXTURE-A#fixture").unwrap();
         let lock = store.lock().unwrap();
         lock.write(&Witness {
             id: "one".into(),

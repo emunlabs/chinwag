@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn stdin_preserves_signed_context_and_last_ten_history_entries() {
         let history = (0..12).map(|i|serde_json::json!({"sender":"Brian", "role":"user", "body":format!("fixture {i}")})).collect::<Vec<_>>();
-        let input = serde_json::json!({"agent":"RUST","sender":"WORKHORSE#parent-id","body":"hello","history":history,"customAgent":{"role":"engineer","dept":"engineering","engine":"codex","system_prompt":"inert fixture"}});
+        let input = serde_json::json!({"agent":"RUST","sender":"FIXTURE-A#parent-id","body":"hello","history":history,"customAgent":{"role":"engineer","dept":"engineering","engine":"codex","system_prompt":"inert fixture"}});
         let payload = read_payload(&mut serde_json::to_vec(&input).unwrap().as_slice()).unwrap();
         assert_eq!(payload.history.len(), 10);
         assert_eq!(payload.history[0].body.as_deref(), Some("fixture 2"));
@@ -382,20 +382,20 @@ mod tests {
         let raw = br#"{"agent":"RUST","body":"fixture"}"#;
         assert!(read_payload_with_actor(&mut raw.as_slice(), None).is_err());
         let a =
-            read_payload_with_actor(&mut raw.as_slice(), Some("WORKHORSE#parent-long-id")).unwrap();
+            read_payload_with_actor(&mut raw.as_slice(), Some("FIXTURE-A#parent-long-id")).unwrap();
         let b =
-            read_payload_with_actor(&mut raw.as_slice(), Some("WORKHORSE#parent-long-id")).unwrap();
-        assert_eq!(a.sender, "WORKHORSE#parent-long-id");
+            read_payload_with_actor(&mut raw.as_slice(), Some("FIXTURE-A#parent-long-id")).unwrap();
+        assert_eq!(a.sender, "FIXTURE-A#parent-long-id");
         assert!(a.agent.starts_with("RUST#"));
         assert_ne!(a.agent, b.agent);
-        let explicit = br#"{"agent":"RUST#child-MixedCase","sender":"GEMINI-PM#explicit-parent","body":"fixture"}"#;
+        let explicit = br#"{"agent":"RUST#child-MixedCase","sender":"FIXTURE-C#explicit-parent","body":"fixture"}"#;
         let payload =
-            read_payload_with_actor(&mut explicit.as_slice(), Some("WORKHORSE#ambient")).unwrap();
-        assert_eq!(payload.sender, "GEMINI-PM#explicit-parent");
+            read_payload_with_actor(&mut explicit.as_slice(), Some("FIXTURE-A#ambient")).unwrap();
+        assert_eq!(payload.sender, "FIXTURE-C#explicit-parent");
         assert_eq!(payload.agent, "RUST#child-MixedCase");
         for invalid in [
             br#"{"agent":"RUST#bad/tag","sender":"Brian","body":"fixture"}"#.as_slice(),
-            br#"{"agent":"RUST","sender":"WORKHORSE#bad/tag","body":"fixture"}"#.as_slice(),
+            br#"{"agent":"RUST","sender":"FIXTURE-A#bad/tag","body":"fixture"}"#.as_slice(),
         ] {
             let mut input = invalid;
             assert!(read_payload_with_actor(&mut input, None).is_err());

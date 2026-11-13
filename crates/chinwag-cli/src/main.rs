@@ -37,57 +37,30 @@ fn main() -> ExitCode {
             }
             let wizard_url = format!("{}/?onboard=1", mission_control_url.trim_end_matches('/'));
             let is_json = raw_args.iter().any(|a| a == "--json");
-            let has_tart = std::path::Path::new("/opt/homebrew/bin/tart").exists()
-                || std::path::Path::new("/usr/local/bin/tart").exists();
-            let has_softnet = std::path::Path::new("/opt/homebrew/bin/softnet").exists()
-                || std::path::Path::new("/usr/local/bin/softnet").exists();
-            let has_node = std::path::Path::new("/opt/homebrew/bin/node").exists()
-                || std::path::Path::new("/usr/local/bin/node").exists();
-            let has_git = std::path::Path::new("/usr/bin/git").exists()
-                || std::path::Path::new("/opt/homebrew/bin/git").exists();
-            let has_dagu = std::path::Path::new("/opt/homebrew/bin/dagu").exists()
-                || std::path::Path::new("/usr/local/bin/dagu").exists();
+            let fleet = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| chinwag_cli::fleet_cmd::load_manifest(None, &cwd).ok());
+            let payload = serde_json::json!({
+                "ok": true,
+                "command": "chinwag onboard",
+                "actor": identity.handle,
+                "actor_id": identity.actor_id,
+                "machine_name": identity.machine_name,
+                "mission_control_url": mission_control_url,
+                "fleet_manifest": fleet.as_ref().map(|(path, _)| path),
+                "fleet_seats": fleet.as_ref().map(|(_, manifest)| &manifest.seats),
+                "fleet_status": if fleet.is_some() { "configured" } else { "unconfigured (no fleet manifest)" },
+                "wizard_url": wizard_url,
+            });
             if is_json {
-                let payload = serde_json::json!({
-                    "ok": true,
-                    "command": "chinwag onboard",
-                    "actor": identity.handle,
-                    "actor_id": identity.actor_id,
-                    "machine_name": identity.machine_name,
-                    "mission_control_url": mission_control_url,
-                    "invariants": ["INV-ONBOARD-01", "INV-ROUTE-01", "INV-MERGE-01"],
-                    "frontier_catalog": {
-                        "source": "https://models.dev/api.json",
-                        "anthropic": ["claude-opus-5-5 ($4/$20)", "claude-sonnet-5-5 ($2/$10)", "claude-haiku-5-5 ($0.10/$0.50)", "claude-fable-5-1 ($10/$50)"],
-                        "openai": ["gpt-6-1-terra ($1/$5)", "gpt-6-1-sol ($2/$10)", "gpt-6-astra ($10/$50)", "gpt-6-luna ($0.10/$0.50)"],
-                        "google": ["gemini-4-argon ($2/$10)"],
-                        "xai": ["grok-4.7 ($2/$6)", "grok-build-0.1 ($1/$2)"]
-                    },
-                    "preflight": {
-                        "tart_installed": has_tart,
-                        "softnet_installed": has_softnet,
-                        "node_installed": has_node,
-                        "git_installed": has_git,
-                        "dagu_installed": has_dagu,
-                        "cleanroom_vm_slots_fleet_target": 4
-                    },
-                    "wizard_url": wizard_url
-                });
                 let _ = writeln!(std::io::stdout().lock(), "{payload}");
-                return ExitCode::SUCCESS;
+            } else {
+                let _ = writeln!(
+                    std::io::stdout().lock(),
+                    "Chinwag onboarding\nFleet: {}\nOpen: {wizard_url}",
+                    payload["fleet_status"].as_str().unwrap_or_default()
+                );
             }
-            let _ = writeln!(
-                std::io::stdout().lock(),
-                "✨ Chinwag First-Run Coalface Onboarding (PRD-ONBOARD-01 · INV-ONBOARD-01 · INV-ROUTE-01)\n\
-                 1. iroh QUIC Multi-Mac Mesh & 4-VM Cleanroom Swarm: 2 VMs Mac Studio + 2 VMs MacBook Pro (Tart: {has_tart}, Softnet: {has_softnet})\n\
-                 2. #mgmt Executive Layer: Always-On Cloud Frontier VPs (Grok 4.7, Gemini 4 Argon, Claude Opus 5.5, GPT-6.1 Sol)\n\
-                 3. Local Frontier CLIs: Claude Code (Opus/Sonnet 5.5), Codex CLI (GPT-6.1 Terra/Sol), Gemini CLI (Gemini 4 Argon), Grok 4.7\n\
-                 4. Burst API Failover: Keychain 0600 (Anthropic, OpenAI, xAI, Google Gemini 4 Argon, ElevenLabs)\n\
-                 5. Local Apple Silicon Models: ■ FLINT (:11500 via iroh QUIC) + LEANN CSR ($0.00/tok Rung 0)\n\
-                 6. FinOps Smart Router: L1–L5 Cost × Capability Arbitrage (~$2.80/commit · 78% saved vs unrouted API)\n\
-                 7. Worker Swarm Provisioning: 30 Enrolled Org Agents active\n\
-                 → Launch Full-Screen First-Run Wizard: {wizard_url}"
-            );
             return ExitCode::SUCCESS;
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("bus") {
@@ -275,6 +248,13 @@ fn main() -> ExitCode {
             &mut std::io::stdout().lock(),
             &mut std::io::stderr().lock(),
         )),
+        chinwag_cli::Dispatch::Fleet(args) => {
+            ExitCode::from(chinwag_cli::fleet_cmd::run_fleet_cli(
+                &args,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            ))
+        }
         chinwag_cli::Dispatch::AgentDispatchStatus(repo) => {
             ExitCode::from(chinwag_cli::run_agent_dispatch_status(
                 repo,

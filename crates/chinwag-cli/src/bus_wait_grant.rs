@@ -177,7 +177,7 @@ mod tests {
             schema: "chinwag.host.enrollment.v3".into(),
             grant_id: "test".into(),
             authority_epoch: 1,
-            actor: "WORKHORSE#fixture".into(),
+            actor: "FIXTURE-A#fixture".into(),
             host_kind: "antigravity_bg_task".into(),
             host_version: "test".into(),
             host_node: None,
@@ -199,24 +199,24 @@ mod tests {
             .to_bytes());
         assert!(
             grant
-                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .verify(&authority, owner.public(), "FIXTURE-A#fixture", 2)
                 .is_ok()
         );
         assert!(
             grant
-                .verify(&authority, owner.public(), "WORKHORSE#other", 2)
+                .verify(&authority, owner.public(), "FIXTURE-A#other", 2)
                 .is_err()
         );
         assert!(
             grant
-                .verify(&authority, owner.public(), "WORKHORSE#fixture", 101)
+                .verify(&authority, owner.public(), "FIXTURE-A#fixture", 101)
                 .is_err()
         );
         let mut forged = grant.clone();
         forged.max_turns_quota = 100;
         assert!(
             forged
-                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .verify(&authority, owner.public(), "FIXTURE-A#fixture", 2)
                 .is_err()
         );
         // Only an owner signature can bind the qualified native actor to this
@@ -224,7 +224,7 @@ mod tests {
         grant.conversation_id = "different-exact-host-chat".into();
         assert!(
             grant
-                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .verify(&authority, owner.public(), "FIXTURE-A#fixture", 2)
                 .is_err()
         );
         grant.issuer_signature_ed25519 = hex(&owner
@@ -232,19 +232,19 @@ mod tests {
             .to_bytes());
         assert!(
             grant
-                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .verify(&authority, owner.public(), "FIXTURE-A#fixture", 2)
                 .is_ok()
         );
         assert!(
             grant
-                .verify(&authority, owner.public(), "WORKHORSE", 2)
+                .verify(&authority, owner.public(), "FIXTURE-A", 2)
                 .is_err()
         );
         let mut changed_chat = grant.clone();
         changed_chat.conversation_id = "wrong-chat".into();
         assert!(
             changed_chat
-                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .verify(&authority, owner.public(), "FIXTURE-A#fixture", 2)
                 .is_err()
         );
         authority.revoked_grant_ids.push("test".into());
@@ -253,7 +253,7 @@ mod tests {
             .to_bytes());
         assert!(
             grant
-                .verify(&authority, owner.public(), "WORKHORSE#fixture", 2)
+                .verify(&authority, owner.public(), "FIXTURE-A#fixture", 2)
                 .is_err()
         );
     }

@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_REQUEST: usize = 32 * 1024;
 const MAX_TASKS: u64 = 1024 * 1024;
-const ACTOR: &str = "GEMINI-PM#f19f151a-f4e0-4ba0-88e4-6b4270e71f44";
+const ACTOR: &str = "FIXTURE-C#f19f151a-f4e0-4ba0-88e4-6b4270e71f44";
 const BASELINE: &str = "c4f8395af729fd7aecf5365f6a4b261a824d83ce";
 const LEGACY_SHA: &str = "a9c6c014f56942a374344b9e5c8e2d5b2e8c37ead40ee6327752c02955e66e8a";
 const PACKAGE_SHA: &str = "142c504a5f85210670c78e3671b453f0a5866383764a4b8306c4f5eac416e528";
@@ -827,7 +827,7 @@ mod tests {
         for case in 0..10 {
             let mut f = Fixture::new();
             match case {
-                0 => f.a.actor = "WORKHORSE#wrong".into(),
+                0 => f.a.actor = "FIXTURE-A#wrong".into(),
                 1 => f.a.operation_id = "../escape".into(),
                 2 => f.a.schema = 2,
                 3 => f.a.repo.identity.ino += 1,

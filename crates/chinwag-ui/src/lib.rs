@@ -8,6 +8,7 @@ pub mod api;
 mod app;
 pub mod components;
 pub mod contracts;
+pub mod fleet;
 #[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 pub mod guard;
 mod health;

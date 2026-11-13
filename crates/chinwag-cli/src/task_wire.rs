@@ -998,7 +998,7 @@ mod tests {
             nonce: [7; NONCE_LEN_BYTES],
             sender_full_actor_address: "RUST#sender".to_owned(),
             parent_full_actor_address: Some("DELIVERY#parent".to_owned()),
-            recipient_full_actor_addresses: vec!["WORKHORSE#receiver".to_owned()],
+            recipient_full_actor_addresses: vec!["FIXTURE-A#receiver".to_owned()],
             room: "#eng".to_owned(),
             message_kind: TaskMessageKind::Assignment,
             receiver_authority_id: "authority-1".to_owned(),
@@ -1074,7 +1074,7 @@ mod tests {
     fn context(task_ref: &TaskRefV1) -> TaskVerificationContext<'_> {
         TaskVerificationContext {
             receiver_authority_id: "authority-1",
-            recipient_full_actor_address: "WORKHORSE#receiver",
+            recipient_full_actor_address: "FIXTURE-A#receiver",
             current_task_ref: task_ref,
             config_digest: Sha256Digest([1; 32]),
             task_control_digest: Sha256Digest([2; 32]),
@@ -1116,7 +1116,7 @@ mod tests {
         assert_eq!(encoded.len(), 833);
         assert_eq!(
             Sha256Digest::of(&encoded).to_string(),
-            "0dab2a9cae6d5afebbcbcd928ae5a15a49924d66d16add937a38d029d2e92c75"
+            "8b27360a267e4463bec24f03df8eacfb71e31e3e652d0acd37bb9f409e3bfefe"
         );
     }
 
@@ -1614,7 +1614,7 @@ mod tests {
             Err(TaskWireError::AuthorityBindingMismatch)
         );
         let mut checks = context(&frame.transcript.task_ref);
-        checks.recipient_full_actor_address = "WORKHORSE#other";
+        checks.recipient_full_actor_address = "FIXTURE-A#other";
         assert_eq!(
             frame.verify(TASK_BUS_V2_ALPN, &roster(), &checks),
             Err(TaskWireError::AudienceMismatch)

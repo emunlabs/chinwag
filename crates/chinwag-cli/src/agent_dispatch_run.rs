@@ -15,6 +15,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use crate::AgentDispatchRequest;
 use crate::execution_binding::{
     ExecutionAuthority, RepoSelectors, StoreSelector, WorkspaceExecutionBinding, bind_execution,
@@ -31,6 +33,7 @@ use serde_json::json;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,15 +41,6 @@ const MAX_CRDB_TEXT_BYTES: usize = 60_000;
 
 fn user_home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned())
-}
-
-fn fleet_skills_agents_dir() -> PathBuf {
-    if let Ok(override_dir) = std::env::var("CHINWAG_FLEET_AGENTS_DIR")
-        && !override_dir.trim().is_empty()
-    {
-        return PathBuf::from(override_dir);
-    }
-    PathBuf::from(user_home()).join("fleet-skills/agents")
 }
 
 const MAX_PROMPT_BYTES: usize = 262_144;
@@ -92,8 +86,6 @@ struct CustomAgentMeta {
     #[serde(default)]
     dept: Option<String>,
     #[serde(default)]
-    engine: Option<String>,
-    #[serde(default)]
     system_prompt: Option<String>,
 }
 
@@ -108,98 +100,20 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_owned()
 }
 
-/// Ordered canonical persona document specification (`CHWG-PERSONA-LOADER-FIX-01`).
-///
-/// Reads ONLY from `<fleet_root>/<AGENT>/`:
-/// 1. `SOUL.md`
-/// 2. `AGENT.md`, otherwise `AGENTS.md` (only when `AGENT.md` is absent)
-/// 3. `TOOL.md`, otherwise `TOOLS.md` (only when `TOOL.md` is absent)
-/// 4. `SKILLS.md`
-/// 5. `MEMORY.md`
-/// 6. `DESIGN.md` for `TYPE` only (`INV-DESIGN-TYPE-ONLY-01`)
-///
-/// Preserves the complete UTF-8 content of each selected document without per-file truncation,
-/// and never loads legacy `docuswiki`, `paperclip-wiki`, or `.paperclip-pilot` directories.
-fn load_persona_from_root(
-    agent_upper: &str,
-    custom: Option<&CustomAgentMeta>,
-    fleet_root: &Path,
-) -> String {
-    let mut parts = Vec::new();
-    if agent_upper == "GEMINI-PM" {
-        parts.push(
-            "You are ■ GEMINI-PM (Antigravity Product Owner & Chief Orchestrator for Chinwag & Emun Labs on Gemini 4 Argon High), talking directly with Brian Spector on Mission Control (:5487).\nKeep your answers concise, sharp, and grounded in live repo & database state. You coordinate the 3-Node Multi-Host Fleet across Node 1 Mac Studio (127.0.0.1), Node 2 Brian's MacBook Pro (100.108.108.25: ■ WORKHORSE on GPT-6.1-SOL Max & ■ FLINT on Recursive Flint MLX 262k), and Node 3 Nicola's MacBook Pro (100.89.25.127: ■ H, ■ AUSDRA, ⚡ H-SWARM).".to_owned(),
-        );
-    } else if agent_upper == "FLINT" {
-        parts.push(
-            "You are ■ FLINT (Flint from Recursive · flint-int4 MLX · 262k context running on Node 2 MacBook Pro 100.108.108.25:11500), Local Adversarial Code Auditor & Rust/CRDT Verifier for Chinwag at Emun Labs.\nRespond with surgical Rust/CRDT/concurrency rigor.".to_owned(),
-        );
-    } else if agent_upper == "WORKHORSE" {
-        parts.push(
-            "You are ■ WORKHORSE (Codex - GPT-6.1-SOL Max running on Node 2 Brian's MacBook Pro 100.108.108.25), Principal Engineering Workhorse, PRD Reviewer & Ephemeral Dev/QA Pool Coordinator at Emun Labs.\nRespond with concrete systems rigor, exact file/schema/state-machine boundaries, and zero fluff.".to_owned(),
-        );
-    } else if agent_upper == "H" {
-        parts.push(
-            "You are ■ H (Codex - GPT-6.1-SOL Ultra on Node 3 Nicola's MacBook Pro 100.89.25.127 · nicolas-macbook-pro), Lead Creative & Technical Agent for Nicola Spector (Co-Founder & Chief Creative Officer) leading laglords.tv, chinwag.tv, and Captionizm™.".to_owned(),
-        );
-    } else if agent_upper == "AUSDRA" {
-        parts.push(
-            "You are ■ AUSDRA (Codex - GPT-6.1-SOL Ultra on Node 3 Nicola's MacBook Pro 100.89.25.127), Business, Legal & Governance Advisor to Nicola Spector.".to_owned(),
-        );
-    } else {
-        parts.push(format!(
-            "You are ■ {agent_upper}, a core specialist agent at Emun Labs working directly with Brian and Nicola Spector.\nRespond directly, helpfully, and in your authentic specialist persona."
-        ));
-    }
-
-    let fleet_dir = fleet_root.join(agent_upper);
-    let doc_slots: &[&[&str]] = &[
-        &["SOUL.md"],
-        &["AGENT.md", "AGENTS.md"],
-        &["TOOL.md", "TOOLS.md"],
-        &["SKILLS.md"],
-        &["MEMORY.md"],
-    ];
-    for candidates in doc_slots {
-        for fname in *candidates {
-            let fpath = fleet_dir.join(fname);
-            match fs::read_to_string(&fpath) {
-                Ok(content) => {
-                    parts.push(format!(
-                        "\n--- {fname} (fleet-skills/{agent_upper}) ---\n{content}"
-                    ));
-                    break;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => break,
-            }
-        }
-    }
-    if agent_upper == "TYPE" {
-        let design_path = fleet_dir.join("DESIGN.md");
-        if let Ok(content) = fs::read_to_string(&design_path) {
-            parts.push(format!(
-                "\n--- DESIGN.md (TYPE Only · INV-DESIGN-TYPE-ONLY-01) ---\n{content}"
-            ));
-        }
-    }
-
+fn load_persona(agent: &str, custom: Option<&CustomAgentMeta>) -> String {
+    let mut persona = format!("You are {agent}. Follow your configured workspace instructions.");
     if let Some(meta) = custom {
-        let role = meta.role.as_deref().unwrap_or("");
-        let dept = meta.dept.as_deref().unwrap_or("");
-        let sys = meta.system_prompt.as_deref().unwrap_or("");
-        if !role.is_empty() || !sys.is_empty() {
-            parts.push(format!(
-                "\n--- Custom Agent Configuration ({agent_upper}) ---\nRole: {role} ({dept})\n{sys}"
-            ));
+        if let Some(role) = &meta.role {
+            persona.push_str(&format!("\nRole: {role}"));
+        }
+        if let Some(dept) = &meta.dept {
+            persona.push_str(&format!("\nGroup: {dept}"));
+        }
+        if let Some(prompt) = &meta.system_prompt {
+            persona.push_str(&format!("\n{prompt}"));
         }
     }
-
-    parts.join("\n")
-}
-
-fn load_persona(agent_upper: &str, custom: Option<&CustomAgentMeta>) -> String {
-    load_persona_from_root(agent_upper, custom, &fleet_skills_agents_dir())
+    persona
 }
 
 fn check_binding(
@@ -252,24 +166,6 @@ fn recall_native_memory(binding: &WorkspaceExecutionBinding) -> Result<String, S
     match (read, closed) {
         (Ok(memory), Ok(_)) => Ok(memory),
         (Err(error), _) | (_, Err(error)) => Err(error),
-    }
-}
-
-fn strip_flint_banner(raw: &str) -> String {
-    let lines: Vec<&str> = raw.lines().collect();
-    if let Some(first) = lines.first()
-        && (first.contains("Opening Pi") || first.contains("11500/v1"))
-    {
-        return lines[1..].join("\n").trim().to_owned();
-    }
-    raw.trim().to_owned()
-}
-
-fn codex_effort_arg(agent_upper: &str) -> &'static str {
-    match agent_upper {
-        "WORKHORSE" => "model_reasoning_effort=\"max\"",
-        "ARCHITECT" | "RUST" | "GAMEDEV" | "H" | "AUSDRA" => "model_reasoning_effort=\"ultra\"",
-        _ => "model_reasoning_effort=\"high\"",
     }
 }
 
@@ -335,6 +231,45 @@ impl BoundGitSigning {
     }
 }
 
+fn bound_execution_environment(
+    binding: &WorkspaceExecutionBinding,
+    identity: &crate::agent_instance::DispatchIdentity,
+    signing: &BoundGitSigning,
+) -> std::collections::BTreeMap<String, String> {
+    let mut environment = [
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+        ("GIT_ATTR_NOSYSTEM", "1"),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect::<std::collections::BTreeMap<_, _>>();
+    environment.extend(signing.environment.iter().cloned());
+    environment.extend(identity.environment());
+    environment.extend([
+        (
+            "CHINWAG_REPO_ROOT".into(),
+            binding.execution_root().display().to_string(),
+        ),
+        (
+            "CHINWAG_STORE_PATH".into(),
+            binding.store_path().display().to_string(),
+        ),
+        ("CHINWAG_STORE_ID".into(), binding.store_id().to_owned()),
+        (
+            "CHINWAG_EXECUTION_BINDING".into(),
+            binding.commitment_id().to_owned(),
+        ),
+        ("CHINWAG_AGENT".into(), identity.child().seat().to_owned()),
+    ]);
+    environment
+}
+
+#[cfg(test)]
 fn install_bound_launch_environment(
     command: &mut Command,
     binding: &WorkspaceExecutionBinding,
@@ -354,23 +289,7 @@ fn install_bound_launch_environment(
     for name in names {
         command.env_remove(name);
     }
-    // These fixed exceptions align child Git's config sources with binding
-    // validation; no inherited or caller-selected config file is reintroduced.
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .envs(signing.environment.iter().cloned())
-        .env("CHINWAG_REPO_ROOT", binding.execution_root())
-        .env("CHINWAG_STORE_PATH", binding.store_path())
-        .env("CHINWAG_STORE_ID", binding.store_id())
-        .env("CHINWAG_EXECUTION_BINDING", binding.commitment_id())
-        .envs(identity.environment())
-        .env("CHINWAG_AGENT", identity.child().seat());
+    command.envs(bound_execution_environment(binding, identity, signing));
 }
 
 #[cfg(test)]
@@ -389,6 +308,7 @@ fn run_bound_local_command(
     )
 }
 
+#[cfg(test)]
 fn run_bound_local_command_with_signing(
     binding: &WorkspaceExecutionBinding,
     authority: &ExecutionAuthority,
@@ -418,27 +338,13 @@ fn run_bound_local_command_with_signing(
     Ok(text)
 }
 
-struct BoundHostedTransport<'a> {
-    binding: &'a WorkspaceExecutionBinding,
-    authority: &'a ExecutionAuthority<'a>,
-    inner: crate::hosted_agent::CurlTransport,
-}
-impl crate::hosted_agent::HostedTransport for BoundHostedTransport<'_> {
-    fn send(
-        &mut self,
-        request: &crate::hosted_agent::HttpRequest,
-    ) -> Result<crate::hosted_agent::HttpResponse, crate::hosted_agent::HostedAgentError> {
-        check_binding(self.binding, self.authority)
-            .map_err(crate::hosted_agent::HostedAgentError::ConfigError)?;
-        crate::hosted_agent::HostedTransport::send(&mut self.inner, request)
-    }
-}
-
+#[cfg(test)]
 struct BoundHostedExecutor<'a> {
     binding: &'a WorkspaceExecutionBinding,
     authority: &'a ExecutionAuthority<'a>,
     inner: crate::hosted_agent::StandardToolExecutor,
 }
+#[cfg(test)]
 impl crate::hosted_agent::ToolExecutor for BoundHostedExecutor<'_> {
     fn execute(
         &mut self,
@@ -459,24 +365,9 @@ impl crate::hosted_agent::ToolExecutor for BoundHostedExecutor<'_> {
 struct EngineRequest<'a> {
     agent: &'a str,
     prompt: &'a str,
-    custom: Option<&'a CustomAgentMeta>,
     environment: &'a [(String, String)],
     git_signing: &'a BoundGitSigning,
     identity: &'a crate::agent_instance::DispatchIdentity,
-}
-
-fn require_local_route(agent: &str, custom: Option<&CustomAgentMeta>) -> Result<(), String> {
-    if crate::deepseek_pool::pool_for_agent(agent).is_some() {
-        return Err("pool_execution_binding_unsupported".into());
-    }
-    let hint = custom
-        .and_then(|meta| meta.engine.as_deref().or(meta.dept.as_deref()))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if agent == "WORKHORSE" || hint.contains("workhorse") {
-        return Err("remote_execution_binding_unsupported".into());
-    }
-    Ok(())
 }
 
 fn dispatch_to_engine(
@@ -485,234 +376,57 @@ fn dispatch_to_engine(
     request: &EngineRequest<'_>,
 ) -> Result<(String, &'static str), String> {
     check_binding(binding, authority)?;
-    let EngineRequest {
-        agent,
-        prompt,
-        custom,
-        environment,
-        git_signing,
-        identity,
-    } = request;
-    require_local_route(agent, *custom)?;
-    let engine_hint = custom
-        .and_then(|meta| meta.engine.as_deref().or(meta.dept.as_deref()))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if let Ok(mock) = std::env::var("CHINWAG_AGENT_MOCK_REPLY")
-        && !mock.trim().is_empty()
-    {
-        return Ok((mock, "mock-engine"));
-    }
-
-    let home = user_home();
-    let local_bin = Path::new(&home).join(".local/bin");
-    let path_env = format!(
-        "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        local_bin.display()
-    );
-    let rich_prompt = truncate_utf8(prompt, MAX_PROMPT_BYTES);
-    let explicit_cfg_path = std::env::var("CHINWAG_PROVIDERS_CONFIG")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from);
-    let default_cfg_path = Path::new(&home).join(".chinwag/providers.json");
-    let default_gemini =
-        *agent == "FREQUENCY" && Path::new(&home).join(".chinwag/gemini.env").is_file();
-    if explicit_cfg_path.is_some() || default_cfg_path.symlink_metadata().is_ok() || default_gemini
-    {
-        check_binding(binding, authority)?;
-        let config = crate::hosted_agent::ProvidersConfig::load_or_default(
-            explicit_cfg_path.as_deref(),
-            Path::new(&home),
-            binding.execution_root(),
-        )
-        .map_err(|error| error.to_string())?;
-        if config.agents.contains_key(*agent) {
-            let mut exec_env = vec![("PATH".to_owned(), path_env.clone())];
-            exec_env.extend(environment.iter().cloned());
-            let mut transport = BoundHostedTransport {
-                binding,
-                authority,
-                inner: crate::hosted_agent::CurlTransport::system_default(Path::new(&home)),
-            };
-            let mut executor = BoundHostedExecutor {
-                binding,
-                authority,
-                inner: crate::hosted_agent::StandardToolExecutor::new(
-                    binding.execution_root().to_owned(),
-                    exec_env,
-                ),
-            };
-            check_binding(binding, authority)?;
-            let system = format!(
-                "You are {agent} ({}), executing in the approved Chinwag workspace.",
-                identity.child()
-            );
-            let reply = crate::hosted_agent::run_hosted_seat(
-                &config,
-                agent,
-                &system,
-                &rich_prompt,
-                &mut transport,
-                &mut executor,
-            )
-            .map_err(|error| format!("hosted_outcome_without_replacement: {error}"))?;
-            return Ok((reply.text, "hosted-agent-api"));
-        }
-    }
-
-    let is_flint = *agent == "FLINT" || engine_hint.contains("flint");
-    let is_deepseek = agent.starts_with("DEV-")
-        || agent.starts_with("EPHEMERAL-DEV-")
-        || agent.starts_with("QA-")
-        || agent.starts_with("EPHEMERAL-QA-")
-        || matches!(
-            *agent,
-            "SKILL"
-                | "MANNY"
-                | "SUMMARIZER"
-                | "RECORD"
-                | "SUPPORT"
-                | "EPHEMERAL-ANALYST"
-                | "EPHEMERAL-SDR"
-                | "EPHEMERAL-SUPPORT"
-        )
-        || engine_hint.contains("deepseek");
-    let is_codex = matches!(
-        *agent,
-        "ARCHITECT"
-            | "RUST"
-            | "GAMEDEV"
-            | "WORKHORSE"
-            | "H"
-            | "AUSDRA"
-            | "H-SWARM"
-            | "TYPE"
-            | "INDEX"
-            | "DECLARATION"
-            | "CLOUDFLARE"
-    ) || engine_hint.contains("codex")
-        || engine_hint.contains("gpt-6.1-sol");
-    let is_grok = matches!(*agent, "GROWTH" | "SALES") || engine_hint.contains("grok");
-
-    for (enabled, name, engine) in [
-        (is_flint, "flint-agent", "flint-agent"),
-        (is_deepseek, "deepseek-agent", "deepseek-workers-ai"),
-    ] {
-        let binary = local_bin.join(name);
-        if enabled && binary.exists() {
-            let mut command = Command::new(binary);
-            command
-                .args(["run", &rich_prompt, "--cwd"])
-                .arg(binding.execution_root())
-                .env("PATH", &path_env)
-                .envs(environment.iter().cloned());
-            let text = run_bound_local_command_with_signing(
-                binding,
-                authority,
-                identity,
-                &mut command,
-                git_signing,
-            )?;
-            let text = if engine == "flint-agent" {
-                strip_flint_banner(&text)
-            } else {
-                text
-            };
-            if text.is_empty() {
-                return Err("engine_empty_reply_without_replacement".into());
-            }
-            return Ok((text, engine));
-        }
-    }
-    let local_codex = local_bin.join("codex");
-    let codex = if local_codex.exists() {
-        local_codex
-    } else {
-        PathBuf::from("/opt/homebrew/bin/codex")
+    let (_, manifest) = crate::fleet_cmd::load_manifest(None, binding.execution_root())?;
+    let plan = chinwag_fleet::resolve_dispatch_plan(
+        &manifest,
+        &chinwag_fleet::DispatchRequest {
+            seat: request.agent.to_owned(),
+            requested_write_globs: manifest
+                .seat(request.agent)
+                .map(|seat| seat.allowed_write_roots.clone())
+                .unwrap_or_default(),
+            cwd: binding.execution_root().to_owned(),
+            actor: Some(request.identity.child().to_string()),
+            ..Default::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let mut context = chinwag_fleet::ExecutionContext {
+        env: request
+            .environment
+            .iter()
+            .filter(|(name, _)| !name.starts_with("GIT_") && !name.starts_with("CHINWAG_"))
+            .cloned()
+            .collect(),
+        scrub_env_prefixes: vec!["GIT_".into(), "CHINWAG_".into()],
+        prompt: Some(request.prompt.to_owned()),
+        ..Default::default()
     };
-    if is_codex && codex.exists() {
-        let mut command = Command::new(&codex);
-        command
-            .args([
-                "exec",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "-m",
-                "gpt-6.1-sol",
-                "-c",
-                codex_effort_arg(agent),
-                "-c",
-                "service_tier=\"priority\"",
-                &rich_prompt,
-            ])
-            .env("PATH", &path_env)
-            .envs(environment.iter().cloned());
-        return run_bound_local_command_with_signing(
-            binding,
-            authority,
-            identity,
-            &mut command,
-            git_signing,
-        )
-        .map(|text| (text, "codex-gpt-6.1-sol"));
+    context.env.extend(bound_execution_environment(
+        binding,
+        request.identity,
+        request.git_signing,
+    ));
+    check_binding(binding, authority)?;
+    let claim_root = binding
+        .execution_control_root()
+        .join("chinwag-fleet-claims");
+    let outcome = crate::fleet_cmd::execute_plan_with_claim_root(
+        &manifest,
+        &plan,
+        &context,
+        &request.identity.child().to_string(),
+        &claim_root,
+        || check_binding(binding, authority),
+    )?;
+    check_binding(binding, authority)?;
+    if !outcome.success {
+        return Err(format!(
+            "engine_failed_without_replacement: {:?}",
+            outcome.exit_code
+        ));
     }
-    let grok = local_bin.join("grok");
-    if is_grok && grok.exists() {
-        let mut command = Command::new(grok);
-        command
-            .args(["agent", "--always-approve", &rich_prompt])
-            .env("PATH", &path_env)
-            .envs(environment.iter().cloned());
-        return run_bound_local_command_with_signing(
-            binding,
-            authority,
-            identity,
-            &mut command,
-            git_signing,
-        )
-        .map(|text| (text, "grok-4.7-high"));
-    }
-    if Path::new("/opt/homebrew/bin/gemini").exists() {
-        let mut command = Command::new("/opt/homebrew/bin/node");
-        command
-            .args(["/opt/homebrew/bin/gemini", "-p", &rich_prompt, "--yolo"])
-            .env("PATH", &path_env)
-            .envs(environment.iter().cloned());
-        return run_bound_local_command_with_signing(
-            binding,
-            authority,
-            identity,
-            &mut command,
-            git_signing,
-        )
-        .map(|text| (text, "gemini-4-argon-high"));
-    }
-    if codex.exists() {
-        let mut command = Command::new(codex);
-        command
-            .args([
-                "exec",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "-m",
-                "gpt-6.1-sol",
-                "-c",
-                "model_reasoning_effort=\"high\"",
-                &rich_prompt,
-            ])
-            .env("PATH", &path_env)
-            .envs(environment.iter().cloned());
-        return run_bound_local_command_with_signing(
-            binding,
-            authority,
-            identity,
-            &mut command,
-            git_signing,
-        )
-        .map(|text| (text, "codex-gpt-6.1-sol"));
-    }
-    Err("engine_unavailable_without_replacement".into())
+    Ok((outcome.stdout, "fleet-manifest-driver"))
 }
 
 /// One inbound/outbound dispatch exchange to persist into the CRDB store.
@@ -724,14 +438,6 @@ struct DispatchExchange<'a> {
     outbound_id: &'a str,
     outbound_body: &'a str,
     now_ms: i64,
-}
-
-#[cfg(test)]
-fn workhorse_remote_command(identity: &crate::agent_instance::DispatchIdentity) -> String {
-    format!(
-        "PATH=/Users/brianspector/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin {} /Users/brianspector/.local/bin/codex exec --skip-git-repo-check --ephemeral -m gpt-6.1-sol -c 'model_reasoning_effort=\"max\"' -c 'service_tier=\"priority\"' -",
-        identity.remote_environment()
-    )
 }
 
 /// Merge explicit CLI and stdin context before any persona, signing or engine I/O.
@@ -941,7 +647,7 @@ pub(crate) fn probe_bound_route(
     let identity = crate::agent_instance::DispatchIdentity::new(
         crate::agent_instance::ActorAddress::parse("RUST#p009-route-probe")
             .map_err(|error| error.to_string())?,
-        crate::agent_instance::ActorAddress::parse("WORKHORSE#p009-route-parent")
+        crate::agent_instance::ActorAddress::parse("FIXTURE-A#p009-route-parent")
             .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
@@ -982,7 +688,6 @@ fn run_bound_exchange(
 ) -> Result<serde_json::Value, String> {
     check_binding(binding, authority)?;
     let agent = input.identity.child().seat();
-    require_local_route(agent, input.custom)?;
     let persona = effects.persona(agent, input.custom)?;
     check_binding(binding, authority)?;
     let memory = effects.memory(binding)?;
@@ -1021,7 +726,6 @@ fn run_bound_exchange(
         &EngineRequest {
             agent,
             prompt: &prompt,
-            custom: input.custom,
             environment: &environment,
             git_signing: &git_signing,
             identity: input.identity,
@@ -1110,14 +814,14 @@ fn run_agent_dispatch_with_effects(
         }
     }
     let ambient_actor = std::env::var("CHINWAG_ACTOR").ok();
-    let identity = match prepare_dispatch_identity(&request, &payload, ambient_actor.as_deref()) {
-        Ok(identity) => identity,
-        Err(error) => {
-            let _ = writeln!(err, "chinwag: {error}");
-            return 2;
-        }
-    };
-    let Some(body) = request.body.or(payload.body).or(payload.message) else {
+    let fleet_manifest_path = request.fleet_manifest.clone();
+    let room = request.room.clone();
+    let Some(body) = request
+        .body
+        .clone()
+        .or(payload.body.clone())
+        .or(payload.message.clone())
+    else {
         let _ = writeln!(err, "chinwag: invalid_arguments");
         return 2;
     };
@@ -1127,17 +831,80 @@ fn run_agent_dispatch_with_effects(
     }
     let item = request
         .item
-        .or(payload.item_key)
-        .or(payload.item)
+        .clone()
+        .or(payload.item_key.clone())
+        .or(payload.item.clone())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "chinwag-v0.1.1-sprint".into());
-    let repo = request.repo.or_else(|| payload.repo.map(PathBuf::from));
-    let store = request.crdb.or_else(|| payload.crdb.map(PathBuf::from));
+    let repo = request
+        .repo
+        .clone()
+        .or_else(|| payload.repo.as_ref().map(PathBuf::from));
+    let store = request
+        .crdb
+        .clone()
+        .or_else(|| payload.crdb.as_ref().map(PathBuf::from));
     let environment_repo = std::env::var_os("CHINWAG_REPO_ROOT");
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(_) => {
             let _ = writeln!(err, "chinwag: execution_cwd_unavailable");
+            return 2;
+        }
+    };
+    let fleet_cwd = repo.as_deref().unwrap_or(&cwd);
+    let fleet_path = crate::fleet_cmd::manifest_path(fleet_manifest_path.as_deref(), fleet_cwd);
+    // Selecting a native store retains its original execution authority gate.
+    // A discovered fleet manifest cannot authorize this store or a legacy remote dispatcher.
+    if store.is_none()
+        && (fleet_manifest_path.is_some()
+            || std::env::var_os("CHINWAG_FLEET_MANIFEST").is_some()
+            || fleet_path.exists())
+    {
+        let result = run_manifest_exchange(
+            &fleet_path,
+            fleet_cwd,
+            room,
+            request
+                .agent
+                .as_deref()
+                .or(payload.agent.as_deref())
+                .unwrap_or_default(),
+            request
+                .sender
+                .as_deref()
+                .or(payload.sender.as_deref())
+                .or(ambient_actor.as_deref()),
+            request.instance.as_deref(),
+            &body,
+            &item,
+            &payload.history,
+            payload.custom_agent.as_ref(),
+        );
+        return match result {
+            Ok(response) => {
+                if serde_json::to_writer(&mut *out, &response).is_err()
+                    || out.write_all(b"\n").is_err()
+                {
+                    1
+                } else {
+                    0
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "{}",
+                    json!({"ok": false, "error": error, "status": "HELD"})
+                );
+                2
+            }
+        };
+    }
+    let identity = match prepare_dispatch_identity(&request, &payload, ambient_actor.as_deref()) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = writeln!(err, "chinwag: {error}");
             return 2;
         }
     };
@@ -1202,6 +969,182 @@ fn run_agent_dispatch_with_effects(
             1
         }
     }
+}
+
+struct ManifestDispatchIdentity {
+    seat: chinwag_fleet::SeatId,
+    actor: String,
+    instance: String,
+    caller: String,
+}
+
+impl ManifestDispatchIdentity {
+    fn new(
+        raw_child: &str,
+        raw_caller: Option<&str>,
+        explicit_parent_instance: Option<&str>,
+    ) -> Result<Self, String> {
+        let raw_child = raw_child.trim().trim_start_matches('@');
+        let (seat, child_instance) = raw_child
+            .split_once('#')
+            .map_or((raw_child, None), |(seat, instance)| (seat, Some(instance)));
+        let seat = chinwag_fleet::SeatId::new(seat).map_err(|error| error.to_string())?;
+        let instance = match child_instance {
+            Some(instance) => instance.to_owned(),
+            None => crate::agent_instance::new_instance_id().map_err(|error| error.to_string())?,
+        };
+        let actor = format!("{seat}#{instance}");
+        chinwag_fleet::validate_actor(&seat, &actor).map_err(|error| error.to_string())?;
+        let caller = raw_caller
+            .ok_or("agent_caller_required")?
+            .trim()
+            .trim_start_matches('@');
+        let (caller_seat, caller_instance) = caller
+            .split_once('#')
+            .map_or((caller, None), |(seat, instance)| (seat, Some(instance)));
+        let caller_seat =
+            chinwag_fleet::SeatId::new(caller_seat).map_err(|error| error.to_string())?;
+        if let (Some(embedded), Some(explicit)) = (caller_instance, explicit_parent_instance)
+            && embedded != explicit
+        {
+            return Err("conflicting_actor_instance".into());
+        }
+        let inherited = if caller_instance.is_none() && explicit_parent_instance.is_none() {
+            crate::agent_instance::inherited_instance().map_err(|error| error.to_string())?
+        } else {
+            None
+        };
+        let caller_instance = explicit_parent_instance
+            .or(caller_instance)
+            .or(inherited.as_deref())
+            .ok_or("agent_instance_required")?;
+        let caller = format!("{caller_seat}#{caller_instance}");
+        chinwag_fleet::validate_actor(&caller_seat, &caller).map_err(|error| error.to_string())?;
+        Ok(Self {
+            seat,
+            actor,
+            instance,
+            caller,
+        })
+    }
+    fn environment(&self) -> std::collections::BTreeMap<String, String> {
+        [
+            ("CHINWAG_ACTOR", self.actor.clone()),
+            ("CHINWAG_INSTANCE_ID", self.instance.clone()),
+            ("CHINWAG_CALLER", self.caller.clone()),
+            ("CHINWAG_PARENT_INSTANCE", self.caller.clone()),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_manifest_exchange(
+    manifest_path: &Path,
+    cwd: &Path,
+    room: Option<String>,
+    recipient: &str,
+    caller: Option<&str>,
+    parent_instance: Option<&str>,
+    body: &str,
+    item: &str,
+    history: &[HistoryEntry],
+    custom: Option<&CustomAgentMeta>,
+) -> Result<serde_json::Value, String> {
+    let identity = ManifestDispatchIdentity::new(recipient, caller, parent_instance)?;
+    let seat = identity.seat.as_str();
+    let manifest =
+        chinwag_fleet::FleetManifest::load(manifest_path).map_err(|error| error.to_string())?;
+    let actor = identity.actor.clone();
+    let plan = chinwag_fleet::resolve_dispatch_plan(
+        &manifest,
+        &chinwag_fleet::DispatchRequest {
+            seat: seat.to_owned(),
+            requested_write_globs: manifest
+                .seat(seat)
+                .map(|seat| seat.allowed_write_roots.clone())
+                .unwrap_or_default(),
+            room,
+            cwd: cwd.to_path_buf(),
+            actor: Some(actor.clone()),
+            ..Default::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let definition = manifest.seat(seat).ok_or("UnknownSeat")?;
+    let mut persona = load_persona(seat, custom);
+    let workspace = cwd.canonicalize().map_err(|error| error.to_string())?;
+    for relative_path in &definition.boot_files {
+        let mut path = workspace.clone();
+        for component in Path::new(relative_path).components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err("boot_file_invalid".into());
+            }
+            path.push(component);
+            if fs::symlink_metadata(&path)
+                .map_err(|error| format!("boot_file_unavailable: {error}"))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err("boot_file_invalid".into());
+            }
+        }
+        if !path
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            .starts_with(&workspace)
+        {
+            return Err("boot_file_invalid".into());
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("boot_file_unavailable: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("boot_file_invalid".into());
+        }
+        let text =
+            fs::read_to_string(&path).map_err(|error| format!("boot_file_unavailable: {error}"))?;
+        persona.push_str(&format!("\n--- {} ---\n{text}", path.display()));
+    }
+    let prompt = assemble_dispatch_prompt(
+        seat,
+        &persona,
+        "",
+        item,
+        &actor,
+        &identity.caller,
+        history,
+        None,
+        body,
+        MAX_PROMPT_BYTES,
+    )?;
+    let mut context = chinwag_fleet::ExecutionContext {
+        env: identity.environment(),
+        prompt: Some(prompt),
+        ..Default::default()
+    };
+    context.env.insert("CHINWAG_ACTOR".into(), actor.clone());
+    context.env.insert(
+        "CHINWAG_FLEET_MANIFEST".into(),
+        manifest_path.display().to_string(),
+    );
+    context
+        .env
+        .insert("CHINWAG_ITEM_KEY".into(), item.to_owned());
+    let outcome = crate::fleet_cmd::execute_plan(&manifest, &plan, &context, &actor)?;
+    if !outcome.success {
+        return Err(format!(
+            "driver_exit_failed: {:?}: {}",
+            outcome.exit_code, outcome.stderr
+        ));
+    }
+    Ok(json!({
+        "ok": true, "agent": seat, "agent_instance": actor, "sender_instance": identity.caller,
+        "engine": plan.model, "target": plan.target, "reply": outcome.stdout, "item_key": item,
+        "exit_code": outcome.exit_code, "crdb_persisted": false, "crdb_status": "not_requested",
+        "manifest_digest": plan.manifest_digest,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1273,28 +1216,9 @@ fn assemble_dispatch_prompt(
 mod execution_binding_route_tests;
 
 #[cfg(test)]
-mod codex_effort_tests {
-    use super::codex_effort_arg;
-
-    #[test]
-    fn ultra_max_and_high_tiers_match_3node_roster() {
-        for seat in ["ARCHITECT", "RUST", "GAMEDEV", "H", "AUSDRA"] {
-            assert_eq!(codex_effort_arg(seat), "model_reasoning_effort=\"ultra\"");
-        }
-        assert_eq!(
-            codex_effort_arg("WORKHORSE"),
-            "model_reasoning_effort=\"max\""
-        );
-        for seat in ["TYPE", "INDEX", "DECLARATION", "CLOUDFLARE"] {
-            assert_eq!(codex_effort_arg(seat), "model_reasoning_effort=\"high\"");
-        }
-    }
-}
-
-#[cfg(test)]
 mod instance_dispatch_tests {
     use super::*;
-    use crate::agent_instance::{ActorAddress, DispatchIdentity, InstanceError};
+    use crate::agent_instance::InstanceError;
 
     fn request(args: &[&str]) -> AgentDispatchRequest {
         let mut args = args
@@ -1308,12 +1232,12 @@ mod instance_dispatch_tests {
     #[test]
     fn stdin_sender_and_explicit_instance_are_merged_before_dispatch() {
         let payload: StdinDispatchPayload = serde_json::from_str(
-            r#"{"agent":"RUST#child-long-id","sender":"WORKHORSE","body":"fixture"}"#,
+            r#"{"agent":"RUST#child-long-id","sender":"FIXTURE-A","body":"fixture"}"#,
         )
         .unwrap();
         let req = request(&["--instance", "parent-long-id"]);
         let identity = prepare_dispatch_identity(&req, &payload, Some("OTHER#ambient")).unwrap();
-        assert_eq!(identity.parent().to_string(), "WORKHORSE#parent-long-id");
+        assert_eq!(identity.parent().to_string(), "FIXTURE-A#parent-long-id");
         assert_eq!(identity.child().to_string(), "RUST#child-long-id");
     }
 
@@ -1325,9 +1249,9 @@ mod instance_dispatch_tests {
             prepare_dispatch_identity(&req, &payload, None),
             Err(InstanceError::MissingCaller)
         );
-        let a = prepare_dispatch_identity(&req, &payload, Some("WORKHORSE#parent")).unwrap();
-        let b = prepare_dispatch_identity(&req, &payload, Some("WORKHORSE#parent")).unwrap();
-        assert_eq!(a.parent().to_string(), "WORKHORSE#parent");
+        let a = prepare_dispatch_identity(&req, &payload, Some("FIXTURE-A#parent")).unwrap();
+        let b = prepare_dispatch_identity(&req, &payload, Some("FIXTURE-A#parent")).unwrap();
+        assert_eq!(a.parent().to_string(), "FIXTURE-A#parent");
         assert_ne!(a.child(), b.child());
         assert_eq!(a.child().instance().unwrap().len(), 32);
     }
@@ -1336,7 +1260,7 @@ mod instance_dispatch_tests {
     fn conflicting_stdin_identity_stops_before_files_or_engine_io() {
         let req = request(&["--instance", "one"]);
         let mut input = std::io::Cursor::new(
-            br#"{"agent":"RUST#child","sender":"WORKHORSE#two","body":"fixture"}"#,
+            br#"{"agent":"RUST#child","sender":"FIXTURE-A#two","body":"fixture"}"#,
         );
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1347,94 +1271,11 @@ mod instance_dispatch_tests {
             "chinwag: conflicting_actor_instance\n"
         );
     }
-
-    #[test]
-    fn remote_workhorse_command_contains_full_validated_lineage() {
-        let identity = DispatchIdentity::new(
-            ActorAddress::parse("WORKHORSE#01a146d0-d769-7a02-a1a5-75c407ffaa3c").unwrap(),
-            ActorAddress::parse("GEMINI-PM#parent-long-id").unwrap(),
-        )
-        .unwrap();
-        let command = workhorse_remote_command(&identity);
-        assert!(command.contains("CHINWAG_ACTOR='WORKHORSE#01a146d0-d769-7a02-a1a5-75c407ffaa3c'"));
-        assert!(command.contains("CHINWAG_INSTANCE_ID='01a146d0-d769-7a02-a1a5-75c407ffaa3c'"));
-        assert!(command.contains("CHINWAG_CALLER='GEMINI-PM#parent-long-id'"));
-        assert!(command.contains("CHINWAG_PARENT_INSTANCE='GEMINI-PM#parent-long-id'"));
-    }
 }
 
 #[cfg(test)]
 mod persona_loader_tests {
     use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn canonical_fleet_skills_loader_deduplicates_aliases_and_never_truncates_at_3500_bytes() {
-        let tmp = TempDir::new().unwrap();
-        let freq_dir = tmp.path().join("FREQUENCY");
-        fs::create_dir_all(&freq_dir).unwrap();
-
-        let long_prefix = "A".repeat(5_000);
-        let tail_sentinel = "SENTINEL_PAST_3500_BYTES_SURVIVES";
-        fs::write(freq_dir.join("SOUL.md"), "SOUL_CANONICAL").unwrap();
-        fs::write(freq_dir.join("AGENT.md"), "AGENT_SINGULAR_WINS").unwrap();
-        fs::write(freq_dir.join("AGENTS.md"), "AGENTS_PLURAL_DUPLICATE").unwrap();
-        fs::write(
-            freq_dir.join("TOOL.md"),
-            format!("{long_prefix}\n{tail_sentinel}"),
-        )
-        .unwrap();
-        fs::write(freq_dir.join("TOOLS.md"), "TOOLS_PLURAL_DUPLICATE").unwrap();
-        fs::write(freq_dir.join("SKILLS.md"), "SKILLS_CANONICAL").unwrap();
-        fs::write(freq_dir.join("MEMORY.md"), "MEMORY_CANONICAL").unwrap();
-        fs::write(
-            freq_dir.join("DESIGN.md"),
-            "DESIGN_MUST_NOT_LOAD_FOR_FREQUENCY",
-        )
-        .unwrap();
-
-        let persona = load_persona_from_root("FREQUENCY", None, tmp.path());
-        assert!(persona.contains("SOUL_CANONICAL"));
-        assert!(persona.contains("AGENT_SINGULAR_WINS"));
-        assert!(
-            !persona.contains("AGENTS_PLURAL_DUPLICATE"),
-            "AGENTS.md must not be double-loaded when AGENT.md exists"
-        );
-        assert!(
-            persona.contains(tail_sentinel),
-            "content beyond 3,500 bytes must survive intact without truncation"
-        );
-        assert!(
-            !persona.contains("TOOLS_PLURAL_DUPLICATE"),
-            "TOOLS.md must not be double-loaded when TOOL.md exists"
-        );
-        assert!(persona.contains("SKILLS_CANONICAL"));
-        assert!(persona.contains("MEMORY_CANONICAL"));
-        assert!(
-            !persona.contains("DESIGN_MUST_NOT_LOAD_FOR_FREQUENCY"),
-            "DESIGN.md is strictly reserved for TYPE"
-        );
-        assert!(!persona.contains("(Wiki)"));
-        assert!(!persona.contains("(Instructions)"));
-    }
-
-    #[test]
-    fn plural_aliases_load_when_singular_files_are_absent_and_design_loads_for_type() {
-        let tmp = TempDir::new().unwrap();
-        let type_dir = tmp.path().join("TYPE");
-        fs::create_dir_all(&type_dir).unwrap();
-
-        fs::write(type_dir.join("AGENTS.md"), "AGENTS_FALLBACK_CONTENT").unwrap();
-        fs::write(type_dir.join("TOOLS.md"), "TOOLS_FALLBACK_CONTENT").unwrap();
-        fs::write(type_dir.join("DESIGN.md"), "TYPE_DESIGN_SYSTEM_CONTENT").unwrap();
-
-        let persona = load_persona_from_root("TYPE", None, tmp.path());
-        assert!(persona.contains("--- AGENTS.md (fleet-skills/TYPE) ---"));
-        assert!(persona.contains("AGENTS_FALLBACK_CONTENT"));
-        assert!(persona.contains("--- TOOLS.md (fleet-skills/TYPE) ---"));
-        assert!(persona.contains("TOOLS_FALLBACK_CONTENT"));
-        assert!(persona.contains("TYPE_DESIGN_SYSTEM_CONTENT"));
-    }
 
     #[test]
     fn assemble_dispatch_prompt_preserves_50kb_persona_and_trims_history_before_failing() {
@@ -1452,12 +1293,12 @@ mod persona_loader_tests {
             },
         ];
         let assembled = assemble_dispatch_prompt(
-            "FREQUENCY",
+            "FIXTURE-F",
             &large_persona,
             "MEMORIES_BLOCK",
             "CHWG-TEST-1",
-            "FREQUENCY#instance123",
-            "GEMINI-PM#caller456",
+            "FIXTURE-F#instance123",
+            "FIXTURE-C#caller456",
             &history,
             Some("SIGNING_NOTE_SENTINEL"),
             "FINAL_USER_MESSAGE_SENTINEL",
@@ -1472,12 +1313,12 @@ mod persona_loader_tests {
 
         // Required context larger than ceiling must return prompt_too_large.
         let err = assemble_dispatch_prompt(
-            "FREQUENCY",
+            "FIXTURE-F",
             &large_persona,
             "",
             "CHWG-TEST-1",
-            "FREQUENCY#instance123",
-            "GEMINI-PM#caller456",
+            "FIXTURE-F#instance123",
+            "FIXTURE-C#caller456",
             &[],
             None,
             "FINAL_USER_MESSAGE_SENTINEL",

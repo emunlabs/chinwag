@@ -283,7 +283,7 @@ fn messages_jsonl_path(repo_root: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-fn daemon_json_path(repo_root: &Path) -> PathBuf {
+pub(crate) fn daemon_json_path(repo_root: &Path) -> PathBuf {
     bus_dir(repo_root).join("daemon.json")
 }
 
@@ -343,7 +343,7 @@ fn os_csprng_32_bytes() -> [u8; 32] {
 
 /// Loads the seat's real OpenSSH Ed25519 signing key (`~/.chinwag/signing/<seat>_ed25519`)
 /// or raw 32-byte CSPRNG seed (`~/.chinwag/signing/<seat>_ed25519.key`) for detached message signing (`BUS-HARDEN-01` & `BUS-HARDEN-06`).
-/// Never derives a predictable key from the public seat name and rejects any path-traversal or invalid seat slug (`FLINT #213 F2`).
+/// Never derives a predictable key from the public seat name and rejects any path-traversal or invalid seat slug (`TESTA #213 F2`).
 pub fn actor_signing_secret(actor: &str) -> Result<SecretKey, InstanceError> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let signing_dir = PathBuf::from(format!("{home}/.chinwag/signing"));
@@ -437,11 +437,11 @@ pub fn sign_bus_message(msg: &mut BusMessage, secret: &SecretKey) {
 /// Fails closed if `.chinwag/allowed_signers` is missing, unreadable, empty, or does not map `pubkey` to `msg.sender`.
 pub fn verify_detached_bus_signature(repo_root: &Path, msg: &mut BusMessage) -> bool {
     use subtle::ConstantTimeEq;
-    if ActorAddress::parse(&msg.sender).is_err()
+    if ActorAddress::parse_fleet(&msg.sender).is_err()
         || msg
             .to
             .as_deref()
-            .is_some_and(|to| agent_instance::parse_recipients(to).is_err())
+            .is_some_and(|to| agent_instance::parse_fleet_recipients(to).is_err())
     {
         msg.sig_verified = false;
         return false;
@@ -531,7 +531,7 @@ fn read_all_messages_unlocked(repo_root: &Path) -> Vec<BusMessage> {
     out
 }
 
-fn read_all_messages(repo_root: &Path) -> Vec<BusMessage> {
+pub(crate) fn read_all_messages(repo_root: &Path) -> Vec<BusMessage> {
     // This legacy query is observational. It must not create/chmod a lock or
     // silently acquire mutation authority merely to render a history view.
     read_all_messages_unlocked(repo_root)
@@ -759,7 +759,7 @@ fn read_daemon_state_strict(repo_root: &Path) -> Result<Option<DaemonState>, ()>
     read_daemon_state_strict_with_env(repo_root, addr.as_deref(), ep.as_deref())
 }
 
-fn read_daemon_state(repo_root: &Path) -> Option<DaemonState> {
+pub(crate) fn read_daemon_state(repo_root: &Path) -> Option<DaemonState> {
     read_daemon_state_strict(repo_root).ok().flatten()
 }
 
@@ -829,7 +829,7 @@ async fn bind_bus_endpoint(
     port: u16,
     lookup: MemoryLookup,
 ) -> Result<Endpoint, String> {
-    bind_configured_bus_endpoint(secret, port, lookup, None).await
+    bind_configured_bus_endpoint(secret, port, lookup, None, None).await
 }
 
 async fn bind_configured_bus_endpoint(
@@ -837,6 +837,7 @@ async fn bind_configured_bus_endpoint(
     port: u16,
     lookup: MemoryLookup,
     network: Option<&(NetworkSelection, DaemonPeerGate)>,
+    controlled_bind: Option<SocketAddr>,
 ) -> Result<Endpoint, String> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
@@ -858,7 +859,10 @@ async fn bind_configured_bus_endpoint(
             )
             .hooks(NativeBusHooks::new(selection.clone(), gate.clone()));
     }
-    if let Some(addr) = configured_bus_bind_addr(port, relay_only) {
+    if controlled_bind.is_some() && (network.is_some() || port != 0) {
+        return Err("controlled bind cannot replace configured network transport".into());
+    }
+    if let Some(addr) = controlled_bind.or_else(|| configured_bus_bind_addr(port, relay_only)) {
         builder = builder
             .clear_ip_transports()
             .bind_addr(addr)
@@ -884,7 +888,7 @@ fn valid_publication_ack(daemon: &DaemonState, message: &BusMessage, ack: &BusAc
         )
 }
 
-async fn publish_over_iroh_quic(
+pub(crate) async fn publish_over_iroh_quic(
     daemon: &DaemonState,
     actor_secret: SecretKey,
     msg: &BusMessage,
@@ -1186,7 +1190,7 @@ pub fn parse_active_tasks_from_markdown(repo_root: &Path) -> Vec<(String, String
         if current_task_id.is_some() {
             if trimmed.starts_with("- **Owner:**") {
                 let upper = trimmed.to_uppercase();
-                for candidate in ["TYPE", "RUST", "ARCHITECT", "FLINT", "ALISTAIR", "QA"] {
+                for candidate in ["TYPE", "RUST", "FIXTURE-B", "TESTA", "REVIEWER", "QA"] {
                     if upper.contains(candidate) {
                         current_seat = Some(candidate.to_string());
                         break;
@@ -2101,7 +2105,7 @@ fn daemon_release_sync_enabled(no_release_sync: bool) -> bool {
 }
 
 #[cfg(test)]
-async fn run_daemon_loop(
+pub(crate) async fn run_daemon_loop(
     repo_root: PathBuf,
     port: u16,
     network_selection: Option<NetworkSelection>,
@@ -2117,11 +2121,13 @@ async fn run_daemon_loop(
         stdout,
         shutdown,
         None,
+        None,
     )
     .await
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon_loop_inner(
     repo_root: PathBuf,
     port: u16,
@@ -2130,6 +2136,7 @@ async fn run_daemon_loop_inner(
     stdout: &mut dyn Write,
     shutdown: impl std::future::Future<Output = ()>,
     controlled_local_driver: Option<RoomOwnerFuture<'static>>,
+    controlled_bind: Option<SocketAddr>,
 ) -> u8 {
     // Test-only controlled loop harness (`#[cfg(test)]`): isolates in-process
     // network/recovery tests from mutating real `$HOME/.local/bin`. Production
@@ -2145,6 +2152,8 @@ async fn run_daemon_loop_inner(
         stdout,
         shutdown,
         controlled_local_driver,
+        None,
+        controlled_bind,
     )
     .await
     {
@@ -2166,6 +2175,8 @@ async fn run_daemon_loop_reexecable(
     stdout: &mut dyn Write,
     shutdown: impl std::future::Future<Output = ()>,
     controlled_local_driver: Option<RoomOwnerFuture<'static>>,
+    fleet_manifest: Option<PathBuf>,
+    controlled_bind: Option<SocketAddr>,
 ) -> DaemonOutcome {
     // This private seam exercises responsiveness under a pending owner. It
     // cannot replace the real owner or create authority on a networked daemon.
@@ -2214,16 +2225,21 @@ async fn run_daemon_loop_reexecable(
         None => None,
     };
     let lookup = MemoryLookup::new();
-    let endpoint =
-        match bind_configured_bus_endpoint(secret.clone(), port, lookup.clone(), network.as_ref())
-            .await
-        {
-            Ok(endpoint) => endpoint,
-            Err(_) => {
-                let _ = writeln!(stdout, "chinwag bus daemon endpoint bind refused");
-                return DaemonOutcome::Exit(1);
-            }
-        };
+    let endpoint = match bind_configured_bus_endpoint(
+        secret.clone(),
+        port,
+        lookup.clone(),
+        network.as_ref(),
+        controlled_bind,
+    )
+    .await
+    {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            let _ = writeln!(stdout, "chinwag bus daemon endpoint bind refused");
+            return DaemonOutcome::Exit(1);
+        }
+    };
     // Home-relay selection is diagnostic only. Explicit peer relay addresses
     // can lazily dial a non-home relay, so no HOME selection may gate them.
     if let Some((selection, _)) = &network
@@ -2311,17 +2327,27 @@ async fn run_daemon_loop_reexecable(
 
     let endpoint_id = endpoint.id().to_string();
     let actual_sockets = endpoint.bound_sockets();
-    let actual_port = actual_sockets.first().map(|s| s.port()).unwrap_or(port);
+    // With an ephemeral bind Iroh can assign distinct IPv4 and IPv6 ports.
+    // Every synthesized IPv4 route must use the bound IPv4 transport's port.
+    let actual_port = actual_sockets
+        .iter()
+        .find(|socket| socket.is_ipv4())
+        .map(|socket| socket.port())
+        .unwrap_or(port);
 
+    let wildcard_ipv4 = actual_sockets
+        .iter()
+        .any(|socket| socket.is_ipv4() && socket.ip().is_unspecified());
     let mut bound_sockets: Vec<String> =
         actual_sockets.into_iter().map(|s| s.to_string()).collect();
     let loopback_sock = format!("127.0.0.1:{actual_port}");
     if !bound_sockets.contains(&loopback_sock) {
         bound_sockets.push(loopback_sock);
     }
-    for ip in if network
-        .as_ref()
-        .is_some_and(|(selection, _)| selection.relay_only())
+    for ip in if !wildcard_ipv4
+        || network
+            .as_ref()
+            .is_some_and(|(selection, _)| selection.relay_only())
     {
         Vec::new()
     } else {
@@ -2331,6 +2357,24 @@ async fn run_daemon_loop_reexecable(
         if !bound_sockets.contains(&candidate) {
             bound_sockets.push(candidate);
         }
+    }
+
+    let wake_coordinator = match chinwag_cli::delivery_operator_readiness::MessageArrivalWakeCoordinator::from_workspace_with_manifest(&repo_root, fleet_manifest.as_deref(), unix_now()) {
+        Ok(coordinator) => coordinator.map(Arc::new),
+        Err(error) => {
+            let _ = writeln!(stdout, "chinwag bus HELD: {error}");
+            if let Some(session) = &mut room_session { session.close().await; }
+            endpoint.close().await;
+            return DaemonOutcome::Exit(1);
+        }
+    };
+
+    if let Some(coordinator) = wake_coordinator.clone() {
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = coordinator.resume_pending(unix_now()) {
+                eprintln!("{error}");
+            }
+        });
     }
 
     let started_at = unix_now();
@@ -2361,7 +2405,11 @@ async fn run_daemon_loop_reexecable(
             "RECONCILIATION_ONLY"
         }
         .to_string(),
-        delivery_router: chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED.to_owned(),
+        delivery_router: if wake_coordinator.is_some() {
+            "QUALIFIED_FLEET_MESSAGE_ARRIVAL_WAKE".into()
+        } else {
+            chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED.to_owned()
+        },
     }));
     let initial_state = state
         .lock()
@@ -2757,7 +2805,8 @@ async fn run_daemon_loop_reexecable(
                 // This legacy bus has no verified qualified-assignment/lease adapter.
                 let update = state.lock().map_err(|_| ()).and_then(|mut guard| {
                     guard.product_governor = format!("RECONCILIATION_ONLY ({})", chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED);
-                    guard.delivery_router = chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED.to_owned();
+                    guard.delivery_router = if wake_coordinator.is_some() { "QUALIFIED_FLEET_MESSAGE_ARRIVAL_WAKE".into() }
+                        else { chinwag_cli::task_scheduler::QUALIFIED_ADMISSION_REQUIRED.to_owned() };
                     write_daemon_state(&repo_root, &guard)
                 });
                 if update.is_err() {
@@ -2777,6 +2826,7 @@ async fn run_daemon_loop_reexecable(
                 let tx_clone = tx.clone();
                 let subscriptions = subscriptions.clone();
                 let publications = publications.clone();
+                let wake_coordinator = wake_coordinator.clone();
                 let daemon_ep = endpoint_id.clone();
                 let state_error = state_error_tx.clone();
                 let receipts = receipts.clone();
@@ -2922,6 +2972,26 @@ async fn run_daemon_loop_reexecable(
                         .is_err()
                     {
                         release_reconcile.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if result.is_ok()
+                        && let Some(coordinator) = wake_coordinator
+                    {
+                        // The arrival is synced before acknowledging publication.
+                        // Process waiting happens outside the async ingress path.
+                        match coordinator.enqueue(&message, unix_now()) {
+                            Ok(recipients) => {
+                                for recipient in recipients {
+                                    let coordinator = coordinator.clone();
+                                    let arrival = message.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Err(error) = coordinator.process_enqueued(&arrival, &recipient, unix_now()) {
+                                            eprintln!("{error}");
+                                        }
+                                    });
+                                }
+                            }
+                            Err(error) => eprintln!("{error}"),
+                        }
                     }
                     let ack = match result {
                         Ok((seq, subscribers)) => BusAck { ok:true, seq, message_id:message.id.clone(), daemon_endpoint_id:daemon_ep,
@@ -3445,6 +3515,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     let mut no_governors = false;
     let mut no_release_sync = false;
     let mut repo_arg: Option<String> = None;
+    let mut fleet_manifest_arg: Option<PathBuf> = None;
     let mut from_arg: Option<String> = None;
     let mut instance_arg: Option<String> = None;
     let mut room_arg: Option<String> = None;
@@ -3532,6 +3603,17 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 }
                 no_release_sync = true;
                 i += 1;
+            }
+            "--fleet-manifest" => {
+                let Some(value) = args.get(i + 1) else {
+                    let _ = writeln!(stderr, "chinwag bus: missing_fleet_manifest");
+                    return 2;
+                };
+                if fleet_manifest_arg.replace(PathBuf::from(value)).is_some() {
+                    let _ = writeln!(stderr, "chinwag bus: duplicate_fleet_manifest");
+                    return 2;
+                }
+                i += 2;
             }
             "--repo" => {
                 let Some(value) = args.get(i + 1) else {
@@ -3830,9 +3912,9 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             let mut collision_warnings = Vec::new();
             for col in &collisions {
                 let warn_to = if col.other_owner.contains('#') {
-                    format!("@{},@ARCHITECT", col.other_owner)
+                    format!("@{},@FIXTURE-B", col.other_owner)
                 } else {
-                    "@ARCHITECT".to_string()
+                    "@FIXTURE-B".to_string()
                 };
                 let warn_body = format!(
                     "[SURFACE COLLISION WARNING] {sender} ({ticket_id}) and {} ({}) both have 03_IN_FLIGHT work touching overlapping surfaces: {}",
@@ -4143,6 +4225,8 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     let _ = tokio::signal::ctrl_c().await;
                 },
                 None,
+                fleet_manifest_arg.clone(),
+                None,
             ));
             drop(rt);
             match outcome {
@@ -4374,81 +4458,53 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
         "roster" | "top" => {
             let all = read_all_messages(&repo_root);
             let active_tasks = parse_active_tasks_from_markdown(&repo_root);
-            let seats = [
-                ("RUST", "Codex - GPT-6.1-SOL Ultra"),
-                ("ARCHITECT", "Codex - GPT-6.1-SOL Ultra"),
-                ("GAMEDEV", "Codex - GPT-6.1-SOL Ultra"),
-                ("WORKHORSE", "Codex - GPT-6.1-SOL Max (Node 2)"),
-                ("FLINT", "Recursive Flint MLX 262k (Node 2)"),
-                ("H", "Codex - GPT-6.1-SOL Ultra (Node 3)"),
-                ("AUSDRA", "Codex - GPT-6.1-SOL Ultra (Node 3)"),
-                ("TYPE", "Codex - GPT-6.1-SOL High"),
-                (
-                    "DEV-1",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral Dev 1)",
-                ),
-                (
-                    "DEV-2",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral Dev 2)",
-                ),
-                (
-                    "DEV-3",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral Dev 3)",
-                ),
-                (
-                    "DEV-4",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral Dev 4)",
-                ),
-                (
-                    "DEV-5",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral Dev 5)",
-                ),
-                (
-                    "QA-1",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral QA 1)",
-                ),
-                (
-                    "QA-2",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral QA 2)",
-                ),
-                (
-                    "QA-3",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral QA 3)",
-                ),
-                (
-                    "QA-4",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral QA 4)",
-                ),
-                (
-                    "QA-5",
-                    "DeepSeek V4.1 Flash 1017 (Workers AI, Ephemeral QA 5)",
-                ),
-                ("ALISTAIR", "Gemini 4 Argon High"),
-                ("EAGLE-EYE", "Gemini 4 Argon High"),
-                ("PATENT", "Gemini 4 Argon High"),
-                ("QA", "Gemini 4 Argon High"),
-                ("GEMINI-PM", "Gemini 4 Argon High"),
-                ("DELIVERY", "Gemini 4 Argon High"),
-                ("BRIAN", "Principal Founder & CEO"),
-                ("NIC", "Co-Founder & CCO"),
-            ];
+            let manifest_path = chinwag_fleet::FleetManifest::discover_path(
+                fleet_manifest_arg.as_deref(),
+                &repo_root,
+            );
+            let manifest = if manifest_path.exists() {
+                match chinwag_fleet::FleetManifest::load(&manifest_path) {
+                    Ok(manifest) => Some(manifest),
+                    Err(error) => {
+                        let _ = writeln!(stderr, "chinwag bus roster: {error}");
+                        return 1;
+                    }
+                }
+            } else {
+                None
+            };
+            let seats: Vec<(String, String)> = manifest
+                .as_ref()
+                .map(|fleet| {
+                    fleet
+                        .seats
+                        .iter()
+                        .map(|seat| {
+                            (
+                                seat.id.to_string(),
+                                format!("{} / {}", seat.model.provider, seat.model.model_id),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let mut rows = Vec::new();
             for (seat, engine) in seats {
-                let worker_active = is_seat_worker_active(&repo_root, seat);
+                let worker_active = is_seat_worker_active(&repo_root, &seat);
                 let assigned_task = active_tasks
                     .iter()
-                    .find(|(s, _, _)| s.eq_ignore_ascii_case(seat))
+                    .find(|(s, _, _)| s.eq_ignore_ascii_case(&seat))
                     .map(|(_, tid, _)| tid.clone())
                     .unwrap_or_else(|| "-".to_string());
                 let msg_count = all
                     .iter()
-                    .filter(|m| base_seat_str(&m.sender).eq_ignore_ascii_case(seat))
+                    .filter(|m| base_seat_str(&m.sender).eq_ignore_ascii_case(&seat))
                     .count();
                 let last_msg = all
                     .iter()
                     .rev()
-                    .find(|m| base_seat_str(&m.sender).eq_ignore_ascii_case(seat));
+                    .find(|m| base_seat_str(&m.sender).eq_ignore_ascii_case(&seat));
                 let last_ts = last_msg
                     .map(|m| format_local_wall_clock(&m.ts_iso))
                     .unwrap_or_else(|| "-".to_string());
@@ -4457,10 +4513,6 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     .unwrap_or_else(|| "-".to_string());
                 let status = if worker_active {
                     "PROCESS_OBSERVED"
-                } else if seat == "PRODUCT" {
-                    "RECONCILIATION_ONLY"
-                } else if seat == "DELIVERY" {
-                    "ADMISSION_HELD"
                 } else {
                     "STANDBY"
                 };
@@ -4479,7 +4531,8 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 let out = json!({
                     "ok": true,
                     "command": "chinwag bus roster",
-                    "seats": rows
+                    "seats": rows,
+                    "configuration": if manifest.is_some() { "configured" } else { "unconfigured (no fleet manifest)" }
                 });
                 let _ = writeln!(
                     stdout,
@@ -4487,9 +4540,12 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                     serde_json::to_string_pretty(&out).unwrap_or_default()
                 );
             } else {
+                if manifest.is_none() {
+                    let _ = writeln!(stdout, "unconfigured (no fleet manifest)");
+                }
                 let _ = writeln!(
                     stdout,
-                    "📊 Chinwag 10-Seat Swarm Utilization Roster (INV-UTIL-01 · Central Time CDT):\n  \
+                    "📊 Chinwag Fleet Utilization Roster:\n  \
                      {:<11} {:<24} {:<12} {:<10} {:<6} {:<14} LAST_TASK",
                     "SEAT", "ENGINE", "STATE", "ASSIGNED", "MSGS", "LAST_RECEIPT"
                 );
@@ -4596,13 +4652,13 @@ fn print_release_help(stdout: &mut dyn Write) -> u8 {
     let _ = writeln!(
         stdout,
         r#"Usage:
-  chinwag release publish --binary <chinwag|chinwag-ci> --source <PATH> [--repo <PATH>] [--from <INFRAJR#INSTANCE>] [--rollback] [--json]
+  chinwag release publish --binary <chinwag|chinwag-ci> --source <PATH> [--repo <PATH>] [--from <SEAT#INSTANCE>] [--rollback] [--json]
   chinwag release sync [--repo <PATH>] [--json]
   chinwag release status [--json]
 
 Symmetric Bus Release Auto-Installer:
   publish  Verifies codesign & --version, hashes SHA-256 + BLAKE3, uploads content-addressed R2 blob, installs locally, and broadcasts signed RELEASE_BUILT on #all.
-  sync     Replays verified INFRAJR RELEASE_BUILT manifests from the local bus journal against content-addressed R2 blobs with pre-exec SHA-256 + BLAKE3 verification.
+  sync     Replays verified authorized RELEASE_BUILT manifests from the local bus journal against content-addressed R2 blobs with pre-exec SHA-256 + BLAKE3 verification.
   status   Reports local ~/.local/bin/{{chinwag,chinwag-ci}} digests and ~/.chinwag/release_sync_state.json monotonic watermarks."#
     );
     0
@@ -4733,7 +4789,7 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
             else {
                 let _ = writeln!(
                     stderr,
-                    "Usage: chinwag release publish --binary <chinwag|chinwag-ci> --source <PATH> [--repo <PATH>] [--from <INFRAJR#INSTANCE>] [--rollback] [--json]"
+                    "Usage: chinwag release publish --binary <chinwag|chinwag-ci> --source <PATH> [--repo <PATH>] [--from <SEAT#INSTANCE>] [--rollback] [--json]"
                 );
                 return 2;
             };
@@ -5048,7 +5104,7 @@ mod tests {
             sender: "QA#ExactCase".into(),
             sender_cast: String::new(),
             sender_endpoint_id: secret.public().to_string(),
-            to: Some("WORKHORSE#owner".into()),
+            to: Some("FIXTURE-A#owner".into()),
             room: "#é".into(),
             task_id: Some("C1".into()),
             body: "🙂|receipt".into(),
@@ -5105,7 +5161,7 @@ mod tests {
             "--repo",
             repo.path().to_str().unwrap(),
             "--to",
-            "GEMINI-PM#one",
+            "FIXTURE-C#one",
             "-t",
             "DELIVERY#two",
             "--message",
@@ -5134,14 +5190,14 @@ mod tests {
     #[test]
     fn detached_ed25519_bus_signature_verifies_allowed_signers_and_rejects_tampering() {
         let temp = tempfile::tempdir().unwrap();
-        let secret = fixture_key(&temp.path().join("fixture-signing"), "ARCHITECT");
+        let secret = fixture_key(&temp.path().join("fixture-signing"), "FIXTURE-B");
         let mut msg = BusMessage {
             id: "bus-1793250000-deadbeef".to_string(),
             seq: 1,
             ts_unix: 1_793_250_000,
             ts_iso: "2026-10-29T18:15:00-0500 CDT".to_string(),
             room: "#eng".to_string(),
-            sender: "ARCHITECT".to_string(),
+            sender: "FIXTURE-B".to_string(),
             sender_cast: "■".to_string(),
             sender_endpoint_id: secret.public().to_string(),
             to: Some("RUST".to_string()),
@@ -5157,7 +5213,7 @@ mod tests {
         // Missing .chinwag/allowed_signers -> must fail closed
         assert!(!verify_detached_bus_signature(temp.path(), &mut msg));
 
-        // Populate .chinwag/allowed_signers for ARCHITECT
+        // Populate .chinwag/allowed_signers for FIXTURE-B
         let ssh_pub = ssh_key::PublicKey::from(ssh_key::public::Ed25519PublicKey(
             *secret.public().as_bytes(),
         ));
@@ -5167,7 +5223,7 @@ mod tests {
         fs::write(
             chinwag_dir.join("allowed_signers"),
             format!(
-                "architect-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ARCHITECT\n"
+                "architect-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag FIXTURE-B\n"
             ),
         )
         .unwrap();
@@ -5207,14 +5263,14 @@ mod tests {
             - **Owner:** `■ RUST` (`GPT / Codex`)\n\
             - **Scope:** Verify 7-field Ed25519 signature and allowed_signers.\n\
             ### `[READY]` `TASK-16` — Dynamic Interface Discovery\n\
-            - **Owner:** `■ ARCHITECT`\n\
+            - **Owner:** `■ FIXTURE-B`\n\
             - **Scope:** Discover active non-loopback IPv4 interfaces.\n";
         fs::write(temp.path().join("TASKS.md"), sample).unwrap();
         let parsed = parse_active_tasks_from_markdown(temp.path());
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].0, "RUST");
         assert_eq!(parsed[0].1, "TASK-15");
-        assert_eq!(parsed[1].0, "ARCHITECT");
+        assert_eq!(parsed[1].0, "FIXTURE-B");
         assert_eq!(parsed[1].1, "TASK-16");
     }
 
@@ -5524,7 +5580,7 @@ mod tests {
                 sender: "RUST".to_string(),
                 sender_cast: "■".to_string(),
                 sender_endpoint_id: secret.public().to_string(),
-                to: Some("ARCHITECT".to_string()),
+                to: Some("FIXTURE-B".to_string()),
                 task_id: Some("TASK-15".to_string()),
                 body: body.to_string(),
                 digest_sha256: "deadbeef".repeat(8),
@@ -5581,12 +5637,12 @@ mod tests {
     fn thread_instance_id_signs_with_base_seat_key_and_verifies_against_allowed_signers() {
         let temp = tempfile::tempdir().unwrap();
         let signing_dir = temp.path().join("fixture-signing");
-        let secret = fixture_key(&signing_dir, "GEMINI-PM#f19f15");
-        let base_secret = actor_signing_secret_at("GEMINI-PM", &signing_dir).unwrap();
+        let secret = fixture_key(&signing_dir, "FIXTURE-C#f19f15");
+        let base_secret = actor_signing_secret_at("FIXTURE-C", &signing_dir).unwrap();
         assert_eq!(secret.public(), base_secret.public());
 
-        let (norm_sender, cast) = normalize_actor("gemini-pm#f19f15").unwrap();
-        assert_eq!(norm_sender, "GEMINI-PM#f19f15");
+        let (norm_sender, cast) = normalize_actor("fixture-c#f19f15").unwrap();
+        assert_eq!(norm_sender, "FIXTURE-C#f19f15");
         assert_eq!(cast, "■");
 
         let mut msg = BusMessage {
@@ -5598,9 +5654,9 @@ mod tests {
             sender: norm_sender,
             sender_cast: cast,
             sender_endpoint_id: secret.public().to_string(),
-            to: Some("WORKHORSE#prd-01".to_string()),
+            to: Some("FIXTURE-A#prd-01".to_string()),
             task_id: Some("CHWG-PRD-FINAL".to_string()),
-            body: "Thread-scoped message from GEMINI-PM#f19f15 to WORKHORSE#prd-01".to_string(),
+            body: "Thread-scoped message from FIXTURE-C#f19f15 to FIXTURE-A#prd-01".to_string(),
             digest_sha256: "beefcafe".repeat(8),
             pubkey_ed25519: None,
             signature_ed25519: None,
@@ -5617,7 +5673,7 @@ mod tests {
         fs::write(
             chinwag_dir.join("allowed_signers"),
             format!(
-                "gemini-pm-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag GEMINI-PM\n"
+                "fixture-c-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag FIXTURE-C\n"
             ),
         )
         .unwrap();
@@ -5626,14 +5682,14 @@ mod tests {
 
         // Tampering with the #instance suffix invalidates the 7-field Ed25519 signature
         let mut spoofed_instance = msg.clone();
-        spoofed_instance.sender = "GEMINI-PM#other99".to_string();
+        spoofed_instance.sender = "FIXTURE-C#other99".to_string();
         assert!(!verify_detached_bus_signature(
             temp.path(),
             &mut spoofed_instance
         ));
 
         let mut spoofed_recipient = msg.clone();
-        spoofed_recipient.to = Some("WORKHORSE#prd-02".to_owned());
+        spoofed_recipient.to = Some("FIXTURE-A#prd-02".to_owned());
         assert!(!verify_detached_bus_signature(
             temp.path(),
             &mut spoofed_recipient
@@ -5641,12 +5697,12 @@ mod tests {
 
         // Even a valid seat signature cannot make malformed addresses routable.
         let mut malformed = msg.clone();
-        malformed.sender = "GEMINI-PM#bad/tag".to_owned();
+        malformed.sender = "FIXTURE-C#bad/tag".to_owned();
         sign_bus_message(&mut malformed, &secret);
         assert!(!verify_detached_bus_signature(temp.path(), &mut malformed));
 
         let mut wrong_seat = msg.clone();
-        wrong_seat.sender = "WORKHORSE#f19f15".to_owned();
+        wrong_seat.sender = "FIXTURE-A#f19f15".to_owned();
         sign_bus_message(&mut wrong_seat, &secret);
         assert!(!verify_detached_bus_signature(temp.path(), &mut wrong_seat));
 
@@ -5666,12 +5722,12 @@ mod tests {
         // Read the actual CLI inbox from an isolated signed fixture journal.
         let mut journal = Vec::new();
         for (seq, to, body) in [
-            (1, Some("WORKHORSE#one"), "own"),
-            (2, Some("WORKHORSE#one-sibling"), "quote @WORKHORSE#one"),
-            (3, Some("WORKHORSE"), "seat broadcast"),
+            (1, Some("FIXTURE-A#one"), "own"),
+            (2, Some("FIXTURE-A#one-sibling"), "quote @FIXTURE-A#one"),
+            (3, Some("FIXTURE-A"), "seat broadcast"),
             (4, Some("ALL"), "all broadcast"),
-            (5, None, "@WORKHORSE#one mention"),
-            (6, None, "@WORKHORSE#one-sibling mention"),
+            (5, None, "@FIXTURE-A#one mention"),
+            (6, None, "@FIXTURE-A#one-sibling mention"),
         ] {
             let mut row = msg.clone();
             row.id = format!("fixture-{seq}");
@@ -5684,7 +5740,7 @@ mod tests {
         let mut forged = msg.clone();
         forged.id = "forged".to_owned();
         forged.seq = 7;
-        forged.to = Some("WORKHORSE#one".to_owned());
+        forged.to = Some("FIXTURE-A#one".to_owned());
         journal.push(serde_json::to_string(&forged).unwrap());
         let path = messages_jsonl_path(temp.path());
         // History path selection is read-only; fixture preparation owns the
@@ -5692,8 +5748,8 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, journal.join("\n") + "\n").unwrap();
         for (query, expected) in [
-            ("WORKHORSE#one", vec![1, 3, 4, 5]),
-            ("WORKHORSE", vec![1, 2, 3, 4, 5, 6]),
+            ("FIXTURE-A#one", vec![1, 3, 4, 5]),
+            ("FIXTURE-A", vec![1, 2, 3, 4, 5, 6]),
         ] {
             let mut out = Vec::new();
             let mut err = Vec::new();
@@ -5726,20 +5782,20 @@ mod tests {
     #[test]
     fn worker_files_are_owned_by_the_exact_instance() {
         let temp = tempfile::tempdir().unwrap();
-        let a = seat_pid_path(temp.path(), "WORKHORSE#one");
-        let b = seat_pid_path(temp.path(), "WORKHORSE#two");
-        let case_distinct = seat_pid_path(temp.path(), "WORKHORSE#ONE");
+        let a = seat_pid_path(temp.path(), "FIXTURE-A#one");
+        let b = seat_pid_path(temp.path(), "FIXTURE-A#two");
+        let case_distinct = seat_pid_path(temp.path(), "FIXTURE-A#ONE");
         assert_ne!(a, b);
         assert_ne!(a, case_distinct);
-        let first = WorkerRegistration::acquire(temp.path(), "WORKHORSE#one").unwrap();
-        assert!(WorkerRegistration::acquire(temp.path(), "WORKHORSE#one").is_err());
-        let sibling = WorkerRegistration::acquire(temp.path(), "WORKHORSE#two").unwrap();
+        let first = WorkerRegistration::acquire(temp.path(), "FIXTURE-A#one").unwrap();
+        assert!(WorkerRegistration::acquire(temp.path(), "FIXTURE-A#one").is_err());
+        let sibling = WorkerRegistration::acquire(temp.path(), "FIXTURE-A#two").unwrap();
         drop(first);
         assert!(!a.exists());
         assert!(b.exists());
         drop(sibling);
 
-        let original = WorkerRegistration::acquire(temp.path(), "WORKHORSE#one").unwrap();
+        let original = WorkerRegistration::acquire(temp.path(), "FIXTURE-A#one").unwrap();
         fs::remove_file(&a).unwrap();
         fs::write(&a, "replacement must survive").unwrap();
         drop(original);
@@ -5751,7 +5807,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let workers = bus_dir(temp.path()).join("workers");
         fs::create_dir_all(&workers).unwrap();
-        let component = worker_file_component("WORKHORSE#retained");
+        let component = worker_file_component("FIXTURE-A#retained");
         for index in 0..4097 {
             fs::write(
                 workers.join(format!("{component}--{index}.log")),
@@ -5759,42 +5815,42 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE"));
-        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE#retained"));
+        assert!(!is_seat_worker_active(temp.path(), "FIXTURE-A"));
+        assert!(!is_seat_worker_active(temp.path(), "FIXTURE-A#retained"));
 
-        let registration = WorkerRegistration::acquire(temp.path(), "WORKHORSE#live").unwrap();
-        assert!(is_seat_worker_active(temp.path(), "WORKHORSE"));
-        assert!(is_seat_worker_active(temp.path(), "WORKHORSE#live"));
-        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE#other"));
+        let registration = WorkerRegistration::acquire(temp.path(), "FIXTURE-A#live").unwrap();
+        assert!(is_seat_worker_active(temp.path(), "FIXTURE-A"));
+        assert!(is_seat_worker_active(temp.path(), "FIXTURE-A#live"));
+        assert!(!is_seat_worker_active(temp.path(), "FIXTURE-A#other"));
         drop(registration);
-        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE"));
+        assert!(!is_seat_worker_active(temp.path(), "FIXTURE-A"));
     }
 
     #[test]
     fn seat_activity_preserves_legacy_pid_and_ignores_other_instance_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let legacy = seat_pid_path(temp.path(), "WORKHORSE");
+        let legacy = seat_pid_path(temp.path(), "FIXTURE-A");
         let workers = bus_dir(temp.path()).join("workers");
-        assert_eq!(legacy, workers.join("workhorse.pid"));
+        assert_eq!(legacy, workers.join("fixture-a.pid"));
         fs::create_dir_all(&workers).unwrap();
         fs::write(&legacy, std::process::id().to_string()).unwrap();
-        assert!(is_seat_worker_active(temp.path(), "WORKHORSE"));
-        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE#one"));
+        assert!(is_seat_worker_active(temp.path(), "FIXTURE-A"));
+        assert!(!is_seat_worker_active(temp.path(), "FIXTURE-A#one"));
         fs::remove_file(&legacy).unwrap();
 
-        let registration = WorkerRegistration::acquire(temp.path(), "ARCHITECT#one").unwrap();
+        let registration = WorkerRegistration::acquire(temp.path(), "FIXTURE-B#one").unwrap();
         assert_eq!(
             registration.path.parent(),
             Some(workers.join("instances").as_path())
         );
-        assert!(is_seat_worker_active(temp.path(), "ARCHITECT"));
-        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE"));
-        let stale = seat_pid_path(temp.path(), "WORKHORSE#stale");
+        assert!(is_seat_worker_active(temp.path(), "FIXTURE-B"));
+        assert!(!is_seat_worker_active(temp.path(), "FIXTURE-A"));
+        let stale = seat_pid_path(temp.path(), "FIXTURE-A#stale");
         fs::write(&stale, "invalid-pid").unwrap();
         fs::write(stale.with_extension("log"), "retained").unwrap();
-        assert!(!is_seat_worker_active(temp.path(), "WORKHORSE"));
+        assert!(!is_seat_worker_active(temp.path(), "FIXTURE-A"));
         drop(registration);
-        assert!(!is_seat_worker_active(temp.path(), "ARCHITECT"));
+        assert!(!is_seat_worker_active(temp.path(), "FIXTURE-B"));
     }
 
     #[test]
@@ -5817,7 +5873,7 @@ mod tests {
                 "--seat",
                 "RUST#child",
                 "--from",
-                "WORKHORSE#parent",
+                "FIXTURE-A#parent",
                 "--task",
                 "P0-07",
                 "--message",
@@ -5829,7 +5885,7 @@ mod tests {
             vec![
                 "send",
                 "--from",
-                "WORKHORSE#parent",
+                "FIXTURE-A#parent",
                 "--to",
                 "RUST",
                 "--wake",
@@ -5839,7 +5895,7 @@ mod tests {
             vec![
                 "send",
                 "--from",
-                "WORKHORSE#parent",
+                "FIXTURE-A#parent",
                 "--to",
                 "RUST",
                 "--dispatch",
@@ -5877,7 +5933,7 @@ mod tests {
         let args: Vec<String> = [
             "send",
             "--from",
-            "WORKHORSE#parent",
+            "FIXTURE-A#parent",
             "--to",
             "QA#existing",
             "--wake",

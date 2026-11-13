@@ -8,13 +8,6 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use subtle::ConstantTimeEq;
 
-// Compile the accepted public roster into the verifier; never load it from a
-// candidate checkout at invocation time. WORKHORSE's separately enrolled public
-// key is retained explicitly; no private signing material is embedded.
-const COMPILED_ROSTER: &str = include_str!("../../../.chinwag/allowed_signers");
-pub const WORKHORSE_PUBLIC_KEY: &str =
-    "3a8eaffca3221988625e53f701b0bdf40bf5e5a973a624ad58c0ffa5dd7e466c";
-
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -34,14 +27,10 @@ pub fn decode<const N: usize>(text: &str) -> Result<[u8; N], &'static str> {
 }
 
 pub fn canonical_roster() -> BTreeMap<String, String> {
-    let mut roster = BTreeMap::new();
-    for (seat, bytes) in chinwag_swarm::identity::parse_allowed_signers(COMPILED_ROSTER) {
-        if let Some(seat) = seat {
-            roster.insert(seat.to_ascii_uppercase(), hex(&bytes));
-        }
-    }
-    roster.insert("WORKHORSE".into(), WORKHORSE_PUBLIC_KEY.into());
-    roster
+    crate::canonical_seat_pubkeys::configured_seat_pubkeys()
+        .into_iter()
+        .map(|(seat, key)| (seat, hex(&key)))
+        .collect()
 }
 
 pub fn signing_payload(message: &BusMessage) -> String {
@@ -88,13 +77,16 @@ pub fn verify_original(message: &BusMessage) -> Result<(), &'static str> {
     verify_with_roster(message, &canonical_roster())
 }
 
-fn verify_with_roster(
+pub fn verify_with_roster(
     message: &BusMessage,
     roster: &BTreeMap<String, String>,
 ) -> Result<(), &'static str> {
-    ActorAddress::parse(&message.sender)
+    let sender = ActorAddress::parse_fleet(&message.sender)
         .and_then(ActorAddress::require_instance)
         .map_err(|_| "INVALID_SENDER")?;
+    if sender.to_string() != message.sender || sender.instance().is_none() {
+        return Err("INVALID_SENDER");
+    }
     if message.id.len() > 160
         || message.sender.len() > 256
         || message.room.len() > 128
@@ -107,13 +99,7 @@ fn verify_with_roster(
     {
         return Err("MESSAGE_BOUND_EXCEEDED");
     }
-    let seat = message
-        .sender
-        .split('#')
-        .next()
-        .unwrap_or("")
-        .to_uppercase();
-    let expected = roster.get(&seat).ok_or("UNPINNED_SENDER")?;
+    let expected = roster.get(sender.seat()).ok_or("UNPINNED_SENDER")?;
     if message.pubkey_ed25519.as_deref() != Some(expected)
         || message.sender_endpoint_id != *expected
         || !bool::from(
@@ -239,10 +225,10 @@ mod tests {
             ts_unix: 1,
             ts_iso: "fixture".into(),
             room: "#eng".into(),
-            sender: "WORKHORSE#fixture".into(),
+            sender: "FIXTURE-A#fixture".into(),
             sender_cast: "■".into(),
             sender_endpoint_id: public.clone(),
-            to: Some("GEMINI-PM#fixture".into()),
+            to: Some("FIXTURE-C#fixture".into()),
             task_id: Some("TEST".into()),
             body: "évidence".into(),
             digest_sha256: String::new(),
@@ -254,7 +240,7 @@ mod tests {
         message.signature_ed25519 = Some(hex(&secret
             .sign(signing_payload(&message).as_bytes())
             .to_bytes()));
-        (message, BTreeMap::from([("WORKHORSE".into(), public)]))
+        (message, BTreeMap::from([("FIXTURE-A".into(), public)]))
     }
 
     #[test]

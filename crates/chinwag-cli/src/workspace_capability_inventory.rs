@@ -247,13 +247,7 @@ pub fn check_pid_birth_binding_live(pid: u32, expected_birth_unix_us: u64) -> Re
 }
 
 fn jj_binary() -> &'static str {
-    if fs::metadata("/opt/homebrew/bin/jj")
-        .is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0)
-    {
-        "/opt/homebrew/bin/jj"
-    } else {
-        "jj"
-    }
+    "jj"
 }
 
 fn read_jj_path_file(path: &Path) -> InventoryResult<PathBuf> {
@@ -2982,7 +2976,7 @@ mod tests {
             f.ws1_id,
             "xnslnrmrotuspxtltrpqrzpzrzmtyyok",
             "9e27172b5e00c9f9e95a044a2a0b4cf0b2db7ff2",
-            "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",
+            "FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA",
             "CHWG-JJ-WORKSPACE-REGISTRY-01",
         );
         assert!(matches!(
@@ -3007,7 +3001,7 @@ mod tests {
             f.ws1_id,
             "xnslnrmrotuspxtltrpqrzpzrzmtyyok",
             "9e27172b5e00c9f9e95a044a2a0b4cf0b2db7ff2",
-            "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",
+            "FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA",
             "CHWG-JJ-WORKSPACE-REGISTRY-01",
         );
         assert!(matches!(
@@ -3030,7 +3024,7 @@ mod tests {
             f.ws2_id,
             "pvonlxyolzsyqopzqrmtopulwnmmvmur",
             "9e27172b5e00c9f9e95a044a2a0b4cf0b2db7ff2",
-            "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",
+            "FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA",
             "CHWG-JJ-WORKSPACE-REGISTRY-01",
         );
         assert!(matches!(
@@ -3053,7 +3047,7 @@ mod tests {
             f.ws2_id,
             "xnslnrmrotuspxtltrpqrzpzrzmtyyok",
             "9e27172b5e00c9f9e95a044a2a0b4cf0b2db7ff2",
-            "GEMINI-PM#ef045f9c-8ad4-42a7-836e-eea718e3d198",
+            "FIXTURE-C#ef045f9c-8ad4-42a7-836e-eea718e3d198",
             "CHWG-JJ-WORKSPACE-REGISTRY-01",
         );
         assert_eq!(
@@ -3096,7 +3090,7 @@ mod tests {
             source_tree_clean: false,
             accepted_source_commit: Some(base_oid),
             compiled_artifact_sha256: Some(bin_sha),
-            installed_binary_path: Some("/Users/brianspector/.local/bin/chinwag".to_owned()),
+            installed_binary_path: Some("/fixture/bin/chinwag".to_owned()),
             installed_binary_sha256: Some(bin_sha),
             runtime_health_verified: false,
             admission_authority_digest: None,
@@ -3177,7 +3171,7 @@ mod tests {
             f.ws2_id,
             "xnslnrmrotuspxtltrpqrzpzrzmtyyok",
             "9e27172b5e00c9f9e95a044a2a0b4cf0b2db7ff2",
-            "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",
+            "FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA",
             "CHWG-JJ-WORKSPACE-REGISTRY-01",
         );
         let crash_payload = InventoryPayloadV1::RegisterWorkspace {
@@ -5116,11 +5110,11 @@ mod tests {
         let mut record = s2b_workspace(f, replacement);
         record.record_id = "ws-1".to_owned();
         if replacement {
-            record.owner_actor = "WORKHORSE#22222222222222222222222222222222".to_owned();
+            record.owner_actor = "FIXTURE-A#22222222222222222222222222222222".to_owned();
             record.issued_unix_ms = 160;
             record.lease_expires_unix_ms = f.base_unix_ms + 5_000;
         } else {
-            record.owner_actor = "WORKHORSE#11111111111111111111111111111111".to_owned();
+            record.owner_actor = "FIXTURE-A#11111111111111111111111111111111".to_owned();
             record.issued_unix_ms = 100;
             record.lease_expires_unix_ms = f.base_unix_ms + 200;
         }
@@ -6241,7 +6235,7 @@ mod tests {
             "### `[NEXT]` CHWG-JJ-WORKSPACE-REGISTRY-01 — Enforce isolated JJ workspaces and maintain canonical live ownership and capability inventories\n",
             "<!-- chinwag-task-begin-v1 task_id=\"CHWG-JJ-WORKSPACE-REGISTRY-01\" -->\n",
             "- [ ] **CHWG-JJ-WORKSPACE-REGISTRY-01** (`in-progress`) — Enforce isolated JJ workspaces and maintain canonical live ownership and capability inventories\n",
-            "<!-- chinwag-task-entry-v1 {\"task_id\":\"CHWG-JJ-WORKSPACE-REGISTRY-01\",\"status\":\"in-progress\",\"task_status_rev\":1,\"task_spec_digest\":\"d220229601d9a92042ff570206905bcb8faf3049d45251b145993dedb3fdd2f4\",\"task_control_digest\":\"d7432f6df63ec14682feafa27e6d02bea1d0076d74e58c0242b1965286ff1ed7\",\"completion_policy_digest\":\"9324dbba9729965789cd1e148903dfb35d17cbe749defd27751b7f9f01988af3\",\"owner_actor\":\"RUST#efffddad3cb4321cb1308b089f76c206\",\"reviewer_role\":\"ARCHITECT\",\"baseline_commit\":\"d326c7129979ca43499547842daac076d80fac35\",\"candidate_commit\":null,\"overlay_digest\":null,\"execution_flags\":[\"priority:next\",\"slice:s1-admitted\"],\"dependencies\":[]} -->\n",
+            "<!-- chinwag-task-entry-v1 {\"task_id\":\"CHWG-JJ-WORKSPACE-REGISTRY-01\",\"status\":\"in-progress\",\"task_status_rev\":1,\"task_spec_digest\":\"d220229601d9a92042ff570206905bcb8faf3049d45251b145993dedb3fdd2f4\",\"task_control_digest\":\"d7432f6df63ec14682feafa27e6d02bea1d0076d74e58c0242b1965286ff1ed7\",\"completion_policy_digest\":\"9324dbba9729965789cd1e148903dfb35d17cbe749defd27751b7f9f01988af3\",\"owner_actor\":\"RUST#efffddad3cb4321cb1308b089f76c206\",\"reviewer_role\":\"FIXTURE-B\",\"baseline_commit\":\"d326c7129979ca43499547842daac076d80fac35\",\"candidate_commit\":null,\"overlay_digest\":null,\"execution_flags\":[\"priority:next\",\"slice:s1-admitted\"],\"dependencies\":[]} -->\n",
             "<!-- chinwag-task-end-v1 task_id=\"CHWG-JJ-WORKSPACE-REGISTRY-01\" -->\n",
         );
         let doc = CanonicalTaskDocumentV1::from_bytes(markdown.as_bytes()).unwrap();

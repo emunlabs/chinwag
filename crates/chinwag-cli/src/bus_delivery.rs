@@ -47,7 +47,7 @@ fn bounded(s: &str) -> bool {
     !s.is_empty() && s.len() <= 256
 }
 fn full_actor(s: &str) -> bool {
-    crate::agent_instance::ActorAddress::parse(s)
+    crate::agent_instance::ActorAddress::parse_fleet(s)
         .is_ok_and(|a| a.instance().is_some() && a.to_string() == s)
 }
 fn hash_string(s: &str) -> bool {
@@ -137,6 +137,37 @@ impl ConsumerBinding {
             turn: None,
         }
     }
+    /// A signed fleet enrollment creates an observable supported consumer;
+    /// processing evidence is still populated only by real invocation receipts.
+    pub fn from_qualified_fleet(
+        readiness: &crate::delivery_operator_readiness::DeliveryOperatorReadiness,
+        now: u64,
+    ) -> Result<Self, DeliveryError> {
+        readiness
+            .revalidate(now)
+            .map_err(|_| DeliveryError::Unsupported)?;
+        let claim = readiness.claim();
+        let actor = crate::agent_instance::ActorAddress::parse_fleet(&claim.recipient)
+            .map_err(|_| DeliveryError::Invalid)?;
+        if claim.expires_at - claim.issued_at > 300 {
+            return Err(DeliveryError::Invalid);
+        }
+        Ok(Self {
+            recipient: claim.recipient.clone(),
+            binding_id: claim.binding_id.clone(),
+            generation: claim.generation,
+            delegation: claim.operator.clone(),
+            host: claim.host.clone(),
+            conversation: actor.instance().ok_or(DeliveryError::Invalid)?.into(),
+            issued_at: claim.issued_at,
+            expires_at: claim.expires_at,
+            principal: Some(readiness.consumer_key()),
+            revoked: false,
+            supported: true,
+            timer_armed: false,
+            turn: None,
+        })
+    }
     fn validate(&self, recipient: &str, now: u64) -> Result<(), DeliveryError> {
         if !self.supported {
             return Err(DeliveryError::Unsupported);
@@ -147,7 +178,7 @@ impl ConsumerBinding {
             || !bounded(&self.binding_id)
             || !bounded(&self.delegation)
             || !bounded(&self.host)
-            || crate::agent_instance::ActorAddress::parse(recipient)
+            || crate::agent_instance::ActorAddress::parse_fleet(recipient)
                 .ok()
                 .and_then(|a| a.instance().map(str::to_owned))
                 .as_deref()
@@ -720,7 +751,7 @@ mod tests {
             id: "expect-1".into(),
             message_id: "original".into(),
             message_digest: "ab".repeat(32),
-            sender: "WORKHORSE#owner".into(),
+            sender: "FIXTURE-A#owner".into(),
             recipient: "QA#target".into(),
             room: "#eng".into(),
             task: Some("consumer01".into()),
@@ -851,7 +882,7 @@ mod tests {
         let report = legacy_publication_report(
             "original",
             "digest",
-            Some("GEMINI-PM#one,DELIVERY#two"),
+            Some("FIXTURE-C#one,DELIVERY#two"),
             PublicationAck {
                 message_id: "original",
                 ok: true,
@@ -875,7 +906,7 @@ mod tests {
         let report = legacy_publication_report(
             "original",
             "digest",
-            Some("WORKHORSE#CaseSensitive"),
+            Some("FIXTURE-A#CaseSensitive"),
             PublicationAck {
                 message_id: "other",
                 ok: true,
@@ -883,7 +914,7 @@ mod tests {
             },
         );
         assert!(!report.publication_acknowledged);
-        assert_eq!(report.recipients[0].recipient, "WORKHORSE#CaseSensitive");
+        assert_eq!(report.recipients[0].recipient, "FIXTURE-A#CaseSensitive");
         assert_eq!(report.recipients[0].consumer_binding, "UNKNOWN");
     }
 
@@ -1039,7 +1070,7 @@ mod tests {
             id: "a".into(),
             timestamp: 7,
             sender: "QA#one".into(),
-            recipient: "WORKHORSE#two".into(),
+            recipient: "FIXTURE-A#two".into(),
             room: "#é".into(),
             task: Some("C".into()),
             body: "🙂".into(),
@@ -1047,7 +1078,7 @@ mod tests {
         };
         assert_eq!(
             e.signing_payload(),
-            "chinwag-bus-sig-v2|1:a|1:7|6:QA#one|13:WORKHORSE#two|3:#é|1:C|4:🙂"
+            "chinwag-bus-sig-v2|1:a|1:7|6:QA#one|13:FIXTURE-A#two|3:#é|1:C|4:🙂"
         );
     }
     #[test]

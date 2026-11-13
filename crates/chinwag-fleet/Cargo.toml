@@ -1,0 +1,21 @@
+[package]
+name = "chinwag-fleet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Declarative, topology-independent fleet dispatch and isolation policy."
+
+[dependencies]
+chinwag-claim = { path = "../chinwag-claim" }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["alloc", "fast", "zeroize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_jcs = "0.1"
+thiserror.workspace = true
+toml = "=0.8.2"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.5", features = ["process"] }

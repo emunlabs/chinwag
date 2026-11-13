@@ -1,13 +1,13 @@
 use super::*;
 use crate::agent_instance::{ActorAddress, DispatchIdentity};
-use crate::execution_binding::test_support::BindingFixture;
+use crate::execution_binding::test_support::{BindingFixture, FixtureOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tempfile::TempDir;
 
 fn identity(agent: &str) -> DispatchIdentity {
     DispatchIdentity::new(
         ActorAddress::parse(&format!("{agent}#p009-child")).unwrap(),
-        ActorAddress::parse("WORKHORSE#p009-parent").unwrap(),
+        ActorAddress::parse("FIXTURE-A#p009-parent").unwrap(),
     )
     .unwrap()
 }
@@ -117,6 +117,9 @@ fn fake_child() -> (TempDir, PathBuf) {
         for name in ["CHINWAG_ACTOR", "CHINWAG_INSTANCE_ID", "CHINWAG_CALLER", "CHINWAG_PARENT_INSTANCE", "CHINWAG_AGENT", "CHINWAG_REPO_ROOT", "CHINWAG_STORE_PATH", "CHINWAG_STORE_ID", "CHINWAG_EXECUTION_BINDING"] {
             println!("{}={}", name, std::env::var(name).unwrap_or_default());
         }
+        for name in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_ATTR_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"] {
+            println!("{}={}", name, std::env::var(name).unwrap_or_default());
+        }
     }"#).unwrap();
     let output = Command::new(chinwag_test_fixtures::rustc())
         .arg(&source)
@@ -138,12 +141,14 @@ fn p009_agent_refuses_unsupported_before_persona_memory_signing_engine_or_store(
     let request = AgentDispatchRequest {
         agent: Some("RUST#p009-child".into()),
         item: None,
-        sender: Some("WORKHORSE#p009-parent".into()),
+        sender: Some("FIXTURE-A#p009-parent".into()),
         instance: None,
         body: Some("fixture".into()),
         repo: Some(fixture.root().to_owned()),
         crdb: Some(fixture.store_path().to_owned()),
         stdin_json: false,
+        fleet_manifest: None,
+        room: None,
     };
     let mut effects = Effects::new();
     let mut out = Vec::new();
@@ -287,21 +292,25 @@ fn p009_agent_foreign_native_marker_is_preserved_without_cleanup_or_retry() {
 }
 
 #[test]
-fn p009_agent_unmapped_remote_refuses_before_every_route_effect() {
+fn p009_agent_arbitrary_seat_uses_bound_effects_without_a_compiled_route_table() {
     let fixture = BindingFixture::new();
     let binding = fixture.bind();
     let authority = fixture.authority();
     let mut effects = Effects::new();
+    effects.fail_persist = true;
     let error = run_bound_exchange(
         &binding,
         &authority,
-        &input(&identity("WORKHORSE")),
+        &input(&identity("CUSTOM-SEAT")),
         &mut effects,
         &mut Vec::new(),
     )
     .unwrap_err();
-    assert_eq!(error, "remote_execution_binding_unsupported");
-    assert!(effects.events.is_empty());
+    assert!(error.contains("persistence_unknown_no_retry"));
+    assert_eq!(
+        effects.events,
+        ["persona", "memory", "signing", "engine", "persist"]
+    );
 }
 
 #[test]
@@ -531,25 +540,21 @@ fn p009_agent_launch_removes_inherited_and_explicit_git_controls() {
 }
 
 #[test]
-fn p009_agent_pool_dispatch_branch_is_held_before_state_or_provider_effects() {
-    let temporary = TempDir::new().unwrap();
-    let state = temporary.path().join("pool");
-    fs::create_dir(&state).unwrap();
-    // The old implementation returns a paused-pool note. This guard ensures
-    // the red regression cannot reach any credential/API/usage-ledger effect.
-    fs::write(state.join("PAUSE"), b"controlled provider safety guard").unwrap();
-    let token = temporary.path().join("fixture-token");
-    fs::write(&token, b"fixture-only-not-a-credential").unwrap();
-    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+fn p009_native_manifest_driver_rebuilds_bound_git_and_store_context() {
+    let home = TempDir::new().unwrap();
+    let foreign = BindingFixture::new();
+    fs::write(
+        home.path().join(".gitconfig"),
+        format!("[core]\nworktree = {}\n", foreign.root().display()),
+    )
+    .unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", BOUND_ENV_CHILD_TEST, "--nocapture"])
-        .env(BOUND_ENV_CHILD, "pool")
-        .env("HOME", temporary.path())
-        .env("EPHEMERAL_DEEPSEEK_TOKEN_FILE", &token)
-        .env("EPHEMERAL_POOLS_DIR", &state)
-        .env("EPHEMERAL_DEEPSEEK_DISABLE", "0")
-        .env_remove("CHINWAG_AGENT_MOCK_REPLY")
-        .env_remove("EPHEMERAL_POOLS_PAUSED")
+        .env(BOUND_ENV_CHILD, "native-manifest")
+        .env("HOME", home.path())
+        .envs(hostile_git_environment(foreign.root()))
+        .envs(hostile_chinwag_environment(foreign.root()))
+        .env_remove("CHINWAG_FLEET_MANIFEST")
         .output()
         .unwrap();
     assert!(
@@ -558,7 +563,33 @@ fn p009_agent_pool_dispatch_branch_is_held_before_state_or_provider_effects() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(fs::read_dir(state).unwrap().count(), 1);
+}
+
+#[test]
+fn p009_unmanifested_dispatch_cannot_be_authorized_by_ambient_engine_hints() {
+    let temporary = TempDir::new().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", BOUND_ENV_CHILD_TEST, "--nocapture"])
+        .env(BOUND_ENV_CHILD, "unmanifested")
+        .env("HOME", temporary.path())
+        .env(
+            "CHINWAG_AGENT_MOCK_REPLY",
+            "an ambient response cannot authorize execution",
+        )
+        .env(
+            "CHINWAG_PROVIDERS_CONFIG",
+            temporary.path().join("untrusted-provider.json"),
+        )
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -633,29 +664,116 @@ fn p009_agent_bound_environment_subprocess_child() {
     let Ok(mode) = std::env::var(BOUND_ENV_CHILD) else {
         return;
     };
-    if mode == "pool" {
+    if mode == "native-manifest" {
+        let (_temporary, worker) = fake_child();
+        let foreign = BindingFixture::new();
+        let mut manifest = chinwag_fleet::FleetManifest::starter_profile("solo").unwrap();
+        manifest.seats[0].id = chinwag_fleet::SeatId::new("CUSTOM-NATIVE").unwrap();
+        manifest.seats[0].lifecycle = chinwag_fleet::SeatLifecycle::ActiveStanding;
+        let hostile: Vec<_> = hostile_git_environment(foreign.root())
+            .into_iter()
+            .chain(hostile_chinwag_environment(foreign.root()))
+            .collect();
+        let mut allowlist: Vec<_> = hostile.iter().map(|(name, _)| name.clone()).collect();
+        allowlist.extend(["HOME".into(), "PATH".into()]);
+        manifest.seats[0].driver = chinwag_fleet::DriverSpec::CliSubprocess {
+            executable: worker.display().to_string(),
+            argv_template: vec!["--cwd".into(), "{cwd}".into()],
+            auth_isolation: chinwag_fleet::CredentialIsolation::NoneLocal,
+            env_allowlist: allowlist,
+            env_overrides: hostile.iter().cloned().collect(),
+            framing: "stdin".into(),
+            timeout_secs: 20,
+        };
+        let fixture = BindingFixture::with_options(FixtureOptions {
+            initial_files: vec![(
+                ".chinwag/fleet.toml".into(),
+                manifest.to_toml().unwrap().into_bytes(),
+            )],
+            ..Default::default()
+        });
+        let binding = fixture.bind();
+        let who = identity("CUSTOM-NATIVE");
+        let (reply, driver) = dispatch_to_engine(
+            &binding,
+            &fixture.authority(),
+            &EngineRequest {
+                agent: "CUSTOM-NATIVE",
+                prompt: "native bound fixture",
+                environment: &hostile,
+                git_signing: &BoundGitSigning::default(),
+                identity: &who,
+            },
+        )
+        .unwrap();
+        assert_eq!(driver, "fleet-manifest-driver");
+        binding.revalidate(&fixture.authority()).unwrap();
+        for (name, expected) in [
+            ("GIT_CONFIG_GLOBAL", "/dev/null".to_owned()),
+            ("GIT_CONFIG_SYSTEM", "/dev/null".to_owned()),
+            ("GIT_CONFIG_NOSYSTEM", "1".to_owned()),
+            ("GIT_ATTR_NOSYSTEM", "1".to_owned()),
+            ("GIT_NO_REPLACE_OBJECTS", "1".to_owned()),
+            ("GIT_OPTIONAL_LOCKS", "0".to_owned()),
+            ("GIT_TERMINAL_PROMPT", "0".to_owned()),
+            ("CHINWAG_ACTOR", who.child().to_string()),
+            ("CHINWAG_CALLER", who.parent().to_string()),
+            (
+                "CHINWAG_STORE_PATH",
+                binding.store_path().display().to_string(),
+            ),
+            ("CHINWAG_STORE_ID", binding.store_id().to_owned()),
+            (
+                "CHINWAG_EXECUTION_BINDING",
+                binding.commitment_id().to_owned(),
+            ),
+            ("git_root", binding.execution_root().display().to_string()),
+        ] {
+            assert!(
+                reply
+                    .lines()
+                    .any(|line| line == format!("{name}={expected}")),
+                "{reply}"
+            );
+        }
+        assert!(reply.contains("git_ok=true"), "{reply}");
+        let names = reply
+            .lines()
+            .find_map(|line| line.strip_prefix("git_names="))
+            .unwrap();
+        assert!(
+            !names.split(',').any(|name| matches!(
+                name,
+                "GIT_DIR" | "GIT_WORK_TREE" | "GIT_FUTURE_CONTROL" | "GIT_CONFIG_PARAMETERS"
+            )),
+            "{reply}"
+        );
+        assert!(!reply.contains("forged-binding"), "{reply}");
+        return;
+    }
+    if mode == "unmanifested" {
         let fixture = BindingFixture::new();
         let binding = fixture.bind();
         let authority = fixture.authority();
-        assert!(
-            crate::deepseek_pool::enabled(),
-            "controlled token enables the old branch"
-        );
         let who = identity("DEV-1");
         let error = dispatch_to_engine(
             &binding,
             &authority,
             &EngineRequest {
                 agent: "DEV-1",
-                prompt: "controlled pool-route check",
-                custom: None,
+                prompt: "controlled unmanifested-route check",
                 environment: &[],
                 git_signing: &BoundGitSigning::default(),
                 identity: &who,
             },
         )
         .unwrap_err();
-        assert_eq!(error, "pool_execution_binding_unsupported");
+        assert!(
+            error.contains("Io:")
+                || error.contains("UnknownSeat")
+                || error.contains("RetiredOrPausedSeat"),
+            "{error}"
+        );
         return;
     }
     let (_temporary, worker) = fake_child();
@@ -767,8 +885,8 @@ fn p009_agent_bound_environment_subprocess_child() {
         for (name, expected) in [
             ("CHINWAG_ACTOR", "RUST#p009-child"),
             ("CHINWAG_INSTANCE_ID", "p009-child"),
-            ("CHINWAG_CALLER", "WORKHORSE#p009-parent"),
-            ("CHINWAG_PARENT_INSTANCE", "WORKHORSE#p009-parent"),
+            ("CHINWAG_CALLER", "FIXTURE-A#p009-parent"),
+            ("CHINWAG_PARENT_INSTANCE", "FIXTURE-A#p009-parent"),
             ("CHINWAG_AGENT", "RUST"),
         ] {
             assert!(

@@ -10,10 +10,32 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+const INTERNAL_BUILDER: &str = "INTERNAL-BUILDER-Z9";
+const INTERNAL_REVIEWER: &str = "INTERNAL-REVIEWER-Z9";
+const INTERNAL_COORDINATOR: &str = "INTERNAL-COORDINATOR-Z9";
+
+fn write_fleet_fixture(root: &Path) -> PathBuf {
+    let mut manifest = chinwag_fleet::FleetManifest::starter_profile("solo").unwrap();
+    let template = manifest.seats.remove(0);
+    for (id, display_name) in [
+        (INTERNAL_BUILDER, "Build Assistant"),
+        (INTERNAL_REVIEWER, "Review Assistant"),
+        (INTERNAL_COORDINATOR, "Planning Assistant"),
+    ] {
+        let mut seat = template.clone();
+        seat.id = chinwag_fleet::SeatId::new(id).unwrap();
+        seat.display_name = Some(display_name.into());
+        manifest.seats.push(seat);
+    }
+    let path = root.join("fleet.json");
+    fs::write(&path, manifest.to_canonical_json().unwrap()).unwrap();
+    path
+}
 
 struct ChildKillGuard(Child);
 
@@ -84,7 +106,12 @@ fn extract_cookie_and_csrf(headers: &str, html_body: &str, port: u16) -> (String
 fn assert_zero_customer_jargon(surface_name: &str, text: &str) {
     let lower = text.to_ascii_lowercase();
     let forbidden_substrings: &[&str] = &[
-        concat!("inception/", "mercury-3"),
+        "internal-builder-z9",
+        "internal-reviewer-z9",
+        "internal-coordinator-z9",
+        "custom-provider/future-model-7",
+        "fixture-worker.local",
+        "custom-provider/future-model-7",
         concat!("mercury", "-3"),
         concat!("mercury", " 3"),
         concat!("vercel-ai", "-gateway"),
@@ -215,13 +242,14 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     let planted_tasks = format!(
         "### **`[IN_PROGRESS]`** `CHWG-9001` — Wire {} with {} and {} on {}\n\
          - **`[DONE]`** `CHWG-9000` — Shipped checkout validation with {} and {}\n",
-        concat!("WORK", "HORSE#inst1"),
-        concat!("inception/", "mercury-3"),
+        format_args!("{INTERNAL_BUILDER}#inst1"),
+        "custom-provider/future-model-7",
         concat!("state.", "crdb"),
-        concat!("Node 1 · ", "Mac Studio"),
-        concat!("ALIS", "TAIR#qa1"),
+        "node 7 · fixture-worker.local",
+        format_args!("{INTERNAL_REVIEWER}#qa1"),
         concat!("ed25", "519")
     );
+    let manifest_path = write_fleet_fixture(&temp_repo);
     fs::write(temp_repo.join("TASKS.md"), planted_tasks).unwrap();
 
     let planted_msg = json!({
@@ -230,10 +258,10 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
         "ts_unix": 1_790_000_000u64,
         "ts_iso": "2026-11-11T00:00:00Z",
         "room": "#eng",
-        "sender": concat!("GEMINI", "-PM#thread99"),
-        "sender_cast": concat!("GEMINI", "-PM"),
+        "sender": format!("{INTERNAL_COORDINATOR}#thread99"),
+        "sender_cast": INTERNAL_COORDINATOR,
         "sender_endpoint_id": "ep-internal",
-        "to": Some(concat!("WORK", "HORSE#inst1")),
+        "to": Some(format_args!("{INTERNAL_BUILDER}#inst1")),
         "task_id": Some("CHWG-9001"),
         "body": format!(
             "Checked {} + {} + {} + {} metrics; all checks passed!",
@@ -283,6 +311,9 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
     let ui_addr: SocketAddr = format!("127.0.0.1:{ui_port}").parse().unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+        .current_dir(&temp_repo)
+        .env("HOME", &temp_repo)
+        .env("CHINWAG_FLEET_MANIFEST", &manifest_path)
         .args([
             "ui",
             "serve",
@@ -625,14 +656,14 @@ fn ui_v4_server_static_assets_scrubber_workflows_credits_and_telemetry_pass_end_
         }
 
         if api_path == "/api/bus/messages" {
-            // Confirm word-boundary scrubber preserved normal English "passed" while scrubbing DORA/SSE/GEMINI-PM!
+            // Confirm word-boundary scrubber preserved normal English "passed" while scrubbing DORA/SSE/FIXTURE-C!
             assert!(
                 body_str.contains("all checks passed!"),
                 "expected 'passed' to remain intact in scrubbed message: {body_str}"
             );
             assert!(
-                body_str.contains("Chinwag PM"),
-                "expected internal sender seat to map to 'Chinwag PM': {body_str}"
+                body_str.contains("Planning Assistant"),
+                "expected manifest sender display name 'Planning Assistant': {body_str}"
             );
         }
     }
@@ -1665,12 +1696,13 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
     ));
     fs::create_dir_all(raw_temp_repo.join(".chinwag/bus")).unwrap();
     let temp_repo = fs::canonicalize(&raw_temp_repo).unwrap();
+    let manifest_path = write_fleet_fixture(&temp_repo);
 
     fs::write(
         temp_repo.join("TASKS.md"),
         format!(
             "### **`[IN_PROGRESS]`** `CHWG-4201` — Scope retry guard with DELIVERY-2 and {} on {}\n",
-            concat!("WORK", "HORSE#inst9"),
+            format_args!("{INTERNAL_BUILDER}#inst9"),
             concat!("state.", "crdb"),
         ),
     )
@@ -1685,6 +1717,9 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
     let ui_addr: SocketAddr = format!("127.0.0.1:{ui_port}").parse().unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+        .current_dir(&temp_repo)
+        .env("HOME", &temp_repo)
+        .env("CHINWAG_FLEET_MANIFEST", &manifest_path)
         .args([
             "ui",
             "serve",
@@ -1898,7 +1933,7 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
     // 4. POST /api/v1/delivery2/message — preserves "Delivery-2" allow-mask while scrubbing bare DELIVERY, seats, vendors & crypto
     let mixed_prompt = format!(
         "Ask DELIVERY-2 and delivery 2 how bare DELIVERY, {}, {}, and {} handled #CHWG-4201 on the eve of release",
-        concat!("WORK", "HORSE"),
+        INTERNAL_BUILDER,
         concat!("state.", "crdb"),
         concat!("Ver", "cel")
     );

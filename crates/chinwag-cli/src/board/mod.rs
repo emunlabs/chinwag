@@ -53,9 +53,62 @@ pub const VERIFIED_COMMIT_CHIPS: i64 = 100;
 /// Total chips clawed back when a shipped commit causes a `<168h` regression on `main` (`-150 ◈`).
 pub const REGRESSION_CLAWBACK_CHIPS: i64 = 150;
 
-/// seats that are hard-locked to `--private` per `INV-DEFAULT-PRIVATE-TASK-01`.
-pub const PRIVATE_LOCKED_SEATS: [&str; 6] =
-    ["PATENT", "EAGLE-EYE", "ALISTAIR", "AUSDRA", "VENTURE", "MO"];
+/// Organization-specific board routing is read from `FleetManifest.extensions["board"]`.
+/// Seats require an explicit public grant; absent or invalid policy stays private.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BoardFleetPolicy {
+    pub private_seats: Vec<String>,
+    pub public_seats: Vec<String>,
+    pub review_partners: BTreeMap<String, String>,
+    pub triage_seat: Option<String>,
+    pub surface_owners: BTreeMap<String, Vec<String>>,
+}
+
+impl BoardFleetPolicy {
+    pub fn from_manifest(manifest: &chinwag_fleet::FleetManifest) -> Result<Self, String> {
+        manifest.validate().map_err(|error| error.to_string())?;
+        let policy: Self = match manifest.extensions.get("board") {
+            Some(value) => {
+                serde_json::from_value(value.clone()).map_err(|error| error.to_string())?
+            }
+            None => Self::default(),
+        };
+        for seat in policy
+            .private_seats
+            .iter()
+            .chain(&policy.public_seats)
+            .chain(policy.review_partners.keys())
+            .chain(policy.review_partners.values())
+            .chain(policy.triage_seat.iter())
+            .chain(policy.surface_owners.values().flatten())
+        {
+            if manifest.seat(seat).is_none() {
+                return Err(format!("unknown board policy seat: {seat}"));
+            }
+        }
+        Ok(policy)
+    }
+
+    fn requires_private(&self, seat: &str) -> bool {
+        let seat = normalize_seat_token(seat);
+        self.private_seats
+            .iter()
+            .any(|name| normalize_seat_token(name) == seat)
+            || !self
+                .public_seats
+                .iter()
+                .any(|name| normalize_seat_token(name) == seat)
+    }
+}
+
+fn configured_board_policy() -> BoardFleetPolicy {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| crate::fleet_cmd::load_manifest(None, &cwd).ok())
+        .and_then(|(_, manifest)| BoardFleetPolicy::from_manifest(&manifest).ok())
+        .unwrap_or_default()
+}
 
 /// Canonical 5-column board status (`<= 27ch` headers per `INV-DECLARATION-COPY-GATE-01`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,8 +436,8 @@ impl AtomicTaskIssue {
             status: BoardStatus::ScopedBenchmarked,
             dora_tier: tier,
             file_scope: "crates/chinwag-cli/src/board/**".to_string(),
-            assigned_seats: vec!["RUST".to_string(), "ARCHITECT".to_string()],
-            author_instance: Some("RUST#chinwag-board-init-01".to_string()),
+            assigned_seats: Vec::new(),
+            author_instance: None,
             base_head_sha: "2a29948000000000000000000000000000000000".to_string(),
             t_claim_ms: 1_793_970_000_000,
             t_ship_ms: 0,
@@ -408,11 +461,11 @@ impl AtomicTaskIssue {
             ),
             receipt_trailers: vec![
                 format!(
-                    "K1-Seat-Signature: ed25519:RUST:sha256:{}",
+                    "K1-Seat-Signature: ed25519:author:sha256:{}",
                     short_digest(id)
                 ),
                 format!(
-                    "K2-Reviewer-Signature: ed25519:ARCHITECT:sha256:{}",
+                    "K2-Reviewer-Signature: ed25519:reviewer:sha256:{}",
                     short_digest(&format!("{id}:k2"))
                 ),
             ],
@@ -756,6 +809,14 @@ pub fn validate_h_board_issue(
     issue: &AtomicTaskIssue,
     raw_markdown: &str,
 ) -> Result<(), HBoardViolation> {
+    validate_h_board_issue_with_policy(issue, raw_markdown, &configured_board_policy())
+}
+
+pub fn validate_h_board_issue_with_policy(
+    issue: &AtomicTaskIssue,
+    raw_markdown: &str,
+    policy: &BoardFleetPolicy,
+) -> Result<(), HBoardViolation> {
     // 1. INV-NO-DRAFT-ISSUES-01: Complete ban on DraftIssue / addProjectV2DraftIssue
     if issue.item_type.eq_ignore_ascii_case("DraftIssue")
         || issue
@@ -841,13 +902,13 @@ pub fn validate_h_board_issue(
     if issue.visibility.eq_ignore_ascii_case("public") {
         for seat in &issue.assigned_seats {
             let base = normalize_seat_token(seat);
-            if PRIVATE_LOCKED_SEATS.contains(&base.as_str()) {
+            if policy.requires_private(&base) {
                 return Err(HBoardViolation {
                     exit_code: EXIT_H_BOARD_REJECT,
                     invariant: "INV-DEFAULT-PRIVATE-TASK-01".to_string(),
                     issue_id: issue.id.clone(),
                     reason: format!(
-                        "seat `{base}` is hard-locked to `--private` and cannot be published on a public board"
+                        "seat `{base}` has no public board grant in the fleet manifest"
                     ),
                 });
             }
@@ -1163,11 +1224,30 @@ pub fn build_ci_failure_routing_plan(
     cross_module_blast: bool,
     is_main_regression: bool,
 ) -> DirectAgentRoutingPlan {
+    build_ci_failure_routing_plan_with_policy(
+        issue,
+        explicit_author,
+        delivery_licensed,
+        cross_module_blast,
+        is_main_regression,
+        &configured_board_policy(),
+    )
+}
+
+#[must_use]
+pub fn build_ci_failure_routing_plan_with_policy(
+    issue: &AtomicTaskIssue,
+    explicit_author: Option<&str>,
+    delivery_licensed: bool,
+    cross_module_blast: bool,
+    is_main_regression: bool,
+    policy: &BoardFleetPolicy,
+) -> DirectAgentRoutingPlan {
     let raw_author = explicit_author
         .filter(|s| !s.trim().is_empty())
         .or(issue.author_instance.as_deref())
         .or_else(|| issue.assigned_seats.first().map(|s| s.as_str()))
-        .unwrap_or("WORKHORSE");
+        .unwrap_or("");
 
     let clean_author = raw_author
         .trim()
@@ -1186,18 +1266,18 @@ pub fn build_ci_failure_routing_plan(
         format!("@{}#ci-{}", clean_author.to_ascii_uppercase(), slug)
     };
 
-    let base_seat = clean_author
-        .split('#')
-        .next()
-        .unwrap_or("WORKHORSE")
-        .to_ascii_uppercase();
-    let orthogonal_partner = match base_seat.as_str() {
-        "RUST" | "WORKHORSE" => "ARCHITECT",
-        "ARCHITECT" => "FLINT",
-        "TYPE" => "DECLARATION",
-        _ => "ARCHITECT",
+    let base_seat = normalize_seat_token(clean_author);
+    let orthogonal_partner = policy.review_partners.get(&base_seat).or_else(|| {
+        policy.review_partners.iter().find_map(|(seat, partner)| {
+            (normalize_seat_token(seat) == base_seat).then_some(partner)
+        })
+    });
+    let qualified_author = if clean_author.is_empty() {
+        String::new()
+    } else {
+        qualified_author
     };
-
+    let triage_seat = policy.triage_seat.as_deref();
     if !delivery_licensed {
         return DirectAgentRoutingPlan {
             invariant: "INV-DIRECT-CI-AGENT-ROUTING-01".to_string(),
@@ -1215,52 +1295,51 @@ pub fn build_ci_failure_routing_plan(
                 } else {
                     0
                 },
-                reason: "Base Chinwag ($0) deterministic direct-to-author fast path (no DELIVERY LLM required)".to_string(),
+                reason: "Deterministic direct-to-author routing".to_string(),
             },
         };
     }
 
     let needs_escalation = issue.ci_failure_count >= 2 || cross_module_blast || is_main_regression;
-    let handoff_cmd = needs_escalation.then(|| {
+    let partner = needs_escalation.then_some(orthogonal_partner).flatten();
+    let handoff_cmd = partner.map(|partner| {
         format!(
             "git chinwag handoff --issue {} --from {} --to @{}",
-            issue.id, qualified_author, orthogonal_partner
+            issue.id, qualified_author, partner
         )
     });
-    let reason = if is_main_regression {
-        "Licensed ■ DELIVERY ++ Triage: <168h main regression detected; upgraded to Pair Team, triggered Calm Handoff, and adjudicated -150 ◈ SURV clawback".to_string()
-    } else if issue.ci_failure_count >= 2 {
-        format!(
-            "Licensed ■ DELIVERY ++ Triage: authoring agent failed {} times; upgraded to Pair Team with @{} and triggered Calm Handoff",
-            issue.ci_failure_count, orthogonal_partner
-        )
-    } else if cross_module_blast {
-        format!(
-            "Licensed ■ DELIVERY ++ Triage: codegraph blast radius crosses module boundaries; upgraded to Pair Team with @{}",
-            orthogonal_partner
-        )
-    } else {
-        "Licensed ■ DELIVERY ++ Triage: CC'd @DELIVERY on first-failure direct-to-author dispatch"
-            .to_string()
-    };
-
     DirectAgentRoutingPlan {
         invariant: "INV-DIRECT-CI-AGENT-ROUTING-01".to_string(),
-        routing_mode: "DIRECT_TO_AUTHOR_PLUS_DELIVERY_TRIAGE".to_string(),
+        routing_mode: if triage_seat.is_some() {
+            "DIRECT_TO_AUTHOR_PLUS_CONFIGURED_TRIAGE"
+        } else {
+            "DIRECT_TO_AUTHOR_FAST_PATH"
+        }
+        .to_string(),
         primary_recipient: qualified_author,
-        cc_recipients: vec!["@DELIVERY".to_string()],
+        cc_recipients: triage_seat
+            .into_iter()
+            .map(|seat| format!("@{seat}"))
+            .collect(),
         delivery_triage: DeliveryTriageDecision {
             delivery_licensed: true,
-            triage_triggered: needs_escalation,
-            upgrade_to_pair_team: needs_escalation,
-            pair_partner_seat: needs_escalation.then(|| orthogonal_partner.to_string()),
+            triage_triggered: needs_escalation && triage_seat.is_some(),
+            upgrade_to_pair_team: partner.is_some(),
+            pair_partner_seat: partner.cloned(),
             calm_handoff_command: handoff_cmd,
             adjudicated_chip_clawback: if is_main_regression {
                 -REGRESSION_CLAWBACK_CHIPS
             } else {
                 0
             },
-            reason,
+            reason: if triage_seat.is_none() {
+                "Triage is unconfigured in the fleet manifest; author retains ownership"
+            } else if needs_escalation && partner.is_none() {
+                "Review partner is unconfigured in the fleet manifest"
+            } else {
+                "Configured fleet triage and review routing"
+            }
+            .into(),
         },
     }
 }
@@ -1689,7 +1768,7 @@ fn issue_requires_private_repo(issue: &AtomicTaskIssue) -> bool {
         || issue
             .assigned_seats
             .iter()
-            .any(|seat| PRIVATE_LOCKED_SEATS.contains(&normalize_seat_token(seat).as_str()))
+            .any(|seat| configured_board_policy().requires_private(seat))
 }
 
 /// Write `.chinwag/templates/github-project-v2-schema.json` and `.chinwag/templates/linear-template.json`.
@@ -1774,6 +1853,14 @@ pub struct SurfaceImpactManifestV1 {
 /// - `#<ID>.3` Website & PostHog Proxy (`chinwag-sh-site`, `chinwag-edge-proxy`)
 /// - `#<ID>.4` QA & UI Gate (`chinwag-ci ui-gate`, `chinwag-ci surface-gate`)
 pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceImpactManifestV1 {
+    let policy = configured_board_policy();
+    let owners = |surface: &str| {
+        policy
+            .surface_owners
+            .get(surface)
+            .cloned()
+            .unwrap_or_else(|| issue.assigned_seats.clone())
+    };
     let sub1_id = format!("{}#1", issue.id);
     let sub2_id = format!("{}#2", issue.id);
     let sub3_id = format!("{}#3", issue.id);
@@ -1844,7 +1931,7 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
                     "#{}.1 marketing_site (css/site.css & scripts/site-v1/pages/*.html subtle neutral grey inline code pills across chinwag.sh)",
                     issue.id
                 ),
-                owner_seats: vec!["TYPE".to_string()],
+                owner_seats: owners("marketing_site"),
                 required: true,
                 verified: v1,
             },
@@ -1855,7 +1942,7 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
                     "#{}.2 docs_site (assets/css/main.css subtle neutral grey inline <code> pills across docs.chinwag.sh)",
                     issue.id
                 ),
-                owner_seats: vec!["DOCS".to_string()],
+                owner_seats: owners("docs_site"),
                 required: true,
                 verified: v2,
             },
@@ -1866,7 +1953,7 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
                     "#{}.3 ui_qa (1440×900 desktop & 390×844 mobile Playwright verification via chinwag-ci ui-gate --surface all)",
                     issue.id
                 ),
-                owner_seats: vec!["QA".to_string()],
+                owner_seats: owners("ui_qa"),
                 required: true,
                 verified: v3,
             },
@@ -1878,7 +1965,7 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
                 subtask_id: sub1_id,
                 surface: "code".to_string(),
                 label: format!("#{}.1 Code (chinwag / chinwag-ci)", issue.id),
-                owner_seats: vec!["RUST".to_string(), "WORKHORSE".to_string()],
+                owner_seats: owners("code"),
                 required: true,
                 verified: v1,
             },
@@ -1889,7 +1976,7 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
                     "#{}.2 Docs & READMEs (README.md / docs.chinwag.sh)",
                     issue.id
                 ),
-                owner_seats: vec!["DOCS".to_string()],
+                owner_seats: owners("docs_and_readmes"),
                 required: true,
                 verified: v2,
             },
@@ -1900,7 +1987,7 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
                     "#{}.3 Website & PostHog Proxy (chinwag.sh / chinwag-edge-proxy)",
                     issue.id
                 ),
-                owner_seats: vec!["DOCS".to_string(), "DEX".to_string(), "INFRAJR".to_string()],
+                owner_seats: owners("website_and_posthog_proxy"),
                 required: true,
                 verified: v3,
             },
@@ -1911,7 +1998,7 @@ pub fn build_issue_surface_impact_manifest(issue: &AtomicTaskIssue) -> SurfaceIm
                     "#{}.4 QA & UI Gate (chinwag-ci ui-gate + surface-gate Pillar 12)",
                     issue.id
                 ),
-                owner_seats: vec!["QA".to_string()],
+                owner_seats: owners("qa_and_ui_gate"),
                 required: true,
                 verified: v4,
             },
@@ -2994,8 +3081,8 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
                     "unsynced_subtasks": manifest.unsynced_subtasks,
                     "wakeup_plan": routing_plan,
                     "delivery_supervisor": {
-                        "seat": "@DELIVERY",
-                        "engine": "Mercury 3 (Chinwag Delivery-2)",
+                        "seat": configured_board_policy().triage_seat.map(|seat| format!("@{seat}")),
+                        "engine": "manifest configured",
                         "action": "WAKE_AUTHOR_AND_SURFACE_OWNERS"
                     }
                 }));
@@ -3771,7 +3858,7 @@ fn card_entry_from_issue(
         })
         .collect();
     let active_seats = if assigned_seats.is_empty() {
-        "■ DELIVERY".to_string()
+        "unassigned".to_string()
     } else {
         assigned_seats
             .iter()
@@ -4086,7 +4173,7 @@ pub fn upsert_agent_thread_board_card(
             cur.assigned_seats.push(sec.clone());
         }
         cur.active_seats = if cur.assigned_seats.is_empty() {
-            "■ DELIVERY".to_string()
+            "unassigned".to_string()
         } else {
             cur.assigned_seats
                 .iter()
@@ -4119,9 +4206,6 @@ pub fn upsert_agent_thread_board_card(
         }
         if let Some(sec) = secondary_seat {
             seats.push(sec);
-        }
-        if seats.is_empty() {
-            seats.push("DELIVERY".to_string());
         }
         let active_seats = seats
             .iter()
@@ -5086,6 +5170,57 @@ pub fn run_ci_report_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut d
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declarative_board_policy_grants_public_seats_and_configures_review_routing() {
+        let mut manifest = chinwag_fleet::FleetManifest::starter_profile("solo").unwrap();
+        let mut reviewer = manifest.seats[0].clone();
+        reviewer.id = chinwag_fleet::SeatId::new("reviewer").unwrap();
+        manifest.seats.push(reviewer);
+        manifest.extensions.insert(
+            "board".into(),
+            json!({
+                "public_seats": ["default"],
+                "private_seats": ["reviewer"],
+                "review_partners": {"default": "reviewer"},
+                "triage_seat": "reviewer",
+                "surface_owners": {"code": ["default"]}
+            }),
+        );
+        let policy = BoardFleetPolicy::from_manifest(&manifest).unwrap();
+        let mut issue = AtomicTaskIssue::new_default("CHWG-9999", "Public change", DoraTier::S);
+        issue.visibility = "public".into();
+        issue.assigned_seats = vec!["default".into()];
+        assert!(validate_h_board_issue_with_policy(&issue, &issue.to_markdown(), &policy).is_ok());
+        assert!(
+            validate_h_board_issue_with_policy(
+                &issue,
+                &issue.to_markdown(),
+                &BoardFleetPolicy::default()
+            )
+            .is_err()
+        );
+        let routing = build_ci_failure_routing_plan_with_policy(
+            &issue,
+            Some("default#instance"),
+            true,
+            true,
+            false,
+            &policy,
+        );
+        assert_eq!(routing.cc_recipients, vec!["@reviewer"]);
+        assert_eq!(
+            routing.delivery_triage.pair_partner_seat.as_deref(),
+            Some("reviewer")
+        );
+        assert!(routing.delivery_triage.upgrade_to_pair_team);
+        issue.assigned_seats = vec!["reviewer".into()];
+        assert!(validate_h_board_issue_with_policy(&issue, &issue.to_markdown(), &policy).is_err());
+        manifest
+            .extensions
+            .insert("board".into(), json!({"public_seats": ["unknown"]}));
+        assert!(BoardFleetPolicy::from_manifest(&manifest).is_err());
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5127,7 +5262,7 @@ mod tests {
         let mut issue = AtomicTaskIssue::new_default("CHWG-9999", "Routing", DoraTier::S);
         issue.visibility = "PuBlIc".to_string();
         assert_eq!(cfg.target_repository(&issue), "another-org/chinwag");
-        for seat in PRIVATE_LOCKED_SEATS {
+        for seat in ["PRIVATE-A", "PRIVATE-B"] {
             issue.assigned_seats = vec![format!("@■ {seat}#instance")];
             assert_eq!(cfg.target_repository(&issue), "another-org/chinwag-tasks");
         }
@@ -5212,7 +5347,7 @@ mod tests {
         fs::create_dir_all(&issues_dir).unwrap();
         let mut issue = AtomicTaskIssue::new_default("CHWG-0201", "Leak Test", DoraTier::S);
         issue.visibility = "public".to_string();
-        issue.body = "Connected to Node 2 at 100.108.108.25:11500 over Tailscale.".to_string();
+        issue.body = "Connected to a peer at 10.77.8.25:11500 over Tailscale.".to_string();
         fs::write(issues_dir.join("CHWG-0201.md"), issue.to_markdown()).unwrap();
 
         let mut out = Vec::new();
@@ -5229,7 +5364,7 @@ mod tests {
         );
         assert_eq!(code, EXIT_H_BOARD_REJECT);
         let stderr_str = String::from_utf8_lossy(&err);
-        assert!(stderr_str.contains("100.108.108.25"));
+        assert!(stderr_str.contains("10.77.8.25"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5393,7 +5528,7 @@ mod tests {
         let mut issue =
             AtomicTaskIssue::new_default("CHWG-0302", "In-Flight Gate Fail", DoraTier::M);
         issue.status = BoardStatus::TribunalGate;
-        issue.author_instance = Some("WORKHORSE#AaFG0NdpegKhpXXEB_-qPA".to_string());
+        issue.author_instance = Some("FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA".to_string());
         fs::write(issues_dir.join("CHWG-0302.md"), issue.to_markdown()).unwrap();
 
         let mut out = Vec::new();
@@ -5407,7 +5542,7 @@ mod tests {
                 "--gate".to_string(),
                 "H2-Clippy".to_string(),
                 "--diagnostic".to_string(),
-                "error in /Users/brianspector/repo/src/lib.rs at 100.108.108.25".to_string(),
+                "error in /Users/alice/repo/src/lib.rs at 10.77.8.25".to_string(),
                 "--push-boards".to_string(),
                 "--tasks-dir".to_string(),
                 dir.to_string_lossy().to_string(),
@@ -5427,7 +5562,7 @@ mod tests {
         );
         assert_eq!(
             resp["routing"]["primary_recipient"],
-            "@WORKHORSE#AaFG0NdpegKhpXXEB_-qPA"
+            "@FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA"
         );
         assert_eq!(
             resp["routing"]["cc_recipients"].as_array().unwrap().len(),
@@ -5470,20 +5605,15 @@ mod tests {
         let resp: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             resp["routing"]["routing_mode"],
-            "DIRECT_TO_AUTHOR_PLUS_DELIVERY_TRIAGE"
+            "DIRECT_TO_AUTHOR_FAST_PATH"
         );
         assert_eq!(resp["routing"]["primary_recipient"], "@RUST#thread-99");
-        assert_eq!(resp["routing"]["cc_recipients"][0], "@DELIVERY");
+        assert_eq!(resp["routing"]["cc_recipients"], json!([]));
         assert_eq!(
             resp["routing"]["delivery_triage"]["upgrade_to_pair_team"],
-            true
+            false
         );
-        assert!(
-            resp["routing"]["delivery_triage"]["calm_handoff_command"]
-                .as_str()
-                .unwrap()
-                .contains("git chinwag handoff")
-        );
+        assert!(resp["routing"]["delivery_triage"]["calm_handoff_command"].is_null());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5548,7 +5678,7 @@ mod tests {
 
     #[test]
     fn test_13_h_board_rejects_public_board_push_for_private_locked_seats_with_exit_78() {
-        for seat in PRIVATE_LOCKED_SEATS {
+        for seat in ["PRIVATE-A", "PRIVATE-B"] {
             let mut issue =
                 AtomicTaskIssue::new_default("CHWG-0305", "Sensitive Advisory Task", DoraTier::M);
             issue.visibility = "public".to_string();
@@ -5663,7 +5793,7 @@ mod tests {
         assert_eq!(resp["tribunal_snapbacks"][0]["snapback_under_200ms"], true);
         assert_eq!(
             resp["tribunal_snapbacks"][0]["delivery_supervisor"]["seat"],
-            "@DELIVERY"
+            Value::Null
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -5711,7 +5841,7 @@ mod tests {
         // A public project can contain issues routed to a private repository.
         let mut locked_issue =
             AtomicTaskIssue::new_default("CHWG-0401", "Patent Review", DoraTier::M);
-        locked_issue.assigned_seats = vec!["PATENT".to_string()];
+        locked_issue.assigned_seats = vec!["SEAT-A".to_string()];
         fs::write(issues_dir.join("CHWG-0401.md"), locked_issue.to_markdown()).unwrap();
 
         let mut out2 = Vec::new();
@@ -5786,7 +5916,7 @@ mod tests {
             &repo_dir,
             "CHWG-0501",
             "DEX#6df4d436df6c01617dcd2f4e404673fc",
-            Some("@INFRAJR#0049dd19946d89fd047810fec6676b05"),
+            Some("@TESTADM#0049dd19946d89fd047810fec6676b05"),
             "3-Way A/B/C Edge Variant Router",
             false,
             Some("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
@@ -5795,7 +5925,7 @@ mod tests {
         .expect("upsert in-flight card");
         assert_eq!(card1.id, "CHWG-0501");
         assert_eq!(card1.status, "03_IN_FLIGHT");
-        assert_eq!(card1.active_seats, "■ DEX · ■ INFRAJR");
+        assert_eq!(card1.active_seats, "■ DEX · ■ TESTADM");
         assert_eq!(card1.execution_mode, "Pair · 100 Cr");
         assert_eq!(card1.net_hours_saved, 0.0);
 
@@ -5811,7 +5941,7 @@ mod tests {
         )
         .expect("upsert completed card");
         assert_eq!(card2.status, "05_SHIPPED_VERIFIED");
-        assert_eq!(card2.active_seats, "■ DEX · ■ INFRAJR · ■ QA");
+        assert_eq!(card2.active_seats, "■ DEX · ■ TESTADM · ■ QA");
         assert_eq!(card2.execution_mode, "Triad · 150 Cr");
         assert_eq!(
             card2.delta_speedup_vs_dora,
@@ -5827,7 +5957,7 @@ mod tests {
         let private_card = upsert_agent_thread_board_card(
             &repo_dir,
             "CHWG-0502",
-            "PATENT#11223344556677889900aabbccddeeff",
+            "SEAT-A#11223344556677889900aabbccddeeff",
             None,
             "Confidential claim drafting",
             false,
@@ -5837,14 +5967,14 @@ mod tests {
         .expect("upsert confidential private card");
         assert_eq!(private_card.visibility, "private");
         assert_eq!(private_card.target_repository, "emunlabs/chinwag-tasks");
-        assert_eq!(private_card.assigned_seats, vec!["PATENT".to_string()]);
+        assert_eq!(private_card.assigned_seats, vec!["SEAT-A".to_string()]);
 
         let _ = fs::remove_dir_all(&repo_dir);
     }
 
     #[test]
     fn private_tasks_accept_internal_strategy_and_locked_seats() {
-        for seat in PRIVATE_LOCKED_SEATS {
+        for seat in ["PRIVATE-A", "PRIVATE-B"] {
             let mut issue =
                 AtomicTaskIssue::new_default("CHWG-0214", "Internal Strategy", DoraTier::M);
             issue.assigned_seats = vec![format!("■ @{seat}#instance")];
@@ -5939,7 +6069,7 @@ mod tests {
         fs::create_dir_all(&issues_dir).unwrap();
         let mut private =
             AtomicTaskIssue::new_default("CHWG-0214-PRIVATE", "Patent Review", DoraTier::M);
-        private.assigned_seats = vec!["@PATENT#instance".to_string()];
+        private.assigned_seats = vec!["@SEAT-A#instance".to_string()];
         private.body = "Patent claim strategy for a US Provisional.".to_string();
         let mut public =
             AtomicTaskIssue::new_default("CHWG-0214-PUBLIC", "Public Routing", DoraTier::S);
@@ -6023,7 +6153,7 @@ mod tests {
         let dir = temp_tasks_dir("dual-repo-cards");
         let mut private =
             AtomicTaskIssue::new_default("CHWG-0214-PRIVATE", "Internal Review", DoraTier::M);
-        private.assigned_seats = vec!["@PATENT#instance".to_string()];
+        private.assigned_seats = vec!["@SEAT-A#instance".to_string()];
         private.body = "Patent claim strategy".to_string();
         let mut public =
             AtomicTaskIssue::new_default("CHWG-0214-PUBLIC", "Public Review", DoraTier::S);
@@ -6138,7 +6268,7 @@ mod tests {
         let moved = upsert_agent_thread_board_card(
             &repo_dir,
             "CHWG-0214",
-            "PATENT",
+            "SEAT-A",
             None,
             "Private review",
             false,
@@ -6162,7 +6292,7 @@ mod tests {
         let err = upsert_agent_thread_board_card(
             &repo_dir,
             "CHWG-0214",
-            "PATENT",
+            "SEAT-A",
             None,
             &secret_summary,
             false,
@@ -6179,7 +6309,7 @@ mod tests {
         let err = upsert_agent_thread_board_card(
             &repo_dir,
             "CHWG-0214",
-            "PATENT",
+            "SEAT-A",
             None,
             "Review task",
             false,
@@ -6193,7 +6323,7 @@ mod tests {
             !ledger.cards[0]
                 .assigned_seats
                 .iter()
-                .any(|seat| seat == "PATENT")
+                .any(|seat| seat == "SEAT-A")
         );
         let _ = fs::remove_dir_all(&repo_dir);
     }
@@ -6329,7 +6459,7 @@ mod tests {
             &repo_dir,
             "CHWG-0208",
             "DEX",
-            Some("INFRAJR"),
+            Some("TESTADM"),
             "Follow-up bus receipt",
             false,
             None,
@@ -6360,8 +6490,8 @@ mod tests {
             json!({
                 "id": "bus-1",
                 "ts_unix": 1_794_380_000_u64,
-                "sender": "GEMINI-PM#f3ef0a87-893f-45d3-a15e-10a9f7e558cc",
-                "to": "DEX#6df4d436df6c01617dcd2f4e404673fc,INFRAJR#0049dd19946d89fd047810fec6676b05",
+                "sender": "FIXTURE-C#f3ef0a87-893f-45d3-a15e-10a9f7e558cc",
+                "to": "DEX#6df4d436df6c01617dcd2f4e404673fc,TESTADM#0049dd19946d89fd047810fec6676b05",
                 "room": "#mgmt",
                 "body": "Delegate CHWG-0234"
             })
@@ -6369,7 +6499,7 @@ mod tests {
             json!({
                 "id": "bus-2",
                 "ts_unix": 1_794_380_100_u64,
-                "sender": "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA",
+                "sender": "FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA",
                 "to": "QA#81126a23-dd44-4e64-8450-bf1a6c8e3c7b",
                 "room": "#eng",
                 "body": "Ready for QA"
@@ -6383,17 +6513,17 @@ mod tests {
         assert_eq!(
             live,
             vec![
-                "GEMINI-PM#f3ef0a87-893f-45d3-a15e-10a9f7e558cc".to_string(),
-                "INFRAJR#0049dd19946d89fd047810fec6676b05".to_string(),
+                "FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA".to_string(),
+                "FIXTURE-C#f3ef0a87-893f-45d3-a15e-10a9f7e558cc".to_string(),
                 "QA#81126a23-dd44-4e64-8450-bf1a6c8e3c7b".to_string(),
-                "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA".to_string(),
+                "TESTADM#0049dd19946d89fd047810fec6676b05".to_string(),
             ]
         );
 
         let mut other_issue =
             AtomicTaskIssue::new_default("CHWG-0230", "Other In-Flight Work", DoraTier::M);
         other_issue.status = BoardStatus::InFlight;
-        other_issue.author_instance = Some("WORKHORSE#AaFG0NdpegKhpXXEB_-qPA".to_string());
+        other_issue.author_instance = Some("FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA".to_string());
         other_issue.file_scope = "crates/chinwag-cli/src/board/**".to_string();
         fs::write(issues_dir.join("CHWG-0230.md"), other_issue.to_markdown()).unwrap();
 
@@ -6407,7 +6537,7 @@ mod tests {
         assert_eq!(collisions[0].other_ticket_id, "CHWG-0230");
         assert_eq!(
             collisions[0].other_owner,
-            "WORKHORSE#AaFG0NdpegKhpXXEB_-qPA"
+            "FIXTURE-A#AaFG0NdpegKhpXXEB_-qPA"
         );
 
         write_active_crisis(
@@ -6416,7 +6546,7 @@ mod tests {
                 schema: "chinwag.bus.crisis.v1".to_string(),
                 invariant: "INV-CRISIS-ALL-STOP-BROADCAST-01".to_string(),
                 active: true,
-                sender: "GEMINI-PM#f3ef0a87-893f-45d3-a15e-10a9f7e558cc".to_string(),
+                sender: "FIXTURE-C#f3ef0a87-893f-45d3-a15e-10a9f7e558cc".to_string(),
                 task_id: Some("CHWG-0234".to_string()),
                 message: "Halt unguarded board sync".to_string(),
                 ts_unix: 1_794_380_200,

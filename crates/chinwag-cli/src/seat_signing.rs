@@ -18,7 +18,7 @@
 //! Per-seat git signing environment for engine processes spawned by
 //! `chinwag agent-dispatch`.
 //!
-//! Each seat (ARCHITECT, RUST, ENG, ...) owns an Ed25519 key under
+//! Each seat (FIXTURE-B, RUST, ENG, ...) owns an Ed25519 key under
 //! `~/.chinwag/signing/<seat>_ed25519(.pub)`. When a key pair exists, the
 //! engine process is given `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
 //! `GIT_CONFIG_VALUE_n` entries that make git sign commits as that seat. These
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn slug_accepts_seat_names_and_rejects_everything_else() {
         assert_eq!(seat_slug("ENG").as_deref(), Some("eng"));
-        assert_eq!(seat_slug(" GEMINI-PM ").as_deref(), Some("gemini-pm"));
+        assert_eq!(seat_slug(" FIXTURE-C ").as_deref(), Some("fixture-c"));
         assert_eq!(seat_slug("DEV-3").as_deref(), Some("dev-3"));
         for bad in ["", "  ", "INFRA BOT (GROK)", "../eng", "a/b", "-x", "EN\nG"] {
             assert_eq!(seat_slug(bad), None, "{bad:?}");
@@ -269,8 +269,8 @@ mod tests {
     #[test]
     fn appends_after_existing_entries_without_touching_them() {
         let home = Home::new();
-        home.add_seat_keys("architect");
-        let signing = build("architect", &home.0, &home.0, Some("3"));
+        home.add_seat_keys("fixture-b");
+        let signing = build("fixture-b", &home.0, &home.0, Some("3"));
 
         assert_eq!(get(&signing, "GIT_CONFIG_COUNT"), Some("9"));
         for i in 0..3 {
@@ -280,13 +280,13 @@ mod tests {
         assert_eq!(get(&signing, "GIT_CONFIG_KEY_3"), Some("user.name"));
         assert_eq!(
             get(&signing, "GIT_CONFIG_VALUE_3"),
-            Some("ARCHITECT (agent)")
+            Some("FIXTURE-B (agent)")
         );
         assert_eq!(
             get(&signing, "GIT_CONFIG_KEY_8"),
             Some("gpg.ssh.allowedSignersFile")
         );
-        assert_eq!(get(&signing, "CHINWAG_AGENT"), Some("ARCHITECT"));
+        assert_eq!(get(&signing, "CHINWAG_AGENT"), Some("FIXTURE-B"));
     }
 
     #[test]
@@ -318,14 +318,14 @@ mod tests {
     #[test]
     fn missing_key_files_inject_nothing_and_warn() {
         let home = Home::new();
-        let none = build("FLINT", &home.0, &home.0, None);
+        let none = build("TESTA", &home.0, &home.0, None);
         assert_eq!(none.env, Vec::new());
-        assert!(none.warning.as_deref().is_some_and(|w| w.contains("FLINT")));
+        assert!(none.warning.as_deref().is_some_and(|w| w.contains("TESTA")));
 
         // Public key only: signing would fail at commit time, so still skip.
-        let (public_key, _) = key_paths(&home.0, "flint");
+        let (public_key, _) = key_paths(&home.0, "testa");
         fs::write(public_key, "ssh-ed25519 AAAA test\n").expect("write public key");
-        assert!(!build("FLINT", &home.0, &home.0, None).is_active());
+        assert!(!build("TESTA", &home.0, &home.0, None).is_active());
 
         // Private key only is equally unusable for the configured .pub path.
         let other = Home::new();

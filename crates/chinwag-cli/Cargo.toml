@@ -10,6 +10,9 @@ repository.workspace = true
 name = "chinwag"
 path = "src/main.rs"
 
+[dependencies]
+chinwag-fleet = { path = "../chinwag-fleet" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 chinwag-host-process = { path = "../chinwag-host-process" }
 chinwag-swarm = { path = "../chinwag-swarm", version = "=0.0.1" }
@@ -18,6 +21,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signa
 rustix = { version = "1", features = ["fs", "process"] }
 rand.workspace = true
 chinwag-signing = { path = "../chinwag-signing" }
+chinwag-claim = { path = "../chinwag-claim" }
 chinwag-confirmed-initial-private = { path = "../confirmed-initial" }
 chinwag-mcp-private-anchored = { path = "../chinwag-mcp", features = ["private-loopback"] }
 chinwag-editor-config-private = { path = "../chinwag-editor-config" }

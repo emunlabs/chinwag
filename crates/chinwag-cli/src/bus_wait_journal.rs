@@ -251,11 +251,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         snapshot(&root).unwrap();
-        let row = |n: u64| serde_json::json!({"id":format!("fixture-{n}"),"seq":n,"ts_unix":1,"ts_iso":"fixture","room":"#eng","sender":"GEMINI-PM#fixture","sender_cast":"","sender_endpoint_id":"fixture","to":"WORKHORSE#fixture","task_id":"TEST","body":"fixture","digest_sha256":format!("digest-{n}"),"pubkey_ed25519":null,"signature_ed25519":null,"sig_verified":false});
+        let row = |n: u64| serde_json::json!({"id":format!("fixture-{n}"),"seq":n,"ts_unix":1,"ts_iso":"fixture","room":"#eng","sender":"FIXTURE-C#fixture","sender_cast":"","sender_endpoint_id":"fixture","to":"FIXTURE-A#fixture","task_id":"TEST","body":"fixture","digest_sha256":format!("digest-{n}"),"pubkey_ed25519":null,"signature_ed25519":null,"sig_verified":false});
         let path = root.join(".chinwag/bus/messages.jsonl");
         std::fs::write(&path, format!("{}\n{}\n", row(1), row(2))).unwrap();
         let old = snapshot(&root).unwrap();
-        let mut c:Cursor=serde_json::from_value(serde_json::json!({"schema":"chinwag.bus.durable-cursor-and-quota.v4","actor":"WORKHORSE#fixture","grant_id":"g","authority_epoch":1,"grant_digest_sha256":"hash","version":0,"max_turns_quota":32,"turns_used":0,"turns_reserved":0,"backlog_policy":"ExplicitWatermarkSeq",
+        let mut c:Cursor=serde_json::from_value(serde_json::json!({"schema":"chinwag.bus.durable-cursor-and-quota.v4","actor":"FIXTURE-A#fixture","grant_id":"g","authority_epoch":1,"grant_digest_sha256":"hash","version":0,"max_turns_quota":32,"turns_used":0,"turns_reserved":0,"backlog_policy":"ExplicitWatermarkSeq",
             "last_scanned_seq":1,"last_scanned_id":"fixture-1","last_scanned_digest":"digest-1","last_scanned_inode":old.inode,"last_scanned_line1_digest":old.first_digest,"pending_deliveries":[],"completed_recent_digests":[],"completed_deliveries":[]})).unwrap();
         let archive = root.join(".chinwag/bus/messages.jsonl.1");
         std::fs::rename(&path, &archive).unwrap();
@@ -292,11 +292,11 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let root = std::fs::canonicalize(temp.path()).unwrap();
             snapshot(&root).unwrap();
-            let row = |id: u64, seq: u64| serde_json::json!({"id":format!("original-{id}"),"seq":seq,"ts_unix":id,"ts_iso":"fixture","room":"#eng","sender":"GEMINI-PM#fixture","sender_cast":"","sender_endpoint_id":"fixture","to":"WORKHORSE#fixture","task_id":"TEST","body":"fixture","digest_sha256":format!("digest-{id}"),"pubkey_ed25519":null,"signature_ed25519":null,"sig_verified":false});
+            let row = |id: u64, seq: u64| serde_json::json!({"id":format!("original-{id}"),"seq":seq,"ts_unix":id,"ts_iso":"fixture","room":"#eng","sender":"FIXTURE-C#fixture","sender_cast":"","sender_endpoint_id":"fixture","to":"FIXTURE-A#fixture","task_id":"TEST","body":"fixture","digest_sha256":format!("digest-{id}"),"pubkey_ed25519":null,"signature_ed25519":null,"sig_verified":false});
             let path = root.join(".chinwag/bus/messages.jsonl");
             std::fs::write(&path, format!("{}\n{}\n", row(1, 1), row(2, 2))).unwrap();
             let old = snapshot(&root).unwrap();
-            let mut c:Cursor=serde_json::from_value(serde_json::json!({"schema":"chinwag.bus.durable-cursor-and-quota.v4","actor":"WORKHORSE#fixture","grant_id":"g","authority_epoch":1,"grant_digest_sha256":"hash","version":0,"max_turns_quota":32,"turns_used":0,"turns_reserved":0,"backlog_policy":"ExplicitWatermarkSeq","last_scanned_seq":1,"last_scanned_id":"original-1","last_scanned_digest":"digest-1","last_scanned_inode":old.inode,"last_scanned_line1_digest":old.first_digest,"pending_deliveries":[],"completed_recent_digests":[],"completed_deliveries":[]})).unwrap();
+            let mut c:Cursor=serde_json::from_value(serde_json::json!({"schema":"chinwag.bus.durable-cursor-and-quota.v4","actor":"FIXTURE-A#fixture","grant_id":"g","authority_epoch":1,"grant_digest_sha256":"hash","version":0,"max_turns_quota":32,"turns_used":0,"turns_reserved":0,"backlog_policy":"ExplicitWatermarkSeq","last_scanned_seq":1,"last_scanned_id":"original-1","last_scanned_digest":"digest-1","last_scanned_inode":old.inode,"last_scanned_line1_digest":old.first_digest,"pending_deliveries":[],"completed_recent_digests":[],"completed_deliveries":[]})).unwrap();
             std::fs::rename(&path, root.join(".chinwag/bus/messages.jsonl.z-old")).unwrap();
             let middle = root.join(if alternate {
                 ".chinwag/bus/messages.a-middle.jsonl"

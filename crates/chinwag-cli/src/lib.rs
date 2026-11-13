@@ -58,7 +58,11 @@ pub mod bus_wait_message;
 pub mod bus_wait_store;
 pub mod canonical_seat_pubkeys;
 #[cfg(target_os = "macos")]
+pub mod delivery_operator_readiness;
+#[cfg(target_os = "macos")]
 pub mod execution_binding;
+#[cfg(target_os = "macos")]
+pub mod fleet_cmd;
 #[cfg(target_os = "macos")]
 pub mod release_sync;
 #[cfg(target_os = "macos")]
@@ -244,6 +248,7 @@ pub enum Dispatch {
     Serve(ServeRequest),
     ServeHttp(ServeRequest),
     Configure(ConfigureRequest),
+    Fleet(Vec<String>),
     AgentDispatch(AgentDispatchRequest),
     AgentDispatchNetwork(DispatchNetworkRequest),
     AgentDispatchStatus(PathBuf),
@@ -315,6 +320,8 @@ pub struct AgentDispatchRequest {
     pub(crate) repo: Option<PathBuf>,
     pub(crate) crdb: Option<PathBuf>,
     pub(crate) stdin_json: bool,
+    pub(crate) fleet_manifest: Option<PathBuf>,
+    pub(crate) room: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -471,6 +478,16 @@ where
         return Dispatch::Immediate(Exit::Rejected(Rejection::UnknownInvocation));
     };
     let args: Vec<OsString> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
+    if args.first().is_some_and(|arg| arg == "fleet") {
+        return match args[1..]
+            .iter()
+            .map(|arg| arg.to_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(args) => Dispatch::Fleet(args),
+            None => Dispatch::Immediate(Exit::Rejected(Rejection::InvalidArguments)),
+        };
+    }
     if args.first().is_some_and(|arg| arg == "configure-editor") {
         if args.len() == 2 && args[1] == "--help" {
             return Dispatch::Immediate(Exit::ConfigureHelp(invocation));
@@ -700,6 +717,8 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
     let mut crdb = None;
     let mut stdin_json = false;
     let mut instance = None;
+    let mut fleet_manifest = None;
+    let mut room = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
@@ -747,7 +766,12 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
                     return None;
                 }
             }
-            "--room" | "--channel" | "-c" => {}
+            "--fleet-manifest" => {
+                if val.is_empty() || fleet_manifest.replace(PathBuf::from(val)).is_some() {
+                    return None;
+                }
+            }
+            "--room" | "--channel" | "-c" => room = Some(val),
             _ => return None,
         }
     }
@@ -757,11 +781,18 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
     if let Some(tag) = instance.as_deref() {
         agent_instance::validate_instance(tag).ok()?;
         if let Some(actor) = sender.as_deref() {
-            sender = Some(
-                agent_instance::resolve_actor(actor, Some(tag), None)
-                    .ok()?
-                    .to_string(),
-            );
+            let actor = actor
+                .trim()
+                .trim_start_matches(['@', '■', '◆', '●', '⚡'])
+                .trim();
+            let (seat, embedded) = actor
+                .split_once('#')
+                .map_or((actor, None), |(seat, instance)| (seat, Some(instance)));
+            if embedded.is_some_and(|embedded| embedded != tag) {
+                return None;
+            }
+            let seat = chinwag_fleet::SeatId::new(seat).ok()?;
+            sender = Some(format!("{seat}#{tag}"));
         }
     }
     if !stdin_json && (agent.is_none() || body.is_none()) {
@@ -776,6 +807,8 @@ fn parse_agent_dispatch(args: &[OsString]) -> Option<AgentDispatchRequest> {
         repo,
         crdb,
         stdin_json,
+        fleet_manifest,
+        room,
     })
 }
 
@@ -878,8 +911,6 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
 
 #[cfg(target_os = "macos")]
 mod agent_dispatch_run;
-#[cfg(target_os = "macos")]
-mod deepseek_pool;
 #[cfg(target_os = "macos")]
 pub mod hosted_agent;
 #[cfg(target_os = "macos")]
@@ -1083,13 +1114,13 @@ mod instance_dispatch_parser_tests {
     #[test]
     fn instance_flag_order_never_changes_the_sender() {
         for flags in [
-            ["--instance", "parent-long-id", "--sender", "WORKHORSE"],
-            ["--sender", "WORKHORSE", "--instance", "parent-long-id"],
+            ["--instance", "parent-long-id", "--sender", "FIXTURE-A"],
+            ["--sender", "FIXTURE-A", "--instance", "parent-long-id"],
         ] {
             let mut args = vec!["--agent", "RUST", "--body", "fixture"];
             args.extend(flags);
             let request = parse(&args).unwrap();
-            assert_eq!(request.sender.as_deref(), Some("WORKHORSE#parent-long-id"));
+            assert_eq!(request.sender.as_deref(), Some("FIXTURE-A#parent-long-id"));
         }
     }
 
@@ -1105,7 +1136,7 @@ mod instance_dispatch_parser_tests {
         for flags in [
             vec!["--instance", "bad/tag"],
             vec!["--instance", "one", "--instance", "two"],
-            vec!["--sender", "WORKHORSE#one", "--instance", "two"],
+            vec!["--sender", "FIXTURE-A#one", "--instance", "two"],
         ] {
             let mut args = vec!["--agent", "RUST", "--body", "fixture"];
             args.extend(flags);

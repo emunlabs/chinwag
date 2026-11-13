@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod path_lease;
 pub mod reply;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};

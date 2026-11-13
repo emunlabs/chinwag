@@ -345,7 +345,7 @@ CREATE TABLE IF NOT EXISTS chinwag_memories (
   tombstone_reason TEXT NOT NULL DEFAULT '',
   file_scope TEXT NOT NULL DEFAULT '*',
   source_commit TEXT NOT NULL DEFAULT 'b1745094d9cb9014361fca30c7de3535c140dd20',
-  author_agent TEXT NOT NULL DEFAULT 'GEMINI-PM',
+  author_agent TEXT NOT NULL DEFAULT 'unconfigured',
   entities TEXT NOT NULL DEFAULT '',
   tags TEXT NOT NULL DEFAULT '',
   document_id TEXT NOT NULL DEFAULT '',
@@ -455,7 +455,7 @@ if op == "retain":
         (
             mid, m["bank"], m.get("category", "observation"), m["context"], m["content"],
             m.get("tombstone_reason", ""), m["file_scope"], m["source_commit"],
-            m.get("author_agent", "GEMINI-PM"), m.get("entities", ""), m.get("tags", ""),
+            m.get("author_agent", "unconfigured"), m.get("entities", ""), m.get("tags", ""),
             m.get("document_id", ""), m.get("origin", "native"), m["created_at_ms"],
             m.get("occurred_at", "")
         )
@@ -501,7 +501,7 @@ elif op == "tombstone":
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             tid, "spector-fleet", "tombstone", f"tombstone:{t['file_scope']}", content,
-            t["reason"], t["file_scope"], t["source_commit"], "GEMINI-PM",
+            t["reason"], t["file_scope"], t["source_commit"], "unconfigured",
             t["file_scope"], "tombstone,negative-memory,do-not-repeat", "", "native-tombstone",
             t["created_at_ms"], ""
         )
@@ -855,7 +855,7 @@ pub fn run_memory(request: MemoryRequest, out: &mut dyn Write, err: &mut dyn Wri
         } => {
             let source_commit = commit.unwrap_or_else(|| DEFAULT_COMMIT_SHA.to_owned());
             let scope = file_scope.unwrap_or_else(|| "*".to_owned());
-            let author = agent.unwrap_or_else(|| "GEMINI-PM".to_owned());
+            let author = agent.unwrap_or_else(|| "unconfigured".to_owned());
             let mem_id = id.unwrap_or_else(|| {
                 format!(
                     "mem-{ts_ms}-{}",

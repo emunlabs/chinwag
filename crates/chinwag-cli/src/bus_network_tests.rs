@@ -47,9 +47,20 @@ async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
     let original = super::tests::native_publication_fixture(&root);
     let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
     let mut output = Vec::new();
-    let daemon = run_daemon_loop(root.clone(), 0, None, true, &mut output, async {
-        let _ = stopped.await;
-    });
+    // Explicit loopback destination keeps all packets on this host. The peer
+    // below binds a real non-loopback source, which the server must refuse.
+    let daemon = run_daemon_loop_inner(
+        root.clone(),
+        0,
+        None,
+        true,
+        &mut output,
+        async {
+            let _ = stopped.await;
+        },
+        None,
+        Some(([127, 0, 0, 1], 0).into()),
+    );
     let exercise = async {
         let result = async {
             let daemon = wait_for_owned_daemon(&root).await?;
@@ -82,29 +93,31 @@ async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
                 .ok_or_else(|| {
                     "this native transport test requires a non-loopback interface".to_owned()
                 })?;
-            let port = daemon.bound_sockets[0]
-                .parse::<SocketAddr>()
-                .unwrap()
-                .port();
-            let client = Endpoint::builder(presets::Minimal)
+            let route = daemon.bound_sockets.iter().filter_map(|raw| raw.parse::<SocketAddr>().ok())
+                .find(|socket| socket.is_ipv4() && socket.ip().is_loopback())
+                .ok_or_else(|| format!("daemon has no IPv4 loopback route: {:?}", daemon.bound_sockets))?;
+            let original_routes: DaemonState = serde_json::from_slice(&fs::read(daemon_json_path(&root)).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+            for query in [frame, BusFrame::NetworkPosture] {
+                let client = Endpoint::builder(presets::Minimal)
                 .relay_mode(RelayMode::Disabled)
                 .clear_address_lookup()
+                .clear_ip_transports()
                 .bind_addr(format!("{local_ip}:0").parse::<SocketAddr>().unwrap())
                 .map_err(|_| "test bind address refused".to_owned())?
                 .bind()
                 .await
                 .map_err(|_| "test endpoint bind failed".to_owned())?;
-            for query in [frame, BusFrame::NetworkPosture] {
                 let address = EndpointAddr::from_parts(
                     daemon.endpoint_id.parse().unwrap(),
-                    [TransportAddr::Ip(
-                        format!("{local_ip}:{port}").parse().unwrap(),
-                    )],
+                    // Keep the destination local to this host while the
+                    // explicitly bound peer source remains non-loopback. The
+                    // daemon must reject that actual source transport path.
+                    [TransportAddr::Ip(route)],
                 );
                 let connection =
                     tokio::time::timeout(Duration::from_secs(5), client.connect(address, BUS_ALPN))
                         .await
-                        .map_err(|_| "adversarial test connect timeout".to_owned())?
+                        .map_err(|_| format!("adversarial test connect timeout: source={local_ip}, destination={route}, query={query:?}, daemon_routes={:?}, client_sockets={:?}", original_routes.bound_sockets, client.bound_sockets()))?
                         .map_err(|_| "adversarial test must actually connect".to_owned())?;
                 let (mut send, mut recv) = connection
                     .open_bi()
@@ -127,8 +140,8 @@ async fn local_receipt_and_posture_queries_do_not_publish_or_replay() {
                     }
                     _ => return Err("server did not explicitly refuse non-loopback query".into()),
                 }
+                client.close().await;
             }
-            client.close().await;
             assert_eq!(one_original_journal(&root, &original)?, journal);
             Ok::<(), String>(())
         }
@@ -174,6 +187,7 @@ async fn pending_room_owner_does_not_starve_local_publication_or_observation() {
             let _ = stopped.await;
         },
         Some(driver),
+        None,
     );
     let exercise = async {
         let result = async {
@@ -260,6 +274,7 @@ async fn room_receive_failure_exits_unsuccessfully() {
             Some(Box::pin(async move {
                 RoomOwnerFailure::ReceiveFailed(error.to_string())
             })),
+            None,
         )
         .await;
         assert_eq!(exit, 1, "unexpected room failure must not report success");
@@ -288,6 +303,7 @@ async fn room_renewal_failure_exits_unsuccessfully_and_preserves_reason() {
                 chinwag_swarm::room::Error::Http("timeout").to_string(),
             )
         })),
+        None,
     )
     .await;
     assert_eq!(exit, 1);
@@ -307,14 +323,17 @@ async fn wait_for_owned_daemon(root: &Path) -> Result<DaemonState, String> {
                 {
                     return Err("state did not describe this controlled daemon".into());
                 }
-                // Use only an actual reported local socket. Do not consult or
-                // mutate global CHINWAG_BUS_* routing environment in this test.
+                // Keep the address family used by the external IPv4 probe.
+                // Iroh may bind IPv4 and IPv6 to different ephemeral ports.
+                // Do not consult or mutate global CHINWAG_BUS_* routing state.
                 let local = daemon
                     .bound_sockets
                     .iter()
                     .filter_map(|raw| raw.parse::<SocketAddr>().ok())
-                    .find(|socket| socket.ip().is_loopback() && socket.port() != 0)
-                    .ok_or("daemon did not report a bound loopback socket")?;
+                    .find(|socket| {
+                        socket.is_ipv4() && socket.ip().is_loopback() && socket.port() != 0
+                    })
+                    .ok_or("daemon did not report a bound IPv4 loopback socket")?;
                 daemon.bound_sockets = vec![local.to_string()];
                 return Ok(daemon);
             }

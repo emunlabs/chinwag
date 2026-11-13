@@ -848,8 +848,10 @@ name = "chinwag-cli"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chinwag-claim",
  "chinwag-confirmed-initial-private",
  "chinwag-editor-config-private",
+ "chinwag-fleet",
  "chinwag-history-archive",
  "chinwag-host-process",
  "chinwag-mcp-private-anchored",
@@ -897,6 +899,21 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "toml_edit 0.25.17+spec-1.1.0",
+]
+
+[[package]]
+name = "chinwag-fleet"
+version = "0.0.1"
+dependencies = [
+ "chinwag-claim",
+ "ed25519-dalek 2.2.0",
+ "rustix",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
 ]
 
 [[package]]
@@ -1055,6 +1072,7 @@ name = "chinwag-ui"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "chinwag-fleet",
  "dioxus",
  "dioxus-ssr",
  "reqwest 0.12.28",
@@ -7424,6 +7442,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7631,6 +7655,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cacecf649bc1a7c5f0e299cc813977c6a78116abda2b93b1ee01735b71ead9a8"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

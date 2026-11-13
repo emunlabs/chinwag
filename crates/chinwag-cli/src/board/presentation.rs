@@ -997,6 +997,7 @@ mod tests {
     #[test]
     fn pipeline_never_claims_hours_or_credits() {
         let mut issue = AtomicTaskIssue::new_default("CHWG-9999", "Test outcome", DoraTier::XL);
+        issue.assigned_seats = vec!["builder".into(), "reviewer".into()];
         issue.loc_changed = Some(80);
         issue.t_ship_ms = issue.t_claim_ms + 1_140_000;
         for status in [

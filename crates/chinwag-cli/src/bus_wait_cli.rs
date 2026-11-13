@@ -780,7 +780,7 @@ mod tests {
         }
         fn seed_pending(&self) {
             let mut c = self.cursor();
-            let message:BusMessage=serde_json::from_value(json!({"id":"fixture-msg","seq":1,"ts_unix":1,"ts_iso":"fixture","room":"#eng","sender":"GEMINI-PM#fixture","sender_cast":"","sender_endpoint_id":"fixture","to":self.grant.actor,"task_id":"TEST","body":"fixture","digest_sha256":"d".repeat(64),"pubkey_ed25519":null,"signature_ed25519":null,"sig_verified":false})).unwrap();
+            let message:BusMessage=serde_json::from_value(json!({"id":"fixture-msg","seq":1,"ts_unix":1,"ts_iso":"fixture","room":"#eng","sender":"FIXTURE-C#fixture","sender_cast":"","sender_endpoint_id":"fixture","to":self.grant.actor,"task_id":"TEST","body":"fixture","digest_sha256":"d".repeat(64),"pubkey_ed25519":null,"signature_ed25519":null,"sig_verified":false})).unwrap();
             // Trusted private-state fixture tests handoff mechanics only. Crypto
             // interoperability uses the separate preserved-original integration.
             c.pending_deliveries.push(Delivery {
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn r1_held_restarts_preserve_classification_quota_witnesses_and_version() {
         for queued in [false, true] {
-            let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+            let f = Fixture::new("FIXTURE-A#fixture", "#eng", "TEST");
             f.seed_pending();
             let mut c = f.cursor();
             c.reserve(0, "e".repeat(64)).unwrap();
@@ -857,7 +857,7 @@ mod tests {
     }
     #[test]
     fn r1_idle_save_is_noop_and_stale_save_is_rejected() {
-        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let f = Fixture::new("FIXTURE-A#fixture", "#eng", "TEST");
         let mut c = f.cursor();
         let version = c.version;
         save(&f.store(), version, &mut c).unwrap();
@@ -885,7 +885,7 @@ mod tests {
     }
     #[test]
     fn timeout_and_offline_release_lock_without_claiming_host_admission() {
-        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let f = Fixture::new("FIXTURE-A#fixture", "#eng", "TEST");
         let args = Flags::from([("--timeout-secs".into(), "5".into())]);
         let mut calls = 0;
         let (code, value) = wait(
@@ -921,7 +921,7 @@ mod tests {
     }
     #[test]
     fn durable_handoff_ack_auth_and_all_lifecycle_states_preserve_one_quota_slot() {
-        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let f = Fixture::new("FIXTURE-A#fixture", "#eng", "TEST");
         f.seed_pending();
         // Crash before the cursor reservation can leave a private token orphan.
         f.store()
@@ -994,7 +994,7 @@ mod tests {
     }
     #[test]
     fn restart_before_ack_holds_unknown_and_owner_reconciliation_cannot_reset_quota() {
-        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let f = Fixture::new("FIXTURE-A#fixture", "#eng", "TEST");
         f.seed_pending();
         wait(
             &f.root,
@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn r1_signed_processed_converts_reserved_once_and_preserves_charged_work() {
         for charged in [false, true] {
-            let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+            let f = Fixture::new("FIXTURE-A#fixture", "#eng", "TEST");
             f.seed_pending();
             let mut c = f.cursor();
             c.reserve(0, "e".repeat(64)).unwrap();
@@ -1120,7 +1120,7 @@ mod tests {
                 let mut invalid = proof.clone();
                 match variant {
                     0 => invalid.expected_cursor_version += 1,
-                    1 => invalid.actor = "WORKHORSE#wrong".into(),
+                    1 => invalid.actor = "FIXTURE-A#wrong".into(),
                     2 => invalid.expires_at_unix = now() - 1,
                     3 => invalid.admission_id = Some("wrong-admission".into()),
                     _ => invalid.original_witnesses.clear(),
@@ -1158,7 +1158,7 @@ mod tests {
     }
     #[test]
     fn r1_archived_nonwaking_tail_resolves_before_idle_and_unproved_successor_holds() {
-        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let f = Fixture::new("FIXTURE-A#fixture", "#eng", "TEST");
         f.seed_pending();
         let mut c = f.cursor();
         let mut row = c.pending_deliveries.remove(0).messages.remove(0);
@@ -1207,7 +1207,7 @@ mod tests {
     }
     #[test]
     fn r1_subscription_boundary_concurrent_cursor_change_refuses_stale_scan() {
-        let f = Fixture::new("WORKHORSE#fixture", "#eng", "TEST");
+        let f = Fixture::new("FIXTURE-A#fixture", "#eng", "TEST");
         let error = wait_subscribed(
             &f.root,
             &f.grant.actor,

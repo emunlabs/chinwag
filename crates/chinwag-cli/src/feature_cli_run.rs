@@ -472,7 +472,7 @@ pub fn verify_plugin_manifest_json(repo_root: &Path, raw_json: &str) -> Result<V
     let signer_seat = v
         .get("signer_seat")
         .and_then(|x| x.as_str())
-        .unwrap_or("ALISTAIR");
+        .unwrap_or("REVIEWER");
 
     let pubkey: EndpointId = pub_hex
         .parse()
@@ -560,7 +560,7 @@ fn run_plugin_cli_in_context(
     let manifest_path = repo_plugin_dir.join("manifest.json");
 
     if sub == "init" && !manifest_path.exists() {
-        let signed_manifest = match build_signed_breakroom_manifest("ALISTAIR") {
+        let signed_manifest = match build_signed_breakroom_manifest("REVIEWER") {
             Ok(manifest) => manifest,
             Err(error) => {
                 let _ = writeln!(stderr, "plugin init: {error}");
@@ -630,7 +630,7 @@ fn run_plugin_cli_in_context(
                 let signer_seat = manifest_val
                     .get("signer_seat")
                     .and_then(|x| x.as_str())
-                    .unwrap_or("ALISTAIR");
+                    .unwrap_or("REVIEWER");
                 let payload = json!({
                     "ok": !airgap_locked,
                     "command": format!("chinwag plugin {sub}"),
@@ -760,23 +760,25 @@ pub(crate) fn run_a509_cli_with_selection(
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
         .count();
-    let seats = [
-        "rust",
-        "architect",
-        "flint",
-        "qa",
-        "alistair",
-        "type",
-        "gemini-pm",
-        "product",
-        "delivery",
-        "brian",
-    ];
-    let seat_records: Vec<_> = seats
+    let manifest_path = chinwag_fleet::FleetManifest::discover_path(None, repo_root);
+    let manifest_path = if manifest_path.is_absolute() {
+        manifest_path
+    } else {
+        repo_root.join(manifest_path)
+    };
+    let manifest = chinwag_fleet::FleetManifest::load(&manifest_path).ok();
+    let fleet_status = if manifest.is_some() {
+        "configured"
+    } else {
+        "unconfigured (no valid fleet manifest)"
+    };
+    let seat_records: Vec<_> = manifest
         .iter()
+        .flat_map(|manifest| &manifest.seats)
         .map(|seat| {
+            let seat = seat.id.as_str();
             json!({
-                "seat": seat.to_uppercase(),
+                "seat": seat,
                 "did": format!("did:chinwag:a509:{seat}"),
                 "iroh_endpoint_id": null,
                 "verified": false,
@@ -793,6 +795,7 @@ pub(crate) fn run_a509_cli_with_selection(
             "command": format!("chinwag a509 {sub}"),
             "allowed_signers": allowed_signers_path.to_string_lossy(),
             "seat_count": seat_records.len(),
+            "fleet_status": fleet_status,
             "public_signer_entries": public_entries,
             "private_keys_read": false,
             "disposition": "UNSUPPORTED",
@@ -825,7 +828,7 @@ pub(crate) fn run_a509_cli_with_selection(
             let _ = writeln!(
                 stdout,
                 "  [{badge}] ■ {seat:<10} did:chinwag:a509:{:<10} iroh:{short_ep}.. (allowed_signers={ok})",
-                seat.to_lowercase()
+                seat
             );
         }
     }
@@ -917,7 +920,7 @@ pub fn verify_cwcard_json(repo_root: &Path, raw_json: &str) -> Result<Value, Str
     let signer_seat = v
         .get("signer_seat")
         .and_then(|x| x.as_str())
-        .unwrap_or("ALISTAIR");
+        .unwrap_or("REVIEWER");
 
     let pubkey: EndpointId = pub_hex
         .parse()
@@ -1003,7 +1006,7 @@ fn run_cwcard_cli_in_context(
         .join("sample.cwcard.json");
 
     if sub == "init" && !cwcard_path.exists() {
-        let env = match build_signed_cwcard_envelope("ALISTAIR") {
+        let env = match build_signed_cwcard_envelope("REVIEWER") {
             Ok(envelope) => envelope,
             Err(error) => {
                 let _ = writeln!(stderr, "cwcard init: {error}");
@@ -1205,7 +1208,7 @@ pub fn verify_bond_json(repo_root: &Path, raw_json: &str) -> Result<Value, Strin
     let signer_seat = v
         .get("signer_seat")
         .and_then(|x| x.as_str())
-        .unwrap_or("ALISTAIR");
+        .unwrap_or("REVIEWER");
 
     let pubkey: EndpointId = pub_hex
         .parse()
@@ -1295,7 +1298,7 @@ fn run_bond_cli_in_context(
                 "cwbond-2026-axel-0001",
                 "AXEL",
                 942,
-                "ALISTAIR",
+                "REVIEWER",
             ) {
                 Ok(envelope) => envelope,
                 Err(error) => {
@@ -1312,7 +1315,7 @@ fn run_bond_cli_in_context(
                 "cwbond-2026-rando-0002",
                 "RANDO",
                 918,
-                "ALISTAIR",
+                "REVIEWER",
             ) {
                 Ok(envelope) => envelope,
                 Err(error) => {
@@ -1477,7 +1480,7 @@ mod tests {
         fs::create_dir_all(&plugin_dir).unwrap();
         fs::write(
             repo.join(".chinwag/allowed_signers"),
-            format!("alistair-agent@chinwag.sh namespaces=\"git\" {public} chinwag ALISTAIR\n"),
+            format!("reviewer@chinwag.test namespaces=\"git\" {public} chinwag REVIEWER\n"),
         )
         .unwrap();
         fs::write(
@@ -1495,7 +1498,7 @@ mod tests {
         fs::create_dir_all(repo.join("docs")).unwrap();
         fs::write(repo.join("docs/spec.md"), "fixture spec").unwrap();
         fs::write(repo.join("TASKS.md"), "# fixture tasks").unwrap();
-        let manifest = sign_breakroom_manifest("ALISTAIR", &SecretKey::from_bytes(&[37; 32]));
+        let manifest = sign_breakroom_manifest("REVIEWER", &SecretKey::from_bytes(&[37; 32]));
         write_test_plugin(&repo, &manifest);
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1534,13 +1537,13 @@ mod tests {
     fn plugin_verify_checks_real_ed25519_signature_and_rejects_tampered_manifest() {
         let temp = tempfile::tempdir().unwrap();
         init_test_repo(temp.path());
-        let manifest = sign_breakroom_manifest("ALISTAIR", &SecretKey::from_bytes(&[37; 32]));
+        let manifest = sign_breakroom_manifest("REVIEWER", &SecretKey::from_bytes(&[37; 32]));
         let raw = serde_json::to_string_pretty(&manifest).unwrap();
 
         // Missing .chinwag/allowed_signers -> fails closed
         assert!(verify_plugin_manifest_json(temp.path(), &raw).is_err());
 
-        // Populate .chinwag/allowed_signers with ALISTAIR's public key
+        // Populate .chinwag/allowed_signers with REVIEWER's public key
         let pub_hex = manifest["signer_pubkey_ed25519"].as_str().unwrap();
         let endpoint_id: EndpointId = pub_hex.parse().unwrap();
         let ssh_pub =
@@ -1550,9 +1553,7 @@ mod tests {
         fs::create_dir_all(&chinwag_dir).unwrap();
         fs::write(
             chinwag_dir.join("allowed_signers"),
-            format!(
-                "alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"
-            ),
+            format!("reviewer@chinwag.test namespaces=\"git\" {openssh_line} chinwag REVIEWER\n"),
         )
         .unwrap();
 
@@ -1615,7 +1616,7 @@ mod tests {
     #[test]
     fn cwcard_verify_checks_hpke_blake3_ed25519_envelope_and_rejects_tampering() {
         let temp = tempfile::tempdir().unwrap();
-        let env = sign_cwcard_envelope("ALISTAIR", &SecretKey::from_bytes(&[41; 32]));
+        let env = sign_cwcard_envelope("REVIEWER", &SecretKey::from_bytes(&[41; 32]));
         let raw = serde_json::to_string_pretty(&env).unwrap();
 
         let pub_hex = env["signer_pubkey_ed25519"].as_str().unwrap();
@@ -1627,9 +1628,7 @@ mod tests {
         fs::create_dir_all(&chinwag_dir).unwrap();
         fs::write(
             chinwag_dir.join("allowed_signers"),
-            format!(
-                "alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"
-            ),
+            format!("reviewer@chinwag.test namespaces=\"git\" {openssh_line} chinwag REVIEWER\n"),
         )
         .unwrap();
 
@@ -1648,7 +1647,7 @@ mod tests {
             "cwbond-2026-axel-0001",
             "AXEL",
             942,
-            "ALISTAIR",
+            "REVIEWER",
             &SecretKey::from_bytes(&[43; 32]),
         );
         let raw = serde_json::to_string_pretty(&bond).unwrap();
@@ -1662,9 +1661,7 @@ mod tests {
         fs::create_dir_all(&chinwag_dir).unwrap();
         fs::write(
             chinwag_dir.join("allowed_signers"),
-            format!(
-                "alistair-agent@chinwag.sh namespaces=\"git\" {openssh_line} chinwag ALISTAIR\n"
-            ),
+            format!("reviewer@chinwag.test namespaces=\"git\" {openssh_line} chinwag REVIEWER\n"),
         )
         .unwrap();
 
@@ -1817,5 +1814,64 @@ mod tests {
         assert_eq!(value["public_signer_entries"], 1);
         assert_eq!(value["private_keys_read"], false);
         assert_eq!(value["disposition"], "UNSUPPORTED");
+        assert_eq!(value["seat_count"], 0);
+        assert_eq!(value["seats"], json!([]));
+        assert_eq!(
+            value["fleet_status"],
+            "unconfigured (no valid fleet manifest)"
+        );
+
+        let mut manifest = chinwag_fleet::FleetManifest::starter_profile("solo").unwrap();
+        manifest.seats[0].id = chinwag_fleet::SeatId::new("arbitrary.Seat_9").unwrap();
+        fs::write(
+            root.join(".chinwag/fleet.toml"),
+            manifest.to_toml().unwrap(),
+        )
+        .unwrap();
+        out.clear();
+        assert_eq!(
+            run_a509_cli(
+                &[
+                    "inspect".into(),
+                    "--json".into(),
+                    "--repo".into(),
+                    root.to_string_lossy().into_owned()
+                ],
+                &mut out,
+                &mut Vec::new()
+            ),
+            1
+        );
+        let declared: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(declared["fleet_status"], "configured");
+        assert_eq!(declared["seat_count"], 1);
+        assert_eq!(declared["seats"][0]["seat"], "arbitrary.Seat_9");
+        assert_eq!(
+            declared["seats"][0]["did"],
+            "did:chinwag:a509:arbitrary.Seat_9"
+        );
+        assert_eq!(declared["seats"][0]["verified"], false);
+        assert_eq!(declared["private_keys_read"], false);
+        assert_eq!(declared["disposition"], "UNSUPPORTED");
+
+        fs::write(root.join(".chinwag/fleet.toml"), "invalid manifest fixture").unwrap();
+        out.clear();
+        assert_eq!(
+            run_a509_cli(
+                &[
+                    "inspect".into(),
+                    "--json".into(),
+                    "--repo".into(),
+                    root.to_string_lossy().into_owned()
+                ],
+                &mut out,
+                &mut Vec::new()
+            ),
+            1
+        );
+        let invalid: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(invalid["seat_count"], 0);
+        assert_eq!(invalid["private_keys_read"], false);
+        assert_eq!(invalid["disposition"], "UNSUPPORTED");
     }
 }

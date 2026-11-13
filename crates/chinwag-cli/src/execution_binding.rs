@@ -882,6 +882,12 @@ pub fn with_execution_binding<T>(
     effect(&mut binding)
 }
 impl WorkspaceExecutionBinding {
+    /// Pinned repository control directory, excluded from the approved worktree overlay.
+    /// Runtime lease bookkeeping here cannot redefine the bound source tree.
+    pub fn execution_control_root(&self) -> &Path {
+        &self.git.gitdir.path
+    }
+
     pub fn revalidate(&self, authority: &ExecutionAuthority<'_>) -> BindingResult<()> {
         self.revalidate_observers(authority)?;
         controls_absent(&self.enrollment.store.path)

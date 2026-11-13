@@ -35,7 +35,7 @@ impl Dispatcher for LocalDispatcher {
         {
             return 2;
         }
-        // CRDB is fixed by the Studio. The signed optional history/persona
+        // The store path is fixed by the listener workspace. The signed optional history/persona
         // context follows the existing stdin path without changing its runner.
         let Ok(bytes) = serde_json::to_vec(&payload) else {
             return 1;
@@ -50,6 +50,8 @@ impl Dispatcher for LocalDispatcher {
                 repo: Some(self.repo.clone()),
                 crdb: Some(self.repo.join(".chinwag/state.crdb")),
                 stdin_json: true,
+                fleet_manifest: None,
+                room: None,
             },
             &mut bytes.as_slice(),
             output,
@@ -337,7 +339,7 @@ mod tests {
         };
         let payload = Payload {
             agent: "RUST#child".into(),
-            sender: "WORKHORSE".into(),
+            sender: "FIXTURE-A".into(),
             body: "inert fixture".into(),
             item_key: "CHWG-THREAD-ID-01".into(),
             history: vec![],

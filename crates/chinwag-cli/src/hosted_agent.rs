@@ -19,7 +19,7 @@
 //!
 //! Generalizes standalone hosted API agent execution across:
 //! 1. `gemini_generate_content` — Google Gemini REST API (`POST {base_url}/models/{model}:generateContent`)
-//! 2. `open_ai_chat_completions` — OpenAI / xAI Grok / OpenRouter / Recursive Flint / Cloudflare AI Gateway
+//! 2. `open_ai_chat_completions` — OpenAI / xAI Grok / OpenRouter / Cloudflare AI Gateway
 //!    OpenAI-compatible Chat Completions (`POST {endpoint}`)
 //! 3. `cloudflare_workers_ai` — Cloudflare Workers AI REST API
 //!    (`POST {base_url}/accounts/{account_id}/ai/run/{model}`)
@@ -46,9 +46,9 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-pub const DEFAULT_GEMINI_MODEL: &str = "gemini-4-argon";
 pub const DEFAULT_CF_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
-pub const DEFAULT_CF_ACCOUNT_ID: &str = "a9dce15ce0193da7d7f1d5dd3a53022b";
+#[cfg(test)]
+const DEFAULT_CF_ACCOUNT_ID: &str = "0123456789abcdef0123456789abcdef";
 
 const O_NOFOLLOW: i32 = 0x0100;
 
@@ -212,134 +212,12 @@ pub struct HostedReply {
 }
 
 impl ProvidersConfig {
-    /// Builds the default fleet configuration rooted at `home_dir` and `workspace_dir`.
-    pub fn default_for_home(home_dir: &Path, workspace_dir: &Path) -> Self {
-        let chinwag_dir = home_dir.join(".chinwag");
-        let gemini_env = chinwag_dir.join("gemini.env");
-        let eleven_env = chinwag_dir.join("eleven.env");
-        let cloudflare_env = chinwag_dir.join("cloudflare.env");
-        let workers_token = home_dir.join(".config/cloudflare/workers-ai-ephemeral.token");
-
-        let cf_token_ref = if cloudflare_env.is_file() {
-            SecretRef::EnvFile {
-                path: cloudflare_env,
-                key: "CLOUDFLARE_WORKERS_AI_TOKEN".to_owned(),
-            }
-        } else {
-            SecretRef::TokenFile {
-                path: workers_token,
-            }
-        };
-
-        let mut providers = BTreeMap::new();
-        providers.insert(
-            "google-gemini".to_owned(),
-            ProviderConfig::GeminiGenerateContent {
-                base_url: DEFAULT_GEMINI_BASE_URL.to_owned(),
-                credential: SecretRef::EnvFile {
-                    path: gemini_env,
-                    key: "GEMINI_API_KEY".to_owned(),
-                },
-            },
-        );
-        providers.insert(
-            "cloudflare-workers-ai".to_owned(),
-            ProviderConfig::CloudflareWorkersAi {
-                base_url: DEFAULT_CF_BASE_URL.to_owned(),
-                account_id: DEFAULT_CF_ACCOUNT_ID.to_owned(),
-                credential: cf_token_ref.clone(),
-            },
-        );
-        let flint_endpoint = std::env::var("CHINWAG_FLINT_ENDPOINT")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "http://127.0.0.1:11500/v1/chat/completions".to_owned());
-        providers.insert(
-            "flint-local-openai".to_owned(),
-            ProviderConfig::OpenAiChatCompletions {
-                endpoint: flint_endpoint,
-                credential: None,
-            },
-        );
-
-        let mut agents = BTreeMap::new();
-        agents.insert(
-            "FREQUENCY".to_owned(),
-            AgentBinding {
-                provider: "google-gemini".to_owned(),
-                model: DEFAULT_GEMINI_MODEL.to_owned(),
-                limits: RunLimits::default(),
-                tools: ToolPolicy {
-                    enabled: true,
-                    allowed_write_roots: vec![
-                        workspace_dir.to_path_buf(),
-                        home_dir.join("fleet-skills/agents/FREQUENCY"),
-                    ],
-                    auth_fetches: vec![
-                        AuthFetchRule {
-                            host: "api.elevenlabs.io".to_owned(),
-                            path_prefix: Some("/v1/".to_owned()),
-                            header_name: "xi-api-key".to_owned(),
-                            header_prefix: None,
-                            credential: SecretRef::EnvFile {
-                                path: eleven_env.clone(),
-                                key: "ELEVENLABS_API_KEY".to_owned(),
-                            },
-                        },
-                        AuthFetchRule {
-                            host: "api.cloudflare.com".to_owned(),
-                            path_prefix: Some(format!(
-                                "/client/v4/accounts/{DEFAULT_CF_ACCOUNT_ID}/ai/"
-                            )),
-                            header_name: "Authorization".to_owned(),
-                            header_prefix: Some("Bearer ".to_owned()),
-                            credential: cf_token_ref.clone(),
-                        },
-                        AuthFetchRule {
-                            host: "gateway.ai.cloudflare.com".to_owned(),
-                            path_prefix: Some(format!("/v1/{DEFAULT_CF_ACCOUNT_ID}/")),
-                            header_name: "Authorization".to_owned(),
-                            header_prefix: Some("Bearer ".to_owned()),
-                            credential: cf_token_ref.clone(),
-                        },
-                    ],
-                    env_injections: vec![
-                        EnvInjectionRule {
-                            env_var: "ELEVENLABS_API_KEY".to_owned(),
-                            source: EnvValueSource::Secret {
-                                credential: SecretRef::EnvFile {
-                                    path: eleven_env,
-                                    key: "ELEVENLABS_API_KEY".to_owned(),
-                                },
-                            },
-                        },
-                        EnvInjectionRule {
-                            env_var: "CLOUDFLARE_ACCOUNT_ID".to_owned(),
-                            source: EnvValueSource::Literal {
-                                value: DEFAULT_CF_ACCOUNT_ID.to_owned(),
-                            },
-                        },
-                        EnvInjectionRule {
-                            env_var: "CLOUDFLARE_WORKERS_AI_TOKEN".to_owned(),
-                            source: EnvValueSource::Secret {
-                                credential: cf_token_ref.clone(),
-                            },
-                        },
-                        EnvInjectionRule {
-                            env_var: "CLOUDFLARE_API_TOKEN".to_owned(),
-                            source: EnvValueSource::Secret {
-                                credential: cf_token_ref,
-                            },
-                        },
-                    ],
-                },
-            },
-        );
-
+    /// An unconfigured provider registry has no dispatchable seats.
+    pub fn default_for_home(_home_dir: &Path, _workspace_dir: &Path) -> Self {
         Self {
             version: 1,
-            providers,
-            agents,
+            providers: BTreeMap::new(),
+            agents: BTreeMap::new(),
         }
     }
 
@@ -1816,7 +1694,7 @@ mod tests {
         let resp = transport
             .send(&HttpRequest {
                 method: "POST".to_owned(),
-                url: "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-argon:generateContent".to_owned(),
+                url: "https://generativelanguage.googleapis.com/v1beta/models/fixture-model:generateContent".to_owned(),
                 headers: vec![("x-goog-api-key".to_owned(), "SUPER_SECRET_SENTINEL_999".to_owned())],
                 body: Some("{\"hello\":\"world\"}".to_owned()),
                 timeout_secs: 30,
@@ -1861,10 +1739,10 @@ mod tests {
         );
         let mut agents = BTreeMap::new();
         agents.insert(
-            "FREQUENCY".to_owned(),
+            "FIXTURE-F".to_owned(),
             AgentBinding {
                 provider: "google-gemini".to_owned(),
-                model: "gemini-4-argon".to_owned(),
+                model: "fixture-model".to_owned(),
                 limits: RunLimits::default(),
                 tools: ToolPolicy {
                     enabled: true,
@@ -1929,7 +1807,7 @@ mod tests {
 
         let reply = run_hosted_seat(
             &cfg,
-            "FREQUENCY",
+            "FIXTURE-F",
             "System instructions",
             "Check ElevenLabs models",
             &mut transport,

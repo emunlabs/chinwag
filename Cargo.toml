@@ -1,7 +1,8 @@
 [workspace]
-members = ["crates/chinwag-acu", "crates/chinwag-history-archive", "crates/chinwag-seed", "crates/chinwag-swarm", "crates/chinwag-claim", "crates/chinwag-host-process", "crates/chinwag-cli", "crates/chinwag-signing", "crates/chinwag-snapshot-read-owner", "crates/chinwag-snapshot-session", "crates/confirmed-initial", "crates/confirmed-initial-consumer", "crates/chinwag-mcp", "crates/chinwag-editor-config", "crates/chinwag-ui", "crates/chinwag-test-fixtures", "crates/chinwag-ci"]
+members = ["crates/chinwag-acu", "crates/chinwag-history-archive", "crates/chinwag-seed", "crates/chinwag-swarm", "crates/chinwag-claim", "crates/chinwag-fleet", "crates/chinwag-host-process", "crates/chinwag-cli", "crates/chinwag-signing", "crates/chinwag-snapshot-read-owner", "crates/chinwag-snapshot-session", "crates/confirmed-initial", "crates/confirmed-initial-consumer", "crates/chinwag-mcp", "crates/chinwag-editor-config", "crates/chinwag-ui", "crates/chinwag-test-fixtures", "crates/chinwag-ci"]
 exclude = ["vendor/swarm-discovery"]
 resolver = "3"
+
 
 [workspace.package]
 version = "0.0.1"

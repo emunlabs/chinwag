@@ -511,7 +511,7 @@ mod tests {
     use iroh::{SecretKey, Signature};
     fn cursor() -> Cursor {
         serde_json::from_value(serde_json::json!({"schema":"chinwag.bus.durable-cursor-and-quota.v4",
-            "actor":"WORKHORSE#test","grant_id":"grant","authority_epoch":1,"grant_digest_sha256":"hash",
+            "actor":"FIXTURE-A#test","grant_id":"grant","authority_epoch":1,"grant_digest_sha256":"hash",
             "version":0,"max_turns_quota":1,"turns_used":0,"turns_reserved":0,"backlog_policy":"ExplicitWatermarkSeq",
             "last_scanned_seq":0,"last_scanned_id":"","last_scanned_digest":"","last_scanned_inode":0,
             "last_scanned_line1_digest":"","pending_deliveries":[],"completed_recent_digests":[],"completed_deliveries":[]})).unwrap()
@@ -536,14 +536,14 @@ mod tests {
     fn signed_bursts_are_bounded_deduplicated_and_backpressure_never_advances_cursor() {
         let key = SecretKey::generate();
         let public = key.public();
-        let grant:HostGrant=serde_json::from_value(serde_json::json!({"schema":"chinwag.host.enrollment.v3","grant_id":"grant","authority_epoch":1,"actor":"WORKHORSE#test",
+        let grant:HostGrant=serde_json::from_value(serde_json::json!({"schema":"chinwag.host.enrollment.v3","grant_id":"grant","authority_epoch":1,"actor":"FIXTURE-A#test",
             "host_kind":"antigravity_bg_task","host_version":"fixture","conversation_id":"test","supports_idempotent_admission_lookup":false,"allow_legacy_plaintext":true,
             "owner":"fixture","granted_capabilities":["bus_wait","same_chat_wake"],"allowed_rooms":["#eng"],"allowed_tasks":["TEST"],"max_turns_quota":1,"enrolled_at_unix":1,"expires_at_unix":100,
             "issuer_pubkey_ed25519":public.to_string(),"issuer_signature_ed25519":"fixture"})).unwrap();
         let mut rows = Vec::new();
         for n in 1..=80 {
-            let mut m:BusMessage=serde_json::from_value(serde_json::json!({"id":format!("fixture-{n}"),"seq":n,"ts_unix":1,"ts_iso":"fixture","room":"#eng","sender":"GEMINI-PM#fixture","sender_cast":"",
-                "sender_endpoint_id":public.to_string(),"to":"WORKHORSE#test","task_id":"TEST","body":"fixture @OTHER","digest_sha256":"","pubkey_ed25519":public.to_string(),"signature_ed25519":null,"sig_verified":false})).unwrap();
+            let mut m:BusMessage=serde_json::from_value(serde_json::json!({"id":format!("fixture-{n}"),"seq":n,"ts_unix":1,"ts_iso":"fixture","room":"#eng","sender":"FIXTURE-C#fixture","sender_cast":"",
+                "sender_endpoint_id":public.to_string(),"to":"FIXTURE-A#test","task_id":"TEST","body":"fixture @OTHER","digest_sha256":"","pubkey_ed25519":public.to_string(),"signature_ed25519":null,"sig_verified":false})).unwrap();
             m.digest_sha256 = message_digest(&m);
             m.signature_ed25519 = Some(hex(&key.sign(signing_payload(&m).as_bytes()).to_bytes()));
             rows.push(m);
@@ -604,7 +604,7 @@ mod tests {
         let mut other = rows[79].clone();
         other.seq = c.last_scanned_seq + 1;
         other.to = Some("OTHER#fixture".into());
-        other.body = "@WORKHORSE#test".into();
+        other.body = "@FIXTURE-A#test".into();
         other.digest_sha256 = message_digest(&other);
         other.signature_ed25519 = Some(hex(&key
             .sign(signing_payload(&other).as_bytes())

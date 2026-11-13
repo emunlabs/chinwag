@@ -1,9 +1,7 @@
 #![forbid(unsafe_code)]
-//! Shared, durable Phase 0 admission. Legacy CLI dispatch has no authority here.
-//!
-//! The public authority constructor is deliberately unsupported for execution:
-//! approved lease/execution adapters arrive in P0-08/P0-09. Positive conformance
-//! uses a private in-module profile, not caller booleans or a public `Done` DTO.
+//! Durable admission bound to current source controls and execution authority.
+//! Fleet qualification requires signed operator grants and a live path lease;
+//! unconfigured callers retain the explicit unsupported-adapter hold.
 use crate::task_dependency::{
     DependencyNode, DependencySourceBinding, ResolvedDependency, TaskStatus,
     validate_dependency_graph, validate_dependency_satisfaction,
@@ -187,6 +185,10 @@ pub struct CurrentAuthority<'a> {
     registry: &'a WorkspaceSourceRegistry,
     clock: HostClockState,
     profile: Option<ControlledProfile>,
+    qualified_fleet: Option<(
+        crate::delivery_operator_readiness::DeliveryOperatorReadiness,
+        chinwag_fleet::WorkspaceLeaseReceipt,
+    )>,
 }
 impl<'a> CurrentAuthority<'a> {
     pub fn unsupported(registry: &'a WorkspaceSourceRegistry, clock: HostClockState) -> Self {
@@ -194,7 +196,102 @@ impl<'a> CurrentAuthority<'a> {
             registry,
             clock,
             profile: None,
+            qualified_fleet: None,
         }
+    }
+
+    /// Verify an enrolled consumer's signed grants against the exact current
+    /// source projection and a live fleet/claim sandbox lease. No message DTO or
+    /// caller-supplied authorization boolean can turn on this constructor.
+    pub fn from_qualified_fleet(
+        registry: &'a WorkspaceSourceRegistry,
+        clock: HostClockState,
+        scheduler: &mut WorkspaceScheduler,
+        readiness: &crate::delivery_operator_readiness::DeliveryOperatorReadiness,
+        lease: &chinwag_fleet::WorkspaceLeaseReceipt,
+    ) -> Result<Self> {
+        let now = match clock {
+            HostClockState::Verified { now_unix } => now_unix,
+            _ => return Err(SchedulerError::Clock),
+        };
+        readiness
+            .verify_lease(lease, now)
+            .map_err(|error| SchedulerError::ResourceLeaseHeld(error.to_string()))?;
+        let claim = readiness.claim();
+        if claim.operator != registry.policy().scheduler_owner
+            || readiness.workspace_root() != registry.root_pin().path
+            || claim.execution_binding_id.is_empty()
+        {
+            return Err(SchedulerError::Grant);
+        }
+        scheduler.synchronize_sources(registry)?;
+        let mut grants = BTreeMap::new();
+        for signed in &claim.task_grants {
+            if signed.task_key_hex.len() % 2 != 0 || !signed.task_key_hex.is_ascii() {
+                return Err(SchedulerError::Grant);
+            }
+            let encoded = (0..signed.task_key_hex.len())
+                .step_by(2)
+                .map(|index| {
+                    u8::from_str_radix(&signed.task_key_hex[index..index + 2], 16)
+                        .map_err(|_| SchedulerError::Grant)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let key = TaskKey::decode(&encoded).map_err(|_| SchedulerError::Grant)?;
+            let task = scheduler
+                .catalog
+                .get(&key)
+                .ok_or(SchedulerError::StaleTask)?;
+            let spec = Sha256Digest::from_hex(&signed.task_spec_digest)
+                .map_err(|_| SchedulerError::Grant)?;
+            let controls = Sha256Digest::from_hex(&signed.task_control_digest)
+                .map_err(|_| SchedulerError::Grant)?;
+            if spec != task.reference.task_spec_digest || controls != task.entry.task_control_digest
+            {
+                return Err(SchedulerError::StaleTask);
+            }
+            task.source
+                .controls
+                .check_dispatch_admission(&signed.action)
+                .map_err(|_| SchedulerError::Grant)?;
+            if grants
+                .insert(
+                    key,
+                    Grant {
+                        id: signed.grant_id.clone(),
+                        principal: readiness.operator_key().to_string(),
+                        action: signed.action.clone(),
+                        executor: claim.recipient.clone(),
+                        resource: signed.resource.clone(),
+                        spec,
+                        controls,
+                        expires: claim.expires_at,
+                        max_tokens: signed.max_tokens,
+                        max_micro_usd: signed.max_micro_usd,
+                    },
+                )
+                .is_some()
+            {
+                return Err(SchedulerError::Grant);
+            }
+        }
+        Ok(Self {
+            registry,
+            clock,
+            profile: Some(ControlledProfile {
+                store_identity: scheduler.store_identity,
+                grants,
+                capacities: claim.resource_capacities.clone(),
+                execution_binding: claim.execution_binding_id.clone(),
+                write_claim: lease.claim_id.clone(),
+                token_limit: claim.token_limit,
+                micro_usd_limit: claim.micro_usd_limit,
+                // Completed dependencies still require the separately admitted
+                // verified acceptance commitment; enrollment cannot forge Done.
+                accepted_dependencies: BTreeMap::new(),
+            }),
+            qualified_fleet: Some((readiness.clone(), lease.clone())),
+        })
     }
 }
 #[derive(Clone)]
@@ -688,6 +785,15 @@ impl WorkspaceScheduler {
             .profile
             .as_ref()
             .ok_or(SchedulerError::UnsupportedAdapters)?;
+        if let Some((readiness, lease)) = &a.qualified_fleet {
+            let now = match a.clock {
+                HostClockState::Verified { now_unix } => now_unix,
+                _ => return Err(SchedulerError::Clock),
+            };
+            readiness
+                .verify_lease(lease, now)
+                .map_err(|error| SchedulerError::ResourceLeaseHeld(error.to_string()))?;
+        }
         if profile.store_identity != self.store_identity {
             return Err(SchedulerError::Grant);
         }
@@ -952,6 +1058,12 @@ impl WorkspaceScheduler {
             .as_ref()
             .ok_or(SchedulerError::UnsupportedAdapters)?;
         let auth = m.authenticated();
+        if a.qualified_fleet
+            .as_ref()
+            .is_some_and(|(readiness, _)| auth.signer_public_key() != readiness.operator_key())
+        {
+            return Err(SchedulerError::Grant);
+        }
         let tr = auth.transcript();
         if tr.message_kind != TaskMessageKind::Assignment
             || tr.sender_full_actor_address != self.policy.owner
@@ -1091,6 +1203,26 @@ impl WorkspaceScheduler {
         trigger: AdmissionTrigger,
         authority: &CurrentAuthority<'_>,
     ) -> Result<AdmissionDisposition> {
+        self.admit_inner(message, trigger, authority)
+    }
+
+    /// Fleet-native admission uses the signed operator enrollment and live
+    /// path-lease gate carried by CurrentAuthority. The legacy constructor
+    /// remains unsupported and cannot reach this admission seam.
+    pub fn admit_qualified_fleet(
+        &mut self,
+        message: &VerifiedTaskMessage,
+        trigger: AdmissionTrigger,
+        authority: &CurrentAuthority<'_>,
+    ) -> Result<AdmissionDisposition> {
+        if authority.qualified_fleet.is_none() {
+            return Err(SchedulerError::UnsupportedAdapters);
+        }
+        authority
+            .registry
+            .root_pin()
+            .verify()
+            .map_err(|error| SchedulerError::ExecutionBindingHeld(format!("{error:?}")))?;
         self.admit_inner(message, trigger, authority)
     }
 
@@ -1298,6 +1430,36 @@ impl WorkspaceScheduler {
         })
     }
 
+    /// Consume a durable scheduler claim using the real fleet subprocess driver.
+    /// A terminal child receipt confirms process retirement, never task Done.
+    pub fn invoke_qualified_fleet(
+        &mut self,
+        claim: ClaimedAssignment,
+        authority: &CurrentAuthority<'_>,
+    ) -> Result<AdmissionStatus> {
+        let (readiness, lease) = authority
+            .qualified_fleet
+            .as_ref()
+            .ok_or(SchedulerError::UnsupportedAdapters)?;
+        let message = claim.message.clone();
+        let now = self.now(authority)?;
+        self.invoke_checked(claim, authority, |admission| {
+            match readiness.execute_admitted_task(&message, lease, now) {
+                Ok(outcome) => {
+                    let bytes =
+                        serde_json::to_vec(&outcome).map_err(|_| SchedulerError::Invalid)?;
+                    Ok(InvocationOutcome::ConfirmedRetired {
+                        original_operation_id: admission.original_operation_id.clone(),
+                        receipt_id: format!("fleet-process-{}", Sha256Digest::of(&bytes)),
+                    })
+                }
+                Err(error) => Ok(InvocationOutcome::Unknown {
+                    reason: error.to_string(),
+                }),
+            }
+        })
+    }
+
     #[cfg(test)]
     fn invoke_with_lease(
         &mut self,
@@ -1426,7 +1588,7 @@ pub(crate) mod tests {
             task_control_digest: Sha256Digest([2; 32]),
             completion_policy_digest: Sha256Digest([3; 32]),
             owner_actor: None,
-            reviewer_role: "ARCHITECT".into(),
+            reviewer_role: "FIXTURE-B".into(),
             baseline_commit: GitOid::from_hex("15ea881e96d43a8ffe87f7e24dd5e9f22311ff31").unwrap(),
             candidate_commit: None,
             overlay_digest: None,
@@ -1682,6 +1844,7 @@ pub(crate) mod tests {
                 registry: &self.registry,
                 clock: HostClockState::Verified { now_unix: now },
                 profile: Some(self.profile.clone()),
+                qualified_fleet: None,
             }
         }
         fn open(&self) -> WorkspaceScheduler {
@@ -1716,14 +1879,14 @@ pub(crate) mod tests {
         let payload = r.encode().unwrap();
         let secret = SecretKey::from_bytes(&[7; 32]);
         let payload_hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
-        let tr=TaskTranscriptV3 {message_id:format!("message-{id}"),issued_at_unix:100,expires_at_unix:200,nonce:[9;32],sender_full_actor_address:f.registry.policy().scheduler_owner.clone(),parent_full_actor_address:Some("WORKHORSE#root".into()),recipient_full_actor_addresses:vec!["RUST#executor".into()],room:"#eng".into(),message_kind:TaskMessageKind::Assignment,receiver_authority_id:"fixture-authority".into(),task_ref:t.reference.clone(),assignment_id:Some(id.into()),operation_id:Some(format!("operation-{id}")),request_id:None,in_reply_to_message_id:None,config_digest:Sha256Digest(f.registry.policy().config_digest),task_control_digest:t.entry.task_control_digest,body_utf8:serde_json::json!({"payload_profile":ASSIGNMENT_PROFILE,"canonical_payload_hex":payload_hex,"payload_digest_sha256":Sha256Digest::of(&payload).to_string()}).to_string()};
+        let tr=TaskTranscriptV3 {message_id:format!("message-{id}"),issued_at_unix:100,expires_at_unix:200,nonce:[9;32],sender_full_actor_address:f.registry.policy().scheduler_owner.clone(),parent_full_actor_address:Some("FIXTURE-A#root".into()),recipient_full_actor_addresses:vec![g.executor.clone()],room:"#eng".into(),message_kind:TaskMessageKind::Assignment,receiver_authority_id:"fixture-authority".into(),task_ref:t.reference.clone(),assignment_id:Some(id.into()),operation_id:Some(format!("operation-{id}")),request_id:None,in_reply_to_message_id:None,config_digest:Sha256Digest(f.registry.policy().config_digest),task_control_digest:t.entry.task_control_digest,body_utf8:serde_json::json!({"payload_profile":ASSIGNMENT_PROFILE,"canonical_payload_hex":payload_hex,"payload_digest_sha256":Sha256Digest::of(&payload).to_string()}).to_string()};
         let profiles = [assignment_profile()];
         let frame = PublishTaskV1::sign(tr, &secret, &profiles).unwrap();
         let roster = [SignerEnrollment {
             workspace_id: t.reference.workspace_id.clone(),
             repo_id: t.reference.repo_id.clone(),
             seat: "DELIVERY".into(),
-            authenticated_signer_principal: "manager-principal".into(),
+            authenticated_signer_principal: g.principal.clone(),
             signer_pubkey: secret.public(),
             key_epoch: 1,
             config_digest: Sha256Digest(f.registry.policy().config_digest),
@@ -1736,7 +1899,7 @@ pub(crate) mod tests {
                 &roster,
                 &TaskVerificationContext {
                     receiver_authority_id: "fixture-authority",
-                    recipient_full_actor_address: "RUST#executor",
+                    recipient_full_actor_address: &g.executor,
                     current_task_ref: &t.reference,
                     config_digest: Sha256Digest(f.registry.policy().config_digest),
                     task_control_digest: t.entry.task_control_digest,
@@ -1963,6 +2126,138 @@ pub(crate) mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn qualified_fleet_signed_grant_live_lease_admits_and_invokes_real_child() {
+        use crate::delivery_operator_readiness::{
+            DeliveryOperatorReadiness, FleetTaskGrant, SignedConsumerBinding,
+        };
+        use chinwag_fleet::{
+            DispatchRequest, SeatId, prepare_execution_sandbox, release_execution_sandbox,
+            resolve_dispatch_plan,
+        };
+        let mut source = Fixture::new(vec![vec![entry("A1")]]);
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&source.registry.root_pin().path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut fleet = crate::delivery_operator_readiness::tests::Fixture::new();
+        fleet.operator = SecretKey::from_bytes(&[7; 32]);
+        let old = SeatId::new("OPERATOR").unwrap();
+        let new = SeatId::new("DELIVERY").unwrap();
+        fleet.manifest.seats[1].id = new.clone();
+        fleet.manifest.pubkey_map.remove(&old);
+        fleet.manifest.allowed_signers.remove(&old);
+        fleet
+            .manifest
+            .pubkey_map
+            .insert(new.clone(), fleet.operator.public().to_string());
+        fleet
+            .manifest
+            .allowed_signers
+            .insert(new, fleet.operator.public().to_string());
+        fleet.manifest.policy.operator_signers = vec!["DELIVERY#manager".into()];
+        fleet.binding.claim.operator = "DELIVERY#manager".into();
+        fleet.binding.claim.manifest_digest = fleet.manifest.digest().unwrap();
+        source.profile.execution_binding = fleet.binding.claim.execution_binding_id.clone();
+        for grant in source.profile.grants.values_mut() {
+            grant.executor = fleet.binding.claim.recipient.clone();
+            grant.principal = fleet.operator.public().to_string();
+        }
+        let mut scheduler = source.open();
+        scheduler.synchronize_sources(&source.registry).unwrap();
+        let key = scheduler.catalog.keys().next().unwrap().clone();
+        let grant = &source.profile.grants[&key];
+        fleet.binding.claim.task_grants = vec![FleetTaskGrant {
+            task_key_hex: key
+                .encode()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            grant_id: grant.id.clone(),
+            action: grant.action.clone(),
+            resource: grant.resource.clone(),
+            task_spec_digest: grant.spec.to_string(),
+            task_control_digest: grant.controls.to_string(),
+            max_tokens: 10,
+            max_micro_usd: 10,
+        }];
+        fleet.binding.claim.resource_capacities = source.profile.capacities.clone();
+        fleet.binding.claim.token_limit = 1000;
+        fleet.binding.claim.micro_usd_limit = 1000;
+        fleet.binding = SignedConsumerBinding::sign(
+            fleet.binding.claim.clone(),
+            &fleet.consumer,
+            &fleet.operator,
+        )
+        .unwrap();
+        let root = source.registry.root_pin().path.clone();
+        let claim_root = fleet.root.join("claims");
+        let readiness = DeliveryOperatorReadiness::qualify(
+            fleet.manifest.clone(),
+            fleet.binding.clone(),
+            &root,
+            &claim_root,
+            150,
+        )
+        .unwrap();
+        let plan = resolve_dispatch_plan(
+            &fleet.manifest,
+            &DispatchRequest {
+                seat: "RUNNER".into(),
+                actor: Some(fleet.binding.claim.recipient.clone()),
+                cwd: root,
+                requested_write_globs: fleet.binding.claim.requested_write_roots.clone(),
+                ..DispatchRequest::default()
+            },
+        )
+        .unwrap();
+        let lease = prepare_execution_sandbox(
+            &fleet.manifest,
+            &plan,
+            &claim_root,
+            &fleet.binding.claim.recipient,
+        )
+        .unwrap();
+        source.profile.write_claim = lease.claim_id.clone();
+        let authority = CurrentAuthority::from_qualified_fleet(
+            &source.registry,
+            HostClockState::Verified { now_unix: 150 },
+            &mut scheduler,
+            &readiness,
+            &lease,
+        )
+        .unwrap();
+        let selected = scheduler.select_next(&authority).unwrap();
+        assert_eq!(selected.task_ref.task_key(), key);
+        let message = message(&scheduler, &source, &key, "fleet-assignment", |_| {});
+        let AdmissionDisposition::Claimed(claim) = scheduler
+            .admit_qualified_fleet(&message, AdmissionTrigger::Manual, &authority)
+            .unwrap()
+        else {
+            panic!("expected qualified durable claim");
+        };
+        assert_eq!(
+            scheduler.invoke_qualified_fleet(claim, &authority).unwrap(),
+            AdmissionStatus::Completed
+        );
+        assert!(lease.isolated_cwd.join("evidence.txt").exists());
+        assert!(matches!(
+            scheduler
+                .admit_qualified_fleet(&message, AdmissionTrigger::Manual, &authority)
+                .unwrap(),
+            AdmissionDisposition::Existing(AdmissionStatus::Completed)
+        ));
+        release_execution_sandbox(&claim_root, &lease, false).unwrap();
+        assert!(matches!(
+            scheduler.select_next(&authority),
+            Err(SchedulerError::ResourceLeaseHeld(_))
+        ));
+    }
+
     #[test]
     fn p007_production_unsupported_and_fresh_authority_checks_have_no_effect() {
         let mut f = Fixture::new(vec![vec![entry("A1")]]);

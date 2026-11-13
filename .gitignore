@@ -4,3 +4,4 @@
 .chinwag/private/
 *.key
 *.pem
+/.t/
