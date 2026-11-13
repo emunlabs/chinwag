@@ -1,143 +1,218 @@
 // Copyright (c) 2026 Emun Labs, Inc. (1401 Lavaca St STE 81335, Austin, TX 78701)
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pairing-based Access Control Unit (`ACU`) core encryption, partial decryption, Chaum–Pedersen
-//! DLEQ share verification across $(\mathbb{G}_1, \mathbb{G}_T)$, combiner, deterministic `CHWGACU2`
-//! binary serialization with ACU-sealed basis commitments + row randomness scalars, and all 4 dynamic
-//! policy evolution operations (`insert_key`, `insert_sibling_key`, `escalate_threshold`, and
-//! `revoke_and_rerandomize`).
-//!
-//! Dynamic policy evolution mechanics are derived from the pairing-based DASTE paper:
-//! *Decentralized Ad-Hoc Access-Structured Threshold Encryption with Dynamic Policy Evolution*
-//! (ePrint 2026/1141), hardened under SXDH on `BLS12-381` for Chinwag (`CHWG-0271`):
-//! 1. **Zero $\mathbb{G}_2$ Secret-Key / Row-Randomness Leakage (`[P0-R2-1]` Fix):**
-//!    Seat public keys (`pk_1 = g_1^{sk}`) and row ciphertexts `(c_1 = g_1^{\lambda_j} + pk_1^{r_j}, c_3 = g_1^{r_j})`
-//!    live strictly in $\mathbb{G}_1$, preserving Decisional Diffie–Hellman in $\mathbb{G}_1$ so no passive
-//!    observer can use the pairing as an unmasking oracle.
-//! 2. **Chaum–Pedersen NIZK DLEQ Share Verification across $(\mathbb{G}_1, \mathbb{G}_T)$:**
-//!    Each partial decryption share $D_j = e(c_{j,1} - c_{j,3} \cdot sk_j, g_2) = e(g_1, g_2)^{\lambda_j} \in \mathbb{G}_T$
-//!    carries a Fiat–Shamir Chaum–Pedersen DLEQ proof $(c, z)$ proving
-//!    $\log_{g_1}(pk_{j,1}) = \log_{e(c_{j,3}, g_2)}(e(c_{j,1}, g_2) - D_j)$ without exposing $g_2^{sk_j}$
-//!    or cleartext basis commitments.
-//! 3. **ACU-Sealed Basis Commitments & Algebraic Row Witnesses (`[P1-R2-2]` Fix):**
-//!    Both $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ (including $V_0 = g_1^s$) and cumulative row
-//!    randomness scalars $r_0, \dots, r_{\ell-1} \in (\mathbb{F}_r^*)^\ell$ are sealed exclusively under
-//!    `pk_ACU` via ephemeral `BLS12-381` $\mathbb{G}_1$ KEM + `HKDF-SHA256` + `ChaCha20-Poly1305` with
-//!    injective binary AAD and verified algebraically against `ct.rows` on every unseal.
+//! Pairing-based Access Control Unit (`ACU`) core encryption (`CHWGACU3`), zero-$V_0$
+//! policy-matched independent $\mathbb{G}_1$-LSSS `SBC` slots (`ePrint v2` §6.1 Step 4 &
+//! Theorem 3(ii)), single-pairing pure-$\mathbb{G}_1$ coalition combine (`ePrint v2` §6.2),
+//! blind row locators $\ell_j$ + oblivious ECDH recipient hints (`UI v5` `F-01`, `ePrint v2` §7),
+//! and all dynamic policy evolution operations:
+//! - [`revoke_and_rerandomize`] (ciphertext-only homomorphic with self-lockout guard) &
+//!   [`emergency_lock_and_rerandomize`] (explicit CISO kill-switch lockout),
+//! - [`escalate_threshold`] / [`escalate_gate_threshold`] (ciphertext-only, subtree-consistent
+//!   $x_{g,c}$ & simultaneous full-$\mathbb{F}_r^k$ $\Delta v$ rerandomization),
+//! - [`insert_sibling_key`] via [`WarmForkRequest`] (`Shadow-KV` warm fork with 3-equation
+//!   HVZK Chaum–Pedersen equality proof — neither `ACU` nor custodian alone can forge or decrypt),
+//! - [`insert_authorized_seat`] via [`CoalitionInsertionRowShare`] (`ePrint v2` §6.3 Op 3 live
+//!   $V_0^{(E)}$ reconstruction + `SBC` compaction to a single slot).
 
 use crate::AcuError;
+use crate::framing::{
+    gt_canonical_bytes, hash_to_nonzero_scalar, lp64_str, read_g1_compressed, read_lp64,
+    read_lp64_str, read_nonidentity_g1_compressed, read_scalar, read_u8, read_u32_be, read_u64_be,
+    sample_uniform_scalar, take_slice,
+};
 use crate::keys::{
     MAX_SEAT_ID_BYTES, SeatPublicKey, SeatSecretKey, is_valid_seat_id, sample_nonzero_scalar,
 };
 use crate::lsss::{
     LsssMatrix, MAX_SERIALIZED_COLS, MAX_SERIALIZED_ROWS, find_reconstruction_weights,
-    submatrix_rank,
+    rows_span_target,
+};
+use crate::share::{
+    DleqMode, PartialDecryptionShare, RowPok, RowUpdateProof, batch_verify_partial_shares,
+    emit_partial_share_with_mode, prove_row_pok, prove_update_row_pok,
+    verify_partial_share_for_object, verify_row_randomness_chain,
 };
 use bls12_381::{G1Affine, G1Projective, G2Affine, Gt, Scalar, pairing};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ff::Field;
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand_core::{CryptoRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-const LEGACY_ACU_CT_MAGIC: &[u8; 8] = b"CHWGACU1";
-const ACU_CT_MAGIC: &[u8; 8] = b"CHWGACU2";
-const BASIS_SEAL_HKDF_SALT: &[u8] = b"chinwag-acu/v2/basis-seal-hkdf-salt";
-const BASIS_SEAL_HKDF_INFO: &[u8] = b"chinwag-acu/v2/basis-seal-chacha20poly1305-key";
-const BASIS_SEAL_AAD_DOMAIN: &[u8] = b"chinwag-acu/v2/basis-seal-aad";
+type HmacSha256 = Hmac<Sha256>;
 
-const DLEQ_NONCE_SALT: &[u8] = b"chinwag-acu/v2/partial-share-dleq-nonce-salt";
-const DLEQ_NONCE_INFO: &[u8] = b"chinwag-acu/v2/partial-share-dleq-nonce-wide";
-const DLEQ_CHALLENGE_DOMAIN: &[u8] = b"chinwag-acu/v2/partial-share-dleq-challenge";
-const DLEQ_CHALLENGE_SALT: &[u8] = b"chinwag-acu/v2/partial-share-dleq-challenge-salt";
-const DLEQ_CHALLENGE_INFO: &[u8] = b"chinwag-acu/v2/partial-share-dleq-challenge-wide";
+const LEGACY_ACU_CT_MAGIC_V1: &[u8; 8] = b"CHWGACU1";
+const LEGACY_ACU_CT_MAGIC_V2: &[u8; 8] = b"CHWGACU2";
+/// Canonical `v2`-parity `AcuCiphertext` wire magic (`CHWGACU3` — zero-$V_0$ policy-matched `SBC_E`).
+pub const ACU_CT_MAGIC: &[u8; 8] = b"CHWGACU3";
 
-const G1_COMPRESSED_BYTES: usize = 48;
-const SCALAR_BYTES: usize = 32;
+const SBC_HKDF_SALT: &[u8] = b"chinwag-acu/v3/sbc-slot-hkdf-salt";
+const SBC_HKDF_INFO_DOMAIN: &[u8] = b"chinwag-acu/v3/sbc-slot-chacha20poly1305-key";
+const SBC_AAD_DOMAIN: &[u8] = b"chinwag-acu/v3/sbc-slot-aad";
+const ROW_LOCATOR_DOMAIN: &[u8] = b"chinwag.acu.v2.row-loc";
+const OBLIVIOUS_HINT_DOMAIN: &[u8] = b"chinwag-acu-hint-v2";
+const WARM_FORK_DST: &[u8] = b"chinwag.acu.v2.warm-fork-hvzk";
+const HEADER_DIGEST_DOMAIN: &[u8] = b"chinwag.acu.v2.header-digest";
+
+const MAX_SBC_SLOTS: usize = 256;
+const MAX_ROW_UPDATES: usize = 256;
 const POLY1305_TAG_BYTES: usize = 16;
 
-/// RAII wrapper zeroizing transient $\mathbb{G}_1$ basis commitments and $\mathbb{F}_r$ row scalars on drop.
-struct UnsealedBasisState {
-    basis: Vec<G1Projective>,
-    row_scalars: Vec<Scalar>,
+/// Compute the `32`-byte per-object keyed blind row locator $\ell_j$ (`ePrint v2` §6.1 Step 2):
+/// $\ell_j = \mathsf{HMAC\text{-}SHA256}(k_{\mathsf{idx}},\, \text{"chinwag.acu.v2.row-loc"} \parallel O \parallel E_8 \parallel j_4 \parallel \mathsf{LP}(\mathsf{seat\_id}))$.
+#[must_use]
+pub fn compute_blind_row_locator(
+    locator_key: &[u8; 32],
+    object_digest: &[u8; 32],
+    epoch: u64,
+    row_index: u32,
+    seat_id: &str,
+) -> [u8; 32] {
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(locator_key).expect("HMAC-SHA256 accepts 32-byte key");
+    mac.update(ROW_LOCATOR_DOMAIN);
+    mac.update(object_digest);
+    mac.update(&epoch.to_be_bytes());
+    mac.update(&row_index.to_be_bytes());
+    mac.update(&(seat_id.len() as u64).to_be_bytes());
+    mac.update(seat_id.as_bytes());
+    mac.finalize().into_bytes().into()
 }
 
-impl Drop for UnsealedBasisState {
-    fn drop(&mut self) {
-        for elem in &mut self.basis {
-            elem.zeroize();
-        }
-        for scalar in &mut self.row_scalars {
-            scalar.zeroize();
-        }
+/// Compute the `8`-byte zero-extra-mul oblivious recipient ECDH hint (`UI v5` `F-01`):
+/// `BLAKE3("chinwag-acu-hint-v2" || compressed(r_j * pk_i))[..8]`.
+#[must_use]
+pub fn compute_oblivious_key_hint(shared_point: &G1Projective) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(OBLIVIOUS_HINT_DOMAIN);
+    hasher.update(&G1Affine::from(*shared_point).to_compressed());
+    let hash = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&hash.as_bytes()[..8]);
+    out
+}
+
+/// A single two-element $\mathbb{G}_1$ row of an [`AcuCiphertext`] (`ePrint v2` §6.1 Step 2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiphertextRow {
+    /// Stable 32-byte object identifier $O$ binding shares and randomness proofs to this object.
+    pub object_digest: [u8; 32],
+    /// Zero-based row index $j$ inside [`AcuCiphertext::rows`].
+    pub row_index: usize,
+    /// Seat or branch identifier $\rho(j)$ (e.g., `"branch:8687872"` or `"blind:..."` on Blind Relay wire).
+    pub seat_id: String,
+    /// Per-object `32`-byte keyed blind row locator $\ell_j$.
+    pub row_locator: [u8; 32],
+    /// `8`-byte oblivious ECDH hint `BLAKE3("chinwag-acu-hint-v2" || compressed(init_r_j * pk_i))[..8]`.
+    pub oblivious_hint: [u8; 8],
+    /// LSSS matrix row vector $M_j \in \mathbb{F}_r^k$.
+    pub matrix_row: Vec<Scalar>,
+    /// Share ciphertext component $c_{j,1} = \lambda_j G_1 + r_j pk_{\rho(j)} \in \mathbb{G}_1$.
+    pub c1: G1Projective,
+    /// Ephemeral randomness component $c_{j,2} = r_j G_1 \in \mathbb{G}_1^*$.
+    pub c2: G1Projective,
+    /// Epoch at which this row was initially created (`1` or insertion epoch).
+    pub init_epoch: u64,
+    /// Row index at `init_epoch` bound into `row_pok`.
+    pub init_row_index: u32,
+    /// Canonical SHA-256 digest of the `LsssMatrix` at `init_epoch` bound into `row_pok`
+    /// (prevents cut-and-paste of `ACU` rows across synthetic matrices without `acu_sk`).
+    pub init_matrix_digest: [u8; 32],
+    /// Initial `c1` at `init_epoch` prior to homomorphic rerandomizations.
+    pub init_c1: G1Projective,
+    /// Initial `c2` at `init_epoch` prior to homomorphic rerandomizations.
+    pub init_c2: G1Projective,
+    /// `64`-byte Schnorr proof $\pi^{\mathsf{row}}_j$ of knowledge of $r_j^{(0)}$ in `init_c2`.
+    pub row_pok: RowPok,
+    /// Verifiable homomorphic rerandomization updates $\pi^{\mathsf{upd}}_{r,j}$ (`c1 = init_c1 + \sum \Delta c1`).
+    pub updates: Vec<RowUpdateProof>,
+}
+
+impl CiphertextRow {
+    /// Check in $O(1)$ (`1` $\mathbb{G}_1$ scalar mul, `0` pairings) whether `secret_key` matches
+    /// this row's `oblivious_hint` without inspecting `seat_id` (`UI v5` `F-01`).
+    #[must_use]
+    pub fn matches_oblivious_hint(&self, secret_key: &SeatSecretKey) -> bool {
+        let shared = self.init_c2 * secret_key.sk;
+        let expected = compute_oblivious_key_hint(&shared);
+        bool::from(self.oblivious_hint.ct_eq(&expected))
     }
 }
 
-/// Basis commitments $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ (where $V_0 = g_1^s$) and cumulative
-/// row randomness scalars $r_0, \dots, r_{\ell-1} \in (\mathbb{F}_r^*)^\ell$ encrypted exclusively
-/// to the ACU operator's BLS12-381 $\mathbb{G}_1$ public key (`pk_ACU`) via ephemeral `BLS12-381`
-/// $\mathbb{G}_1$ KEM + `HKDF-SHA256` + `ChaCha20-Poly1305`.
+/// Policy-matched independent $\mathbb{G}_1$-LSSS Sealed Basis Commitment slot (`ePrint v2` §6.1 Step 4).
 ///
-/// Bound via injective binary AAD to `policy_epoch`, `acu_seat_id`, `cols`, `num_rows`, `c0_g1`,
-/// and the full LSSS matrix and row ciphertexts, and algebraically verified against `ct.rows` upon
-/// unsealing so untrusted relays, storage buckets, and unauthorized seats never observe cleartext
-/// $V_0 = g_1^s$ and cannot forge synthetic cut-and-paste ciphertexts against `CisoAcuFatClient`.
+/// Encrypts **only** auxiliary column commitments $(V_{\text{col\_offset}}, \dots, V_{\text{col\_offset}+\text{col\_count}-1})$
+/// (`col_offset >= 1` strictly — **never $V_0 = s G_1$!**) under an independent target-group secret
+/// $K_{\mathsf{sbc}} \in \mathbb{G}_T$ and independent sharing vector $v_{\mathsf{sbc}} \in \mathbb{F}_r^k$
+/// over the current `(M_E, \rho_E)` policy (zero KDM cycles, zero unilateral `ACU` decryption, and
+/// zero sub-threshold escalation rollback).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SealedBasisCommitments {
-    /// Canonical seat identifier of the ACU operator whose `pk_ACU` seals these commitments.
-    pub acu_seat_id: String,
-    /// Ephemeral KEM encapsulation point $E_{\text{kem}} = g_1^{r_{\text{kem}}} \in \mathbb{G}_1$.
-    pub ephemeral_pk1: G1Projective,
-    /// 96-bit ChaCha20-Poly1305 nonce.
-    pub nonce: [u8; 12],
-    /// ChaCha20-Poly1305 ciphertext + 16-byte Poly1305 tag encrypting $48 \cdot k + 32 \cdot \ell$ bytes.
-    pub ciphertext: Vec<u8>,
-}
-
-/// A single row of an [`AcuCiphertext`] bound to recipient seat `seat_id` in $\mathbb{G}_1$.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CiphertextRow {
-    /// Zero-based row index inside [`AcuCiphertext::rows`].
-    pub row_index: usize,
-    /// Seat or branch identifier $\rho(j)$ (e.g., `"branch:8687872"` or `"acu:98939834"`).
-    pub seat_id: String,
-    /// LSSS matrix row vector $M_j \in \mathbb{F}_r^k$.
-    pub matrix_row: Vec<Scalar>,
-    /// Share ciphertext component $c_{j,1} = g_1^{\lambda_j} + pk_{\rho(j),1}^{r_j} \in \mathbb{G}_1$.
-    pub c1: G1Projective,
-    /// Ephemeral randomness component $c_{j,3} = g_1^{r_j} \in \mathbb{G}_1^*$.
-    pub c3: G1Projective,
-}
-
-/// Pairing-based ACU header ciphertext (`CHWGACU2`) supporting in-place dynamic policy evolution
-/// by the ACU operator without decrypting $c_0$ or exposing cleartext basis commitments $V_m = g_1^{v_m}$
-/// or $\mathbb{G}_2$ blinding witnesses on the wire.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AcuCiphertext {
-    /// Monotonically increasing policy epoch counter (starts at `1` upon initial encryption).
-    pub policy_epoch: u64,
-    /// Masked $\mathbb{G}_1$ preimage $c_{0,\mathbb{G}_1} = K_{\mathbb{G}_1} + g_1^s \in \mathbb{G}_1$
-    /// such that $c_0 = e(c_{0,\mathbb{G}_1}, g_2) = K + e(g_1, g_2)^s \in \mathbb{G}_T$.
-    /// Serializes canonically in 48 compressed bytes (`G1Affine::to_compressed`).
+pub struct SbcSlot {
+    /// Epoch at which this slot's symmetric ciphertext was sealed (`>= 1`).
+    pub created_epoch: u64,
+    /// Starting auxiliary column index (`>= 1` strictly; column `0` / $V_0$ is forbidden).
+    pub col_offset: usize,
+    /// Number of auxiliary $\mathbb{G}_1$ commitments encrypted in `ciphertext` (`48 * col_count + 16` B).
+    pub col_count: usize,
+    /// Independent $\mathbb{G}_1$ preimage $c_{0,\mathsf{sbc},\mathbb{G}_1} = \kappa_{\mathsf{sbc}} G_1 + s_{\mathsf{sbc}} G_1$.
     pub c0_g1: G1Projective,
-    /// Masked target-group payload key $c_0 = K + e(g_1, g_2)^s \in \mathbb{G}_T$.
-    pub c0: Gt,
-    /// Basis commitments $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ and row scalars $r_0, \dots, r_{\ell-1}$
-    /// sealed exclusively under `pk_ACU`.
-    pub sealed_basis: SealedBasisCommitments,
-    /// Current LSSS policy matrix $(M, \rho)$ over $\mathbb{F}_r$.
-    pub matrix: LsssMatrix,
-    /// Per-row ciphertext components matching `matrix.rows`.
+    /// `96`-bit ChaCha20-Poly1305 nonce.
+    pub nonce: [u8; 12],
+    /// ChaCha20-Poly1305 ciphertext encrypting `col_count` compressed `48`-byte $\mathbb{G}_1$ points.
+    pub ciphertext: Vec<u8>,
+    /// Policy-matched $\mathbb{G}_1$-LSSS rows aligned 1-to-1 with [`AcuCiphertext::rows`].
     pub rows: Vec<CiphertextRow>,
 }
 
+/// Pairing-based ACU header ciphertext (`CHWGACU3`) with zero-$V_0$ policy-matched `SBC` slots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcuCiphertext {
+    /// Stable 32-byte object digest $O$.
+    pub object_digest: [u8; 32],
+    /// Monotonically increasing policy epoch counter (`>= 1`).
+    pub policy_epoch: u64,
+    /// Seat identifier of the `ACU` operator authorized to apply ciphertext-only policy evolutions
+    /// (holds **zero** unilateral decryption capability over `c0` or `sbc_slots`).
+    pub acu_seat_id: String,
+    /// Masked $\mathbb{G}_1$ preimage $c_{0,\mathbb{G}_1} = K_{\mathbb{G}_1} + s^{(E)} G_1 \in \mathbb{G}_1$.
+    pub c0_g1: G1Projective,
+    /// Masked target-group payload key $c_0 = e(c_{0,\mathbb{G}_1}, G_2) = K_{\mathbb{G}_T} \cdot g_T^{s^{(E)}} \in \mathbb{G}_T$.
+    pub c0: Gt,
+    /// Current LSSS policy matrix $(M_E, \rho_E, \mathcal{D}_{\mathsf{gate}})$ over $\mathbb{F}_r$.
+    pub matrix: LsssMatrix,
+    /// Per-row two-element $\mathbb{G}_1$ ciphertexts and randomness proofs.
+    pub rows: Vec<CiphertextRow>,
+    /// Zero-$V_0$ policy-matched independent $\mathbb{G}_1$-LSSS auxiliary commitment slots $\mathsf{SBC}_E$.
+    pub sbc_slots: Vec<SbcSlot>,
+    /// Algebraic Schnorr signature under `acu_pk.pk1` authenticating dynamic policy evolutions (`policy_epoch >= 2`).
+    pub acu_epoch_auth: Option<RowPok>,
+}
+
 impl AcuCiphertext {
-    /// Validate full in-memory structural equivalence between `self.matrix` and `self.rows`.
+    /// Compute the deterministic 32-byte SHA-256 digest $h_{H_E}$ of this `AcuCiphertext` header.
+    #[must_use]
+    pub fn header_digest(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(HEADER_DIGEST_DOMAIN);
+        h.update(self.to_bytes());
+        h.finalize().into()
+    }
+
+    /// Validate full structural equivalence across `self.matrix`, `self.rows`, and all `self.sbc_slots`,
+    /// including strict zero-$V_0$ enforcement (`slot.col_offset >= 1` and exact ciphertext byte lengths).
     pub fn validate_structure(&self) -> Result<(), AcuError> {
+        if self.policy_epoch == 0 {
+            return Err(AcuError::SerializationError("policy_epoch must be >= 1"));
+        }
+        if !is_valid_seat_id(&self.acu_seat_id) {
+            return Err(AcuError::InvalidSeatId);
+        }
         self.matrix.validate()?;
         if self.rows.len() != self.matrix.rows.len() {
             return Err(AcuError::DimensionMismatch {
@@ -148,9 +223,12 @@ impl AcuCiphertext {
         for (expected_idx, (row, (mat_seat, mat_vec))) in
             self.rows.iter().zip(self.matrix.rows.iter()).enumerate()
         {
-            if row.row_index != expected_idx || row.seat_id != *mat_seat {
+            if row.row_index != expected_idx
+                || row.seat_id != *mat_seat
+                || !bool::from(row.object_digest.ct_eq(&self.object_digest))
+            {
                 return Err(AcuError::SerializationError(
-                    "AcuCiphertext rows/matrix seat or index mismatch",
+                    "AcuCiphertext rows/matrix seat, object_digest, or index mismatch",
                 ));
             }
             if row.matrix_row != *mat_vec {
@@ -159,60 +237,351 @@ impl AcuCiphertext {
                     actual: row.matrix_row.len(),
                 });
             }
+            if row.updates.len() > MAX_ROW_UPDATES {
+                return Err(AcuError::SerializationError("too many row updates"));
+            }
+        }
+
+        if self.sbc_slots.is_empty() || self.sbc_slots.len() > MAX_SBC_SLOTS {
+            return Err(AcuError::SerializationError("invalid sbc_slots count"));
+        }
+        for slot in &self.sbc_slots {
+            if slot.created_epoch == 0 || slot.created_epoch > self.policy_epoch {
+                return Err(AcuError::SerializationError("invalid SbcSlot epoch"));
+            }
+            // HARD ZERO-V_0 INVARIANT: column 0 (`s * G_1`) may NEVER appear in any SbcSlot!
+            if slot.col_offset == 0 {
+                return Err(AcuError::SerializationError(
+                    "SbcSlot col_offset == 0 forbidden (zero-V_0 invariant)",
+                ));
+            }
+            let end_col = slot
+                .col_offset
+                .checked_add(slot.col_count)
+                .ok_or(AcuError::SerializationError("SbcSlot column overflow"))?;
+            if self.matrix.cols == 1 {
+                if slot.col_offset != 1 || slot.col_count != 0 {
+                    return Err(AcuError::SerializationError(
+                        "SbcSlot non-empty on 1-column matrix",
+                    ));
+                }
+            } else if end_col > self.matrix.cols {
+                return Err(AcuError::DimensionMismatch {
+                    expected: self.matrix.cols,
+                    actual: end_col,
+                });
+            }
+            let expected_ct_len = slot
+                .col_count
+                .checked_mul(48)
+                .and_then(|n| n.checked_add(POLY1305_TAG_BYTES))
+                .ok_or(AcuError::SerializationError("SbcSlot ciphertext overflow"))?;
+            if slot.ciphertext.len() != expected_ct_len {
+                return Err(AcuError::SerializationError(
+                    "SbcSlot ciphertext length mismatch",
+                ));
+            }
+            if slot.rows.len() != self.rows.len() {
+                return Err(AcuError::DimensionMismatch {
+                    expected: self.rows.len(),
+                    actual: slot.rows.len(),
+                });
+            }
+            for (idx, (s_row, m_row)) in slot.rows.iter().zip(self.rows.iter()).enumerate() {
+                if s_row.row_index != idx
+                    || s_row.seat_id != m_row.seat_id
+                    || s_row.matrix_row != m_row.matrix_row
+                    || !bool::from(s_row.object_digest.ct_eq(&self.object_digest))
+                {
+                    return Err(AcuError::SerializationError("SbcSlot row alignment error"));
+                }
+            }
         }
         Ok(())
     }
 
-    /// Serialize this [`AcuCiphertext`] into a deterministic, self-framing binary format
-    /// (`CHWGACU2`) using canonical Zcash/IETF compressed BLS12-381 $\mathbb{G}_1$ points (`48` bytes),
-    /// `32`-byte little-endian $\mathbb{F}_r$ scalars, and ACU-sealed basis commitments + row scalars.
+    /// Serialize this [`AcuCiphertext`] into canonical `CHWGACU3` bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.encode_internal(false)
+    }
+
+    /// Serialize this [`AcuCiphertext`] into Blind-Relay / R2-Parquet `CHWGACU3` bytes where every
+    /// cleartext `seat_id` is replaced on the wire by its pseudonymous blind locator handle
+    /// (`"blind:<hex>"`), leaking zero roster strings to $\mathcal{A}_1$ (`UI v5` `F-01`, `ePrint v2` §7).
+    #[must_use]
+    pub fn to_blind_bytes(&self) -> Vec<u8> {
+        self.encode_internal(true)
+    }
+
+    fn encode_internal(&self, blind_seats: bool) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(ACU_CT_MAGIC);
+        out.extend_from_slice(&self.object_digest);
         out.extend_from_slice(&self.policy_epoch.to_be_bytes());
+
+        let acu_wire_id = if blind_seats {
+            let loc = compute_blind_row_locator(
+                &self.object_digest,
+                &self.object_digest,
+                1,
+                u32::MAX,
+                &self.acu_seat_id,
+            );
+            blind_handle_from_locator(&loc)
+        } else {
+            self.acu_seat_id.clone()
+        };
+        lp64_str(&mut out, &acu_wire_id);
+
         out.extend_from_slice(&(self.matrix.cols as u32).to_be_bytes());
         out.extend_from_slice(&(self.rows.len() as u32).to_be_bytes());
         out.extend_from_slice(&G1Affine::from(self.c0_g1).to_compressed());
-
-        let acu_seat_bytes = self.sealed_basis.acu_seat_id.as_bytes();
-        out.extend_from_slice(&(acu_seat_bytes.len() as u32).to_be_bytes());
-        out.extend_from_slice(acu_seat_bytes);
-        out.extend_from_slice(&G1Affine::from(self.sealed_basis.ephemeral_pk1).to_compressed());
-        out.extend_from_slice(&self.sealed_basis.nonce);
-        out.extend_from_slice(&(self.sealed_basis.ciphertext.len() as u32).to_be_bytes());
-        out.extend_from_slice(&self.sealed_basis.ciphertext);
+        self.matrix.encode_gates(&mut out);
 
         for row in &self.rows {
-            out.extend_from_slice(&(row.row_index as u32).to_be_bytes());
-            let seat_bytes = row.seat_id.as_bytes();
-            out.extend_from_slice(&(seat_bytes.len() as u32).to_be_bytes());
-            out.extend_from_slice(seat_bytes);
-            for scalar in &row.matrix_row {
-                out.extend_from_slice(&scalar.to_bytes());
+            encode_ciphertext_row(&mut out, row, blind_seats);
+        }
+
+        out.extend_from_slice(&(self.sbc_slots.len() as u32).to_be_bytes());
+        for slot in &self.sbc_slots {
+            out.extend_from_slice(&slot.created_epoch.to_be_bytes());
+            out.extend_from_slice(&(slot.col_offset as u32).to_be_bytes());
+            out.extend_from_slice(&(slot.col_count as u32).to_be_bytes());
+            out.extend_from_slice(&G1Affine::from(slot.c0_g1).to_compressed());
+            out.extend_from_slice(&slot.nonce);
+            out.extend_from_slice(&(slot.ciphertext.len() as u64).to_be_bytes());
+            out.extend_from_slice(&slot.ciphertext);
+            for s_row in &slot.rows {
+                encode_ciphertext_row(&mut out, s_row, blind_seats);
             }
-            out.extend_from_slice(&G1Affine::from(row.c1).to_compressed());
-            out.extend_from_slice(&G1Affine::from(row.c3).to_compressed());
+        }
+        match &self.acu_epoch_auth {
+            None => out.push(0u8),
+            Some(pok) => {
+                out.push(1u8);
+                out.extend_from_slice(&pok.to_bytes());
+            }
         }
         out
     }
 
-    /// Deserialize an [`AcuCiphertext`] from its canonical `CHWGACU2` binary representation,
-    /// failing closed on legacy insecure `CHWGACU1` wire blobs, curve subgroup violations,
-    /// identity points, non-canonical scalars, or structural mismatches.
+    /// Compute the canonical core digest covered by `acu_epoch_auth` (`acu_sk.sk` Schnorr signature)
+    /// across dynamic policy evolutions (`policy_epoch >= 2`), invariant across `to_blind_bytes` -> `resolve_blind_seats`.
+    fn epoch_auth_core_digest(&self) -> [u8; 32] {
+        let mut copy = self.clone();
+        copy.acu_epoch_auth = None;
+        let encoded = copy.to_bytes();
+        let mut h = Sha256::new();
+        h.update(b"chinwag.acu.v2.epoch-auth-core");
+        h.update((encoded.len() as u64).to_be_bytes());
+        h.update(&encoded);
+        h.finalize().into()
+    }
+
+    pub(crate) fn sign_epoch_auth(&mut self, acu_sk: &SeatSecretKey) -> Result<(), AcuError> {
+        let core = self.epoch_auth_core_digest();
+        let g1 = G1Projective::generator();
+        let pk1_aff = G1Affine::from(g1 * acu_sk.sk);
+        let sk_bytes = Zeroizing::new(acu_sk.sk.to_bytes());
+        for ctr in 0u32.. {
+            let mut nonce_msg = Zeroizing::new([0u8; 68]);
+            nonce_msg[..32].copy_from_slice(&*sk_bytes);
+            nonce_msg[32..64].copy_from_slice(&core);
+            nonce_msg[64..68].copy_from_slice(&ctr.to_be_bytes());
+            let mut k = hash_to_nonzero_scalar(&nonce_msg[..], b"chinwag.acu.v2.epoch-auth-k")?;
+            let r_aff = G1Affine::from(g1 * k);
+            if bool::from(r_aff.is_identity()) {
+                k.zeroize();
+                continue;
+            }
+            let mut ch_msg = [0u8; 32 + 48 + 48];
+            ch_msg[..32].copy_from_slice(&core);
+            ch_msg[32..80].copy_from_slice(&pk1_aff.to_compressed());
+            ch_msg[80..128].copy_from_slice(&r_aff.to_compressed());
+            let ch = hash_to_nonzero_scalar(&ch_msg, b"chinwag.acu.v2.epoch-auth-ch")?;
+            let z = k + ch * acu_sk.sk;
+            k.zeroize();
+            if !bool::from(z.is_zero()) {
+                self.acu_epoch_auth = Some(RowPok {
+                    challenge: ch,
+                    response: z,
+                });
+                return Ok(());
+            }
+        }
+        unreachable!("unbounded counter finds valid epoch_auth nonce w.h.p.")
+    }
+
+    fn verify_epoch_auth(&self, acu_pk: &SeatPublicKey, pok: &RowPok) -> bool {
+        if self.policy_epoch < 2
+            || bool::from(pok.challenge.is_zero())
+            || bool::from(pok.response.is_zero())
+        {
+            return false;
+        }
+        let core = self.epoch_auth_core_digest();
+        let pk1_aff = G1Affine::from(acu_pk.pk1);
+        let r_pt = G1Projective::generator() * pok.response - acu_pk.pk1 * pok.challenge;
+        let r_aff = G1Affine::from(r_pt);
+        if bool::from(r_aff.is_identity()) {
+            return false;
+        }
+        let mut ch_msg = [0u8; 32 + 48 + 48];
+        ch_msg[..32].copy_from_slice(&core);
+        ch_msg[32..80].copy_from_slice(&pk1_aff.to_compressed());
+        ch_msg[80..128].copy_from_slice(&r_aff.to_compressed());
+        let Ok(expected) = hash_to_nonzero_scalar(&ch_msg, b"chinwag.acu.v2.epoch-auth-ch") else {
+            return false;
+        };
+        bool::from(pok.challenge.to_bytes().ct_eq(&expected.to_bytes()))
+    }
+
+    /// Cryptographically authenticate this [`AcuCiphertext`] (`CHWGACU3`) before any online custodian
+    /// (`CisoAcuFatClient`) applies its secret key:
+    /// 1. Validates structure and zero-$V_0$ `SbcSlot` bounds,
+    /// 2. Enforces either `acu_epoch_auth` (Schnorr proof under `acu_pk.pk1` for dynamic policy evolutions)
+    ///    OR exact initial matrix digest match (`row.init_matrix_digest == self.matrix.canonical_digest()`
+    ///    with `updates.is_empty()` and `init_epoch == policy_epoch`), blocking cut-and-paste row splicing, and
+    /// 3. Verifies every row's pure-$\mathbb{G}_1$ `RowPok` + `RowUpdateProof` randomness chain across
+    ///    both `self.rows` and `self.sbc_slots`.
+    pub fn verify_authenticity<'a>(
+        &self,
+        acu_pk: &SeatPublicKey,
+        seat_lookup: impl Fn(&str) -> Option<&'a SeatPublicKey>,
+    ) -> Result<(), AcuError> {
+        self.validate_structure()?;
+        if self.acu_seat_id != acu_pk.seat_id || !acu_pk.verify_consistency() {
+            return Err(AcuError::InvalidPublicKey(self.acu_seat_id.clone()));
+        }
+
+        let current_mat_digest = self.matrix.canonical_digest();
+        match &self.acu_epoch_auth {
+            Some(pok) => {
+                if !self.verify_epoch_auth(acu_pk, pok) {
+                    return Err(AcuError::BasisUnsealFailed);
+                }
+            }
+            None => {
+                for row in &self.rows {
+                    if !bool::from(row.init_matrix_digest.ct_eq(&current_mat_digest)) {
+                        return Err(AcuError::InvalidRowPok);
+                    }
+                    if row.init_epoch != self.policy_epoch || !row.updates.is_empty() {
+                        return Err(AcuError::BasisUnsealFailed);
+                    }
+                }
+                for slot in &self.sbc_slots {
+                    if slot.created_epoch != self.policy_epoch {
+                        return Err(AcuError::BasisUnsealFailed);
+                    }
+                    for s_row in &slot.rows {
+                        if !bool::from(s_row.init_matrix_digest.ct_eq(&current_mat_digest)) {
+                            return Err(AcuError::InvalidRowPok);
+                        }
+                        if s_row.init_epoch != slot.created_epoch || !s_row.updates.is_empty() {
+                            return Err(AcuError::BasisUnsealFailed);
+                        }
+                    }
+                }
+            }
+        }
+
+        for row in &self.rows {
+            let pk = seat_lookup(&row.seat_id)
+                .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
+            if !verify_row_randomness_chain(&self.object_digest, row, pk) {
+                return Err(AcuError::InvalidRowPok);
+            }
+        }
+        for slot in &self.sbc_slots {
+            for s_row in &slot.rows {
+                let pk = seat_lookup(&s_row.seat_id)
+                    .ok_or_else(|| AcuError::UnknownSeat(s_row.seat_id.clone()))?;
+                if !verify_row_randomness_chain(&self.object_digest, s_row, pk) {
+                    return Err(AcuError::InvalidRowPok);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve pseudonymous `"blind:..."` seat handles back to canonical seat IDs using a workspace
+    /// `locator_key` and known `seat_keys` directory (or oblivious ECDH hints).
+    pub fn resolve_blind_seats(
+        &mut self,
+        locator_key: &[u8; 32],
+        seat_keys: &BTreeMap<String, SeatPublicKey>,
+    ) {
+        for cand_id in seat_keys.keys() {
+            let acu_loc = compute_blind_row_locator(
+                &self.object_digest,
+                &self.object_digest,
+                1,
+                u32::MAX,
+                cand_id,
+            );
+            if self.acu_seat_id == blind_handle_from_locator(&acu_loc) {
+                self.acu_seat_id = cand_id.clone();
+                break;
+            }
+        }
+        for idx in 0..self.rows.len() {
+            let row = &self.rows[idx];
+            let mut matched: Option<String> = None;
+            for cand_id in seat_keys.keys() {
+                let cand_loc = compute_blind_row_locator(
+                    locator_key,
+                    &self.object_digest,
+                    row.init_epoch,
+                    row.init_row_index,
+                    cand_id,
+                );
+                if bool::from(cand_loc.ct_eq(&row.row_locator)) {
+                    matched = Some(cand_id.clone());
+                    break;
+                }
+            }
+            if let Some(real_id) = matched {
+                self.rows[idx].seat_id.clone_from(&real_id);
+                self.matrix.rows[idx].0.clone_from(&real_id);
+                for slot in &mut self.sbc_slots {
+                    slot.rows[idx].seat_id.clone_from(&real_id);
+                }
+            }
+        }
+    }
+
+    /// Deserialize an [`AcuCiphertext`] from canonical `CHWGACU3` bytes, failing closed with
+    /// [`AcuError::InsecureLegacyFormat`] on both `CHWGACU1` (cleartext $V_0$) and `CHWGACU2`
+    /// (`acu_pk`-only `SealedBasisCommitments` unilateral backdoor).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AcuError> {
         let mut cursor = 0usize;
         let magic = take_slice(bytes, &mut cursor, 8)?;
-        if magic == LEGACY_ACU_CT_MAGIC {
+        if magic == LEGACY_ACU_CT_MAGIC_V1 {
             return Err(AcuError::InsecureLegacyFormat("CHWGACU1"));
+        }
+        if magic == LEGACY_ACU_CT_MAGIC_V2 {
+            return Err(AcuError::InsecureLegacyFormat("CHWGACU2"));
         }
         if magic != ACU_CT_MAGIC {
             return Err(AcuError::SerializationError("invalid AcuCiphertext magic"));
         }
+
+        let obj_slice = take_slice(bytes, &mut cursor, 32)?;
+        let mut object_digest = [0u8; 32];
+        object_digest.copy_from_slice(obj_slice);
+
         let policy_epoch = read_u64_be(bytes, &mut cursor)?;
         if policy_epoch == 0 {
             return Err(AcuError::SerializationError("policy_epoch must be >= 1"));
         }
+
+        let acu_seat_id = read_lp64_str(bytes, &mut cursor, MAX_SEAT_ID_BYTES)?;
+        if !is_valid_seat_id(&acu_seat_id) {
+            return Err(AcuError::InvalidSeatId);
+        }
+
         let cols = read_u32_be(bytes, &mut cursor)? as usize;
         let num_rows = read_u32_be(bytes, &mut cursor)? as usize;
         if cols == 0
@@ -225,76 +594,83 @@ impl AcuCiphertext {
             ));
         }
 
-        let c0_g1 = read_nonidentity_g1_compressed(bytes, &mut cursor)?;
+        let c0_g1 = read_g1_compressed(bytes, &mut cursor)?;
         let c0 = pairing(&G1Affine::from(c0_g1), &G2Affine::generator());
-
-        let acu_seat_len = read_u32_be(bytes, &mut cursor)? as usize;
-        if acu_seat_len == 0 || acu_seat_len > MAX_SEAT_ID_BYTES {
-            return Err(AcuError::SerializationError("invalid acu_seat_id length"));
-        }
-        let acu_seat_slice = take_slice(bytes, &mut cursor, acu_seat_len)?;
-        let acu_seat_id = std::str::from_utf8(acu_seat_slice)
-            .map_err(|_| AcuError::SerializationError("acu_seat_id is not valid UTF-8"))?
-            .to_string();
-        if !is_valid_seat_id(&acu_seat_id) {
-            return Err(AcuError::InvalidSeatId);
-        }
-
-        let ephemeral_pk1 = read_nonidentity_g1_compressed(bytes, &mut cursor)?;
-        let nonce_slice = take_slice(bytes, &mut cursor, 12)?;
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(nonce_slice);
-
-        let expected_sealed_len = expected_sealed_basis_len(cols, num_rows)?;
-        let sealed_ct_len = read_u32_be(bytes, &mut cursor)? as usize;
-        if sealed_ct_len != expected_sealed_len {
-            return Err(AcuError::SerializationError(
-                "invalid sealed_basis ciphertext length",
-            ));
-        }
-        let sealed_ciphertext = take_slice(bytes, &mut cursor, sealed_ct_len)?.to_vec();
-        let sealed_basis = SealedBasisCommitments {
-            acu_seat_id,
-            ephemeral_pk1,
-            nonce,
-            ciphertext: sealed_ciphertext,
-        };
+        let gates = LsssMatrix::decode_gates(bytes, &mut cursor, num_rows)?;
 
         let mut rows = Vec::with_capacity(num_rows);
         let mut matrix_rows = Vec::with_capacity(num_rows);
         for expected_idx in 0..num_rows {
-            let row_index = read_u32_be(bytes, &mut cursor)? as usize;
-            if row_index != expected_idx {
-                return Err(AcuError::SerializationError("non-contiguous row_index"));
-            }
-            let seat_len = read_u32_be(bytes, &mut cursor)? as usize;
-            if seat_len == 0 || seat_len > MAX_SEAT_ID_BYTES {
-                return Err(AcuError::SerializationError("invalid seat_id length"));
-            }
-            let seat_slice = take_slice(bytes, &mut cursor, seat_len)?;
-            let seat_id = std::str::from_utf8(seat_slice)
-                .map_err(|_| AcuError::SerializationError("seat_id is not valid UTF-8"))?
-                .to_string();
-            if !is_valid_seat_id(&seat_id) {
-                return Err(AcuError::InvalidSeatId);
-            }
+            let row =
+                decode_ciphertext_row(bytes, &mut cursor, &object_digest, expected_idx, cols)?;
+            matrix_rows.push((row.seat_id.clone(), row.matrix_row.clone()));
+            rows.push(row);
+        }
 
-            let mut matrix_row = Vec::with_capacity(cols);
-            for _ in 0..cols {
-                matrix_row.push(read_scalar(bytes, &mut cursor)?);
+        let num_slots = read_u32_be(bytes, &mut cursor)? as usize;
+        if num_slots == 0 || num_slots > MAX_SBC_SLOTS {
+            return Err(AcuError::SerializationError("invalid sbc_slots count"));
+        }
+        let mut sbc_slots = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            let created_epoch = read_u64_be(bytes, &mut cursor)?;
+            let col_offset = read_u32_be(bytes, &mut cursor)? as usize;
+            let col_count = read_u32_be(bytes, &mut cursor)? as usize;
+            if col_offset == 0 {
+                return Err(AcuError::SerializationError(
+                    "SbcSlot col_offset == 0 forbidden (zero-V_0 invariant)",
+                ));
             }
-            let c1 = read_g1_compressed(bytes, &mut cursor)?;
-            let c3 = read_nonidentity_g1_compressed(bytes, &mut cursor)?;
-
-            matrix_rows.push((seat_id.clone(), matrix_row.clone()));
-            rows.push(CiphertextRow {
-                row_index,
-                seat_id,
-                matrix_row,
-                c1,
-                c3,
+            let max_ct_len = col_count
+                .checked_mul(48)
+                .and_then(|n| n.checked_add(POLY1305_TAG_BYTES))
+                .ok_or(AcuError::SerializationError("SbcSlot ciphertext overflow"))?;
+            let slot_c0_g1 = read_g1_compressed(bytes, &mut cursor)?;
+            let nonce_slice = take_slice(bytes, &mut cursor, 12)?;
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(nonce_slice);
+            let ct_slice = read_lp64(bytes, &mut cursor, max_ct_len)?;
+            if ct_slice.len() != max_ct_len {
+                return Err(AcuError::SerializationError(
+                    "SbcSlot ciphertext length mismatch",
+                ));
+            }
+            let mut slot_rows = Vec::with_capacity(num_rows);
+            for expected_idx in 0..num_rows {
+                slot_rows.push(decode_ciphertext_row(
+                    bytes,
+                    &mut cursor,
+                    &object_digest,
+                    expected_idx,
+                    cols,
+                )?);
+            }
+            sbc_slots.push(SbcSlot {
+                created_epoch,
+                col_offset,
+                col_count,
+                c0_g1: slot_c0_g1,
+                nonce,
+                ciphertext: ct_slice.to_vec(),
+                rows: slot_rows,
             });
         }
+
+        let has_epoch_auth = read_u8(bytes, &mut cursor)?;
+        let acu_epoch_auth = match has_epoch_auth {
+            0 => None,
+            1 => {
+                let auth_slice = take_slice(bytes, &mut cursor, 64)?;
+                let mut auth_arr = [0u8; 64];
+                auth_arr.copy_from_slice(auth_slice);
+                Some(RowPok::from_bytes(&auth_arr)?)
+            }
+            _ => {
+                return Err(AcuError::SerializationError(
+                    "invalid acu_epoch_auth presence tag",
+                ));
+            }
+        };
 
         if cursor != bytes.len() {
             return Err(AcuError::SerializationError(
@@ -305,41 +681,159 @@ impl AcuCiphertext {
         let matrix = LsssMatrix {
             cols,
             rows: matrix_rows,
+            gates,
         };
-        matrix.validate()?;
-
-        Ok(Self {
+        let ct = Self {
+            object_digest,
             policy_epoch,
+            acu_seat_id,
             c0_g1,
             c0,
-            sealed_basis,
             matrix,
             rows,
-        })
+            sbc_slots,
+            acu_epoch_auth,
+        };
+        ct.validate_structure()?;
+        Ok(ct)
     }
 }
 
-/// Partial decryption share $D_j = e(g_1, g_2)^{\lambda_j} \in \mathbb{G}_T$ emitted by seat $\rho(j)$,
-/// accompanied by a Chaum–Pedersen NIZK DLEQ proof across $(\mathbb{G}_1, \mathbb{G}_T)$.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PartialDecryptionShare {
-    /// Row index $j$ in [`AcuCiphertext::rows`] that this partial share decrypts.
-    pub row_index: usize,
-    /// Seat identifier $\rho(j)$ that produced this share.
-    pub seat_id: String,
-    /// Policy epoch of the ciphertext when this share was computed (`>= 1`).
-    pub policy_epoch: u64,
-    /// Unblinded pairing share $D_j = e(c_{j,1} - c_{j,3} \cdot sk_j, g_2) = e(g_1, g_2)^{\lambda_j} \in \mathbb{G}_T$.
-    pub value: Gt,
-    /// Chaum–Pedersen DLEQ Fiat–Shamir challenge $c \in \mathbb{F}_r^*$.
-    pub dleq_challenge: Scalar,
-    /// Chaum–Pedersen DLEQ response $z = k + c \cdot sk_j \in \mathbb{F}_r^*$.
-    pub dleq_response: Scalar,
+fn blind_handle_from_locator(locator: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(6 + 32);
+    s.push_str("blind:");
+    for &b in &locator[..16] {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
-/// Sample a fresh target-group secret $K = e(K_{\mathbb{G}_1}, g_2) \in \mathbb{G}_T$ and encrypt it
-/// under `matrix` and `seat_keys`, sealing the basis commitments $V_0, \dots, V_{k-1}$ and row scalars
-/// exclusively under `acu_pk` (`CHWGACU2`).
+fn encode_ciphertext_row(out: &mut Vec<u8>, row: &CiphertextRow, blind_seats: bool) {
+    out.extend_from_slice(&(row.row_index as u32).to_be_bytes());
+    let wire_seat = if blind_seats {
+        blind_handle_from_locator(&row.row_locator)
+    } else {
+        row.seat_id.clone()
+    };
+    lp64_str(out, &wire_seat);
+    out.extend_from_slice(&row.row_locator);
+    out.extend_from_slice(&row.oblivious_hint);
+    for scalar in &row.matrix_row {
+        out.extend_from_slice(&scalar.to_bytes());
+    }
+    out.extend_from_slice(&G1Affine::from(row.c1).to_compressed());
+    out.extend_from_slice(&G1Affine::from(row.c2).to_compressed());
+    out.extend_from_slice(&row.init_epoch.to_be_bytes());
+    out.extend_from_slice(&row.init_row_index.to_be_bytes());
+    out.extend_from_slice(&row.init_matrix_digest);
+    out.extend_from_slice(&G1Affine::from(row.init_c1).to_compressed());
+    out.extend_from_slice(&G1Affine::from(row.init_c2).to_compressed());
+    out.extend_from_slice(&row.row_pok.to_bytes());
+    out.extend_from_slice(&(row.updates.len() as u32).to_be_bytes());
+    for upd in &row.updates {
+        out.extend_from_slice(&upd.epoch.to_be_bytes());
+        out.extend_from_slice(&upd.prev_header_digest);
+        out.extend_from_slice(&upd.row_index.to_be_bytes());
+        out.extend_from_slice(&G1Affine::from(upd.delta_c1).to_compressed());
+        out.extend_from_slice(&G1Affine::from(upd.delta_c2).to_compressed());
+        out.extend_from_slice(&upd.pok.to_bytes());
+    }
+}
+
+fn decode_ciphertext_row(
+    bytes: &[u8],
+    cursor: &mut usize,
+    object_digest: &[u8; 32],
+    expected_idx: usize,
+    cols: usize,
+) -> Result<CiphertextRow, AcuError> {
+    let row_index = read_u32_be(bytes, cursor)? as usize;
+    if row_index != expected_idx {
+        return Err(AcuError::SerializationError("non-contiguous row_index"));
+    }
+    let seat_id = read_lp64_str(bytes, cursor, MAX_SEAT_ID_BYTES)?;
+    if !is_valid_seat_id(&seat_id) {
+        return Err(AcuError::InvalidSeatId);
+    }
+    let loc_slice = take_slice(bytes, cursor, 32)?;
+    let mut row_locator = [0u8; 32];
+    row_locator.copy_from_slice(loc_slice);
+
+    let hint_slice = take_slice(bytes, cursor, 8)?;
+    let mut oblivious_hint = [0u8; 8];
+    oblivious_hint.copy_from_slice(hint_slice);
+
+    let mut matrix_row = Vec::with_capacity(cols);
+    for _ in 0..cols {
+        matrix_row.push(read_scalar(bytes, cursor)?);
+    }
+    let c1 = read_g1_compressed(bytes, cursor)?;
+    let c2 = read_nonidentity_g1_compressed(bytes, cursor)?;
+    let init_epoch = read_u64_be(bytes, cursor)?;
+    if init_epoch == 0 {
+        return Err(AcuError::SerializationError("init_epoch must be >= 1"));
+    }
+    let init_row_index = read_u32_be(bytes, cursor)?;
+    let imat_slice = take_slice(bytes, cursor, 32)?;
+    let mut init_matrix_digest = [0u8; 32];
+    init_matrix_digest.copy_from_slice(imat_slice);
+    let init_c1 = read_g1_compressed(bytes, cursor)?;
+    let init_c2 = read_nonidentity_g1_compressed(bytes, cursor)?;
+    let pok_slice = take_slice(bytes, cursor, 64)?;
+    let mut pok_arr = [0u8; 64];
+    pok_arr.copy_from_slice(pok_slice);
+    let row_pok = RowPok::from_bytes(&pok_arr)?;
+
+    let num_updates = read_u32_be(bytes, cursor)? as usize;
+    if num_updates > MAX_ROW_UPDATES {
+        return Err(AcuError::SerializationError("too many row updates"));
+    }
+    let mut updates = Vec::with_capacity(num_updates);
+    for _ in 0..num_updates {
+        let epoch = read_u64_be(bytes, cursor)?;
+        let prev_slice = take_slice(bytes, cursor, 32)?;
+        let mut prev_header_digest = [0u8; 32];
+        prev_header_digest.copy_from_slice(prev_slice);
+        let upd_row_idx = read_u32_be(bytes, cursor)?;
+        let delta_c1 = read_g1_compressed(bytes, cursor)?;
+        let delta_c2 = read_nonidentity_g1_compressed(bytes, cursor)?;
+        let upok_slice = take_slice(bytes, cursor, 64)?;
+        let mut upok_arr = [0u8; 64];
+        upok_arr.copy_from_slice(upok_slice);
+        let pok = RowPok::from_bytes(&upok_arr)?;
+        updates.push(RowUpdateProof {
+            epoch,
+            prev_header_digest,
+            row_index: upd_row_idx,
+            delta_c1,
+            delta_c2,
+            pok,
+        });
+    }
+
+    Ok(CiphertextRow {
+        object_digest: *object_digest,
+        row_index,
+        seat_id,
+        row_locator,
+        oblivious_hint,
+        matrix_row,
+        c1,
+        c2,
+        init_epoch,
+        init_row_index,
+        init_matrix_digest,
+        init_c1,
+        init_c2,
+        row_pok,
+        updates,
+    })
+}
+
+/// Sample a fresh target-group secret $K_{\mathbb{G}_T} \in \mathbb{G}_T^*$ and encrypt it under
+/// `matrix` (`CHWGACU3` zero-$V_0$ policy-matched `SBC`).
 pub fn acu_encrypt(
     matrix: &LsssMatrix,
     seat_keys: &BTreeMap<String, SeatPublicKey>,
@@ -349,21 +843,53 @@ pub fn acu_encrypt(
     let mut k_scalar = sample_nonzero_scalar(rng);
     let mut payload_g1 = G1Projective::generator() * k_scalar;
     k_scalar.zeroize();
-    let res = acu_encrypt_with_g1(&payload_g1, matrix, seat_keys, acu_pk, rng);
+    let mut obj_digest = [0u8; 32];
+    rng.fill_bytes(&mut obj_digest);
+    let mut loc_key = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut loc_key[..]);
+    let res = acu_encrypt_with_g1_and_context(
+        &payload_g1,
+        &obj_digest,
+        &loc_key,
+        matrix,
+        seat_keys,
+        acu_pk,
+        rng,
+    );
     payload_g1.zeroize();
     res
 }
 
-/// Encrypt a target-group element $K = e(K_{\mathbb{G}_1}, g_2) \in \mathbb{G}_T$ (given its
-/// non-identity $\mathbb{G}_1$ preimage `payload_g1`) under an [`LsssMatrix`] and a directory of
-/// verified [`SeatPublicKey`]s, sealing the basis commitments $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$
-/// and row randomness scalars $r_0, \dots, r_{\ell-1} \in (\mathbb{F}_r^*)^\ell$ exclusively under
-/// `acu_pk` (`CHWGACU2`).
-///
-/// Every referenced [`SeatPublicKey`] and `acu_pk` is verified via [`SeatPublicKey::verify_consistency`]
-/// before encryption proceeds; any missing, malformed, or rogue key fails closed.
+/// Encrypt a target-group element $K_{\mathbb{G}_T} = e(\text{payload\_g1}, G_2)$ under `matrix`
+/// with a fresh CSPRNG object digest (`CHWGACU3`).
 pub fn acu_encrypt_with_g1(
     payload_g1: &G1Projective,
+    matrix: &LsssMatrix,
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    acu_pk: &SeatPublicKey,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<(AcuCiphertext, Gt), AcuError> {
+    let mut obj_digest = [0u8; 32];
+    rng.fill_bytes(&mut obj_digest);
+    let mut loc_key = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut loc_key[..]);
+    acu_encrypt_with_g1_and_context(
+        payload_g1,
+        &obj_digest,
+        &loc_key,
+        matrix,
+        seat_keys,
+        acu_pk,
+        rng,
+    )
+}
+
+/// Encrypt a target-group element $K_{\mathbb{G}_T} = e(\text{payload\_g1}, G_2)$ bound to an
+/// explicit `object_digest` ($O$) and workspace `locator_key` ($k_{\mathsf{idx}}$).
+pub fn acu_encrypt_with_g1_and_context(
+    payload_g1: &G1Projective,
+    object_digest: &[u8; 32],
+    locator_key: &[u8; 32],
     matrix: &LsssMatrix,
     seat_keys: &BTreeMap<String, SeatPublicKey>,
     acu_pk: &SeatPublicKey,
@@ -382,8 +908,6 @@ pub fn acu_encrypt_with_g1(
     {
         return Err(AcuError::InvalidPublicKey(acu_pk.seat_id.clone()));
     }
-
-    // Pre-verify every recipient seat's Schnorr Proof-of-Possession (ALISTAIR rogue-key gate).
     for (seat_id, _) in &matrix.rows {
         let pk = seat_keys
             .get(seat_id)
@@ -395,788 +919,361 @@ pub fn acu_encrypt_with_g1(
 
     let g1 = G1Projective::generator();
     let g2_aff = G2Affine::generator();
-
-    // Sample secret column vector v = (s, v_1, ..., v_{k-1}) in (F_r^*)^k ensuring c0_g1 != O.
     let k = matrix.cols;
+
+    // Full F_r^k uniform sharing vector (including 0, exact 0 statistical distance in Theorem 3(ii)).
     let mut v = Zeroizing::new(Vec::with_capacity(k));
-    let (s, c0_g1) = loop {
-        let candidate_s = sample_nonzero_scalar(rng);
-        let candidate_c0_g1 = *payload_g1 + g1 * candidate_s;
-        if !bool::from(candidate_c0_g1.is_identity()) {
-            break (candidate_s, candidate_c0_g1);
-        }
-    };
-    v.push(s);
-    for _ in 1..k {
-        v.push(sample_nonzero_scalar(rng));
+    for _ in 0..k {
+        v.push(sample_uniform_scalar(rng));
     }
 
+    let c0_g1 = *payload_g1 + g1 * v[0];
     let payload_key = pairing(&payload_aff, &g2_aff);
     let c0 = pairing(&G1Affine::from(c0_g1), &g2_aff);
 
-    // Transient basis commitments V_m = g1^(v_m) and row scalars r_j (zeroized automatically on drop).
-    let mut unsealed_state = UnsealedBasisState {
-        basis: v.iter().map(|vm| g1 * vm).collect(),
-        row_scalars: Vec::with_capacity(matrix.rows.len()),
+    let rows = build_lsss_rows(object_digest, 1, locator_key, matrix, &v, seat_keys, rng)?;
+
+    // Auxiliary commitments ONLY: V_1 = v_1 * G_1 .. V_{k-1} = v_{k-1} * G_1 (OMIT V_0 = s * G_1!).
+    let mut v_aux: Vec<G1Projective> = v[1..].iter().map(|vm| g1 * vm).collect();
+    let slot1 = seal_sbc_slot(
+        object_digest,
+        1,
+        1,
+        &v_aux,
+        locator_key,
+        matrix,
+        seat_keys,
+        rng,
+    )?;
+    for pt in &mut v_aux {
+        pt.zeroize();
+    }
+
+    let ct = AcuCiphertext {
+        object_digest: *object_digest,
+        policy_epoch: 1,
+        acu_seat_id: acu_pk.seat_id.clone(),
+        c0_g1,
+        c0,
+        matrix: matrix.clone(),
+        rows,
+        sbc_slots: vec![slot1],
+        acu_epoch_auth: None,
     };
+    ct.validate_structure()?;
+    Ok((ct, payload_key))
+}
 
-    // Construct per-row ciphertexts strictly in G1
+fn build_lsss_rows(
+    object_digest: &[u8; 32],
+    epoch: u64,
+    locator_key: &[u8; 32],
+    matrix: &LsssMatrix,
+    v: &[Scalar],
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<Vec<CiphertextRow>, AcuError> {
+    let g1 = G1Projective::generator();
+    let init_matrix_digest = matrix.canonical_digest();
     let mut rows = Vec::with_capacity(matrix.rows.len());
-    for (row_index, (seat_id, matrix_row)) in matrix.rows.iter().enumerate() {
-        let pk = &seat_keys[seat_id];
-        let mut lambda_j = inner_product(matrix_row, &v);
-        let r_j = sample_nonzero_scalar(rng);
-
-        let c1 = g1 * lambda_j + pk.pk1 * r_j;
-        let c3 = g1 * r_j;
-
+    for (row_idx, (seat_id, m_row)) in matrix.rows.iter().enumerate() {
+        let pk = seat_keys
+            .get(seat_id)
+            .ok_or_else(|| AcuError::UnknownSeat(seat_id.clone()))?;
+        let mut lambda_j = m_row
+            .iter()
+            .zip(v.iter())
+            .fold(Scalar::ZERO, |acc, (&m, &vm)| acc + m * vm);
+        let mut r_j = sample_nonzero_scalar(rng);
+        let shared_pt = pk.pk1 * r_j;
+        let c1 = g1 * lambda_j + shared_pt;
+        let c2 = g1 * r_j;
         lambda_j.zeroize();
-        unsealed_state.row_scalars.push(r_j);
+
+        let row_locator =
+            compute_blind_row_locator(locator_key, object_digest, epoch, row_idx as u32, seat_id);
+        let oblivious_hint = compute_oblivious_key_hint(&shared_pt);
+        let row_pok = prove_row_pok(
+            object_digest,
+            &init_matrix_digest,
+            epoch,
+            row_idx as u32,
+            &row_locator,
+            &pk.pk1,
+            &c1,
+            &c2,
+            &r_j,
+            rng,
+        )?;
+        r_j.zeroize();
 
         rows.push(CiphertextRow {
-            row_index,
+            object_digest: *object_digest,
+            row_index: row_idx,
             seat_id: seat_id.clone(),
-            matrix_row: matrix_row.clone(),
+            row_locator,
+            oblivious_hint,
+            matrix_row: m_row.clone(),
             c1,
-            c3,
+            c2,
+            init_epoch: epoch,
+            init_row_index: row_idx as u32,
+            init_matrix_digest,
+            init_c1: c1,
+            init_c2: c2,
+            row_pok,
+            updates: Vec::new(),
         });
     }
-    v.zeroize();
+    Ok(rows)
+}
 
-    let policy_epoch = 1u64;
-    let sealed_basis = seal_basis_commitments(
-        &unsealed_state.basis,
-        &unsealed_state.row_scalars,
-        &acu_pk.seat_id,
-        &acu_pk.pk1,
-        policy_epoch,
-        &c0_g1,
-        &rows,
+#[allow(clippy::too_many_arguments)]
+fn seal_sbc_slot(
+    object_digest: &[u8; 32],
+    epoch: u64,
+    col_offset: usize,
+    aux_points: &[G1Projective],
+    locator_key: &[u8; 32],
+    matrix: &LsssMatrix,
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<SbcSlot, AcuError> {
+    if col_offset == 0 {
+        return Err(AcuError::SerializationError(
+            "SbcSlot col_offset == 0 forbidden (zero-V_0 invariant)",
+        ));
+    }
+    let g1 = G1Projective::generator();
+    let g2_aff = G2Affine::generator();
+
+    let mut kappa_sbc = sample_nonzero_scalar(rng);
+    let mut k_sbc_g1 = g1 * kappa_sbc;
+    kappa_sbc.zeroize();
+    let k_sbc_gt = pairing(&G1Affine::from(k_sbc_g1), &g2_aff);
+
+    let mut v_sbc = Zeroizing::new(Vec::with_capacity(matrix.cols));
+    for _ in 0..matrix.cols {
+        v_sbc.push(sample_uniform_scalar(rng));
+    }
+    let c0_g1 = k_sbc_g1 + g1 * v_sbc[0];
+    k_sbc_g1.zeroize();
+
+    let mut slot_loc_key = Zeroizing::new([0u8; 32]);
+    let mut slot_mac = <HmacSha256 as Mac>::new_from_slice(locator_key)
+        .expect("HMAC-SHA256 accepts 32-byte locator key");
+    slot_mac.update(b"sbc-slot-loc");
+    slot_mac.update(&epoch.to_be_bytes());
+    slot_loc_key.copy_from_slice(&slot_mac.finalize().into_bytes());
+
+    let slot_rows = build_lsss_rows(
+        object_digest,
+        epoch,
+        &slot_loc_key,
+        matrix,
+        &v_sbc,
+        seat_keys,
         rng,
     )?;
 
-    Ok((
-        AcuCiphertext {
-            policy_epoch,
-            c0_g1,
-            c0,
-            sealed_basis,
-            matrix: matrix.clone(),
-            rows,
-        },
-        payload_key,
-    ))
+    let mut pt_bytes = Zeroizing::new(Vec::with_capacity(aux_points.len() * 48));
+    for pt in aux_points {
+        pt_bytes.extend_from_slice(&G1Affine::from(*pt).to_compressed());
+    }
+
+    let sym_key = derive_sbc_slot_key(
+        &k_sbc_gt,
+        object_digest,
+        epoch,
+        col_offset,
+        aux_points.len(),
+    )?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&*sym_key));
+    let mut nonce = [0u8; 12];
+    rng.fill_bytes(&mut nonce);
+    let aad = encode_sbc_slot_aad(object_digest, epoch, col_offset, aux_points.len());
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &pt_bytes,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| AcuError::AeadFailure)?;
+
+    Ok(SbcSlot {
+        created_epoch: epoch,
+        col_offset,
+        col_count: aux_points.len(),
+        c0_g1,
+        nonce,
+        ciphertext,
+        rows: slot_rows,
+    })
 }
 
-/// **Dynamic Policy Operation 1 — Semantically Neutral Key Insertion (`insert_key`)**:
-///
-/// Executed exclusively by the ACU operator holding `acu_sk`:
-/// 1. Unseals `({V_m}, {r_j})` from `ct.sealed_basis` (verifying AAD binding, `acu_sk`, and algebraic row witnesses).
-/// 2. Evaluates $g_1^{\lambda_{\text{new}}} = \sum_{m=0}^{k-1} V_m \cdot r_{\text{new},m}$ homomorphically
-///    in $\mathbb{G}_1$ without decrypting $c_0$.
-/// 3. Blinds with fresh row randomness $r_{\text{new}} \xleftarrow{\$} \mathbb{F}_r^*$, appends the row,
-///    and re-seals `({V_m}, {r_j})` under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
-pub fn insert_key(
-    ct: &mut AcuCiphertext,
-    acu_sk: &SeatSecretKey,
-    new_seat: &SeatPublicKey,
-    new_row: Vec<Scalar>,
-    rng: &mut (impl RngCore + CryptoRng),
-) -> Result<usize, AcuError> {
-    ct.validate_structure()?;
-    let mut state = unseal_basis_commitments(ct, acu_sk)?;
-
-    if new_row.len() != ct.matrix.cols {
-        return Err(AcuError::DimensionMismatch {
-            expected: ct.matrix.cols,
-            actual: new_row.len(),
-        });
+fn unseal_sbc_slot_with_weights(
+    object_digest: &[u8; 32],
+    slot: &SbcSlot,
+    weights: &[(usize, Scalar)],
+    slot_shares_by_row: &BTreeMap<usize, G1Projective>,
+) -> Result<Vec<G1Projective>, AcuError> {
+    let mut s_sbc_g1 = G1Projective::identity();
+    for &(row_idx, omega) in weights {
+        let share_pt = slot_shares_by_row
+            .get(&row_idx)
+            .ok_or(AcuError::PolicyNotSatisfied)?;
+        s_sbc_g1 += *share_pt * omega;
     }
-    if new_row.iter().all(|s| bool::from(s.is_zero())) {
-        return Err(AcuError::InvalidAccessTree("LSSS row cannot be all zero"));
-    }
-    if !new_seat.verify_consistency() {
-        return Err(AcuError::InvalidPublicKey(new_seat.seat_id.clone()));
-    }
+    let mut k_sbc_g1 = slot.c0_g1 - s_sbc_g1;
+    let k_sbc_gt = pairing(&G1Affine::from(k_sbc_g1), &G2Affine::generator());
+    k_sbc_g1.zeroize();
 
-    let mut g1_lambda_new = commit_row_in_g1(&state.basis, &new_row);
-
-    let g1 = G1Projective::generator();
-    let r_new = sample_nonzero_scalar(rng);
-
-    let c1 = g1_lambda_new + new_seat.pk1 * r_new;
-    let c3 = g1 * r_new;
-    g1_lambda_new.zeroize();
-
-    let row_index = ct.rows.len();
-    if row_index >= MAX_SERIALIZED_ROWS {
-        return Err(AcuError::SerializationError(
-            "invalid AcuCiphertext dimensions",
-        ));
-    }
-    let new_epoch = ct
-        .policy_epoch
-        .checked_add(1)
-        .ok_or(AcuError::SerializationError("policy_epoch overflow"))?;
-
-    let mut new_rows = ct.rows.clone();
-    new_rows.push(CiphertextRow {
-        row_index,
-        seat_id: new_seat.seat_id.clone(),
-        matrix_row: new_row.clone(),
-        c1,
-        c3,
-    });
-    state.row_scalars.push(r_new);
-
-    let mut acu_pk1 = g1 * acu_sk.sk;
-    let re_sealed_res = seal_basis_commitments(
-        &state.basis,
-        &state.row_scalars,
-        &ct.sealed_basis.acu_seat_id,
-        &acu_pk1,
-        new_epoch,
-        &ct.c0_g1,
-        &new_rows,
-        rng,
+    let sym_key = derive_sbc_slot_key(
+        &k_sbc_gt,
+        object_digest,
+        slot.created_epoch,
+        slot.col_offset,
+        slot.col_count,
+    )?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&*sym_key));
+    let aad = encode_sbc_slot_aad(
+        object_digest,
+        slot.created_epoch,
+        slot.col_offset,
+        slot.col_count,
     );
-    acu_pk1.zeroize();
-    let new_sealed_basis = re_sealed_res?;
-
-    ct.matrix.rows.push((new_seat.seat_id.clone(), new_row));
-    ct.rows = new_rows;
-    ct.sealed_basis = new_sealed_basis;
-    ct.policy_epoch = new_epoch;
-
-    Ok(row_index)
-}
-
-/// Convenience helper for Shadow-KV warm-forking: unseals `ct.sealed_basis` with `acu_sk`,
-/// inserts `new_seat` as a disjunctive (`OR`) sibling of `sibling_row_index`, and re-seals
-/// `basis_commitments` and `row_scalars` with fresh randomness at `policy_epoch + 1`.
-pub fn insert_sibling_key(
-    ct: &mut AcuCiphertext,
-    acu_sk: &SeatSecretKey,
-    sibling_row_index: usize,
-    new_seat: &SeatPublicKey,
-    rng: &mut (impl RngCore + CryptoRng),
-) -> Result<usize, AcuError> {
-    if sibling_row_index >= ct.rows.len() {
-        return Err(AcuError::RowIndexOutOfBounds {
-            index: sibling_row_index,
-            total_rows: ct.rows.len(),
-        });
-    }
-    let sibling_row = ct.rows[sibling_row_index].matrix_row.clone();
-    insert_key(ct, acu_sk, new_seat, sibling_row, rng)
-}
-
-/// **Dynamic Policy Operation 2 — Threshold Escalation (`escalate_threshold`)**:
-///
-/// Executed exclusively by the ACU operator holding `acu_sk` without decrypting $c_0$:
-/// 1. Unseals `({V_m}, {r_j})` from `ct.sealed_basis`, verifies algebraic row commitments across all
-///    rows against `seat_keys`, and extracts each affected row's exact Vandermonde abscissa $x_j \in \mathbb{F}_r^*$
-///    (preserving true abscissas even if intermediate siblings were pruned in an earlier revocation).
-/// 2. Samples $\Delta t$ fresh non-zero column secrets $u_1, \dots, u_{\Delta t} \xleftarrow{\$} \mathbb{F}_r^*$,
-///    extends affected rows with $x_j^t, \dots, x_j^{t + \Delta t - 1}$, and zero-pads unaffected rows.
-/// 3. Rotates $c_{0,\mathbb{G}_1}$, $c_0$, $\{V_m'\}$, and **all** rows (affected and unaffected) by a fresh
-///    blinding delta $\Delta v = (\Delta s, \Delta v_1, \dots, \Delta v_{\text{new\_cols}-1}) \in (\mathbb{F}_r^*)^{\text{new\_cols}}$
-///    and non-canceling row randomness $r'_j$ (`r_j + r'_j != 0`), then re-seals `({V_m'}, {r_j'})` under
-///    `pk_ACU` with fresh randomness at `policy_epoch + 1`.
-pub fn escalate_threshold(
-    ct: &mut AcuCiphertext,
-    acu_sk: &SeatSecretKey,
-    affected_row_indices: &[usize],
-    delta_t: usize,
-    seat_keys: &BTreeMap<String, SeatPublicKey>,
-    rng: &mut (impl RngCore + CryptoRng),
-) -> Result<(), AcuError> {
-    ct.validate_structure()?;
-    let mut state = unseal_basis_commitments(ct, acu_sk)?;
-
-    if delta_t == 0 {
-        return Err(AcuError::InvalidThreshold {
-            threshold: 0,
-            children: affected_row_indices.len(),
-        });
-    }
-    if affected_row_indices.is_empty() {
-        return Err(AcuError::InvalidThreshold {
-            threshold: delta_t,
-            children: 0,
-        });
-    }
-
-    let mut affected_set = BTreeSet::new();
-    for &idx in affected_row_indices {
-        if idx >= ct.rows.len() {
-            return Err(AcuError::RowIndexOutOfBounds {
-                index: idx,
-                total_rows: ct.rows.len(),
-            });
-        }
-        affected_set.insert(idx);
-    }
-
-    let unique_affected: Vec<usize> = affected_set.iter().copied().collect();
-    let current_rank = submatrix_rank(&ct.matrix, &unique_affected);
-    if current_rank == 0 {
-        return Err(AcuError::InvalidAccessTree("affected rows have zero rank"));
-    }
-    if current_rank + delta_t > unique_affected.len() {
-        return Err(AcuError::InvalidThreshold {
-            threshold: current_rank + delta_t,
-            children: unique_affected.len(),
-        });
-    }
-
-    // Extract and algebraically verify each affected row's Vandermonde abscissa x_j in F_r^*.
-    let first_row = &ct.rows[unique_affected[0]].matrix_row;
-    let mut diff_cols = Vec::new();
-    let mut has_nonzero_parent = false;
-    for (col, &first_val) in first_row.iter().enumerate().take(ct.matrix.cols) {
-        let all_equal = unique_affected[1..]
-            .iter()
-            .all(|&r_idx| ct.rows[r_idx].matrix_row[col] == first_val);
-        if all_equal {
-            if !bool::from(first_val.is_zero()) {
-                has_nonzero_parent = true;
-            }
-        } else {
-            diff_cols.push(col);
-        }
-    }
-    if !has_nonzero_parent {
-        return Err(AcuError::InvalidAccessTree(
-            "affected rows do not share a non-zero parent label",
-        ));
-    }
-
-    let mut abscissa_by_row: BTreeMap<usize, Scalar> = BTreeMap::new();
-    if current_rank == 1 {
-        if !diff_cols.is_empty() {
-            return Err(AcuError::InvalidAccessTree(
-                "rank-1 affected rows do not share an identical OR parent vector",
-            ));
-        }
-        for (pos, &r_idx) in unique_affected.iter().enumerate() {
-            abscissa_by_row.insert(r_idx, Scalar::from((pos + 1) as u64));
-        }
-    } else {
-        if diff_cols.len() != current_rank - 1 {
-            return Err(AcuError::InvalidAccessTree(
-                "affected rows do not form a valid sibling threshold gate",
-            ));
-        }
-        for (r_idx, row) in ct.rows.iter().enumerate() {
-            if !affected_set.contains(&r_idx)
-                && diff_cols
-                    .iter()
-                    .any(|&c| !bool::from(row.matrix_row[c].is_zero()))
-            {
-                return Err(AcuError::InvalidAccessTree(
-                    "affected_row_indices omits sibling rows of the target threshold gate",
-                ));
-            }
-        }
-        let degree_one_col = diff_cols[0];
-        let mut seen_x: BTreeSet<[u8; 32]> = BTreeSet::new();
-        for &r_idx in &unique_affected {
-            let x_j = ct.rows[r_idx].matrix_row[degree_one_col];
-            if bool::from(x_j.is_zero()) || !seen_x.insert(x_j.to_bytes()) {
-                return Err(AcuError::InvalidAccessTree(
-                    "affected threshold rows lack distinct non-zero Vandermonde abscissas",
-                ));
-            }
-            for (deg_offset, &col_idx) in diff_cols.iter().enumerate() {
-                let expected_pow = scalar_pow(x_j, (deg_offset + 1) as u64);
-                if ct.rows[r_idx].matrix_row[col_idx] != expected_pow {
-                    return Err(AcuError::InvalidAccessTree(
-                        "affected rows violate Vandermonde threshold structure",
-                    ));
-                }
-            }
-            abscissa_by_row.insert(r_idx, x_j);
-        }
-    }
-
-    let new_cols = ct
-        .matrix
-        .cols
-        .checked_add(delta_t)
-        .filter(|&c| c <= MAX_SERIALIZED_COLS)
-        .ok_or(AcuError::SerializationError(
-            "invalid AcuCiphertext dimensions",
-        ))?;
-
-    // Verify public keys and algebraic row commitments for ALL rows in `ct.rows`.
-    for (row, &r_j) in ct.rows.iter().zip(state.row_scalars.iter()) {
-        let pk = seat_keys
-            .get(&row.seat_id)
-            .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
-        if pk.seat_id != row.seat_id || !pk.verify_consistency() {
-            return Err(AcuError::InvalidPublicKey(row.seat_id.clone()));
-        }
-        let mut expected_c1 = commit_row_in_g1(&state.basis, &row.matrix_row) + pk.pk1 * r_j;
-        let matches = expected_c1 == row.c1;
-        expected_c1.zeroize();
-        if !matches {
-            return Err(AcuError::BasisUnsealFailed);
-        }
-    }
-
-    let g1 = G1Projective::generator();
-    let g2_aff = G2Affine::generator();
-
-    // Sample delta_t fresh column secrets u_1..u_{delta_t} and extend state.basis.
-    let mut u = Zeroizing::new(Vec::with_capacity(delta_t));
-    for _ in 0..delta_t {
-        let u_m = sample_nonzero_scalar(rng);
-        state.basis.push(g1 * u_m);
-        u.push(u_m);
-    }
-
-    let mut new_matrix = ct.matrix.clone();
-    let mut new_rows = ct.rows.clone();
-
-    let base_exp = current_rank;
-    for (row_idx, (new_row, (_, new_mat_row))) in new_rows
-        .iter_mut()
-        .zip(new_matrix.rows.iter_mut())
-        .enumerate()
-    {
-        if let Some(&x_j) = abscissa_by_row.get(&row_idx) {
-            let mut x_pow = scalar_pow(x_j, base_exp as u64);
-            let mut delta_lambda = Scalar::ZERO;
-
-            for m in 0..delta_t {
-                new_mat_row.push(x_pow);
-                new_row.matrix_row.push(x_pow);
-                delta_lambda += u[m] * x_pow;
-                x_pow *= x_j;
-            }
-
-            new_row.c1 += g1 * delta_lambda;
-            delta_lambda.zeroize();
-        } else {
-            for _ in 0..delta_t {
-                new_mat_row.push(Scalar::ZERO);
-                new_row.matrix_row.push(Scalar::ZERO);
-            }
-        }
-    }
-    u.zeroize();
-    new_matrix.cols = new_cols;
-
-    // Rotate c0_g1, c0, state.basis[0..new_cols], and ALL rows by fresh blinding delta_v
-    // so new-epoch shares (e.g. D_ACU) cannot be downgraded onto cached prior-epoch ciphertexts.
-    let mut delta_v = Zeroizing::new(Vec::with_capacity(new_cols));
-    let (delta_s, new_c0_g1) = loop {
-        let candidate_ds = sample_nonzero_scalar(rng);
-        let candidate_c0_g1 = ct.c0_g1 + g1 * candidate_ds;
-        let candidate_v0 = state.basis[0] + g1 * candidate_ds;
-        if !bool::from(candidate_c0_g1.is_identity()) && !bool::from(candidate_v0.is_identity()) {
-            break (candidate_ds, candidate_c0_g1);
-        }
-    };
-    delta_v.push(delta_s);
-    state.basis[0] += g1 * delta_s;
-
-    for vm in state.basis.iter_mut().skip(1) {
-        let dv_m = loop {
-            let candidate = sample_nonzero_scalar(rng);
-            if !bool::from((*vm + g1 * candidate).is_identity()) {
-                break candidate;
-            }
-        };
-        *vm += g1 * dv_m;
-        delta_v.push(dv_m);
-    }
-
-    let new_c0 = pairing(&G1Affine::from(new_c0_g1), &g2_aff);
-
-    for (row, r_j) in new_rows.iter_mut().zip(state.row_scalars.iter_mut()) {
-        let pk = &seat_keys[&row.seat_id];
-        let mut rot_lambda = inner_product(&row.matrix_row, &delta_v);
-        let mut r_prime = loop {
-            let candidate = sample_nonzero_scalar(rng);
-            if !bool::from((*r_j + candidate).is_zero()) {
-                break candidate;
-            }
-        };
-
-        row.c1 += g1 * rot_lambda + pk.pk1 * r_prime;
-        row.c3 += g1 * r_prime;
-        *r_j += r_prime;
-
-        rot_lambda.zeroize();
-        r_prime.zeroize();
-    }
-    delta_v.zeroize();
-
-    let new_epoch = ct
-        .policy_epoch
-        .checked_add(1)
-        .ok_or(AcuError::SerializationError("policy_epoch overflow"))?;
-
-    let mut acu_pk1 = g1 * acu_sk.sk;
-    let re_sealed_res = seal_basis_commitments(
-        &state.basis,
-        &state.row_scalars,
-        &ct.sealed_basis.acu_seat_id,
-        &acu_pk1,
-        new_epoch,
-        &new_c0_g1,
-        &new_rows,
-        rng,
+    let pt = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&slot.nonce),
+                Payload {
+                    msg: &slot.ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| AcuError::BasisUnsealFailed)?,
     );
-    acu_pk1.zeroize();
-    let new_sealed_basis = re_sealed_res?;
-
-    ct.c0_g1 = new_c0_g1;
-    ct.c0 = new_c0;
-    ct.matrix = new_matrix;
-    ct.rows = new_rows;
-    ct.sealed_basis = new_sealed_basis;
-    ct.policy_epoch = new_epoch;
-    Ok(())
+    if pt.len() != slot.col_count * 48 {
+        return Err(AcuError::BasisUnsealFailed);
+    }
+    let mut cursor = 0usize;
+    let mut points = Vec::with_capacity(slot.col_count);
+    for _ in 0..slot.col_count {
+        points.push(read_g1_compressed(&pt, &mut cursor).map_err(|_| AcuError::BasisUnsealFailed)?);
+    }
+    Ok(points)
 }
 
-/// **Dynamic Policy Operation 3 & 4 — Subtree Revocation + Ciphertext Rerandomization (`revoke_and_rerandomize`)**:
-///
-/// Executed exclusively by the ACU operator holding `acu_sk`:
-/// 1. Unseals `({V_m}, {r_j})` from `ct.sealed_basis`.
-/// 2. Prunes all rows matching `revoked_seat_ids`, re-indexes surviving rows, and verifies algebraic
-///    commitments for all surviving rows against `seat_keys`.
-/// 3. Samples a fresh blinding vector $\Delta v = (\Delta s, \Delta v_1, \dots, \Delta v_{k-1}) \in (\mathbb{F}_r^*)^k$.
-/// 4. Rotates $c_{0,\mathbb{G}_1} \mathrel{+}= g_1 \cdot \Delta s$, $c_0 = e(c_{0,\mathbb{G}_1}', g_2)$,
-///    and $V_m' = V_m + g_1 \cdot \Delta v_m$.
-/// 5. Shifts every surviving row $j$ by $\Delta \lambda_j = \langle M_j, \Delta v \rangle$ and non-canceling $r'_j$,
-///    then re-seals `({V_m'}, {r_j'})` under `pk_ACU` with fresh randomness at `policy_epoch + 1`.
-pub fn revoke_and_rerandomize(
-    ct: &mut AcuCiphertext,
-    acu_sk: &SeatSecretKey,
-    revoked_seat_ids: &[&str],
-    seat_keys: &BTreeMap<String, SeatPublicKey>,
-    rng: &mut (impl RngCore + CryptoRng),
-) -> Result<(), AcuError> {
-    ct.validate_structure()?;
-    let mut state = unseal_basis_commitments(ct, acu_sk)?;
+fn derive_sbc_slot_key(
+    k_sbc_gt: &Gt,
+    object_digest: &[u8; 32],
+    created_epoch: u64,
+    col_offset: usize,
+    col_count: usize,
+) -> Result<Zeroizing<[u8; 32]>, AcuError> {
+    let gt_bytes = gt_canonical_bytes(k_sbc_gt)?;
+    let hk = Hkdf::<Sha256>::new(Some(SBC_HKDF_SALT), &*gt_bytes);
+    let mut info = Vec::with_capacity(SBC_HKDF_INFO_DOMAIN.len() + 32 + 8 + 8);
+    info.extend_from_slice(SBC_HKDF_INFO_DOMAIN);
+    info.extend_from_slice(object_digest);
+    info.extend_from_slice(&created_epoch.to_be_bytes());
+    info.extend_from_slice(&(col_offset as u32).to_be_bytes());
+    info.extend_from_slice(&(col_count as u32).to_be_bytes());
 
-    let revoked_set: BTreeSet<&str> = revoked_seat_ids.iter().copied().collect();
-
-    // Retain only non-revoked rows and their corresponding cumulative row scalars.
-    let mut surviving_rows = Vec::new();
-    let mut surviving_matrix_rows = Vec::new();
-    let mut surviving_scalars = Zeroizing::new(Vec::new());
-    for (row, &r_j) in ct.rows.iter().zip(state.row_scalars.iter()) {
-        if !revoked_set.contains(row.seat_id.as_str()) {
-            let mut cloned = row.clone();
-            cloned.row_index = surviving_rows.len();
-            surviving_matrix_rows.push((cloned.seat_id.clone(), cloned.matrix_row.clone()));
-            surviving_rows.push(cloned);
-            surviving_scalars.push(r_j);
-        }
-    }
-
-    if surviving_rows.is_empty() {
-        return Err(AcuError::EmptyPolicy);
-    }
-
-    // Verify all surviving seats have valid public keys in `seat_keys` and match the unsealed commitments.
-    for (row, &r_j) in surviving_rows.iter().zip(surviving_scalars.iter()) {
-        let pk = seat_keys
-            .get(&row.seat_id)
-            .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
-        if pk.seat_id != row.seat_id || !pk.verify_consistency() {
-            return Err(AcuError::InvalidPublicKey(row.seat_id.clone()));
-        }
-        let mut expected_c1 = commit_row_in_g1(&state.basis, &row.matrix_row) + pk.pk1 * r_j;
-        let matches = expected_c1 == row.c1;
-        expected_c1.zeroize();
-        if !matches {
-            return Err(AcuError::BasisUnsealFailed);
-        }
-    }
-
-    let g1 = G1Projective::generator();
-    let g2_aff = G2Affine::generator();
-    let k = ct.matrix.cols;
-
-    // Sample fresh blinding delta vector delta_v = (delta_s, delta_v1, ..., delta_v_{k-1}),
-    // ensuring rotated c0_g1 and rotated V_m' are non-identity.
-    let mut delta_v = Zeroizing::new(Vec::with_capacity(k));
-    let (delta_s, new_c0_g1) = loop {
-        let candidate_ds = sample_nonzero_scalar(rng);
-        let candidate_c0_g1 = ct.c0_g1 + g1 * candidate_ds;
-        let candidate_v0 = state.basis[0] + g1 * candidate_ds;
-        if !bool::from(candidate_c0_g1.is_identity()) && !bool::from(candidate_v0.is_identity()) {
-            break (candidate_ds, candidate_c0_g1);
-        }
-    };
-    delta_v.push(delta_s);
-    state.basis[0] += g1 * delta_s;
-
-    for vm in state.basis.iter_mut().skip(1) {
-        let dv_m = loop {
-            let candidate = sample_nonzero_scalar(rng);
-            if !bool::from((*vm + g1 * candidate).is_identity()) {
-                break candidate;
-            }
-        };
-        *vm += g1 * dv_m;
-        delta_v.push(dv_m);
-    }
-
-    let new_c0 = pairing(&G1Affine::from(new_c0_g1), &g2_aff);
-
-    // Rerandomize all surviving rows with delta_lambda_j = <M_j, delta_v> and non-canceling r'_j.
-    for (row, r_j) in surviving_rows.iter_mut().zip(surviving_scalars.iter_mut()) {
-        let pk = &seat_keys[&row.seat_id];
-        let mut delta_lambda = inner_product(&row.matrix_row, &delta_v);
-        let mut r_prime = loop {
-            let candidate = sample_nonzero_scalar(rng);
-            if !bool::from((*r_j + candidate).is_zero()) {
-                break candidate;
-            }
-        };
-
-        row.c1 += g1 * delta_lambda + pk.pk1 * r_prime;
-        row.c3 += g1 * r_prime;
-        *r_j += r_prime;
-
-        delta_lambda.zeroize();
-        r_prime.zeroize();
-    }
-    delta_v.zeroize();
-
-    let new_epoch = ct
-        .policy_epoch
-        .checked_add(1)
-        .ok_or(AcuError::SerializationError("policy_epoch overflow"))?;
-
-    let mut acu_pk1 = g1 * acu_sk.sk;
-    let re_sealed_res = seal_basis_commitments(
-        &state.basis,
-        &surviving_scalars,
-        &ct.sealed_basis.acu_seat_id,
-        &acu_pk1,
-        new_epoch,
-        &new_c0_g1,
-        &surviving_rows,
-        rng,
-    );
-    acu_pk1.zeroize();
-    let new_sealed_basis = re_sealed_res?;
-
-    ct.c0_g1 = new_c0_g1;
-    ct.c0 = new_c0;
-    ct.matrix.rows = surviving_matrix_rows;
-    ct.rows = surviving_rows;
-    ct.sealed_basis = new_sealed_basis;
-    ct.policy_epoch = new_epoch;
-    Ok(())
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(&info, &mut *key)
+        .map_err(|_| AcuError::AeadFailure)?;
+    Ok(key)
 }
 
-/// Compute a partial decryption share $D_j \in \mathbb{G}_T$ with its Chaum–Pedersen DLEQ proof for
-/// `ct.rows[row_index]` bound to `ct.policy_epoch` using seat secret key `sk`:
-///
-/// $$D_j = e(c_{j,1} - c_{j,3} \cdot sk, g_2) = e(g_1, g_2)^{\lambda_j}$$
+fn encode_sbc_slot_aad(
+    object_digest: &[u8; 32],
+    created_epoch: u64,
+    col_offset: usize,
+    col_count: usize,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(SBC_AAD_DOMAIN.len() + 32 + 8 + 8);
+    aad.extend_from_slice(SBC_AAD_DOMAIN);
+    aad.extend_from_slice(object_digest);
+    aad.extend_from_slice(&created_epoch.to_be_bytes());
+    aad.extend_from_slice(&(col_offset as u32).to_be_bytes());
+    aad.extend_from_slice(&(col_count as u32).to_be_bytes());
+    aad
+}
+
+/// Compute a verifiable `48`-byte $\mathbb{G}_1$ partial decryption share (default Mode A `Compact` `64` B)
+/// at `row`'s latest recorded epoch (`updates.last().map_or(init_epoch, |u| u.epoch)`).
+#[must_use]
 pub fn acu_partial_decrypt(
-    ct: &AcuCiphertext,
-    row_index: usize,
-    sk: &SeatSecretKey,
-) -> Result<PartialDecryptionShare, AcuError> {
-    let row = ct
-        .rows
-        .get(row_index)
-        .ok_or(AcuError::RowIndexOutOfBounds {
-            index: row_index,
-            total_rows: ct.rows.len(),
-        })?;
-    Ok(acu_partial_decrypt_at_epoch(row, sk, ct.policy_epoch))
+    row: &CiphertextRow,
+    secret_key: &SeatSecretKey,
+) -> PartialDecryptionShare {
+    let latest_epoch = row.updates.last().map_or(row.init_epoch, |u| u.epoch);
+    acu_partial_decrypt_at_epoch(row, secret_key, latest_epoch)
 }
 
-/// Compute a partial decryption share $D_j \in \mathbb{G}_T$ and Chaum–Pedersen NIZK DLEQ proof
-/// bound to a specific `policy_epoch`.
+/// Compute a verifiable `48`-byte $\mathbb{G}_1$ partial decryption share (default Mode A `Compact` `64` B)
+/// at `policy_epoch`.
 #[must_use]
 pub fn acu_partial_decrypt_at_epoch(
     row: &CiphertextRow,
-    sk: &SeatSecretKey,
+    secret_key: &SeatSecretKey,
     policy_epoch: u64,
 ) -> PartialDecryptionShare {
-    let g2_aff = G2Affine::generator();
-    let mut unmasked_g1 = row.c1 - row.c3 * sk.sk;
-    let value = pairing(&G1Affine::from(unmasked_g1), &g2_aff);
-    unmasked_g1.zeroize();
-
-    let mut pk1_proj = G1Projective::generator() * sk.sk;
-    let pk1_aff = G1Affine::from(pk1_proj);
-    pk1_proj.zeroize();
-
-    let c1_aff = G1Affine::from(row.c1);
-    let c3_aff = G1Affine::from(row.c3);
-    let b_t = pairing(&c3_aff, &g2_aff);
-    let y_t = pairing(&c1_aff, &g2_aff) - value;
-
-    let (dleq_challenge, dleq_response) = prove_partial_share_dleq(
-        row.row_index,
-        &row.seat_id,
+    emit_partial_share_with_mode(
+        &row.object_digest,
+        row,
+        secret_key,
         policy_epoch,
-        &sk.sk,
-        &pk1_aff,
-        &c1_aff,
-        &c3_aff,
-        &value,
-        &b_t,
-        &y_t,
-    );
-
-    PartialDecryptionShare {
-        row_index: row.row_index,
-        seat_id: row.seat_id.clone(),
-        policy_epoch,
-        value,
-        dleq_challenge,
-        dleq_response,
-    }
-}
-
-/// Verify that a [`PartialDecryptionShare`] $D_j$ is well-formed with respect to `row` and `pk`:
-/// 1. Checks `policy_epoch >= 1`, `row.row_index == share.row_index`,
-///    `row.seat_id == share.seat_id == pk.seat_id`, [`verify_row_randomness_witness`], and
-///    [`SeatPublicKey::verify_consistency`].
-/// 2. Verifies the Chaum–Pedersen NIZK DLEQ proof $(c, z)$ across $(\mathbb{G}_1, \mathbb{G}_T)$ proving:
-///
-/// $$\log_{g_1}(pk_{\rho(j),1}) = \log_{e(c_{j,3}, g_2)}\!\big(e(c_{j,1}, g_2) - D_j\big)$$
-///
-/// Because $c_{j,1} = g_1^{\lambda_j} + pk_{\rho(j),1}^{r_j}$ and $c_{j,3} = g_1^{r_j} \in \mathbb{G}_1^*$,
-/// special soundness of DLEQ uniquely pins $D_j = e(g_1, g_2)^{\lambda_j}$ for `row`'s current epoch
-/// **without exposing $g_2^{sk_j}$ or cleartext `basis_commitments`**.
-#[must_use]
-pub fn acu_verify_partial_share(
-    row: &CiphertextRow,
-    pk: &SeatPublicKey,
-    share: &PartialDecryptionShare,
-) -> bool {
-    if share.policy_epoch == 0
-        || row.row_index != share.row_index
-        || row.seat_id != share.seat_id
-        || row.seat_id != pk.seat_id
-    {
-        return false;
-    }
-    if !verify_row_randomness_witness(row) || !pk.verify_consistency() {
-        return false;
-    }
-    if bool::from(share.dleq_challenge.is_zero()) || bool::from(share.dleq_response.is_zero()) {
-        return false;
-    }
-
-    let g2_aff = G2Affine::generator();
-    let pk1_aff = G1Affine::from(pk.pk1);
-    let c1_aff = G1Affine::from(row.c1);
-    let c3_aff = G1Affine::from(row.c3);
-
-    let b_t = pairing(&c3_aff, &g2_aff);
-    if b_t == Gt::identity() {
-        return false;
-    }
-    let y_t = pairing(&c1_aff, &g2_aff) - share.value;
-
-    let r1 = G1Projective::generator() * share.dleq_response - pk.pk1 * share.dleq_challenge;
-    let r1_aff = G1Affine::from(r1);
-    let r_t = b_t * share.dleq_response - y_t * share.dleq_challenge;
-    if bool::from(r1_aff.is_identity()) || r_t == Gt::identity() {
-        return false;
-    }
-
-    let expected_c = compute_partial_share_dleq_challenge(
-        share.row_index,
-        &share.seat_id,
-        share.policy_epoch,
-        &pk1_aff,
-        &c1_aff,
-        &c3_aff,
-        &share.value,
-        &b_t,
-        &y_t,
-        &r1_aff,
-        &r_t,
-    );
-    bool::from(
-        share
-            .dleq_challenge
-            .to_bytes()
-            .ct_eq(&expected_c.to_bytes()),
+        DleqMode::Compact,
     )
 }
 
-/// Check that a [`CiphertextRow`]'s $\mathbb{G}_1$ components `(c1, c3)` and LSSS row vector
-/// are structurally valid, prime-order torsion-free, and have non-identity `c3`.
+/// Compute a verifiable `48`-byte $\mathbb{G}_1$ partial decryption share in an explicit [`DleqMode`]
+/// (`Compact` `64` B or `Batchable` `128` B).
 #[must_use]
-pub fn verify_row_randomness_witness(row: &CiphertextRow) -> bool {
-    if !is_valid_seat_id(&row.seat_id)
-        || row.matrix_row.is_empty()
-        || row.matrix_row.len() > MAX_SERIALIZED_COLS
-        || row.matrix_row.iter().all(|s| bool::from(s.is_zero()))
-    {
-        return false;
-    }
-    let c1_aff = G1Affine::from(row.c1);
-    let c3_aff = G1Affine::from(row.c3);
-    !bool::from(c3_aff.is_identity())
-        && bool::from(c1_aff.is_torsion_free())
-        && bool::from(c3_aff.is_torsion_free())
+pub fn acu_partial_decrypt_with_mode(
+    row: &CiphertextRow,
+    secret_key: &SeatSecretKey,
+    policy_epoch: u64,
+    mode: DleqMode,
+) -> PartialDecryptionShare {
+    emit_partial_share_with_mode(&row.object_digest, row, secret_key, policy_epoch, mode)
 }
 
-/// Combine a set of [`PartialDecryptionShare`]s for `ct` using exact LSSS Gaussian elimination
-/// weights $\{\omega_j\}_{j \in S}$ to recover the target-group key $K \in \mathbb{G}_T$:
+/// Verify a [`PartialDecryptionShare`] purely in $\mathbb{G}_1$ (`0` pairings!) against `row` and `seat_pk`.
+#[must_use]
+pub fn acu_verify_partial_share(
+    row: &CiphertextRow,
+    seat_pk: &SeatPublicKey,
+    share: &PartialDecryptionShare,
+) -> bool {
+    verify_partial_share_for_object(&row.object_digest, share.policy_epoch, row, seat_pk, share)
+}
+
+/// Verify the complete pure-$\mathbb{G}_1$ row-randomness proof chain (`row_pok` + `updates`) on `row`.
+#[must_use]
+pub fn verify_row_randomness_witness(row: &CiphertextRow, seat_pk: &SeatPublicKey) -> bool {
+    verify_row_randomness_chain(&row.object_digest, row, seat_pk)
+}
+
+/// Combine verified `48`-byte $\mathbb{G}_1$ partial decryption shares using **only 1 pairing total**:
 ///
-/// $$K = c_0 - \sum_{j \in S} \omega_j D_j$$
+/// $$S = \sum_{j \in \Gamma} \omega_j S_j = s^{(E)} G_1 \in \mathbb{G}_1, \qquad
+///   K_{\mathbb{G}_T} = e(c_{0,\mathbb{G}_1} - S,\, G_2) = c_0 \cdot e(S, G_2)^{-1}.$$
 ///
-/// Strictly verifies every contributed share via `policy_epoch`, row/seat binding, and
-/// [`acu_verify_partial_share`] against `seat_keys` (requiring zero cleartext `basis_commitments`),
-/// so stale shares from prior epochs (`D_old` before `revoke_and_rerandomize`) or corrupted
-/// shares fail closed immediately.
+/// Automatically uses fast batch verification when Mode B (`Batchable`) shares are supplied, and
+/// isolates the exact offending row via recursive binary splitting if a batch fails.
 pub fn acu_combine(
     ct: &AcuCiphertext,
     shares: &[PartialDecryptionShare],
     seat_keys: &BTreeMap<String, SeatPublicKey>,
 ) -> Result<Gt, AcuError> {
-    combine_inner(ct, shares, Some(seat_keys))
-}
-
-/// Perform pure LSSS linear combination $K = c_0 - \sum_{j \in S} \omega_j D_j$ enforcing
-/// `policy_epoch` and row/seat binding without DLEQ-verifying individual shares upfront
-/// (used in tests to prove that even if share verification is skipped, stale epoch-1 shares
-/// cannot cancel the rotated $c_0^{(2)}$ blinding factor and fail ChaCha20-Poly1305 AEAD authentication).
-pub fn acu_combine_unverified(
-    ct: &AcuCiphertext,
-    shares: &[PartialDecryptionShare],
-) -> Result<Gt, AcuError> {
-    combine_inner(ct, shares, None)
-}
-
-fn combine_inner(
-    ct: &AcuCiphertext,
-    shares: &[PartialDecryptionShare],
-    seat_keys_opt: Option<&BTreeMap<String, SeatPublicKey>>,
-) -> Result<Gt, AcuError> {
     ct.validate_structure()?;
-    if ct.policy_epoch == 0 {
-        return Err(AcuError::SerializationError("policy_epoch must be >= 1"));
-    }
-    let expected_sealed_len = expected_sealed_basis_len(ct.matrix.cols, ct.rows.len())?;
-    if ct.sealed_basis.ciphertext.len() != expected_sealed_len {
-        return Err(AcuError::SerializationError(
-            "invalid sealed_basis ciphertext length",
-        ));
-    }
 
-    let mut share_by_row: BTreeMap<usize, &PartialDecryptionShare> = BTreeMap::new();
-    let mut available_indices = Vec::new();
-
+    // Pre-check epoch, bounds, and seat existence so callers receive deterministic typed errors.
     for share in shares {
         if share.policy_epoch != ct.policy_epoch {
             return Err(AcuError::EpochMismatch {
@@ -1184,559 +1281,1288 @@ fn combine_inner(
                 actual: share.policy_epoch,
             });
         }
-        let Some(row) = ct.rows.get(share.row_index) else {
-            return Err(AcuError::InvalidPartialShare {
-                row_index: share.row_index,
-                seat_id: share.seat_id.clone(),
-            });
-        };
-        if row.seat_id != share.seat_id {
-            return Err(AcuError::InvalidPartialShare {
-                row_index: share.row_index,
-                seat_id: share.seat_id.clone(),
-            });
+        let row = ct
+            .rows
+            .get(share.row_index)
+            .ok_or(AcuError::RowIndexOutOfBounds {
+                index: share.row_index,
+                total_rows: ct.rows.len(),
+            })?;
+        let pk = seat_keys
+            .get(&row.seat_id)
+            .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
+        if !pk.verify_consistency() {
+            return Err(AcuError::InvalidPublicKey(row.seat_id.clone()));
         }
-        if let Some(seat_keys) = seat_keys_opt {
-            let pk = seat_keys
-                .get(&row.seat_id)
-                .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
-            if !acu_verify_partial_share(row, pk, share) {
+    }
+
+    if !shares.is_empty()
+        && !batch_verify_partial_shares(
+            &ct.object_digest,
+            ct.policy_epoch,
+            &ct.rows,
+            seat_keys,
+            shares,
+        )
+    {
+        for share in shares {
+            let row = &ct.rows[share.row_index];
+            let pk = &seat_keys[&row.seat_id];
+            if !verify_partial_share_for_object(&ct.object_digest, ct.policy_epoch, row, pk, share)
+            {
                 return Err(AcuError::InvalidPartialShare {
                     row_index: share.row_index,
                     seat_id: share.seat_id.clone(),
                 });
             }
         }
-        match share_by_row.entry(share.row_index) {
-            std::collections::btree_map::Entry::Vacant(e) => {
-                e.insert(share);
-                available_indices.push(share.row_index);
+        return Err(AcuError::InvalidPartialShare {
+            row_index: shares[0].row_index,
+            seat_id: shares[0].seat_id.clone(),
+        });
+    }
+
+    acu_combine_unverified(ct, shares)
+}
+
+/// Combine partial decryption shares in $\mathbb{G}_1$ using **1 pairing total** when DLEQ proofs
+/// have already been verified upstream (still enforces structural, epoch, and `object_digest` checks).
+pub fn acu_combine_unverified(
+    ct: &AcuCiphertext,
+    shares: &[PartialDecryptionShare],
+) -> Result<Gt, AcuError> {
+    ct.validate_structure()?;
+    if shares.is_empty() {
+        return Err(AcuError::PolicyNotSatisfied);
+    }
+
+    let mut share_by_row: BTreeMap<usize, &PartialDecryptionShare> = BTreeMap::new();
+    let mut available_indices = Vec::with_capacity(shares.len());
+    for share in shares {
+        if share.policy_epoch != ct.policy_epoch {
+            return Err(AcuError::EpochMismatch {
+                expected: ct.policy_epoch,
+                actual: share.policy_epoch,
+            });
+        }
+        let row = ct
+            .rows
+            .get(share.row_index)
+            .ok_or(AcuError::RowIndexOutOfBounds {
+                index: share.row_index,
+                total_rows: ct.rows.len(),
+            })?;
+        if share.seat_id != row.seat_id || !bool::from(share.object_digest.ct_eq(&ct.object_digest))
+        {
+            return Err(AcuError::InvalidPartialShare {
+                row_index: share.row_index,
+                seat_id: share.seat_id.clone(),
+            });
+        }
+        if let Some(existing) = share_by_row.get(&share.row_index) {
+            if existing.share_g1 != share.share_g1 {
+                return Err(AcuError::InvalidPartialShare {
+                    row_index: share.row_index,
+                    seat_id: share.seat_id.clone(),
+                });
             }
-            std::collections::btree_map::Entry::Occupied(existing) => {
-                let prev = existing.get();
-                if prev.value != share.value
-                    || prev.dleq_challenge != share.dleq_challenge
-                    || prev.dleq_response != share.dleq_response
-                {
-                    return Err(AcuError::InvalidPartialShare {
-                        row_index: share.row_index,
-                        seat_id: share.seat_id.clone(),
-                    });
-                }
-            }
+        } else {
+            share_by_row.insert(share.row_index, share);
+            available_indices.push(share.row_index);
         }
     }
 
     let weights = find_reconstruction_weights(&ct.matrix, &available_indices)?;
-    let mut blinding_gt = Gt::identity();
-    for (row_idx, omega_j) in weights {
-        let share = share_by_row[&row_idx];
-        blinding_gt += share.value * omega_j;
+    let mut s_g1 = G1Projective::identity();
+    for (row_idx, omega) in weights {
+        let share = share_by_row
+            .get(&row_idx)
+            .ok_or(AcuError::PolicyNotSatisfied)?;
+        s_g1 += share.share_g1 * omega;
     }
 
-    Ok(ct.c0 - blinding_gt)
+    let mut payload_g1 = ct.c0_g1 - s_g1;
+    let payload_gt = pairing(&G1Affine::from(payload_g1), &G2Affine::generator());
+    payload_g1.zeroize();
+    Ok(payload_gt)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prove_partial_share_dleq(
-    row_index: usize,
-    seat_id: &str,
-    policy_epoch: u64,
-    sk: &Scalar,
-    pk1_aff: &G1Affine,
-    c1_aff: &G1Affine,
-    c3_aff: &G1Affine,
-    value: &Gt,
-    b_t: &Gt,
-    y_t: &Gt,
-) -> (Scalar, Scalar) {
-    if bool::from(c3_aff.is_identity()) || *b_t == Gt::identity() || policy_epoch == 0 {
-        return (Scalar::ZERO, Scalar::ZERO);
-    }
-
-    let mut sk_bytes = Zeroizing::new(sk.to_bytes());
-    let mut ikm = Zeroizing::new(Vec::with_capacity(32 + 8 + 4 + 4 + seat_id.len() + 48 * 3));
-    ikm.extend_from_slice(&*sk_bytes);
-    sk_bytes.zeroize();
-    ikm.extend_from_slice(&policy_epoch.to_be_bytes());
-    ikm.extend_from_slice(&(row_index as u32).to_be_bytes());
-    ikm.extend_from_slice(&(seat_id.len() as u32).to_be_bytes());
-    ikm.extend_from_slice(seat_id.as_bytes());
-    ikm.extend_from_slice(&pk1_aff.to_compressed());
-    ikm.extend_from_slice(&c1_aff.to_compressed());
-    ikm.extend_from_slice(&c3_aff.to_compressed());
-
-    let hk = Hkdf::<Sha256>::new(Some(DLEQ_NONCE_SALT), &ikm);
-    let g1 = G1Projective::generator();
-
-    for ctr in 0u32.. {
-        let mut info = Vec::with_capacity(DLEQ_NONCE_INFO.len() + 4);
-        info.extend_from_slice(DLEQ_NONCE_INFO);
-        info.extend_from_slice(&ctr.to_be_bytes());
-
-        let mut wide = Zeroizing::new([0u8; 64]);
-        hk.expand(&info, &mut *wide)
-            .expect("64-byte HKDF-SHA256 output is always valid");
-        let mut k = Scalar::from_bytes_wide(&wide);
-        wide.zeroize();
-        if bool::from(k.is_zero()) {
-            continue;
-        }
-        let r1_aff = G1Affine::from(g1 * k);
-        let r_t = *b_t * k;
-        if bool::from(r1_aff.is_identity()) || r_t == Gt::identity() {
-            k.zeroize();
-            continue;
-        }
-        let c = compute_partial_share_dleq_challenge(
-            row_index,
-            seat_id,
-            policy_epoch,
-            pk1_aff,
-            c1_aff,
-            c3_aff,
-            value,
-            b_t,
-            y_t,
-            &r1_aff,
-            &r_t,
-        );
-        if bool::from(c.is_zero()) {
-            k.zeroize();
-            continue;
-        }
-        let z = k + c * *sk;
-        k.zeroize();
-        if !bool::from(z.is_zero()) {
-            return (c, z);
-        }
-    }
-    unreachable!("unbounded u32 counter finds valid DLEQ nonce on ctr = 0 w.h.p.")
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compute_partial_share_dleq_challenge(
-    row_index: usize,
-    seat_id: &str,
-    policy_epoch: u64,
-    pk1_aff: &G1Affine,
-    c1_aff: &G1Affine,
-    c3_aff: &G1Affine,
-    value: &Gt,
-    b_t: &Gt,
-    y_t: &Gt,
-    r1_aff: &G1Affine,
-    r_t: &Gt,
-) -> Scalar {
-    let mut hasher = Sha256::new();
-    hasher.update(DLEQ_CHALLENGE_DOMAIN);
-    hasher.update(policy_epoch.to_be_bytes());
-    hasher.update((row_index as u32).to_be_bytes());
-    hasher.update((seat_id.len() as u32).to_be_bytes());
-    hasher.update(seat_id.as_bytes());
-    hasher.update(G1Affine::generator().to_compressed());
-    hasher.update(G2Affine::generator().to_compressed());
-    hasher.update(pk1_aff.to_compressed());
-    hasher.update(c1_aff.to_compressed());
-    hasher.update(c3_aff.to_compressed());
-    hasher.update(r1_aff.to_compressed());
-    for gt_elem in [value, b_t, y_t, r_t] {
-        let repr = Zeroizing::new(format!("{gt_elem:?}"));
-        hasher.update((repr.len() as u32).to_be_bytes());
-        hasher.update(repr.as_bytes());
-    }
-    let digest = hasher.finalize();
-
-    let hk = Hkdf::<Sha256>::new(Some(DLEQ_CHALLENGE_SALT), &digest);
-    let mut wide = [0u8; 64];
-    hk.expand(DLEQ_CHALLENGE_INFO, &mut wide)
-        .expect("64-byte HKDF-SHA256 output is always valid");
-    Scalar::from_bytes_wide(&wide)
-}
-
-pub(crate) fn expected_sealed_basis_len(cols: usize, num_rows: usize) -> Result<usize, AcuError> {
-    if cols == 0 || cols > MAX_SERIALIZED_COLS || num_rows == 0 || num_rows > MAX_SERIALIZED_ROWS {
-        return Err(AcuError::SerializationError(
-            "invalid AcuCiphertext dimensions",
-        ));
-    }
-    let basis_bytes = cols
-        .checked_mul(G1_COMPRESSED_BYTES)
-        .ok_or(AcuError::SerializationError("sealed_basis length overflow"))?;
-    let scalar_bytes = num_rows
-        .checked_mul(SCALAR_BYTES)
-        .ok_or(AcuError::SerializationError("sealed_basis length overflow"))?;
-    basis_bytes
-        .checked_add(scalar_bytes)
-        .and_then(|n| n.checked_add(POLY1305_TAG_BYTES))
-        .ok_or(AcuError::SerializationError("sealed_basis length overflow"))
-}
-
-fn derive_basis_seal_key(
-    ephemeral_pk1: &G1Projective,
-    acu_pk1: &G1Projective,
-    shared_z: &G1Projective,
-) -> Zeroizing<[u8; 32]> {
-    let mut ikm = Zeroizing::new([0u8; G1_COMPRESSED_BYTES * 3]);
-    ikm[0..48].copy_from_slice(&G1Affine::from(*ephemeral_pk1).to_compressed());
-    ikm[48..96].copy_from_slice(&G1Affine::from(*acu_pk1).to_compressed());
-    ikm[96..144].copy_from_slice(&G1Affine::from(*shared_z).to_compressed());
-
-    let hk = Hkdf::<Sha256>::new(Some(BASIS_SEAL_HKDF_SALT), &*ikm);
-    let mut okm = Zeroizing::new([0u8; 32]);
-    hk.expand(BASIS_SEAL_HKDF_INFO, &mut *okm)
-        .expect("32-byte HKDF-SHA256 output is always valid");
-    okm
-}
-
-fn encode_basis_seal_aad(
-    policy_epoch: u64,
-    acu_seat_id: &str,
-    cols: usize,
-    c0_g1: &G1Projective,
-    rows: &[CiphertextRow],
-) -> Vec<u8> {
-    let mut aad = Vec::new();
-    aad.extend_from_slice(BASIS_SEAL_AAD_DOMAIN);
-    aad.extend_from_slice(&policy_epoch.to_be_bytes());
-    aad.extend_from_slice(&(acu_seat_id.len() as u32).to_be_bytes());
-    aad.extend_from_slice(acu_seat_id.as_bytes());
-    aad.extend_from_slice(&(cols as u32).to_be_bytes());
-    aad.extend_from_slice(&(rows.len() as u32).to_be_bytes());
-    aad.extend_from_slice(&G1Affine::from(*c0_g1).to_compressed());
-    for row in rows {
-        aad.extend_from_slice(&(row.row_index as u32).to_be_bytes());
-        aad.extend_from_slice(&(row.seat_id.len() as u32).to_be_bytes());
-        aad.extend_from_slice(row.seat_id.as_bytes());
-        aad.extend_from_slice(&(row.matrix_row.len() as u32).to_be_bytes());
-        for scalar in &row.matrix_row {
-            aad.extend_from_slice(&scalar.to_bytes());
-        }
-        aad.extend_from_slice(&G1Affine::from(row.c1).to_compressed());
-        aad.extend_from_slice(&G1Affine::from(row.c3).to_compressed());
-    }
-    aad
-}
-
-#[allow(clippy::too_many_arguments)]
-fn seal_basis_commitments(
-    basis_commitments: &[G1Projective],
-    row_scalars: &[Scalar],
-    acu_seat_id: &str,
-    acu_pk1: &G1Projective,
-    policy_epoch: u64,
-    c0_g1: &G1Projective,
-    rows: &[CiphertextRow],
-    rng: &mut (impl RngCore + CryptoRng),
-) -> Result<SealedBasisCommitments, AcuError> {
-    if !is_valid_seat_id(acu_seat_id) {
-        return Err(AcuError::InvalidSeatId);
-    }
-    let acu_pk1_aff = G1Affine::from(*acu_pk1);
-    if bool::from(acu_pk1_aff.is_identity())
-        || !bool::from(acu_pk1_aff.is_torsion_free())
-        || basis_commitments.is_empty()
-        || row_scalars.len() != rows.len()
-        || rows.is_empty()
-    {
-        return Err(AcuError::InvalidPublicKey(acu_seat_id.to_string()));
-    }
-
-    let cols = basis_commitments.len();
-    let mut plaintext = Zeroizing::new(Vec::with_capacity(
-        cols * G1_COMPRESSED_BYTES + row_scalars.len() * SCALAR_BYTES,
-    ));
-    for vm in basis_commitments {
-        if bool::from(vm.is_identity()) {
-            return Err(AcuError::SerializationError("identity basis commitment"));
-        }
-        let mut compressed = G1Affine::from(*vm).to_compressed();
-        plaintext.extend_from_slice(&compressed);
-        compressed.zeroize();
-    }
-    for r_j in row_scalars {
-        if bool::from(r_j.is_zero()) {
-            return Err(AcuError::SerializationError("zero row randomness scalar"));
-        }
-        let mut s_bytes = r_j.to_bytes();
-        plaintext.extend_from_slice(&s_bytes);
-        s_bytes.zeroize();
-    }
-
-    let g1 = G1Projective::generator();
-    let mut r_kem = sample_nonzero_scalar(rng);
-    let ephemeral_pk1 = g1 * r_kem;
-    let mut shared_z = *acu_pk1 * r_kem;
-    r_kem.zeroize();
-
-    let sym_key = derive_basis_seal_key(&ephemeral_pk1, acu_pk1, &shared_z);
-    shared_z.zeroize();
-
-    let aad = encode_basis_seal_aad(policy_epoch, acu_seat_id, cols, c0_g1, rows);
-    let mut nonce = [0u8; 12];
-    rng.fill_bytes(&mut nonce);
-
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&*sym_key));
-    let ciphertext = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| AcuError::AeadFailure)?;
-
-    Ok(SealedBasisCommitments {
-        acu_seat_id: acu_seat_id.to_string(),
-        ephemeral_pk1,
-        nonce,
-        ciphertext,
-    })
-}
-
-/// Cryptographically authenticate `ct` against `acu_sk` AND verify that every row `j` in `ct.rows`
-/// algebraically matches `commit_row_in_g1(&basis, &row.matrix_row) + pk_j.pk1 * r_j == row.c1`
-/// and `g_1 * r_j == row.c3` against the caller-supplied public-key directory lookup, zeroizing
-/// unsealed secrets immediately on return.
-pub(crate) fn verify_sealed_basis_with_lookup<'a, F>(
+fn verify_acu_operator(
     ct: &AcuCiphertext,
     acu_sk: &SeatSecretKey,
-    mut lookup_pk: F,
-) -> Result<(), AcuError>
-where
-    F: FnMut(&str) -> Option<&'a SeatPublicKey>,
-{
-    let state = unseal_basis_commitments(ct, acu_sk)?;
-    for (row, &r_j) in ct.rows.iter().zip(state.row_scalars.iter()) {
-        let pk = lookup_pk(&row.seat_id).ok_or(AcuError::BasisUnsealFailed)?;
-        if pk.seat_id != row.seat_id || !pk.verify_consistency() {
-            return Err(AcuError::BasisUnsealFailed);
-        }
-        let mut expected_c1 = commit_row_in_g1(&state.basis, &row.matrix_row) + pk.pk1 * r_j;
-        let matches = expected_c1 == row.c1;
-        expected_c1.zeroize();
-        if !matches {
-            return Err(AcuError::BasisUnsealFailed);
-        }
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+) -> Result<(), AcuError> {
+    if acu_sk.seat_id != ct.acu_seat_id {
+        return Err(AcuError::UnauthorizedPolicyOperator);
+    }
+    let acu_pk = seat_keys
+        .get(&ct.acu_seat_id)
+        .ok_or_else(|| AcuError::UnknownSeat(ct.acu_seat_id.clone()))?;
+    if !acu_pk.verify_consistency() {
+        return Err(AcuError::InvalidPublicKey(ct.acu_seat_id.clone()));
+    }
+    let derived_pk1 = G1Projective::generator() * acu_sk.sk;
+    if !bool::from(
+        G1Affine::from(derived_pk1)
+            .to_compressed()
+            .ct_eq(&G1Affine::from(acu_pk.pk1).to_compressed()),
+    ) {
+        return Err(AcuError::UnauthorizedPolicyOperator);
     }
     Ok(())
 }
 
-fn unseal_basis_commitments(
-    ct: &AcuCiphertext,
+/// Ciphertext-only homomorphic revocation and rerandomization (`ePrint v2` §6.3 Op 1).
+///
+/// Operates **without** unsealing `sbc_slots` or knowing $V_0 = s G_1$, **refusing self-lockout**
+/// (`Err(AcuError::PolicyUnsatisfiableAfterRevocation)`) if pruning `revoked_seat_ids` would leave
+/// $(1, 0, \dots, 0) \notin \mathsf{span}(M_{E+1})$ (for example on a `2-of-2` policy without an
+/// archive fallback). For intentional CISO kill-switch lockout on a `2-of-2` split-key ciphertext,
+/// call [`emergency_lock_and_rerandomize`].
+pub fn revoke_and_rerandomize(
+    ct: &mut AcuCiphertext,
     acu_sk: &SeatSecretKey,
-) -> Result<UnsealedBasisState, AcuError> {
-    if ct.policy_epoch == 0
-        || !is_valid_seat_id(&ct.sealed_basis.acu_seat_id)
-        || acu_sk.seat_id != ct.sealed_basis.acu_seat_id
-    {
-        return Err(AcuError::BasisUnsealFailed);
-    }
-    ct.validate_structure()
-        .map_err(|_| AcuError::BasisUnsealFailed)?;
-    let eph_aff = G1Affine::from(ct.sealed_basis.ephemeral_pk1);
-    let c0_aff = G1Affine::from(ct.c0_g1);
-    if bool::from(eph_aff.is_identity())
-        || !bool::from(eph_aff.is_torsion_free())
-        || bool::from(c0_aff.is_identity())
-        || !bool::from(c0_aff.is_torsion_free())
-        || !ct.rows.iter().all(verify_row_randomness_witness)
-    {
-        return Err(AcuError::BasisUnsealFailed);
-    }
-    let expected_len = expected_sealed_basis_len(ct.matrix.cols, ct.rows.len())
-        .map_err(|_| AcuError::BasisUnsealFailed)?;
-    if ct.sealed_basis.ciphertext.len() != expected_len {
-        return Err(AcuError::BasisUnsealFailed);
-    }
-    if ct.c0 != pairing(&c0_aff, &G2Affine::generator()) {
-        return Err(AcuError::BasisUnsealFailed);
+    revoked_seat_ids: &[&str],
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<(), AcuError> {
+    revoke_internal(ct, acu_sk, revoked_seat_ids, seat_keys, false, rng)
+}
+
+/// Explicit CISO emergency kill-switch revocation & rerandomization: identical to
+/// [`revoke_and_rerandomize`], except permitted to prune a `2-of-2` policy into an intentionally
+/// unsatisfiable `PolicyNotSatisfied` locked state (`test_1` instant CISO branch kill-switch).
+pub fn emergency_lock_and_rerandomize(
+    ct: &mut AcuCiphertext,
+    acu_sk: &SeatSecretKey,
+    revoked_seat_ids: &[&str],
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<(), AcuError> {
+    revoke_internal(ct, acu_sk, revoked_seat_ids, seat_keys, true, rng)
+}
+
+fn revoke_internal(
+    ct: &mut AcuCiphertext,
+    acu_sk: &SeatSecretKey,
+    revoked_seat_ids: &[&str],
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    allow_unsatisfiable_lockout: bool,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<(), AcuError> {
+    ct.validate_structure()?;
+    verify_acu_operator(ct, acu_sk, seat_keys)?;
+
+    let revoked: BTreeSet<&str> = revoked_seat_ids.iter().copied().collect();
+    let keep_mask: Vec<bool> = ct
+        .rows
+        .iter()
+        .map(|r| !revoked.contains(r.seat_id.as_str()))
+        .collect();
+    if !keep_mask.iter().any(|&keep| keep) {
+        return Err(AcuError::PolicyUnsatisfiableAfterRevocation);
     }
 
+    let mut next_matrix = ct.matrix.clone();
+    next_matrix.retain_rows(&keep_mask)?;
+    let surviving_indices: Vec<usize> = (0..next_matrix.rows.len()).collect();
+    if !allow_unsatisfiable_lockout
+        && find_reconstruction_weights(&next_matrix, &surviving_indices).is_err()
+    {
+        return Err(AcuError::PolicyUnsatisfiableAfterRevocation);
+    }
+
+    for (seat_id, _) in &next_matrix.rows {
+        let pk = seat_keys
+            .get(seat_id)
+            .ok_or_else(|| AcuError::UnknownSeat(seat_id.clone()))?;
+        if !pk.verify_consistency() {
+            return Err(AcuError::InvalidPublicKey(seat_id.clone()));
+        }
+    }
+
+    let prev_digest = ct.header_digest();
+    let next_epoch = ct
+        .policy_epoch
+        .checked_add(1)
+        .ok_or(AcuError::SerializationError("policy_epoch overflow"))?;
+    let k = next_matrix.cols;
     let g1 = G1Projective::generator();
-    let mut acu_pk1 = g1 * acu_sk.sk;
-    let mut shared_z = ct.sealed_basis.ephemeral_pk1 * acu_sk.sk;
-    if bool::from(acu_pk1.is_identity()) || bool::from(shared_z.is_identity()) {
-        acu_pk1.zeroize();
-        shared_z.zeroize();
-        return Err(AcuError::BasisUnsealFailed);
+
+    // Sample delta_s in F_r^* and delta_v_1..delta_v_{k-1} in F_r.
+    let mut delta_v = Zeroizing::new(Vec::with_capacity(k));
+    delta_v.push(sample_nonzero_scalar(rng));
+    for _ in 1..k {
+        delta_v.push(sample_uniform_scalar(rng));
     }
 
-    let sym_key = derive_basis_seal_key(&ct.sealed_basis.ephemeral_pk1, &acu_pk1, &shared_z);
-    acu_pk1.zeroize();
-    shared_z.zeroize();
+    let next_c0_g1 = ct.c0_g1 + g1 * delta_v[0];
+    let next_c0 = pairing(&G1Affine::from(next_c0_g1), &G2Affine::generator());
 
-    let aad = encode_basis_seal_aad(
-        ct.policy_epoch,
-        &ct.sealed_basis.acu_seat_id,
-        ct.matrix.cols,
-        &ct.c0_g1,
+    let next_rows = rerandomize_kept_rows(
+        &ct.object_digest,
+        next_epoch,
+        &prev_digest,
         &ct.rows,
-    );
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&*sym_key));
-    let decrypted = Zeroizing::new(
-        cipher
-            .decrypt(
-                Nonce::from_slice(&ct.sealed_basis.nonce),
-                Payload {
-                    msg: &ct.sealed_basis.ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| AcuError::BasisUnsealFailed)?,
-    );
+        &keep_mask,
+        &delta_v,
+        seat_keys,
+        rng,
+    )?;
 
-    let basis_bytes_len = ct.matrix.cols * G1_COMPRESSED_BYTES;
-    let scalar_bytes_len = ct.rows.len() * SCALAR_BYTES;
-    if decrypted.len() != basis_bytes_len + scalar_bytes_len {
-        return Err(AcuError::BasisUnsealFailed);
+    // Tighten and rerandomize EVERY existing SbcSlot homomorphically (without unsealing!).
+    let mut next_slots = Vec::with_capacity(ct.sbc_slots.len() + 1);
+    for slot in &ct.sbc_slots {
+        let mut dv_sbc = Zeroizing::new(Vec::with_capacity(k));
+        dv_sbc.push(sample_nonzero_scalar(rng));
+        for _ in 1..k {
+            dv_sbc.push(sample_uniform_scalar(rng));
+        }
+        let slot_next_c0 = slot.c0_g1 + g1 * dv_sbc[0];
+        let slot_next_rows = rerandomize_kept_rows(
+            &ct.object_digest,
+            next_epoch,
+            &prev_digest,
+            &slot.rows,
+            &keep_mask,
+            &dv_sbc,
+            seat_keys,
+            rng,
+        )?;
+        next_slots.push(SbcSlot {
+            created_epoch: slot.created_epoch,
+            col_offset: slot.col_offset,
+            col_count: slot.col_count,
+            c0_g1: slot_next_c0,
+            nonce: slot.nonce,
+            ciphertext: slot.ciphertext.clone(),
+            rows: slot_next_rows,
+        });
     }
 
-    let mut state = UnsealedBasisState {
-        basis: Vec::with_capacity(ct.matrix.cols),
-        row_scalars: Vec::with_capacity(ct.rows.len()),
+    if k > 1 {
+        let mut delta_aux: Vec<G1Projective> = delta_v[1..].iter().map(|s| g1 * s).collect();
+        let mut fresh_loc_key = Zeroizing::new([0u8; 32]);
+        rng.fill_bytes(&mut fresh_loc_key[..]);
+        let delta_slot = seal_sbc_slot(
+            &ct.object_digest,
+            next_epoch,
+            1,
+            &delta_aux,
+            &fresh_loc_key,
+            &next_matrix,
+            seat_keys,
+            rng,
+        )?;
+        for pt in &mut delta_aux {
+            pt.zeroize();
+        }
+        next_slots.push(delta_slot);
+    }
+
+    ct.policy_epoch = next_epoch;
+    ct.c0_g1 = next_c0_g1;
+    ct.c0 = next_c0;
+    ct.matrix = next_matrix;
+    ct.rows = next_rows;
+    ct.sbc_slots = next_slots;
+    ct.sign_epoch_auth(acu_sk)?;
+    ct.validate_structure()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rerandomize_kept_rows(
+    object_digest: &[u8; 32],
+    next_epoch: u64,
+    prev_digest: &[u8; 32],
+    old_rows: &[CiphertextRow],
+    keep_mask: &[bool],
+    delta_v: &[Scalar],
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<Vec<CiphertextRow>, AcuError> {
+    let g1 = G1Projective::generator();
+    let mut next_rows = Vec::new();
+    for (keep, old_row) in keep_mask.iter().zip(old_rows.iter()) {
+        if !*keep {
+            continue;
+        }
+        let new_idx = next_rows.len();
+        let pk = seat_keys
+            .get(&old_row.seat_id)
+            .ok_or_else(|| AcuError::UnknownSeat(old_row.seat_id.clone()))?;
+        let mut delta_lambda = old_row
+            .matrix_row
+            .iter()
+            .zip(delta_v.iter())
+            .fold(Scalar::ZERO, |acc, (&m, &dv)| acc + m * dv);
+        let mut r_prime = sample_nonzero_scalar(rng);
+        let delta_c1 = g1 * delta_lambda + pk.pk1 * r_prime;
+        let delta_c2 = g1 * r_prime;
+        delta_lambda.zeroize();
+
+        let pok = prove_update_row_pok(
+            object_digest,
+            next_epoch,
+            prev_digest,
+            new_idx as u32,
+            &pk.pk1,
+            &delta_c1,
+            &delta_c2,
+            &r_prime,
+            rng,
+        )?;
+        r_prime.zeroize();
+
+        let mut updates = old_row.updates.clone();
+        updates.push(RowUpdateProof {
+            epoch: next_epoch,
+            prev_header_digest: *prev_digest,
+            row_index: new_idx as u32,
+            delta_c1,
+            delta_c2,
+            pok,
+        });
+
+        next_rows.push(CiphertextRow {
+            object_digest: *object_digest,
+            row_index: new_idx,
+            seat_id: old_row.seat_id.clone(),
+            row_locator: old_row.row_locator,
+            oblivious_hint: old_row.oblivious_hint,
+            matrix_row: old_row.matrix_row.clone(),
+            c1: old_row.c1 + delta_c1,
+            c2: old_row.c2 + delta_c2,
+            init_epoch: old_row.init_epoch,
+            init_row_index: old_row.init_row_index,
+            init_matrix_digest: old_row.init_matrix_digest,
+            init_c1: old_row.init_c1,
+            init_c2: old_row.init_c2,
+            row_pok: old_row.row_pok,
+            updates,
+        });
+    }
+    Ok(next_rows)
+}
+
+/// Ciphertext-only subtree-consistent threshold escalation (`ePrint v2` §6.3 Op 2) resolved by
+/// matching leaf row indices `gate_row_indices`.
+pub fn escalate_threshold(
+    ct: &mut AcuCiphertext,
+    acu_sk: &SeatSecretKey,
+    gate_row_indices: &[usize],
+    delta_t: usize,
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<(), AcuError> {
+    let gate_id = ct.matrix.resolve_gate_for_rows(gate_row_indices)?;
+    escalate_gate_threshold(ct, acu_sk, gate_id, delta_t, seat_keys, rng)
+}
+
+/// Ciphertext-only subtree-consistent threshold escalation by `gate_id` (`ePrint v2` §6.3 Op 2):
+/// 1. Shares Vandermonde scalar $x_{g,c}$ identically across every leaf row $j \in C_{g,c}$ (fixing
+///    nested `OR` / `AND` subtrees beneath threshold gates),
+/// 2. Simultaneously samples fresh rerandomization scalars $\Delta v = (\Delta s, \Delta v_1, \dots, \Delta v_{k_E-1})$
+///    alongside $u_1, \dots, u_{\Delta t} \in \mathbb{F}_r^{\Delta t}$, updating $c'_0$ and shifting all
+///    rows so cached pre-escalation shares are algebraically useless, and
+/// 3. Escalates & rerandomizes all existing `sbc_slots` homomorphically while sealing
+///    $(\Delta V_{\text{aux}}, u_1 G_1, \dots, u_{\Delta t} G_1)$ into a fresh slot under $(M_{E+1}, \rho_{E+1})$.
+pub fn escalate_gate_threshold(
+    ct: &mut AcuCiphertext,
+    acu_sk: &SeatSecretKey,
+    gate_id: usize,
+    delta_t: usize,
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<(), AcuError> {
+    ct.validate_structure()?;
+    verify_acu_operator(ct, acu_sk, seat_keys)?;
+
+    for (seat_id, _) in &ct.matrix.rows {
+        let pk = seat_keys
+            .get(seat_id)
+            .ok_or_else(|| AcuError::UnknownSeat(seat_id.clone()))?;
+        if !pk.verify_consistency() {
+            return Err(AcuError::InvalidPublicKey(seat_id.clone()));
+        }
+    }
+
+    let old_k = ct.matrix.cols;
+    let mut next_matrix = ct.matrix.clone();
+    let row_tails = next_matrix.escalate_gate(gate_id, delta_t)?;
+    let new_k = next_matrix.cols;
+
+    let prev_digest = ct.header_digest();
+    let next_epoch = ct
+        .policy_epoch
+        .checked_add(1)
+        .ok_or(AcuError::SerializationError("policy_epoch overflow"))?;
+    let g1 = G1Projective::generator();
+
+    // Sample full extended shift vector `[delta_s, delta_v_1..delta_v_{old_k-1}, u_1..u_{delta_t}]`.
+    let mut full_shift = Zeroizing::new(Vec::with_capacity(new_k));
+    full_shift.push(sample_nonzero_scalar(rng));
+    for _ in 1..new_k {
+        full_shift.push(sample_uniform_scalar(rng));
+    }
+    let _ = old_k;
+
+    let next_c0_g1 = ct.c0_g1 + g1 * full_shift[0];
+    let next_c0 = pairing(&G1Affine::from(next_c0_g1), &G2Affine::generator());
+
+    let next_rows = escalate_rows_homomorphically(
+        &ct.object_digest,
+        next_epoch,
+        &prev_digest,
+        &ct.rows,
+        &row_tails,
+        &full_shift,
+        seat_keys,
+        rng,
+    )?;
+
+    let mut next_slots = Vec::with_capacity(ct.sbc_slots.len() + 1);
+    for slot in &ct.sbc_slots {
+        let mut sbc_shift = Zeroizing::new(Vec::with_capacity(new_k));
+        sbc_shift.push(sample_nonzero_scalar(rng));
+        for _ in 1..new_k {
+            sbc_shift.push(sample_uniform_scalar(rng));
+        }
+        let slot_next_c0 = slot.c0_g1 + g1 * sbc_shift[0];
+        let slot_next_rows = escalate_rows_homomorphically(
+            &ct.object_digest,
+            next_epoch,
+            &prev_digest,
+            &slot.rows,
+            &row_tails,
+            &sbc_shift,
+            seat_keys,
+            rng,
+        )?;
+        next_slots.push(SbcSlot {
+            created_epoch: slot.created_epoch,
+            col_offset: slot.col_offset,
+            col_count: slot.col_count,
+            c0_g1: slot_next_c0,
+            nonce: slot.nonce,
+            ciphertext: slot.ciphertext.clone(),
+            rows: slot_next_rows,
+        });
+    }
+
+    let mut delta_and_u_aux: Vec<G1Projective> = full_shift[1..].iter().map(|s| g1 * s).collect();
+    let mut fresh_loc_key = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut fresh_loc_key[..]);
+    let new_slot = seal_sbc_slot(
+        &ct.object_digest,
+        next_epoch,
+        1,
+        &delta_and_u_aux,
+        &fresh_loc_key,
+        &next_matrix,
+        seat_keys,
+        rng,
+    )?;
+    for pt in &mut delta_and_u_aux {
+        pt.zeroize();
+    }
+    next_slots.push(new_slot);
+
+    ct.policy_epoch = next_epoch;
+    ct.c0_g1 = next_c0_g1;
+    ct.c0 = next_c0;
+    ct.matrix = next_matrix;
+    ct.rows = next_rows;
+    ct.sbc_slots = next_slots;
+    ct.sign_epoch_auth(acu_sk)?;
+    ct.validate_structure()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn escalate_rows_homomorphically(
+    object_digest: &[u8; 32],
+    next_epoch: u64,
+    prev_digest: &[u8; 32],
+    old_rows: &[CiphertextRow],
+    row_tails: &[Vec<Scalar>],
+    full_shift: &[Scalar],
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<Vec<CiphertextRow>, AcuError> {
+    let g1 = G1Projective::generator();
+    let mut next_rows = Vec::with_capacity(old_rows.len());
+    for (idx, (old_row, tail)) in old_rows.iter().zip(row_tails.iter()).enumerate() {
+        let pk = seat_keys
+            .get(&old_row.seat_id)
+            .ok_or_else(|| AcuError::UnknownSeat(old_row.seat_id.clone()))?;
+        let mut ext_row = Vec::with_capacity(old_row.matrix_row.len() + tail.len());
+        ext_row.extend_from_slice(&old_row.matrix_row);
+        ext_row.extend_from_slice(tail);
+
+        let mut delta_lambda = ext_row
+            .iter()
+            .zip(full_shift.iter())
+            .fold(Scalar::ZERO, |acc, (&m, &s)| acc + m * s);
+        let mut r_prime = sample_nonzero_scalar(rng);
+        let delta_c1 = g1 * delta_lambda + pk.pk1 * r_prime;
+        let delta_c2 = g1 * r_prime;
+        delta_lambda.zeroize();
+
+        let pok = prove_update_row_pok(
+            object_digest,
+            next_epoch,
+            prev_digest,
+            idx as u32,
+            &pk.pk1,
+            &delta_c1,
+            &delta_c2,
+            &r_prime,
+            rng,
+        )?;
+        r_prime.zeroize();
+
+        let mut updates = old_row.updates.clone();
+        updates.push(RowUpdateProof {
+            epoch: next_epoch,
+            prev_header_digest: *prev_digest,
+            row_index: idx as u32,
+            delta_c1,
+            delta_c2,
+            pok,
+        });
+
+        next_rows.push(CiphertextRow {
+            object_digest: *object_digest,
+            row_index: idx,
+            seat_id: old_row.seat_id.clone(),
+            row_locator: old_row.row_locator,
+            oblivious_hint: old_row.oblivious_hint,
+            matrix_row: ext_row,
+            c1: old_row.c1 + delta_c1,
+            c2: old_row.c2 + delta_c2,
+            init_epoch: old_row.init_epoch,
+            init_row_index: old_row.init_row_index,
+            init_matrix_digest: old_row.init_matrix_digest,
+            init_c1: old_row.init_c1,
+            init_c2: old_row.init_c2,
+            row_pok: old_row.row_pok,
+            updates,
+        });
+    }
+    Ok(next_rows)
+}
+
+/// 3-equation pure-$\mathbb{G}_1$ HVZK Chaum–Pedersen proof that `(new_c1, new_c2)` under `new_pk`
+/// encrypts the exact same hidden share $\lambda_{\text{sib}} G_1$ as `(sib_c1, sib_c2)` under `sib_pk`
+/// without revealing $\lambda_{\text{sib}} G_1$ to the `ACU` operator!
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiblingRowTransfer {
+    /// Sibling's re-encrypted $c'_1 = (c_1 - sk_{\text{sib}} c_2) + r_{\text{new}} pk_{\text{new}} \in \mathbb{G}_1$.
+    pub new_c1: G1Projective,
+    /// Sibling's fresh ephemeral randomness $c'_2 = r_{\text{new}} G_1 \in \mathbb{G}_1^*$.
+    pub new_c2: G1Projective,
+    /// Oblivious ECDH hint for the new sibling seat (`r_new * pk_new`).
+    pub oblivious_hint: [u8; 8],
+    /// `64`-byte initial `RowPok` on `(new_c1, new_c2)` at `target_epoch`.
+    pub row_pok: RowPok,
+    /// Per-object blind row locator $\ell_{\text{new}}$.
+    pub row_locator: [u8; 32],
+    /// HVZK 3-equation challenge $\mathsf{ch} \in \mathbb{F}_r^*$.
+    pub challenge: Scalar,
+    /// HVZK response $z_1 = k_1 + \mathsf{ch} \cdot sk_{\text{sib}} \pmod{r}$.
+    pub response_sk: Scalar,
+    /// HVZK response $z_2 = k_2 + \mathsf{ch} \cdot r_{\text{new}} \pmod{r}$.
+    pub response_r: Scalar,
+}
+
+/// Custodian-signed blinded warm-fork authorization (`Shadow-KV` `OR`-branch attachment) that
+/// neither `acu_sk` alone nor `sib_sk` alone can forge into a threshold bypass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WarmForkRequest {
+    /// Expected `object_digest` ($O$).
+    pub object_digest: [u8; 32],
+    /// Current `policy_epoch` ($E$).
+    pub base_epoch: u64,
+    /// Existing non-ACU custodian row index being warm-forked.
+    pub existing_row_index: usize,
+    /// Seat ID of the new sibling branch.
+    pub new_seat_id: String,
+    /// Blinded HVZK transfer of the main ciphertext row.
+    pub main_transfer: SiblingRowTransfer,
+    /// Blinded HVZK transfers of each `SbcSlot` row aligned with `existing_row_index`.
+    pub sbc_transfers: Vec<SiblingRowTransfer>,
+}
+
+impl WarmForkRequest {
+    /// Construct a blinded [`WarmForkRequest`] as the non-ACU custodian holding `existing_sk`.
+    pub fn create(
+        ct: &AcuCiphertext,
+        existing_row_index: usize,
+        existing_sk: &SeatSecretKey,
+        new_pk: &SeatPublicKey,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<Self, AcuError> {
+        ct.validate_structure()?;
+        if !new_pk.verify_consistency() {
+            return Err(AcuError::InvalidPublicKey(new_pk.seat_id.clone()));
+        }
+        let sib_row = ct
+            .rows
+            .get(existing_row_index)
+            .ok_or(AcuError::RowIndexOutOfBounds {
+                index: existing_row_index,
+                total_rows: ct.rows.len(),
+            })?;
+        // Forbid warm-forking the ACU row itself!
+        if sib_row.seat_id == ct.acu_seat_id || existing_sk.seat_id != sib_row.seat_id {
+            return Err(AcuError::UnauthorizedPolicyOperator);
+        }
+
+        let target_epoch = ct
+            .policy_epoch
+            .checked_add(1)
+            .ok_or(AcuError::SerializationError("policy_epoch overflow"))?;
+        let new_row_index = ct.rows.len() as u32;
+        let sib_pk1 = G1Projective::generator() * existing_sk.sk;
+
+        let mut next_mat = ct.matrix.clone();
+        next_mat.attach_sibling(existing_row_index, new_pk.seat_id.clone())?;
+        let target_mat_digest = next_mat.canonical_digest();
+
+        let mut loc_key = Zeroizing::new([0u8; 32]);
+        rng.fill_bytes(&mut loc_key[..]);
+
+        let main_transfer = build_sibling_transfer(
+            &ct.object_digest,
+            &target_mat_digest,
+            target_epoch,
+            new_row_index,
+            0,
+            &loc_key,
+            sib_row,
+            &existing_sk.sk,
+            &sib_pk1,
+            new_pk,
+            rng,
+        )?;
+
+        let mut sbc_transfers = Vec::with_capacity(ct.sbc_slots.len());
+        for (slot_idx, slot) in ct.sbc_slots.iter().enumerate() {
+            let slot_sib = &slot.rows[existing_row_index];
+            sbc_transfers.push(build_sibling_transfer(
+                &ct.object_digest,
+                &target_mat_digest,
+                target_epoch,
+                new_row_index,
+                (slot_idx + 1) as u32,
+                &loc_key,
+                slot_sib,
+                &existing_sk.sk,
+                &sib_pk1,
+                new_pk,
+                rng,
+            )?);
+        }
+
+        Ok(Self {
+            object_digest: ct.object_digest,
+            base_epoch: ct.policy_epoch,
+            existing_row_index,
+            new_seat_id: new_pk.seat_id.clone(),
+            main_transfer,
+            sbc_transfers,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sibling_transfer(
+    object_digest: &[u8; 32],
+    target_mat_digest: &[u8; 32],
+    target_epoch: u64,
+    new_row_index: u32,
+    domain_slot_idx: u32,
+    loc_key: &[u8; 32],
+    sib_row: &CiphertextRow,
+    sib_sk: &Scalar,
+    sib_pk1: &G1Projective,
+    new_pk: &SeatPublicKey,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<SiblingRowTransfer, AcuError> {
+    let g1 = G1Projective::generator();
+    let mut r_new = sample_nonzero_scalar(rng);
+    let mut hidden_s = sib_row.c1 - sib_row.c2 * *sib_sk;
+    let shared_new = new_pk.pk1 * r_new;
+    let new_c1 = hidden_s + shared_new;
+    let new_c2 = g1 * r_new;
+    hidden_s.zeroize();
+
+    let row_locator = compute_blind_row_locator(
+        loc_key,
+        object_digest,
+        target_epoch,
+        new_row_index,
+        &new_pk.seat_id,
+    );
+    let oblivious_hint = compute_oblivious_key_hint(&shared_new);
+    let row_pok = prove_row_pok(
+        object_digest,
+        target_mat_digest,
+        target_epoch,
+        new_row_index,
+        &row_locator,
+        &new_pk.pk1,
+        &new_c1,
+        &new_c2,
+        &r_new,
+        rng,
+    )?;
+
+    loop {
+        let mut k1 = sample_nonzero_scalar(rng);
+        let mut k2 = sample_nonzero_scalar(rng);
+        let t1 = g1 * k1;
+        let t2 = g1 * k2;
+        let t3 = sib_row.c2 * k1 - new_pk.pk1 * k2;
+        let ch = compute_warm_fork_challenge(
+            object_digest,
+            target_epoch,
+            new_row_index,
+            domain_slot_idx,
+            sib_pk1,
+            &new_pk.pk1,
+            &sib_row.c1,
+            &sib_row.c2,
+            &new_c1,
+            &new_c2,
+            &t1,
+            &t2,
+            &t3,
+        )?;
+        let z1 = k1 + ch * *sib_sk;
+        let z2 = k2 + ch * r_new;
+        k1.zeroize();
+        k2.zeroize();
+        if !bool::from(z1.is_zero()) && !bool::from(z2.is_zero()) {
+            r_new.zeroize();
+            return Ok(SiblingRowTransfer {
+                new_c1,
+                new_c2,
+                oblivious_hint,
+                row_pok,
+                row_locator,
+                challenge: ch,
+                response_sk: z1,
+                response_r: z2,
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_sibling_transfer(
+    object_digest: &[u8; 32],
+    target_mat_digest: &[u8; 32],
+    target_epoch: u64,
+    new_row_index: u32,
+    domain_slot_idx: u32,
+    sib_row: &CiphertextRow,
+    sib_pk1: &G1Projective,
+    new_pk: &SeatPublicKey,
+    tr: &SiblingRowTransfer,
+) -> bool {
+    if bool::from(tr.challenge.is_zero())
+        || bool::from(tr.response_sk.is_zero())
+        || bool::from(tr.response_r.is_zero())
+    {
+        return false;
+    }
+    if !crate::share::verify_initial_row_pok(
+        object_digest,
+        target_mat_digest,
+        target_epoch,
+        new_row_index,
+        &tr.row_locator,
+        &new_pk.pk1,
+        &tr.new_c1,
+        &tr.new_c2,
+        &tr.row_pok,
+    ) {
+        return false;
+    }
+    let g1 = G1Projective::generator();
+    let t1 = g1 * tr.response_sk - *sib_pk1 * tr.challenge;
+    let t2 = g1 * tr.response_r - tr.new_c2 * tr.challenge;
+    let diff_c1 = sib_row.c1 - tr.new_c1;
+    let t3 = sib_row.c2 * tr.response_sk - new_pk.pk1 * tr.response_r - diff_c1 * tr.challenge;
+
+    let Ok(expected) = compute_warm_fork_challenge(
+        object_digest,
+        target_epoch,
+        new_row_index,
+        domain_slot_idx,
+        sib_pk1,
+        &new_pk.pk1,
+        &sib_row.c1,
+        &sib_row.c2,
+        &tr.new_c1,
+        &tr.new_c2,
+        &t1,
+        &t2,
+        &t3,
+    ) else {
+        return false;
     };
+    bool::from(tr.challenge.to_bytes().ct_eq(&expected.to_bytes()))
+}
 
-    for chunk in decrypted[..basis_bytes_len].chunks_exact(G1_COMPRESSED_BYTES) {
-        let mut arr = [0u8; G1_COMPRESSED_BYTES];
-        arr.copy_from_slice(chunk);
-        let aff_opt: Option<G1Affine> = G1Affine::from_compressed(&arr).into();
-        arr.zeroize();
-        let Some(aff) = aff_opt else {
-            return Err(AcuError::BasisUnsealFailed);
-        };
-        if bool::from(aff.is_identity()) || !bool::from(aff.is_torsion_free()) {
-            return Err(AcuError::BasisUnsealFailed);
-        }
-        state.basis.push(G1Projective::from(aff));
+#[allow(clippy::too_many_arguments)]
+fn compute_warm_fork_challenge(
+    object_digest: &[u8; 32],
+    target_epoch: u64,
+    new_row_index: u32,
+    domain_slot_idx: u32,
+    sib_pk1: &G1Projective,
+    new_pk1: &G1Projective,
+    sib_c1: &G1Projective,
+    sib_c2: &G1Projective,
+    new_c1: &G1Projective,
+    new_c2: &G1Projective,
+    t1: &G1Projective,
+    t2: &G1Projective,
+    t3: &G1Projective,
+) -> Result<Scalar, AcuError> {
+    let mut msg = Vec::with_capacity(32 + 8 + 8 + 48 * 10);
+    msg.extend_from_slice(object_digest);
+    msg.extend_from_slice(&target_epoch.to_be_bytes());
+    msg.extend_from_slice(&new_row_index.to_be_bytes());
+    msg.extend_from_slice(&domain_slot_idx.to_be_bytes());
+    msg.extend_from_slice(&G1Affine::generator().to_compressed());
+    for pt in [sib_pk1, new_pk1, sib_c1, sib_c2, new_c1, new_c2, t1, t2, t3] {
+        msg.extend_from_slice(&G1Affine::from(*pt).to_compressed());
+    }
+    hash_to_nonzero_scalar(&msg, WARM_FORK_DST)
+}
+
+/// Attach a `Shadow-KV` warm-fork `OR` sibling leaf verified jointly by `acu_sk` and a
+/// custodian-issued [`WarmForkRequest`] (preserving strict `ACU`-blindness).
+pub fn insert_sibling_key(
+    ct: &mut AcuCiphertext,
+    acu_sk: &SeatSecretKey,
+    warm_fork: &WarmForkRequest,
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+) -> Result<usize, AcuError> {
+    ct.validate_structure()?;
+    verify_acu_operator(ct, acu_sk, seat_keys)?;
+
+    if !bool::from(warm_fork.object_digest.ct_eq(&ct.object_digest)) {
+        return Err(AcuError::InvalidMetadata);
+    }
+    if warm_fork.base_epoch != ct.policy_epoch {
+        return Err(AcuError::EpochMismatch {
+            expected: ct.policy_epoch,
+            actual: warm_fork.base_epoch,
+        });
+    }
+    if warm_fork.sbc_transfers.len() != ct.sbc_slots.len() {
+        return Err(AcuError::DimensionMismatch {
+            expected: ct.sbc_slots.len(),
+            actual: warm_fork.sbc_transfers.len(),
+        });
+    }
+    let sib_row =
+        ct.rows
+            .get(warm_fork.existing_row_index)
+            .ok_or(AcuError::RowIndexOutOfBounds {
+                index: warm_fork.existing_row_index,
+                total_rows: ct.rows.len(),
+            })?;
+    if sib_row.seat_id == ct.acu_seat_id || warm_fork.new_seat_id == ct.acu_seat_id {
+        return Err(AcuError::UnauthorizedPolicyOperator);
+    }
+    let sib_pk = seat_keys
+        .get(&sib_row.seat_id)
+        .ok_or_else(|| AcuError::UnknownSeat(sib_row.seat_id.clone()))?;
+    let new_pk = seat_keys
+        .get(&warm_fork.new_seat_id)
+        .ok_or_else(|| AcuError::UnknownSeat(warm_fork.new_seat_id.clone()))?;
+    if !sib_pk.verify_consistency() || !new_pk.verify_consistency() {
+        return Err(AcuError::InvalidPublicKey(warm_fork.new_seat_id.clone()));
     }
 
-    for chunk in decrypted[basis_bytes_len..].chunks_exact(SCALAR_BYTES) {
-        let mut arr = [0u8; SCALAR_BYTES];
-        arr.copy_from_slice(chunk);
-        let sc_opt: Option<Scalar> = Scalar::from_bytes(&arr).into();
-        arr.zeroize();
-        let Some(sc) = sc_opt else {
-            return Err(AcuError::BasisUnsealFailed);
-        };
-        if bool::from(sc.is_zero()) {
-            return Err(AcuError::BasisUnsealFailed);
+    let next_epoch = ct
+        .policy_epoch
+        .checked_add(1)
+        .ok_or(AcuError::SerializationError("policy_epoch overflow"))?;
+    let new_row_idx = ct.rows.len();
+
+    let mut next_matrix = ct.matrix.clone();
+    let attached_idx =
+        next_matrix.attach_sibling(warm_fork.existing_row_index, warm_fork.new_seat_id.clone())?;
+    debug_assert_eq!(attached_idx, new_row_idx);
+    let target_mat_digest = next_matrix.canonical_digest();
+
+    if !verify_sibling_transfer(
+        &ct.object_digest,
+        &target_mat_digest,
+        next_epoch,
+        new_row_idx as u32,
+        0,
+        sib_row,
+        &sib_pk.pk1,
+        new_pk,
+        &warm_fork.main_transfer,
+    ) {
+        return Err(AcuError::InvalidRowPok);
+    }
+    for (slot_idx, (slot, tr)) in ct
+        .sbc_slots
+        .iter()
+        .zip(warm_fork.sbc_transfers.iter())
+        .enumerate()
+    {
+        if !verify_sibling_transfer(
+            &ct.object_digest,
+            &target_mat_digest,
+            next_epoch,
+            new_row_idx as u32,
+            (slot_idx + 1) as u32,
+            &slot.rows[warm_fork.existing_row_index],
+            &sib_pk.pk1,
+            new_pk,
+            tr,
+        ) {
+            return Err(AcuError::InvalidRowPok);
         }
-        state.row_scalars.push(sc);
     }
 
-    // Algebraic cut-and-paste & forged-basis defense (`[P1-R2-2]`):
-    // 1. Every row's randomness point `c3` MUST equal `g1 * r_j` (prevents wrapping any foreign row
-    //    with unknown discrete-log randomness `r_victim` into a synthetic `AcuCiphertext`).
-    // 2. Every row assigned to `acu_sk.seat_id` MUST unblind under `acu_sk.sk` to the exact LSSS
-    //    linear commitment `commit_row_in_g1(&state.basis, &row.matrix_row)`.
-    for (row, &r_j) in ct.rows.iter().zip(state.row_scalars.iter()) {
-        if g1 * r_j != row.c3 {
-            return Err(AcuError::BasisUnsealFailed);
+    let cloned_vec = sib_row.matrix_row.clone();
+
+    ct.rows.push(CiphertextRow {
+        object_digest: ct.object_digest,
+        row_index: new_row_idx,
+        seat_id: warm_fork.new_seat_id.clone(),
+        row_locator: warm_fork.main_transfer.row_locator,
+        oblivious_hint: warm_fork.main_transfer.oblivious_hint,
+        matrix_row: cloned_vec.clone(),
+        c1: warm_fork.main_transfer.new_c1,
+        c2: warm_fork.main_transfer.new_c2,
+        init_epoch: next_epoch,
+        init_row_index: new_row_idx as u32,
+        init_matrix_digest: target_mat_digest,
+        init_c1: warm_fork.main_transfer.new_c1,
+        init_c2: warm_fork.main_transfer.new_c2,
+        row_pok: warm_fork.main_transfer.row_pok,
+        updates: Vec::new(),
+    });
+
+    for (slot, tr) in ct.sbc_slots.iter_mut().zip(warm_fork.sbc_transfers.iter()) {
+        slot.rows.push(CiphertextRow {
+            object_digest: ct.object_digest,
+            row_index: new_row_idx,
+            seat_id: warm_fork.new_seat_id.clone(),
+            row_locator: tr.row_locator,
+            oblivious_hint: tr.oblivious_hint,
+            matrix_row: cloned_vec.clone(),
+            c1: tr.new_c1,
+            c2: tr.new_c2,
+            init_epoch: next_epoch,
+            init_row_index: new_row_idx as u32,
+            init_matrix_digest: target_mat_digest,
+            init_c1: tr.new_c1,
+            init_c2: tr.new_c2,
+            row_pok: tr.row_pok,
+            updates: Vec::new(),
+        });
+    }
+
+    ct.matrix = next_matrix;
+    ct.policy_epoch = next_epoch;
+    ct.sign_epoch_auth(acu_sk)?;
+    ct.validate_structure()?;
+    Ok(new_row_idx)
+}
+
+/// Coalition share bundle for a single row $j \in \Gamma$ during [`insert_authorized_seat`]
+/// (`ePrint v2` §6.3 Op 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoalitionInsertionRowShare {
+    /// Verified $\mathbb{G}_1$ partial decryption share on `ct.rows[row_index]`.
+    pub main_share: PartialDecryptionShare,
+    /// Verified $\mathbb{G}_1$ partial decryption shares on each `ct.sbc_slots[q].rows[row_index]`.
+    pub sbc_shares: Vec<PartialDecryptionShare>,
+}
+
+impl CoalitionInsertionRowShare {
+    /// Emit a [`CoalitionInsertionRowShare`] for `row_index` using `secret_key` (`0` pairings).
+    pub fn issue_for_row(
+        ct: &AcuCiphertext,
+        row_index: usize,
+        secret_key: &SeatSecretKey,
+    ) -> Result<Self, AcuError> {
+        let row = ct
+            .rows
+            .get(row_index)
+            .ok_or(AcuError::RowIndexOutOfBounds {
+                index: row_index,
+                total_rows: ct.rows.len(),
+            })?;
+        if row.seat_id != secret_key.seat_id {
+            return Err(AcuError::UnauthorizedPolicyOperator);
         }
-        if row.seat_id == acu_sk.seat_id {
-            let mut unmasked = row.c1 - row.c3 * acu_sk.sk;
-            let expected = commit_row_in_g1(&state.basis, &row.matrix_row);
-            let ok = unmasked == expected;
-            unmasked.zeroize();
-            if !ok {
-                return Err(AcuError::BasisUnsealFailed);
+        let main_share = acu_partial_decrypt_at_epoch(row, secret_key, ct.policy_epoch);
+        let mut sbc_shares = Vec::with_capacity(ct.sbc_slots.len());
+        for slot in &ct.sbc_slots {
+            sbc_shares.push(acu_partial_decrypt_at_epoch(
+                &slot.rows[row_index],
+                secret_key,
+                ct.policy_epoch,
+            ));
+        }
+        Ok(Self {
+            main_share,
+            sbc_shares,
+        })
+    }
+}
+
+/// Coalition-authorized general seat insertion (`ePrint v2` §6.3 Op 3):
+/// 1. Verifies an authorized coalition $\Gamma \models (M_E, \rho_E)$,
+/// 2. Reconstructs $V_0^{(E)} = \sum_{j \in \Gamma} \omega_j S_j = s^{(E)} G_1$ in $\mathbb{G}_1$
+///    **without evaluating $e(\cdot, G_2)$ on `c0` or recovering $K_{\mathbb{G}_T}$**,
+/// 3. Unseals and folds $V_{\text{aux}}^{(E)} = (V_1^{(E)}, \dots, V_{k_E-1}^{(E)})$ across `sbc_slots`,
+/// 4. Enforces non-ACU span exclusion (`AcuError::SlotSpanExposesSecret`) so adding `new_row`
+///    cannot let non-ACU seats bypass an `ACU`-conjunctive policy,
+/// 5. Appends `(new_seat_id, new_row_vec)` with a fresh `RowPok`, and
+/// 6. Compacts `ct.sbc_slots` back to a **single** fresh `SbcSlot` under `(M_{E+1}, \rho_{E+1})`.
+pub fn insert_authorized_seat(
+    ct: &mut AcuCiphertext,
+    acu_sk: &SeatSecretKey,
+    new_seat_id: impl Into<String>,
+    new_row_vec: Vec<Scalar>,
+    coalition: &[CoalitionInsertionRowShare],
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<usize, AcuError> {
+    ct.validate_structure()?;
+    verify_acu_operator(ct, acu_sk, seat_keys)?;
+
+    let new_seat_id = new_seat_id.into();
+    if !is_valid_seat_id(&new_seat_id) {
+        return Err(AcuError::InvalidSeatId);
+    }
+    if new_row_vec.len() != ct.matrix.cols {
+        return Err(AcuError::DimensionMismatch {
+            expected: ct.matrix.cols,
+            actual: new_row_vec.len(),
+        });
+    }
+    if new_row_vec.iter().all(|s| bool::from(s.is_zero())) {
+        return Err(AcuError::InvalidAccessTree("LSSS row cannot be all zero"));
+    }
+    let new_pk = seat_keys
+        .get(&new_seat_id)
+        .ok_or_else(|| AcuError::UnknownSeat(new_seat_id.clone()))?;
+    if !new_pk.verify_consistency() {
+        return Err(AcuError::InvalidPublicKey(new_seat_id));
+    }
+    if ct.rows.len() >= MAX_SERIALIZED_ROWS {
+        return Err(AcuError::SerializationError(
+            "invalid AcuCiphertext dimensions",
+        ));
+    }
+
+    // Non-ACU span safety check: if non-ACU rows currently do NOT span e_0 (i.e. ACU is mandatory),
+    // forbid inserting a non-ACU row whose addition would let non-ACU seats span e_0 without ACU!
+    if new_seat_id != ct.acu_seat_id {
+        let existing_non_acu: Vec<Vec<Scalar>> = ct
+            .matrix
+            .rows
+            .iter()
+            .filter(|(s, _)| *s != ct.acu_seat_id)
+            .map(|(_, r)| r.clone())
+            .collect();
+        if !rows_span_target(ct.matrix.cols, &existing_non_acu) {
+            let mut candidate_non_acu = existing_non_acu;
+            candidate_non_acu.push(new_row_vec.clone());
+            if rows_span_target(ct.matrix.cols, &candidate_non_acu) {
+                return Err(AcuError::SlotSpanExposesSecret);
             }
         }
     }
 
-    Ok(state)
-}
-
-fn inner_product(a: &[Scalar], b: &[Scalar]) -> Scalar {
-    a.iter()
-        .zip(b.iter())
-        .fold(Scalar::ZERO, |acc, (&x, &y)| acc + x * y)
-}
-
-fn commit_row_in_g1(basis_commitments: &[G1Projective], row: &[Scalar]) -> G1Projective {
-    basis_commitments
-        .iter()
-        .zip(row.iter())
-        .fold(G1Projective::identity(), |acc, (&v_m, &r_m)| {
-            acc + v_m * r_m
-        })
-}
-
-fn scalar_pow(base: Scalar, exp: u64) -> Scalar {
-    let mut result = Scalar::ONE;
-    for _ in 0..exp {
-        result *= base;
+    if coalition.is_empty() {
+        return Err(AcuError::PolicyNotSatisfied);
     }
-    result
-}
 
-pub(crate) fn take_slice<'a>(
-    bytes: &'a [u8],
-    cursor: &mut usize,
-    len: usize,
-) -> Result<&'a [u8], AcuError> {
-    let end = cursor
-        .checked_add(len)
-        .ok_or(AcuError::SerializationError("byte slice length overflow"))?;
-    if end > bytes.len() {
-        return Err(AcuError::SerializationError(
-            "unexpected end of serialized bytes",
-        ));
+    let mut available_indices = Vec::with_capacity(coalition.len());
+    let mut main_by_row: BTreeMap<usize, G1Projective> = BTreeMap::new();
+    let mut slot_by_row: Vec<BTreeMap<usize, G1Projective>> =
+        vec![BTreeMap::new(); ct.sbc_slots.len()];
+
+    for bundle in coalition {
+        if bundle.sbc_shares.len() != ct.sbc_slots.len() {
+            return Err(AcuError::DimensionMismatch {
+                expected: ct.sbc_slots.len(),
+                actual: bundle.sbc_shares.len(),
+            });
+        }
+        let row_idx = bundle.main_share.row_index;
+        let row = ct.rows.get(row_idx).ok_or(AcuError::RowIndexOutOfBounds {
+            index: row_idx,
+            total_rows: ct.rows.len(),
+        })?;
+        let pk = seat_keys
+            .get(&row.seat_id)
+            .ok_or_else(|| AcuError::UnknownSeat(row.seat_id.clone()))?;
+        if bundle.main_share.policy_epoch != ct.policy_epoch {
+            return Err(AcuError::EpochMismatch {
+                expected: ct.policy_epoch,
+                actual: bundle.main_share.policy_epoch,
+            });
+        }
+        if !verify_partial_share_for_object(
+            &ct.object_digest,
+            ct.policy_epoch,
+            row,
+            pk,
+            &bundle.main_share,
+        ) {
+            return Err(AcuError::InvalidPartialShare {
+                row_index: row_idx,
+                seat_id: bundle.main_share.seat_id.clone(),
+            });
+        }
+        for (q, sbc_share) in bundle.sbc_shares.iter().enumerate() {
+            if !verify_partial_share_for_object(
+                &ct.object_digest,
+                ct.policy_epoch,
+                &ct.sbc_slots[q].rows[row_idx],
+                pk,
+                sbc_share,
+            ) {
+                return Err(AcuError::InvalidPartialShare {
+                    row_index: row_idx,
+                    seat_id: sbc_share.seat_id.clone(),
+                });
+            }
+            slot_by_row[q].insert(row_idx, sbc_share.share_g1);
+        }
+        if main_by_row
+            .insert(row_idx, bundle.main_share.share_g1)
+            .is_none()
+        {
+            available_indices.push(row_idx);
+        }
     }
-    let slice = &bytes[*cursor..end];
-    *cursor = end;
-    Ok(slice)
-}
 
-pub(crate) fn read_u32_be(bytes: &[u8], cursor: &mut usize) -> Result<u32, AcuError> {
-    let s = take_slice(bytes, cursor, 4)?;
-    let mut arr = [0u8; 4];
-    arr.copy_from_slice(s);
-    Ok(u32::from_be_bytes(arr))
-}
+    let weights = find_reconstruction_weights(&ct.matrix, &available_indices)?;
 
-pub(crate) fn read_u64_be(bytes: &[u8], cursor: &mut usize) -> Result<u64, AcuError> {
-    let s = take_slice(bytes, cursor, 8)?;
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(s);
-    Ok(u64::from_be_bytes(arr))
-}
-
-fn read_g1_compressed(bytes: &[u8], cursor: &mut usize) -> Result<G1Projective, AcuError> {
-    let s = take_slice(bytes, cursor, G1_COMPRESSED_BYTES)?;
-    let mut arr = [0u8; G1_COMPRESSED_BYTES];
-    arr.copy_from_slice(s);
-    let aff: Option<G1Affine> = G1Affine::from_compressed(&arr).into();
-    let aff = aff.ok_or(AcuError::SerializationError(
-        "invalid compressed G1Affine point",
-    ))?;
-    if !bool::from(aff.is_torsion_free()) {
-        return Err(AcuError::SerializationError(
-            "non-torsion-free G1Affine point",
-        ));
+    // Reconstruct V_0^{(E)} = s^{(E)} * G_1 live in G_1 WITHOUT computing K_{G_T}!
+    let mut v0_g1 = G1Projective::identity();
+    for &(row_idx, omega) in &weights {
+        let s_pt = main_by_row
+            .get(&row_idx)
+            .ok_or(AcuError::PolicyNotSatisfied)?;
+        v0_g1 += *s_pt * omega;
     }
-    Ok(G1Projective::from(aff))
-}
 
-fn read_nonidentity_g1_compressed(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<G1Projective, AcuError> {
-    let pt = read_g1_compressed(bytes, cursor)?;
-    if bool::from(pt.is_identity()) {
-        return Err(AcuError::SerializationError(
-            "identity G1 point rejected in AcuCiphertext",
-        ));
+    // Fold V_aux^{(E)} = (V_1^{(E)}, ..., V_{k-1}^{(E)}) across all slots.
+    let aux_len = ct.matrix.cols.saturating_sub(1);
+    let mut v_aux = vec![G1Projective::identity(); aux_len];
+    for (q, slot) in ct.sbc_slots.iter().enumerate() {
+        let slot_pts =
+            unseal_sbc_slot_with_weights(&ct.object_digest, slot, &weights, &slot_by_row[q])?;
+        for (m, pt) in slot_pts.into_iter().enumerate() {
+            v_aux[slot.col_offset - 1 + m] += pt;
+        }
     }
-    Ok(pt)
-}
 
-fn read_scalar(bytes: &[u8], cursor: &mut usize) -> Result<Scalar, AcuError> {
-    let s = take_slice(bytes, cursor, 32)?;
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(s);
-    let scalar: Option<Scalar> = Scalar::from_bytes(&arr).into();
-    scalar.ok_or(AcuError::SerializationError("non-canonical F_r scalar"))
+    // Evaluate lambda_new * G_1 = new_row[0] * V_0 + sum_{d=1..k-1} new_row[d] * V_d.
+    let mut lambda_new_g1 = v0_g1 * new_row_vec[0];
+    for (d, aux_pt) in v_aux.iter().enumerate() {
+        lambda_new_g1 += *aux_pt * new_row_vec[d + 1];
+    }
+    v0_g1.zeroize();
+
+    let next_epoch = ct
+        .policy_epoch
+        .checked_add(1)
+        .ok_or(AcuError::SerializationError("policy_epoch overflow"))?;
+    let new_row_idx = ct.rows.len();
+
+    let g1 = G1Projective::generator();
+    let mut r_new = sample_nonzero_scalar(rng);
+    let shared_new = new_pk.pk1 * r_new;
+    let new_c1 = lambda_new_g1 + shared_new;
+    let new_c2 = g1 * r_new;
+    lambda_new_g1.zeroize();
+
+    let mut next_matrix = ct.matrix.clone();
+    let appended_idx =
+        next_matrix.append_authorized_row(new_seat_id.clone(), new_row_vec.clone())?;
+    debug_assert_eq!(appended_idx, new_row_idx);
+    let target_mat_digest = next_matrix.canonical_digest();
+
+    let mut loc_key = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut loc_key[..]);
+    let row_locator = compute_blind_row_locator(
+        &loc_key,
+        &ct.object_digest,
+        next_epoch,
+        new_row_idx as u32,
+        &new_seat_id,
+    );
+    let oblivious_hint = compute_oblivious_key_hint(&shared_new);
+    let row_pok = prove_row_pok(
+        &ct.object_digest,
+        &target_mat_digest,
+        next_epoch,
+        new_row_idx as u32,
+        &row_locator,
+        &new_pk.pk1,
+        &new_c1,
+        &new_c2,
+        &r_new,
+        rng,
+    )?;
+    r_new.zeroize();
+
+    let compacted_slot = seal_sbc_slot(
+        &ct.object_digest,
+        next_epoch,
+        1,
+        &v_aux,
+        &loc_key,
+        &next_matrix,
+        seat_keys,
+        rng,
+    )?;
+    for pt in &mut v_aux {
+        pt.zeroize();
+    }
+
+    ct.rows.push(CiphertextRow {
+        object_digest: ct.object_digest,
+        row_index: new_row_idx,
+        seat_id: new_seat_id,
+        row_locator,
+        oblivious_hint,
+        matrix_row: new_row_vec,
+        c1: new_c1,
+        c2: new_c2,
+        init_epoch: next_epoch,
+        init_row_index: new_row_idx as u32,
+        init_matrix_digest: target_mat_digest,
+        init_c1: new_c1,
+        init_c2: new_c2,
+        row_pok,
+        updates: Vec::new(),
+    });
+    ct.matrix = next_matrix;
+    ct.sbc_slots = vec![compacted_slot];
+    ct.policy_epoch = next_epoch;
+    ct.sign_epoch_auth(acu_sk)?;
+    ct.validate_structure()?;
+    Ok(new_row_idx)
 }

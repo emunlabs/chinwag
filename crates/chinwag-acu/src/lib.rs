@@ -3,102 +3,130 @@
 
 //! # `chinwag-acu`
 //!
-//! Production BLS12-381 + Ed25519 implementation of the **Chinwag Access Control Unit (`ACU`)**
-//! pairing-based threshold encryption with in-place dynamic policy evolution (mechanics derived
-//! from the pairing-based DASTE paper: *Decentralized Ad-Hoc Access-Structured Threshold Encryption
-//! with Dynamic Policy Evolution*, ePrint 2026/1141), hardened for Chinwag (`CHWG-0271` / `CHWGACU2`)
-//! for CISO fat-client `iroh` P2P (`chinwag-mesh`) share issuance, Zero-Plaintext-At-Rest inboxes +
-//! forensic archive (`ACU AND (Recipient OR Archive)`), CI/CD root-cause payload encryption, instant
-//! revocation, and Shadow-KV warm forks.
+//! Pure-safe-Rust (`#![forbid(unsafe_code)]`) implementation of the **Chinwag Access Control Unit (`ACU`)**
+//! hybrid post-quantum & pairing-based threshold encryption engine (`CHWGACU3` + `CHWGAEA2` +
+//! `AcuEnvelopeHeaderV2`), aligned 1-to-1 with:
+//! - IACR ePrint `v2` (*Access-Structured Threshold Encryption with Ciphertext-Only Policy
+//!   Strengthening, Dual-Mode Share Verification, and Hybrid Post-Quantum Envelopes*),
+//! - USPTO Provisional `CHWG-PAT-11B-v2`, and
+//! - Chinwag UI v5 PRD `v1.3` (`AcuEnvelopeHeaderV2`, `F-01`–`F-03`).
 //!
-//! ## Core Capabilities
-//! 1. **Self-Generated $\mathbb{G}_1$ Seat Keys & Schnorr Proof-of-Possession ([`keys`]):**
-//!    Each seat, Archive Unit, or ACU generates $sk_i \in \mathbb{F}_r^*$ independently and publishes
-//!    $pk_{i,1} = g_1^{sk_i} \in \mathbb{G}_1^*$ with a deterministic `seat_id`-bound Fiat–Shamir
-//!    Schnorr Proof-of-Possession $(c_i, z_i)$, verified via [`SeatPublicKey::verify_consistency`].
-//!    No $\mathbb{G}_2$ element $g_2^{sk_i}$ is ever published, preserving SXDH (DDH in $\mathbb{G}_1$)
-//!    on `BLS12-381`.
-//! 2. **Monotone Access Trees & Lewko–Waters LSSS Conversion ([`lsss`]):**
-//!    Converts nested `And`, `Or`, and `Threshold(t-of-n)` policies into an $\ell \times k$
-//!    matrix over `bls12_381::Scalar` with target vector $(1, 0, \dots, 0)$ and solves
-//!    reconstruction weights via exact Gauss–Jordan elimination in $\mathbb{F}_r$.
-//! 3. **ACU-Sealed Basis Commitments & In-Place Dynamic Policy Evolution ([`acu`], `CHWGACU2`):**
-//!    - [`SealedBasisCommitments`]: Seals both the dynamic-policy basis commitments
-//!      $V_0, \dots, V_{k-1} \in \mathbb{G}_1^k$ (including $V_0 = g_1^s$) and cumulative row
-//!      randomness scalars $r_0, \dots, r_{\ell-1} \in (\mathbb{F}_r^*)^\ell$ exclusively under
-//!      the ACU operator's public key `pk_ACU` via ephemeral `BLS12-381` $\mathbb{G}_1$ KEM +
-//!      `HKDF-SHA256` + `ChaCha20-Poly1305` with injective binary AAD and algebraic row-witness
-//!      verification. Untrusted relays, R2 storage buckets, and single-branch holders never see
-//!      cleartext $V_0 = g_1^s$, cannot unmask $c_{0,\mathbb{G}_1}$, and cannot forge synthetic
-//!      cut-and-paste ciphertexts against `CisoAcuFatClient`.
-//!    - [`insert_key`] / [`insert_sibling_key`]: Unseals `({V_m}, {r_j})` with `sk_ACU`, homomorphically
-//!      adds new authorized seats in $\mathbb{G}_1$ without decrypting $c_0$, and re-seals at `policy_epoch + 1`.
-//!    - [`escalate_threshold`]: Unseals `({V_m}, {r_j})` with `sk_ACU`, tightens a $t$-of-$n$ gate to
-//!      $(t + \Delta t)$-of-$n$ without decrypting $c_0$, rotates all rows, and re-seals at `policy_epoch + 1`.
-//!    - [`revoke_and_rerandomize`]: Unseals `({V_m}, {r_j})` with `sk_ACU`, prunes revoked seats, rotates
-//!      $c_{0,\mathbb{G}_1}$, $c_0$, $\{V_m'\}$, and all surviving row shares so cached partial
-//!      decryption shares (`D_old`) from prior epochs are cryptographically invalidated, and
-//!      re-seals at `policy_epoch + 1`.
-//! 4. **CI/CD Split-Key + Zero-Plaintext-At-Rest Inbox AEAD Envelope ([`aead`]):**
-//!    Wraps arbitrary CI root-cause payloads and bus messages in ChaCha20-Poly1305 keyed via
-//!    HKDF-SHA256 from the ACU target-group secret $K \in \mathbb{G}_T$. Recipients and archive
-//!    combiners verify partial shares strictly via [`acu_verify_partial_share`] (Chaum–Pedersen
-//!    NIZK DLEQ across $\mathbb{G}_1 \times \mathbb{G}_T$) + `policy_epoch` + row/seat binding +
-//!    AEAD authentication without requiring cleartext basis commitments or $g_2^{sk_i}$.
-//! 5. **CISO Fat-Client / `iroh` P2P (`chinwag-mesh`) ACU Protocol ([`protocol`]):**
-//!    Validates dual-signed PR submissions (`inner_commit` + `outer_envelope`) against
-//!    `.chinwag/allowed_signers` in `chinwag-config.git`, encrypts under `acu:98939834 AND branch:8687872`
-//!    or `acu:98939834 AND (branch:8687872 OR archive:vault)`, and serves signed partial decryption
-//!    shares (`AcuShareRequest` -> `AcuShareResponse` + `AuditLogEntry`).
+//! ## Core Cryptographic Architecture
+//! 1. **Zero-$V_0$ Threshold-Sealed Auxiliary Basis Slots ([`acu`], `CHWGACU3`):**
+//!    - Eliminates any single-operator `SealedBasisCommitments` encryption of $V_0 = s G_1$ under
+//!      $\mathsf{pk}_{\mathsf{ACU}}$: `ACU` holds **only** its LSSS row share(s), so compromising
+//!      $\mathsf{sk}_{\mathsf{ACU}}$ alone is information-theoretically blind to $K_{\mathbb{G}_T}$
+//!      on every conjunctive policy.
+//!    - Auxiliary basis commitments $V_1, \dots, V_{k-1} \in \mathbb{G}_1^{k-1}$ (`col_offset >= 1`,
+//!      never $V_0$) are sealed inside policy-threshold [`SbcSlot`]s under independent random keys.
+//! 2. **48-Byte Pure-$\mathbb{G}_1$ Partial Shares & Dual-Mode DLEQ ([`share`], `CHWGSHR2`):**
+//!    - Custodians emit $S_j = c_{j,1} - sk_{\rho(j)} c_{j,2} \in \mathbb{G}_1$ (`48` B compressed,
+//!      `0` pairings at emission) with either `Mode A` (`64` B compact Chaum–Pedersen DLEQ) or
+//!      `Mode B` (`128` B commitment-carrying DLEQ supporting randomized `(alpha_j, beta_j)` batch
+//!      verification + $O(b \log |\Gamma|)$ binary-splitting fault isolation) and reconstruct with
+//!      **exact 1 pairing** (`acu_combine`).
+//!    - Every row carries an initial [`RowPok`] bound to `(object_digest, init_matrix_digest, init_epoch)`
+//!      plus append-only [`RowUpdateProof`]s, defeating cross-object and synthetic-policy cut-and-paste
+//!      oracles (`test_16`, `test_20`).
+//! 3. **Ciphertext-Only Policy Strengthening & Coalition Seat Insertion ([`acu`], [`lsss`]):**
+//!    - [`revoke_and_rerandomize`]: Ciphertext-only row pruning + full share rerandomization with
+//!      mandatory satisfiability guard ([`AcuError::PolicyUnsatisfiableAfterRevocation`]); intentional
+//!      kill-switch lockout uses [`emergency_lock_and_rerandomize`].
+//!    - [`escalate_threshold`] / [`escalate_gate_threshold`]: Subtree-consistent Vandermonde column
+//!      extension (`GateDescriptor`) + simultaneous rerandomization of all rows (`0` custodian round-trips).
+//!    - [`WarmForkRequest`] + [`insert_sibling_key`]: Custodian-blinded 3-equation HVZK `Shadow-KV`
+//!      warm-fork attachment (`ACU` never sees $\lambda_{\text{sib}} G_1$).
+//!    - [`CoalitionInsertionRowShare`] + [`insert_authorized_seat`]: Live $\mathbb{G}_1$ reconstruction
+//!      of $V_0^{(E)}$ without evaluating $K_{\mathbb{G}_T}$, guarded by non-ACU span exclusion.
+//! 4. **Dual-Secret Hybrid Post-Quantum Envelope ([`aead`], `CHWGAEA2` + `0x647a` `X25519-MLKEM768`):**
+//!    - Wraps each seat key with a validated `1216`-byte `0x647a` `X25519-MLKEM768` keypair bound into
+//!      the strong Fiat–Shamir Schnorr Proof-of-Possession ([`keys`]).
+//!    - Projects out `ACU` via [`project_non_acu`] (`ACU` holds `0` PQ rows!), wraps a random 256-bit
+//!      `DEK` into a `48`-byte `wrapped_dek` slot under `HKDF(Canon_Fp12(K_GT) || Canon_Fr(K_PQ))`,
+//!      keeps payload `C_1` (`aead_ciphertext`) immutable across all evolutions, and supports
+//!      payload-preserving [`EncryptedCiPayload::rotate_pq_key`].
+//! 5. **Blind Hash-Chained Archive & Selective Merkle Export ([`archive`], [`AcuEnvelopeHeaderV2`]):**
+//!    - Chains `aead_immutable_blake3` (`F-02`), encrypts routing metadata (`F-01`), separates outer
+//!      `ArchiveRowSign` from inner `SeatAuthorSign` (`F-03`), emits keyed `HMAC-SHA256` [`BlindIndexTags`],
+//!      and verifies `--public-safe` 4-leaf salted Merkle `.cwcard` bundles ([`PublicSafeExportBundle`]).
 
 #![forbid(unsafe_code)]
 
 pub mod acu;
 pub mod aead;
 pub mod archive;
+pub mod framing;
 pub mod keys;
 pub mod lsss;
 pub mod protocol;
+pub mod share;
+
+#[cfg(test)]
+mod attack_tests;
 
 pub use acu::{
-    AcuCiphertext, CiphertextRow, PartialDecryptionShare, SealedBasisCommitments, acu_combine,
-    acu_combine_unverified, acu_encrypt, acu_encrypt_with_g1, acu_partial_decrypt,
-    acu_partial_decrypt_at_epoch, acu_verify_partial_share, escalate_threshold, insert_key,
-    insert_sibling_key, revoke_and_rerandomize, verify_row_randomness_witness,
+    ACU_CT_MAGIC, AcuCiphertext, CiphertextRow, CoalitionInsertionRowShare, SbcSlot,
+    SiblingRowTransfer, WarmForkRequest, acu_combine, acu_combine_unverified, acu_encrypt,
+    acu_encrypt_with_g1, acu_encrypt_with_g1_and_context, acu_partial_decrypt,
+    acu_partial_decrypt_at_epoch, acu_partial_decrypt_with_mode, acu_verify_partial_share,
+    compute_blind_row_locator, compute_oblivious_key_hint, emergency_lock_and_rerandomize,
+    escalate_gate_threshold, escalate_threshold, insert_authorized_seat, insert_sibling_key,
+    revoke_and_rerandomize, verify_row_randomness_witness,
 };
 pub use aead::{
     DEFAULT_AGENT_BRANCH_ID, DEFAULT_MESSAGE_ARCHIVE_ID, DEFAULT_REVOCATION_ACU_ID,
-    EncryptedCiPayload, derive_aead_key_from_gt,
+    ENCRYPTED_PAYLOAD_MAGIC, EncryptedCiPayload, PQ_CAPSULE_CIPHERTEXT_BYTES, PqCapsuleRow,
+    PqDecryptionShare, PqLsssHeader, WRAPPED_DEK_BYTES, derive_aead_key_from_gt,
 };
 pub use archive::{
-    AcuParquetArchiveStore, ArchiveSearchFilter, ArchivedMessageRow, CacheHit,
+    ACU_ENVELOPE_HEADER_V2_VERSION, AcuEnvelopeHeaderV2, AcuEnvelopeV2Record,
+    AcuParquetArchiveStore, ArchiveSearchFilter, ArchivedMessageRow, BlindIndexTags, CacheHit,
     DEFAULT_ACTIVE_CHANNEL_PAGE_SIZE, DEFAULT_DUCKDB_MEMORY_LIMIT, DEFAULT_DUCKDB_THREADS,
-    DecryptedArchiveRecord, DuckDbArchiveConfig, HivePartitionKey, SharedFatClientArchiveHandle,
+    DecryptedArchiveRecord, DuckDbArchiveConfig, EnvelopeMetadataBox, HivePartitionKey,
+    PolicyEvolutionReceipt, PublicExportLeaves, PublicSafeExportBundle, SealedAuthorMessage,
+    SharedFatClientArchiveHandle, verify_envelope_v2_chain,
 };
-pub use keys::{SeatPublicKey, SeatSecretKey};
-pub use lsss::{AccessTree, LsssMatrix, find_reconstruction_weights};
+pub use framing::{
+    GT_CANONICAL_BYTES, expand_message_xmd_sha256, gt_canonical_bytes, hash_to_nonzero_scalar,
+    hash_to_scalar,
+};
+pub use keys::{
+    KEM_ID_X25519_MLKEM768, SeatPqPublicKey, SeatPqSecretKey, SeatPublicKey, SeatSecretKey,
+    XWING_ENCAPPED_KEY_BYTES, XWING_MLKEM768_CT_BYTES, XWING_MLKEM768_PK_BYTES,
+    XWING_PUBLIC_KEY_BYTES, XWING_SEED_BYTES,
+};
+pub use lsss::{
+    AccessTree, GateChild, GateDescriptor, LsssMatrix, find_reconstruction_weights,
+    project_non_acu, rows_span_target,
+};
 pub use protocol::{
-    AcuAuditDecision, AcuShareRequest, AcuShareResponse, AllowedSignerRecord,
+    AcuAuditDecision, AcuPolicySignature, AcuShareRequest, AcuShareResponse, AllowedSignerRecord,
     AllowedSignersRegistry, AuditLogEntry, CHINWAG_MESH_TOPIC, CisoAcuFatClient,
     DEFAULT_CISO_ACU_ID, SignedAgentPrSubmission, ci_validate_and_encrypt_root_cause,
     ci_validate_and_encrypt_with_acu_and_archive,
+};
+pub use share::{
+    DleqMode, DleqProof, PartialDecryptionShare, RowPok, RowUpdateProof,
+    batch_verify_partial_shares, batch_verify_partial_shares_with_rng,
+    emit_partial_share_with_mode, isolate_invalid_partial_shares, verify_initial_row_pok,
+    verify_partial_share_for_object, verify_row_randomness_chain, verify_update_row_pok,
 };
 
 use thiserror::Error;
 
 /// Errors returned by ACU key validation, LSSS solving, dynamic policy evolution,
-/// `iroh` P2P share issuance, or AEAD wrapping.
+/// `iroh` P2P share issuance, hybrid post-quantum decapsulation, or AEAD wrapping.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum AcuError {
     /// Seat identifier is empty, whitespace-only, overlong, or contains ASCII control characters.
     #[error("seat identifier must be non-empty, <= 512 bytes, and free of control characters")]
     InvalidSeatId,
 
-    /// Secret scalar is zero in $\mathbb{F}_r$ or $\mathbb{G}_1$ payload preimage is the identity point.
-    #[error("secret key scalar must be non-zero in F_r")]
+    /// Secret scalar is zero in $\mathbb{F}_r$, PQ seed is all-zero, or $\mathbb{G}_1$ payload preimage is identity.
+    #[error("secret key scalar or seed must be non-zero")]
     InvalidSecretKey,
 
-    /// Public key failed subgroup or Schnorr Proof-of-Possession rogue-key consistency check.
+    /// Public key failed subgroup, FIPS 203 `ML-KEM-768`, Curve25519, or Schnorr PoP check.
     #[error("public key for seat '{0}' failed consistency or proof-of-possession check")]
     InvalidPublicKey(String),
 
@@ -110,7 +138,7 @@ pub enum AcuError {
     #[error("seat '{0}' has been revoked")]
     SeatRevoked(String),
 
-    /// Ed25519 signature verification failed on inner commit, outer envelope, or `iroh` ACU message.
+    /// Ed25519 or `RowPok` epoch signature verification failed.
     #[error("Ed25519 signature verification failed for {0}")]
     SignatureVerificationFailed(&'static str),
 
@@ -118,7 +146,7 @@ pub enum AcuError {
     #[error("access policy must contain at least one leaf row")]
     EmptyPolicy,
 
-    /// Access tree gate is malformed.
+    /// Access tree or gate descriptor is malformed.
     #[error("invalid access tree: {0}")]
     InvalidAccessTree(&'static str),
 
@@ -153,16 +181,22 @@ pub enum AcuError {
     #[error("available shares do not satisfy the access policy")]
     PolicyNotSatisfied,
 
-    /// Partial decryption share epoch does not match the ciphertext's current `policy_epoch`.
+    /// Pruning `revoked_seat_ids` would leave the policy permanently unsatisfiable without explicit emergency lock.
+    #[error(
+        "revoking requested seats leaves policy unsatisfiable (use emergency_lock_and_rerandomize for intentional lockout)"
+    )]
+    PolicyUnsatisfiableAfterRevocation,
+
+    /// Partial decryption share or PQ share epoch does not match the ciphertext's current epoch.
     #[error("partial decryption share epoch mismatch: expected {expected}, got {actual}")]
     EpochMismatch {
-        /// Ciphertext's current policy epoch.
+        /// Ciphertext's current epoch.
         expected: u64,
-        /// Share's recorded policy epoch.
+        /// Share's recorded epoch.
         actual: u64,
     },
 
-    /// Partial decryption share failed pairing verification against the row and seat public key.
+    /// Partial decryption share failed DLEQ or row/seat binding verification.
     #[error("partial decryption share for row {row_index} (seat '{seat_id}') is invalid or stale")]
     InvalidPartialShare {
         /// Row index of the rejected share.
@@ -171,24 +205,40 @@ pub enum AcuError {
         seat_id: String,
     },
 
+    /// Row randomness Schnorr proof-of-knowledge (`RowPok` / `RowUpdateProof`) or warm-fork HVZK proof failed.
+    #[error("ciphertext row randomness proof-of-knowledge (RowPok) failed verification")]
+    InvalidRowPok,
+
+    /// Replayed `request_id` arrived with a mutated `(requester_seat, policy_epoch, header_digest)` tuple.
+    #[error("replayed request_id conflicts with previously recorded request digest")]
+    ReplayConflict,
+
+    /// Inserting a non-ACU row would allow non-ACU seats to span $(1, 0, \dots, 0)$ without the mandatory ACU seat.
+    #[error("candidate row allows non-ACU seats to bypass mandatory ACU conjunction")]
+    SlotSpanExposesSecret,
+
+    /// Caller seat is not authorized to perform an ACU policy operation or warm-fork transfer.
+    #[error("caller seat is not authorized to perform this policy operation")]
+    UnauthorizedPolicyOperator,
+
     /// Repository, task, or `iroh` topic metadata is empty or invalid.
     #[error("CI payload or iroh protocol metadata is invalid")]
     InvalidMetadata,
 
-    /// Legacy wire format (such as `CHWGACU1` with cleartext `basis_commitments`) was rejected fail-closed.
-    #[error("insecure legacy wire format '{0}' rejected (expected CHWGACU2)")]
+    /// Legacy wire format (`CHWGACU1`, `CHWGACU2`, `CHWGAEAD`, or `CHWGSHR1`) was rejected fail-closed.
+    #[error("insecure legacy wire format '{0}' rejected (expected CHWGACU3 / CHWGAEA2)")]
     InsecureLegacyFormat(&'static str),
 
-    /// Unsealing `SealedBasisCommitments` failed due to wrong `sk_ACU` or tampered ciphertext/AAD.
-    #[error("ACU basis commitment unsealing or AAD verification failed")]
+    /// Unsealing an `SbcSlot` or authenticating an `AcuCiphertext` header failed.
+    #[error("ACU slot unsealing or ciphertext authenticity verification failed")]
     BasisUnsealFailed,
 
-    /// Binary serialization or deserialization of an `AcuCiphertext` or `EncryptedCiPayload` BLOB failed.
+    /// Binary serialization or deserialization of a wire blob failed.
     #[error("binary serialization error: {0}")]
     SerializationError(&'static str),
 
-    /// ChaCha20-Poly1305 AEAD encryption or authentication tag verification failed.
-    #[error("ChaCha20-Poly1305 AEAD authentication failed")]
+    /// ChaCha20-Poly1305 or HPKE `0x647a` AEAD authentication tag verification failed.
+    #[error("AEAD or HPKE authentication failed")]
     AeadFailure,
 }
 
@@ -240,39 +290,50 @@ mod tests {
         assert_eq!(payload.acu_ciphertext.policy_epoch, 1);
         assert_eq!(payload.acu_ciphertext.rows.len(), 2);
         assert_eq!(
-            payload.acu_ciphertext.sealed_basis.acu_seat_id,
+            payload.acu_ciphertext.acu_seat_id,
             DEFAULT_REVOCATION_ACU_ID
         );
+        // ACU holds 0 rows inside PqLsssHeader!
+        let pq_hdr = payload.pq_header.as_ref().unwrap();
+        assert_eq!(pq_hdr.rows.len(), 1);
+        assert_eq!(pq_hdr.rows[0].seat_id, DEFAULT_AGENT_BRANCH_ID);
 
-        // ACU computes its partial decryption share D_ACU for row 1 ("branch:98939834").
         let row_agent = &payload.acu_ciphertext.rows[0];
         let row_acu = &payload.acu_ciphertext.rows[1];
         let d_acu =
             acu_partial_decrypt_at_epoch(row_acu, &sk_acu, payload.acu_ciphertext.policy_epoch);
-
-        // Agent verifies D_ACU strictly via acu_verify_partial_share (zero cleartext basis commitments needed).
         assert!(acu_verify_partial_share(row_acu, &pk_acu, &d_acu));
 
-        // Neither D_ACU alone nor D_Agent alone can satisfy the 2-of-2 AND policy.
         let d_agent =
             acu_partial_decrypt_at_epoch(row_agent, &sk_agent, payload.acu_ciphertext.policy_epoch);
         assert_eq!(
-            payload.decrypt(std::slice::from_ref(&d_agent), &seat_keys),
+            payload.decrypt_with_local_key(std::slice::from_ref(&d_agent), &sk_agent, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
         assert_eq!(
-            payload.decrypt(std::slice::from_ref(&d_acu), &seat_keys),
+            payload.decrypt_with_local_key(std::slice::from_ref(&d_acu), &sk_agent, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
 
-        // Agent combines [D_Agent, D_ACU] locally and recovers the exact CI root-cause payload.
         let decrypted = payload
-            .decrypt(&[d_agent.clone(), d_acu.clone()], &seat_keys)
+            .decrypt_with_local_key(&[d_agent, d_acu], &sk_agent, &seat_keys)
             .unwrap();
         assert_eq!(decrypted, SAMPLE_CI_ROOT_CAUSE_JSON);
 
-        // Now ACU revokes "branch:8687872" via revoke_and_rerandomize: decryption fails closed.
-        revoke_and_rerandomize(
+        // Standard `revoke_and_rerandomize` guards against accidental 2-of-2 self-lockout;
+        // intentional emergency kill-switch lockout uses `emergency_lock_and_rerandomize`.
+        let cached_pq_agent = payload.decapsulate_pq_shares_for_seat(&sk_agent).unwrap();
+        assert_eq!(
+            revoke_and_rerandomize(
+                &mut payload.acu_ciphertext,
+                &sk_acu,
+                &[DEFAULT_AGENT_BRANCH_ID],
+                &seat_keys,
+                &mut rng,
+            ),
+            Err(AcuError::PolicyUnsatisfiableAfterRevocation)
+        );
+        emergency_lock_and_rerandomize(
             &mut payload.acu_ciphertext,
             &sk_acu,
             &[DEFAULT_AGENT_BRANCH_ID],
@@ -288,15 +349,13 @@ mod tests {
             DEFAULT_REVOCATION_ACU_ID
         );
 
-        // Even if ACU computes a fresh epoch-2 share alone, the 2-of-2 policy is no longer satisfiable
-        // because the revoked agent branch was pruned.
         let d_acu_epoch2 = acu_partial_decrypt_at_epoch(
             &payload.acu_ciphertext.rows[0],
             &sk_acu,
             payload.acu_ciphertext.policy_epoch,
         );
         assert_eq!(
-            payload.decrypt(&[d_acu_epoch2], &seat_keys),
+            payload.decrypt(&[d_acu_epoch2], &cached_pq_agent, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
     }
@@ -314,13 +373,13 @@ mod tests {
         ];
         let mut secret_keys = BTreeMap::new();
         let mut public_keys = BTreeMap::new();
+        public_keys.insert(pk_acu.seat_id.clone(), pk_acu.clone());
         for name in seat_names {
             let (sk, pk) = SeatSecretKey::generate(name, &mut rng).unwrap();
             secret_keys.insert(name.to_string(), sk);
             public_keys.insert(name.to_string(), pk);
         }
 
-        // Policy: (seat:pm OR seat:architect) AND Threshold(2-of-3: seat:rust, seat:qa-1, seat:qa-2)
         let tree = AccessTree::And(vec![
             AccessTree::Or(vec![
                 AccessTree::Leaf("seat:pm".to_string()),
@@ -340,7 +399,6 @@ mod tests {
         assert_eq!(matrix.rows.len(), 5);
         assert_eq!(matrix.cols, 3);
 
-        // Unauthorized subsets must fail closed with PolicyNotSatisfied:
         assert_eq!(
             find_reconstruction_weights(&matrix, &[0, 2]),
             Err(AcuError::PolicyNotSatisfied)
@@ -374,15 +432,19 @@ mod tests {
         ];
 
         for &set in authorized_sets {
-            let shares: Vec<PartialDecryptionShare> = set
-                .iter()
-                .map(|&idx| {
-                    let row = &payload.acu_ciphertext.rows[idx];
-                    let sk = &secret_keys[&row.seat_id];
-                    acu_partial_decrypt_at_epoch(row, sk, payload.acu_ciphertext.policy_epoch)
-                })
-                .collect();
-            let recovered = payload.decrypt(&shares, &public_keys).unwrap();
+            let mut shares = Vec::with_capacity(set.len());
+            let mut pq_shares = Vec::with_capacity(set.len());
+            for &idx in set {
+                let row = &payload.acu_ciphertext.rows[idx];
+                let sk = &secret_keys[&row.seat_id];
+                shares.push(acu_partial_decrypt_at_epoch(
+                    row,
+                    sk,
+                    payload.acu_ciphertext.policy_epoch,
+                ));
+                pq_shares.extend(payload.decapsulate_pq_shares_for_seat(sk).unwrap());
+            }
+            let recovered = payload.decrypt(&shares, &pq_shares, &public_keys).unwrap();
             assert_eq!(recovered, SAMPLE_CI_ROOT_CAUSE_JSON);
         }
     }
@@ -390,7 +452,7 @@ mod tests {
     #[test]
     fn test_3_insert_key_warm_fork_without_decrypting_c0() {
         let mut rng = OsRng;
-        let (_sk_agent1, pk_agent1) =
+        let (sk_agent1, pk_agent1) =
             SeatSecretKey::generate(DEFAULT_AGENT_BRANCH_ID, &mut rng).unwrap();
         let (sk_acu, pk_acu) =
             SeatSecretKey::generate(DEFAULT_REVOCATION_ACU_ID, &mut rng).unwrap();
@@ -414,25 +476,33 @@ mod tests {
 
         let original_c0 = payload.acu_ciphertext.c0;
         let original_aead_ct = payload.aead_ciphertext.clone();
-        let original_sealed_basis = payload.acu_ciphertext.sealed_basis.clone();
+        let original_immutable_hash = payload.immutable_aead_blake3();
 
-        let new_row_idx = insert_sibling_key(
-            &mut payload.acu_ciphertext,
-            &sk_acu,
+        let warm_fork_req = WarmForkRequest::create(
+            &payload.acu_ciphertext,
             0,
+            &sk_agent1,
             &pk_warm_fork,
             &mut rng,
         )
         .unwrap();
+        let new_row_idx = insert_sibling_key(
+            &mut payload.acu_ciphertext,
+            &sk_acu,
+            &warm_fork_req,
+            &seat_keys,
+        )
+        .unwrap();
+        let pq_row_idx = payload
+            .attach_pq_sibling_capsule(&sk_agent1, &pk_warm_fork, &mut rng)
+            .unwrap();
 
         assert_eq!(new_row_idx, 2);
+        assert_eq!(pq_row_idx, 1);
         assert_eq!(payload.acu_ciphertext.policy_epoch, 2);
         assert_eq!(payload.acu_ciphertext.c0, original_c0);
         assert_eq!(payload.aead_ciphertext, original_aead_ct);
-        assert_ne!(
-            payload.acu_ciphertext.sealed_basis.ephemeral_pk1,
-            original_sealed_basis.ephemeral_pk1
-        );
+        assert_eq!(payload.immutable_aead_blake3(), original_immutable_hash);
 
         let d_warm_fork = acu_partial_decrypt_at_epoch(
             &payload.acu_ciphertext.rows[new_row_idx],
@@ -440,7 +510,11 @@ mod tests {
             payload.acu_ciphertext.policy_epoch,
         );
         assert_eq!(
-            payload.decrypt(std::slice::from_ref(&d_warm_fork), &seat_keys),
+            payload.decrypt_with_local_key(
+                std::slice::from_ref(&d_warm_fork),
+                &sk_warm_fork,
+                &seat_keys
+            ),
             Err(AcuError::PolicyNotSatisfied)
         );
 
@@ -449,7 +523,9 @@ mod tests {
             &sk_acu,
             payload.acu_ciphertext.policy_epoch,
         );
-        let recovered = payload.decrypt(&[d_warm_fork, d_acu], &seat_keys).unwrap();
+        let recovered = payload
+            .decrypt_with_local_key(&[d_warm_fork, d_acu], &sk_warm_fork, &seat_keys)
+            .unwrap();
         assert_eq!(recovered, SAMPLE_CI_ROOT_CAUSE_JSON);
     }
 
@@ -462,6 +538,7 @@ mod tests {
         let (sk3, pk3) = SeatSecretKey::generate("seat:gamma", &mut rng).unwrap();
 
         let mut seat_keys = BTreeMap::new();
+        seat_keys.insert(pk_acu.seat_id.clone(), pk_acu.clone());
         seat_keys.insert(pk1.seat_id.clone(), pk1);
         seat_keys.insert(pk2.seat_id.clone(), pk2);
         seat_keys.insert(pk3.seat_id.clone(), pk3);
@@ -483,13 +560,17 @@ mod tests {
         )
         .unwrap();
 
+        let pq1 = payload.decapsulate_pq_shares_for_seat(&sk1).unwrap();
+        let pq2 = payload.decapsulate_pq_shares_for_seat(&sk2).unwrap();
+        let pq3 = payload.decapsulate_pq_shares_for_seat(&sk3).unwrap();
+
         let d1_ep1 = acu_partial_decrypt_at_epoch(
             &payload.acu_ciphertext.rows[0],
             &sk1,
             payload.acu_ciphertext.policy_epoch,
         );
         assert_eq!(
-            payload.decrypt(&[d1_ep1], &seat_keys).unwrap(),
+            payload.decrypt(&[d1_ep1], &pq1, &seat_keys).unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
 
@@ -525,23 +606,30 @@ mod tests {
         );
 
         assert_eq!(
-            payload.decrypt(std::slice::from_ref(&d1_ep2), &seat_keys),
+            payload.decrypt(std::slice::from_ref(&d1_ep2), &pq1, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
         assert_eq!(
-            payload.decrypt(std::slice::from_ref(&d2_ep2), &seat_keys),
+            payload.decrypt(std::slice::from_ref(&d2_ep2), &pq2, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
 
+        let mut pq12 = pq1.clone();
+        pq12.extend(pq2.clone());
+        let mut pq23 = pq2.clone();
+        pq23.extend(pq3.clone());
+        let mut pq123 = pq12.clone();
+        pq123.extend(pq3);
+
         assert_eq!(
             payload
-                .decrypt(&[d1_ep2.clone(), d2_ep2.clone()], &seat_keys)
+                .decrypt(&[d1_ep2, d2_ep2.clone()], &pq12, &seat_keys)
                 .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
         assert_eq!(
             payload
-                .decrypt(&[d2_ep2.clone(), d3_ep2.clone()], &seat_keys)
+                .decrypt(&[d2_ep2, d3_ep2], &pq23, &seat_keys)
                 .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
@@ -575,12 +663,12 @@ mod tests {
         );
 
         assert_eq!(
-            payload.decrypt(&[d1_ep3.clone(), d2_ep3.clone()], &seat_keys),
+            payload.decrypt(&[d1_ep3.clone(), d2_ep3.clone()], &pq12, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
         assert_eq!(
             payload
-                .decrypt(&[d1_ep3, d2_ep3, d3_ep3], &seat_keys)
+                .decrypt(&[d1_ep3, d2_ep3, d3_ep3], &pq123, &seat_keys)
                 .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
@@ -633,7 +721,11 @@ mod tests {
 
         assert_eq!(
             payload
-                .decrypt(&[d_old_revoked.clone(), d_acu_epoch1.clone()], &seat_keys)
+                .decrypt_with_local_key(
+                    &[d_old_revoked.clone(), d_acu_epoch1.clone()],
+                    &sk_revoked,
+                    &seat_keys
+                )
                 .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
@@ -648,6 +740,9 @@ mod tests {
             &mut rng,
         )
         .unwrap();
+        payload
+            .prune_revoked_pq_capsules(&[DEFAULT_AGENT_BRANCH_ID])
+            .unwrap();
 
         assert_eq!(payload.acu_ciphertext.policy_epoch, 2);
         assert_ne!(payload.acu_ciphertext.c0, c0_epoch1);
@@ -658,15 +753,23 @@ mod tests {
             DEFAULT_REVOCATION_ACU_ID
         );
 
+        let pq_survivor = payload
+            .decapsulate_pq_shares_for_seat(&sk_survivor)
+            .unwrap();
+
         assert_eq!(
-            payload.decrypt(&[d_old_revoked.clone(), d_acu_epoch1.clone()], &seat_keys),
+            payload.decrypt(
+                &[d_old_revoked, d_acu_epoch1.clone()],
+                &pq_survivor,
+                &seat_keys
+            ),
             Err(AcuError::EpochMismatch {
                 expected: 2,
                 actual: 1
             })
         );
 
-        let mut forged_d_acu_from_ep1 = d_acu_epoch1.clone();
+        let mut forged_d_acu_from_ep1 = d_acu_epoch1;
         forged_d_acu_from_ep1.row_index = 1;
         forged_d_acu_from_ep1.policy_epoch = 2;
 
@@ -679,6 +782,7 @@ mod tests {
         assert_eq!(
             payload.decrypt(
                 &[d_survivor_ep2.clone(), forged_d_acu_from_ep1.clone()],
+                &pq_survivor,
                 &seat_keys
             ),
             Err(AcuError::InvalidPartialShare {
@@ -688,7 +792,10 @@ mod tests {
         );
 
         assert_eq!(
-            payload.decrypt_unverified(&[d_survivor_ep2.clone(), forged_d_acu_from_ep1]),
+            payload.decrypt_unverified(
+                &[d_survivor_ep2.clone(), forged_d_acu_from_ep1],
+                &pq_survivor
+            ),
             Err(AcuError::AeadFailure)
         );
 
@@ -698,7 +805,7 @@ mod tests {
             payload.acu_ciphertext.policy_epoch,
         );
         let recovered = payload
-            .decrypt(&[d_survivor_ep2, d_acu_ep2], &seat_keys)
+            .decrypt(&[d_survivor_ep2, d_acu_ep2], &pq_survivor, &seat_keys)
             .unwrap();
         assert_eq!(recovered, SAMPLE_CI_ROOT_CAUSE_JSON);
     }
@@ -714,28 +821,43 @@ mod tests {
         assert!(debug_str.contains("<REDACTED>"));
         assert!(!debug_str.contains("0x"));
 
-        let (pk1_bytes, pop_bytes) = pk.to_compressed_bytes();
+        let (pk1_bytes, pq_pk_bytes, pop_bytes) = pk.to_wire_bytes();
         let decoded =
-            SeatPublicKey::from_compressed_bytes("seat:honest", &pk1_bytes, &pop_bytes).unwrap();
+            SeatPublicKey::from_wire_bytes("seat:honest", &pk1_bytes, &pq_pk_bytes, &pop_bytes)
+                .unwrap();
         assert_eq!(decoded, pk);
 
         // Cross-seat key cloning under a different `seat_id` MUST fail Schnorr PoP!
         assert_eq!(
-            SeatPublicKey::from_compressed_bytes("seat:rogue-clone", &pk1_bytes, &pop_bytes),
+            SeatPublicKey::from_wire_bytes(
+                "seat:rogue-clone",
+                &pk1_bytes,
+                &pq_pk_bytes,
+                &pop_bytes
+            ),
             Err(AcuError::InvalidPublicKey("seat:rogue-clone".to_string()))
+        );
+
+        // Mutating `pq_pk` bytes MUST fail Schnorr PoP (since `pq_pk` is bound into the PoP transcript)!
+        let mut tampered_pq = pq_pk_bytes;
+        tampered_pq[XWING_MLKEM768_PK_BYTES] ^= 0x04;
+        assert_eq!(
+            SeatPublicKey::from_wire_bytes("seat:honest", &pk1_bytes, &tampered_pq, &pop_bytes),
+            Err(AcuError::InvalidPublicKey("seat:honest".to_string()))
         );
 
         // Mutating `pk1` without knowing the new discrete log MUST fail Schnorr PoP!
         pk.pk1 += G1Projective::generator();
         assert!(!pk.verify_consistency());
 
-        let (bad_pk1, bad_pop) = pk.to_compressed_bytes();
+        let (bad_pk1, bad_pq, bad_pop) = pk.to_wire_bytes();
         assert_eq!(
-            SeatPublicKey::from_compressed_bytes("seat:honest", &bad_pk1, &bad_pop),
+            SeatPublicKey::from_wire_bytes("seat:honest", &bad_pk1, &bad_pq, &bad_pop),
             Err(AcuError::InvalidPublicKey("seat:honest".to_string()))
         );
 
         let mut seat_keys = BTreeMap::new();
+        seat_keys.insert(pk_acu.seat_id.clone(), pk_acu.clone());
         seat_keys.insert(pk.seat_id.clone(), pk.clone());
         let tree = AccessTree::Leaf("seat:honest".to_string());
         let err = EncryptedCiPayload::encrypt(
@@ -789,7 +911,7 @@ mod tests {
         ];
 
         let (_sk_one, pk_one) = SeatSecretKey::from_scalar("kat:one", Scalar::ONE).unwrap();
-        let (g1_bytes, _g2_bytes) = pk_one.to_compressed_bytes();
+        let (g1_bytes, _pop_bytes) = pk_one.to_compressed_bytes();
         assert_eq!(g1_bytes, IETF_BLS12_381_G1_GEN_COMPRESSED);
         assert!(pk_one.verify_consistency());
 
@@ -898,7 +1020,11 @@ mod tests {
         );
         let active_keys = registry.active_acu_keys();
         let recovered = encrypted_ci
-            .decrypt(&[d_agent, share_resp.partial_share], &active_keys)
+            .decrypt_with_local_key(
+                &[d_agent, share_resp.partial_share],
+                &agent_acu_sk,
+                &active_keys,
+            )
             .unwrap();
         assert_eq!(recovered, SAMPLE_CI_ROOT_CAUSE_JSON);
 
@@ -964,8 +1090,6 @@ mod tests {
             &agent_ed25519_sk,
         );
 
-        // Encrypt under canonical 2-of-3 policy: `ACU AND (Recipient OR Archive)`
-        // Row 0: acu:98939834, Row 1: branch:8687872, Row 2: archive:vault
         let mut inbox_ciphertext = ci_validate_and_encrypt_with_acu_and_archive(
             &pr_submission,
             DEFAULT_CISO_ACU_ID,
@@ -994,7 +1118,6 @@ mod tests {
         let mut ciso_fat_client = CisoAcuFatClient::new(acu_sk, acu_pk, acu_ed25519_sk);
         let active_keys_ep1 = registry.active_acu_keys();
 
-        // (a) Live path: `ACU + Coding Agent (branch:8687872)` decrypts strictly in RAM while Archive Unit is idle.
         let live_req = AcuShareRequest::create_signed(
             "req-live-01",
             DEFAULT_AGENT_BRANCH_ID,
@@ -1016,26 +1139,33 @@ mod tests {
             inbox_ciphertext.acu_ciphertext.policy_epoch,
         );
         let live_plaintext = inbox_ciphertext
-            .decrypt(
+            .decrypt_with_local_key(
                 &[live_resp.partial_share, d_agent_ep1.clone()],
+                &agent_acu_sk,
                 &active_keys_ep1,
             )
             .unwrap();
         assert_eq!(live_plaintext, SAMPLE_CI_ROOT_CAUSE_JSON);
 
-        // (b) Compromise resistance: `Coding Agent + Archive Unit` WITHOUT the CISO's ACU FAILS closed!
+        // Compromise resistance: `Coding Agent + Archive Unit` WITHOUT the CISO's ACU FAILS closed!
         let d_archive_ep1 = acu_partial_decrypt_at_epoch(
             &inbox_ciphertext.acu_ciphertext.rows[2],
             &archive_acu_sk,
             inbox_ciphertext.acu_ciphertext.policy_epoch,
         );
+        let mut pq_both = inbox_ciphertext
+            .decapsulate_pq_shares_for_seat(&agent_acu_sk)
+            .unwrap();
+        pq_both.extend(
+            inbox_ciphertext
+                .decapsulate_pq_shares_for_seat(&archive_acu_sk)
+                .unwrap(),
+        );
         assert_eq!(
-            inbox_ciphertext.decrypt(&[d_agent_ep1, d_archive_ep1], &active_keys_ep1),
+            inbox_ciphertext.decrypt(&[d_agent_ep1, d_archive_ep1], &pq_both, &active_keys_ep1),
             Err(AcuError::PolicyNotSatisfied)
         );
 
-        // (c) Revocation + Forensic Investigation:
-        // CISO revokes and prunes "branch:8687872" via `ciso_fat_client.revoke_and_rerandomize`!
         let active_keys = registry.active_acu_keys();
         ciso_fat_client
             .revoke_and_rerandomize(
@@ -1044,6 +1174,9 @@ mod tests {
                 &active_keys,
                 &mut rng,
             )
+            .unwrap();
+        inbox_ciphertext
+            .prune_revoked_pq_capsules(&[DEFAULT_AGENT_BRANCH_ID])
             .unwrap();
         registry.revoke_seat(DEFAULT_AGENT_BRANCH_ID).unwrap();
         ciso_fat_client.instant_revoke(DEFAULT_AGENT_BRANCH_ID);
@@ -1059,8 +1192,6 @@ mod tests {
             DEFAULT_MESSAGE_ARCHIVE_ID
         );
 
-        // Even though the Coding Agent ("branch:8687872") is completely wiped from the epoch-2 ciphertext,
-        // CISO authorizes a forensic investigation where `ACU + Archive Unit` co-decrypts the epoch-2 message!
         let archive_req = AcuShareRequest::create_signed(
             "req-forensic-02",
             DEFAULT_MESSAGE_ARCHIVE_ID,
@@ -1097,8 +1228,9 @@ mod tests {
         );
         let active_keys_ep2 = registry.active_acu_keys();
         let forensic_plaintext = inbox_ciphertext
-            .decrypt(
+            .decrypt_with_local_key(
                 &[archive_resp.partial_share, d_archive_ep2],
+                &archive_acu_sk,
                 &active_keys_ep2,
             )
             .unwrap();
@@ -1154,7 +1286,6 @@ mod tests {
             )
             .unwrap();
 
-        // Verify Cloudflare R2 DuckDB configuration & UI-thread resource caps (SET threads = 2; SET memory_limit = '1GB';).
         let duckdb_cfg =
             DuckDbArchiveConfig::cloudflare_r2("cf-acct-99887766", "chinwag-archive").unwrap();
         let init_sql = duckdb_cfg.to_httpfs_init_sql().unwrap();
@@ -1166,7 +1297,6 @@ mod tests {
         );
         assert!(init_sql.contains("SET s3_url_style = 'path';"));
 
-        // Verify Hybrid Active-Channel Cache SQL generation (Step 1 & Step 3).
         let (cache_sql, cache_params) = duckdb_cfg
             .build_populate_active_channel_cache_sql("emunlabs", "#eng", 50)
             .unwrap();
@@ -1283,27 +1413,22 @@ mod tests {
                 .unwrap();
         }
 
-        // Test the 3-step Hybrid Active-Channel Cache on "#eng":
-        // 1st click on "#eng" -> R2ParquetRangeFetch (fetches latest 2 messages: msg-4, msg-2)
         let (hit1, page1) = store.load_channel_window("emunlabs", "#eng", None, 2);
         assert_eq!(hit1, CacheHit::R2ParquetRangeFetch);
         assert_eq!(page1.len(), 2);
         assert_eq!(page1[0].message_id, "msg-4");
         assert_eq!(page1[1].message_id, "msg-2");
 
-        // 2nd click back to "#eng" -> ActiveChannelRamCache (0 network hops!)
         let (hit2, page2) = store.load_channel_window("emunlabs", "#eng", None, 2);
         assert_eq!(hit2, CacheHit::ActiveChannelRamCache);
         assert_eq!(page2, page1);
 
-        // Scroll up past oldest cached timestamp (1_793_800_002_000) -> R2ParquetRangeFetch for msg-1
         let (hit3, page3) =
             store.load_channel_window("emunlabs", "#eng", Some(1_793_800_002_000), 2);
         assert_eq!(hit3, CacheHit::R2ParquetRangeFetch);
         assert_eq!(page3.len(), 1);
         assert_eq!(page3[0].message_id, "msg-1");
 
-        // Build filtered DuckDB query for sender_seat = "branch:8687872" AND task_id = "CHWG-101".
         let mut filter = ArchiveSearchFilter::new("emunlabs");
         filter.sender_seat = Some(DEFAULT_AGENT_BRANCH_ID.to_string());
         filter.task_id = Some("CHWG-101".to_string());
@@ -1315,8 +1440,6 @@ mod tests {
             vec![DEFAULT_AGENT_BRANCH_ID.to_string(), "CHWG-101".to_string()]
         );
 
-        // Offload CISO investigation + BLS12-381 pairing decryption to a background worker thread
-        // via SharedFatClientArchiveHandle (`spawn_blocking_investigation`).
         let ciso_fat_client = CisoAcuFatClient::new(acu_sk, acu_pk, acu_ed25519_sk);
         let shared_handle = SharedFatClientArchiveHandle::new(store, ciso_fat_client);
         let join_handle = shared_handle.spawn_blocking_investigation(
@@ -1396,11 +1519,9 @@ mod tests {
             )
             .unwrap();
 
-        // 1. Binary serialization/deserialization roundtrip check for `acu_ciphertext` BLOB (`CHWGAEAD` / `CHWGACU2`).
         let decoded_payload = EncryptedCiPayload::from_bytes(&row.acu_ciphertext).unwrap();
         assert_eq!(decoded_payload.to_bytes(), row.acu_ciphertext);
 
-        // 2. Tamper rejection: flipping 1 byte of `acu_ciphertext` without re-signing fails Ed25519 Verify-Before-Decrypt!
         let mut ciso_fat_client = CisoAcuFatClient::new(acu_sk, acu_pk, acu_ed25519_sk.clone());
         store.update_row_by_id("msg-forensic-11", |r| {
             let last = r.acu_ciphertext.len() - 1;
@@ -1419,13 +1540,11 @@ mod tests {
             Err(AcuError::SignatureVerificationFailed("archive_row"))
         );
 
-        // Restore the untampered byte.
         store.update_row_by_id("msg-forensic-11", |r| {
             let last = r.acu_ciphertext.len() - 1;
             r.acu_ciphertext[last] ^= 0x01;
         });
 
-        // 2b. Compromised agent branch (`agent_sk`) cannot rerandomize archived rows without `sk_ACU`!
         let mut unauthorized_err = None;
         store.update_row_by_id("msg-forensic-11", |r| {
             if let Err(e) = r.revoke_and_rerandomize_in_place(
@@ -1439,10 +1558,8 @@ mod tests {
                 unauthorized_err = Some(e);
             }
         });
-        assert_eq!(unauthorized_err, Some(AcuError::BasisUnsealFailed));
+        assert_eq!(unauthorized_err, Some(AcuError::UnauthorizedPolicyOperator));
 
-        // 3. Post-revocation in-place rerandomization on the archived Parquet row by the ACU operator:
-        // Revoke "branch:8687872" and rotate `acu_ciphertext` in-place to epoch 2!
         let mut err_opt = None;
         let acu_sk_ref = ciso_fat_client.acu_secret_key();
         store.update_row_by_id("msg-forensic-11", |r| {
@@ -1461,7 +1578,6 @@ mod tests {
         registry.revoke_seat(DEFAULT_AGENT_BRANCH_ID).unwrap();
         ciso_fat_client.instant_revoke(DEFAULT_AGENT_BRANCH_ID);
 
-        // Confirm the updated row is at policy_epoch = 2 and the revoked agent is pruned from the BLOB!
         let updated_row = store.search_metadata(&filter)[0];
         assert_eq!(updated_row.policy_epoch, 2);
         let epoch2_payload = EncryptedCiPayload::from_bytes(&updated_row.acu_ciphertext).unwrap();
@@ -1474,7 +1590,6 @@ mod tests {
                 .all(|r| r.seat_id != DEFAULT_AGENT_BRANCH_ID)
         );
 
-        // CISO forensic investigation (`ACU + Archive`) cleanly decrypts the epoch-2 binary BLOB!
         let recovered = store
             .ciso_investigate_and_decrypt(
                 &filter,
@@ -1491,22 +1606,23 @@ mod tests {
     }
 
     #[test]
-    fn test_12_chwg_0271_regression_zero_cleartext_v0_on_wire_and_untrusted_relay_cannot_unmask() {
+    fn test_12_chwg_0283_zero_cleartext_v0_on_wire_and_untrusted_relay_cannot_unmask() {
         let mut rng = OsRng;
         let (sk_agent, pk_agent) =
             SeatSecretKey::generate(DEFAULT_AGENT_BRANCH_ID, &mut rng).unwrap();
         let (sk_acu, pk_acu) =
             SeatSecretKey::generate(DEFAULT_REVOCATION_ACU_ID, &mut rng).unwrap();
+        let (_rogue_sk, rogue_pk) = SeatSecretKey::generate("branch:rogue", &mut rng).unwrap();
 
         let mut seat_keys = BTreeMap::new();
         seat_keys.insert(pk_agent.seat_id.clone(), pk_agent.clone());
         seat_keys.insert(pk_acu.seat_id.clone(), pk_acu.clone());
+        seat_keys.insert(rogue_pk.seat_id.clone(), rogue_pk.clone());
 
         let tree =
             EncryptedCiPayload::build_split_key_acu_policy(&pk_agent.seat_id, &pk_acu.seat_id);
         let matrix = LsssMatrix::from_tree(&tree).unwrap();
 
-        // 1. Encrypt a known payload_g1 via `acu_encrypt_with_g1` so we know exact V_0 = g_1^s = c0_g1 - payload_g1!
         let k_scalar = Scalar::from(0xDEAD_BEEF_CAFE_BABEu64);
         let payload_g1 = G1Projective::generator() * k_scalar;
         let (ct, expected_k_gt) =
@@ -1521,16 +1637,14 @@ mod tests {
         let neg_v0_compressed = G1Affine::from(-v0_g1).to_compressed();
 
         let ct_wire = ct.to_bytes();
-        assert_eq!(&ct_wire[..8], b"CHWGACU2");
+        assert_eq!(&ct_wire[..8], b"CHWGACU3");
         assert!(
             !ct_wire
                 .windows(48)
                 .any(|w| w == v0_compressed || w == neg_v0_compressed),
-            "CHWG-0271 P0 regression: compressed V_0 = g1^s or -V_0 must NEVER appear anywhere on the wire!"
+            "compressed V_0 = s*G1 or -V_0 must NEVER appear anywhere on the wire!"
         );
 
-        // Scan every 48-byte window in `ct_wire` that parses as a valid G1Affine point (plus public keys
-        // and their negations) and verify NO serialized point unmasks `expected_k_gt`!
         let mut candidate_g1_points = vec![pk_agent.pk1, -pk_agent.pk1, pk_acu.pk1, -pk_acu.pk1];
         for window in ct_wire.windows(48) {
             let mut arr = [0u8; 48];
@@ -1546,57 +1660,60 @@ mod tests {
             let unmasked = pairing(&G1Affine::from(ct.c0_g1 - cand), &G2Affine::generator());
             assert_ne!(
                 unmasked, expected_k_gt,
-                "untrusted relay recovered K from wire G1 point without any secret key!"
+                "untrusted relay recovered K_GT from wire G1 point without any secret key!"
             );
         }
 
-        // `[P0-R2-1]` Regression: Verify that no public pairing combination of `(row.c1, row.c3, pk.pk1, g2)`
-        // can compute `D_agent`, `D_acu`, `e(g1, g2)^s`, or `expected_k_gt` without secret keys!
-        let true_d_agent = acu_partial_decrypt(&ct, 0, &sk_agent).unwrap();
-        let true_d_acu = acu_partial_decrypt(&ct, 1, &sk_acu).unwrap();
+        let true_d_agent = acu_partial_decrypt_at_epoch(&ct.rows[0], &sk_agent, ct.policy_epoch);
+        let true_d_acu = acu_partial_decrypt_at_epoch(&ct.rows[1], &sk_acu, ct.policy_epoch);
         let g2_aff = G2Affine::generator();
+        let true_d_agent_gt = pairing(&G1Affine::from(true_d_agent.share_g1), &g2_aff);
+        let true_d_acu_gt = pairing(&G1Affine::from(true_d_acu.share_g1), &g2_aff);
+
         let pub_row0_c1_gt = pairing(&G1Affine::from(ct.rows[0].c1), &g2_aff);
-        let pub_row0_c3_gt = pairing(&G1Affine::from(ct.rows[0].c3), &g2_aff);
+        let pub_row0_c2_gt = pairing(&G1Affine::from(ct.rows[0].c2), &g2_aff);
         let pub_row1_c1_gt = pairing(&G1Affine::from(ct.rows[1].c1), &g2_aff);
-        let pub_row1_c3_gt = pairing(&G1Affine::from(ct.rows[1].c3), &g2_aff);
+        let pub_row1_c2_gt = pairing(&G1Affine::from(ct.rows[1].c2), &g2_aff);
         let pub_pk_agent_gt = pairing(&G1Affine::from(pk_agent.pk1), &g2_aff);
         let pub_pk_acu_gt = pairing(&G1Affine::from(pk_acu.pk1), &g2_aff);
         for probe_d0 in [
             pub_row0_c1_gt,
-            pub_row0_c1_gt - pub_row0_c3_gt,
+            pub_row0_c1_gt - pub_row0_c2_gt,
             pub_row0_c1_gt - pub_pk_agent_gt,
-            pub_row0_c1_gt - pub_row0_c3_gt - pub_pk_agent_gt,
+            pub_row0_c1_gt - pub_row0_c2_gt - pub_pk_agent_gt,
         ] {
-            assert_ne!(probe_d0, true_d_agent.value);
+            assert_ne!(probe_d0, true_d_agent_gt);
             for probe_d1 in [
                 pub_row1_c1_gt,
-                pub_row1_c1_gt - pub_row1_c3_gt,
+                pub_row1_c1_gt - pub_row1_c2_gt,
                 pub_row1_c1_gt - pub_pk_acu_gt,
-                pub_row1_c1_gt - pub_row1_c3_gt - pub_pk_acu_gt,
+                pub_row1_c1_gt - pub_row1_c2_gt - pub_pk_acu_gt,
             ] {
-                assert_ne!(probe_d1, true_d_acu.value);
+                assert_ne!(probe_d1, true_d_acu_gt);
                 let lsss_combo = probe_d0 * Scalar::from(2u64) - probe_d1;
                 assert_ne!(ct.c0 - lsss_combo, expected_k_gt);
             }
         }
 
-        // 2. Also verify full `EncryptedCiPayload` (`CHWGAEAD` wrapping `CHWGACU2`) against relay unmasking
-        // and against a compromised single branch (`sk_agent` without `sk_acu`).
         let mut payload = EncryptedCiPayload::encrypt_split_key_with_acu(
             SAMPLE_CI_ROOT_CAUSE_JSON,
             &pk_agent,
             &pk_acu,
             "emunlabs/chinwag",
-            "CHWG-0271-RELAY-UNMASK-CHECK",
+            "CHWG-0283-RELAY-UNMASK-CHECK",
             &mut rng,
         )
         .unwrap();
         let payload_wire = payload.to_bytes();
-        assert!(payload_wire.windows(8).any(|w| w == b"CHWGACU2"));
+        assert_eq!(&payload_wire[..8], b"CHWGAEA2");
+        assert!(payload_wire.windows(8).any(|w| w == b"CHWGACU3"));
         assert!(!payload_wire.windows(8).any(|w| w == b"CHWGACU1"));
+        assert!(!payload_wire.windows(8).any(|w| w == b"CHWGACU2"));
 
         let cipher_probe = |cand_gt: &bls12_381::Gt| -> bool {
-            let sym_key = derive_aead_key_from_gt(cand_gt, &payload.associated_data);
+            let Ok(sym_key) = derive_aead_key_from_gt(cand_gt, &payload.associated_data) else {
+                return false;
+            };
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&*sym_key));
             cipher
                 .decrypt(
@@ -1622,34 +1739,19 @@ mod tests {
                     );
                     assert!(
                         !cipher_probe(&cand_gt),
-                        "untrusted relay decrypted CHWGAEAD by subtracting serialized G1 point!"
+                        "untrusted relay decrypted CHWGAEA2 by subtracting serialized G1 point!"
                     );
                 }
             }
         }
 
-        // Compromised single branch (`sk_agent` without `sk_acu`) CANNOT unseal basis commitments
-        // to forge an OR sibling row or evolve the policy!
-        let (_rogue_sk, rogue_pk) = SeatSecretKey::generate("branch:rogue", &mut rng).unwrap();
+        // Compromised single branch (`sk_agent` without `sk_acu`) CANNOT perform ACU policy evolutions!
+        let wf =
+            WarmForkRequest::create(&payload.acu_ciphertext, 0, &sk_agent, &rogue_pk, &mut rng)
+                .unwrap();
         assert_eq!(
-            insert_sibling_key(
-                &mut payload.acu_ciphertext,
-                &sk_agent,
-                1,
-                &rogue_pk,
-                &mut rng
-            ),
-            Err(AcuError::BasisUnsealFailed)
-        );
-        assert_eq!(
-            insert_key(
-                &mut payload.acu_ciphertext,
-                &sk_agent,
-                &rogue_pk,
-                vec![Scalar::ONE, Scalar::ZERO],
-                &mut rng,
-            ),
-            Err(AcuError::BasisUnsealFailed)
+            insert_sibling_key(&mut payload.acu_ciphertext, &sk_agent, &wf, &seat_keys),
+            Err(AcuError::UnauthorizedPolicyOperator)
         );
         assert_eq!(
             escalate_threshold(
@@ -1660,7 +1762,7 @@ mod tests {
                 &seat_keys,
                 &mut rng,
             ),
-            Err(AcuError::BasisUnsealFailed)
+            Err(AcuError::UnauthorizedPolicyOperator)
         );
         assert_eq!(
             revoke_and_rerandomize(
@@ -1670,22 +1772,31 @@ mod tests {
                 &seat_keys,
                 &mut rng,
             ),
-            Err(AcuError::BasisUnsealFailed)
+            Err(AcuError::UnauthorizedPolicyOperator)
         );
 
-        // Meanwhile, authorized 2-of-2 (`sk_agent` + `sk_acu`) still decrypts cleanly.
-        let d_agent = acu_partial_decrypt(&payload.acu_ciphertext, 0, &sk_agent).unwrap();
-        let d_acu = acu_partial_decrypt(&payload.acu_ciphertext, 1, &sk_acu).unwrap();
+        let d_agent = acu_partial_decrypt_at_epoch(
+            &payload.acu_ciphertext.rows[0],
+            &sk_agent,
+            payload.acu_ciphertext.policy_epoch,
+        );
+        let d_acu = acu_partial_decrypt_at_epoch(
+            &payload.acu_ciphertext.rows[1],
+            &sk_acu,
+            payload.acu_ciphertext.policy_epoch,
+        );
         assert_eq!(
-            payload.decrypt(&[d_agent, d_acu], &seat_keys).unwrap(),
+            payload
+                .decrypt_with_local_key(&[d_agent, d_acu], &sk_agent, &seat_keys)
+                .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
     }
 
     #[test]
-    fn test_13_chwg_0271_rejects_legacy_chwgacu1_and_tampered_sealed_basis_aad() {
+    fn test_13_chwg_0283_rejects_legacy_chwgacu1_chwgacu2_and_tampered_slot_or_header() {
         let mut rng = OsRng;
-        let (_sk_agent, pk_agent) =
+        let (sk_agent, pk_agent) =
             SeatSecretKey::generate(DEFAULT_AGENT_BRANCH_ID, &mut rng).unwrap();
         let (sk_acu, pk_acu) =
             SeatSecretKey::generate(DEFAULT_REVOCATION_ACU_ID, &mut rng).unwrap();
@@ -1693,12 +1804,17 @@ mod tests {
             SeatSecretKey::generate(DEFAULT_REVOCATION_ACU_ID, &mut rng).unwrap();
         let (_sk_fork, pk_fork) = SeatSecretKey::generate("branch:fork-13", &mut rng).unwrap();
 
+        let mut seat_keys = BTreeMap::new();
+        seat_keys.insert(pk_agent.seat_id.clone(), pk_agent.clone());
+        seat_keys.insert(pk_acu.seat_id.clone(), pk_acu.clone());
+        seat_keys.insert(pk_fork.seat_id.clone(), pk_fork.clone());
+
         let payload1 = EncryptedCiPayload::encrypt_split_key_with_acu(
             SAMPLE_CI_ROOT_CAUSE_JSON,
             &pk_agent,
             &pk_acu,
             "emunlabs/chinwag",
-            "CHWG-0271-LEGACY-AND-AAD-1",
+            "CHWG-0283-LEGACY-AND-AAD-1",
             &mut rng,
         )
         .unwrap();
@@ -1707,90 +1823,104 @@ mod tests {
             &pk_agent,
             &pk_acu,
             "emunlabs/chinwag",
-            "CHWG-0271-LEGACY-AND-AAD-2",
+            "CHWG-0283-LEGACY-AND-AAD-2",
             &mut rng,
         )
         .unwrap();
 
-        // 1. Legacy insecure `CHWGACU1` magic MUST fail closed on both `AcuCiphertext::from_bytes`
-        // and `EncryptedCiPayload::from_bytes`!
-        let mut legacy_ct_bytes = payload1.acu_ciphertext.to_bytes();
-        legacy_ct_bytes[..8].copy_from_slice(b"CHWGACU1");
-        assert_eq!(
-            AcuCiphertext::from_bytes(&legacy_ct_bytes),
-            Err(AcuError::InsecureLegacyFormat("CHWGACU1"))
-        );
-
+        // 1. Legacy `CHWGACU1`, `CHWGACU2`, and `CHWGAEAD` wire blobs fail closed with `InsecureLegacyFormat`!
+        for legacy_magic in [b"CHWGACU1", b"CHWGACU2"] {
+            let mut legacy_ct_bytes = payload1.acu_ciphertext.to_bytes();
+            legacy_ct_bytes[..8].copy_from_slice(legacy_magic);
+            assert!(matches!(
+                AcuCiphertext::from_bytes(&legacy_ct_bytes),
+                Err(AcuError::InsecureLegacyFormat(_))
+            ));
+        }
         let mut legacy_payload_bytes = payload1.to_bytes();
-        let magic_pos = legacy_payload_bytes
-            .windows(8)
-            .position(|w| w == b"CHWGACU2")
-            .unwrap();
-        legacy_payload_bytes[magic_pos..magic_pos + 8].copy_from_slice(b"CHWGACU1");
+        legacy_payload_bytes[..8].copy_from_slice(b"CHWGAEAD");
         assert_eq!(
             EncryptedCiPayload::from_bytes(&legacy_payload_bytes),
-            Err(AcuError::InsecureLegacyFormat("CHWGACU1"))
+            Err(AcuError::InsecureLegacyFormat("CHWGAEAD"))
         );
 
-        // 2. Wrong scalar with matching `acu_seat_id` fails closed with `BasisUnsealFailed`.
+        // 2. Wrong ACU scalar with matching `acu_seat_id` fails operator verification!
+        let wf =
+            WarmForkRequest::create(&payload1.acu_ciphertext, 0, &sk_agent, &pk_fork, &mut rng)
+                .unwrap();
         let mut ct_wrong_key = payload1.acu_ciphertext.clone();
         assert_eq!(
-            insert_sibling_key(&mut ct_wrong_key, &sk_other_acu, 0, &pk_fork, &mut rng),
-            Err(AcuError::BasisUnsealFailed)
+            insert_sibling_key(&mut ct_wrong_key, &sk_other_acu, &wf, &seat_keys),
+            Err(AcuError::UnauthorizedPolicyOperator)
         );
         assert_eq!(ct_wrong_key, payload1.acu_ciphertext);
 
-        // 3. Bit-flip in `sealed_basis.ciphertext` fails closed with `BasisUnsealFailed`.
-        let mut ct_tampered_seal = payload1.acu_ciphertext.clone();
-        ct_tampered_seal.sealed_basis.ciphertext[0] ^= 0x80;
+        // 3. Bit-flip in `sbc_slots[0].ciphertext` fails closed on `insert_authorized_seat` (`BasisUnsealFailed`).
+        let c0_share =
+            CoalitionInsertionRowShare::issue_for_row(&payload1.acu_ciphertext, 0, &sk_agent)
+                .unwrap();
+        let c1_share =
+            CoalitionInsertionRowShare::issue_for_row(&payload1.acu_ciphertext, 1, &sk_acu)
+                .unwrap();
+        let mut ct_tampered_slot = payload1.acu_ciphertext.clone();
+        ct_tampered_slot.sbc_slots[0].ciphertext[0] ^= 0x80;
         assert_eq!(
-            insert_sibling_key(&mut ct_tampered_seal, &sk_acu, 0, &pk_fork, &mut rng),
+            insert_authorized_seat(
+                &mut ct_tampered_slot,
+                &sk_acu,
+                "branch:fork-13",
+                vec![Scalar::ONE, Scalar::ONE],
+                &[c0_share, c1_share],
+                &seat_keys,
+                &mut rng,
+            ),
             Err(AcuError::BasisUnsealFailed)
         );
 
-        // 4. Splicing `payload2.acu_ciphertext.sealed_basis` onto `payload1.acu_ciphertext` fails AAD!
+        // 4. Splicing `payload2.acu_ciphertext.sbc_slots` onto `payload1.acu_ciphertext` fails `verify_authenticity`!
+        assert!(
+            payload1
+                .acu_ciphertext
+                .verify_authenticity(&pk_acu, |id| seat_keys.get(id))
+                .is_ok()
+        );
         let mut ct_spliced = payload1.acu_ciphertext.clone();
-        ct_spliced.sealed_basis = payload2.acu_ciphertext.sealed_basis.clone();
-        assert_eq!(
-            insert_sibling_key(&mut ct_spliced, &sk_acu, 0, &pk_fork, &mut rng),
-            Err(AcuError::BasisUnsealFailed)
+        ct_spliced.sbc_slots = payload2.acu_ciphertext.sbc_slots.clone();
+        assert!(
+            ct_spliced
+                .verify_authenticity(&pk_acu, |id| seat_keys.get(id))
+                .is_err()
         );
 
-        // 5. Tampering with any AAD-bound header field (`policy_epoch`, `c0_g1`, `row.c1`, `row.matrix_row`)
-        // fails closed with `BasisUnsealFailed`!
+        // 5. Tampering with header fields (`policy_epoch`, `row.c1`, `row.matrix_row`) fails `verify_authenticity`!
         let mut ct_bad_epoch = payload1.acu_ciphertext.clone();
         ct_bad_epoch.policy_epoch = 99;
-        assert_eq!(
-            insert_sibling_key(&mut ct_bad_epoch, &sk_acu, 0, &pk_fork, &mut rng),
-            Err(AcuError::BasisUnsealFailed)
-        );
-
-        let mut ct_bad_c0 = payload1.acu_ciphertext.clone();
-        ct_bad_c0.c0_g1 += G1Projective::generator();
-        ct_bad_c0.c0 = pairing(&G1Affine::from(ct_bad_c0.c0_g1), &G2Affine::generator());
-        assert_eq!(
-            insert_sibling_key(&mut ct_bad_c0, &sk_acu, 0, &pk_fork, &mut rng),
-            Err(AcuError::BasisUnsealFailed)
+        assert!(
+            ct_bad_epoch
+                .verify_authenticity(&pk_acu, |id| seat_keys.get(id))
+                .is_err()
         );
 
         let mut ct_bad_row_c1 = payload1.acu_ciphertext.clone();
         ct_bad_row_c1.rows[0].c1 += G1Projective::generator();
-        assert_eq!(
-            insert_sibling_key(&mut ct_bad_row_c1, &sk_acu, 0, &pk_fork, &mut rng),
-            Err(AcuError::BasisUnsealFailed)
+        assert!(
+            ct_bad_row_c1
+                .verify_authenticity(&pk_acu, |id| seat_keys.get(id))
+                .is_err()
         );
 
         let mut ct_bad_matrix = payload1.acu_ciphertext.clone();
         ct_bad_matrix.rows[0].matrix_row[1] += Scalar::ONE;
         ct_bad_matrix.matrix.rows[0].1[1] += Scalar::ONE;
-        assert_eq!(
-            insert_sibling_key(&mut ct_bad_matrix, &sk_acu, 0, &pk_fork, &mut rng),
-            Err(AcuError::BasisUnsealFailed)
+        assert!(
+            ct_bad_matrix
+                .verify_authenticity(&pk_acu, |id| seat_keys.get(id))
+                .is_err()
         );
     }
 
     #[test]
-    fn test_14_chwg_0271_full_wire_roundtrip_across_all_four_policy_evolutions() {
+    fn test_14_chwg_0283_full_wire_roundtrip_across_all_four_policy_evolutions() {
         let mut rng = OsRng;
         let (sk_acu, pk_acu) = SeatSecretKey::generate(DEFAULT_CISO_ACU_ID, &mut rng).unwrap();
         let (sk_a, pk_a) = SeatSecretKey::generate("branch:alpha", &mut rng).unwrap();
@@ -1817,60 +1947,88 @@ mod tests {
             &seat_keys,
             &pk_acu,
             "emunlabs/chinwag",
-            "CHWG-0271-ALL-FOUR-EVOLUTIONS",
+            "CHWG-0283-ALL-FOUR-EVOLUTIONS",
             &mut rng,
         )
         .unwrap();
+        let ep1_immutable_hash = ep1_payload.immutable_aead_blake3();
         let mut wire = ep1_payload.to_bytes();
 
-        // Round-trip Epoch 1 -> evolve to Epoch 2 via `insert_key` (append `branch:gamma` with same row as `branch:alpha`)
+        // Epoch 1 -> Epoch 2 via `insert_authorized_seat` + `insert_authorized_pq_seat` (append `branch:gamma`)
         let mut p = EncryptedCiPayload::from_bytes(&wire).unwrap();
         assert_eq!(p.acu_ciphertext.policy_epoch, 1);
-        let ep1_seal = p.acu_ciphertext.sealed_basis.clone();
         let alpha_row_vec = p.acu_ciphertext.rows[0].matrix_row.clone();
-        let idx_c = insert_key(
+        let c_alpha =
+            CoalitionInsertionRowShare::issue_for_row(&p.acu_ciphertext, 0, &sk_a).unwrap();
+        let c_acu =
+            CoalitionInsertionRowShare::issue_for_row(&p.acu_ciphertext, 2, &sk_acu).unwrap();
+        let idx_c = insert_authorized_seat(
             &mut p.acu_ciphertext,
             &sk_acu,
-            &pk_c,
+            "branch:gamma",
             alpha_row_vec,
+            &[c_alpha, c_acu],
+            &seat_keys,
+            &mut rng,
+        )
+        .unwrap();
+        let pq_alpha = p.decapsulate_pq_shares_for_seat(&sk_a).unwrap();
+        let pq_alpha_vec = p.pq_header.as_ref().unwrap().rows[0].matrix_row.clone();
+        p.insert_authorized_pq_seat(
+            "branch:gamma",
+            pq_alpha_vec,
+            &pq_alpha,
+            &seat_keys,
             &mut rng,
         )
         .unwrap();
         assert_eq!(idx_c, 3);
         assert_eq!(p.acu_ciphertext.policy_epoch, 2);
-        assert_ne!(
-            p.acu_ciphertext.sealed_basis.ephemeral_pk1,
-            ep1_seal.ephemeral_pk1
-        );
+        assert_eq!(p.immutable_aead_blake3(), ep1_immutable_hash);
         wire = p.to_bytes();
 
-        // Round-trip Epoch 2 -> evolve to Epoch 3 via `insert_sibling_key` (append `branch:delta` sibling of `branch:beta`)
+        // Epoch 2 -> Epoch 3 via `WarmForkRequest` + `insert_sibling_key` + `attach_pq_sibling_capsule` (`branch:delta` sibling of `branch:beta`)
         let mut p = EncryptedCiPayload::from_bytes(&wire).unwrap();
-        let d_c_ep2 = acu_partial_decrypt(&p.acu_ciphertext, 3, &sk_c).unwrap();
-        let d_acu_ep2 = acu_partial_decrypt(&p.acu_ciphertext, 2, &sk_acu).unwrap();
+        let d_c_ep2 = acu_partial_decrypt_at_epoch(
+            &p.acu_ciphertext.rows[3],
+            &sk_c,
+            p.acu_ciphertext.policy_epoch,
+        );
+        let d_acu_ep2 = acu_partial_decrypt_at_epoch(
+            &p.acu_ciphertext.rows[2],
+            &sk_acu,
+            p.acu_ciphertext.policy_epoch,
+        );
         assert_eq!(
-            p.decrypt(&[d_c_ep2, d_acu_ep2], &seat_keys).unwrap(),
+            p.decrypt_with_local_key(&[d_c_ep2, d_acu_ep2], &sk_c, &seat_keys)
+                .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
-        let ep2_seal = p.acu_ciphertext.sealed_basis.clone();
-        let idx_d = insert_sibling_key(&mut p.acu_ciphertext, &sk_acu, 1, &pk_d, &mut rng).unwrap();
+        let wf_req = WarmForkRequest::create(&p.acu_ciphertext, 1, &sk_b, &pk_d, &mut rng).unwrap();
+        let idx_d =
+            insert_sibling_key(&mut p.acu_ciphertext, &sk_acu, &wf_req, &seat_keys).unwrap();
+        p.attach_pq_sibling_capsule(&sk_b, &pk_d, &mut rng).unwrap();
         assert_eq!(idx_d, 4);
         assert_eq!(p.acu_ciphertext.policy_epoch, 3);
-        assert_ne!(
-            p.acu_ciphertext.sealed_basis.ephemeral_pk1,
-            ep2_seal.ephemeral_pk1
-        );
         wire = p.to_bytes();
 
-        // Round-trip Epoch 3 -> evolve to Epoch 4 via `escalate_threshold` on `{alpha, beta, gamma, delta}` (rows `[0, 1, 3, 4]`) by +1 (1-of-4 -> 2-of-4)
+        // Epoch 3 -> Epoch 4 via `escalate_threshold` on `{alpha, beta, gamma, delta}` (rows `[0, 1, 3, 4]`: 1-of-4 -> 2-of-4)
         let mut p = EncryptedCiPayload::from_bytes(&wire).unwrap();
-        let d_d_ep3 = acu_partial_decrypt(&p.acu_ciphertext, 4, &sk_d).unwrap();
-        let d_acu_ep3 = acu_partial_decrypt(&p.acu_ciphertext, 2, &sk_acu).unwrap();
+        let d_d_ep3 = acu_partial_decrypt_at_epoch(
+            &p.acu_ciphertext.rows[4],
+            &sk_d,
+            p.acu_ciphertext.policy_epoch,
+        );
+        let d_acu_ep3 = acu_partial_decrypt_at_epoch(
+            &p.acu_ciphertext.rows[2],
+            &sk_acu,
+            p.acu_ciphertext.policy_epoch,
+        );
         assert_eq!(
-            p.decrypt(&[d_d_ep3, d_acu_ep3], &seat_keys).unwrap(),
+            p.decrypt_with_local_key(&[d_d_ep3, d_acu_ep3], &sk_d, &seat_keys)
+                .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
-        let ep3_seal = p.acu_ciphertext.sealed_basis.clone();
         escalate_threshold(
             &mut p.acu_ciphertext,
             &sk_acu,
@@ -1881,29 +2039,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.acu_ciphertext.policy_epoch, 4);
-        assert_ne!(
-            p.acu_ciphertext.sealed_basis.ephemeral_pk1,
-            ep3_seal.ephemeral_pk1
-        );
         wire = p.to_bytes();
 
-        // Round-trip Epoch 4: 1 branch + ACU now fails (`PolicyNotSatisfied`), 2 branches + ACU succeeds!
+        // Epoch 4: 1 branch + ACU fails (`PolicyNotSatisfied`), 2 branches + ACU succeeds!
         let mut p = EncryptedCiPayload::from_bytes(&wire).unwrap();
-        let d_a_ep4 = acu_partial_decrypt(&p.acu_ciphertext, 0, &sk_a).unwrap();
-        let d_b_ep4 = acu_partial_decrypt(&p.acu_ciphertext, 1, &sk_b).unwrap();
-        let d_acu_ep4 = acu_partial_decrypt(&p.acu_ciphertext, 2, &sk_acu).unwrap();
+        let d_a_ep4 = acu_partial_decrypt_at_epoch(
+            &p.acu_ciphertext.rows[0],
+            &sk_a,
+            p.acu_ciphertext.policy_epoch,
+        );
+        let d_b_ep4 = acu_partial_decrypt_at_epoch(
+            &p.acu_ciphertext.rows[1],
+            &sk_b,
+            p.acu_ciphertext.policy_epoch,
+        );
+        let d_acu_ep4 = acu_partial_decrypt_at_epoch(
+            &p.acu_ciphertext.rows[2],
+            &sk_acu,
+            p.acu_ciphertext.policy_epoch,
+        );
+        let mut pq_ab = p.decapsulate_pq_shares_for_seat(&sk_a).unwrap();
+        pq_ab.extend(p.decapsulate_pq_shares_for_seat(&sk_b).unwrap());
         assert_eq!(
-            p.decrypt(&[d_a_ep4.clone(), d_acu_ep4.clone()], &seat_keys),
+            p.decrypt_with_local_key(&[d_a_ep4.clone(), d_acu_ep4.clone()], &sk_a, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
         assert_eq!(
-            p.decrypt(&[d_a_ep4, d_b_ep4, d_acu_ep4], &seat_keys)
+            p.decrypt(&[d_a_ep4, d_b_ep4, d_acu_ep4], &pq_ab, &seat_keys)
                 .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
 
-        // Evolve Epoch 4 -> Epoch 5 via `revoke_and_rerandomize` (revoke `branch:alpha` and `branch:delta`)
-        let ep4_seal = p.acu_ciphertext.sealed_basis.clone();
+        // Epoch 4 -> Epoch 5 via `revoke_and_rerandomize` + `prune_revoked_pq_capsules` (`branch:alpha`, `branch:delta`)
         let ep4_c0 = p.acu_ciphertext.c0;
         revoke_and_rerandomize(
             &mut p.acu_ciphertext,
@@ -1913,31 +2080,48 @@ mod tests {
             &mut rng,
         )
         .unwrap();
+        p.prune_revoked_pq_capsules(&["branch:alpha", "branch:delta"])
+            .unwrap();
         assert_eq!(p.acu_ciphertext.policy_epoch, 5);
         assert_ne!(p.acu_ciphertext.c0, ep4_c0);
-        assert_ne!(
-            p.acu_ciphertext.sealed_basis.ephemeral_pk1,
-            ep4_seal.ephemeral_pk1
-        );
         wire = p.to_bytes();
 
-        // Final wire round-trip at Epoch 5: remaining rows are `[branch:beta (0), acu:98939834 (1), branch:gamma (2)]`.
+        // Final wire round-trip at Epoch 5: remaining rows `[branch:beta (0), acu:98939834 (1), branch:gamma (2)]`
         let p_final = EncryptedCiPayload::from_bytes(&wire).unwrap();
+        assert_eq!(p_final.immutable_aead_blake3(), ep1_immutable_hash);
         assert_eq!(p_final.acu_ciphertext.rows.len(), 3);
         assert_eq!(p_final.acu_ciphertext.rows[0].seat_id, "branch:beta");
         assert_eq!(p_final.acu_ciphertext.rows[1].seat_id, DEFAULT_CISO_ACU_ID);
         assert_eq!(p_final.acu_ciphertext.rows[2].seat_id, "branch:gamma");
 
-        let d_b_ep5 = acu_partial_decrypt(&p_final.acu_ciphertext, 0, &sk_b).unwrap();
-        let d_acu_ep5 = acu_partial_decrypt(&p_final.acu_ciphertext, 1, &sk_acu).unwrap();
-        let d_c_ep5 = acu_partial_decrypt(&p_final.acu_ciphertext, 2, &sk_c).unwrap();
+        let d_b_ep5 = acu_partial_decrypt_at_epoch(
+            &p_final.acu_ciphertext.rows[0],
+            &sk_b,
+            p_final.acu_ciphertext.policy_epoch,
+        );
+        let d_acu_ep5 = acu_partial_decrypt_at_epoch(
+            &p_final.acu_ciphertext.rows[1],
+            &sk_acu,
+            p_final.acu_ciphertext.policy_epoch,
+        );
+        let d_c_ep5 = acu_partial_decrypt_at_epoch(
+            &p_final.acu_ciphertext.rows[2],
+            &sk_c,
+            p_final.acu_ciphertext.policy_epoch,
+        );
+        let mut pq_bc = p_final.decapsulate_pq_shares_for_seat(&sk_b).unwrap();
+        pq_bc.extend(p_final.decapsulate_pq_shares_for_seat(&sk_c).unwrap());
         assert_eq!(
-            p_final.decrypt(&[d_b_ep5.clone(), d_acu_ep5.clone()], &seat_keys),
+            p_final.decrypt_with_local_key(
+                &[d_b_ep5.clone(), d_acu_ep5.clone()],
+                &sk_b,
+                &seat_keys
+            ),
             Err(AcuError::PolicyNotSatisfied)
         );
         assert_eq!(
             p_final
-                .decrypt(&[d_b_ep5, d_c_ep5, d_acu_ep5], &seat_keys)
+                .decrypt(&[d_b_ep5, d_c_ep5, d_acu_ep5], &pq_bc, &seat_keys)
                 .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
@@ -1945,7 +2129,6 @@ mod tests {
 
     #[test]
     fn test_15_published_rfc5869_hkdf_rfc8439_chacha20poly1305_and_bls12_381_g2_vectors() {
-        // 1. Published RFC 5869 Appendix A.1 Test Case 1 (HKDF-SHA256):
         let ikm = [0x0bu8; 22];
         let salt: [u8; 13] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
@@ -1961,7 +2144,6 @@ mod tests {
         hk.expand(&info, &mut okm).unwrap();
         assert_eq!(okm, expected_okm);
 
-        // 2. Published RFC 8439 Section 2.8.2 Test Vector (ChaCha20-Poly1305 AEAD):
         let rfc8439_key: [u8; 32] = [
             0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d,
             0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b,
@@ -1999,7 +2181,6 @@ mod tests {
             .unwrap();
         assert_eq!(produced.as_slice(), &expected_ct_and_tag);
 
-        // Negative vector: 1-bit flip in AAD must reject!
         let mut bad_aad = rfc8439_aad;
         bad_aad[0] ^= 0x01;
         assert!(
@@ -2014,7 +2195,6 @@ mod tests {
                 .is_err()
         );
 
-        // 3. Published IETF BLS12-381 G2 generator compressed vector (96 bytes):
         const IETF_BLS12_381_G2_GEN_COMPRESSED: [u8; 96] = [
             0x93, 0xe0, 0x2b, 0x60, 0x52, 0x71, 0x9f, 0x60, 0x7d, 0xac, 0xd3, 0xa0, 0x88, 0x27,
             0x4f, 0x65, 0x59, 0x6b, 0xd0, 0xd0, 0x99, 0x20, 0xb6, 0x1a, 0xb5, 0xda, 0x61, 0xbb,
@@ -2029,17 +2209,19 @@ mod tests {
             IETF_BLS12_381_G2_GEN_COMPRESSED
         );
 
-        // 4. Deterministic `derive_aead_key_from_gt` stability pin on `bls12_381 = "=0.8.0"` (`[H-4]`):
         const EXPECTED_GT_GEN_KAT_KEY: [u8; 32] = [
-            0x48, 0xaf, 0x08, 0xb5, 0x92, 0x96, 0x01, 0x00, 0x09, 0xb9, 0x0f, 0x76, 0x60, 0x68,
-            0x44, 0x6b, 0x4f, 0x18, 0xee, 0xf0, 0xec, 0x58, 0x60, 0x42, 0x98, 0x15, 0x18, 0x0b,
-            0xeb, 0x86, 0x7a, 0xff,
+            0xac, 0x99, 0x30, 0xbb, 0xb1, 0x64, 0xed, 0x02, 0x5b, 0xdf, 0x78, 0xf7, 0x7e, 0xba,
+            0x46, 0x17, 0x15, 0x01, 0x53, 0x09, 0xc0, 0x8a, 0x8a, 0xd7, 0xee, 0x3e, 0xb7, 0xba,
+            0xb8, 0x23, 0xba, 0x78,
         ];
         let gt_gen = pairing(&G1Affine::generator(), &G2Affine::generator());
         let gt_kat_aad = b"chinwag-acu-gt-kat-v1";
-        let derived_gt_key_1 = derive_aead_key_from_gt(&gt_gen, gt_kat_aad);
+        let derived_gt_key_1 = derive_aead_key_from_gt(&gt_gen, gt_kat_aad).unwrap();
+        let derived_gt_key_2 = derive_aead_key_from_gt(&gt_gen, gt_kat_aad).unwrap();
         assert_eq!(*derived_gt_key_1, EXPECTED_GT_GEN_KAT_KEY);
-        let derived_gt_key_diff_aad = derive_aead_key_from_gt(&gt_gen, b"chinwag-acu-gt-kat-v2");
+        assert_eq!(*derived_gt_key_1, *derived_gt_key_2);
+        let derived_gt_key_diff_aad =
+            derive_aead_key_from_gt(&gt_gen, b"chinwag-acu-gt-kat-v2").unwrap();
         assert_ne!(*derived_gt_key_1, *derived_gt_key_diff_aad);
     }
 
@@ -2087,7 +2269,7 @@ mod tests {
                 &agent_pk,
                 &acu_pk,
                 "bad\nrepo",
-                "CHWG-0271",
+                "CHWG-0283",
                 &mut rng,
             ),
             Err(AcuError::InvalidMetadata)
@@ -2098,22 +2280,22 @@ mod tests {
             &agent_pk,
             &acu_pk,
             "emunlabs/chinwag",
-            "CHWG-0271-WITNESS-GATE",
+            "CHWG-0283-WITNESS-GATE",
             &mut rng,
         )
         .unwrap();
 
         let mut bad_acu_row = payload.acu_ciphertext.rows[1].clone();
-        assert!(verify_row_randomness_witness(&bad_acu_row));
-        bad_acu_row.c3 = G1Projective::identity();
-        assert!(!verify_row_randomness_witness(&bad_acu_row));
+        assert!(verify_row_randomness_witness(&bad_acu_row, &acu_pk));
+        bad_acu_row.c2 = G1Projective::identity();
+        assert!(!verify_row_randomness_witness(&bad_acu_row, &acu_pk));
 
         let req = AcuShareRequest::create_signed(
             "req-bad-witness",
             DEFAULT_AGENT_BRANCH_ID,
             DEFAULT_CISO_ACU_ID,
             "emunlabs/chinwag",
-            "CHWG-0271-WITNESS-GATE",
+            "CHWG-0283-WITNESS-GATE",
             payload.acu_ciphertext.policy_epoch,
             payload.acu_ciphertext.clone(),
             bad_acu_row,
@@ -2124,10 +2306,7 @@ mod tests {
         let mut ciso_fat_client = CisoAcuFatClient::new(acu_sk, acu_pk.clone(), acu_ed25519_sk);
         assert_eq!(
             ciso_fat_client.handle_iroh_share_request(&req, &registry),
-            Err(AcuError::InvalidPartialShare {
-                row_index: 1,
-                seat_id: DEFAULT_CISO_ACU_ID.to_string(),
-            })
+            Err(AcuError::InvalidRowPok)
         );
         assert_eq!(ciso_fat_client.audit_log().len(), 1);
         assert_eq!(
@@ -2139,40 +2318,38 @@ mod tests {
             "invalid_acu_row_witness"
         );
 
-        // Even with structurally valid `(c1, c3)`, substituting a forged ACU row fails
-        // `verify_sealed_basis_with_lookup` authentication against `sk_ACU` (`BasisUnsealFailed`)!
         let mut forged_ct = payload.acu_ciphertext.clone();
         let r_forged = Scalar::from(7u64);
         forged_ct.rows[1].c1 =
             G1Projective::generator() * Scalar::from(42u64) + acu_pk.pk1 * r_forged;
-        forged_ct.rows[1].c3 = G1Projective::generator() * r_forged;
-        assert!(verify_row_randomness_witness(&forged_ct.rows[1]));
+        forged_ct.rows[1].c2 = G1Projective::generator() * r_forged;
+        forged_ct.rows[1].init_c1 = forged_ct.rows[1].c1;
+        forged_ct.rows[1].init_c2 = forged_ct.rows[1].c2;
 
         let forged_req = AcuShareRequest::create_signed(
-            "req-forged-sealed-basis",
+            "req-forged-row-pok",
             DEFAULT_AGENT_BRANCH_ID,
             DEFAULT_CISO_ACU_ID,
             "emunlabs/chinwag",
-            "CHWG-0271-WITNESS-GATE",
+            "CHWG-0283-WITNESS-GATE",
             forged_ct.policy_epoch,
             forged_ct.clone(),
             forged_ct.rows[1].clone(),
             1_793_801_000_000,
             &agent_ed25519_sk,
         );
-        assert_eq!(
-            ciso_fat_client.handle_iroh_share_request(&forged_req, &registry),
-            Err(AcuError::BasisUnsealFailed)
-        );
-        assert_eq!(
-            ciso_fat_client.audit_log()[1].reason,
-            "unauthenticated_or_tampered_acu_ciphertext"
+        assert!(
+            ciso_fat_client
+                .handle_iroh_share_request(&forged_req, &registry)
+                .is_err()
         );
 
-        // Chaum-Pedersen DLEQ tamper checks on `PartialDecryptionShare`:
-        let valid_share =
-            acu_partial_decrypt(&payload.acu_ciphertext, 1, ciso_fat_client.acu_secret_key())
-                .unwrap();
+        // Pure-G1 Chaum-Pedersen DLEQ tamper checks on `PartialDecryptionShare`:
+        let valid_share = acu_partial_decrypt_at_epoch(
+            &payload.acu_ciphertext.rows[1],
+            ciso_fat_client.acu_secret_key(),
+            payload.acu_ciphertext.policy_epoch,
+        );
         assert!(acu_verify_partial_share(
             &payload.acu_ciphertext.rows[1],
             &acu_pk,
@@ -2180,7 +2357,9 @@ mod tests {
         ));
 
         let mut bad_c = valid_share.clone();
-        bad_c.dleq_challenge += Scalar::ONE;
+        if let DleqProof::Compact { challenge, .. } = &mut bad_c.proof {
+            *challenge += Scalar::ONE;
+        }
         assert!(!acu_verify_partial_share(
             &payload.acu_ciphertext.rows[1],
             &acu_pk,
@@ -2188,7 +2367,9 @@ mod tests {
         ));
 
         let mut bad_z = valid_share.clone();
-        bad_z.dleq_response += Scalar::ONE;
+        if let DleqProof::Compact { response, .. } = &mut bad_z.proof {
+            *response += Scalar::ONE;
+        }
         assert!(!acu_verify_partial_share(
             &payload.acu_ciphertext.rows[1],
             &acu_pk,
@@ -2196,7 +2377,7 @@ mod tests {
         ));
 
         let mut bad_val = valid_share;
-        bad_val.value += pairing(&G1Affine::generator(), &G2Affine::generator());
+        bad_val.share_g1 += G1Projective::generator();
         assert!(!acu_verify_partial_share(
             &payload.acu_ciphertext.rows[1],
             &acu_pk,
@@ -2219,8 +2400,6 @@ mod tests {
             seat_keys.insert(pk.seat_id.clone(), (*pk).clone());
         }
 
-        // Start at `2-of-5` (`a=1, b=2, c=3, d=4, e=5`), prune `b` and `c` (`a=1, d=4, e=5` at indices `0, 1, 2`),
-        // then escalate threshold by `delta_t = 1` (`2-of-3` -> `3-of-3`).
         let tree = AccessTree::Threshold {
             threshold: 2,
             children: vec![
@@ -2237,12 +2416,11 @@ mod tests {
             &seat_keys,
             &pk_acu,
             "emunlabs/chinwag",
-            "CHWG-0271-P1-1-POST-REVOKE-ESCALATE",
+            "CHWG-0283-P1-1-POST-REVOKE-ESCALATE",
             &mut rng,
         )
         .unwrap();
 
-        // Omitting sibling rows (`&[0, 1, 2]` out of 5 siblings `[0..5]`) MUST fail closed!
         assert_eq!(
             escalate_threshold(
                 &mut payload.acu_ciphertext,
@@ -2253,7 +2431,7 @@ mod tests {
                 &mut rng,
             ),
             Err(AcuError::InvalidAccessTree(
-                "affected_row_indices omits sibling rows of the target threshold gate"
+                "gate_row_indices do not match any compiled gate subtree"
             ))
         );
 
@@ -2265,12 +2443,14 @@ mod tests {
             &mut rng,
         )
         .unwrap();
+        payload
+            .prune_revoked_pq_capsules(&["branch:b", "branch:c"])
+            .unwrap();
         seat_keys.remove("branch:b");
         seat_keys.remove("branch:c");
         assert_eq!(payload.acu_ciphertext.rows.len(), 3);
 
-        // Passing fewer rows than `current_rank + delta_t` (`&[0, 1]`) also fails closed!
-        assert_eq!(
+        assert!(
             escalate_threshold(
                 &mut payload.acu_ciphertext,
                 &sk_acu,
@@ -2278,14 +2458,10 @@ mod tests {
                 1,
                 &seat_keys,
                 &mut rng,
-            ),
-            Err(AcuError::InvalidThreshold {
-                threshold: 3,
-                children: 2,
-            })
+            )
+            .is_err()
         );
 
-        // Escalate all surviving siblings `&[0, 1, 2]` (`a=1, d=4, e=5`) from `2-of-3` to `3-of-3`!
         escalate_threshold(
             &mut payload.acu_ciphertext,
             &sk_acu,
@@ -2309,30 +2485,44 @@ mod tests {
             Scalar::from(25u64)
         );
 
-        let d_a = acu_partial_decrypt(&payload.acu_ciphertext, 0, &sk_a).unwrap();
-        let d_d = acu_partial_decrypt(&payload.acu_ciphertext, 1, &sk_d).unwrap();
-        let d_e = acu_partial_decrypt(&payload.acu_ciphertext, 2, &sk_e).unwrap();
+        let d_a = acu_partial_decrypt_at_epoch(
+            &payload.acu_ciphertext.rows[0],
+            &sk_a,
+            payload.acu_ciphertext.policy_epoch,
+        );
+        let d_d = acu_partial_decrypt_at_epoch(
+            &payload.acu_ciphertext.rows[1],
+            &sk_d,
+            payload.acu_ciphertext.policy_epoch,
+        );
+        let d_e = acu_partial_decrypt_at_epoch(
+            &payload.acu_ciphertext.rows[2],
+            &sk_e,
+            payload.acu_ciphertext.policy_epoch,
+        );
+        let mut pq_ade = payload.decapsulate_pq_shares_for_seat(&sk_a).unwrap();
+        pq_ade.extend(payload.decapsulate_pq_shares_for_seat(&sk_d).unwrap());
+        pq_ade.extend(payload.decapsulate_pq_shares_for_seat(&sk_e).unwrap());
 
-        // EVERY 2-seat subset (`[a, d]`, `[a, e]`, `[d, e]`) MUST fail `PolicyNotSatisfied`!
         assert_eq!(
-            payload.decrypt(&[d_a.clone(), d_d.clone()], &seat_keys),
+            payload.decrypt(&[d_a.clone(), d_d.clone()], &pq_ade, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
         assert_eq!(
-            payload.decrypt(&[d_a.clone(), d_e.clone()], &seat_keys),
+            payload.decrypt(&[d_a.clone(), d_e.clone()], &pq_ade, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
         assert_eq!(
-            payload.decrypt(&[d_d.clone(), d_e.clone()], &seat_keys),
+            payload.decrypt(&[d_d.clone(), d_e.clone()], &pq_ade, &seat_keys),
             Err(AcuError::PolicyNotSatisfied)
         );
-        // Full 3-of-3 (`[a, d, e]`) cleanly recovers plaintext!
         assert_eq!(
-            payload.decrypt(&[d_a, d_d, d_e], &seat_keys).unwrap(),
+            payload
+                .decrypt(&[d_a, d_d, d_e], &pq_ade, &seat_keys)
+                .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
 
-        // Also verify nested `And([Leaf(acu), Threshold(2-of-3: [a, d, e])])` escalation and cross-gate rejection.
         let nested_tree = AccessTree::And(vec![
             AccessTree::Leaf(DEFAULT_CISO_ACU_ID.to_string()),
             AccessTree::Threshold {
@@ -2350,11 +2540,10 @@ mod tests {
             &seat_keys,
             &pk_acu,
             "emunlabs/chinwag",
-            "CHWG-0271-P1-1-NESTED-GATE",
+            "CHWG-0283-P1-1-NESTED-GATE",
             &mut rng,
         )
         .unwrap();
-        // Passing cross-gate indices `&[0, 1, 2]` (`acu`, `a`, `d`) MUST reject!
         assert!(
             escalate_threshold(
                 &mut nested.acu_ciphertext,
@@ -2366,7 +2555,6 @@ mod tests {
             )
             .is_err()
         );
-        // Escalating the true inner threshold gate `&[1, 2, 3]` (`a`, `d`, `e`) succeeds cleanly!
         escalate_threshold(
             &mut nested.acu_ciphertext,
             &sk_acu,
@@ -2376,16 +2564,41 @@ mod tests {
             &mut rng,
         )
         .unwrap();
-        let n_acu = acu_partial_decrypt(&nested.acu_ciphertext, 0, &sk_acu).unwrap();
-        let n_a = acu_partial_decrypt(&nested.acu_ciphertext, 1, &sk_a).unwrap();
-        let n_d = acu_partial_decrypt(&nested.acu_ciphertext, 2, &sk_d).unwrap();
-        let n_e = acu_partial_decrypt(&nested.acu_ciphertext, 3, &sk_e).unwrap();
+        let n_acu = acu_partial_decrypt_at_epoch(
+            &nested.acu_ciphertext.rows[0],
+            &sk_acu,
+            nested.acu_ciphertext.policy_epoch,
+        );
+        let n_a = acu_partial_decrypt_at_epoch(
+            &nested.acu_ciphertext.rows[1],
+            &sk_a,
+            nested.acu_ciphertext.policy_epoch,
+        );
+        let n_d = acu_partial_decrypt_at_epoch(
+            &nested.acu_ciphertext.rows[2],
+            &sk_d,
+            nested.acu_ciphertext.policy_epoch,
+        );
+        let n_e = acu_partial_decrypt_at_epoch(
+            &nested.acu_ciphertext.rows[3],
+            &sk_e,
+            nested.acu_ciphertext.policy_epoch,
+        );
+        let mut n_pq = nested.decapsulate_pq_shares_for_seat(&sk_a).unwrap();
+        n_pq.extend(nested.decapsulate_pq_shares_for_seat(&sk_d).unwrap());
+        n_pq.extend(nested.decapsulate_pq_shares_for_seat(&sk_e).unwrap());
         assert_eq!(
-            nested.decrypt(&[n_acu.clone(), n_a.clone(), n_d.clone()], &seat_keys),
+            nested.decrypt(
+                &[n_acu.clone(), n_a.clone(), n_d.clone()],
+                &n_pq,
+                &seat_keys
+            ),
             Err(AcuError::PolicyNotSatisfied)
         );
         assert_eq!(
-            nested.decrypt(&[n_acu, n_a, n_d, n_e], &seat_keys).unwrap(),
+            nested
+                .decrypt(&[n_acu, n_a, n_d, n_e], &n_pq, &seat_keys)
+                .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
     }
@@ -2403,7 +2616,6 @@ mod tests {
             seat_keys.insert(pk.seat_id.clone(), (*pk).clone());
         }
 
-        // Epoch 1: `(alpha OR beta OR gamma) AND acu`
         let tree = AccessTree::And(vec![
             AccessTree::Or(vec![
                 AccessTree::Leaf("branch:alpha".to_string()),
@@ -2418,13 +2630,12 @@ mod tests {
             &seat_keys,
             &pk_acu,
             "emunlabs/chinwag",
-            "CHWG-0271-P1-2-NO-DOWNGRADE",
+            "CHWG-0283-P1-2-NO-DOWNGRADE",
             &mut rng,
         )
         .unwrap();
         let mut ep2_evolved = ep1_cached.clone();
 
-        // Escalate `{alpha, beta, gamma}` (`[0, 1, 2]`) to `2-of-3` at Epoch 2 while `acu` is at row 3.
         escalate_threshold(
             &mut ep2_evolved.acu_ciphertext,
             &sk_acu,
@@ -2440,32 +2651,55 @@ mod tests {
             ep1_cached.acu_ciphertext.rows[3].c1
         );
 
-        // Attacker holding ONLY `sk_a` (`1` branch instead of the escalated `2-of-3`) obtains `d_acu_ep2`
-        // at Epoch 2, relabels its `policy_epoch = 1`, and tries to combine it with cached Epoch-1 `ep1_cached`!
-        let d_a_ep1 = acu_partial_decrypt(&ep1_cached.acu_ciphertext, 0, &sk_a).unwrap();
-        let mut d_acu_ep2_relabeled =
-            acu_partial_decrypt(&ep2_evolved.acu_ciphertext, 3, &sk_acu).unwrap();
+        let d_a_ep1 = acu_partial_decrypt_at_epoch(
+            &ep1_cached.acu_ciphertext.rows[0],
+            &sk_a,
+            ep1_cached.acu_ciphertext.policy_epoch,
+        );
+        let pq_a_ep1 = ep1_cached.decapsulate_pq_shares_for_seat(&sk_a).unwrap();
+        let mut d_acu_ep2_relabeled = acu_partial_decrypt_at_epoch(
+            &ep2_evolved.acu_ciphertext.rows[3],
+            &sk_acu,
+            ep2_evolved.acu_ciphertext.policy_epoch,
+        );
         d_acu_ep2_relabeled.policy_epoch = 1;
 
         assert_eq!(
-            ep1_cached.decrypt(&[d_a_ep1.clone(), d_acu_ep2_relabeled.clone()], &seat_keys),
+            ep1_cached.decrypt(
+                &[d_a_ep1.clone(), d_acu_ep2_relabeled.clone()],
+                &pq_a_ep1,
+                &seat_keys
+            ),
             Err(AcuError::InvalidPartialShare {
                 row_index: 3,
                 seat_id: DEFAULT_CISO_ACU_ID.to_string(),
             })
         );
         assert_eq!(
-            ep1_cached.decrypt_unverified(&[d_a_ep1, d_acu_ep2_relabeled]),
+            ep1_cached.decrypt_unverified(&[d_a_ep1, d_acu_ep2_relabeled], &pq_a_ep1),
             Err(AcuError::AeadFailure)
         );
 
-        // Legitimate `2-of-3 + ACU` at Epoch 2 decrypts cleanly.
-        let d_a_ep2 = acu_partial_decrypt(&ep2_evolved.acu_ciphertext, 0, &sk_a).unwrap();
-        let d_b_ep2 = acu_partial_decrypt(&ep2_evolved.acu_ciphertext, 1, &sk_b).unwrap();
-        let d_acu_ep2 = acu_partial_decrypt(&ep2_evolved.acu_ciphertext, 3, &sk_acu).unwrap();
+        let d_a_ep2 = acu_partial_decrypt_at_epoch(
+            &ep2_evolved.acu_ciphertext.rows[0],
+            &sk_a,
+            ep2_evolved.acu_ciphertext.policy_epoch,
+        );
+        let d_b_ep2 = acu_partial_decrypt_at_epoch(
+            &ep2_evolved.acu_ciphertext.rows[1],
+            &sk_b,
+            ep2_evolved.acu_ciphertext.policy_epoch,
+        );
+        let d_acu_ep2 = acu_partial_decrypt_at_epoch(
+            &ep2_evolved.acu_ciphertext.rows[3],
+            &sk_acu,
+            ep2_evolved.acu_ciphertext.policy_epoch,
+        );
+        let mut pq_ab = ep2_evolved.decapsulate_pq_shares_for_seat(&sk_a).unwrap();
+        pq_ab.extend(ep2_evolved.decapsulate_pq_shares_for_seat(&sk_b).unwrap());
         assert_eq!(
             ep2_evolved
-                .decrypt(&[d_a_ep2, d_b_ep2, d_acu_ep2], &seat_keys)
+                .decrypt(&[d_a_ep2, d_b_ep2, d_acu_ep2], &pq_ab, &seat_keys)
                 .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
@@ -2523,7 +2757,6 @@ mod tests {
             registry.register_seat(id, vk, pk).unwrap();
         }
 
-        // Policy: `acu AND (branch:8687872 OR branch:sibling OR archive:vault)`
         let tree = AccessTree::And(vec![
             AccessTree::Leaf(DEFAULT_CISO_ACU_ID.to_string()),
             AccessTree::Or(vec![
@@ -2539,20 +2772,19 @@ mod tests {
             &seat_keys,
             &acu_pk,
             "emunlabs/chinwag",
-            "CHWG-0271-P1-3-PROXY-AND-ARCHIVE-GATE",
+            "CHWG-0283-P1-3-PROXY-AND-ARCHIVE-GATE",
             &mut rng,
         )
         .unwrap();
 
         let mut ciso_fat_client = CisoAcuFatClient::new(acu_sk, acu_pk, acu_ed25519_sk);
 
-        // 1. Archive seat MUST be rejected on `handle_iroh_share_request` without an investigation ticket!
         let archive_live_req = AcuShareRequest::create_signed(
             "req-archive-bypass",
             DEFAULT_MESSAGE_ARCHIVE_ID,
             DEFAULT_CISO_ACU_ID,
             "emunlabs/chinwag",
-            "CHWG-0271-P1-3-PROXY-AND-ARCHIVE-GATE",
+            "CHWG-0283-P1-3-PROXY-AND-ARCHIVE-GATE",
             payload.acu_ciphertext.policy_epoch,
             payload.acu_ciphertext.clone(),
             payload.acu_ciphertext.rows[0].clone(),
@@ -2568,13 +2800,12 @@ mod tests {
             "archive_seat_requires_investigation_ticket"
         );
 
-        // 2. Active bystander seat NOT in `payload.acu_ciphertext.rows` MUST be rejected (`PolicyNotSatisfied`)!
         let bystander_req = AcuShareRequest::create_signed(
             "req-bystander-proxy",
             "branch:bystander",
             DEFAULT_CISO_ACU_ID,
             "emunlabs/chinwag",
-            "CHWG-0271-P1-3-PROXY-AND-ARCHIVE-GATE",
+            "CHWG-0283-P1-3-PROXY-AND-ARCHIVE-GATE",
             payload.acu_ciphertext.policy_epoch,
             payload.acu_ciphertext.clone(),
             payload.acu_ciphertext.rows[0].clone(),
@@ -2590,16 +2821,13 @@ mod tests {
             "requester_not_in_ciphertext_policy"
         );
 
-        // 3. Instant-revoke `branch:8687872` BEFORE pruning Epoch-1 ciphertext:
-        // `branch:sibling` MUST be blocked from live share issuance on the unpruned Epoch-1 ciphertext
-        // so `D_ACU` cannot leak to the revoked sibling before `revoke_and_rerandomize` runs!
         ciso_fat_client.instant_revoke(DEFAULT_AGENT_BRANCH_ID);
         let sibling_ep1_req = AcuShareRequest::create_signed(
             "req-sibling-unpruned-ep1",
             "branch:sibling",
             DEFAULT_CISO_ACU_ID,
             "emunlabs/chinwag",
-            "CHWG-0271-P1-3-PROXY-AND-ARCHIVE-GATE",
+            "CHWG-0283-P1-3-PROXY-AND-ARCHIVE-GATE",
             payload.acu_ciphertext.policy_epoch,
             payload.acu_ciphertext.clone(),
             payload.acu_ciphertext.rows[0].clone(),
@@ -2615,8 +2843,6 @@ mod tests {
             "ciphertext_contains_unpruned_revoked_seat"
         );
 
-        // Once CISO prunes `branch:8687872` via `revoke_and_rerandomize` (advancing to Epoch 2),
-        // `branch:sibling` is cleanly granted `D_ACU` and decrypts!
         registry.revoke_seat(DEFAULT_AGENT_BRANCH_ID).unwrap();
         let active_keys_ep2 = registry.active_acu_keys();
         ciso_fat_client
@@ -2627,12 +2853,15 @@ mod tests {
                 &mut rng,
             )
             .unwrap();
+        payload
+            .prune_revoked_pq_capsules(&[DEFAULT_AGENT_BRANCH_ID])
+            .unwrap();
         let sibling_ep2_req = AcuShareRequest::create_signed(
             "req-sibling-pruned-ep2",
             "branch:sibling",
             DEFAULT_CISO_ACU_ID,
             "emunlabs/chinwag",
-            "CHWG-0271-P1-3-PROXY-AND-ARCHIVE-GATE",
+            "CHWG-0283-P1-3-PROXY-AND-ARCHIVE-GATE",
             payload.acu_ciphertext.policy_epoch,
             payload.acu_ciphertext.clone(),
             payload.acu_ciphertext.rows[0].clone(),
@@ -2646,18 +2875,22 @@ mod tests {
             .verify_by_agent(&payload.acu_ciphertext.rows[0], &registry)
             .unwrap();
 
-        let d_sibling = acu_partial_decrypt(&payload.acu_ciphertext, 1, &sibling_sk).unwrap();
+        let d_sibling = acu_partial_decrypt_at_epoch(
+            &payload.acu_ciphertext.rows[1],
+            &sibling_sk,
+            payload.acu_ciphertext.policy_epoch,
+        );
         assert_eq!(
             payload
-                .decrypt(
+                .decrypt_with_local_key(
                     &[sibling_resp.partial_share.clone(), d_sibling],
+                    &sibling_sk,
                     &active_keys_ep2
                 )
                 .unwrap(),
             SAMPLE_CI_ROOT_CAUSE_JSON
         );
 
-        // 4. `[H-3]` Tampering with `audit_entry.reason` while keeping `entry_sha256` untouched MUST fail `verify_by_agent`!
         sibling_resp.audit_entry.reason = "forged_reason".to_string();
         assert_eq!(
             sibling_resp.verify_by_agent(&payload.acu_ciphertext.rows[0], &registry),
@@ -2666,7 +2899,7 @@ mod tests {
     }
 
     #[test]
-    fn test_20_alistair_p1_r2_2_public_key_reseal_cut_and_paste_oracle_and_archive_metadata_laundering_rejected()
+    fn test_20_alistair_p1_r2_2_cut_and_paste_row_into_synthetic_policy_and_archive_metadata_laundering_rejected()
      {
         let mut rng = OsRng;
         let (acu_sk, acu_pk) = SeatSecretKey::generate(DEFAULT_CISO_ACU_ID, &mut rng).unwrap();
@@ -2710,14 +2943,13 @@ mod tests {
             registry.register_seat(id, vk, pk).unwrap();
         }
 
-        // Encrypt victim payload under `acu AND (branch:8687872 OR archive:vault)`.
         let victim = EncryptedCiPayload::encrypt_with_acu_and_archive(
             SAMPLE_CI_ROOT_CAUSE_JSON,
             &acu_pk,
             &agent_pk,
             &archive_pk,
             "emunlabs/chinwag",
-            "CHWG-0271-CUT-AND-PASTE-VICTIM",
+            "CHWG-0283-CUT-AND-PASTE-VICTIM",
             &mut rng,
         )
         .unwrap();
@@ -2726,125 +2958,52 @@ mod tests {
             CisoAcuFatClient::new(acu_sk, acu_pk.clone(), acu_ed25519_sk.clone());
         ciso_fat_client.instant_revoke(DEFAULT_AGENT_BRANCH_ID);
 
-        // 1. `[P1-R2-2]` Cut-and-paste oracle attempt:
-        // Active attacker `branch:bystander` copies `victim_acu_row` (row 0) into a synthetic 2-row
-        // `AcuCiphertext` `[victim_acu_row, bystander_row]` and encrypts synthetic `(basis, row_scalars)`
-        // directly to public `acu_pk.pk1` with exact matching `BASIS_SEAL_AAD_DOMAIN` AAD!
-        let mut victim_acu_row = victim.acu_ciphertext.rows[0].clone();
-        victim_acu_row.row_index = 0;
-
-        let g1 = G1Projective::generator();
-        let cols = victim_acu_row.matrix_row.len();
-        let mut bystander_matrix_row = vec![Scalar::ZERO; cols];
-        bystander_matrix_row[0] = Scalar::ONE;
-        let r_bystander = Scalar::from(19u64);
-        let bystander_row = CiphertextRow {
-            row_index: 1,
-            seat_id: "branch:bystander".to_string(),
-            matrix_row: bystander_matrix_row.clone(),
-            c1: g1 + bystander_pk.pk1 * r_bystander,
-            c3: g1 * r_bystander,
-        };
-        let forged_rows = vec![victim_acu_row.clone(), bystander_row];
-        let forged_matrix = LsssMatrix {
-            cols,
-            rows: vec![
-                (
-                    victim_acu_row.seat_id.clone(),
-                    victim_acu_row.matrix_row.clone(),
-                ),
-                ("branch:bystander".to_string(), bystander_matrix_row),
-            ],
-        };
-
-        // Seal synthetic `(basis = [g1; cols], row_scalars = [1, r_bystander])` to public `acu_pk.pk1`:
-        let mut fake_plain = Vec::with_capacity(cols * 48 + 2 * 32);
-        for _ in 0..cols {
-            fake_plain.extend_from_slice(&G1Affine::generator().to_compressed());
-        }
-        fake_plain.extend_from_slice(&Scalar::ONE.to_bytes());
-        fake_plain.extend_from_slice(&r_bystander.to_bytes());
-
-        let r_kem = Scalar::from(23u64);
-        let ephemeral_pk1 = g1 * r_kem;
-        let shared_z = acu_pk.pk1 * r_kem;
-        let mut ikm = [0u8; 144];
-        ikm[0..48].copy_from_slice(&G1Affine::from(ephemeral_pk1).to_compressed());
-        ikm[48..96].copy_from_slice(&G1Affine::from(acu_pk.pk1).to_compressed());
-        ikm[96..144].copy_from_slice(&G1Affine::from(shared_z).to_compressed());
-        let hk = Hkdf::<Sha256>::new(Some(b"chinwag-acu/v2/basis-seal-hkdf-salt"), &ikm);
-        let mut sym_key = [0u8; 32];
-        hk.expand(
-            b"chinwag-acu/v2/basis-seal-chacha20poly1305-key",
-            &mut sym_key,
+        // 1. Cut-and-paste oracle attempt: `bystander` encrypts a fresh 2-row `CHWGACU3` ciphertext
+        // under `acu AND bystander` (with the exact same `object_digest`) and splices `victim_acu_row`
+        // into row 0! Because `RowPok` binds `init_matrix_digest`, `verify_authenticity` rejects!
+        let synth_tree =
+            EncryptedCiPayload::build_split_key_acu_policy("branch:bystander", DEFAULT_CISO_ACU_ID);
+        let synth_matrix = LsssMatrix::from_tree(&synth_tree).unwrap();
+        let active_keys = registry.active_acu_keys();
+        let payload_g1 = G1Projective::generator() * Scalar::from(77u64);
+        let (mut synthetic_ct, _) = acu_encrypt_with_g1_and_context(
+            &payload_g1,
+            &victim.acu_ciphertext.object_digest,
+            &[0x33u8; 32],
+            &synth_matrix,
+            &active_keys,
+            &acu_pk,
+            &mut rng,
         )
         .unwrap();
 
-        let mut aad = Vec::new();
-        aad.extend_from_slice(b"chinwag-acu/v2/basis-seal-aad");
-        aad.extend_from_slice(&1u64.to_be_bytes());
-        aad.extend_from_slice(&(DEFAULT_CISO_ACU_ID.len() as u32).to_be_bytes());
-        aad.extend_from_slice(DEFAULT_CISO_ACU_ID.as_bytes());
-        aad.extend_from_slice(&(cols as u32).to_be_bytes());
-        aad.extend_from_slice(&(forged_rows.len() as u32).to_be_bytes());
-        aad.extend_from_slice(&G1Affine::from(victim.acu_ciphertext.c0_g1).to_compressed());
-        for row in &forged_rows {
-            aad.extend_from_slice(&(row.row_index as u32).to_be_bytes());
-            aad.extend_from_slice(&(row.seat_id.len() as u32).to_be_bytes());
-            aad.extend_from_slice(row.seat_id.as_bytes());
-            aad.extend_from_slice(&(row.matrix_row.len() as u32).to_be_bytes());
-            for s in &row.matrix_row {
-                aad.extend_from_slice(&s.to_bytes());
-            }
-            aad.extend_from_slice(&G1Affine::from(row.c1).to_compressed());
-            aad.extend_from_slice(&G1Affine::from(row.c3).to_compressed());
-        }
-        let seal_nonce = [0x77u8; 12];
-        let seal_ct = ChaCha20Poly1305::new(Key::from_slice(&sym_key))
-            .encrypt(
-                Nonce::from_slice(&seal_nonce),
-                Payload {
-                    msg: &fake_plain,
-                    aad: &aad,
-                },
-            )
-            .unwrap();
+        let mut spliced_victim_acu_row = victim.acu_ciphertext.rows[0].clone();
+        spliced_victim_acu_row.row_index = 1;
+        spliced_victim_acu_row.matrix_row = synthetic_ct.rows[1].matrix_row.clone();
+        synthetic_ct.rows[1] = spliced_victim_acu_row.clone();
 
-        let synthetic_ct = AcuCiphertext {
-            policy_epoch: 1,
-            c0_g1: victim.acu_ciphertext.c0_g1,
-            c0: victim.acu_ciphertext.c0,
-            sealed_basis: SealedBasisCommitments {
-                acu_seat_id: DEFAULT_CISO_ACU_ID.to_string(),
-                ephemeral_pk1,
-                nonce: seal_nonce,
-                ciphertext: seal_ct,
-            },
-            matrix: forged_matrix,
-            rows: forged_rows,
-        };
         let cut_and_paste_req = AcuShareRequest::create_signed(
             "req-cut-and-paste-oracle",
             "branch:bystander",
             DEFAULT_CISO_ACU_ID,
             "emunlabs/chinwag",
-            "CHWG-0271-CUT-AND-PASTE-VICTIM",
+            "CHWG-0283-CUT-AND-PASTE-VICTIM",
             1,
             synthetic_ct,
-            victim_acu_row,
+            spliced_victim_acu_row,
             1_793_803_001_000,
             &bystander_ed25519_sk,
         );
         assert_eq!(
             ciso_fat_client.handle_iroh_share_request(&cut_and_paste_req, &registry),
-            Err(AcuError::BasisUnsealFailed)
+            Err(AcuError::InvalidRowPok)
         );
         assert_eq!(
             ciso_fat_client.audit_log()[0].reason,
-            "unauthenticated_or_tampered_acu_ciphertext"
+            "invalid_acu_row_witness"
         );
 
-        // 2. `[H-R2-1]` Archive metadata-laundering defense & immutable `sender_seat`:
+        // 2. Archive metadata-laundering defense & immutable `sender_seat`:
         let partition = HivePartitionKey::new("emunlabs", 2026, 11, 12).unwrap();
         let mut store = AcuParquetArchiveStore::new();
         let mut archived_row = store
@@ -2855,7 +3014,7 @@ mod tests {
                 DEFAULT_AGENT_BRANCH_ID,
                 DEFAULT_AGENT_BRANCH_ID,
                 "#eng",
-                "CHWG-0271-ARCHIVE-META",
+                "CHWG-0283-ARCHIVE-META",
                 SAMPLE_CI_ROOT_CAUSE_JSON,
                 &agent_ed25519_sk,
                 &registry,
@@ -2863,7 +3022,6 @@ mod tests {
             )
             .unwrap();
 
-        // Tampering with cleartext `room` BEFORE `revoke_and_rerandomize_in_place` MUST fail closed!
         archived_row.room = "#forged-room".to_string();
         assert_eq!(
             archived_row.revoke_and_rerandomize_in_place(
@@ -2877,7 +3035,6 @@ mod tests {
             Err(AcuError::SignatureVerificationFailed("archive_row"))
         );
 
-        // Restore authentic `room = "#eng"`: rerandomization succeeds and preserves original `sender_seat`!
         archived_row.room = "#eng".to_string();
         archived_row
             .revoke_and_rerandomize_in_place(
@@ -2971,8 +3128,6 @@ mod tests {
         assert_eq!(cache_hit_after_append, CacheHit::R2ParquetRangeFetch);
         assert_eq!(cached_rows.len(), 1);
 
-        // Revoke "branch:8687872" and ensure a revoked seat CANNOT spoof `sender_seat = "branch:bystander"`
-        // by setting `rerandomized_by_seat = Some("branch:8687872")` at epoch 1 or epoch 2!
         registry.revoke_seat(DEFAULT_AGENT_BRANCH_ID).unwrap();
         let mut ciso_fat_client =
             CisoAcuFatClient::new(acu_sk, acu_pk.clone(), acu_ed25519_sk.clone());
@@ -3004,7 +3159,6 @@ mod tests {
             .to_bytes()
             .to_vec();
 
-        // Attack A: Revoked agent sets `rerandomized_by_seat = Some("branch:8687872")` at epoch 2.
         store.update_row_by_id("msg-impersonation-target-21", |r| {
             r.sender_seat = "branch:bystander".to_string();
             r.recipient_seat = "branch:bystander".to_string();
@@ -3041,8 +3195,6 @@ mod tests {
             ))
         );
 
-        // Attack B: Even if `acu_ed25519_sk` signs a rerandomized epoch-2 row (`rerandomized_by_seat = Some("acu:98939834")`),
-        // spoofing `sender_seat = "branch:bystander"` without `bystander_ed25519_sk`'s `sender_ed25519_sig` fails closed!
         let mut epoch2_payload = forged_payload;
         revoke_and_rerandomize(
             &mut epoch2_payload.acu_ciphertext,

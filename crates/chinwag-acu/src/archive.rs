@@ -1,31 +1,60 @@
 // Copyright (c) 2026 Emun Labs, Inc. (1401 Lavaca St STE 81335, Austin, TX 78701)
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cloudflare R2 / S3 Parquet + DuckDB (`httpfs`) Encrypted Message Archive with Cleartext
-//! Searchable Routing Metadata (`sender_seat`, `recipient_seat`, `timestamp_utc`, `room`, `task_id`),
-//! Encrypted `acu_ciphertext` BLOB Column (`CHWGAEAD` wrapping `CHWGACU2`), Hybrid Active-Channel RAM Cache
-//! (`active_channel_cache`), and Off-UI-Thread CISO Forensic Decryption (`SharedFatClientArchiveHandle`).
+//! Cloudflare R2 / S3 Parquet + DuckDB (`httpfs`) Encrypted Message Archive, Blind Hash-Chained
+//! [`AcuEnvelopeHeaderV2`] (`F-01`, `F-02`, `F-03` & `ePrint v2` §§6–7), Join-Resistant
+//! `ArchiveRowSign` + Inner `SeatAuthorSign` (`SealedAuthorMessage`), `HMAC-SHA256` Blind Index Tags,
+//! 4-Leaf Salted Merkle `--public-safe` Selective Openings (`PublicSafeExportBundle`), Hybrid
+//! Active-Channel RAM Cache (`active_channel_cache`), and Off-UI-Thread CISO Forensic Decryption.
 
 use crate::AcuError;
 use crate::acu::{acu_partial_decrypt_at_epoch, revoke_and_rerandomize};
 use crate::aead::{DEFAULT_MESSAGE_ARCHIVE_ID, EncryptedCiPayload, is_valid_metadata_token};
+use crate::framing::{lp64_bytes, lp64_str, read_lp64_bytes, read_lp64_str};
 use crate::keys::{SeatSecretKey, is_valid_seat_id};
 use crate::protocol::{
-    AcuShareRequest, AllowedSignersRegistry, CisoAcuFatClient, DEFAULT_CISO_ACU_ID,
+    AcuPolicySignature, AcuShareRequest, AllowedSignersRegistry, CisoAcuFatClient,
+    DEFAULT_CISO_ACU_ID,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand_core::{CryptoRng, OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
-const ARCHIVE_ROW_SIG_DOMAIN: &[u8] = b"chinwag-parquet-archive-row/v4";
-const ARCHIVE_SENDER_BODY_SIG_DOMAIN: &[u8] = b"chinwag-parquet-archive-sender-body/v1";
+type HmacSha256 = Hmac<Sha256>;
 
-/// Default DuckDB background worker thread cap on the CISO/developer fat client so GPUI / local
-/// web workbench UI rendering threads are never starved.
+const ARCHIVE_ROW_SIG_DOMAIN: &[u8] = b"chinwag-parquet-archive-row/v5";
+const ARCHIVE_SENDER_BODY_SIG_DOMAIN: &[u8] = b"chinwag-parquet-archive-sender-body/v2";
+const ENVELOPE_V2_SIG_DOMAIN: &[u8] = b"chinwag.acu.v2.archive-row-sign";
+const ENVELOPE_V2_CHAIN_DOMAIN: &[u8] = b"chinwag.acu.v2.envelope-chain-link";
+const ENVELOPE_V2_META_KDF_INFO: &[u8] = b"chinwag.acu.v2.meta-box-key";
+const ENVELOPE_V2_META_AAD_DOMAIN: &[u8] = b"chinwag.acu.v2.meta-box-aad";
+const SEAT_AUTHOR_SIGN_DOMAIN: &[u8] = b"chinwag.acu.v2.seat-author-sign";
+const SEAT_AUTHOR_MAGIC: &[u8; 8] = b"CHWGAUT2";
+const MERKLE_LEAF_DOMAIN: &[u8] = b"chinwag.acu.v2.merkle-leaf";
+const MERKLE_NODE_DOMAIN: &[u8] = b"chinwag.acu.v2.merkle-node";
+const MERKLE_ROOT_DOMAIN: &[u8] = b"chinwag.acu.v2.merkle-root";
+const BLIND_TAG_SENDER_DOMAIN: &[u8] = b"chinwag.acu.v2.blind-tag.sender";
+const BLIND_TAG_RECIPIENT_DOMAIN: &[u8] = b"chinwag.acu.v2.blind-tag.recipient";
+const BLIND_TAG_ROOM_DOMAIN: &[u8] = b"chinwag.acu.v2.blind-tag.room";
+const BLIND_TAG_TASK_DOMAIN: &[u8] = b"chinwag.acu.v2.blind-tag.task";
+
+/// Canonical `version` byte for [`AcuEnvelopeHeaderV2`].
+pub const ACU_ENVELOPE_HEADER_V2_VERSION: u8 = 2;
+
+/// Default DuckDB background worker thread cap on the CISO/developer fat client so local
+/// web workbench (`127.0.0.1:5487`) UI rendering threads are never starved.
 pub const DEFAULT_DUCKDB_THREADS: u8 = 2;
 
 /// Default DuckDB RAM cap on the CISO/developer fat client.
@@ -33,6 +62,826 @@ pub const DEFAULT_DUCKDB_MEMORY_LIMIT: &str = "1GB";
 
 /// Default number of recent messages cached per active room in RAM (`active_channel_cache`).
 pub const DEFAULT_ACTIVE_CHANNEL_PAGE_SIZE: usize = 50;
+
+// ============================================================================
+// Slice F: Inner `SeatAuthorSign` (`SealedAuthorMessage`), `BlindIndexTags`,
+//          `AcuEnvelopeHeaderV2`, & 4-Leaf Salted Merkle `--public-safe` Export
+// ============================================================================
+
+/// Inner `SeatAuthorSign` payload sealed **inside** the immutable `CHWGAEA2` `C_1` ciphertext
+/// (`ePrint v2` §7.1): keeps `author_seat_id` and its Ed25519 signature strictly invisible to
+/// Blind Relay and Parquet `.keys` SQL-JOIN observers while preserving cryptographic non-repudiation
+/// upon authorized decryption!
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedAuthorMessage {
+    /// Author seat ID (e.g., `"branch:8687872"`).
+    pub author_seat_id: String,
+    /// Flow or message identifier bound into the inner signature.
+    pub message_id: String,
+    /// UTC timestamp in milliseconds since Unix epoch.
+    pub timestamp_utc: u64,
+    /// Inner application plaintext bytes.
+    pub body: Vec<u8>,
+    /// Detached Ed25519 `SeatAuthorSign` signature (`64` B).
+    #[serde(with = "crate::framing::serde_bytes64")]
+    pub author_signature: [u8; 64],
+}
+
+impl SealedAuthorMessage {
+    /// Sign `(author_seat_id, message_id, timestamp_utc, body)` under `author_ed25519_sk` and
+    /// serialize into canonical `CHWGAUT2` inner bytes ready to encrypt inside `C_1`.
+    #[must_use]
+    pub fn seal_and_sign(
+        author_seat_id: impl Into<String>,
+        message_id: impl Into<String>,
+        timestamp_utc: u64,
+        body: Vec<u8>,
+        author_ed25519_sk: &SigningKey,
+    ) -> Self {
+        let author_seat_id = author_seat_id.into();
+        let message_id = message_id.into();
+        let preimage = Self::signing_preimage(&author_seat_id, &message_id, timestamp_utc, &body);
+        let sig: Signature = author_ed25519_sk.sign(&preimage);
+        Self {
+            author_seat_id,
+            message_id,
+            timestamp_utc,
+            body,
+            author_signature: sig.to_bytes(),
+        }
+    }
+
+    /// Encode this [`SealedAuthorMessage`] to deterministic `CHWGAUT2` bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128 + self.body.len());
+        out.extend_from_slice(SEAT_AUTHOR_MAGIC);
+        lp64_str(&mut out, &self.author_seat_id);
+        lp64_str(&mut out, &self.message_id);
+        out.extend_from_slice(&self.timestamp_utc.to_be_bytes());
+        lp64_bytes(&mut out, &self.body);
+        out.extend_from_slice(&self.author_signature);
+        out
+    }
+
+    /// Parse and cryptographically verify an inner `CHWGAUT2` [`SealedAuthorMessage`] against
+    /// `.chinwag/allowed_signers` (`get_any` supports historical forensic verification after revocation).
+    pub fn from_bytes_and_verify(
+        bytes: &[u8],
+        registry: &AllowedSignersRegistry,
+    ) -> Result<Self, AcuError> {
+        if bytes.len() < 8 + 8 + 8 + 8 + 8 + 64 || &bytes[..8] != SEAT_AUTHOR_MAGIC {
+            return Err(AcuError::SerializationError(
+                "invalid CHWGAUT2 SealedAuthorMessage header",
+            ));
+        }
+        let mut offset = 8usize;
+        let author_seat_id = read_lp64_str(bytes, &mut offset, 256)?.to_string();
+        let message_id = read_lp64_str(bytes, &mut offset, 256)?.to_string();
+        if offset + 8 > bytes.len() {
+            return Err(AcuError::SerializationError(
+                "truncated SealedAuthorMessage timestamp",
+            ));
+        }
+        let mut ts_arr = [0u8; 8];
+        ts_arr.copy_from_slice(&bytes[offset..offset + 8]);
+        offset += 8;
+        let timestamp_utc = u64::from_be_bytes(ts_arr);
+        let body = read_lp64_bytes(bytes, &mut offset, 64 * 1024 * 1024)?.to_vec();
+        if offset + 64 != bytes.len() {
+            return Err(AcuError::SerializationError(
+                "trailing or truncated SealedAuthorMessage signature",
+            ));
+        }
+        let mut author_signature = [0u8; 64];
+        author_signature.copy_from_slice(&bytes[offset..offset + 64]);
+
+        if !is_valid_seat_id(&author_seat_id) || !is_valid_metadata_token(&message_id) {
+            return Err(AcuError::InvalidMetadata);
+        }
+        let rec = registry.get_any(&author_seat_id)?;
+        let preimage = Self::signing_preimage(&author_seat_id, &message_id, timestamp_utc, &body);
+        let sig = Signature::from_bytes(&author_signature);
+        rec.ed25519_verifying_key
+            .verify_strict(&preimage, &sig)
+            .map_err(|_| AcuError::SignatureVerificationFailed("seat_author_sign"))?;
+
+        Ok(Self {
+            author_seat_id,
+            message_id,
+            timestamp_utc,
+            body,
+            author_signature,
+        })
+    }
+
+    fn signing_preimage(
+        author_seat_id: &str,
+        message_id: &str,
+        timestamp_utc: u64,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let body_hash = Sha256::digest(body);
+        let mut out = Vec::with_capacity(SEAT_AUTHOR_SIGN_DOMAIN.len() + 96);
+        out.extend_from_slice(SEAT_AUTHOR_SIGN_DOMAIN);
+        lp64_str(&mut out, author_seat_id);
+        lp64_str(&mut out, message_id);
+        out.extend_from_slice(&timestamp_utc.to_be_bytes());
+        out.extend_from_slice(&body_hash);
+        out
+    }
+}
+
+/// Keyed `HMAC-SHA256` blind Parquet index tags (`ePrint v2` §7.2): enables sub-second DuckDB
+/// equality predicate pushdown for holders of `index_key` while preventing `.keys` SQL-JOIN
+/// de-anonymization against storage-only adversaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindIndexTags {
+    /// `HMAC-SHA256(k_index, "sender" || LP(org_id) || LP(sender_seat))`.
+    pub sender_tag: [u8; 32],
+    /// `HMAC-SHA256(k_index, "recipient" || LP(org_id) || LP(recipient_seat))`.
+    pub recipient_tag: [u8; 32],
+    /// `HMAC-SHA256(k_index, "room" || LP(org_id) || LP(room))`.
+    pub room_tag: [u8; 32],
+    /// `HMAC-SHA256(k_index, "task" || LP(org_id) || LP(task_id))`.
+    pub task_tag: [u8; 32],
+}
+
+impl BlindIndexTags {
+    /// Compute keyed `HMAC-SHA256` blind index tags for `(org_id, sender_seat, recipient_seat, room, task_id)`.
+    #[must_use]
+    pub fn compute(
+        index_key: &[u8; 32],
+        org_id: &str,
+        sender_seat: &str,
+        recipient_seat: &str,
+        room: &str,
+        task_id: &str,
+    ) -> Self {
+        Self {
+            sender_tag: compute_blind_hmac_tag(
+                index_key,
+                BLIND_TAG_SENDER_DOMAIN,
+                org_id,
+                sender_seat,
+            ),
+            recipient_tag: compute_blind_hmac_tag(
+                index_key,
+                BLIND_TAG_RECIPIENT_DOMAIN,
+                org_id,
+                recipient_seat,
+            ),
+            room_tag: compute_blind_hmac_tag(index_key, BLIND_TAG_ROOM_DOMAIN, org_id, room),
+            task_tag: compute_blind_hmac_tag(index_key, BLIND_TAG_TASK_DOMAIN, org_id, task_id),
+        }
+    }
+
+    /// Constant-time match check against an expected sender tag.
+    #[must_use]
+    pub fn matches_sender(&self, index_key: &[u8; 32], org_id: &str, sender_seat: &str) -> bool {
+        let expected =
+            compute_blind_hmac_tag(index_key, BLIND_TAG_SENDER_DOMAIN, org_id, sender_seat);
+        bool::from(self.sender_tag.ct_eq(&expected))
+    }
+}
+
+fn compute_blind_hmac_tag(
+    index_key: &[u8; 32],
+    domain: &[u8],
+    org_id: &str,
+    token: &str,
+) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(index_key)
+        .expect("HMAC-SHA256 accepts 32-byte index key");
+    let mut buf = Vec::with_capacity(domain.len() + org_id.len() + token.len() + 16);
+    buf.extend_from_slice(domain);
+    lp64_str(&mut buf, org_id);
+    lp64_str(&mut buf, token);
+    mac.update(&buf);
+    mac.finalize().into_bytes().into()
+}
+
+/// Encrypted metadata payload sealed inside [`AcuEnvelopeHeaderV2::encrypted_meta_box`] under `k_route`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeMetadataBox {
+    /// Flow run identifier (e.g., `"flow-run-9912"`).
+    pub flow_run_id: String,
+    /// DAG node identifier (e.g., `"node_fix_ci"`).
+    pub node_id: String,
+    /// Author/sender seat identifier (invisible to Blind Relay).
+    pub sender_seat: String,
+    /// Visibility tier (e.g., `"org_internal"` or `"ciso_restricted"`).
+    pub visibility: String,
+}
+
+/// Four-leaf input tuple for [`AcuEnvelopeHeaderV2::public_export_merkle_root`] (`UI v5` `F-02`):
+/// Leaves `0` and `1` hold the `--public-safe` summary and gate metrics; Leaves `2` and `3` hold
+/// private DAG topology and vault/audit metadata salted with 256-bit CSPRNG randomness so
+/// `--public-safe` openings leak `0` bits about private leaves!
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicExportLeaves {
+    /// 256-bit random salt for Leaf 0 (`public_summary`).
+    pub salt_0: [u8; 32],
+    /// Leaf 0: `--public-safe` run summary bytes (e.g., title, status, net hours saved).
+    pub public_summary: Vec<u8>,
+    /// 256-bit random salt for Leaf 1 (`public_gate_metrics`).
+    pub salt_1: [u8; 32],
+    /// Leaf 1: `--public-safe` gate counts & DORA speed metrics.
+    pub public_gate_metrics: Vec<u8>,
+    /// 256-bit random salt for Leaf 2 (`private_topology`).
+    pub salt_2: [u8; 32],
+    /// Leaf 2: private DAG fan-out/retry topology (redacted in `--public-safe` exports).
+    pub private_topology: Vec<u8>,
+    /// 256-bit random salt for Leaf 3 (`private_audit_context`).
+    pub salt_3: [u8; 32],
+    /// Leaf 3: private seat/worktree audit context (redacted in `--public-safe` exports).
+    pub private_audit_context: Vec<u8>,
+}
+
+impl PublicExportLeaves {
+    /// Sample fresh 256-bit CSPRNG salts for all 4 Merkle leaves.
+    pub fn new_salted(
+        public_summary: Vec<u8>,
+        public_gate_metrics: Vec<u8>,
+        private_topology: Vec<u8>,
+        private_audit_context: Vec<u8>,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Self {
+        let mut salt_0 = [0u8; 32];
+        let mut salt_1 = [0u8; 32];
+        let mut salt_2 = [0u8; 32];
+        let mut salt_3 = [0u8; 32];
+        rng.fill_bytes(&mut salt_0);
+        rng.fill_bytes(&mut salt_1);
+        rng.fill_bytes(&mut salt_2);
+        rng.fill_bytes(&mut salt_3);
+        Self {
+            salt_0,
+            public_summary,
+            salt_1,
+            public_gate_metrics,
+            salt_2,
+            private_topology,
+            salt_3,
+            private_audit_context,
+        }
+    }
+
+    /// Compute `(merkle_root, sibling_h23)` over the 4 salted leaves.
+    #[must_use]
+    pub fn compute_root_and_private_subtree(&self) -> ([u8; 32], [u8; 32]) {
+        let h0 = merkle_leaf_blake3(0, &self.salt_0, &self.public_summary);
+        let h1 = merkle_leaf_blake3(1, &self.salt_1, &self.public_gate_metrics);
+        let h2 = merkle_leaf_blake3(2, &self.salt_2, &self.private_topology);
+        let h3 = merkle_leaf_blake3(3, &self.salt_3, &self.private_audit_context);
+        let h01 = merkle_node_blake3(&h0, &h1);
+        let h23 = merkle_node_blake3(&h2, &h3);
+        let root = merkle_root_blake3(&h01, &h23);
+        (root, h23)
+    }
+}
+
+fn merkle_leaf_blake3(leaf_index: u8, salt: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(MERKLE_LEAF_DOMAIN);
+    h.update(&[leaf_index]);
+    h.update(salt);
+    h.update(&(data.len() as u64).to_be_bytes());
+    h.update(data);
+    *h.finalize().as_bytes()
+}
+
+fn merkle_node_blake3(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(MERKLE_NODE_DOMAIN);
+    h.update(left);
+    h.update(right);
+    *h.finalize().as_bytes()
+}
+
+fn merkle_root_blake3(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(MERKLE_ROOT_DOMAIN);
+    h.update(left);
+    h.update(right);
+    *h.finalize().as_bytes()
+}
+
+/// Selective `--public-safe` Merkle export bundle (`chinwag flow export --public-safe` / `.cwcard`
+/// Slack unfurl): reveals ONLY Leaves `0` and `1` plus the blinded 32-byte `private_subtree_h23`
+/// sibling hash, verifiable against `header`'s `archive_row_sig` with `0` secret keys!
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicSafeExportBundle {
+    /// Envelope sequence number.
+    pub seq: u64,
+    /// Previous blind chain link digest.
+    pub prev_header_blake3: [u8; 32],
+    /// Immutable payload `C_1` BLAKE3 digest.
+    pub aead_immutable_blake3: [u8; 32],
+    /// Keyed 16-byte run locator.
+    pub run_locator: [u8; 16],
+    /// Committed 4-leaf Merkle root signed by `archive_row_sig`.
+    pub public_export_merkle_root: [u8; 32],
+    /// Encrypted metadata nonce (committed in `archive_row_sig` preimage).
+    pub meta_nonce: [u8; 12],
+    /// Encrypted metadata ciphertext digest `BLAKE3(encrypted_meta_box)` so the raw box need not even be shipped if desired,
+    /// or full `encrypted_meta_box` for exact `ArchiveRowSign` verification.
+    pub encrypted_meta_box: Vec<u8>,
+    /// Outer repo-scoped `ArchiveRowSign` Ed25519 signature (`64` B).
+    #[serde(with = "crate::framing::serde_bytes64")]
+    pub archive_row_sig: [u8; 64],
+    /// Salt for Leaf 0.
+    pub salt_0: [u8; 32],
+    /// Revealed Leaf 0 (`public_summary`).
+    pub public_summary: Vec<u8>,
+    /// Salt for Leaf 1.
+    pub salt_1: [u8; 32],
+    /// Revealed Leaf 1 (`public_gate_metrics`).
+    pub public_gate_metrics: Vec<u8>,
+    /// Blinded 32-byte sibling subtree hash `H(Leaf_2 || Leaf_3)` (`0` private bytes revealed!).
+    pub private_subtree_h23: [u8; 32],
+}
+
+impl PublicSafeExportBundle {
+    /// Cryptographically verify both the outer `ArchiveRowSign` Ed25519 signature AND the 4-leaf
+    /// Merkle opening for `(public_summary, public_gate_metrics)` in constant time.
+    pub fn verify(&self, archive_verifying_key: &VerifyingKey) -> Result<(), AcuError> {
+        let h0 = merkle_leaf_blake3(0, &self.salt_0, &self.public_summary);
+        let h1 = merkle_leaf_blake3(1, &self.salt_1, &self.public_gate_metrics);
+        let h01 = merkle_node_blake3(&h0, &h1);
+        let computed_root = merkle_root_blake3(&h01, &self.private_subtree_h23);
+        if !bool::from(computed_root.ct_eq(&self.public_export_merkle_root)) {
+            return Err(AcuError::SignatureVerificationFailed(
+                "public_export_merkle_root",
+            ));
+        }
+
+        let preimage = AcuEnvelopeHeaderV2::archive_row_sign_preimage(
+            ACU_ENVELOPE_HEADER_V2_VERSION,
+            self.seq,
+            &self.prev_header_blake3,
+            &self.aead_immutable_blake3,
+            &self.run_locator,
+            &self.public_export_merkle_root,
+            &self.meta_nonce,
+            &self.encrypted_meta_box,
+        );
+        let sig = Signature::from_bytes(&self.archive_row_sig);
+        archive_verifying_key
+            .verify_strict(&preimage, &sig)
+            .map_err(|_| AcuError::SignatureVerificationFailed("archive_row_sign"))
+    }
+}
+
+/// Signed receipt attached alongside an [`AcuEnvelopeV2Record`] whenever its mutable `CHWGACU3` /
+/// `CHWGAEA2` policy header evolves in-place (`RevokeAndRerandomize`, `EscalateThreshold`,
+/// `InsertAuthorizedSeat`, `InsertSiblingKey`, or `RotatePQKey`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyEvolutionReceipt {
+    /// Envelope sequence number evolved in-place.
+    pub seq: u64,
+    /// Previous policy epoch (`E`).
+    pub from_epoch: u64,
+    /// New policy epoch (`E + 1`).
+    pub to_epoch: u64,
+    /// Immutable `C_1` digest (`aead_immutable_blake3` MUST match `AcuEnvelopeHeaderV2::aead_immutable_blake3`).
+    pub aead_immutable_blake3: [u8; 32],
+    /// Detached `AcuPolicySign` signature over the evolved `AcuCiphertext` header at `to_epoch`.
+    pub policy_signature: AcuPolicySignature,
+}
+
+/// Blind Hash-Chained Envelope Header (`UI v5` §7 `F-01`, `F-02`, `F-03` & `ePrint v2` §§6–7):
+///
+/// Chains `aead_immutable_blake3` (`BLAKE3(nonce || aad || C_1)`) inside `prev_header_blake3`
+/// rather than the mutable `CHWGACU3` policy header `H_E`, so in-place policy evolution on
+/// `seq = 42` **never** invalidates `prev_header_blake3` on `seq = 43..N`!
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcuEnvelopeHeaderV2 {
+    /// Envelope format version (`= 2`).
+    pub version: u8,
+    /// Monotonic sequence number within the workspace/channel log.
+    pub seq: u64,
+    /// `BLAKE3` chain link of record `seq - 1` (`[0u8; 32]` at genesis `seq = 1`).
+    pub prev_header_blake3: [u8; 32],
+    /// Immutable payload digest `EncryptedCiPayload::immutable_aead_blake3()` (`C_{E+1} == C_1`).
+    pub aead_immutable_blake3: [u8; 32],
+    /// Keyed 16-byte run locator `BLAKE3_keyed(k_route, "run/v2:" || flow_run_id)[..16]`.
+    pub run_locator: [u8; 16],
+    /// Per-object 16-byte blind row locator prefixes (`ell_j[..16]`, opaque to Blind Relay & `.keys` JOINs).
+    pub recipient_hints: Vec<[u8; 16]>,
+    /// 4-leaf salted Merkle root supporting selective `--public-safe` openings (`PublicSafeExportBundle`).
+    pub public_export_merkle_root: [u8; 32],
+    /// 96-bit nonce for `encrypted_meta_box`.
+    pub meta_nonce: [u8; 12],
+    /// `ChaCha20-Poly1305` ciphertext under `k_route` sealing [`EnvelopeMetadataBox`].
+    pub encrypted_meta_box: Vec<u8>,
+    /// Repo-scoped outer `ArchiveRowSign` Ed25519 signature (`64` B; inner `SeatAuthorSign` lives inside `C_1`).
+    #[serde(with = "crate::framing::serde_bytes64")]
+    pub archive_row_sig: [u8; 64],
+}
+
+impl AcuEnvelopeHeaderV2 {
+    /// Compute the keyed 16-byte `run_locator` from `route_key` and `flow_run_id`.
+    #[must_use]
+    pub fn compute_run_locator(route_key: &[u8; 32], flow_run_id: &str) -> [u8; 16] {
+        let mut h = blake3::Hasher::new_keyed(route_key);
+        h.update(b"run/v2:");
+        h.update(&(flow_run_id.len() as u64).to_be_bytes());
+        h.update(flow_run_id.as_bytes());
+        let full = h.finalize();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&full.as_bytes()[..16]);
+        out
+    }
+
+    /// Compute the immutable `BLAKE3` chain link passed into record `seq + 1`'s `prev_header_blake3`.
+    ///
+    /// Covers ONLY immutable envelope fields and `aead_immutable_blake3` (`C_1`), so in-place
+    /// `RevokeAndRerandomize` / `EscalateThreshold` / `RotatePQKey` never breaks downstream links!
+    #[must_use]
+    pub fn chain_link_blake3(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(ENVELOPE_V2_CHAIN_DOMAIN);
+        h.update(&[self.version]);
+        h.update(&self.seq.to_be_bytes());
+        h.update(&self.prev_header_blake3);
+        h.update(&self.aead_immutable_blake3);
+        h.update(&self.run_locator);
+        h.update(&self.public_export_merkle_root);
+        h.update(&self.meta_nonce);
+        h.update(&(self.encrypted_meta_box.len() as u64).to_be_bytes());
+        h.update(&self.encrypted_meta_box);
+        h.update(&self.archive_row_sig);
+        *h.finalize().as_bytes()
+    }
+
+    /// Decrypt `encrypted_meta_box` using the workspace's 256-bit `route_key`.
+    pub fn open_metadata_box(&self, route_key: &[u8; 32]) -> Result<EnvelopeMetadataBox, AcuError> {
+        let key = derive_meta_box_key(route_key)?;
+        let aad = Self::meta_box_aad(
+            self.version,
+            self.seq,
+            &self.prev_header_blake3,
+            &self.aead_immutable_blake3,
+            &self.run_locator,
+            &self.public_export_merkle_root,
+        );
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*key));
+        let plain = cipher
+            .decrypt(
+                Nonce::from_slice(&self.meta_nonce),
+                Payload {
+                    msg: &self.encrypted_meta_box,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| AcuError::AeadFailure)?;
+        serde_json::from_slice(&plain)
+            .map_err(|_| AcuError::SerializationError("invalid EnvelopeMetadataBox JSON"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn archive_row_sign_preimage(
+        version: u8,
+        seq: u64,
+        prev_header_blake3: &[u8; 32],
+        aead_immutable_blake3: &[u8; 32],
+        run_locator: &[u8; 16],
+        public_export_merkle_root: &[u8; 32],
+        meta_nonce: &[u8; 12],
+        encrypted_meta_box: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256 + encrypted_meta_box.len());
+        out.extend_from_slice(ENVELOPE_V2_SIG_DOMAIN);
+        out.push(version);
+        out.extend_from_slice(&seq.to_be_bytes());
+        out.extend_from_slice(prev_header_blake3);
+        out.extend_from_slice(aead_immutable_blake3);
+        out.extend_from_slice(run_locator);
+        out.extend_from_slice(public_export_merkle_root);
+        out.extend_from_slice(meta_nonce);
+        lp64_bytes(&mut out, encrypted_meta_box);
+        out
+    }
+
+    fn meta_box_aad(
+        version: u8,
+        seq: u64,
+        prev_header_blake3: &[u8; 32],
+        aead_immutable_blake3: &[u8; 32],
+        run_locator: &[u8; 16],
+        public_export_merkle_root: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut aad =
+            Vec::with_capacity(ENVELOPE_V2_META_AAD_DOMAIN.len() + 1 + 8 + 32 + 32 + 16 + 32);
+        aad.extend_from_slice(ENVELOPE_V2_META_AAD_DOMAIN);
+        aad.push(version);
+        aad.extend_from_slice(&seq.to_be_bytes());
+        aad.extend_from_slice(prev_header_blake3);
+        aad.extend_from_slice(aead_immutable_blake3);
+        aad.extend_from_slice(run_locator);
+        aad.extend_from_slice(public_export_merkle_root);
+        aad
+    }
+}
+
+fn derive_meta_box_key(route_key: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, AcuError> {
+    let hk = Hkdf::<Sha256>::new(Some(b"chinwag.acu.v2.meta-box-salt"), route_key);
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(ENVELOPE_V2_META_KDF_INFO, &mut *key)
+        .map_err(|_| AcuError::SerializationError("HKDF expand failed for meta_box"))?;
+    Ok(key)
+}
+
+/// Complete blind-chained archive record pairing an immutable [`AcuEnvelopeHeaderV2`] with its
+/// dynamically evolvable [`EncryptedCiPayload`] (`CHWGAEA2` + `CHWGACU3`), optional
+/// [`PolicyEvolutionReceipt`] history, and 4-leaf Merkle export witnesses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcuEnvelopeV2Record {
+    /// Blind hash-chained envelope header (`version = 2`).
+    pub header: AcuEnvelopeHeaderV2,
+    /// `CHWGAEA2` + `CHWGACU3` payload (`immutable_aead_blake3()` stays constant across policy evolutions).
+    pub payload: EncryptedCiPayload,
+    /// Detached `AcuPolicySign` signature authenticating the current `payload.acu_ciphertext` epoch.
+    pub current_policy_sig: AcuPolicySignature,
+    /// Append-only history of in-place policy evolutions on this envelope (`seq`).
+    pub evolution_receipts: Vec<PolicyEvolutionReceipt>,
+    /// Keyed `HMAC-SHA256` blind index tags for Parquet predicate pushdown.
+    pub blind_tags: BlindIndexTags,
+    export_leaves: PublicExportLeaves,
+}
+
+impl AcuEnvelopeV2Record {
+    /// Seal a new [`AcuEnvelopeV2Record`] at sequence `seq` chained from `prev_header_blake3`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal(
+        seq: u64,
+        prev_header_blake3: [u8; 32],
+        route_key: &[u8; 32],
+        index_key: &[u8; 32],
+        org_id: &str,
+        recipient_seat: &str,
+        room: &str,
+        task_id: &str,
+        meta: &EnvelopeMetadataBox,
+        export_leaves: PublicExportLeaves,
+        payload: EncryptedCiPayload,
+        policy_signer_seat_id: &str,
+        policy_signer_ed25519_sk: &SigningKey,
+        archive_row_signing_key: &SigningKey,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<Self, AcuError> {
+        if seq == 0 {
+            return Err(AcuError::InvalidMetadata);
+        }
+        let aead_immutable_blake3 = payload.immutable_aead_blake3();
+        let run_locator = AcuEnvelopeHeaderV2::compute_run_locator(route_key, &meta.flow_run_id);
+        let recipient_hints = payload
+            .acu_ciphertext
+            .rows
+            .iter()
+            .map(|r| {
+                let mut hint = [0u8; 16];
+                hint.copy_from_slice(&r.row_locator[..16]);
+                hint
+            })
+            .collect();
+        let (public_export_merkle_root, _) = export_leaves.compute_root_and_private_subtree();
+
+        let mut meta_nonce = [0u8; 12];
+        rng.fill_bytes(&mut meta_nonce);
+        let meta_plain = serde_json::to_vec(meta)
+            .map_err(|_| AcuError::SerializationError("failed to serialize EnvelopeMetadataBox"))?;
+        let meta_key = derive_meta_box_key(route_key)?;
+        let meta_aad = AcuEnvelopeHeaderV2::meta_box_aad(
+            ACU_ENVELOPE_HEADER_V2_VERSION,
+            seq,
+            &prev_header_blake3,
+            &aead_immutable_blake3,
+            &run_locator,
+            &public_export_merkle_root,
+        );
+        let encrypted_meta_box = ChaCha20Poly1305::new(Key::from_slice(&*meta_key))
+            .encrypt(
+                Nonce::from_slice(&meta_nonce),
+                Payload {
+                    msg: &meta_plain,
+                    aad: &meta_aad,
+                },
+            )
+            .map_err(|_| AcuError::SerializationError("meta_box AEAD encryption failed"))?;
+
+        let sig_preimage = AcuEnvelopeHeaderV2::archive_row_sign_preimage(
+            ACU_ENVELOPE_HEADER_V2_VERSION,
+            seq,
+            &prev_header_blake3,
+            &aead_immutable_blake3,
+            &run_locator,
+            &public_export_merkle_root,
+            &meta_nonce,
+            &encrypted_meta_box,
+        );
+        let archive_sig: Signature = archive_row_signing_key.sign(&sig_preimage);
+
+        let header = AcuEnvelopeHeaderV2 {
+            version: ACU_ENVELOPE_HEADER_V2_VERSION,
+            seq,
+            prev_header_blake3,
+            aead_immutable_blake3,
+            run_locator,
+            recipient_hints,
+            public_export_merkle_root,
+            meta_nonce,
+            encrypted_meta_box,
+            archive_row_sig: archive_sig.to_bytes(),
+        };
+
+        let current_policy_sig = AcuPolicySignature::sign(
+            policy_signer_seat_id,
+            &payload.acu_ciphertext,
+            policy_signer_ed25519_sk,
+        );
+        let blind_tags = BlindIndexTags::compute(
+            index_key,
+            org_id,
+            &meta.sender_seat,
+            recipient_seat,
+            room,
+            task_id,
+        );
+
+        Ok(Self {
+            header,
+            payload,
+            current_policy_sig,
+            evolution_receipts: Vec::new(),
+            blind_tags,
+            export_leaves,
+        })
+    }
+
+    /// Apply an in-place `RevokeAndRerandomize` + PQ capsule pruning on this record (`e.g. seq = 42`)
+    /// **without** modifying `header.aead_immutable_blake3`, `header.archive_row_sig`, or
+    /// `header.chain_link_blake3()` — so `seq = 43..N` remain 100% hash-chain valid!
+    pub fn revoke_and_rerandomize_in_place(
+        &mut self,
+        acu_sk: &SeatSecretKey,
+        revoked_seat_ids: &[&str],
+        registry: &AllowedSignersRegistry,
+        acu_ed25519_sk: &SigningKey,
+        archive_verifying_key: &VerifyingKey,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<PolicyEvolutionReceipt, AcuError> {
+        self.verify_integrity(archive_verifying_key, registry)?;
+        let from_epoch = self.payload.acu_ciphertext.policy_epoch;
+        let active_keys = registry.active_acu_keys();
+
+        revoke_and_rerandomize(
+            &mut self.payload.acu_ciphertext,
+            acu_sk,
+            revoked_seat_ids,
+            &active_keys,
+            rng,
+        )?;
+        if !revoked_seat_ids.is_empty() {
+            self.payload.prune_revoked_pq_capsules(revoked_seat_ids)?;
+        }
+
+        // Refresh blind `recipient_hints` to match the rerandomized surviving rows.
+        self.header.recipient_hints = self
+            .payload
+            .acu_ciphertext
+            .rows
+            .iter()
+            .map(|r| {
+                let mut hint = [0u8; 16];
+                hint.copy_from_slice(&r.row_locator[..16]);
+                hint
+            })
+            .collect();
+
+        let after_immutable = self.payload.immutable_aead_blake3();
+        if !bool::from(after_immutable.ct_eq(&self.header.aead_immutable_blake3)) {
+            return Err(AcuError::InvalidMetadata);
+        }
+
+        let to_epoch = self.payload.acu_ciphertext.policy_epoch;
+        let new_policy_sig = AcuPolicySignature::sign(
+            acu_sk.seat_id(),
+            &self.payload.acu_ciphertext,
+            acu_ed25519_sk,
+        );
+        let receipt = PolicyEvolutionReceipt {
+            seq: self.header.seq,
+            from_epoch,
+            to_epoch,
+            aead_immutable_blake3: after_immutable,
+            policy_signature: new_policy_sig.clone(),
+        };
+        self.current_policy_sig = new_policy_sig;
+        self.evolution_receipts.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    /// Verify this record's `ArchiveRowSign`, `aead_immutable_blake3` payload binding, and current
+    /// `AcuPolicySign` epoch signature.
+    pub fn verify_integrity(
+        &self,
+        archive_verifying_key: &VerifyingKey,
+        registry: &AllowedSignersRegistry,
+    ) -> Result<(), AcuError> {
+        if self.header.version != ACU_ENVELOPE_HEADER_V2_VERSION || self.header.seq == 0 {
+            return Err(AcuError::InvalidMetadata);
+        }
+        let actual_immutable = self.payload.immutable_aead_blake3();
+        if !bool::from(actual_immutable.ct_eq(&self.header.aead_immutable_blake3)) {
+            return Err(AcuError::SignatureVerificationFailed(
+                "aead_immutable_blake3_mismatch",
+            ));
+        }
+        let preimage = AcuEnvelopeHeaderV2::archive_row_sign_preimage(
+            self.header.version,
+            self.header.seq,
+            &self.header.prev_header_blake3,
+            &self.header.aead_immutable_blake3,
+            &self.header.run_locator,
+            &self.header.public_export_merkle_root,
+            &self.header.meta_nonce,
+            &self.header.encrypted_meta_box,
+        );
+        let sig = Signature::from_bytes(&self.header.archive_row_sig);
+        archive_verifying_key
+            .verify_strict(&preimage, &sig)
+            .map_err(|_| AcuError::SignatureVerificationFailed("archive_row_sign"))?;
+
+        self.current_policy_sig
+            .verify(&self.payload.acu_ciphertext, registry)?;
+        for receipt in &self.evolution_receipts {
+            if !bool::from(
+                receipt
+                    .aead_immutable_blake3
+                    .ct_eq(&self.header.aead_immutable_blake3),
+            ) {
+                return Err(AcuError::SignatureVerificationFailed(
+                    "evolution_receipt_immutable_mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Export a selective `--public-safe` Merkle proof bundle revealing ONLY Leaves `0` and `1`
+    /// (`public_summary` + `public_gate_metrics`) while keeping Leaves `2` and `3` (`private_topology`
+    /// + `private_audit_context`) cryptographically blinded behind `private_subtree_h23`.
+    #[must_use]
+    pub fn export_public_safe(&self) -> PublicSafeExportBundle {
+        let (_, private_subtree_h23) = self.export_leaves.compute_root_and_private_subtree();
+        PublicSafeExportBundle {
+            seq: self.header.seq,
+            prev_header_blake3: self.header.prev_header_blake3,
+            aead_immutable_blake3: self.header.aead_immutable_blake3,
+            run_locator: self.header.run_locator,
+            public_export_merkle_root: self.header.public_export_merkle_root,
+            meta_nonce: self.header.meta_nonce,
+            encrypted_meta_box: self.header.encrypted_meta_box.clone(),
+            archive_row_sig: self.header.archive_row_sig,
+            salt_0: self.export_leaves.salt_0,
+            public_summary: self.export_leaves.public_summary.clone(),
+            salt_1: self.export_leaves.salt_1,
+            public_gate_metrics: self.export_leaves.public_gate_metrics.clone(),
+            private_subtree_h23,
+        }
+    }
+}
+
+/// Verify an ordered slice of [`AcuEnvelopeV2Record`]s (`seq = 1..=N`), checking every record's
+/// `ArchiveRowSign`, `aead_immutable_blake3`, `AcuPolicySign`, and unbroken `prev_header_blake3`
+/// hash chain across in-place policy evolutions!
+pub fn verify_envelope_v2_chain(
+    records: &[AcuEnvelopeV2Record],
+    archive_verifying_key: &VerifyingKey,
+    registry: &AllowedSignersRegistry,
+) -> Result<(), AcuError> {
+    let mut expected_prev = [0u8; 32];
+    for (idx, rec) in records.iter().enumerate() {
+        let expected_seq = (idx + 1) as u64;
+        if rec.header.seq != expected_seq {
+            return Err(AcuError::InvalidMetadata);
+        }
+        if !bool::from(rec.header.prev_header_blake3.ct_eq(&expected_prev)) {
+            return Err(AcuError::SignatureVerificationFailed(
+                "prev_header_blake3_chain_broken",
+            ));
+        }
+        rec.verify_integrity(archive_verifying_key, registry)?;
+        expected_prev = rec.header.chain_link_blake3();
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Cloudflare R2 / S3 Parquet Message Archive & Hybrid Active-Channel Cache
+// ============================================================================
 
 /// Hive-partitioned key for Cloudflare R2 / S3 Parquet message archives:
 /// `org_id=<org_id>/year=<YYYY>/month=<MM>/day=<DD>/archive.parquet`.
@@ -102,11 +951,9 @@ impl HivePartitionKey {
 
 /// A single row in the Cloudflare R2 Parquet Message Archive table.
 ///
-/// Routing metadata columns (`message_id`, `timestamp_utc`, `sender_seat`, `recipient_seat`,
-/// `room`, `task_id`, `policy_epoch`, `rerandomized_by_seat`, `sender_ed25519_sig`, `ed25519_sig`)
-/// are stored in cleartext Parquet columns for sub-second DuckDB predicate pushdown and min/max
-/// row-group pruning, while the message body is sealed inside the `acu_ciphertext` BLOB column
-/// (`CHWGAEAD` / `CHWGACU2`) under `ACU AND (Recipient OR Archive)` with zero cleartext basis commitments.
+/// The message body is sealed inside the `acu_ciphertext` BLOB column (`CHWGAEA2` wrapping
+/// `CHWGACU3`) under `ACU AND (Recipient OR Archive)` with zero-$V_0$ `SbcSlot`s and `0x647A`
+/// non-ACU LSSS-PQ.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchivedMessageRow {
     /// Unique message identifier.
@@ -135,10 +982,8 @@ pub struct ArchivedMessageRow {
 }
 
 impl ArchivedMessageRow {
-    /// Verify both the outer `ed25519_sig` (over the row metadata, `sender_ed25519_sig`, and
-    /// `SHA-256(acu_ciphertext)`) AND the immutable `sender_ed25519_sig` (by `sender_seat` over
-    /// the routing metadata and immutable AEAD envelope) against `.chinwag/allowed_signers`
-    /// BEFORE attempting pairing or AEAD decryption.
+    /// Verify both the outer `ed25519_sig` AND the immutable `sender_ed25519_sig` against
+    /// `.chinwag/allowed_signers` BEFORE attempting pairing or AEAD decryption.
     pub fn verify_row_signature(&self, registry: &AllowedSignersRegistry) -> Result<(), AcuError> {
         if !is_valid_metadata_token(&self.message_id)
             || !is_valid_seat_id(&self.sender_seat)
@@ -203,13 +1048,13 @@ impl ArchivedMessageRow {
                 actual: payload.acu_ciphertext.policy_epoch,
             });
         }
-        if payload.acu_ciphertext.sealed_basis.acu_seat_id != DEFAULT_CISO_ACU_ID {
+        if payload.acu_ciphertext.acu_seat_id != DEFAULT_CISO_ACU_ID {
             return Err(AcuError::SignatureVerificationFailed(
                 "unauthorized_re_signer",
             ));
         }
         if let Some(re_signer) = self.rerandomized_by_seat.as_deref()
-            && re_signer != payload.acu_ciphertext.sealed_basis.acu_seat_id
+            && re_signer != payload.acu_ciphertext.acu_seat_id
         {
             return Err(AcuError::SignatureVerificationFailed(
                 "unauthorized_re_signer",
@@ -237,11 +1082,10 @@ impl ArchivedMessageRow {
             .map_err(|_| AcuError::SignatureVerificationFailed("archive_sender_body"))
     }
 
-    /// Prune `revoked_seat_ids` and cryptographically rerandomize this archived row's
-    /// `acu_ciphertext` BLOB in-place using the ACU operator's `acu_sk` (verifying the existing
-    /// row and sender non-repudiation signatures first so tampered metadata cannot be laundered,
-    /// unsealing and re-sealing `basis_commitments` with fresh randomness at `policy_epoch + 1`,
-    /// preserving `sender_seat` + `sender_ed25519_sig`, and re-signing with `re_signer_ed25519_sk`).
+    /// Prune `revoked_seat_ids` (both classical LSSS rows AND `0x647A` PQ capsules) and
+    /// cryptographically rerandomize this archived row's `acu_ciphertext` BLOB in-place using
+    /// `acu_sk` (`0` $V_0$ unsealing, `0` bulk `C_1` re-encryption!), preserving `sender_seat`
+    /// + `sender_ed25519_sig` and re-signing with `re_signer_ed25519_sk`.
     pub fn revoke_and_rerandomize_in_place(
         &mut self,
         acu_sk: &SeatSecretKey,
@@ -268,8 +1112,12 @@ impl ArchivedMessageRow {
             &active_keys,
             rng,
         )?;
+        if !revoked_seat_ids.is_empty() {
+            payload.prune_revoked_pq_capsules(revoked_seat_ids)?;
+        }
+
         if re_signer_seat_id != DEFAULT_CISO_ACU_ID
-            || re_signer_seat_id != payload.acu_ciphertext.sealed_basis.acu_seat_id
+            || re_signer_seat_id != payload.acu_ciphertext.acu_seat_id
         {
             return Err(AcuError::SignatureVerificationFailed(
                 "unauthorized_re_signer",
@@ -310,16 +1158,16 @@ impl ArchivedMessageRow {
         aead_ciphertext: &[u8],
     ) -> Vec<u8> {
         let aead_hash = Sha256::digest(aead_ciphertext);
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(256 + associated_data.len());
         out.extend_from_slice(ARCHIVE_SENDER_BODY_SIG_DOMAIN);
-        push_len_prefixed(&mut out, message_id.as_bytes());
+        lp64_str(&mut out, message_id);
         out.extend_from_slice(&timestamp_utc.to_be_bytes());
-        push_len_prefixed(&mut out, sender_seat.as_bytes());
-        push_len_prefixed(&mut out, recipient_seat.as_bytes());
-        push_len_prefixed(&mut out, room.as_bytes());
-        push_len_prefixed(&mut out, task_id.as_bytes());
+        lp64_str(&mut out, sender_seat);
+        lp64_str(&mut out, recipient_seat);
+        lp64_str(&mut out, room);
+        lp64_str(&mut out, task_id);
         out.extend_from_slice(nonce);
-        push_len_prefixed(&mut out, associated_data);
+        lp64_bytes(&mut out, associated_data);
         out.extend_from_slice(&aead_hash);
         out
     }
@@ -338,31 +1186,26 @@ impl ArchivedMessageRow {
         acu_ciphertext: &[u8],
     ) -> Vec<u8> {
         let blob_hash = Sha256::digest(acu_ciphertext);
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(256);
         out.extend_from_slice(ARCHIVE_ROW_SIG_DOMAIN);
-        push_len_prefixed(&mut out, message_id.as_bytes());
+        lp64_str(&mut out, message_id);
         out.extend_from_slice(&timestamp_utc.to_be_bytes());
-        push_len_prefixed(&mut out, sender_seat.as_bytes());
-        push_len_prefixed(&mut out, recipient_seat.as_bytes());
-        push_len_prefixed(&mut out, room.as_bytes());
-        push_len_prefixed(&mut out, task_id.as_bytes());
+        lp64_str(&mut out, sender_seat);
+        lp64_str(&mut out, recipient_seat);
+        lp64_str(&mut out, room);
+        lp64_str(&mut out, task_id);
         out.extend_from_slice(&policy_epoch.to_be_bytes());
         match rerandomized_by_seat {
             Some(re_signer) => {
                 out.push(1u8);
-                push_len_prefixed(&mut out, re_signer.as_bytes());
+                lp64_str(&mut out, re_signer);
             }
             None => out.push(0u8),
         }
-        push_len_prefixed(&mut out, sender_ed25519_sig);
+        lp64_bytes(&mut out, sender_ed25519_sig);
         out.extend_from_slice(&blob_hash);
         out
     }
-}
-
-fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(bytes);
 }
 
 /// Cleartext metadata predicate filter for DuckDB `read_parquet` queries over Cloudflare R2 / S3.
@@ -414,7 +1257,7 @@ pub struct DuckDbArchiveConfig {
     pub s3_endpoint: String,
     /// S3 region (`"auto"` for Cloudflare R2).
     pub s3_region: String,
-    /// Maximum DuckDB worker threads (`SET threads = 2;`) to protect GUI responsiveness.
+    /// Maximum DuckDB worker threads (`SET threads = 2;`) to protect web workbench responsiveness.
     pub threads: u8,
     /// Maximum DuckDB RAM allocation (`SET memory_limit = '1GB';`).
     pub memory_limit: String,
@@ -591,10 +1434,9 @@ impl AcuParquetArchiveStore {
     }
 
     /// Encrypt a bus message or CI/CD alert under the canonical Zero-Plaintext-At-Rest policy
-    /// (`ACU AND (recipient_seat OR archive:vault)`), sealing basis commitments exclusively under `pk_ACU`,
-    /// serialize to `acu_ciphertext` (`CHWGAEAD` / `CHWGACU2`), sign both the immutable sender body
-    /// commitment (`sender_ed25519_sig`) and cleartext routing metadata + `SHA-256(acu_ciphertext)`
-    /// (`ed25519_sig`) with `sender_ed25519_sk`, and append to its R2 Hive partition.
+    /// (`ACU AND (recipient_seat OR archive:vault)`) using `CHWGAEA2` + `CHWGACU3`, sign both the
+    /// immutable sender body commitment (`sender_ed25519_sig`) and routing metadata +
+    /// `SHA-256(acu_ciphertext)` (`ed25519_sig`), and append to its R2 Hive partition.
     #[allow(clippy::too_many_arguments)]
     pub fn append_signed_message(
         &mut self,
@@ -625,7 +1467,6 @@ impl AcuParquetArchiveStore {
             return Err(AcuError::InvalidMetadata);
         }
 
-        // Verify sender is active in .chinwag/allowed_signers and matches sender_ed25519_sk.
         let sender_rec = registry.get_active(&sender_seat)?;
         if sender_rec.ed25519_verifying_key != sender_ed25519_sk.verifying_key() {
             return Err(AcuError::SignatureVerificationFailed("sender_key_mismatch"));
@@ -698,9 +1539,8 @@ impl AcuParquetArchiveStore {
         Ok(row)
     }
 
-    /// Execute a fast cleartext metadata search across Hive partitions (`sender_seat`,
-    /// `recipient_seat`, `room`, `task_id`, `timestamp_utc` range) without touching or
-    /// decrypting any `acu_ciphertext` BLOBs.
+    /// Execute a fast metadata search across Hive partitions without touching or decrypting any
+    /// `acu_ciphertext` BLOBs.
     #[must_use]
     pub fn search_metadata(&self, filter: &ArchiveSearchFilter) -> Vec<&ArchivedMessageRow> {
         let mut matches: Vec<&ArchivedMessageRow> = self
@@ -777,8 +1617,7 @@ impl AcuParquetArchiveStore {
         (CacheHit::R2ParquetRangeFetch, fetched)
     }
 
-    /// Mutate an archived row in-place by `message_id` (used for testing tampering rejection
-    /// or in-place `revoke_and_rerandomize` rotation on stored Parquet rows).
+    /// Mutate an archived row in-place by `message_id`.
     pub fn update_row_by_id(
         &mut self,
         message_id: &str,
@@ -796,14 +1635,9 @@ impl AcuParquetArchiveStore {
         false
     }
 
-    /// Execute a CISO forensic investigation query:
-    /// 1. Filters Parquet rows using cleartext metadata predicates (`search_metadata`).
-    /// 2. Verifies each matching row's `ed25519_sig` and `sender_ed25519_sig` against `.chinwag/allowed_signers` (Verify-Before-Decrypt).
-    /// 3. Deserializes the `acu_ciphertext` BLOB (`EncryptedCiPayload::from_bytes`, requiring `CHWGACU2`).
-    /// 4. Requests $D_{\text{ACU}}$ from `ciso_acu.authorize_archive_investigation(...)` (logging
-    ///    `AcuAuditDecision::GrantedArchiveInvestigation`).
-    /// 5. Combines $D_{\text{ACU}} + D_{\text{Archive}}$ strictly via [`crate::acu::acu_verify_partial_share`]
-    ///    (zero cleartext basis commitments) in RAM and returns the decrypted records.
+    /// Execute a CISO forensic investigation query combining `48`-byte pure-$\mathbb{G}_1$ shares
+    /// ($S_{\text{ACU}} + S_{\text{Archive}}$ -> `1` pairing) + `0x647A` `archive_acu_sk` PQ capsule
+    /// strictly in RAM (`Verify-Before-Decrypt`).
     pub fn ciso_investigate_and_decrypt(
         &self,
         filter: &ArchiveSearchFilter,
@@ -818,10 +1652,8 @@ impl AcuParquetArchiveStore {
         let mut out = Vec::with_capacity(matching_rows.len());
 
         for row in matching_rows {
-            // 1. Verify-Before-Decrypt: check Ed25519 signature over row metadata + SHA256(acu_ciphertext).
             row.verify_row_signature(registry)?;
 
-            // 2. Deserialize EncryptedCiPayload from the `acu_ciphertext` BLOB column.
             let payload = EncryptedCiPayload::from_bytes(&row.acu_ciphertext)?;
             if payload.acu_ciphertext.policy_epoch != row.policy_epoch {
                 return Err(AcuError::EpochMismatch {
@@ -830,7 +1662,6 @@ impl AcuParquetArchiveStore {
                 });
             }
 
-            // Locate the ACU row and Archive Unit row inside `payload.acu_ciphertext.rows`.
             let acu_row = payload
                 .acu_ciphertext
                 .rows
@@ -846,7 +1677,6 @@ impl AcuParquetArchiveStore {
                 .find(|r| r.seat_id == DEFAULT_MESSAGE_ARCHIVE_ID)
                 .ok_or_else(|| AcuError::UnknownSeat(DEFAULT_MESSAGE_ARCHIVE_ID.to_string()))?;
 
-            // 3. Request partial decryption share D_ACU from CISO ACU fat client over iroh.
             let req = AcuShareRequest::create_signed(
                 format!("forensic-{}-{}", investigation_ticket, row.message_id),
                 DEFAULT_MESSAGE_ARCHIVE_ID,
@@ -867,13 +1697,16 @@ impl AcuParquetArchiveStore {
             )?;
             resp.verify_by_agent(&acu_row, registry)?;
 
-            // 4. Compute Archive Unit's partial decryption share D_Archive and combine in RAM.
             let d_archive = acu_partial_decrypt_at_epoch(
                 archive_row,
                 archive_acu_sk,
                 payload.acu_ciphertext.policy_epoch,
             );
-            let plaintext = payload.decrypt(&[resp.partial_share, d_archive], &active_keys)?;
+            let plaintext = payload.decrypt_with_local_key(
+                &[resp.partial_share, d_archive],
+                archive_acu_sk,
+                &active_keys,
+            )?;
 
             out.push(DecryptedArchiveRecord {
                 message_id: row.message_id.clone(),
@@ -892,8 +1725,8 @@ impl AcuParquetArchiveStore {
 }
 
 /// Thread-safe handle wrapping [`AcuParquetArchiveStore`] and [`CisoAcuFatClient`] so the
-/// GPUI / local web workbench UI thread can offload blocking DuckDB R2 Range queries and
-/// BLS12-381 pairing math onto a background OS thread (`std::thread::spawn` / `spawn_blocking`).
+/// local web workbench (`127.0.0.1:5487`) UI thread can offload blocking DuckDB R2 Range queries
+/// and BLS12-381 pairing + `0x647A` KEM math onto a background OS thread.
 #[derive(Clone)]
 pub struct SharedFatClientArchiveHandle {
     store: Arc<Mutex<AcuParquetArchiveStore>>,
@@ -911,7 +1744,7 @@ impl SharedFatClientArchiveHandle {
     }
 
     /// Offload a metadata search + BLS12-381 pairing decryption investigation onto a dedicated
-    /// background worker thread so the fat client's GUI rendering thread never drops a frame.
+    /// background worker thread so the fat client's UI rendering thread never drops a frame.
     #[must_use]
     pub fn spawn_blocking_investigation(
         &self,
