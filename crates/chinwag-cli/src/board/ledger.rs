@@ -31,6 +31,15 @@ const LIVE_ISSUE_STATE_LIMIT: usize = 5_000;
 
 const CYCLE_TIME_UNSETTLED_PREFIXES: [&str; 2] = ["Queued", "In flight"];
 
+/// A shipped card that reads "unavailable" in a settlement field was closed without the
+/// measurement that field records, e.g. `Shipped · Timing unavailable`.
+fn reads_unavailable(text: &str) -> bool {
+    const NEEDLE: &[u8] = b"unavailable";
+    text.as_bytes()
+        .windows(NEEDLE.len())
+        .any(|window| window.eq_ignore_ascii_case(NEEDLE))
+}
+
 fn violation(invariant: &str, issue_id: &str, reason: String) -> HBoardViolation {
     HBoardViolation {
         exit_code: EXIT_H_BOARD_REJECT,
@@ -613,9 +622,10 @@ pub fn collect_live_board_violations(
                 }
                 SettlementField::ChinwagCycleTime => {
                     if let Some(text) = item.text(name)
-                        && CYCLE_TIME_UNSETTLED_PREFIXES
-                            .iter()
-                            .any(|unsettled| text.starts_with(unsettled))
+                        && (reads_unavailable(text)
+                            || CYCLE_TIME_UNSETTLED_PREFIXES
+                                .iter()
+                                .any(|unsettled| text.starts_with(unsettled)))
                     {
                         reject(format!(
                             "{issue_ref} is shipped but `{name}` still reads `{text}`"
@@ -624,16 +634,23 @@ pub fn collect_live_board_violations(
                 }
                 SettlementField::SpeedupVsDora => {
                     if let Some(text) = item.text(name)
-                        && (text == SPEEDUP_OPTIONS[3] || text == SPEEDUP_OPTIONS[4])
+                        && SPEEDUP_OPTIONS[3..=5].contains(&text)
                     {
                         reject(format!(
                             "{issue_ref} is shipped but `{name}` still reads `{text}`"
                         ));
                     }
                 }
-                SettlementField::VerificationReceipt
-                | SettlementField::CryptographicReceipt
-                | SettlementField::TClaimMs
+                SettlementField::VerificationReceipt | SettlementField::CryptographicReceipt => {
+                    if let Some(text) = item.text(name)
+                        && reads_unavailable(text)
+                    {
+                        reject(format!(
+                            "{issue_ref} is shipped but `{name}` still reads `{text}`"
+                        ));
+                    }
+                }
+                SettlementField::TClaimMs
                 | SettlementField::TShipMs
                 | SettlementField::LocChanged => {}
             }
@@ -1485,6 +1502,71 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn shipped_cards_reading_unavailable_are_rejected() {
+        let cases = [
+            (
+                "\u{fffd}\u{fffd} Speedup vs. DORA",
+                "Δ Speedup vs. DORA",
+                "Shipped · Measurement unavailable",
+            ),
+            (
+                "chinwag Cycle Time",
+                "Chinwag Cycle Time",
+                "Shipped · Timing unavailable",
+            ),
+            (
+                "verification Receipt",
+                "Verification Receipt",
+                "Verification evidence unavailable",
+            ),
+            (
+                "cryptographic Receipt",
+                "Cryptographic Receipt",
+                "Delivery metrics unavailable",
+            ),
+            (
+                "verification Receipt",
+                "Verification Receipt",
+                "Delivery metrics unavailable",
+            ),
+            (
+                "cryptographic Receipt",
+                "Cryptographic Receipt",
+                "Owner confirmed complete · DELIVERY METRICS UNAVAILABLE",
+            ),
+            (
+                "chinwag Cycle Time",
+                "Chinwag Cycle Time",
+                "19m 00s · LOC Unavailable",
+            ),
+        ];
+        for (key, name, value) in cases {
+            let mut card = live_item(20, "acme-co/product", "[ACME-0020] Unmeasured", SHIPPED);
+            card[key] = json!(value);
+            let violations = collect_live_board_violations(&snapshot(vec![card]), &policy());
+            assert_eq!(
+                violations
+                    .iter()
+                    .map(|v| (v.exit_code, v.issue_id.as_str(), v.reason.as_str()))
+                    .collect::<Vec<_>>(),
+                [(
+                    78,
+                    "ACME-0020",
+                    format!("acme-co/product#20 is shipped but `{name}` still reads `{value}`")
+                        .as_str()
+                )],
+                "{name} = {value}"
+            );
+            assert_eq!(violations[0].exit_code, EXIT_H_BOARD_REJECT);
+            assert_eq!(violations[0].invariant, "INV-BOARD-LEDGER-TRACKING-01");
+        }
+
+        let mut in_flight = live_item(21, "acme-co/product", "[ACME-0021] Unshipped", IN_FLIGHT);
+        in_flight["verification Receipt"] = json!("Verification evidence unavailable");
+        assert_eq!(live_reasons(&snapshot(vec![in_flight])), []);
     }
 
     #[test]
