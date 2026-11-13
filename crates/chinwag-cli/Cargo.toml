@@ -21,6 +21,7 @@ chinwag-signing = { path = "../chinwag-signing" }
 chinwag-confirmed-initial-private = { path = "../confirmed-initial" }
 chinwag-mcp-private-anchored = { path = "../chinwag-mcp", features = ["private-loopback"] }
 chinwag-editor-config-private = { path = "../chinwag-editor-config" }
+toml = { version = "=0.8.2", default-features = false, features = ["parse"] }
 chinwag-snapshot-session-private = { path = "../chinwag-snapshot-session" }
 chinwag-snapshot-read-owner-private = { path = "../chinwag-snapshot-read-owner" }
 serde = { version = "=1.0.229", features = ["derive"] }
