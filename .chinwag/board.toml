@@ -1,0 +1,65 @@
+# Chinwag board policy for this workspace (CHWG-0282).
+#
+# `chinwag board add|move|push|sync|verify-ledger` load this file and fail closed (exit 78)
+# when it is missing, invalid, or violated. Unknown keys are rejected, so a misspelled
+# requirement cannot switch enforcement off.
+#
+#   INV-BOARD-LEDGER-TRACKING-01  No card joins the board without its scoping fields, and
+#                                 none sits in the shipped column without its settlement fields.
+#   INV-UNIQUE-TICKET-ID-01       No two cards, in any linked repository, share a ticket ID.
+schema = "chinwag.board.policy.v1"
+
+[board]
+org = "emunlabs"
+project_number = 1
+project_id = "PVT_kwDOFJPsXM4BrFUV"
+public_repo = "emunlabs/chinwag"
+private_repo = "emunlabs/chinwag-tasks"
+linked_repos = [
+    "emunlabs/chinwag",
+    "emunlabs/chinwag-tasks",
+    "emunlabs/chinwag-website",
+    "emunlabs/chinwag-edge-proxy",
+]
+# Ticket IDs must match ^CHWG-[0-9]{4}(?:\.[0-9]{2}(?:-[0-9]{2})?)?$
+ticket_prefix = "CHWG"
+# A live board item whose title carries no ticket ID was created outside the gate
+# (raw `gh issue create`, `Fixes #<n>`) and is reported by `verify-ledger --live`.
+disallow_raw_bypass = true
+
+[board.ledger]
+# Both switches must be true for `verify-ledger` to certify INV-BOARD-LEDGER-TRACKING-01.
+require_scoping_on_add = true
+require_settlement_on_ship = true
+# `code`: loc_changed is a diff size and locks the DORA tier (INV-TIER-LOCK-01).
+# `artifact`: loc_changed is a line or page count (0 allowed) and never rebands the tier.
+allow_deliverable_kinds = ["code", "artifact"]
+required_add_fields = [
+    "dora_tier",
+    "baseline_hours",
+    "execution_mode",
+    "function_team",
+    "active_seats",
+]
+required_ship_fields = [
+    "t_claim_ms",
+    "t_ship_ms",
+    "loc_changed",
+    "credits_used",
+    "net_hours_saved",
+    "chinwag_cycle_time",
+    "speedup_vs_dora",
+    "verification_receipt",
+    "cryptographic_receipt",
+]
+
+[board.privacy]
+# Added to the built-in guards; entries here can only tighten them.
+private_locked_seats = ["PATENT", "EAGLE-EYE", "ALISTAIR", "AUSDRA", "VENTURE", "MO"]
+forbidden_public_substrings = [
+    "chinwag-eve-bridge",
+    "inception/mercury-3",
+    "Vercel AI Gateway",
+    "@cf/openai/gpt-oss-120b",
+    "3-Repo Git Time Machine",
+]

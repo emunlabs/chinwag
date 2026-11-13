@@ -35,6 +35,22 @@ use std::path::{Path, PathBuf};
 mod templates;
 pub use templates::{build_github_project_v2_template_schema, build_linear_template_schema};
 
+mod policy;
+pub use policy::{
+    BOARD_POLICY_RELATIVE_PATH, BOARD_POLICY_SCHEMA_V1, BoardLedgerPolicyV1, BoardPolicyBoardV1,
+    BoardPolicyError, BoardPolicyTomlV1, BoardPrivacyPolicyV1, DELIVERABLE_KIND_ARTIFACT,
+    DELIVERABLE_KIND_CODE, INV_BOARD_LEDGER_TRACKING, INV_UNIQUE_TICKET_ID,
+    KNOWN_DELIVERABLE_KINDS, ScopingField, SettlementField, TicketId, default_deliverable_kind,
+};
+
+mod ledger;
+pub use ledger::{
+    LiveBoardItem, LiveBoardSnapshot, TicketCardRef, collect_board_ledger_violations,
+    collect_live_board_violations, parse_live_project_items, run_board_verify_ledger,
+    validate_board_ledger_issue, validate_unique_ticket_ids,
+};
+use ledger::{require_board_policy_for_live, resolve_board_policy, resolve_board_workspace_root};
+
 /// Exit code `78` (`EX_CONFIG`) returned whenever `H_board` rejects a board push or task mutation.
 pub const EXIT_H_BOARD_REJECT: u8 = 78;
 
@@ -286,7 +302,42 @@ pub fn compute_velocity_proof(
     t_claim_ms: u64,
     t_ship_ms: u64,
 ) -> VelocityProof {
-    let (effective_tier, tier_downgraded) = DoraTier::enforce_tier_lock(claimed_tier, loc_changed);
+    compute_velocity_proof_for_deliverable(
+        claimed_tier,
+        loc_changed,
+        DELIVERABLE_KIND_CODE,
+        t_claim_ms,
+        t_ship_ms,
+    )
+}
+
+/// `INV-TIER-LOCK-01` applies to code only: a diff's LOC bounds the tier that may be claimed
+/// for it. For any other deliverable kind `loc_changed` is an artifact size, not a diff, so
+/// the claimed tier stands.
+#[must_use]
+pub fn enforce_tier_lock_for_deliverable(
+    claimed: DoraTier,
+    loc_changed: Option<u64>,
+    deliverable_kind: &str,
+) -> (DoraTier, bool) {
+    if deliverable_kind == DELIVERABLE_KIND_CODE {
+        DoraTier::enforce_tier_lock(claimed, loc_changed)
+    } else {
+        (claimed, false)
+    }
+}
+
+/// [`compute_velocity_proof`] for a card of the given `deliverable_kind`.
+#[must_use]
+pub fn compute_velocity_proof_for_deliverable(
+    claimed_tier: DoraTier,
+    loc_changed: Option<u64>,
+    deliverable_kind: &str,
+    t_claim_ms: u64,
+    t_ship_ms: u64,
+) -> VelocityProof {
+    let (effective_tier, tier_downgraded) =
+        enforce_tier_lock_for_deliverable(claimed_tier, loc_changed, deliverable_kind);
     let actual_elapsed_ms = if t_ship_ms > t_claim_ms && t_claim_ms > 0 {
         t_ship_ms - t_claim_ms
     } else {
@@ -317,8 +368,12 @@ pub fn compute_velocity_proof(
     let total_secs = clamped_ms / 1_000;
     let mins = total_secs / 60;
     let secs = total_secs % 60;
-    let loc_display = loc_changed.unwrap_or(88);
-    let cycle_time_label = format!("{mins}m {secs:02}s · {loc_display} LOC");
+    let cycle_time_label = if deliverable_kind == DELIVERABLE_KIND_CODE {
+        let loc_display = loc_changed.unwrap_or(88);
+        format!("{mins}m {secs:02}s · {loc_display} LOC")
+    } else {
+        format!("{mins}m {secs:02}s · {deliverable_kind}")
+    };
 
     VelocityProof {
         claimed_tier,
@@ -348,6 +403,9 @@ pub struct AtomicTaskIssue {
     pub title: String,
     pub status: BoardStatus,
     pub dora_tier: DoraTier,
+    /// `code` or `artifact`. Task files written before this field existed are `code`.
+    #[serde(default = "default_deliverable_kind")]
+    pub deliverable_kind: String,
     pub file_scope: String,
     pub assigned_seats: Vec<String>,
     pub author_instance: Option<String>,
@@ -382,6 +440,7 @@ impl AtomicTaskIssue {
             title: title.to_string(),
             status: BoardStatus::ScopedBenchmarked,
             dora_tier: tier,
+            deliverable_kind: default_deliverable_kind(),
             file_scope: "crates/chinwag-cli/src/board/**".to_string(),
             assigned_seats: vec!["RUST".to_string(), "ARCHITECT".to_string()],
             author_instance: Some("RUST#chinwag-board-init-01".to_string()),
@@ -419,6 +478,23 @@ impl AtomicTaskIssue {
         }
     }
 
+    /// A new card with nothing assumed on its behalf: no function, seats, clocks, or receipts.
+    /// The caller supplies scoping explicitly and the ledger gate rejects what is left blank.
+    #[must_use]
+    pub fn new_unscoped(id: &str, title: &str, tier: DoraTier) -> Self {
+        Self {
+            file_scope: "*".to_string(),
+            assigned_seats: Vec::new(),
+            author_instance: None,
+            base_head_sha: "0000000000000000000000000000000000000000".to_string(),
+            t_claim_ms: 0,
+            surv_status: SurvStatus::Unstarted,
+            body: title.to_string(),
+            receipt_trailers: Vec::new(),
+            ..Self::new_default(id, title, tier)
+        }
+    }
+
     /// Serializes the issue to its canonical Markdown + YAML frontmatter + `K1+K2` receipt trailers format.
     #[must_use]
     pub fn to_markdown(&self) -> String {
@@ -453,6 +529,7 @@ impl AtomicTaskIssue {
         }
         out.push_str(&format!("status: {}\n", self.status.as_code()));
         out.push_str(&format!("dora_tier: {}\n", self.dora_tier.as_str()));
+        out.push_str(&format!("deliverable_kind: {}\n", self.deliverable_kind));
         out.push_str(&format!("file_scope: {}\n", self.file_scope));
         out.push_str(&format!("assigned_seats: [{seats_joined}]\n"));
         out.push_str(&format!("author_instance: {author_inst}\n"));
@@ -518,6 +595,7 @@ impl AtomicTaskIssue {
         let mut completion_evidence_note = None;
         let mut status = BoardStatus::ScopedBenchmarked;
         let mut dora_tier = DoraTier::M;
+        let mut deliverable_kind = default_deliverable_kind();
         let mut file_scope = String::from("*");
         let mut assigned_seats = Vec::new();
         let mut author_instance = None;
@@ -567,6 +645,7 @@ impl AtomicTaskIssue {
                     dora_tier =
                         DoraTier::parse(val).ok_or_else(|| format!("invalid dora_tier: {val}"))?;
                 }
+                "deliverable_kind" => deliverable_kind = val.to_string(),
                 "file_scope" => file_scope = val.to_string(),
                 "assigned_seats" => {
                     let inner = val.trim_start_matches('[').trim_end_matches(']');
@@ -666,6 +745,7 @@ impl AtomicTaskIssue {
             title,
             status,
             dora_tier,
+            deliverable_kind,
             file_scope,
             assigned_seats,
             author_instance,
@@ -1296,9 +1376,10 @@ fn build_board_push_graphql_payload_with_config(
     let mut linear_mutations = Vec::with_capacity(issues.len());
 
     for issue in issues {
-        let proof = compute_velocity_proof(
+        let proof = compute_velocity_proof_for_deliverable(
             issue.dora_tier,
             issue.loc_changed,
+            &issue.deliverable_kind,
             issue.t_claim_ms,
             issue.t_ship_ms,
         );
@@ -2398,6 +2479,23 @@ pub fn push_github_project_v2_live(
     issues: &[AtomicTaskIssue],
     org: &str,
 ) -> Result<Value, String> {
+    let describe = |v: HBoardViolation| format!("{} on {}: {}", v.invariant, v.issue_id, v.reason);
+    let policy = resolve_board_policy(&[], tasks_dir).map_err(describe)?;
+    let policy = require_board_policy_for_live(policy.as_ref()).map_err(describe)?;
+    push_github_project_v2_live_governed(tasks_dir, issues, org, policy)
+}
+
+/// Every live card mutation goes through here, so no card reaches the board without
+/// passing the ledger policy.
+fn push_github_project_v2_live_governed(
+    tasks_dir: &Path,
+    issues: &[AtomicTaskIssue],
+    org: &str,
+    policy: &BoardPolicyTomlV1,
+) -> Result<Value, String> {
+    validate_org_matches_policy(org, policy)
+        .and_then(|()| validate_board_ledger_issues(issues, policy))
+        .map_err(|v| format!("{} on {}: {}", v.invariant, v.issue_id, v.reason))?;
     let mut local_ids = std::collections::BTreeSet::new();
     for issue in issues {
         validate_h_board_issue(issue, &issue.to_markdown())
@@ -2428,6 +2526,13 @@ pub fn push_github_project_v2_live(
     let private_repo = cfg.private_repo.clone().ok_or("missing private_repo")?;
     if public_repo.eq_ignore_ascii_case(&private_repo) {
         return Err("public_repo and private_repo must be distinct repositories".to_string());
+    }
+    for repo in [&public_repo, &private_repo] {
+        if !policy.links_repo(repo) {
+            return Err(format!(
+                "{INV_BOARD_LEDGER_TRACKING}: repository `{repo}` is not in board.linked_repos"
+            ));
+        }
     }
     // Complete inventories are authoritative, including closed issues and tasks beyond the first page.
     let public_inventory = fetch_github_repository_issues(&public_repo, false)?;
@@ -2822,6 +2927,105 @@ query($org: String!, $number: Int!) {
     }))
 }
 
+/// Ticket prefix written into a starter policy when `chinwag board init` is given none.
+const STARTER_TICKET_PREFIX: &str = "CHWG";
+
+fn emit_h_board_rejection(
+    violation: &HBoardViolation,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    let _ = writeln!(
+        stderr,
+        "H_board GATE REJECTED (exit {}) [{}] on {}: {}",
+        violation.exit_code, violation.invariant, violation.issue_id, violation.reason
+    );
+    let _ = writeln!(
+        stdout,
+        "{}",
+        json!({
+            "ok": false,
+            "exit_code": violation.exit_code,
+            "invariant": violation.invariant,
+            "issue_id": violation.issue_id,
+            "reason": violation.reason
+        })
+    );
+    violation.exit_code
+}
+
+/// Admission, settlement, and ticket-ID uniqueness for a whole set of cards.
+fn validate_board_ledger_issues(
+    issues: &[AtomicTaskIssue],
+    policy: &BoardPolicyTomlV1,
+) -> Result<(), HBoardViolation> {
+    for issue in issues {
+        validate_board_ledger_issue(issue, policy)?;
+    }
+    let claims: Vec<TicketCardRef> = issues
+        .iter()
+        .map(|issue| TicketCardRef {
+            ticket_id: issue.id.clone(),
+            source: format!("issues/{}.md", issue.id),
+        })
+        .collect();
+    validate_unique_ticket_ids(&claims, &policy.board.ticket_prefix)
+        .map_err(|mut duplicates| duplicates.remove(0))
+}
+
+/// A board named on the command line must be the board the policy governs.
+fn validate_org_matches_policy(
+    org: &str,
+    policy: &BoardPolicyTomlV1,
+) -> Result<(), HBoardViolation> {
+    if org.eq_ignore_ascii_case(&policy.board.org) {
+        return Ok(());
+    }
+    Err(HBoardViolation {
+        exit_code: EXIT_H_BOARD_REJECT,
+        invariant: INV_BOARD_LEDGER_TRACKING.to_string(),
+        issue_id: BOARD_POLICY_RELATIVE_PATH.to_string(),
+        reason: format!(
+            "`--org {org}` is not the organization governed by the board policy (`{}`)",
+            policy.board.org
+        ),
+    })
+}
+
+/// Writes a fully enforcing starter policy when the workspace has none. Never overwrites.
+fn write_starter_board_policy(
+    workspace_root: &Path,
+    cfg: &BoardConfigV1,
+    ticket_prefix: &str,
+) -> Result<Option<PathBuf>, String> {
+    let path = BoardPolicyTomlV1::policy_path(workspace_root);
+    if path.exists() {
+        return Ok(None);
+    }
+    let public_repo = cfg
+        .public_repo
+        .clone()
+        .unwrap_or_else(|| format!("{}/chinwag", cfg.org));
+    let policy = BoardPolicyTomlV1::starter(
+        &cfg.org,
+        cfg.project_number,
+        Some(cfg.project_id.as_str()).filter(|id| !id.is_empty() && *id != "PVT_kwDOChinwag1"),
+        &public_repo,
+        cfg.private_repo.as_deref(),
+        ticket_prefix,
+    );
+    policy
+        .validate()
+        .map_err(|problems| format!("starter board policy is invalid: {}", problems.join("; ")))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    fs::write(&path, policy.to_toml_string())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(Some(path))
+}
+
 /// Execute Card-Move-Driven Cross-Surface Orchestration (`chinwag board sync-loop` / `chinwag board watch`).
 ///
 /// - Inspects `.chinwag/tasks/issues/*.md` (and pulls live card column state when `--live` is passed).
@@ -2918,8 +3122,11 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
             let prior_status_code = issue.status.as_code().to_string();
             if manifest.all_surfaces_synced && manifest.ui_gate_passed {
                 let claimed_tier = issue.dora_tier;
-                let (effective_tier, tier_downgraded) =
-                    DoraTier::enforce_tier_lock(claimed_tier, issue.loc_changed);
+                let (effective_tier, tier_downgraded) = enforce_tier_lock_for_deliverable(
+                    claimed_tier,
+                    issue.loc_changed,
+                    &issue.deliverable_kind,
+                );
                 issue.dora_tier = effective_tier;
                 issue.status = BoardStatus::ShippedVerified;
                 if issue.t_claim_ms == 0 {
@@ -2935,9 +3142,10 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
                 issue.chips_minted += minted;
                 let _ = bridge.save(&tasks_dir);
 
-                let proof = compute_velocity_proof(
+                let proof = compute_velocity_proof_for_deliverable(
                     claimed_tier,
                     issue.loc_changed,
+                    &issue.deliverable_kind,
                     issue.t_claim_ms,
                     issue.t_ship_ms,
                 );
@@ -3006,7 +3214,15 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
     }
 
     let live_sync = if live {
-        match push_github_project_v2_live(&tasks_dir, &updated_issues, &org) {
+        let policy = match resolve_board_policy(args, &tasks_dir) {
+            Ok(policy) => policy,
+            Err(violation) => return emit_h_board_rejection(&violation, stdout, stderr),
+        };
+        let policy = match require_board_policy_for_live(policy.as_ref()) {
+            Ok(policy) => policy,
+            Err(violation) => return emit_h_board_rejection(&violation, stdout, stderr),
+        };
+        match push_github_project_v2_live_governed(&tasks_dir, &updated_issues, &org, policy) {
             Ok(val) => Some(val),
             Err(e) => {
                 let _ = writeln!(stderr, "chinwag board sync-loop --live warning: {e}");
@@ -3047,13 +3263,18 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
     0
 }
 
-/// Entrypoint for `chinwag board <init|push|sync|pull|watch|sync-loop|add|move> ...`.
+/// Entrypoint for `chinwag board <init|push|sync|pull|watch|sync-loop|add|move|verify-ledger> ...`.
 pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("push");
     if sub == "--help" || sub == "-h" || sub == "help" {
         let _ = writeln!(
             stdout,
-            "Usage: chinwag board <init|push|sync|pull|watch|sync-loop|add|move> [--org <org>] [--title <title>] [--private] [--public-board] [--private-repo <org/repo>] [--public-repo <org/repo>] [--live] [--once] [--workspace-root <path>] [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run] [--json]"
+            "Usage: chinwag board <init|push|sync|pull|watch|sync-loop|add|move|verify-ledger> [--org <org>] [--title <title>] [--private] [--public-board] [--private-repo <org/repo>] [--public-repo <org/repo>] [--ticket-prefix <PREFIX>] [--live] [--once] [--workspace-root <path>] [--tasks-dir <dir>] [--github-project <id>] [--linear-team <id>] [--dry-run] [--json]\n\
+             \n\
+             chinwag board add|move <TICKET_ID> [<STATUS>] [--function <team>] [--seats <a,b>] [--deliverable-kind <code|artifact>] [--tier <S|M|L|XL>] [--loc-changed <n>] [--title <title>]\n\
+             chinwag board verify-ledger [--live] [--json] [--workspace-root <path>]\n\
+             \n\
+             add, move, push, sync, and verify-ledger enforce <workspace>/.chinwag/board.toml and exit 78 when it is missing, invalid, or violated."
         );
         return 0;
     }
@@ -3067,12 +3288,26 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
     if matches!(sub, "add" | "move") {
         return run_board_add_or_move(sub, args, &tasks_dir, stdout, stderr);
     }
+    if sub == "verify-ledger" {
+        return run_board_verify_ledger(args, stdout, stderr);
+    }
     if !matches!(sub, "push" | "sync" | "init" | "pull") {
         let _ = writeln!(stderr, "chinwag board: unknown subcommand `{sub}`");
         return 2;
     }
     let issues_dir = tasks_dir.join("issues");
-    let mut org = "emunlabs".to_string();
+    let policy = if matches!(sub, "push" | "sync") {
+        match resolve_board_policy(args, &tasks_dir) {
+            Ok(policy) => policy,
+            Err(violation) => return emit_h_board_rejection(&violation, stdout, stderr),
+        }
+    } else {
+        None
+    };
+    let mut org = policy
+        .as_ref()
+        .map_or_else(|| "emunlabs".to_string(), |p| p.board.org.clone());
+    let mut ticket_prefix = STARTER_TICKET_PREFIX.to_string();
     let mut title = "Chinwag Engineering Velocity & Agent Fleet".to_string();
     let mut github_project = BoardConfigV1::load(&tasks_dir)
         .map(|c| c.project_id)
@@ -3095,6 +3330,10 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             }
             "--title" if i + 1 < args.len() => {
                 title = args[i + 1].clone();
+                i += 2;
+            }
+            "--ticket-prefix" if i + 1 < args.len() => {
+                ticket_prefix = args[i + 1].clone();
                 i += 2;
             }
             "--private-repo" if i + 1 < args.len() => {
@@ -3141,6 +3380,19 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 i += 1;
             }
         }
+    }
+
+    if let Some(policy) = &policy
+        && let Err(violation) = validate_org_matches_policy(&org, policy)
+    {
+        return emit_h_board_rejection(&violation, stdout, stderr);
+    }
+    if matches!(sub, "push" | "sync")
+        && live
+        && !dry_run
+        && let Err(violation) = require_board_policy_for_live(policy.as_ref())
+    {
+        return emit_h_board_rejection(&violation, stdout, stderr);
     }
 
     if sub == "pull" {
@@ -3214,8 +3466,11 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         }
 
         // Enforce INV-TIER-LOCK-01 automatic tier downgrade if loc_changed is smaller than claimed tier
-        let (effective_tier, downgraded) =
-            DoraTier::enforce_tier_lock(issue.dora_tier, issue.loc_changed);
+        let (effective_tier, downgraded) = enforce_tier_lock_for_deliverable(
+            issue.dora_tier,
+            issue.loc_changed,
+            &issue.deliverable_kind,
+        );
         if downgraded {
             issue.dora_tier = effective_tier;
             let _ = fs::write(&path, issue.to_markdown());
@@ -3224,6 +3479,13 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
         validated_issues.push(issue);
     }
 
+    if let Some(policy) = &policy
+        && let Err(violation) = validate_board_ledger_issues(&validated_issues, policy)
+    {
+        return emit_h_board_rejection(&violation, stdout, stderr);
+    }
+
+    let workspace_root = resolve_board_workspace_root(args, &tasks_dir);
     if sub == "init" {
         if live {
             match init_github_project_v2_live_with_visibility(
@@ -3242,6 +3504,17 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                                 tasks_dir.join("templates/linear-template.json"),
                             )
                         });
+                    let created_policy = match workspace_root
+                        .as_deref()
+                        .map(|root| write_starter_board_policy(root, &cfg, &ticket_prefix))
+                        .transpose()
+                    {
+                        Ok(path) => path.flatten(),
+                        Err(e) => {
+                            let _ = writeln!(stderr, "chinwag board init --live failed: {e}");
+                            return 1;
+                        }
+                    };
                     let payload = json!({
                         "ok": true,
                         "command": "chinwag board init",
@@ -3249,6 +3522,7 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                         "public_board": cfg.public_board,
                         "default_visibility": if cfg.public_board { "public" } else { "private" },
                         "board_config": cfg,
+                        "board_policy_created": created_policy.map(|p| p.to_string_lossy().to_string()),
                         "templates": {
                             "github_project_v2_schema": gh_tpl.to_string_lossy(),
                             "linear_template": lin_tpl.to_string_lossy(),
@@ -3291,6 +3565,17 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                     return 1;
                 }
             };
+            let created_policy = match workspace_root
+                .as_deref()
+                .map(|root| write_starter_board_policy(root, &cfg, &ticket_prefix))
+                .transpose()
+            {
+                Ok(path) => path.flatten(),
+                Err(e) => {
+                    let _ = writeln!(stderr, "chinwag board init failed: {e}");
+                    return 1;
+                }
+            };
             let payload = json!({
                 "ok": true,
                 "command": "chinwag board init",
@@ -3298,6 +3583,7 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                 "public_board": cfg.public_board,
                 "default_visibility": if cfg.public_board { "public" } else { "private" },
                 "board_config": cfg,
+                "board_policy_created": created_policy.map(|p| p.to_string_lossy().to_string()),
                 "templates": {
                     "github_project_v2_schema": gh_tpl.to_string_lossy(),
                     "linear_template": lin_tpl.to_string_lossy(),
@@ -3346,7 +3632,12 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             );
             return 1;
         }
-        match push_github_project_v2_live(&tasks_dir, &validated_issues, &org) {
+        let live_policy = match require_board_policy_for_live(policy.as_ref()) {
+            Ok(policy) => policy,
+            Err(violation) => return emit_h_board_rejection(&violation, stdout, stderr),
+        };
+        match push_github_project_v2_live_governed(&tasks_dir, &validated_issues, &org, live_policy)
+        {
             Ok(live_receipt) => {
                 if let Some(obj) = payload.as_object_mut() {
                     obj.insert("live_sync_receipt".to_string(), live_receipt);
@@ -3753,9 +4044,10 @@ fn card_entry_from_issue(
     existing_trigger: Option<&str>,
     existing_ticket_code: Option<String>,
 ) -> BoardCardEntryV1 {
-    let proof = compute_velocity_proof(
+    let proof = compute_velocity_proof_for_deliverable(
         issue.dora_tier,
         issue.loc_changed,
+        &issue.deliverable_kind,
         issue.t_claim_ms,
         issue.t_ship_ms,
     );
@@ -4515,6 +4807,25 @@ pub fn detect_in_flight_surface_collisions(
     collisions
 }
 
+/// Ticket IDs claimed by every task file in `issues_dir` except `skip`.
+fn local_ticket_claims(issues_dir: &Path, skip: &Path) -> Vec<TicketCardRef> {
+    let Ok(entries) = fs::read_dir(issues_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path != skip && path.extension().and_then(|e| e.to_str()) == Some("md"))
+        .filter_map(|path| {
+            let issue = AtomicTaskIssue::from_markdown(&fs::read_to_string(&path).ok()?).ok()?;
+            Some(TicketCardRef {
+                ticket_id: issue.id,
+                source: format!("issues/{}", path.file_name()?.to_string_lossy()),
+            })
+        })
+        .collect()
+}
+
 fn run_board_add_or_move(
     sub: &str,
     args: &[String],
@@ -4538,6 +4849,10 @@ fn run_board_add_or_move(
     let mut branch: Option<String> = None;
     let mut surfaces: Vec<String> = Vec::new();
     let mut from_actor: Option<String> = std::env::var("CHINWAG_ACTOR").ok();
+    let mut function: Option<String> = None;
+    let mut seats: Option<Vec<String>> = None;
+    let mut deliverable_kind: Option<String> = None;
+    let mut loc_changed: Option<u64> = None;
     let mut is_json = false;
     let mut positionals = Vec::new();
 
@@ -4582,7 +4897,37 @@ fn run_board_add_or_move(
                 from_actor = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--repo" | "--tasks-dir" if i + 1 < args.len() => {
+            "--function" if i + 1 < args.len() => {
+                function = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--seats" if i + 1 < args.len() => {
+                seats = Some(
+                    args[i + 1]
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                );
+                i += 2;
+            }
+            "--deliverable-kind" if i + 1 < args.len() => {
+                deliverable_kind = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--loc-changed" if i + 1 < args.len() => {
+                let Ok(loc) = args[i + 1].parse::<u64>() else {
+                    let _ = writeln!(
+                        stderr,
+                        "chinwag board {sub}: `--loc-changed {}` is not a whole number",
+                        args[i + 1]
+                    );
+                    return 2;
+                };
+                loc_changed = Some(loc);
+                i += 2;
+            }
+            "--repo" | "--tasks-dir" | "--workspace-root" if i + 1 < args.len() => {
                 i += 2;
             }
             "--json" => {
@@ -4610,12 +4955,35 @@ fn run_board_add_or_move(
         let _ = writeln!(stderr, "chinwag board {sub}: missing <TICKET_ID>");
         return 2;
     };
-    if !is_canonical_chwg_ticket_id(&id) {
-        let _ = writeln!(
-            stderr,
-            "H_board rejected [INV-ENTITY-SEP-01]: ticket `{id}` must match ^CHWG-[0-9]{{4}}$"
-        );
-        return EXIT_H_BOARD_REJECT;
+    let policy = match resolve_board_policy(args, tasks_dir) {
+        Ok(policy) => policy,
+        Err(violation) => return emit_h_board_rejection(&violation, stdout, stderr),
+    };
+    let ledger_rejection = |reason: String| HBoardViolation {
+        exit_code: EXIT_H_BOARD_REJECT,
+        invariant: INV_BOARD_LEDGER_TRACKING.to_string(),
+        issue_id: id.clone(),
+        reason,
+    };
+    // The ID becomes a file name below, so its shape is checked before anything touches disk.
+    match &policy {
+        Some(policy) => {
+            let prefix = &policy.board.ticket_prefix;
+            if TicketId::parse(&id, prefix).is_none() {
+                let violation = ledger_rejection(format!(
+                    "ticket id `{id}` must match ^{prefix}-[0-9]{{4}}(?:\\.[0-9]{{2}}(?:-[0-9]{{2}})?)?$"
+                ));
+                return emit_h_board_rejection(&violation, stdout, stderr);
+            }
+        }
+        None if !is_canonical_chwg_ticket_id(&id) => {
+            let _ = writeln!(
+                stderr,
+                "H_board rejected [INV-ENTITY-SEP-01]: ticket `{id}` must match ^CHWG-[0-9]{{4}}$"
+            );
+            return EXIT_H_BOARD_REJECT;
+        }
+        None => {}
     }
 
     let target_status = status_code
@@ -4624,14 +4992,34 @@ fn run_board_add_or_move(
         .unwrap_or(BoardStatus::InFlight);
 
     let issue_path = issues_dir.join(format!("{id}.md"));
-    let mut issue = if issue_path.is_file()
-        && let Ok(raw) = fs::read_to_string(&issue_path)
-        && let Ok(existing) = AtomicTaskIssue::from_markdown(&raw)
-    {
-        existing
-    } else {
-        AtomicTaskIssue::new_default(&id, &title, tier)
+    let existing = issue_path.is_file().then(|| {
+        fs::read_to_string(&issue_path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| AtomicTaskIssue::from_markdown(&raw))
+    });
+    let mut issue = match (existing, &policy) {
+        (Some(Ok(existing)), _) => existing,
+        (Some(Err(e)), Some(_)) => {
+            let violation = ledger_rejection(format!(
+                "existing task file cannot be read as a card and will not be overwritten: {e}"
+            ));
+            return emit_h_board_rejection(&violation, stdout, stderr);
+        }
+        (None, Some(_)) => AtomicTaskIssue::new_unscoped(&id, &title, tier),
+        (Some(Err(_)) | None, None) => AtomicTaskIssue::new_default(&id, &title, tier),
     };
+    if let Some(function) = function {
+        issue.primary_function = Some(function);
+    }
+    if let Some(seats) = seats {
+        issue.assigned_seats = seats;
+    }
+    if let Some(kind) = deliverable_kind {
+        issue.deliverable_kind = kind;
+    }
+    if let Some(loc) = loc_changed {
+        issue.loc_changed = Some(loc);
+    }
 
     if issue.status == BoardStatus::ShippedVerified && target_status != BoardStatus::ShippedVerified
     {
@@ -4647,6 +5035,44 @@ fn run_board_add_or_move(
     }
     if let Some(ref actor) = from_actor {
         issue.author_instance = Some(actor.clone());
+    }
+    if let Some(policy) = &policy {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        // The claim clock starts when work starts and the ship clock stops when it ships.
+        // A card that was never claimed gets no ship time and fails settlement below.
+        if matches!(
+            target_status,
+            BoardStatus::InFlight | BoardStatus::TribunalGate
+        ) && issue.t_claim_ms == 0
+        {
+            issue.t_claim_ms = now_ms;
+        }
+        if target_status == BoardStatus::ShippedVerified {
+            if issue.t_ship_ms == 0 && issue.t_claim_ms > 0 {
+                issue.t_ship_ms = now_ms.max(issue.t_claim_ms);
+            }
+            issue.dora_tier = enforce_tier_lock_for_deliverable(
+                issue.dora_tier,
+                issue.loc_changed,
+                &issue.deliverable_kind,
+            )
+            .0;
+        }
+
+        let mut claims = local_ticket_claims(&issues_dir, &issue_path);
+        claims.push(TicketCardRef {
+            ticket_id: issue.id.clone(),
+            source: format!("issues/{id}.md"),
+        });
+        let verdict = validate_board_ledger_issue(&issue, policy).and_then(|()| {
+            validate_unique_ticket_ids(&claims, &policy.board.ticket_prefix)
+                .map_err(|mut duplicates| duplicates.remove(0))
+        });
+        if let Err(violation) = verdict {
+            return emit_h_board_rejection(&violation, stdout, stderr);
+        }
     }
     if let Err(e) = fs::write(&issue_path, issue.to_markdown()) {
         let _ = writeln!(stderr, "chinwag board {sub}: {e}");
@@ -4866,8 +5292,11 @@ pub fn run_ci_report_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut d
     match status.as_str() {
         "pass" | "passed" | "success" => {
             let claimed_tier = issue.dora_tier;
-            let (effective_tier, tier_downgraded) =
-                DoraTier::enforce_tier_lock(claimed_tier, issue.loc_changed);
+            let (effective_tier, tier_downgraded) = enforce_tier_lock_for_deliverable(
+                claimed_tier,
+                issue.loc_changed,
+                &issue.deliverable_kind,
+            );
             issue.dora_tier = effective_tier;
             issue.status = BoardStatus::ShippedVerified;
             if issue.t_claim_ms == 0 {
@@ -4883,9 +5312,10 @@ pub fn run_ci_report_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut d
             issue.chips_minted += minted;
             let _ = bridge.save(&tasks_dir);
 
-            let proof = compute_velocity_proof(
+            let proof = compute_velocity_proof_for_deliverable(
                 claimed_tier,
                 issue.loc_changed,
+                &issue.deliverable_kind,
                 issue.t_claim_ms,
                 issue.t_ship_ms,
             );
