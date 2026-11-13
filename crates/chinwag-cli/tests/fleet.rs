@@ -1234,3 +1234,117 @@ fn explicit_bound_actor_preserved_in_launch_and_multicall_and_rejects_mismatch()
         .unwrap();
     assert_eq!(mismatch.status.code(), Some(2));
 }
+
+#[test]
+fn multicall_flags_before_explain_and_status_never_hit_network_and_explain_includes_actor() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let reply = serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "DOUBLE_DASH_OK"}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+    })
+    .to_string();
+    let (base_url, captured, handle) = spawn_mock_status_server(vec![(200, reply)]);
+    let (manifest_path, qa_bin) = setup_openai_http_manifest(&root, &base_url, true);
+    let bound = "QA#2427c46641e272de554b8e82a04af0d8";
+
+    // Flags before `explain` without `--seat` must NOT execute `run` or call HTTP
+    let explain_out = Command::new(&qa_bin)
+        .args([
+            "--actor",
+            bound,
+            "--cwd",
+            root.to_str().unwrap(),
+            "explain",
+            "--json",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        explain_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explain_out.stderr)
+    );
+    let explain_json: Value = serde_json::from_slice(&explain_out.stdout).unwrap();
+    assert_eq!(explain_json["ok"], true);
+    assert_eq!(explain_json["plan"]["actor"], bound);
+    assert!(captured.lock().unwrap().is_empty());
+
+    // Flags before `status` without `--seat` must NOT execute `run` or call HTTP
+    let status_out = Command::new(&qa_bin)
+        .args([
+            "--actor",
+            bound,
+            "--cwd",
+            root.to_str().unwrap(),
+            "status",
+            "--json",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        status_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    assert!(captured.lock().unwrap().is_empty());
+
+    // Explicit `chinwag fleet explain --actor ...` also includes `plan.actor`
+    let cli_explain = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+        .args([
+            "fleet",
+            "explain",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--seat",
+            "QA",
+            "--actor",
+            bound,
+            "--cwd",
+            root.to_str().unwrap(),
+            "--json",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .output()
+        .unwrap();
+    assert!(
+        cli_explain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_explain.stderr)
+    );
+    let cli_json: Value = serde_json::from_slice(&cli_explain.stdout).unwrap();
+    assert_eq!(cli_json["plan"]["actor"], bound);
+    assert!(captured.lock().unwrap().is_empty());
+
+    // Literal prompt "explain" after `--` runs against HTTP as a prompt
+    let prompt_out = Command::new(&qa_bin)
+        .args([
+            "--cwd",
+            root.to_str().unwrap(),
+            "--json",
+            "--",
+            "explain",
+        ])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        prompt_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prompt_out.stderr)
+    );
+    let _ = handle.join();
+    assert_eq!(captured.lock().unwrap().len(), 1);
+}

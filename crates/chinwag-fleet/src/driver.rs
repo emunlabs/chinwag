@@ -124,6 +124,8 @@ impl Default for DispatchRequest {
 #[derive(Clone, Debug, Serialize)]
 pub struct ResolvedDispatchPlan {
     pub seat: SeatId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
     pub driver: DriverSpec,
     pub target: ExecutionTarget,
     pub model: ModelBinding,
@@ -388,6 +390,7 @@ pub fn resolve_dispatch_plan(
     let cwd = request.cwd.canonicalize()?;
     let mut plan = ResolvedDispatchPlan {
         seat: seat.id.clone(),
+        actor: request.actor.clone(),
         driver,
         target: seat.target_selector.clone(),
         model: seat.model.clone(),

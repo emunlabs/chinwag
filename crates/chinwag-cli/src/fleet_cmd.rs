@@ -440,9 +440,13 @@ pub fn run_multicall_agent_cli_at(
     let mut seat_docs_disabled = false;
     let mut idx = 0;
     let mut after_double_dash = false;
+    let mut first_pos_after_double_dash = false;
     while idx < rest.len() {
         let raw = rest[idx].as_str();
         if after_double_dash {
+            if positional.is_empty() {
+                first_pos_after_double_dash = true;
+            }
             positional.push(raw.to_owned());
             idx += 1;
             continue;
@@ -567,9 +571,10 @@ pub fn run_multicall_agent_cli_at(
     };
     if explicit_subcommand.is_none()
         && !status_flag
+        && !first_pos_after_double_dash
         && let Some(first_pos) = positional.first()
-        && ((matches!(first_pos.as_str(), "status" | "explain" | "run")
-            && values.contains_key("--seat"))
+        && ((matches!(first_pos.as_str(), "status" | "explain") && positional.len() == 1)
+            || first_pos == "run"
             || seat_action_exists(&manifest, seat_def.id.as_str(), first_pos))
     {
         subcommand = positional.remove(0);
