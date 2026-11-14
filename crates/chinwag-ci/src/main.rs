@@ -24,6 +24,9 @@ fn main() {
         }
         return;
     }
+    if let Some(code) = chinwag_ci::unified_gates::dispatch_unified_subcommand(&args) {
+        std::process::exit(i32::from(code));
+    }
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

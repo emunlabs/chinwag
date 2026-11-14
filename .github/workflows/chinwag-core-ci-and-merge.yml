@@ -85,18 +85,15 @@ jobs:
               export PATH="$INSTALL_DIR:$PATH"
             else
               rustup toolchain install 1.97.1 --profile minimal --no-self-update
-              CI_SRC="${RUNNER_TEMP:-/tmp}/chinwag-ci-standalone"
-              rm -rf "$CI_SRC"
-              git clone --depth 1 https://github.com/emunlabs/chinwag-ci.git "$CI_SRC"
-              cargo +1.97.1 build --locked --release --manifest-path "$CI_SRC/Cargo.toml"
-              export PATH="$CI_SRC/target/release:$PATH"
+              cargo +1.97.1 build --locked --release --package chinwag-ci
+              export PATH="$PWD/target/release:$PATH"
             fi
           fi
           if ! rustup toolchain list | grep -q '^1\.97\.1'; then
             rustup toolchain install 1.97.1 --profile minimal --no-self-update
           fi
           chinwag-ci --version
-          chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${VERIFY_COMMIT:-HEAD}"
+          chinwag-ci verify-signer --require-git-sig --allowed-signers .chinwag/allowed_signers --commit "${VERIFY_COMMIT:-HEAD}"
           chinwag-ci wrap --org emunlabs -- cargo +1.97.1 test --locked --package chinwag-ci
           if [[ -d "$HOME/.chinwag-native-inputs" && -x ./scripts/verify-workhorse-test-suite.sh ]]; then
             chmod +x ./scripts/verify-workhorse-test-suite.sh
@@ -198,14 +195,11 @@ jobs:
               export PATH="$INSTALL_DIR:$PATH"
             else
               rustup toolchain install 1.97.1 --profile minimal --no-self-update
-              CI_SRC="${RUNNER_TEMP:-/tmp}/chinwag-ci-standalone"
-              rm -rf "$CI_SRC"
-              git clone --depth 1 https://github.com/emunlabs/chinwag-ci.git "$CI_SRC"
-              cargo +1.97.1 build --locked --release --manifest-path "$CI_SRC/Cargo.toml"
-              export PATH="$CI_SRC/target/release:$PATH"
+              cargo +1.97.1 build --locked --release --package chinwag-ci
+              export PATH="$PWD/target/release:$PATH"
             fi
           fi
-          chinwag-ci verify-signer --allowed-signers .chinwag/allowed_signers --commit "${VERIFY_COMMIT:-HEAD}"
+          chinwag-ci verify-signer --require-git-sig --allowed-signers .chinwag/allowed_signers --commit "${VERIFY_COMMIT:-HEAD}"
           if chinwag-ci --help 2>&1 | grep -q 'surface-gate'; then
             WS_ROOT="$PWD/.."
             if [[ ! -d "$WS_ROOT/chinwag/.chinwag/regressions" && -d ".chinwag/regressions" ]]; then
