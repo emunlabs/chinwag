@@ -1,8 +1,12 @@
 #![forbid(unsafe_code)]
+use crate::live_coord_mcp::{
+    BusDeltaEnvelope, LiveSessionTracker, attach_bus_delta_to_tool_result,
+    build_resource_updated_param,
+};
 use crate::profile::{McpProfile, rmcp_tools_for_profile};
 use chinwag_snapshot_read_owner_private::{ReadOwner, RepositoryAdmission};
 use chinwag_snapshot_session_private::{
-    Rows, SnapshotSession, Value as SqlValue,
+    CrdbHeaderStamp, Rows, SnapshotSession, Value as SqlValue,
     replacement::{Completion, HandoffRequest, PinRequest, ThreadStart, WriteOwner, WriteSession},
 };
 use rmcp::{
@@ -25,11 +29,18 @@ use std::{
 };
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-type Reply = oneshot::Sender<Result<Value, String>>;
+type ToolOutcomePayload = (Value, Option<BusDeltaEnvelope>);
+type Reply = oneshot::Sender<Result<ToolOutcomePayload, String>>;
 enum Command {
     Read(ReadArgs, Reply),
     Pin(PinRequest, Reply, RequestControl),
     Handoff(HandoffRequest, Reply),
+    RegisterLease(oneshot::Sender<Result<Value, String>>),
+    RenewLease {
+        force: bool,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
+    PeekDelta(oneshot::Sender<Result<bool, String>>),
     Shutdown(oneshot::Sender<Result<(), String>>),
 }
 #[derive(Deserialize)]
@@ -122,7 +133,7 @@ impl OperationError {
         }
     }
 }
-type Operation = Result<Value, OperationError>;
+type Operation = Result<ToolOutcomePayload, OperationError>;
 struct RequestControl {
     #[cfg(all(test, feature = "private-http-probe"))]
     probe: Option<Arc<crate::http_probe::Probe>>,
@@ -157,24 +168,32 @@ fn read_session(repo: &Path) -> Result<SnapshotSession, OperationError> {
     })?;
     SnapshotSession::from_owner(owner).map_err(OperationError::original)
 }
-fn validate_repository(repo: &Path) -> Result<(), OperationError> {
+fn validate_repository(
+    repo: &Path,
+    tracker: &mut LiveSessionTracker,
+) -> Result<(), OperationError> {
     // No long-lived filesystem or native handle is retained after this point.
-    read_session(repo)?
-        .finish()
-        .map_err(OperationError::original)?;
+    let session = read_session(repo)?;
+    tracker.initialize_from_open_session(repo, &session);
+    session.finish().map_err(OperationError::original)?;
     Ok(())
 }
-fn read(repo: &Path, args: ReadArgs) -> Operation {
+fn read(repo: &Path, args: ReadArgs, tracker: &mut LiveSessionTracker) -> Operation {
     let session = read_session(repo)?;
     let value = session
         .context(&args.thread_id)
         .map_err(|e| e.to_string())
         .and_then(context_data)
         .and_then(bound_output);
+    let delta = if value.is_ok() {
+        tracker.consume_delta_from_open_session(repo, &session)
+    } else {
+        None
+    };
     // Even an unknown thread or bounded-output refusal must consume the original
     // checked read release before a tool result is available.
     session.finish().map_err(OperationError::original)?;
-    value.map_err(OperationError::refused)
+    value.map(|v| (v, delta)).map_err(OperationError::refused)
 }
 fn write_session(repo: &Path) -> Result<WriteSession, OperationError> {
     let owner = WriteOwner::acquire_existing_private_fixture(repo).map_err(|e| OperationError {
@@ -183,7 +202,7 @@ fn write_session(repo: &Path) -> Result<WriteSession, OperationError> {
     })?;
     WriteSession::from_owner(owner).map_err(OperationError::original)
 }
-fn response(completion: Completion) -> Operation {
+fn response(completion: Completion) -> Result<Value, OperationError> {
     if completion.is_error() {
         Err(OperationError::refused(
             completion.response()["error"]
@@ -195,7 +214,28 @@ fn response(completion: Completion) -> Operation {
         Ok(completion.response().clone())
     }
 }
-fn pin(repo: &Path, request: PinRequest, reply: &Reply, control: RequestControl) -> Operation {
+fn collect_external_delta_after_write(
+    repo: &Path,
+    had_external_before: bool,
+    after_stamp: Option<CrdbHeaderStamp>,
+    tracker: &mut LiveSessionTracker,
+) -> Result<Option<BusDeltaEnvelope>, OperationError> {
+    tracker.record_exact_own_write_stamp(after_stamp);
+    if !had_external_before {
+        return Ok(None);
+    }
+    let session = read_session(repo)?;
+    let delta = tracker.consume_delta_from_open_session(repo, &session);
+    session.finish().map_err(OperationError::original)?;
+    Ok(delta)
+}
+fn pin(
+    repo: &Path,
+    request: PinRequest,
+    reply: &Reply,
+    control: RequestControl,
+    tracker: &mut LiveSessionTracker,
+) -> Operation {
     let prepared = write_session(repo)?
         .prepare_pin(request, || {
             #[cfg(all(test, feature = "private-http-probe"))]
@@ -207,16 +247,31 @@ fn pin(repo: &Path, request: PinRequest, reply: &Reply, control: RequestControl)
     let completion = prepared
         .commit(reply.is_closed())
         .map_err(OperationError::original)?;
-    response(completion)
+    let external_before =
+        tracker.has_external_change(completion.observation().before_header_stamp());
+    let after_stamp = completion.observation().after_header_stamp();
+    let val = response(completion)?;
+    let delta = collect_external_delta_after_write(repo, external_before, after_stamp, tracker)?;
+    Ok((val, delta))
 }
-fn handoff(repo: &Path, request: HandoffRequest, reply: &Reply) -> Operation {
+fn handoff(
+    repo: &Path,
+    request: HandoffRequest,
+    reply: &Reply,
+    tracker: &mut LiveSessionTracker,
+) -> Operation {
     let prepared = write_session(repo)?
         .prepare_handoff(request, || reply.is_closed())
         .map_err(OperationError::original)?;
     let completion = prepared
         .commit(reply.is_closed())
         .map_err(OperationError::original)?;
-    response(completion)
+    let external_before =
+        tracker.has_external_change(completion.observation().before_header_stamp());
+    let after_stamp = completion.observation().after_header_stamp();
+    let val = response(completion)?;
+    let delta = collect_external_delta_after_write(repo, external_before, after_stamp, tracker)?;
+    Ok((val, delta))
 }
 fn deliver(reply: Reply, kind: &str, outcome: Operation) -> Result<(), String> {
     match outcome {
@@ -293,10 +348,11 @@ impl Owner {
             } else {
                 None
             };
+            let mut tracker = LiveSessionTracker::for_repo(&repo);
             let outcome = (|| {
                 let startup = admitted_operation(&admission, || {
-                    validate_repository(&repo)?;
-                    Ok(Value::Null)
+                    validate_repository(&repo, &mut tracker)?;
+                    Ok((Value::Null, None))
                 });
                 if let Err(error) = startup {
                     let _ = ready_tx.send(Err(error.message.clone()));
@@ -309,7 +365,8 @@ impl Owner {
                             if reply.is_closed() {
                                 continue;
                             }
-                            let result = admitted_operation(&admission, || read(&repo, args));
+                            let result =
+                                admitted_operation(&admission, || read(&repo, args, &mut tracker));
                             deliver(reply, "read", result)?;
                         }
                         Command::Pin(args, reply, control) => {
@@ -317,7 +374,7 @@ impl Owner {
                                 continue;
                             }
                             let result = admitted_operation(&admission, || {
-                                pin(&repo, args, &reply, control)
+                                pin(&repo, args, &reply, control, &mut tracker)
                             });
                             deliver(reply, "pin", result)?;
                         }
@@ -325,9 +382,22 @@ impl Owner {
                             if reply.is_closed() {
                                 continue;
                             }
-                            let result =
-                                admitted_operation(&admission, || handoff(&repo, args, &reply));
+                            let result = admitted_operation(&admission, || {
+                                handoff(&repo, args, &reply, &mut tracker)
+                            });
                             deliver(reply, "handoff", result)?;
+                        }
+                        Command::RegisterLease(reply) => {
+                            let res = tracker.persist_lease_to_crdb(&repo);
+                            let _ = reply.send(res);
+                        }
+                        Command::RenewLease { force, reply } => {
+                            let res = tracker.renew_lease_if_due(&repo, force);
+                            let _ = reply.send(res);
+                        }
+                        Command::PeekDelta(reply) => {
+                            let res = tracker.peek_unnotified_beacons(&repo);
+                            let _ = reply.send(res);
                         }
                         Command::Shutdown(reply) => {
                             let _ = reply.send(Ok(()));
@@ -397,6 +467,32 @@ impl Owner {
             .ok_or("Private worker termination acknowledgment missing")?
             .map_err(|error| format!("Private worker termination: {error}"))?;
         Ok(())
+    }
+    pub async fn register_session_lease(&self) -> Result<Value, String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(Command::RegisterLease(tx))
+            .await
+            .map_err(|_| "MCP owner unavailable".to_owned())?;
+        rx.await
+            .map_err(|_| "MCP lease registration dropped".to_owned())?
+    }
+    pub async fn renew_session_lease(&self, force: bool) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(Command::RenewLease { force, reply: tx })
+            .await
+            .map_err(|_| "MCP owner unavailable".to_owned())?;
+        rx.await
+            .map_err(|_| "MCP lease renewal dropped".to_owned())?
+    }
+    pub async fn peek_unnotified_delta(&self) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(Command::PeekDelta(tx))
+            .await
+            .map_err(|_| "MCP owner unavailable".to_owned())?;
+        rx.await.map_err(|_| "MCP delta peek dropped".to_owned())?
     }
     pub async fn shutdown(self) -> Result<(), Box<dyn Error>> {
         let (tx, rx) = oneshot::channel();
@@ -581,7 +677,21 @@ impl ServerHandler for ContextServer {
         };
         drop(permit);
         Ok(match result {
-            Ok(value) => CallToolResult::structured(value),
+            Ok((value, delta)) => {
+                if delta.is_some() {
+                    #[cfg(feature = "private-http-probe")]
+                    let send_notify = self.http_lifetime.is_none();
+                    #[cfg(not(feature = "private-http-probe"))]
+                    let send_notify = true;
+                    if send_notify {
+                        let _ = context
+                            .peer
+                            .notify_resource_updated(build_resource_updated_param())
+                            .await;
+                    }
+                }
+                attach_bus_delta_to_tool_result(CallToolResult::structured(value), delta.as_ref())
+            }
             Err(error) => CallToolResult::structured_error(json!({"error":error})),
         }
         .into())

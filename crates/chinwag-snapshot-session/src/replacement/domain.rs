@@ -860,3 +860,475 @@ pub(super) fn record_memory_pin(native: &Connection, r: MemoryPinRecord) -> Resu
     decision.dirty = true;
     Ok(decision)
 }
+
+pub const LIVE_COORD_BEACON_THREAD_ID: &str = "chinwag-live-coord-beacons";
+pub const LIVE_SESSION_LEASE_CLAIM_ID: &str = "__live_session_lease__";
+
+fn is_valid_beacon_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "TASK_CREATED" | "CLAIM_ACQUIRED" | "PR_OPENED" | "PR_MERGED" | "RELEASE_BUILT"
+    )
+}
+
+fn short_hex_digest(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let bytes = hasher.finalize();
+    bytes[..12].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub struct LiveCoordBeaconRecord {
+    id: String,
+    kind: String,
+    actor: String,
+    repo_id: String,
+    branch_ref: String,
+    worktree: String,
+    ticket_id: String,
+    claimed_paths: Vec<String>,
+    payload_json: String,
+    authority_event_hash: String,
+    lease_expires_at_ms: i64,
+    created_at_ms: i64,
+}
+
+impl LiveCoordBeaconRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        id: String,
+        kind: String,
+        actor: String,
+        repo_id: String,
+        branch_ref: String,
+        worktree: String,
+        ticket_id: String,
+        claimed_paths: Vec<String>,
+        payload_json: String,
+        authority_event_hash: String,
+        lease_expires_at_ms: i64,
+        created_at_ms: i64,
+    ) -> std::result::Result<Self, &'static str> {
+        if id.is_empty()
+            || actor.is_empty()
+            || !is_valid_beacon_kind(&kind)
+            || created_at_ms < 0
+            || lease_expires_at_ms < 0
+        {
+            return Err("live_coord_beacon_required_fields");
+        }
+        if [
+            &id,
+            &kind,
+            &actor,
+            &repo_id,
+            &branch_ref,
+            &worktree,
+            &ticket_id,
+            &payload_json,
+            &authority_event_hash,
+        ]
+        .iter()
+        .any(|s| s.len() > crate::MAX_VALUE_BYTES)
+            || claimed_paths.len() > 256
+            || claimed_paths
+                .iter()
+                .any(|p| p.is_empty() || p.len() > crate::MAX_VALUE_BYTES)
+        {
+            return Err("live_coord_beacon_value_limit");
+        }
+        Ok(Self {
+            id,
+            kind,
+            actor,
+            repo_id,
+            branch_ref,
+            worktree,
+            ticket_id,
+            claimed_paths,
+            payload_json,
+            authority_event_hash,
+            lease_expires_at_ms,
+            created_at_ms,
+        })
+    }
+
+    pub(super) fn digest(&self) -> [u8; 32] {
+        let joined = self.claimed_paths.join("\x1f");
+        digest(
+            "live_coord_beacon_v1",
+            &[
+                &self.id,
+                &self.kind,
+                &self.actor,
+                &self.repo_id,
+                &self.branch_ref,
+                &self.worktree,
+                &self.ticket_id,
+                &joined,
+                &self.payload_json,
+                &self.authority_event_hash,
+            ],
+            &[self.lease_expires_at_ms, self.created_at_ms],
+        )
+    }
+}
+
+pub(super) fn record_live_coord_beacon(
+    native: &Connection,
+    r: LiveCoordBeaconRecord,
+) -> Result<Decision> {
+    let thread_id = LIVE_COORD_BEACON_THREAD_ID.to_owned();
+    let existing_msg = one_row(native.query(
+        c"SELECT role FROM messages WHERE id=?1 AND thread_id=?2",
+        &[Value::Text(r.id.clone()), Value::Text(thread_id.clone())],
+    )?)?;
+    if let Some([Value::Text(role)]) = existing_msg.as_deref() {
+        let seq = role
+            .split(':')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        return bound(Decision {
+            dirty: false,
+            response: json!({
+                "beacon_id": &r.id,
+                "kind": &r.kind,
+                "seq": seq,
+                "ticket_id": &r.ticket_id,
+                "replayed": true
+            }),
+            outcome: "live_coord_beacon_replayed",
+            is_error: false,
+        });
+    }
+
+    let count_rows = native.query(
+        c"SELECT COUNT(*) FROM messages WHERE thread_id=?1",
+        &[Value::Text(thread_id.clone())],
+    )?;
+    let current_count = match count_rows.as_slice() {
+        [row] => match row.as_slice() {
+            [Value::Integer(n)] if *n >= 0 => *n as u64,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    let next_seq = current_count.saturating_add(1);
+    let role_tag = format!("{next_seq:012}:{}", r.kind);
+
+    let mut payload_val: serde_json::Value =
+        serde_json::from_str(&r.payload_json).unwrap_or_else(|_| json!({}));
+    let beacon_sig_verified = payload_val["sig_verified"].as_bool().unwrap_or(false);
+    let beacon_authorized_merger =
+        beacon_sig_verified && payload_val["authorized_merger"].as_bool().unwrap_or(false);
+    if let Some(obj) = payload_val.as_object_mut() {
+        obj.insert("seq".to_owned(), json!(next_seq));
+        obj.insert("beacon_id".to_owned(), json!(&r.id));
+        obj.insert("kind".to_owned(), json!(&r.kind));
+    }
+    let stored_body =
+        serde_json::to_string(&payload_val).map_err(|_| Error::Contract("Beacon JSON encode"))?;
+    if stored_body.len() > crate::MAX_VALUE_BYTES {
+        return Ok(refused("beacon_body_limit", "Beacon payload exceeds limit"));
+    }
+
+    let mut releasable_claim_ids: Vec<String> = Vec::new();
+    if r.kind == "PR_MERGED" && !r.ticket_id.is_empty() {
+        let actor_seat = r.actor.split('#').next().unwrap_or(&r.actor).trim();
+        let matching_claims = native.query(
+            c"SELECT c.id, c.owner_key_id, l.authority_event_hash, l.observed_expires_at_ms FROM agent_claims c LEFT JOIN leases l ON l.claim_id = c.id WHERE c.symbol_hash=?1",
+            &[Value::Text(r.ticket_id.clone())],
+        )?;
+        for row in matching_claims {
+            let (claim_id, owner_actor, lease_meta_opt, expires_opt) = match row.as_slice() {
+                [
+                    Value::Text(cid),
+                    Value::Text(owner),
+                    Value::Text(meta),
+                    Value::Integer(exp),
+                ] => (cid.clone(), owner.clone(), Some(meta.as_str()), Some(*exp)),
+                [
+                    Value::Text(cid),
+                    Value::Text(owner),
+                    Value::Null,
+                    Value::Null,
+                ] => (cid.clone(), owner.clone(), None, None),
+                _ => continue,
+            };
+            let is_active = expires_opt.is_some_and(|exp| exp >= r.created_at_ms);
+            if !is_active {
+                continue;
+            }
+            let lease_sig_verified = lease_meta_opt
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| v["sig_verified"].as_bool())
+                .unwrap_or(false);
+            let owner_seat = owner_actor.split('#').next().unwrap_or(&owner_actor).trim();
+            let same_owner_or_seat = r.actor == owner_actor
+                || (!actor_seat.eq_ignore_ascii_case("LOCAL-CLI")
+                    && !actor_seat.is_empty()
+                    && actor_seat.eq_ignore_ascii_case(owner_seat));
+            let authorized = if lease_sig_verified {
+                beacon_sig_verified && (same_owner_or_seat || beacon_authorized_merger)
+            } else {
+                same_owner_or_seat || beacon_authorized_merger
+            };
+            if !authorized {
+                return Ok(refused(
+                    "unauthorized_pr_merged_release",
+                    "Actor is not authorized to release active claims owned by another seat",
+                ));
+            }
+            releasable_claim_ids.push(claim_id);
+        }
+    }
+
+    let existing_thread = one_row(native.query(
+        c"SELECT id FROM threads WHERE id=?1",
+        &[Value::Text(thread_id.clone())],
+    )?)?;
+    if existing_thread.is_none() {
+        native.query(
+            c"INSERT INTO threads(id,repo_id,branch_ref,title,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+            &[
+                Value::Text(thread_id.clone()),
+                Value::Text(r.repo_id.clone()),
+                Value::Text(r.branch_ref.clone()),
+                Value::Text("Chinwag Universal Live Coordination Beacons".to_owned()),
+                Value::Integer(r.created_at_ms),
+                Value::Integer(r.created_at_ms),
+            ],
+        )?;
+    } else {
+        native.query(
+            c"UPDATE threads SET updated_at_ms=?2 WHERE id=?1",
+            &[
+                Value::Text(thread_id.clone()),
+                Value::Integer(r.created_at_ms),
+            ],
+        )?;
+    }
+
+    native.query(
+        c"INSERT INTO messages(id,thread_id,author_key_id,role,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+        &[
+            Value::Text(r.id.clone()),
+            Value::Text(thread_id),
+            Value::Text(r.actor.clone()),
+            Value::Text(role_tag),
+            Value::Text(stored_body),
+            Value::Integer(r.created_at_ms),
+        ],
+    )?;
+
+    let mut claims_upserted = 0_usize;
+    let mut claims_released = 0_usize;
+    if matches!(r.kind.as_str(), "CLAIM_ACQUIRED" | "TASK_CREATED") {
+        for path_glob in &r.claimed_paths {
+            if path_glob == "*" && r.kind == "TASK_CREATED" {
+                continue;
+            }
+            let claim_id = format!(
+                "claim-{}",
+                short_hex_digest(&[&r.actor, &r.ticket_id, path_glob])
+            );
+            let lease_id = format!("lease-{claim_id}");
+            let existing_claim = one_row(native.query(
+                c"SELECT id FROM agent_claims WHERE id=?1",
+                &[Value::Text(claim_id.clone())],
+            )?)?;
+            let claim_vals = [
+                Value::Text(claim_id.clone()),
+                Value::Text(path_glob.clone()),
+                Value::Text(r.ticket_id.clone()),
+                Value::Text(r.actor.clone()),
+                Value::Text(r.authority_event_hash.clone()),
+                Value::Integer(r.created_at_ms),
+            ];
+            if existing_claim.is_none() {
+                native.query(
+                    c"INSERT INTO agent_claims(id,file_path,symbol_hash,owner_key_id,authority_event_hash,observed_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                    &claim_vals,
+                )?;
+            } else {
+                native.query(
+                    c"UPDATE agent_claims SET file_path=?2,symbol_hash=?3,owner_key_id=?4,authority_event_hash=?5,observed_at_ms=?6 WHERE id=?1",
+                    &claim_vals,
+                )?;
+            }
+            let existing_lease = one_row(native.query(
+                c"SELECT id FROM leases WHERE id=?1",
+                &[Value::Text(lease_id.clone())],
+            )?)?;
+            let lease_meta = json!({
+                "worktree": &r.worktree,
+                "branch_ref": &r.branch_ref,
+                "ticket_id": &r.ticket_id,
+                "sig_verified": beacon_sig_verified,
+            })
+            .to_string();
+            let lease_vals = [
+                Value::Text(lease_id),
+                Value::Text(claim_id),
+                Value::Text(r.actor.clone()),
+                Value::Text(lease_meta),
+                Value::Integer(r.lease_expires_at_ms),
+                Value::Integer(r.created_at_ms),
+            ];
+            if existing_lease.is_none() {
+                native.query(
+                    c"INSERT INTO leases(id,claim_id,owner_key_id,authority_event_hash,observed_expires_at_ms,observed_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                    &lease_vals,
+                )?;
+            } else {
+                native.query(
+                    c"UPDATE leases SET claim_id=?2,owner_key_id=?3,authority_event_hash=?4,observed_expires_at_ms=?5,observed_at_ms=?6 WHERE id=?1",
+                    &lease_vals,
+                )?;
+            }
+            claims_upserted += 1;
+        }
+    } else if r.kind == "PR_MERGED" && !releasable_claim_ids.is_empty() {
+        let expired_ms = r.created_at_ms.saturating_sub(1).max(0);
+        for claim_id in releasable_claim_ids {
+            native.query(
+                c"UPDATE leases SET observed_expires_at_ms=?2,observed_at_ms=?3 WHERE claim_id=?1",
+                &[
+                    Value::Text(claim_id),
+                    Value::Integer(expired_ms),
+                    Value::Integer(r.created_at_ms),
+                ],
+            )?;
+            claims_released += 1;
+        }
+    }
+
+    bound(Decision {
+        dirty: true,
+        response: json!({
+            "beacon_id": &r.id,
+            "kind": &r.kind,
+            "seq": next_seq,
+            "ticket_id": &r.ticket_id,
+            "claims_upserted": claims_upserted,
+            "claims_released": claims_released,
+            "replayed": false
+        }),
+        outcome: "live_coord_beacon_stored",
+        is_error: false,
+    })
+}
+
+pub struct LiveSessionLeaseRecord {
+    actor_instance: String,
+    pid: u32,
+    worktree: String,
+    last_seen_seq: u64,
+    updated_at_ms: i64,
+    expires_at_ms: i64,
+}
+
+impl LiveSessionLeaseRecord {
+    pub fn try_new(
+        actor_instance: String,
+        pid: u32,
+        worktree: String,
+        last_seen_seq: u64,
+        updated_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> std::result::Result<Self, &'static str> {
+        if actor_instance.is_empty()
+            || pid == 0
+            || updated_at_ms < 0
+            || expires_at_ms < updated_at_ms
+            || actor_instance.len() > crate::MAX_VALUE_BYTES
+            || worktree.len() > crate::MAX_VALUE_BYTES
+        {
+            return Err("live_session_lease_fields");
+        }
+        Ok(Self {
+            actor_instance,
+            pid,
+            worktree,
+            last_seen_seq,
+            updated_at_ms,
+            expires_at_ms,
+        })
+    }
+
+    pub(super) fn digest(&self) -> [u8; 32] {
+        digest(
+            "live_session_lease_v1",
+            &[&self.actor_instance, &self.worktree],
+            &[
+                i64::from(self.pid),
+                self.last_seen_seq as i64,
+                self.updated_at_ms,
+                self.expires_at_ms,
+            ],
+        )
+    }
+}
+
+pub(super) fn record_live_session_lease(
+    native: &Connection,
+    r: LiveSessionLeaseRecord,
+) -> Result<Decision> {
+    let lease_id = format!(
+        "session-{}",
+        short_hex_digest(&[&r.actor_instance, &r.pid.to_string(), &r.worktree])
+    );
+    let metadata = json!({
+        "pid": r.pid,
+        "worktree": &r.worktree,
+        "last_seen_seq": r.last_seen_seq,
+        "updated_at_ms": r.updated_at_ms,
+    })
+    .to_string();
+    if metadata.len() > crate::MAX_VALUE_BYTES {
+        return Ok(refused(
+            "session_lease_limit",
+            "Session lease metadata exceeds limit",
+        ));
+    }
+    let existing = one_row(native.query(
+        c"SELECT id FROM leases WHERE id=?1",
+        &[Value::Text(lease_id.clone())],
+    )?)?;
+    let vals = [
+        Value::Text(lease_id.clone()),
+        Value::Text(LIVE_SESSION_LEASE_CLAIM_ID.to_owned()),
+        Value::Text(r.actor_instance.clone()),
+        Value::Text(metadata),
+        Value::Integer(r.expires_at_ms),
+        Value::Integer(r.updated_at_ms),
+    ];
+    if existing.is_none() {
+        native.query(
+            c"INSERT INTO leases(id,claim_id,owner_key_id,authority_event_hash,observed_expires_at_ms,observed_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+            &vals,
+        )?;
+    } else {
+        native.query(
+            c"UPDATE leases SET claim_id=?2,owner_key_id=?3,authority_event_hash=?4,observed_expires_at_ms=?5,observed_at_ms=?6 WHERE id=?1",
+            &vals,
+        )?;
+    }
+    bound(Decision {
+        dirty: true,
+        response: json!({
+            "lease_id": lease_id,
+            "actor_instance": r.actor_instance,
+            "pid": r.pid,
+            "worktree": r.worktree,
+            "last_seen_seq": r.last_seen_seq,
+            "expires_at_ms": r.expires_at_ms,
+        }),
+        outcome: "live_session_lease_stored",
+        is_error: false,
+    })
+}

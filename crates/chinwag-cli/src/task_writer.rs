@@ -2010,11 +2010,25 @@ pub fn commit_task_write(
     };
     let mut entry = match journal.reserve(journal_request)? {
         ReplayDispositionV1::Fresh(entry) => entry,
-        ReplayDispositionV1::Existing(entry) | ReplayDispositionV1::DuplicateRecorded(entry) => {
+        ReplayDispositionV1::Existing(mut entry)
+        | ReplayDispositionV1::DuplicateRecorded(mut entry) => {
             return match entry.state {
-                WriteOperationState::Recorded | WriteOperationState::Acknowledged => Ok(
-                    WriterWriteOutcome::DuplicateRecorded(WriterCommitProof::from_record(&entry)?),
-                ),
+                WriteOperationState::Recorded | WriteOperationState::Acknowledged => {
+                    let proof = WriterCommitProof::from_record(&entry)?;
+                    crate::live_coord::emit_task_writer_transition_beacon(
+                        &context.root.path,
+                        &request.operation_id,
+                        &request.admitted_task_ref.task_id,
+                        &request.admitted_task_ref.canonical_task_path,
+                        request.next_status.as_str(),
+                        &request.authenticated_signer_principal,
+                    )
+                    .map_err(std::io::Error::other)?;
+                    if entry.state == WriteOperationState::Recorded {
+                        journal_phase(journal, &mut entry, WriteOperationState::Acknowledged)?;
+                    }
+                    Ok(WriterWriteOutcome::DuplicateRecorded(proof))
+                }
                 WriteOperationState::Rejected => Ok(WriterWriteOutcome::Rejected),
                 WriteOperationState::Held => Ok(WriterWriteOutcome::Held),
                 WriteOperationState::FileCommitted => {
@@ -2026,6 +2040,15 @@ pub fn commit_task_write(
                         &mut record_projection,
                     )? {
                         RecoveredCommitOutcome::Committed(proof) => {
+                            crate::live_coord::emit_task_writer_transition_beacon(
+                                &context.root.path,
+                                &request.operation_id,
+                                &request.admitted_task_ref.task_id,
+                                &request.admitted_task_ref.canonical_task_path,
+                                request.next_status.as_str(),
+                                &request.authenticated_signer_principal,
+                            )
+                            .map_err(std::io::Error::other)?;
                             Ok(WriterWriteOutcome::DuplicateRecorded(*proof))
                         }
                         RecoveredCommitOutcome::RolledBack => Ok(WriterWriteOutcome::Rejected),
@@ -2223,7 +2246,18 @@ where
         _journal: &mut Journal,
         record: &JournalRecordV1,
     ) -> Result<WriterCommitProof, WriterError> {
-        WriterCommitProof::from_record(record)
+        let proof = WriterCommitProof::from_record(record)?;
+        let admitted = &self.request.admitted_task_ref;
+        crate::live_coord::emit_task_writer_transition_beacon(
+            &self.context.root.path,
+            &self.request.operation_id,
+            &admitted.task_id,
+            &admitted.canonical_task_path,
+            self.request.next_status.as_str(),
+            &self.request.authenticated_signer_principal,
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(proof)
     }
 }
 
@@ -3818,6 +3852,24 @@ pub fn classify_and_recover_prepared_operation(
                 ));
             }
             journal_phase(journal, &mut entry, WriteOperationState::Recorded)?;
+            if let Ok(task_ref) = TaskRefV1::decode(&entry.request.signed_task_ref)
+                && let Ok((committed_bytes, _)) = target.read()
+                && let Ok(committed_doc) = CanonicalTaskDocumentV1::from_bytes(&committed_bytes)
+                && let Some(task) = committed_doc
+                    .tasks
+                    .iter()
+                    .find(|t| t.task_id == task_ref.task_id)
+            {
+                crate::live_coord::emit_task_writer_transition_beacon(
+                    &context.root.path,
+                    &entry.request.operation_id,
+                    &task_ref.task_id,
+                    &task_ref.canonical_task_path,
+                    task.status.as_str(),
+                    &entry.request.signer_principal,
+                )
+                .map_err(std::io::Error::other)?;
+            }
             journal_phase(journal, &mut entry, WriteOperationState::Acknowledged)?;
             Ok(RecoveredCommitOutcome::Committed(Box::new(proof)))
         }

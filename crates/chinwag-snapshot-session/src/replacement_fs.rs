@@ -45,6 +45,27 @@ pub(super) struct Image {
     pub id: FileId,
     pub bytes: Vec<u8>,
 }
+impl Image {
+    pub(super) fn header_stamp(&self) -> Option<crate::CrdbHeaderStamp> {
+        if self.bytes.len() < 100 || &self.bytes[..16] != b"SQLite format 3\0" {
+            return None;
+        }
+        let sqlite_change_counter = u32::from_be_bytes([
+            self.bytes[24],
+            self.bytes[25],
+            self.bytes[26],
+            self.bytes[27],
+        ]);
+        let s = self.id.0;
+        Some(crate::CrdbHeaderStamp {
+            dev: s.dev as u64,
+            ino: s.ino,
+            sqlite_change_counter,
+            size: s.size,
+            mtime_nsec: s.times[0] * 1_000_000_000 + s.times[1],
+        })
+    }
+}
 #[derive(PartialEq, Eq)]
 pub(super) struct DetachedImage {
     pub id: DetachedId,

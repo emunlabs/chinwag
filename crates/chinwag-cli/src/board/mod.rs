@@ -3158,6 +3158,18 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
                     proof.metric_b_active_speedup, minted
                 ));
                 let _ = fs::write(&path, issue.to_markdown());
+                if let Some(repo_root) = tasks_dir.parent().and_then(|p| p.parent()) {
+                    let _ = crate::live_coord::emit_transactional_beacon(
+                        repo_root,
+                        &crate::live_coord::AutoBeaconRequest {
+                            kind: Some(crate::live_coord::BeaconKind::PrMerged),
+                            actor: None,
+                            ticket_id: issue.id.clone(),
+                            summary: Some(crate::live_coord::scrub_coord_text(&issue.title)),
+                            ..Default::default()
+                        },
+                    );
+                }
 
                 tribunal_promotions.push(json!({
                     "issue_id": issue.id,
@@ -3280,7 +3292,7 @@ pub fn run_board_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
     }
     let tasks_dir = resolve_tasks_dir(args);
     if let Some(repo_root) = tasks_dir.parent().and_then(|p| p.parent()) {
-        emit_active_crisis_alert_if_any(repo_root, stderr);
+        let _ = crate::live_coord::emit_live_coord_delta_if_any(repo_root, stderr);
     }
     if matches!(sub, "watch" | "sync-loop") {
         return run_board_sync_loop(args, stdout, stderr);
@@ -5074,9 +5086,102 @@ fn run_board_add_or_move(
             return emit_h_board_rejection(&violation, stdout, stderr);
         }
     }
+    // Persist canonical board card first, then commit transactional CRDB auto-beacon
+    // (rolling back the board card if CRDB refuses so claims are never prematurely released).
+    let previous_issue_bytes = fs::read(&issue_path).ok();
     if let Err(e) = fs::write(&issue_path, issue.to_markdown()) {
         let _ = writeln!(stderr, "chinwag board {sub}: {e}");
         return 1;
+    }
+
+    let rollback_issue_file = || match &previous_issue_bytes {
+        Some(prev) => {
+            let _ = fs::write(&issue_path, prev);
+        }
+        None => {
+            let _ = fs::remove_file(&issue_path);
+        }
+    };
+
+    if crate::live_coord::resolve_coord_store_root(&repo_root)
+        .join(".chinwag")
+        .join("state.crdb")
+        .is_file()
+    {
+        let claimed_globs: Vec<String> = issue
+            .file_scope
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let safe_summary = crate::live_coord::scrub_coord_text(&issue.title);
+        if sub == "add"
+            && target_status != BoardStatus::InFlight
+            && let Err(e) = crate::live_coord::emit_transactional_beacon(
+                &repo_root,
+                &crate::live_coord::AutoBeaconRequest {
+                    kind: Some(crate::live_coord::BeaconKind::TaskCreated),
+                    actor: from_actor.clone(),
+                    ticket_id: id.clone(),
+                    worktree: worktree.clone(),
+                    branch_ref: branch.clone(),
+                    summary: Some(safe_summary.clone()),
+                    ..Default::default()
+                },
+            )
+        {
+            rollback_issue_file();
+            let _ = writeln!(stderr, "chinwag board {sub}: live-coord beacon failed: {e}");
+            return 1;
+        }
+        let transition_kind = match target_status {
+            BoardStatus::InFlight => Some(crate::live_coord::BeaconKind::ClaimAcquired),
+            BoardStatus::TribunalGate => Some(crate::live_coord::BeaconKind::PrOpened),
+            BoardStatus::ShippedVerified => Some(crate::live_coord::BeaconKind::PrMerged),
+            _ => None,
+        };
+        if let Some(kind) = transition_kind {
+            if sub == "add"
+                && kind == crate::live_coord::BeaconKind::ClaimAcquired
+                && let Err(e) = crate::live_coord::emit_transactional_beacon(
+                    &repo_root,
+                    &crate::live_coord::AutoBeaconRequest {
+                        kind: Some(crate::live_coord::BeaconKind::TaskCreated),
+                        actor: from_actor.clone(),
+                        ticket_id: id.clone(),
+                        worktree: worktree.clone(),
+                        branch_ref: branch.clone(),
+                        summary: Some(safe_summary.clone()),
+                        ..Default::default()
+                    },
+                )
+            {
+                rollback_issue_file();
+                let _ = writeln!(stderr, "chinwag board {sub}: live-coord beacon failed: {e}");
+                return 1;
+            }
+            if let Err(e) = crate::live_coord::emit_transactional_beacon(
+                &repo_root,
+                &crate::live_coord::AutoBeaconRequest {
+                    kind: Some(kind),
+                    actor: from_actor.clone(),
+                    ticket_id: id.clone(),
+                    worktree: worktree.clone(),
+                    branch_ref: branch.clone(),
+                    claimed_paths: if kind == crate::live_coord::BeaconKind::ClaimAcquired {
+                        claimed_globs
+                    } else {
+                        Vec::new()
+                    },
+                    summary: Some(safe_summary),
+                    ..Default::default()
+                },
+            ) {
+                rollback_issue_file();
+                let _ = writeln!(stderr, "chinwag board {sub}: live-coord beacon failed: {e}");
+                return 1;
+            }
+        }
     }
 
     if let Some(ref actor) = from_actor {

@@ -93,6 +93,14 @@ pub fn run_init(request: InitRequest, out: &mut dyn Write, err: &mut dyn Write) 
                 value["signature_verified"] = json!(true);
                 value["signing_confirmation"] = json!("confirmed_before_store");
                 attach_proof(&mut value, token.proof());
+                if let Err(hook_reason) =
+                    crate::live_coord::validate_repo_local_git_hooks_precondition(&repo)
+                {
+                    value["result"] = json!("git_hooks_refused");
+                    value["stage"] = json!("git_hooks");
+                    value["reason"] = json!(hook_reason);
+                    return failed_report(value, out, err);
+                }
                 value["stage"] = json!("store");
                 value["store_attempted"] = json!(true);
                 let receipt = match token
@@ -128,12 +136,38 @@ pub fn run_init(request: InitRequest, out: &mut dyn Write, err: &mut dyn Write) 
                     "sha256": hex(&receipt.store().sha256()),
                     "bytes": receipt.store().bytes(),
                 });
+                let mut git_hooks_refused_reason: Option<String> = None;
+                match crate::live_coord::install_repo_local_claim_floor(&repo) {
+                    Ok(hook_receipt) => {
+                        value["git_claim_hooks_installed"] = json!(true);
+                        value["installed_git_hooks"] = json!(hook_receipt.installed_hooks);
+                        value["active_work_path"] = json!(crate::live_coord::ACTIVE_WORK_REL_PATH);
+                    }
+                    Err(e) if e == "missing_dot_git" => {
+                        value["git_claim_hooks_installed"] = json!(false);
+                    }
+                    Err(e) => {
+                        value["git_claim_hooks_installed"] = json!(false);
+                        if !editor_refused {
+                            value["result"] = json!("local_initialized_git_hooks_unconfirmed");
+                            value["reason"] = json!(&e);
+                            value["stage"] = json!("git_hooks");
+                        }
+                        git_hooks_refused_reason = Some(e);
+                    }
+                }
                 if emit(out, &value).is_err() {
                     let _ = writeln!(err, "chinwag: output_failed");
                     return 1;
                 }
                 if editor_refused {
                     let reason = value["reason"].as_str().unwrap_or("editor_unconfirmed");
+                    if writeln!(err, "chinwag: {reason}").is_err() {
+                        return 1;
+                    }
+                    return 3;
+                }
+                if let Some(reason) = git_hooks_refused_reason {
                     if writeln!(err, "chinwag: {reason}").is_err() {
                         return 1;
                     }

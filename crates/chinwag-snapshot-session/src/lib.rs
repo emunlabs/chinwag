@@ -32,6 +32,46 @@ pub struct NativeCounts {
 pub fn native_counts_for_private_probe() -> NativeCounts {
     native::counts()
 }
+
+/// Fast `<0.05ms` lock-free change stamp `(dev, ino, sqlite_file_change_counter, len, mtime_nsec)`
+/// read from the 100-byte SQLite header of `.chinwag/state.crdb` (no symlink follow).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrdbHeaderStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub sqlite_change_counter: u32,
+    pub size: u64,
+    pub mtime_nsec: i128,
+}
+
+pub fn fast_crdb_header_stamp(repo_root: &std::path::Path) -> Option<CrdbHeaderStamp> {
+    use rustix::fs::{Mode, OFlags, fstat, openat};
+    use std::io::Read;
+    let crdb_path = repo_root.join(".chinwag").join("state.crdb");
+    let fd = openat(
+        rustix::fs::CWD,
+        &crdb_path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let st = fstat(&fd).ok()?;
+    let mut file = std::fs::File::from(fd);
+    let mut header = [0_u8; 100];
+    file.read_exact(&mut header).ok()?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return None;
+    }
+    let sqlite_change_counter =
+        u32::from_be_bytes([header[24], header[25], header[26], header[27]]);
+    Some(CrdbHeaderStamp {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        sqlite_change_counter,
+        size: st.st_size.max(0) as u64,
+        mtime_nsec: i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec),
+    })
+}
 #[derive(Debug, PartialEq)]
 pub struct ThreadContext {
     pub thread: Rows,
@@ -143,6 +183,56 @@ impl SnapshotSession {
                 &[],
             )
             .map_err(SessionError::Native)
+    }
+    pub fn live_coord_beacons(&self) -> SessionResult<Rows> {
+        self.connection()?
+            .query(
+                c"SELECT id,author_key_id,role,body,created_at_ms FROM messages WHERE thread_id='chinwag-live-coord-beacons' ORDER BY role DESC, id DESC LIMIT 256",
+                &[],
+            )
+            .map_err(SessionError::Native)
+    }
+    pub fn live_coord_claims_and_leases(&self, now_ms: i64) -> SessionResult<(Rows, Rows)> {
+        let conn = self.connection()?;
+        let claims = conn
+            .query(
+                c"SELECT id,file_path,symbol_hash,owner_key_id,authority_event_hash,observed_at_ms FROM agent_claims WHERE id IN (SELECT claim_id FROM leases WHERE observed_expires_at_ms >= ?1) ORDER BY observed_at_ms DESC, id ASC LIMIT 512",
+                &[Value::Integer(now_ms)],
+            )
+            .map_err(SessionError::Native)?;
+        let leases = conn
+            .query(
+                c"SELECT id,claim_id,owner_key_id,authority_event_hash,observed_expires_at_ms,observed_at_ms FROM leases WHERE observed_expires_at_ms >= ?1 ORDER BY observed_at_ms DESC, id ASC LIMIT 512",
+                &[Value::Integer(now_ms)],
+            )
+            .map_err(SessionError::Native)?;
+        Ok((claims, leases))
+    }
+    pub fn pragma_data_and_db_version(&self) -> SessionResult<(i64, i64)> {
+        let conn = self.connection()?;
+        let data_ver = match conn
+            .query(c"PRAGMA data_version", &[])
+            .map_err(SessionError::Native)?
+            .as_slice()
+        {
+            [row] => match row.as_slice() {
+                [Value::Integer(v)] => *v,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        let db_ver = match conn
+            .query(c"SELECT crsql_db_version()", &[])
+            .map_err(SessionError::Native)?
+            .as_slice()
+        {
+            [row] => match row.as_slice() {
+                [Value::Integer(v)] => *v,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        Ok((data_ver, db_ver))
     }
     pub fn finish(mut self) -> SessionResult<SessionReceipt> {
         let mut native = self

@@ -6,6 +6,7 @@ mod http_lifetime;
 mod http_probe;
 #[cfg(all(test, feature = "private-http-probe"))]
 mod http_tests;
+pub mod live_coord_mcp;
 mod owner;
 pub mod profile;
 #[cfg(test)]
@@ -179,14 +180,52 @@ fn run(path: PathBuf, require_repository: bool) -> Result<(), Box<dyn Error>> {
 }
 
 async fn serve(path: PathBuf, require_repository: bool) -> Result<(), Box<dyn Error>> {
-    let (server, owner): (ContextServer, Owner) = Owner::start(path, require_repository).await?;
+    let (server, owner): (ContextServer, Owner) =
+        Owner::start(path.clone(), require_repository).await?;
+    if require_repository {
+        let _ = owner.register_session_lease().await;
+    }
     let transport = AsyncRwTransport::new(
         tokio::io::stdin(),
         wire::BoundedWriter::new(tokio::io::stdout()),
     )
     .with_max_line_length(wire::MAX_INPUT_BYTES);
     let outcome = async {
-        server.serve(transport).await?.waiting().await?;
+        let running = server.serve(transport).await?;
+        let peer = running.peer().clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let watch_owner_ref = &owner;
+        let wait_fut = running.waiting();
+        let watch_fut = async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = interval.tick() => {
+                        if !require_repository {
+                            continue;
+                        }
+                        let _ = watch_owner_ref.renew_session_lease(false).await;
+                        if let Ok(true) = watch_owner_ref.peek_unnotified_delta().await {
+                            let _ = peer
+                                .notify_resource_updated(live_coord_mcp::build_resource_updated_param())
+                                .await;
+                        }
+                    }
+                }
+            }
+        };
+        tokio::pin!(wait_fut);
+        tokio::pin!(watch_fut);
+        let wait_res = tokio::select! {
+            res = &mut wait_fut => {
+                let _ = stop_tx.send(());
+                res
+            }
+            _ = &mut watch_fut => wait_fut.await,
+        };
+        wait_res?;
         Ok::<(), Box<dyn Error>>(())
     }
     .await;
