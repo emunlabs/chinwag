@@ -6,18 +6,21 @@
 
 use chinwag_cleanroom_vm::{
     CleanroomDiagnosticInput, CleanroomSeatbeltSpec, CleanroomVmError, EnvLockError,
-    EphemeralTartSession, HostHardwareTelemetry, JobTriggerContext, MAX_DRAIN_BUDGET_MS,
-    MAX_VIRTIOFS_MOUNT_LATENCY_MS, MAX_VMS_PER_MAC_HOST, NetworkEgressPolicy, PoolAdmissionPolicy,
+    EphemeralTartSession, GUEST_NIX_STORE_MOUNT, GUEST_SCCACHE_MOUNT, GUEST_WORKTREE_MOUNT,
+    HostHardwareTelemetry, JobTriggerContext, MAX_DRAIN_BUDGET_MS, MAX_VIRTIOFS_MOUNT_LATENCY_MS,
+    MAX_VMS_PER_MAC_HOST, NetworkEgressPolicy, PoolAdmissionPolicy, ProcessTartExecutor,
     ReleaseRefPolicy, ReleaseSignerAttestation, RunnerPoolController, RunnerTrustProfile,
     RunningTartVm, SeatbeltError, SeatbeltSignalMode, StoreClosureEntry, TartCleanroomSpec,
     TartCommandRecord, TartExecutor, ThermalPressure, TrustPoolError, VirtioFsAccess,
-    VirtioFsMount, acquire_host_vm_slot, compile_seatbelt_profile, compile_workspace_env_lock,
-    count_active_slot_leases, evaluate_trust_gate, evaluate_trust_gate_with_policy,
-    generate_receipt_signing_key, generate_recipient_kem_keypair, open_failure_diagnostic_bundle,
-    parse_openssh_allowed_signers_ed25519, scrub_diagnostic_secrets,
-    seal_failure_diagnostic_bundle, serialize_nar_v1, sign_env_lock_receipt,
-    signing_key_from_seed_file, verify_env_lock_bundle, verify_env_lock_bundle_with_signers,
-    verify_env_lock_receipt, write_env_lock_bundle,
+    VirtioFsMount, acquire_host_vm_slot, atomic_write_regular_file, compile_seatbelt_profile,
+    compile_workspace_env_lock, count_active_slot_leases, evaluate_trust_gate,
+    evaluate_trust_gate_with_policy, generate_receipt_signing_key, generate_recipient_kem_keypair,
+    open_failure_diagnostic_bundle, parse_darwin_ioreg_hid_active, parse_darwin_pmset_therm,
+    parse_darwin_top_cpu_idle, parse_openssh_allowed_signers_ed25519, reap_dead_slot_leases,
+    scrub_diagnostic_secrets, seal_failure_diagnostic_bundle, serialize_nar_v1,
+    sign_env_lock_receipt, signing_key_from_seed_file, verify_env_lock_bundle,
+    verify_env_lock_bundle_with_signers, verify_env_lock_receipt, verify_host_mount_directory,
+    verify_mounted_store_closures, verify_trusted_executable_path, write_env_lock_bundle,
 };
 use ed25519_dalek::SigningKey;
 use std::cell::RefCell;
@@ -189,6 +192,9 @@ fn tart_spec_generates_clone_set_run_ro_and_delete_argv() {
         vec![
             "run",
             "--no-graphics",
+            "--no-clipboard",
+            "--no-audio",
+            "--net-softnet",
             "--dir=nix-store:/nix/store:ro",
             "--dir=sccache:/var/tmp/sccache:ro",
             "cleanroom-job-42"
@@ -429,6 +435,7 @@ fn macos_sandbox_exec_kernel_enforces_read_only_store_and_writable_worktree() {
     // 1. Reading `/nix/store` and writing inside isolated `worktree` MUST succeed
     let allowed_target = worktree.join("artifact.txt");
     let ok_out = Command::new("/usr/bin/sandbox-exec")
+        .current_dir(&worktree)
         .args(["-p", &profile.sbpl, "/bin/cp"])
         .arg(&existing_drv)
         .arg(&allowed_target)
@@ -447,6 +454,7 @@ fn macos_sandbox_exec_kernel_enforces_read_only_store_and_writable_worktree() {
     // 2. Attempting to mutate the read-only Nix store MUST be kernel-blocked!
     let tampered_store_file = mock_nix_store.join("tampered-payload");
     let deny_out = Command::new("/usr/bin/sandbox-exec")
+        .current_dir(&worktree)
         .args(["-p", &profile.sbpl, "/usr/bin/touch"])
         .arg(&tampered_store_file)
         .output()
@@ -456,6 +464,22 @@ fn macos_sandbox_exec_kernel_enforces_read_only_store_and_writable_worktree() {
         "XNU Seatbelt must block writes to read-only Nix store"
     );
     assert!(!tampered_store_file.exists());
+
+    // 3. Default-deny file-read* (`[F-01]`): reading an unmounted host secret file MUST be kernel-blocked!
+    let unmounted_secret_dir = canon.join("host-private-secrets");
+    fs::create_dir_all(&unmounted_secret_dir).unwrap();
+    let secret_file = unmounted_secret_dir.join("id_ed25519");
+    fs::write(&secret_file, b"TOP_SECRET_HOST_KEY").unwrap();
+    let deny_read = Command::new("/usr/bin/sandbox-exec")
+        .current_dir(&worktree)
+        .args(["-p", &profile.sbpl, "/bin/cat"])
+        .arg(&secret_file)
+        .output()
+        .expect("invoke sandbox-exec read deny check");
+    assert!(
+        !deny_read.status.success(),
+        "XNU Seatbelt default-deny file-read* must block reading unmounted host paths"
+    );
 }
 
 // ============================================================================
@@ -1190,10 +1214,14 @@ fn ephemeral_tart_session_with_seatbelt_executes_guest_sandbox_exec_and_deletes_
     );
     assert_eq!(st.log[4].argv[0], "exec");
     assert_eq!(st.log[4].argv[1], "sandboxed-run-1");
-    assert_eq!(st.log[4].argv[2], "/usr/bin/sandbox-exec");
-    assert_eq!(st.log[4].argv[3], "-p");
-    assert!(st.log[4].argv[4].contains("(deny file-write* (subpath \"/nix/store\")"));
-    assert_eq!(&st.log[4].argv[5..], &["--", "cargo", "test", "--offline"]);
+    assert_eq!(st.log[4].argv[2], "--");
+    assert_eq!(st.log[4].argv[3], "/usr/bin/sandbox-exec");
+    assert_eq!(st.log[4].argv[4], "-p");
+    assert!(st.log[4].argv[5].contains("(deny file-write* (subpath \"/nix/store\")"));
+    assert_eq!(
+        &st.log[4].argv[6..],
+        &["--", "/usr/bin/env", "-i", "cargo", "test", "--offline"]
+    );
     drop(st);
 
     // Also verify workload `exec` failure STILL runs `stop` + `reap-run` + `delete`
@@ -1400,4 +1428,646 @@ fn custom_release_ref_policy_supports_customer_release_branches_and_prefixes() {
     };
     let dec = evaluate_trust_gate_with_policy(&ctx, &BTreeMap::new(), &[pk], &policy).unwrap();
     assert!(dec.allow_release_keys);
+}
+
+// ============================================================================
+// Security Audit Remediation Regression Suite (`[F-01]`..`[F-09]` & `[F-11]`)
+// ============================================================================
+
+#[test]
+fn f01_seatbelt_default_deny_forbids_allow_default_and_scopes_network_and_reads() {
+    let pub_spec = CleanroomSeatbeltSpec::new(
+        RunnerTrustProfile::Public,
+        "/nix/store",
+        "/var/tmp/sccache",
+        "/private/tmp/worktree-f01",
+        "/private/tmp/scratch-f01",
+    )
+    .unwrap();
+    let pub_profile = compile_seatbelt_profile(&pub_spec).unwrap();
+    assert!(!pub_profile.sbpl.contains("(allow default)"));
+    assert!(pub_profile.sbpl.contains("(deny default)"));
+    assert!(pub_profile.sbpl.contains("(deny file-read*)"));
+    assert!(pub_profile.sbpl.contains("(deny file-write*)"));
+    assert!(pub_profile.sbpl.contains("(deny network*)"));
+    assert!(pub_profile.sbpl.contains("(deny network-inbound)"));
+    assert!(pub_profile.sbpl.contains("(deny network-bind)"));
+    assert!(
+        pub_profile
+            .sbpl
+            .contains("(deny file-read* (regex #\"/\\.ssh(/|$)\"))")
+    );
+    assert!(
+        pub_profile
+            .sbpl
+            .contains("(deny file-read* (regex #\"/Library/Keychains(/|$)\"))")
+    );
+    assert!(
+        pub_profile
+            .sbpl
+            .contains("(deny file-read* (regex #\"/Users/[^/]+/\\.chinwag(/|$)\"))")
+    );
+
+    // Offline mode emits zero outbound network allow rules
+    let offline_spec = pub_spec
+        .clone()
+        .with_network_policy(NetworkEgressPolicy::Offline)
+        .unwrap();
+    let offline_profile = compile_seatbelt_profile(&offline_spec).unwrap();
+    assert!(!offline_profile.sbpl.contains("(allow network-outbound"));
+
+    // Public profile cannot enable release upload/notarization network policy
+    assert_eq!(
+        pub_spec.with_network_policy(NetworkEgressPolicy::ScopedReleaseUploadAndNotarization),
+        Err(SeatbeltError::NetworkPolicyProfileMismatch(
+            NetworkEgressPolicy::ScopedReleaseUploadAndNotarization
+        ))
+    );
+
+    // Release profile ALSO retains Keychain, SSH, and ~/.chinwag denies
+    let rel_spec = CleanroomSeatbeltSpec::new(
+        RunnerTrustProfile::Release,
+        "/nix/store",
+        "/var/tmp/sccache",
+        "/private/tmp/worktree-rel-f01",
+        "/private/tmp/scratch-rel-f01",
+    )
+    .unwrap();
+    let rel_profile = compile_seatbelt_profile(&rel_spec).unwrap();
+    assert!(!rel_profile.sbpl.contains("(allow default)"));
+    assert!(
+        rel_profile
+            .sbpl
+            .contains("(deny file-read* (regex #\"/\\.ssh(/|$)\"))")
+    );
+    assert!(
+        rel_profile
+            .sbpl
+            .contains("(deny file-read* (regex #\"/Library/Keychains(/|$)\"))")
+    );
+    assert!(
+        rel_profile
+            .sbpl
+            .contains("(deny file-read* (regex #\"/Users/[^/]+/\\.chinwag(/|$)\"))")
+    );
+}
+
+#[test]
+fn f02_seatbelt_rejects_repeated_slashes_root_mounts_and_canonicalizes_var_tmp_overlap() {
+    for invalid in [
+        "/nix//store",
+        "/var/tmp//sccache",
+        "/",
+        "/Users",
+        "/System",
+        "/tmp",
+        "/nix/store/",
+    ] {
+        assert!(
+            matches!(
+                CleanroomSeatbeltSpec::new(
+                    RunnerTrustProfile::Public,
+                    invalid,
+                    "/var/tmp/sccache",
+                    "/private/tmp/worktree",
+                    "/private/tmp/scratch",
+                ),
+                Err(SeatbeltError::InvalidPath(_))
+            ),
+            "expected `{invalid}` to fail strict SBPL normalization"
+        );
+    }
+
+    // `/var/tmp/shared-ro` canonicalizes to `/private/var/tmp/shared-ro`, catching overlap!
+    assert!(matches!(
+        CleanroomSeatbeltSpec::new(
+            RunnerTrustProfile::Public,
+            "/nix/store",
+            "/var/tmp/shared-ro",
+            "/private/var/tmp/shared-ro/nested-worktree",
+            "/private/tmp/scratch",
+        ),
+        Err(SeatbeltError::ReadOnlyOverlap(_, _))
+    ));
+}
+
+#[test]
+fn f03_seatbelt_serde_try_from_blocks_bypass_and_guest_virtiofs_hides_host_paths() {
+    let overlap_json = r#"{
+        "trust_profile": "chinwag-ephemeral-public",
+        "nix_store_path": "/nix/store",
+        "sccache_path": "/private/var/tmp/sccache",
+        "writable_worktree": "/nix/store/sneaky-overlap",
+        "writable_scratch": "/private/tmp/scratch"
+    }"#;
+    assert!(serde_json::from_str::<CleanroomSeatbeltSpec>(overlap_json).is_err());
+
+    let public_rel_json = r#"{
+        "trust_profile": "chinwag-ephemeral-public",
+        "nix_store_path": "/nix/store",
+        "sccache_path": "/private/var/tmp/sccache",
+        "writable_worktree": "/private/tmp/worktree",
+        "writable_scratch": "/private/tmp/scratch",
+        "release_signing_dir": "/private/tmp/signing-lease"
+    }"#;
+    assert!(serde_json::from_str::<CleanroomSeatbeltSpec>(public_rel_json).is_err());
+
+    let guest_spec = CleanroomSeatbeltSpec::for_guest_virtiofs(
+        RunnerTrustProfile::Public,
+        "vm-pr-97",
+        "/private/tmp",
+    )
+    .unwrap();
+    let guest_sbpl = compile_seatbelt_profile(&guest_spec).unwrap();
+    assert!(guest_sbpl.sbpl.contains(GUEST_NIX_STORE_MOUNT));
+    assert!(guest_sbpl.sbpl.contains(GUEST_SCCACHE_MOUNT));
+    assert!(guest_sbpl.sbpl.contains(GUEST_WORKTREE_MOUNT));
+    assert!(guest_sbpl.sbpl.contains("/private/tmp/vm-pr-97-worktree"));
+    assert!(guest_sbpl.sbpl.contains("/private/tmp/vm-pr-97-scratch"));
+}
+
+#[test]
+fn f04_tart_run_argv_enforces_no_clipboard_no_audio_and_softnet_cidr_policy() {
+    let base =
+        TartCleanroomSpec::new("base-img", "run-vm-4", "/nix/store", "/var/tmp/sccache").unwrap();
+    let argv = base.run_argv();
+    assert!(argv.contains(&"--no-graphics".to_owned()));
+    assert!(argv.contains(&"--no-clipboard".to_owned()));
+    assert!(argv.contains(&"--no-audio".to_owned()));
+    assert!(argv.contains(&"--net-softnet".to_owned()));
+
+    let offline = base
+        .clone()
+        .with_network_egress(NetworkEgressPolicy::Offline, vec!["1.1.1.1/32".to_owned()])
+        .unwrap();
+    assert!(
+        offline
+            .run_argv()
+            .contains(&"--net-softnet-allow=127.0.0.1/32".to_owned())
+    );
+
+    let scoped = base
+        .clone()
+        .with_network_egress(
+            NetworkEgressPolicy::RegistriesAndBinaryCacheOnly,
+            vec!["1.1.1.1/32".to_owned(), "2606:4700::/32".to_owned()],
+        )
+        .unwrap();
+    assert!(
+        scoped
+            .run_argv()
+            .contains(&"--net-softnet-allow=1.1.1.1/32,2606:4700::/32".to_owned())
+    );
+
+    for bad_cidr in [
+        "-inject/32",
+        "10.0.0.1",
+        "10.0.0.1/33",
+        "10.0.0.1/24,0.0.0.0/0",
+        "not-an-ip/24",
+    ] {
+        assert!(matches!(
+            base.clone().with_network_egress(
+                NetworkEgressPolicy::RegistriesAndBinaryCacheOnly,
+                vec![bad_cidr.to_owned()]
+            ),
+            Err(CleanroomVmError::InvalidEgressCidr(_))
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn f05_virtiofs_and_tart_spec_serde_and_live_host_mount_reject_symlinks_and_broad_roots() {
+    use std::os::unix::fs::symlink;
+
+    for blocked in [
+        "/",
+        "/Users",
+        "/Users/alice",
+        "/Users/alice/.ssh",
+        "/Users/alice/.chinwag",
+        "/Users/alice/Library/Keychains",
+        "/System/Library",
+        "/Volumes/MacintoshHD",
+        "/private/etc/ssl",
+        "/etc/ssl",
+        "/var/root/secret",
+    ] {
+        assert!(
+            VirtioFsMount::read_only("worktree", blocked, VirtioFsAccess::ReadOnly).is_err(),
+            "broad or sensitive host path `{blocked}` must be rejected"
+        );
+    }
+
+    // Deserializing `:rw` or `run_vm_name == base_image` via serde_json MUST fail closed!
+    assert!(
+        serde_json::from_str::<VirtioFsMount>(
+            r#"{"tag":"nix-store","host_path":"/nix/store","access":"read_write"}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<TartCleanroomSpec>(
+            r#"{
+                "base_image": "same-vm",
+                "run_vm_name": "same-vm",
+                "nix_store_mount": {"tag":"nix-store","host_path":"/nix/store"},
+                "sccache_mount": {"tag":"sccache","host_path":"/var/tmp/sccache"}
+            }"#
+        )
+        .is_err()
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let real_dir = tmp.path().join("real-mount");
+    fs::create_dir_all(&real_dir).unwrap();
+    assert!(verify_host_mount_directory(&real_dir).is_ok());
+
+    let sym_dir = tmp.path().join("sym-mount");
+    symlink(&real_dir, &sym_dir).unwrap();
+    assert!(matches!(
+        verify_host_mount_directory(&sym_dir),
+        Err(CleanroomVmError::InvalidMountPath(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn f06_process_tart_executor_drains_large_stderr_without_deadlock_and_validates_bin_and_nul() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let tmp = TempDir::new().unwrap();
+    let nix_dir = tmp.path().join("nix-store");
+    let sccache_dir = tmp.path().join("sccache");
+    fs::create_dir_all(&nix_dir).unwrap();
+    fs::create_dir_all(&sccache_dir).unwrap();
+
+    // Reject relative PATH, symlinks, and world-writable binaries
+    assert!(verify_trusted_executable_path(Path::new("tart")).is_err());
+    assert!(verify_trusted_executable_path(Path::new("./tart")).is_err());
+
+    let mock_tart = tmp.path().join("tart-flood.sh");
+    // `run` floods >192 KiB to stderr (3x 64 KiB pipe capacity!) then sleeps until stopped;
+    // without `spawn_bounded_stderr_drain`, the child blocks on write(2) and deadlocks!
+    fs::write(
+        &mock_tart,
+        "#!/bin/sh\ncase \"$1\" in\n  clone|set|exec|stop|delete) exit 0 ;;\n  run)\n    dd if=/dev/zero bs=1024 count=196 2>/dev/null | tr '\\0' 'E' >&2\n    sleep 2\n    exit 0\n    ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&mock_tart, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(
+        verify_trusted_executable_path(&mock_tart).is_err(),
+        "world-writable tart binary must fail closed"
+    );
+    fs::set_permissions(&mock_tart, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(verify_trusted_executable_path(&mock_tart).is_ok());
+
+    let sym_bin = tmp.path().join("tart-sym.sh");
+    symlink(&mock_tart, &sym_bin).unwrap();
+    assert!(verify_trusted_executable_path(&sym_bin).is_err());
+
+    let spec = TartCleanroomSpec::new("base-v1", "flood-vm-1", &nix_dir, &sccache_dir)
+        .unwrap()
+        .with_boot_readiness(4, 10);
+    let sb = compile_seatbelt_profile(
+        &CleanroomSeatbeltSpec::for_guest_virtiofs(
+            RunnerTrustProfile::Public,
+            "flood-vm-1",
+            "/private/tmp",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Reject NUL bytes and leading `-` in guest_command
+    assert!(
+        spec.guest_sandbox_exec_argv(&sb, &["/usr/bin/echo".into(), "bad\0arg".into()])
+            .is_err()
+    );
+    assert!(
+        spec.guest_sandbox_exec_argv(&sb, &["-flag".into()])
+            .is_err()
+    );
+
+    let exec = ProcessTartExecutor::new(&mock_tart);
+    let mut session = EphemeralTartSession::clone_and_arm(spec, exec).unwrap();
+    session
+        .run_ephemeral_with_seatbelt(&sb, &["/usr/bin/true".to_owned()])
+        .expect("stderr flood >64 KiB must drain without deadlocking");
+    assert!(session.startup_telemetry().is_some());
+    let (_, del_res) = session.finish();
+    del_res.unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn f07_env_lock_rejects_intermediate_dir_symlinks_arbitrary_symlinks_and_hardlinked_manifests() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), "outside-data").unwrap();
+
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname = \"f07\"\nversion = \"0.1.0\"\nrust-version = \"1.97.1\"\n",
+    )
+    .unwrap();
+    write_resolved_store_closures(&ws, &[("rust-toolchain", "rust-1.97.1", 0x31)]);
+    assert!(compile_workspace_env_lock(&ws).is_ok());
+
+    // 1. Arbitrary non-.nix file symlink inside repo_root MUST fail closed
+    symlink(outside.join("secret.txt"), ws.join("notes.txt")).unwrap();
+    assert!(matches!(
+        compile_workspace_env_lock(&ws),
+        Err(EnvLockError::SymlinkForbidden(ref p)) if p == "notes.txt"
+    ));
+    fs::remove_file(ws.join("notes.txt")).unwrap();
+
+    // 2. Intermediate directory symlink inside repo_root MUST fail closed
+    symlink(&outside, ws.join("linked-dir")).unwrap();
+    assert!(matches!(
+        compile_workspace_env_lock(&ws),
+        Err(EnvLockError::SymlinkForbidden(ref p)) if p == "linked-dir"
+    ));
+    fs::remove_file(ws.join("linked-dir")).unwrap();
+
+    // 3. Hard-linked manifest (`st_nlink > 1`) MUST fail closed
+    let hard_copy = tmp.path().join("cargo-hardlink.toml");
+    fs::hard_link(ws.join("Cargo.toml"), &hard_copy).unwrap();
+    assert!(matches!(
+        compile_workspace_env_lock(&ws),
+        Err(EnvLockError::ManifestParse { ref path, .. }) if path == "Cargo.toml"
+    ));
+    fs::remove_file(&hard_copy).unwrap();
+    assert!(compile_workspace_env_lock(&ws).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn f08_nar_v1_supports_intra_store_relative_symlinks_rejects_escape_and_checks_manifest_list_parity()
+ {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let mock_store = tmp.path().join("nix-store");
+    let pkg_root = mock_store.join("00000000000000000000000000000000-rust-1.97.1");
+    fs::create_dir_all(pkg_root.join("bin")).unwrap();
+    fs::create_dir_all(pkg_root.join("lib")).unwrap();
+    fs::write(pkg_root.join("lib/rustc-driver"), b"rustc-binary-v1").unwrap();
+    // Valid intra-store relative symlink (`bin/rustc -> ../lib/rustc-driver`)
+    symlink("../lib/rustc-driver", pkg_root.join("bin/rustc")).unwrap();
+
+    let nar_ok = serialize_nar_v1(&pkg_root).expect("intra-store relative symlink must serialize");
+    assert_eq!(nar_ok, serialize_nar_v1(&pkg_root).unwrap());
+    let nar_sha_hex = hex::encode(Sha256::digest(&nar_ok));
+
+    // Escaping relative symlink (`../../outside`) or absolute symlink (`/etc/passwd`) MUST fail closed!
+    let bad_store = tmp.path().join("bad-store");
+    fs::create_dir_all(bad_store.join("bin")).unwrap();
+    symlink("../../outside", bad_store.join("bin/escape")).unwrap();
+    assert!(serialize_nar_v1(&bad_store).is_err());
+
+    let abs_store = tmp.path().join("abs-store");
+    fs::create_dir_all(&abs_store).unwrap();
+    symlink("/etc/hosts", abs_store.join("hosts")).unwrap();
+    assert!(serialize_nar_v1(&abs_store).is_err());
+
+    // Verify `receipt.manifests == compiled.manifests` & `verify_mounted_store_closures`
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(ws.join(".chinwag")).unwrap();
+    fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname = \"f08\"\nversion = \"0.1.0\"\nrust-version = \"1.97.1\"\n",
+    )
+    .unwrap();
+    let mut closures = BTreeMap::new();
+    closures.insert(
+        "rust-toolchain".to_owned(),
+        StoreClosureEntry {
+            store_path: "/nix/store/00000000000000000000000000000000-rust-1.97.1".to_owned(),
+            nar_sha256_hex: Some(nar_sha_hex),
+            artifact_file: None,
+        },
+    );
+    fs::write(
+        ws.join(".chinwag/store-closures.json"),
+        serde_json::to_vec_pretty(&closures).unwrap(),
+    )
+    .unwrap();
+
+    let compiled = compile_workspace_env_lock(&ws).unwrap();
+    let sk = SigningKey::from_bytes(&[0x48u8; 32]);
+    let pk = sk.verifying_key().to_bytes();
+    let receipt = sign_env_lock_receipt(&compiled, &sk).unwrap();
+    write_env_lock_bundle(&ws, &compiled, &receipt).unwrap();
+
+    // Realized store directory matches locked narHash -> passes!
+    verify_mounted_store_closures(&ws, &mock_store).unwrap();
+
+    // Tamper realized store file without updating lock -> fails closed with `LockfileDrift`!
+    fs::write(pkg_root.join("lib/rustc-driver"), b"tampered-rustc").unwrap();
+    assert!(matches!(
+        verify_mounted_store_closures(&ws, &mock_store),
+        Err(EnvLockError::LockfileDrift(_))
+    ));
+
+    // Re-sign a receipt with truncated `manifests` list -> `verify_env_lock_bundle_with_signers` rejects!
+    let mut forged_compiled = compiled.clone();
+    forged_compiled.manifests.truncate(1);
+    let forged_receipt = sign_env_lock_receipt(&forged_compiled, &sk).unwrap();
+    write_env_lock_bundle(&ws, &compiled, &forged_receipt).unwrap();
+    assert!(matches!(
+        verify_env_lock_bundle_with_signers(&ws, &[pk]),
+        Err(EnvLockError::LockfileDrift(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn f09_guest_env_i_populates_sanitized_env_and_scrubber_redacts_json_urls_multi_bearer_and_all_token_families()
+ {
+    use std::os::unix::fs::PermissionsExt;
+
+    let spec =
+        TartCleanroomSpec::new("base-img", "env-vm-9", "/nix/store", "/var/tmp/sccache").unwrap();
+    let sb = compile_seatbelt_profile(
+        &CleanroomSeatbeltSpec::for_guest_virtiofs(
+            RunnerTrustProfile::Public,
+            "env-vm-9",
+            "/private/tmp",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut env_map = BTreeMap::new();
+    env_map.insert("CHINWAG_CLEANROOM_TIER".to_owned(), "public".to_owned());
+    env_map.insert("LANG".to_owned(), "C.UTF-8".to_owned());
+    let argv = spec
+        .guest_sandbox_exec_with_env_argv(&sb, &env_map, &["cargo".into(), "test".into()])
+        .unwrap();
+    assert_eq!(
+        &argv[6..],
+        &[
+            "--",
+            "/usr/bin/env",
+            "-i",
+            "CHINWAG_CLEANROOM_TIER=public",
+            "LANG=C.UTF-8",
+            "cargo",
+            "test"
+        ]
+    );
+
+    let dirty = concat!(
+        "{\"openai\":\"sk-proj-1234567890abcdefghijklmnop\",",
+        "\"jwt\":\"eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIzNDU2\"}\n",
+        "url=https://ci.example.invalid/cb?tok=ghp_1234567890abcdefghijklmnopqrstuv&slack=xoxb-1234567890-abcdefghij\n",
+        "hdrs: Authorization: Bearer   first_live_secret_111 , Proxy-Auth: bearer\tsecond_live_secret_222\n",
+        "chinwag1=chwg_live_abcdef0123456789 chinwag2=chwg_agent_9876543210abcdef rk=rk-live-1234567890abcdef\n",
+        "gitlab=glpat-1234567890abcdefghij aws1=AKIA1234567890ABCDEF aws2=ASIA1234567890ABCDEF\n",
+        "ANTHROPIC_API_KEY=custom_anth_val_999 OPENAI_ORG_KEY=org_val_888 GEMINI_API_KEY=AIzaSyA1234567890abcdefghijk VERCEL_TOKEN=vcp_1234567890abcdef\n",
+        "UNUSUAL_LHS_NAME=sk-ant-api03-secretvalue1234567890"
+    );
+    let clean = scrub_diagnostic_secrets(dirty);
+    for forbidden in [
+        "sk-proj-1234567890",
+        "eyJhbGciOiJFZERTQSJ9",
+        "ghp_1234567890",
+        "xoxb-1234567890",
+        "first_live_secret_111",
+        "second_live_secret_222",
+        "chwg_live_abcdef",
+        "chwg_agent_987654",
+        "rk-live-123456",
+        "glpat-123456",
+        "AKIA1234567890ABCDEF",
+        "ASIA1234567890ABCDEF",
+        "custom_anth_val_999",
+        "org_val_888",
+        "AIzaSyA1234567890",
+        "vcp_1234567890",
+        "sk-ant-api03-secretvalue",
+    ] {
+        assert!(
+            !clean.contains(forbidden),
+            "scrubber failed to redact `{forbidden}` in:\n{clean}"
+        );
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let bundle_file = tmp.path().join("sealed-0600.json");
+    atomic_write_regular_file(&bundle_file, b"{\"ok\":true}\n", 0o600).unwrap();
+    let mode = fs::symlink_metadata(&bundle_file)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn f11_cleanroom_policy_toml_darwin_parsers_0700_slot_dir_and_dead_pid_lease_reaping() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert_eq!(
+        parse_darwin_pmset_therm(
+            "Note: No thermal warning level has been recorded\n\tCPU_Speed_Limit = 100\n"
+        ),
+        ThermalPressure::Nominal
+    );
+    assert_eq!(
+        parse_darwin_pmset_therm("\tCPU_Speed_Limit = 85\n"),
+        ThermalPressure::Fair
+    );
+    assert_eq!(
+        parse_darwin_pmset_therm("\tCPU_Speed_Limit = 60\n"),
+        ThermalPressure::Serious
+    );
+    assert!(parse_darwin_ioreg_hid_active("    |   \"HIDIdleTime\" = 5000000000\n").unwrap());
+    assert!(!parse_darwin_ioreg_hid_active("    |   \"HIDIdleTime\" = 45000000000\n").unwrap());
+    assert_eq!(
+        parse_darwin_top_cpu_idle("CPU usage: 8.12% user, 4.38% sys, 87.50% idle\n").unwrap(),
+        87
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let policy_path = tmp.path().join("cleanroom-policy.toml");
+    fs::write(
+        &policy_path,
+        r#"
+allowed_exact_refs = ["refs/heads/main"]
+allowed_ref_prefixes = ["refs/tags/v"]
+base_image = "org-custom-sequoia-v2"
+nix_store_path = "/nix/store"
+nix_daemon_socket_dir = "/nix/var/nix/custom-daemon"
+nix_daemon_socket_path = "/nix/var/nix/custom-daemon/socket"
+sccache_dir = "/private/var/tmp/org-sccache"
+guest_scratch_root = "/private/var/tmp"
+release_lease_env_keys = ["ORG_NOTARY_LEASE"]
+allowed_egress_cidrs = ["203.0.113.0/24"]
+"#,
+    )
+    .unwrap();
+    let policy = ReleaseRefPolicy::from_toml_file(&policy_path).unwrap();
+    assert_eq!(policy.base_image, "org-custom-sequoia-v2");
+    assert_eq!(policy.allowed_egress_cidrs, vec!["203.0.113.0/24"]);
+
+    let sk = SigningKey::from_bytes(&[0x77u8; 32]);
+    let pk = sk.verifying_key().to_bytes();
+    let oid = "f".repeat(40);
+    let att = ReleaseSignerAttestation::sign("refs/heads/main", &oid, &sk);
+    let mut host_env = BTreeMap::new();
+    host_env.insert("ORG_NOTARY_LEASE".to_owned(), "lease-ok".to_owned());
+    host_env.insert(
+        "APPLE_DEVELOPER_ID_LEASE".to_owned(),
+        "not-in-custom-policy".to_owned(),
+    );
+    let rel_dec = evaluate_trust_gate_with_policy(
+        &JobTriggerContext {
+            requested_profile: RunnerTrustProfile::Release,
+            git_ref: "refs/heads/main".to_owned(),
+            commit_oid: oid,
+            is_fork_pr: false,
+            is_untrusted_pr_event: false,
+            release_attestation: Some(att),
+        },
+        &host_env,
+        &[pk],
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(
+        rel_dec
+            .sanitized_env
+            .get("ORG_NOTARY_LEASE")
+            .map(String::as_str),
+        Some("lease-ok")
+    );
+    assert!(
+        !rel_dec
+            .sanitized_env
+            .contains_key("APPLE_DEVELOPER_ID_LEASE")
+    );
+
+    // 0755 slot_dir MUST fail closed (`0700` required)
+    let insecure_slots = tmp.path().join("slots-0755");
+    fs::create_dir_all(&insecure_slots).unwrap();
+    fs::set_permissions(&insecure_slots, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(acquire_host_vm_slot(&insecure_slots, 2).is_err());
+
+    // 0700 slot_dir with stale dead-PID lease (`pid=99999999`) reaps dead lease and acquires slot 1!
+    let secure_slots = tmp.path().join("slots-0700");
+    fs::create_dir_all(&secure_slots).unwrap();
+    fs::set_permissions(&secure_slots, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(secure_slots.join("slot-1.lease"), "pid=99999999\nslot=1\n").unwrap();
+    assert_eq!(reap_dead_slot_leases(&secure_slots, 2).unwrap(), 1);
+    let lease = acquire_host_vm_slot(&secure_slots, 2).unwrap();
+    assert_eq!(lease.slot_index(), 1);
 }

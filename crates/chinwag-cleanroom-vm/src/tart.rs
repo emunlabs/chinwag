@@ -2,21 +2,25 @@
 // 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ephemeral Tart cleanroom VM lifecycle (`tart clone` -> background `tart run --no-graphics
-//! --dir=nix-store:/nix/store:ro --dir=sccache:<cache>:ro` -> readiness probe ->
-//! `tart exec <run-vm> /usr/bin/sandbox-exec -p <sbpl> -- <cmd...>` -> `tart stop` + reap ->
-//! deterministic `defer tart delete`).
+//! Ephemeral Tart cleanroom VM lifecycle (`tart clone` -> background
+//! `tart run --no-graphics --no-clipboard --no-audio --net-softnet --dir=...:ro` ->
+//! readiness probe -> `tart exec <run-vm> -- /usr/bin/sandbox-exec -p <sbpl> -- /usr/bin/env -i ...` ->
+//! `tart stop` + reap -> deterministic `defer tart delete`).
 //!
 //! Enforces `INV-NIX-VIRTIOFS-01` (sub-200ms read-only VirtioFS mount budget) and
 //! `INV-NIX-RO-STORE-01` (hypervisor `:ro` tag enforcement + runtime guest Seatbelt).
 
+use crate::runner_pool::NetworkEgressPolicy;
 use crate::seatbelt::SeatbeltProfile;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
 use std::io::Read;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// Maximum permitted VirtioFS mount latency budget in milliseconds (`INV-NIX-VIRTIOFS-01`).
 pub const MAX_VIRTIOFS_MOUNT_LATENCY_MS: u64 = 200;
@@ -27,6 +31,12 @@ pub const NIX_STORE_TAG: &str = "nix-store";
 /// Canonical VirtioFS share tag for the content-addressed host `sccache`.
 pub const SCCACHE_TAG: &str = "sccache";
 
+/// Canonical VirtioFS share tag for the read-only host repository worktree.
+pub const WORKTREE_TAG: &str = "worktree";
+
+/// Canonical VirtioFS share tag for the scoped read-only release signing lease directory.
+pub const RELEASE_SIGNING_TAG: &str = "release-signing";
+
 /// Canonical Nix store path inside host/guest filesystems.
 pub const CANONICAL_NIX_STORE_PATH: &str = "/nix/store";
 
@@ -34,6 +44,13 @@ const MAX_VM_NAME_LEN: usize = 128;
 const MAX_MOUNT_PATH_LEN: usize = 1024;
 const DEFAULT_BOOT_READY_ATTEMPTS: u32 = 60;
 const DEFAULT_BOOT_READY_POLL_MS: u64 = 250;
+const MAX_CAPTURED_TART_STDERR_BYTES: usize = 64 * 1024;
+
+const TRUSTED_TART_BINARY_PATHS: &[&str] = &[
+    "/opt/homebrew/bin/tart",
+    "/usr/local/bin/tart",
+    "/usr/bin/tart",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CleanroomVmError {
@@ -46,7 +63,7 @@ pub enum CleanroomVmError {
     #[error("invalid VirtioFS share tag `{0}`")]
     InvalidShareTag(String),
     #[error(
-        "invalid VirtioFS host path `{0}`: must be normalized absolute path without ':', ',', or control characters"
+        "invalid or unsafe VirtioFS host path `{0}`: must be normalized >=3-component non-symlink directory owned by root or current user"
     )]
     InvalidMountPath(String),
     #[error(
@@ -57,12 +74,18 @@ pub enum CleanroomVmError {
     GraphicsForbidden,
     #[error("invalid CPU ({cpu_cores}) or memory ({memory_mib} MiB) bounds for ephemeral VM")]
     InvalidResourceBounds { cpu_cores: u8, memory_mib: u32 },
+    #[error("invalid Softnet egress CIDR `{0}`")]
+    InvalidEgressCidr(String),
     #[error(
         "VirtioFS mount latency {observed_ms}ms exceeded budget {budget_ms}ms (INV-NIX-VIRTIOFS-01)"
     )]
     MountLatencyExceeded { observed_ms: u64, budget_ms: u64 },
     #[error("cleanroom guest command cannot be empty")]
     EmptyGuestCommand,
+    #[error("invalid guest command or sanitized environment entry: {0}")]
+    InvalidGuestCommand(String),
+    #[error("untrusted or invalid `tart` executable `{path}`: {reason}")]
+    InvalidTartExecutable { path: String, reason: String },
     #[error("tart subcommand `{step}` failed: {detail}")]
     TartExecutionFailed { step: &'static str, detail: String },
 }
@@ -75,11 +98,33 @@ pub enum VirtioFsAccess {
     ReadWrite,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVirtioFsMount {
+    tag: String,
+    host_path: PathBuf,
+    #[serde(default)]
+    access: Option<VirtioFsAccess>,
+}
+
 /// Validated VirtioFS directory share passed to `tart run --dir=<tag>:<path>:ro`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawVirtioFsMount")]
 pub struct VirtioFsMount {
     tag: String,
     host_path: PathBuf,
+}
+
+impl TryFrom<RawVirtioFsMount> for VirtioFsMount {
+    type Error = CleanroomVmError;
+
+    fn try_from(raw: RawVirtioFsMount) -> Result<Self, Self::Error> {
+        Self::read_only(
+            &raw.tag,
+            &raw.host_path,
+            raw.access.unwrap_or(VirtioFsAccess::ReadOnly),
+        )
+    }
 }
 
 impl VirtioFsMount {
@@ -114,8 +159,64 @@ impl VirtioFsMount {
     }
 }
 
+fn default_cpu_cores() -> u8 {
+    4
+}
+
+fn default_memory_mib() -> u32 {
+    8192
+}
+
+fn default_no_graphics() -> bool {
+    true
+}
+
+fn default_mount_budget() -> u64 {
+    MAX_VIRTIOFS_MOUNT_LATENCY_MS
+}
+
+fn default_boot_attempts() -> u32 {
+    DEFAULT_BOOT_READY_ATTEMPTS
+}
+
+fn default_boot_poll_ms() -> u64 {
+    DEFAULT_BOOT_READY_POLL_MS
+}
+
+fn default_network_policy() -> NetworkEgressPolicy {
+    NetworkEgressPolicy::RegistriesAndBinaryCacheOnly
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTartCleanroomSpec {
+    base_image: String,
+    run_vm_name: String,
+    nix_store_mount: VirtioFsMount,
+    sccache_mount: VirtioFsMount,
+    #[serde(default)]
+    extra_ro_mounts: Vec<VirtioFsMount>,
+    #[serde(default = "default_cpu_cores")]
+    cpu_cores: u8,
+    #[serde(default = "default_memory_mib")]
+    memory_mib: u32,
+    #[serde(default = "default_no_graphics")]
+    no_graphics: bool,
+    #[serde(default = "default_network_policy")]
+    network_policy: NetworkEgressPolicy,
+    #[serde(default)]
+    allowed_egress_cidrs: Vec<String>,
+    #[serde(default = "default_mount_budget")]
+    mount_latency_budget_ms: u64,
+    #[serde(default = "default_boot_attempts")]
+    boot_ready_attempts: u32,
+    #[serde(default = "default_boot_poll_ms")]
+    boot_ready_poll_ms: u64,
+}
+
 /// Complete validated specification for an ephemeral Tart cleanroom VM run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawTartCleanroomSpec")]
 pub struct TartCleanroomSpec {
     base_image: String,
     run_vm_name: String,
@@ -125,9 +226,51 @@ pub struct TartCleanroomSpec {
     cpu_cores: u8,
     memory_mib: u32,
     no_graphics: bool,
+    network_policy: NetworkEgressPolicy,
+    allowed_egress_cidrs: Vec<String>,
     mount_latency_budget_ms: u64,
     boot_ready_attempts: u32,
     boot_ready_poll_ms: u64,
+}
+
+impl TryFrom<RawTartCleanroomSpec> for TartCleanroomSpec {
+    type Error = CleanroomVmError;
+
+    fn try_from(raw: RawTartCleanroomSpec) -> Result<Self, Self::Error> {
+        if raw.nix_store_mount.tag() != NIX_STORE_TAG {
+            return Err(CleanroomVmError::InvalidShareTag(
+                raw.nix_store_mount.tag().to_owned(),
+            ));
+        }
+        if raw.sccache_mount.tag() != SCCACHE_TAG {
+            return Err(CleanroomVmError::InvalidShareTag(
+                raw.sccache_mount.tag().to_owned(),
+            ));
+        }
+        let mut spec = Self::new(
+            &raw.base_image,
+            &raw.run_vm_name,
+            raw.nix_store_mount.host_path(),
+            raw.sccache_mount.host_path(),
+        )?
+        .with_resources(raw.cpu_cores, raw.memory_mib)?
+        .with_graphics_enabled(!raw.no_graphics)?
+        .with_network_egress(raw.network_policy, raw.allowed_egress_cidrs)?
+        .with_boot_readiness(raw.boot_ready_attempts, raw.boot_ready_poll_ms);
+        if raw.mount_latency_budget_ms == 0
+            || raw.mount_latency_budget_ms > MAX_VIRTIOFS_MOUNT_LATENCY_MS
+        {
+            return Err(CleanroomVmError::MountLatencyExceeded {
+                observed_ms: raw.mount_latency_budget_ms,
+                budget_ms: MAX_VIRTIOFS_MOUNT_LATENCY_MS,
+            });
+        }
+        spec.mount_latency_budget_ms = raw.mount_latency_budget_ms;
+        for extra in raw.extra_ro_mounts {
+            spec = spec.with_extra_ro_mount(extra)?;
+        }
+        Ok(spec)
+    }
 }
 
 impl TartCleanroomSpec {
@@ -157,6 +300,8 @@ impl TartCleanroomSpec {
             cpu_cores: 4,
             memory_mib: 8192,
             no_graphics: true,
+            network_policy: NetworkEgressPolicy::RegistriesAndBinaryCacheOnly,
+            allowed_egress_cidrs: Vec::new(),
             mount_latency_budget_ms: MAX_VIRTIOFS_MOUNT_LATENCY_MS,
             boot_ready_attempts: DEFAULT_BOOT_READY_ATTEMPTS,
             boot_ready_poll_ms: DEFAULT_BOOT_READY_POLL_MS,
@@ -176,6 +321,19 @@ impl TartCleanroomSpec {
         }
         self.cpu_cores = cpu_cores;
         self.memory_mib = memory_mib;
+        Ok(self)
+    }
+
+    pub fn with_network_egress(
+        mut self,
+        policy: NetworkEgressPolicy,
+        cidrs: Vec<String>,
+    ) -> Result<Self, CleanroomVmError> {
+        for cidr in &cidrs {
+            validate_cidr_spec(cidr)?;
+        }
+        self.network_policy = policy;
+        self.allowed_egress_cidrs = cidrs;
         Ok(self)
     }
 
@@ -203,6 +361,17 @@ impl TartCleanroomSpec {
         Ok(self)
     }
 
+    /// Verifies on the live host filesystem that every configured VirtioFS `host_path`
+    /// traverses exclusively non-symlink directories owned by `root` (`uid 0`) or `geteuid()`.
+    pub fn verify_host_mounts(&self) -> Result<(), CleanroomVmError> {
+        verify_host_mount_directory(self.nix_store_mount.host_path())?;
+        verify_host_mount_directory(self.sccache_mount.host_path())?;
+        for extra in &self.extra_ro_mounts {
+            verify_host_mount_directory(extra.host_path())?;
+        }
+        Ok(())
+    }
+
     pub fn base_image(&self) -> &str {
         &self.base_image
     }
@@ -217,6 +386,18 @@ impl TartCleanroomSpec {
 
     pub fn sccache_mount(&self) -> &VirtioFsMount {
         &self.sccache_mount
+    }
+
+    pub fn extra_ro_mounts(&self) -> &[VirtioFsMount] {
+        &self.extra_ro_mounts
+    }
+
+    pub const fn network_policy(&self) -> NetworkEgressPolicy {
+        self.network_policy
+    }
+
+    pub fn allowed_egress_cidrs(&self) -> &[String] {
+        &self.allowed_egress_cidrs
     }
 
     pub fn cpu_cores(&self) -> u8 {
@@ -263,14 +444,25 @@ impl TartCleanroomSpec {
         ]
     }
 
-    /// Exact `tart run --no-graphics --dir=nix-store:<store>:ro --dir=sccache:<cache>:ro <run-vm>` argv.
+    /// Exact `tart run --no-graphics --no-clipboard --no-audio --net-softnet [--net-softnet-allow=...] --dir=...:ro <run-vm>` argv.
     pub fn run_argv(&self) -> Vec<String> {
         let mut args = vec![
             "run".to_owned(),
             "--no-graphics".to_owned(),
-            self.nix_store_mount.to_tart_dir_arg(),
-            self.sccache_mount.to_tart_dir_arg(),
+            "--no-clipboard".to_owned(),
+            "--no-audio".to_owned(),
+            "--net-softnet".to_owned(),
         ];
+        if self.network_policy == NetworkEgressPolicy::Offline {
+            args.push("--net-softnet-allow=127.0.0.1/32".to_owned());
+        } else if !self.allowed_egress_cidrs.is_empty() {
+            args.push(format!(
+                "--net-softnet-allow={}",
+                self.allowed_egress_cidrs.join(",")
+            ));
+        }
+        args.push(self.nix_store_mount.to_tart_dir_arg());
+        args.push(self.sccache_mount.to_tart_dir_arg());
         for extra in &self.extra_ro_mounts {
             args.push(extra.to_tart_dir_arg());
         }
@@ -278,32 +470,76 @@ impl TartCleanroomSpec {
         args
     }
 
-    /// Exact `tart exec <run-vm> /usr/bin/true` guest-agent readiness probe argument vector.
+    /// Exact `tart exec <run-vm> -- /usr/bin/true` guest-agent readiness probe argument vector.
     pub fn guest_readiness_argv(&self) -> Vec<String> {
         vec![
             "exec".to_owned(),
             self.run_vm_name.clone(),
+            "--".to_owned(),
             "/usr/bin/true".to_owned(),
         ]
     }
 
-    /// Exact `tart exec <run-vm> /usr/bin/sandbox-exec -p <sbpl> -- <guest_command...>` argv
-    /// applying the compiled XNU Seatbelt profile at runtime inside the live guest (`INV-NIX-RO-STORE-01`).
+    /// Exact `tart exec <run-vm> -- /usr/bin/sandbox-exec -p <sbpl> -- /usr/bin/env -i <guest_command...>` argv
+    /// with an empty sanitized environment.
     pub fn guest_sandbox_exec_argv(
         &self,
         seatbelt: &SeatbeltProfile,
         guest_command: &[String],
     ) -> Result<Vec<String>, CleanroomVmError> {
+        self.guest_sandbox_exec_with_env_argv(seatbelt, &BTreeMap::new(), guest_command)
+    }
+
+    /// Exact `tart exec <run-vm> -- /usr/bin/sandbox-exec -p <sbpl> -- /usr/bin/env -i K=V ... <guest_command...>` argv
+    /// applying both XNU Seatbelt and a scrubbed `/usr/bin/env -i` allowlist inside the guest.
+    pub fn guest_sandbox_exec_with_env_argv(
+        &self,
+        seatbelt: &SeatbeltProfile,
+        sanitized_env: &BTreeMap<String, String>,
+        guest_command: &[String],
+    ) -> Result<Vec<String>, CleanroomVmError> {
         if guest_command.is_empty() || guest_command[0].trim().is_empty() {
             return Err(CleanroomVmError::EmptyGuestCommand);
         }
-        let mut argv = Vec::with_capacity(6 + guest_command.len());
+        let prog = &guest_command[0];
+        if prog.starts_with('-') || prog.contains('=') {
+            return Err(CleanroomVmError::InvalidGuestCommand(format!(
+                "guest executable `{prog}` cannot start with '-' or contain '='"
+            )));
+        }
+        for arg in guest_command {
+            if arg.contains('\0') {
+                return Err(CleanroomVmError::InvalidGuestCommand(
+                    "guest command argument contains NUL byte".to_owned(),
+                ));
+            }
+        }
+        for (k, v) in sanitized_env {
+            if !is_valid_env_key(k) {
+                return Err(CleanroomVmError::InvalidGuestCommand(format!(
+                    "invalid sanitized environment variable name `{k}`"
+                )));
+            }
+            if v.contains('\0') {
+                return Err(CleanroomVmError::InvalidGuestCommand(format!(
+                    "sanitized environment variable `{k}` contains NUL byte"
+                )));
+            }
+        }
+
+        let mut argv = Vec::with_capacity(9 + sanitized_env.len() + guest_command.len());
         argv.push("exec".to_owned());
         argv.push(self.run_vm_name.clone());
+        argv.push("--".to_owned());
         argv.push("/usr/bin/sandbox-exec".to_owned());
         argv.push("-p".to_owned());
         argv.push(seatbelt.sbpl.clone());
         argv.push("--".to_owned());
+        argv.push("/usr/bin/env".to_owned());
+        argv.push("-i".to_owned());
+        for (k, v) in sanitized_env {
+            argv.push(format!("{k}={v}"));
+        }
         argv.extend(guest_command.iter().cloned());
         Ok(argv)
     }
@@ -319,6 +555,15 @@ impl TartCleanroomSpec {
     }
 }
 
+/// Runtime startup and VirtioFS mount telemetry captured during `EphemeralTartSession`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanroomStartupTelemetry {
+    pub mount_latency_ms: u64,
+    pub mount_budget_ms: u64,
+    pub boot_ready_ms: u64,
+    pub readiness_attempts: u32,
+}
+
 /// Recorded command execution trace for deterministic audit & testing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TartCommandRecord {
@@ -327,15 +572,8 @@ pub struct TartCommandRecord {
 }
 
 /// Handle to a concurrently running `tart run --no-graphics ...` hypervisor process.
-///
-/// Because `tart run` blocks for the lifetime of the booted guest VM, `EphemeralTartSession`
-/// spawns `tart run` in the background, probes guest readiness via `tart exec <vm> /usr/bin/true`,
-/// runs the workload via `tart exec <vm> /usr/bin/sandbox-exec -p <sbpl> -- ...`, issues
-/// `tart stop <vm>`, and reaps this handle before `tart delete <vm>`.
 pub trait RunningTartVm {
     /// Non-blocking check for premature hypervisor exit.
-    /// Returns `Ok(None)` while the VM is still running, `Ok(Some(Ok(())))` if it exited `0`,
-    /// or `Ok(Some(Err(detail)))` if `tart run` exited non-zero.
     fn try_poll_exited(&mut self) -> Result<Option<Result<(), String>>, CleanroomVmError>;
 
     /// Reaps the background `tart run` process (killing + waiting if still alive after `tart stop`).
@@ -344,6 +582,12 @@ pub trait RunningTartVm {
 
 /// Abstract executor for `tart` hypervisor operations.
 pub trait TartExecutor {
+    /// Live host preflight hook called before cloning/mounting.
+    fn validate_live_mounts(&self, spec: &TartCleanroomSpec) -> Result<(), CleanroomVmError> {
+        let _ = spec;
+        Ok(())
+    }
+
     fn exec_tart(&mut self, step: &'static str, argv: &[String]) -> Result<(), CleanroomVmError>;
 
     fn spawn_tart_run(
@@ -354,15 +598,15 @@ pub trait TartExecutor {
 
 struct ProcessRunningTartVm {
     child: Option<Child>,
+    stderr_reader: Option<JoinHandle<String>>,
 }
 
 impl ProcessRunningTartVm {
-    fn collect_stderr(child: &mut Child) -> String {
-        let mut buf = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut buf);
+    fn join_stderr(&mut self) -> String {
+        match self.stderr_reader.take() {
+            Some(handle) => handle.join().unwrap_or_default().trim().to_owned(),
+            None => String::new(),
         }
-        buf.trim().to_owned()
     }
 }
 
@@ -374,8 +618,8 @@ impl RunningTartVm for ProcessRunningTartVm {
         match child.try_wait() {
             Ok(None) => Ok(None),
             Ok(Some(status)) => {
-                let mut owned = self.child.take().expect("checked Some");
-                let stderr = Self::collect_stderr(&mut owned);
+                let _ = self.child.take();
+                let stderr = self.join_stderr();
                 if status.success() {
                     Ok(Some(Ok(())))
                 } else {
@@ -396,16 +640,20 @@ impl RunningTartVm for ProcessRunningTartVm {
 
     fn reap(&mut self) -> Result<(), CleanroomVmError> {
         let Some(mut child) = self.child.take() else {
+            let _ = self.join_stderr();
             return Ok(());
         };
-        // Allow brief grace window after `tart stop <vm>` before sending SIGKILL
         for _ in 0..40 {
             match child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
+                Ok(Some(_)) => {
+                    let _ = self.join_stderr();
+                    return Ok(());
+                }
                 Ok(None) => thread::sleep(Duration::from_millis(50)),
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = self.join_stderr();
                     return Err(CleanroomVmError::TartExecutionFailed {
                         step: "reap-run",
                         detail: e.to_string(),
@@ -414,8 +662,9 @@ impl RunningTartVm for ProcessRunningTartVm {
             }
         }
         let _ = child.kill();
-        child
-            .wait()
+        let wait_res = child.wait();
+        let _ = self.join_stderr();
+        wait_res
             .map(|_| ())
             .map_err(|e| CleanroomVmError::TartExecutionFailed {
                 step: "reap-run",
@@ -430,51 +679,113 @@ impl Drop for ProcessRunningTartVm {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = self.join_stderr();
     }
 }
 
-/// Subprocess executor invoking an explicit customer-configured `tart` binary path
-/// (or `"tart"` resolved via standard `PATH`) with a scrubbed environment.
-#[derive(Debug, Clone)]
+fn spawn_bounded_stderr_drain(mut pipe: std::process::ChildStderr) -> JoinHandle<String> {
+    thread::spawn(move || {
+        let mut captured: Vec<u8> = Vec::with_capacity(4096);
+        let mut truncated = false;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if captured.len() < MAX_CAPTURED_TART_STDERR_BYTES {
+                        let avail = MAX_CAPTURED_TART_STDERR_BYTES - captured.len();
+                        let copy_len = n.min(avail);
+                        captured.extend_from_slice(&chunk[..copy_len]);
+                        if copy_len < n {
+                            truncated = true;
+                        }
+                    } else {
+                        truncated = true;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let mut text = String::from_utf8_lossy(&captured).into_owned();
+        if truncated {
+            text.push_str("\n...[truncated tart stderr]");
+        }
+        text
+    })
+}
+
+/// Subprocess executor invoking an explicit validated absolute `tart` binary path
+/// (or resolving strictly across fixed root-owned system directories, rejecting relative `PATH`).
+#[derive(Debug, Clone, Default)]
 pub struct ProcessTartExecutor {
-    executable: PathBuf,
+    executable: Option<PathBuf>,
 }
 
 impl ProcessTartExecutor {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
-        Self {
-            executable: executable.into(),
+        let p = executable.into();
+        if p == Path::new("tart") {
+            Self { executable: None }
+        } else {
+            Self {
+                executable: Some(p),
+            }
         }
     }
 
-    fn scrubbed_command(&self, argv: &[String]) -> Command {
-        let mut cmd = Command::new(&self.executable);
-        cmd.args(argv).env_clear();
-        for key in ["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"] {
+    fn resolve_verified_executable(&self) -> Result<PathBuf, CleanroomVmError> {
+        match self.executable {
+            Some(ref explicit) => {
+                verify_trusted_executable_path(explicit)?;
+                Ok(explicit.clone())
+            }
+            None => {
+                for candidate in TRUSTED_TART_BINARY_PATHS {
+                    let p = Path::new(candidate);
+                    if p.exists() && verify_trusted_executable_path(p).is_ok() {
+                        return Ok(p.to_path_buf());
+                    }
+                }
+                Err(CleanroomVmError::InvalidTartExecutable {
+                    path: "tart".to_owned(),
+                    reason: format!(
+                        "no verified non-symlink tart binary found in trusted system directories {:?}",
+                        TRUSTED_TART_BINARY_PATHS
+                    ),
+                })
+            }
+        }
+    }
+
+    fn scrubbed_command(&self, argv: &[String]) -> Result<Command, CleanroomVmError> {
+        let verified_bin = self.resolve_verified_executable()?;
+        let mut cmd = Command::new(verified_bin);
+        cmd.args(argv)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        for key in ["HOME", "TMPDIR", "USER", "LOGNAME"] {
             if let Some(val) = std::env::var_os(key) {
                 cmd.env(key, val);
             }
         }
-        cmd
-    }
-}
-
-impl Default for ProcessTartExecutor {
-    fn default() -> Self {
-        Self {
-            executable: PathBuf::from("tart"),
-        }
+        Ok(cmd)
     }
 }
 
 impl TartExecutor for ProcessTartExecutor {
+    fn validate_live_mounts(&self, spec: &TartCleanroomSpec) -> Result<(), CleanroomVmError> {
+        spec.verify_host_mounts()
+    }
+
     fn exec_tart(&mut self, step: &'static str, argv: &[String]) -> Result<(), CleanroomVmError> {
-        let output = self.scrubbed_command(argv).output().map_err(|e| {
-            CleanroomVmError::TartExecutionFailed {
+        let mut cmd = self.scrubbed_command(argv)?;
+        let output = cmd
+            .output()
+            .map_err(|e| CleanroomVmError::TartExecutionFailed {
                 step,
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             return Err(CleanroomVmError::TartExecutionFailed {
@@ -493,8 +804,8 @@ impl TartExecutor for ProcessTartExecutor {
         &mut self,
         argv: &[String],
     ) -> Result<Box<dyn RunningTartVm>, CleanroomVmError> {
-        let child = self
-            .scrubbed_command(argv)
+        let mut cmd = self.scrubbed_command(argv)?;
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -503,7 +814,11 @@ impl TartExecutor for ProcessTartExecutor {
                 step: "run",
                 detail: e.to_string(),
             })?;
-        Ok(Box::new(ProcessRunningTartVm { child: Some(child) }))
+        let stderr_reader = child.stderr.take().map(spawn_bounded_stderr_drain);
+        Ok(Box::new(ProcessRunningTartVm {
+            child: Some(child),
+            stderr_reader,
+        }))
     }
 }
 
@@ -514,15 +829,18 @@ pub struct EphemeralTartSession<E: TartExecutor> {
     executor: Option<E>,
     cloned: bool,
     deleted: bool,
+    startup_telemetry: Option<CleanroomStartupTelemetry>,
 }
 
 impl<E: TartExecutor> EphemeralTartSession<E> {
-    /// Clones `<base>` -> `<run-vm>`, configures CPU/RAM bounds, and arms the
-    /// deterministic `tart delete` guard immediately upon clone creation.
+    /// Verifies live host mounts (when backed by `ProcessTartExecutor`), clones
+    /// `<base>` -> `<run-vm>`, configures CPU/RAM bounds, and arms the deterministic
+    /// `tart delete` guard immediately upon clone creation.
     pub fn clone_and_arm(
         spec: TartCleanroomSpec,
         mut executor: E,
     ) -> Result<Self, CleanroomVmError> {
+        executor.validate_live_mounts(&spec)?;
         let clone_argv = spec.clone_argv();
         executor.exec_tart("clone", &clone_argv)?;
         let mut session = Self {
@@ -530,6 +848,7 @@ impl<E: TartExecutor> EphemeralTartSession<E> {
             executor: Some(executor),
             cloned: true,
             deleted: false,
+            startup_telemetry: None,
         };
         let set_argv = session.spec.set_resources_argv();
         if let Some(exec) = session.executor.as_mut() {
@@ -542,16 +861,33 @@ impl<E: TartExecutor> EphemeralTartSession<E> {
         &self.spec
     }
 
-    /// Spawns the headless cleanroom VM (`tart run`) in the background, waits for guest
-    /// readiness (`tart exec <vm> /usr/bin/true`), executes `guest_command` inside the
-    /// live running VM under `/usr/bin/sandbox-exec -p <sbpl>`, issues `tart stop <vm>`
-    /// + reaps the hypervisor handle, and guarantees `defer tart delete` on any failure.
+    pub const fn startup_telemetry(&self) -> Option<CleanroomStartupTelemetry> {
+        self.startup_telemetry
+    }
+
+    /// Runs `guest_command` with an empty `/usr/bin/env -i` environment under XNU Seatbelt.
     pub fn run_ephemeral_with_seatbelt(
         &mut self,
         seatbelt: &SeatbeltProfile,
         guest_command: &[String],
     ) -> Result<(), CleanroomVmError> {
-        let exec_argv = self.spec.guest_sandbox_exec_argv(seatbelt, guest_command)?;
+        self.run_ephemeral_with_seatbelt_and_env(seatbelt, &BTreeMap::new(), guest_command)
+    }
+
+    /// Spawns the headless cleanroom VM (`tart run`) in the background, enforces the
+    /// `<200ms` VirtioFS mount startup SLA (`check_mount_latency`), waits for guest
+    /// readiness (`tart exec <vm> -- /usr/bin/true`), executes `guest_command` inside the
+    /// live running VM under `/usr/bin/sandbox-exec -p <sbpl> -- /usr/bin/env -i ...`,
+    /// issues `tart stop <vm>` + reaps the hypervisor handle, and guarantees `defer tart delete`.
+    pub fn run_ephemeral_with_seatbelt_and_env(
+        &mut self,
+        seatbelt: &SeatbeltProfile,
+        sanitized_env: &BTreeMap<String, String>,
+        guest_command: &[String],
+    ) -> Result<(), CleanroomVmError> {
+        let exec_argv =
+            self.spec
+                .guest_sandbox_exec_with_env_argv(seatbelt, sanitized_env, guest_command)?;
         let run_argv = self.spec.run_argv();
         let readiness_argv = self.spec.guest_readiness_argv();
         let stop_argv = self.spec.stop_argv();
@@ -566,10 +902,20 @@ impl<E: TartExecutor> EphemeralTartSession<E> {
                 detail: "session already finalized".to_owned(),
             })?;
 
+        let mount_start = Instant::now();
         let mut running_vm = exec.spawn_tart_run(&run_argv)?;
+        let mount_latency_ms = mount_start.elapsed().as_millis() as u64;
+        if let Err(lat_err) = self.spec.check_mount_latency(mount_latency_ms) {
+            let _ = exec.exec_tart("stop", &stop_argv);
+            let _ = running_vm.reap();
+            return Err(lat_err);
+        }
 
+        let ready_start = Instant::now();
+        let mut readiness_attempts = 0u32;
         let mut readiness_res: Result<(), CleanroomVmError> = Ok(());
         for attempt in 1..=max_attempts {
+            readiness_attempts = attempt;
             if let Some(exit_state) = running_vm.try_poll_exited()? {
                 let _ = running_vm.reap();
                 let detail = match exit_state {
@@ -600,6 +946,13 @@ impl<E: TartExecutor> EphemeralTartSession<E> {
             let _ = running_vm.reap();
             return Err(ready_err);
         }
+
+        self.startup_telemetry = Some(CleanroomStartupTelemetry {
+            mount_latency_ms,
+            mount_budget_ms: self.spec.mount_latency_budget_ms,
+            boot_ready_ms: ready_start.elapsed().as_millis() as u64,
+            readiness_attempts,
+        });
 
         if let Some(exit_state) = running_vm.try_poll_exited()? {
             let _ = running_vm.reap();
@@ -646,6 +999,46 @@ impl<E: TartExecutor> Drop for EphemeralTartSession<E> {
     }
 }
 
+fn is_valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn validate_cidr_spec(cidr: &str) -> Result<(), CleanroomVmError> {
+    if cidr.is_empty()
+        || cidr.len() > 64
+        || cidr.starts_with('-')
+        || cidr
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ',')
+    {
+        return Err(CleanroomVmError::InvalidEgressCidr(cidr.to_owned()));
+    }
+    let Some((ip_part, prefix_part)) = cidr.split_once('/') else {
+        return Err(CleanroomVmError::InvalidEgressCidr(cidr.to_owned()));
+    };
+    let ip: IpAddr = ip_part
+        .parse()
+        .map_err(|_| CleanroomVmError::InvalidEgressCidr(cidr.to_owned()))?;
+    let prefix: u8 = prefix_part
+        .parse()
+        .map_err(|_| CleanroomVmError::InvalidEgressCidr(cidr.to_owned()))?;
+    let max_prefix = match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        return Err(CleanroomVmError::InvalidEgressCidr(cidr.to_owned()));
+    }
+    Ok(())
+}
+
 fn validate_vm_name(name: &str) -> Result<(), CleanroomVmError> {
     if name.is_empty()
         || name.len() > MAX_VM_NAME_LEN
@@ -681,17 +1074,305 @@ fn validate_clean_abs_path(path: &Path) -> Result<PathBuf, CleanroomVmError> {
         .ok_or_else(|| CleanroomVmError::InvalidMountPath(path.display().to_string()))?;
     if text.is_empty()
         || text.len() > MAX_MOUNT_PATH_LEN
+        || text.starts_with('-')
         || !path.is_absolute()
+        || (text.len() > 1 && text.ends_with('/'))
+        || text.contains("//")
         || text
             .chars()
             .any(|c| c.is_control() || matches!(c, ':' | ',' | '"' | '\'' | '\\'))
     {
         return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
     }
+
+    let mut rebuilt = PathBuf::new();
+    let mut normals: Vec<&str> = Vec::new();
     for comp in path.components() {
-        if matches!(comp, Component::ParentDir | Component::CurDir) {
+        match comp {
+            Component::RootDir => rebuilt.push("/"),
+            Component::Normal(seg) => {
+                let Some(s) = seg.to_str() else {
+                    return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
+                };
+                if s.is_empty() {
+                    return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
+                }
+                normals.push(s);
+                rebuilt.push(seg);
+            }
+            Component::ParentDir | Component::CurDir | Component::Prefix(_) => {
+                return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
+            }
+        }
+    }
+
+    // Require >= 3 total components (`/` + >= 2 Normal segments), blocking `/`, `/Users`, `/System`, `/Volumes`, `/private`, `/etc`, `/var`, `/tmp`
+    if normals.len() < 2 || rebuilt.to_str() != Some(text) {
+        return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
+    }
+
+    // Explicitly block sensitive or broad host trees even at depth >= 3
+    let first = normals[0];
+    let second = normals[1];
+    if first == "System"
+        || first == "Volumes"
+        || first == "etc"
+        || (first == "private" && second == "etc")
+        || (first == "Library" && second == "Keychains")
+        || (first == "var" && second == "root")
+        || (first == "private" && second == "var" && normals.get(2) == Some(&"root"))
+    {
+        return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
+    }
+    if first == "Users" {
+        // Block mounting an entire user home directory (`/Users/<user>`) or sensitive home subtrees
+        if normals.len() < 3 {
+            return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
+        }
+        let third = normals[2];
+        if third.starts_with('.') || third == "Library" {
             return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
         }
     }
-    Ok(path.to_path_buf())
+
+    Ok(rebuilt)
+}
+
+/// Verifies on the live host filesystem that every component of `path` is a non-symlink
+/// directory owned by `root` (`uid 0`) or `geteuid()`.
+pub fn verify_host_mount_directory(path: &Path) -> Result<PathBuf, CleanroomVmError> {
+    let clean = validate_clean_abs_path(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let euid = rustix::process::geteuid().as_raw();
+        let mut cursor = PathBuf::from("/");
+        let root_meta = fs::symlink_metadata(&cursor)
+            .map_err(|_| CleanroomVmError::InvalidMountPath(clean.display().to_string()))?;
+        if root_meta.file_type().is_symlink() || !root_meta.is_dir() || root_meta.uid() != 0 {
+            return Err(CleanroomVmError::InvalidMountPath(
+                clean.display().to_string(),
+            ));
+        }
+
+        for (idx, comp) in clean.components().enumerate() {
+            let Component::Normal(seg) = comp else {
+                continue;
+            };
+            cursor.push(seg);
+            let meta = fs::symlink_metadata(&cursor)
+                .map_err(|_| CleanroomVmError::InvalidMountPath(clean.display().to_string()))?;
+            if meta.file_type().is_symlink() {
+                // Allow only macOS's root-owned top-level `/var -> private/var` and `/tmp -> private/tmp` firmlinks
+                if idx == 1 && meta.uid() == 0 && (seg == "var" || seg == "tmp") {
+                    let target = fs::read_link(&cursor).map_err(|_| {
+                        CleanroomVmError::InvalidMountPath(clean.display().to_string())
+                    })?;
+                    let expected_rel = if seg == "var" {
+                        Path::new("private/var")
+                    } else {
+                        Path::new("private/tmp")
+                    };
+                    let expected_abs = Path::new("/").join(expected_rel);
+                    if target == expected_rel || target == expected_abs {
+                        let priv_meta = fs::symlink_metadata("/private").map_err(|_| {
+                            CleanroomVmError::InvalidMountPath(clean.display().to_string())
+                        })?;
+                        if priv_meta.file_type().is_symlink()
+                            || !priv_meta.is_dir()
+                            || priv_meta.uid() != 0
+                        {
+                            return Err(CleanroomVmError::InvalidMountPath(
+                                clean.display().to_string(),
+                            ));
+                        }
+                        cursor = expected_abs;
+                        let redirected_meta = fs::symlink_metadata(&cursor).map_err(|_| {
+                            CleanroomVmError::InvalidMountPath(clean.display().to_string())
+                        })?;
+                        if redirected_meta.file_type().is_symlink()
+                            || !redirected_meta.is_dir()
+                            || redirected_meta.uid() != 0
+                        {
+                            return Err(CleanroomVmError::InvalidMountPath(
+                                clean.display().to_string(),
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                return Err(CleanroomVmError::InvalidMountPath(
+                    clean.display().to_string(),
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(CleanroomVmError::InvalidMountPath(
+                    clean.display().to_string(),
+                ));
+            }
+            let uid = meta.uid();
+            if uid != 0 && uid != euid {
+                return Err(CleanroomVmError::InvalidMountPath(
+                    clean.display().to_string(),
+                ));
+            }
+        }
+        Ok(cursor)
+    }
+    #[cfg(not(unix))]
+    {
+        if !clean.is_dir() {
+            return Err(CleanroomVmError::InvalidMountPath(
+                clean.display().to_string(),
+            ));
+        }
+        Ok(clean)
+    }
+}
+
+/// Verifies that `bin_path` is an absolute, non-symlink regular executable file owned by
+/// `root` (`uid 0`) or `geteuid()`, with zero group/world write permissions and trusted ancestors.
+pub fn verify_trusted_executable_path(bin_path: &Path) -> Result<(), CleanroomVmError> {
+    let display = bin_path.display().to_string();
+    let Some(text) = bin_path.to_str() else {
+        return Err(CleanroomVmError::InvalidTartExecutable {
+            path: display,
+            reason: "executable path must be valid UTF-8".to_owned(),
+        });
+    };
+    if text.is_empty() || !bin_path.is_absolute() || text.contains("//") || text.contains('\0') {
+        return Err(CleanroomVmError::InvalidTartExecutable {
+            path: display,
+            reason: "executable path must be normalized absolute path (relative PATH rejected)"
+                .to_owned(),
+        });
+    }
+    for comp in bin_path.components() {
+        if matches!(
+            comp,
+            Component::CurDir | Component::ParentDir | Component::Prefix(_)
+        ) {
+            return Err(CleanroomVmError::InvalidTartExecutable {
+                path: display,
+                reason: "relative `.` or `..` segments are forbidden".to_owned(),
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let euid = rustix::process::geteuid().as_raw();
+        let meta = fs::symlink_metadata(bin_path).map_err(|e| {
+            CleanroomVmError::InvalidTartExecutable {
+                path: display.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(CleanroomVmError::InvalidTartExecutable {
+                path: display,
+                reason: "executable must be a regular non-symlink file".to_owned(),
+            });
+        }
+        let uid = meta.uid();
+        if uid != 0 && uid != euid {
+            return Err(CleanroomVmError::InvalidTartExecutable {
+                path: display,
+                reason: format!("executable owned by untrusted uid {uid}"),
+            });
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o111 == 0 {
+            return Err(CleanroomVmError::InvalidTartExecutable {
+                path: display,
+                reason: "file is not executable".to_owned(),
+            });
+        }
+        if mode & 0o022 != 0 {
+            return Err(CleanroomVmError::InvalidTartExecutable {
+                path: display,
+                reason: "executable must not be group- or world-writable".to_owned(),
+            });
+        }
+
+        let Some(parent) = bin_path.parent() else {
+            return Err(CleanroomVmError::InvalidTartExecutable {
+                path: display,
+                reason: "missing parent directory".to_owned(),
+            });
+        };
+        let mut cursor = PathBuf::from("/");
+        for (idx, comp) in parent.components().enumerate() {
+            let Component::Normal(seg) = comp else {
+                continue;
+            };
+            cursor.push(seg);
+            let dir_meta = fs::symlink_metadata(&cursor).map_err(|e| {
+                CleanroomVmError::InvalidTartExecutable {
+                    path: display.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            if dir_meta.file_type().is_symlink() {
+                if idx == 1 && dir_meta.uid() == 0 && (seg == "var" || seg == "tmp") {
+                    let target = fs::read_link(&cursor).map_err(|e| {
+                        CleanroomVmError::InvalidTartExecutable {
+                            path: display.clone(),
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let expected = if seg == "var" {
+                        Path::new("private/var")
+                    } else {
+                        Path::new("private/tmp")
+                    };
+                    if target == expected {
+                        cursor = Path::new("/").join(expected);
+                        let redir_meta = fs::symlink_metadata(&cursor).map_err(|e| {
+                            CleanroomVmError::InvalidTartExecutable {
+                                path: display.clone(),
+                                reason: e.to_string(),
+                            }
+                        })?;
+                        if redir_meta.file_type().is_symlink()
+                            || !redir_meta.is_dir()
+                            || redir_meta.uid() != 0
+                        {
+                            return Err(CleanroomVmError::InvalidTartExecutable {
+                                path: display,
+                                reason: "invalid macOS /private firmlink target".to_owned(),
+                            });
+                        }
+                        continue;
+                    }
+                }
+                return Err(CleanroomVmError::InvalidTartExecutable {
+                    path: display,
+                    reason: "ancestor directory cannot be a symlink".to_owned(),
+                });
+            }
+            if !dir_meta.is_dir() {
+                return Err(CleanroomVmError::InvalidTartExecutable {
+                    path: display,
+                    reason: "ancestor component is not a directory".to_owned(),
+                });
+            }
+            let d_uid = dir_meta.uid();
+            if d_uid != 0 && d_uid != euid {
+                return Err(CleanroomVmError::InvalidTartExecutable {
+                    path: display,
+                    reason: format!("ancestor directory owned by untrusted uid {d_uid}"),
+                });
+            }
+            let d_mode = dir_meta.permissions().mode();
+            if (d_mode & 0o002) != 0 && (d_mode & 0o1000) == 0 {
+                return Err(CleanroomVmError::InvalidTartExecutable {
+                    path: display,
+                    reason: "ancestor directory is world-writable without sticky bit".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
