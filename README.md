@@ -127,6 +127,10 @@ chinwag memory stats --bank default
 
 - **Deterministic DOM Geometry Gate (`chinwag ui-gate`):** Evaluates `176/176` machine-measured DOM bounding-box and kinetic scroll checks across 8 viewports and Midnight/Daylight themes (`INV-UI-BLEED`, `INV-UI-OVERLAP`, `INV-UI-CLIP`, `INV-UI-HIT-TEST`), plus optional `Vision-3` `16-surface` multimodal visual audits and autonomous CSS auto-patch.
 - **Companion [`chinwag-ci`](https://github.com/emunlabs/chinwag-ci) Runner:** Pure-Rust static CI binary (`wrap`, `verify-signer`, `test-regressions`, `diff-run`, `fork-run`, `ui-gate`, `omp-gate`, `policy-gate`, `surface-gate`, `attest-green`, `notify`, `selftest`) that scrubs secrets before encryption, coalesces 20-shard CI matrix storms into one `1.4s` agent wakeup, holds the warm CI container open for a signed live patch (`--hold-for-patch`), verifies `<5ms` `CP-OMP` orthogonal quorums, `<1ms` `WP-01..WP-15` policy rules, and `SurfaceImpactManifestV1` cross-surface completeness (`surface-gate`), and replays `.chinwag/regressions/*.json` Tombstone cassettes offline in `<50 ms` at `$0` LLM spend.
+- **Ephemeral Apple Silicon Tart Cleanroom VMs & Zero-Nix Lockfiles (`chinwag env lock` & `chinwag runner start --ephemeral` · `crates/chinwag-cleanroom-vm`):**
+  - **Zero-Nix Deterministic Lockfile Synthesis (`chinwag env lock [--check]` · `INV-NIX-ZERO-SYNTAX-01`):** Compiles a deterministic `.chinwag/flake.lock` (schema v7 with content-addressed SRI `narHash` closures) and an `Ed25519` `verify_strict` receipt (`.chinwag/env-lock.receipt.json`) directly from repository manifests (`Cargo.toml`, `rust-toolchain.toml`, `package.json`, `pyproject.toml`, `go.mod`, or `.chinwag/env.ts`) while rejecting hand-authored `.nix` files.
+  - **Ephemeral `Virtualization.framework` Cleanrooms (`chinwag runner start --ephemeral` · `INV-NIX-VIRTIOFS-01` & `INV-NIX-RO-STORE-01`):** Clones an APFS CoW cleanroom VM (`tart clone`), mounts the host `/nix/store` and `sccache` strictly read-only over `VirtioFS` (`--no-graphics --dir=nix-store:/nix/store:ro --dir=sccache:<cache>:ro`, `<200ms` mount budget), enforces an XNU Seatbelt (`sandbox_init` / `SIGKILL`) profile blocking all store and `nix-daemon` socket writes, and guarantees `defer tart delete` teardown via RAII `Drop`.
+  - **Two-Tier Runner Trust Split & Hardware Pool Policy (`INV-CLEANROOM-TRUST-SPLIT-01`):** Isolates untrusted PR/branch jobs in `chinwag-ephemeral-public` (zero release keys, Keychain/SSH blocked, scrubbed environment) from `chinwag-ephemeral-release` (protected `refs/heads/main` and `refs/tags/v*` with verified `Ed25519` commit signer attestation), enforces the 2-VM-per-host Apple Silicon limit plus AC-power/thermal-pressure opportunistic admission (`<500ms` user-input drain), and seals scrubbed failure logs with `X25519-MLKEM768` HPKE + `Ed25519` verify-before-decrypt.
 
 ---
 
@@ -191,6 +195,8 @@ Usage:
   chinwag omp <status | plan> [--repo <path>] [--json]
   chinwag pair | triad | quad [options]
   chinwag verify --policy .chinwag/workflow.yaml [--json]
+  chinwag env lock [--repo <path>] [--check] [--signing-seed-file <path>] [--signer-pubkey-hex <64hex>] [--json]
+  chinwag runner start --ephemeral [--profile <public|release>] [--opportunistic] [--dry-run] [--json]
   chinwag tasks <init | create | list | split> [options]
   chinwag board <init | push | pull | watch | sync-loop> [options]
   chinwag ci-report --issue <ID> --status <pass|fail> [--push-boards] [--delivery-licensed]
@@ -259,7 +265,8 @@ flowchart TB
 
 | Crate / Component | Path | Target | Role in the Chinwag Architecture |
 | :--- | :--- | :--- | :--- |
-| **`chinwag-cli`** | [`crates/chinwag-cli`](crates/chinwag-cli) | `bin: chinwag` | Main CLI dispatcher (`init`, `status`, `delivery`, `omp`, `pair`, `triad`, `quad`, `verify`, `tasks`, `board`, `ci-report`, `bus`, `memory`, `agent-dispatch`, `configure-editor`, `mcp-serve`, `ui-gate`, `a509`, `cwcard`). |
+| **`chinwag-cli`** | [`crates/chinwag-cli`](crates/chinwag-cli) | `bin: chinwag` | Main CLI dispatcher (`init`, `status`, `delivery`, `omp`, `pair`, `triad`, `quad`, `verify`, `env lock`, `runner start --ephemeral`, `tasks`, `board`, `ci-report`, `bus`, `memory`, `agent-dispatch`, `configure-editor`, `mcp-serve`, `ui-gate`, `a509`, `cwcard`). |
+| **`chinwag-cleanroom-vm`** | [`crates/chinwag-cleanroom-vm`](crates/chinwag-cleanroom-vm) | `lib` | Ephemeral Apple Silicon Tart VM driver (`tart clone` / `run --no-graphics :ro` / `defer delete`), XNU Seatbelt SBPL compiler, zero-Nix `.chinwag/flake.lock` synthesizer, 2-tier runner trust gate, and `X25519-MLKEM768` failure bundle sealer. |
 | **`chinwag-mcp`** | [`crates/chinwag-mcp`](crates/chinwag-mcp) | `lib` | Bounded MCP server (`rmcp`) over `stdio` and authenticated loopback `HTTP`, serving `chinwag_read_thread`, `chinwag_pin_context`, and `chinwag_handoff`. |
 | **`chinwag-swarm`** | [`crates/chinwag-swarm`](crates/chinwag-swarm) | `lib` | Sovereign P2P transport built on `iroh 1.4.1` QUIC, `iroh-gossip`, `iroh-blobs` (`BLAKE3` 32 MiB cap), VPN-safe `LAN mDNS`, `RelayPolicy::Own` / `MultiRegion` health-scored failover, 128-slot `ReplayWindow`, `SessionResumptionTicketV1`, and `1,408`-byte `SignedHpkeBlobV1` (`K1 + K2` verify-before-decrypt). |
 | **`chinwag-claim`** | [`crates/chinwag-claim`](crates/chinwag-claim) | `lib` (`native` + `wasm`) | Pure `Ed25519`-signed task-claim requests, coordinator receipts (`SignedClaimReceipt`), and disjoint `--file-scope` glob policy checks. |
