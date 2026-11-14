@@ -9,9 +9,15 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+/// macOS `<sys/fcntl.h>` `O_NOFOLLOW` flag (`0x0100`) used alongside `O_CREAT | O_EXCL` on temp writes.
+const MACOS_O_NOFOLLOW: i32 = 0x0100;
+
+static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Exit code `78` (`EX_CONFIG`) returned whenever `INV-CURSOR-IMPORT-SAFE-01` quarantines an input.
 pub const EXIT_QUARANTINE: u8 = 78;
@@ -103,12 +109,13 @@ impl QuarantineViolation {
 }
 
 /// Non-secret record of an inline credential converted into a `PhantomVault` reference.
+/// Never stores secret length or secret-derived hashes (`INV-CURSOR-IMPORT-SAFE-01d`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhantomVaultPlaceholder {
     pub location: String,
     pub key: String,
     pub placeholder: String,
-    pub fingerprint: String,
+    pub redaction: String,
 }
 
 /// Sanitized MCP server descriptor written into `TOOL.md` and `import-receipt.json`.
@@ -154,6 +161,17 @@ pub struct ImportCursorOptions {
     pub agent_name: String,
     pub out_dir: PathBuf,
     pub json_output: bool,
+    pub include_design: bool,
+    pub allowed_mcp_commands: BTreeSet<String>,
+}
+
+/// Default customer-configurable allowlist of bare MCP package launcher names.
+#[must_use]
+pub fn default_allowed_mcp_commands() -> BTreeSet<String> {
+    ["npx", "uvx", "bunx", "pnpx", "docker", "podman"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Outcome of `import_cursor_bundle`.
@@ -208,7 +226,7 @@ struct AgentMetadata {
 
 #[must_use]
 pub fn agent_help() -> &'static str {
-    "Usage: chinwag agent import-cursor <src-dir> --name <NAME> [--out <dest-dir>] [--json]\n\n\
+    "Usage: chinwag agent import-cursor <src-dir> --name <NAME> [--out <dest-dir>] [--include-design] [--allow-mcp-command <CMD>] [--json]\n\n\
      Deterministically translate a Cursor Agent SDK or .cursor/ project directory into a\n\
      local Chinwag SOP-BOOT-01 agent bundle while enforcing the 5-gate INV-CURSOR-IMPORT-SAFE-01\n\
      static security sanitizer (exits 78 on quarantine).\n"
@@ -367,12 +385,32 @@ pub fn parse_import_cursor_args(args: &[String]) -> Result<ImportCursorOptions, 
     let mut agent_name: Option<String> = None;
     let mut out_dir: Option<String> = None;
     let mut json_output = false;
+    let mut include_design = false;
+    let mut allowed_mcp_commands = default_allowed_mcp_commands();
+
+    if let Ok(extra_cmds) = std::env::var("CHINWAG_ALLOWED_MCP_COMMANDS") {
+        for raw_cmd in extra_cmds.split(',') {
+            let trimmed = raw_cmd.trim();
+            if !trimmed.is_empty() {
+                register_allowed_mcp_command(
+                    trimmed,
+                    "CHINWAG_ALLOWED_MCP_COMMANDS",
+                    &mut allowed_mcp_commands,
+                )?;
+            }
+        }
+    }
 
     let mut idx = 0;
     while idx < args.len() {
         let token = args[idx].as_str();
         if token == "--json" {
             json_output = true;
+            idx += 1;
+            continue;
+        }
+        if token == "--include-design" {
+            include_design = true;
             idx += 1;
             continue;
         }
@@ -398,6 +436,22 @@ pub fn parse_import_cursor_args(args: &[String]) -> Result<ImportCursorOptions, 
                         ));
                     }
                     src_dir = Some(inline_val.to_owned());
+                }
+                "--include-design" => match inline_val {
+                    "true" | "1" => include_design = true,
+                    "false" | "0" => include_design = false,
+                    _ => {
+                        return Err(ImportError::InvalidArgs(
+                            "--include-design expects 'true' or 'false'".to_owned(),
+                        ));
+                    }
+                },
+                "--allow-mcp-command" => {
+                    register_allowed_mcp_command(
+                        inline_val,
+                        "--allow-mcp-command",
+                        &mut allowed_mcp_commands,
+                    )?;
                 }
                 _ => {
                     return Err(ImportError::InvalidArgs(format!("unknown flag '{flag}'")));
@@ -444,6 +498,19 @@ pub fn parse_import_cursor_args(args: &[String]) -> Result<ImportCursorOptions, 
                     ));
                 }
                 src_dir = Some(val.clone());
+                idx += 2;
+            }
+            "--allow-mcp-command" => {
+                let Some(val) = args.get(idx + 1) else {
+                    return Err(ImportError::InvalidArgs(
+                        "missing value for --allow-mcp-command".to_owned(),
+                    ));
+                };
+                register_allowed_mcp_command(
+                    val,
+                    "--allow-mcp-command",
+                    &mut allowed_mcp_commands,
+                )?;
                 idx += 2;
             }
             other if other.starts_with('-') => {
@@ -517,7 +584,43 @@ pub fn parse_import_cursor_args(args: &[String]) -> Result<ImportCursorOptions, 
         agent_name: raw_name,
         out_dir: resolved_out,
         json_output,
+        include_design,
+        allowed_mcp_commands,
     })
+}
+
+fn register_allowed_mcp_command(
+    raw_cmd: &str,
+    source_flag: &str,
+    allowed: &mut BTreeSet<String>,
+) -> Result<(), ImportError> {
+    let trimmed = raw_cmd.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.starts_with('~')
+        || trimmed.starts_with('.')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
+            SecurityGate::McpShellMetacharQuarantine,
+            source_flag,
+            format!(
+                "MCP launcher '{trimmed}' must be a bare executable basename without path separators"
+            ),
+        )]));
+    }
+    let normalized = strip_executable_ext_lower(trimmed);
+    if FORBIDDEN_SHELL_AND_EXEC_COMMANDS.contains(&normalized.as_str()) {
+        return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
+            SecurityGate::McpShellMetacharQuarantine,
+            source_flag,
+            format!("shell/interpreter '{normalized}' cannot be added to MCP launcher allowlist"),
+        )]));
+    }
+    allowed.insert(normalized);
+    Ok(())
 }
 
 fn validate_agent_name(name: &str) -> Result<(), ImportError> {
@@ -614,20 +717,30 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
     }
 
     validate_no_symlink_ancestors(&options.out_dir, "<out-dir>")?;
-    if let Ok(out_meta) = fs::symlink_metadata(&options.out_dir)
-        && out_meta.file_type().is_symlink()
+    if path_crosses_ignored_vcs_or_cache(&options.out_dir) {
+        return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
+            SecurityGate::InertAstParse,
+            "<out-dir>",
+            "output path must not target '.git', 'node_modules', or 'target'",
+        )]));
+    }
+    if let (Ok(canon_src), Ok(canon_out)) = (
+        fs::canonicalize(&options.src_dir),
+        fs::canonicalize(&options.out_dir),
+    ) && canon_src == canon_out
     {
         return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
             SecurityGate::InertAstParse,
             "<out-dir>",
-            "destination path is a symbolic link (symlink refusal)",
+            "output directory must not equal the source root directory",
         )]));
     }
 
     let mut violations: Vec<QuarantineViolation> = Vec::new();
     let mut total_bytes: u64 = 0;
 
-    // Gate 1a: scan directory tree for symlinks, irregular files, or traversal bombs.
+    // Gate 1a: pre-scan both `src_dir` (including `.chinwag/`) and any pre-existing `out_dir`
+    // for symlinks, hardlinks (`nlink > 1`), FIFOs/devices, or depth/size bombs BEFORE reading/writing.
     scan_tree_symlinks(
         &options.src_dir,
         &options.src_dir,
@@ -635,6 +748,7 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
         &mut total_bytes,
         &mut violations,
     );
+    scan_existing_output_dir(&options.out_dir, &mut violations);
     if !violations.is_empty() {
         return Err(ImportError::Quarantine(violations));
     }
@@ -647,6 +761,7 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
     let mut parsed_tools: Vec<ParsedTool> = Vec::new();
     let mut parsed_channels: Vec<ParsedChannel> = Vec::new();
     let mut skipped_design_files: Vec<String> = Vec::new();
+    let mut included_design_markdown: Option<String> = None;
     let mut metadata = AgentMetadata::default();
 
     // 1. Optional `agent.json`
@@ -655,10 +770,11 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
         && let Some(raw) = read_utf8_checked(&agent_json_path, "agent.json", &mut violations)
     {
         source_artifacts.insert("agent.json".to_owned());
-        scan_gate_1e_text("agent.json", &raw, false, &mut violations);
+        scan_gate_1e_text("agent.json", &raw, true, &mut violations);
         parse_agent_json(
             &raw,
             &options.agent_name,
+            &options.allowed_mcp_commands,
             &mut metadata,
             &mut mcp_servers,
             &mut placeholders,
@@ -701,14 +817,23 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
         cursorrules_text = Some(scrubbed);
     }
 
-    // 3. Optional `DESIGN.md` (enforcing `INV-DESIGN-TYPE-ONLY-01`)
+    // 3. Optional `DESIGN.md` (customer-configurable via `--include-design`, defaulting to `false`)
     let design_path = options.src_dir.join("DESIGN.md");
     if path_exists_regular(&design_path, "DESIGN.md", &mut violations)
         && let Some(raw) = read_utf8_checked(&design_path, "DESIGN.md", &mut violations)
     {
         source_artifacts.insert("DESIGN.md".to_owned());
         scan_gate_1e_text("DESIGN.md", &raw, true, &mut violations);
-        if options.agent_name != "TYPE" {
+        scan_markdown_links("DESIGN.md", &raw, &mut violations);
+        if options.include_design {
+            let scrubbed_design = scrub_inline_secrets_in_prose(
+                &raw,
+                &options.agent_name,
+                "DESIGN.md",
+                &mut placeholders,
+            );
+            included_design_markdown = Some(ensure_trailing_newline(&scrubbed_design));
+        } else {
             skipped_design_files.push("DESIGN.md".to_owned());
         }
     }
@@ -740,6 +865,7 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
                 None,
                 &raw,
                 &options.agent_name,
+                &options.allowed_mcp_commands,
                 &mut mcp_servers,
                 &mut placeholders,
                 &mut violations,
@@ -753,6 +879,7 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
             &options.src_dir,
             &mcp_conn_dir,
             &options.agent_name,
+            &options.allowed_mcp_commands,
             &mut source_artifacts,
             &mut mcp_servers,
             &mut placeholders,
@@ -888,6 +1015,9 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
     rendered_files.insert("TOOL.md".to_owned(), tool_md.into_bytes());
     rendered_files.insert("SKILLS.md".to_owned(), skills_index_md.into_bytes());
     rendered_files.insert("MEMORY.md".to_owned(), memory_md.into_bytes());
+    if let Some(design_md) = included_design_markdown {
+        rendered_files.insert("DESIGN.md".to_owned(), design_md.into_bytes());
+    }
 
     let mut skills_generated = Vec::new();
     for skill in &parsed_skills {
@@ -903,6 +1033,16 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
     if !mcp_servers.is_empty() {
         let allowlist = render_mcp_allowlist_json(&options.agent_name, &mcp_servers);
         rendered_files.insert("mcp-allowlist.json".to_owned(), allowlist.into_bytes());
+    }
+
+    // Defense-in-depth Gate 1e verification over every rendered output buffer prior to disk write.
+    for (rel_out, content) in &rendered_files {
+        if let Ok(rendered_str) = std::str::from_utf8(content) {
+            scan_gate_1e_text(rel_out, rendered_str, true, &mut violations);
+        }
+    }
+    if !violations.is_empty() {
+        return Err(ImportError::Quarantine(violations));
     }
 
     // Compute deterministic SHA-256 across all bundle files prior to receipt emission.
@@ -953,39 +1093,245 @@ pub fn import_cursor_bundle(options: &ImportCursorOptions) -> Result<ImportRecei
         .map_err(|err| ImportError::Io(format!("failed to serialize import receipt: {err}")))?;
     let mut receipt_with_newline = receipt_bytes;
     receipt_with_newline.push(b'\n');
-    rendered_files.insert("import-receipt.json".to_owned(), receipt_with_newline);
 
-    // Write all verified files safely (checking no intermediate symlinks exist).
-    write_bundle_files(&options.out_dir, &rendered_files)?;
+    // Write all verified bundle files atomically via O_NOFOLLOW temp files, writing
+    // `import-receipt.json` STRICTLY LAST only after all bundle files succeed.
+    write_bundle_files(&options.out_dir, &rendered_files, &receipt_with_newline)?;
 
     Ok(receipt)
+}
+
+fn path_crosses_ignored_vcs_or_cache(path: &Path) -> bool {
+    path.components().any(|comp| {
+        comp.as_os_str()
+            .to_str()
+            .is_some_and(|s| matches!(s, ".git" | "node_modules" | "target"))
+    })
+}
+
+fn scan_existing_output_dir(out_dir: &Path, violations: &mut Vec<QuarantineViolation>) {
+    let meta = match fs::symlink_metadata(out_dir) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                "<out-dir>",
+                format!("unable to stat output directory: {err}"),
+            ));
+            return;
+        }
+    };
+    if meta.file_type().is_symlink() {
+        violations.push(QuarantineViolation::new(
+            SecurityGate::InertAstParse,
+            "<out-dir>",
+            "destination path is a symbolic link (symlink refusal)",
+        ));
+        return;
+    }
+    if !meta.is_dir() {
+        violations.push(QuarantineViolation::new(
+            SecurityGate::InertAstParse,
+            "<out-dir>",
+            "destination path exists and is not a real directory",
+        ));
+        return;
+    }
+    scan_output_tree(out_dir, out_dir, 0, violations);
+}
+
+fn scan_output_tree(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    violations: &mut Vec<QuarantineViolation>,
+) {
+    if depth > MAX_IMPORT_DEPTH {
+        violations.push(QuarantineViolation::new(
+            SecurityGate::InertAstParse,
+            relative_display(root, current),
+            format!("output directory nesting exceeds maximum depth ({MAX_IMPORT_DEPTH})"),
+        ));
+        return;
+    }
+    let Ok(entries) = read_sorted_dir(current) else {
+        return;
+    };
+    for entry_path in entries {
+        let rel = relative_display(root, &entry_path);
+        let Ok(meta) = fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                format!("<out-dir>/{rel}"),
+                "symbolic link in output directory is forbidden",
+            ));
+            continue;
+        }
+        if ft.is_dir() {
+            scan_output_tree(root, &entry_path, depth + 1, violations);
+        } else if ft.is_file() {
+            if meta.nlink() > 1 {
+                violations.push(QuarantineViolation::new(
+                    SecurityGate::InertAstParse,
+                    format!("<out-dir>/{rel}"),
+                    format!(
+                        "hard-linked file (nlink={}) in output directory is forbidden",
+                        meta.nlink()
+                    ),
+                ));
+            }
+        } else {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                format!("<out-dir>/{rel}"),
+                "non-regular special file (FIFO/socket/device) in output directory is forbidden",
+            ));
+        }
+    }
 }
 
 fn write_bundle_files(
     out_dir: &Path,
     files: &BTreeMap<String, Vec<u8>>,
+    receipt_bytes: &[u8],
 ) -> Result<(), ImportError> {
-    ensure_real_dir_all(out_dir)?;
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    ensure_real_dir_all(out_dir, &mut created_dirs)?;
+    let mut written_paths: Vec<PathBuf> = Vec::with_capacity(files.len() + 1);
+
     for (rel_path, bytes) in files {
-        let full_path = out_dir.join(rel_path);
-        if let Some(parent) = full_path.parent() {
-            ensure_real_dir_all(parent)?;
+        if let Err(err) = atomic_write_nofollow(
+            out_dir,
+            rel_path,
+            bytes,
+            &mut written_paths,
+            &mut created_dirs,
+        ) {
+            rollback_written_files(&written_paths, &created_dirs);
+            return Err(err);
         }
-        if let Ok(existing_meta) = fs::symlink_metadata(&full_path)
-            && existing_meta.file_type().is_symlink()
+    }
+
+    if let Err(err) = atomic_write_nofollow(
+        out_dir,
+        "import-receipt.json",
+        receipt_bytes,
+        &mut written_paths,
+        &mut created_dirs,
+    ) {
+        rollback_written_files(&written_paths, &created_dirs);
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+fn rollback_written_files(paths: &[PathBuf], created_dirs: &[PathBuf]) {
+    for p in paths.iter().rev() {
+        if let Ok(meta) = fs::symlink_metadata(p)
+            && meta.is_file()
+            && !meta.file_type().is_symlink()
+            && meta.nlink() == 1
         {
+            let _ = fs::remove_file(p);
+        }
+    }
+    for d in created_dirs.iter().rev() {
+        let _ = fs::remove_dir(d);
+    }
+}
+
+fn atomic_write_nofollow(
+    out_dir: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    written_paths: &mut Vec<PathBuf>,
+    created_dirs: &mut Vec<PathBuf>,
+) -> Result<(), ImportError> {
+    let full_path = out_dir.join(rel_path);
+    let Some(parent) = full_path.parent() else {
+        return Err(ImportError::Io(format!(
+            "output path '{}' has no parent directory",
+            full_path.display()
+        )));
+    };
+    ensure_real_dir_all(parent, created_dirs)?;
+    verify_safe_output_destination(&full_path, rel_path)?;
+
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp_name = format!(".chinwag-import-tmp-{pid}-{seq}");
+    let tmp_path = parent.join(tmp_name);
+
+    let write_res = (|| -> Result<(), std::io::Error> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(MACOS_O_NOFOLLOW)
+            .open(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ImportError::Io(format!(
+            "failed to stage atomic output file for '{}': {err}",
+            full_path.display()
+        )));
+    }
+
+    if let Err(q_err) = verify_safe_output_destination(&full_path, rel_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(q_err);
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, &full_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ImportError::Io(format!(
+            "failed to atomically commit output file '{}': {err}",
+            full_path.display()
+        )));
+    }
+
+    written_paths.push(full_path);
+    Ok(())
+}
+
+fn verify_safe_output_destination(full_path: &Path, rel_path: &str) -> Result<(), ImportError> {
+    if let Ok(existing_meta) = fs::symlink_metadata(full_path) {
+        let ft = existing_meta.file_type();
+        if ft.is_symlink() {
             return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
                 SecurityGate::InertAstParse,
-                rel_path.clone(),
+                rel_path.to_owned(),
                 "refusing to overwrite symbolic link in output directory",
             )]));
         }
-        fs::write(&full_path, bytes).map_err(|err| {
-            ImportError::Io(format!(
-                "failed to write output file '{}': {err}",
-                full_path.display()
-            ))
-        })?;
+        if !ft.is_file() {
+            return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                rel_path.to_owned(),
+                "refusing to overwrite directory or special file (FIFO/socket/device) in output directory",
+            )]));
+        }
+        if existing_meta.nlink() > 1 {
+            return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                rel_path.to_owned(),
+                format!(
+                    "refusing to overwrite hard-linked file (nlink={}) in output directory",
+                    existing_meta.nlink()
+                ),
+            )]));
+        }
     }
     Ok(())
 }
@@ -1016,26 +1362,75 @@ fn validate_no_symlink_ancestors(path: &Path, label: &str) -> Result<(), ImportE
     Ok(())
 }
 
-fn ensure_real_dir_all(dir: &Path) -> Result<(), ImportError> {
+fn ensure_real_dir_all(dir: &Path, created_dirs: &mut Vec<PathBuf>) -> Result<(), ImportError> {
     validate_no_symlink_ancestors(dir, "<out-dir>")?;
-    if let Ok(meta) = fs::symlink_metadata(dir) {
-        if meta.file_type().is_symlink() {
-            return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
-                SecurityGate::InertAstParse,
-                dir.display().to_string(),
-                "output directory component is a symbolic link",
-            )]));
+    let mut current = PathBuf::new();
+    for comp in dir.components() {
+        current.push(comp.as_os_str());
+        if matches!(
+            comp,
+            Component::RootDir | Component::CurDir | Component::Prefix(_)
+        ) {
+            continue;
         }
-        if meta.is_dir() {
-            return Ok(());
+        if matches!(current.to_str(), Some("/var" | "/tmp" | "/etc")) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
+                        SecurityGate::InertAstParse,
+                        current.display().to_string(),
+                        "output directory component is a symbolic link",
+                    )]));
+                }
+                if !meta.is_dir() {
+                    return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
+                        SecurityGate::InertAstParse,
+                        current.display().to_string(),
+                        "output directory component exists and is not a directory",
+                    )]));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let mut did_create = true;
+                if let Err(mkdir_err) = fs::create_dir(&current) {
+                    if mkdir_err.kind() == std::io::ErrorKind::AlreadyExists {
+                        did_create = false;
+                    } else {
+                        return Err(ImportError::Io(format!(
+                            "failed to create output directory '{}': {mkdir_err}",
+                            current.display()
+                        )));
+                    }
+                }
+                let post_meta = fs::symlink_metadata(&current).map_err(|e| {
+                    ImportError::Io(format!(
+                        "failed to verify created directory '{}': {e}",
+                        current.display()
+                    ))
+                })?;
+                if post_meta.file_type().is_symlink() || !post_meta.is_dir() {
+                    return Err(ImportError::Quarantine(vec![QuarantineViolation::new(
+                        SecurityGate::InertAstParse,
+                        current.display().to_string(),
+                        "output directory component raced with non-directory or symlink",
+                    )]));
+                }
+                if did_create {
+                    created_dirs.push(current.clone());
+                }
+            }
+            Err(err) => {
+                return Err(ImportError::Io(format!(
+                    "failed to inspect output directory '{}': {err}",
+                    current.display()
+                )));
+            }
         }
     }
-    fs::create_dir_all(dir).map_err(|err| {
-        ImportError::Io(format!(
-            "failed to create output directory '{}': {err}",
-            dir.display()
-        ))
-    })
+    Ok(())
 }
 
 fn scan_tree_symlinks(
@@ -1090,18 +1485,37 @@ fn scan_tree_symlinks(
             continue;
         }
 
-        let name = entry_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
+        let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) else {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                rel,
+                "non-UTF-8 filename is forbidden inside imported Cursor bundles",
+            ));
+            continue;
+        };
+        if name.chars().any(char::is_control) {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                rel,
+                "filename containing ASCII/Unicode control characters is forbidden",
+            ));
+            continue;
+        }
 
         if ft.is_dir() {
             // Skip heavy VCS/build caches only after confirming they are real directories, not symlinks.
-            if depth == 0 && matches!(name, ".git" | "node_modules" | "target" | ".chinwag") {
+            // Never skip `.chinwag` so pre-seeded symlinks/hardlinks under `<src>/.chinwag` are caught!
+            if depth == 0 && matches!(name, ".git" | "node_modules" | "target") {
                 continue;
+            }
+            if rel != ".chinwag" && !rel.starts_with(".chinwag/") {
+                scan_gate_1e_text(&rel, &rel, true, violations);
             }
             scan_tree_symlinks(root, &entry_path, depth + 1, total_bytes, violations);
         } else if ft.is_file() {
+            if rel != ".chinwag" && !rel.starts_with(".chinwag/") {
+                scan_gate_1e_text(&rel, &rel, true, violations);
+            }
             if meta.nlink() > 1 {
                 violations.push(QuarantineViolation::new(
                     SecurityGate::InertAstParse,
@@ -1266,14 +1680,28 @@ fn strip_leading_bom_only(text: &str) -> String {
     }
 }
 
-/// Gate 1e (`UnicodeBidiAndInjectionScan`): scan for Trojan Source Unicode bidi/zero-width/tag
-/// characters, mid-line `U+FEFF`, hidden HTML-comment prompt injections, and credential-path exfiltration.
+/// Gate 1e (`UnicodeBidiAndInjectionScan`): scan for Trojan Source Unicode bidi/zero-width/tag/variation
+/// characters, lone `\r` terminal-spoofing controls, mid-line `U+FEFF`, hidden HTML/CommonMark-comment
+/// prompt injections, and credential-path exfiltration.
 fn scan_gate_1e_text(
     rel_label: &str,
     text: &str,
     check_prose_injections: bool,
     violations: &mut Vec<QuarantineViolation>,
 ) {
+    // Reject lone `\r` (`U+000D` without immediately following `\n`) terminal line-overwrite spoofing.
+    let raw_bytes = text.as_bytes();
+    for (idx, &b) in raw_bytes.iter().enumerate() {
+        if b == b'\r' && raw_bytes.get(idx + 1) != Some(&b'\n') {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::UnicodeBidiAndInjectionScan,
+                rel_label,
+                "lone carriage return (U+000D without LF) terminal-spoofing control character detected",
+            ));
+            return;
+        }
+    }
+
     for (line_idx, line) in text.split('\n').enumerate() {
         for ch in line.chars() {
             if is_forbidden_unicode_control(ch) {
@@ -1288,6 +1716,30 @@ fn scan_gate_1e_text(
                 ));
                 return;
             }
+        }
+    }
+
+    // CommonMark single- and multi-line reference definitions (`[label]: # (...)`, `[label]:\n  # (...)`, etc.)
+    for ref_def in extract_commonmark_ref_definitions(text) {
+        if ref_def.is_comment_target
+            && let Some(reason) = detect_html_comment_injection(&ref_def.combined_rest)
+        {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::UnicodeBidiAndInjectionScan,
+                rel_label,
+                format!("hidden Markdown reference-comment prompt injection ({reason})"),
+            ));
+            return;
+        }
+        if !ref_def.title_slice.is_empty()
+            && let Some(reason) = detect_html_comment_injection(&ref_def.title_slice)
+        {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::UnicodeBidiAndInjectionScan,
+                rel_label,
+                format!("hidden Markdown reference-title prompt injection ({reason})"),
+            ));
+            return;
         }
     }
 
@@ -1325,23 +1777,70 @@ fn scan_gate_1e_text(
     }
 }
 
+fn scan_decoded_json_value(
+    rel_label: &str,
+    value: &Value,
+    check_prose_injections: bool,
+    violations: &mut Vec<QuarantineViolation>,
+) {
+    match value {
+        Value::String(s) => {
+            if s.contains('\0') {
+                violations.push(QuarantineViolation::new(
+                    SecurityGate::InertAstParse,
+                    rel_label,
+                    "decoded JSON string contains binary NUL byte",
+                ));
+                return;
+            }
+            scan_gate_1e_text(rel_label, s, check_prose_injections, violations);
+        }
+        Value::Array(items) => {
+            for item in items {
+                scan_decoded_json_value(rel_label, item, check_prose_injections, violations);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k.contains('\0') {
+                    violations.push(QuarantineViolation::new(
+                        SecurityGate::InertAstParse,
+                        rel_label,
+                        "decoded JSON object key contains binary NUL byte",
+                    ));
+                    return;
+                }
+                scan_gate_1e_text(rel_label, k, check_prose_injections, violations);
+                scan_decoded_json_value(rel_label, v, check_prose_injections, violations);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 const fn is_forbidden_unicode_control(ch: char) -> bool {
     matches!(
         ch,
         '\u{0000}'..='\u{0008}' // C0 controls (excluding \t U+0009, \n U+000A)
-        | '\u{000B}'..='\u{000C}' // VT, FF (excluding \r U+000D)
+        | '\u{000B}'..='\u{000C}' // VT, FF (excluding \r U+000D which is checked for CRLF)
         | '\u{000E}'..='\u{001F}' // C0 controls including U+001B ANSI ESC
         | '\u{007F}'..='\u{009F}' // DEL + C1 controls
         | '\u{00AD}' // Soft Hyphen (invisible keyword splitter)
+        | '\u{034F}' // Combining Grapheme Joiner (invisible keyword splitter)
         | '\u{061C}' // Arabic Letter Mark
-        | '\u{180E}' // Mongolian Vowel Separator
+        | '\u{115F}'..='\u{1160}' // Hangul Choseong / Jungseong Fillers
+        | '\u{17B4}'..='\u{17B5}' // Khmer Inherent Vowel invisible controls
+        | '\u{180B}'..='\u{180E}' // Mongolian Free Variation Selectors + Vowel Separator
         | '\u{200B}'..='\u{200F}' // ZWSP, ZWNJ, ZWJ, LRM, RLM
         | '\u{202A}'..='\u{202E}' // Bidi LRE, RLE, PDF, LRO, RLO
-        | '\u{2060}'..='\u{2064}' // Word Joiner + Invisible math operators/separators
-        | '\u{2066}'..='\u{2069}' // Bidi isolates LRI, RLI, FSI, PDI
-        | '\u{FEFF}' // Mid-file / mid-line BOM (leading file BOM was already stripped)
+        | '\u{2060}'..='\u{206F}' // Word Joiner, Invisible Operators, Bidi Isolates, Deprecated Format Controls
+        | '\u{3164}' // Hangul Filler
+        | '\u{FE00}'..='\u{FE0F}' // Variation Selectors VS1..VS16
+        | '\u{FEFF}' // Mid-file / mid-line / JSON-decoded BOM
+        | '\u{FFA0}' // Halfwidth Hangul Filler
         | '\u{FFF9}'..='\u{FFFB}' // Interlinear annotation controls
         | '\u{E0000}'..='\u{E007F}' // Invisible Unicode Tag block
+        | '\u{E0100}'..='\u{E01EF}' // Variation Selectors Supplement VS17..VS256 ("Sneaky Bits")
     )
 }
 
@@ -1405,12 +1904,20 @@ fn detect_prose_exfiltration_or_injection(text: &str) -> Option<String> {
             "references forbidden SSH private key '.ssh/id_*'",
         ),
         (
+            ".ssh/authorized_keys",
+            "references forbidden SSH authorized_keys target",
+        ),
+        (
             "~/.aws",
             "references forbidden cloud credential directory '~/.aws'",
         ),
         (
             ".aws/credentials",
             "references forbidden cloud credentials file '.aws/credentials'",
+        ),
+        (
+            "~/.gnupg",
+            "references forbidden GPG keyring directory '~/.gnupg'",
         ),
         (
             "/etc/passwd",
@@ -1425,16 +1932,40 @@ fn detect_prose_exfiltration_or_injection(text: &str) -> Option<String> {
             "references forbidden signing store 'agent-keys.json'",
         ),
         (
-            ".chinwag/signing/",
-            "references forbidden private signing directory '.chinwag/signing/'",
+            ".chinwag/signing",
+            "references forbidden private signing directory '.chinwag/signing'",
+        ),
+        (
+            "~/.chinwag",
+            "references forbidden host configuration directory '~/.chinwag'",
+        ),
+        (
+            ".chinwag/agents",
+            "references forbidden agent bundle directory '.chinwag/agents'",
+        ),
+        (
+            "ignore previous instructions",
+            "contains prompt-injection override 'ignore previous instructions'",
         ),
         (
             "ignore all previous instructions",
             "contains prompt-injection override 'ignore all previous instructions'",
         ),
         (
+            "ignore prior instructions",
+            "contains prompt-injection override 'ignore prior instructions'",
+        ),
+        (
+            "disregard previous instructions",
+            "contains prompt-injection override 'disregard previous instructions'",
+        ),
+        (
             "disregard all previous instructions",
             "contains prompt-injection override 'disregard all previous instructions'",
+        ),
+        (
+            "forget all previous instructions",
+            "contains prompt-injection override 'forget all previous instructions'",
         ),
         (
             "base64 -d | sh",
@@ -1452,52 +1983,379 @@ fn detect_prose_exfiltration_or_injection(text: &str) -> Option<String> {
         }
     }
 
-    // Markdown hidden comment `[//]: # (...)` injection check.
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if (trimmed.starts_with("[//]:") || trimmed.starts_with("[comment]:"))
-            && let Some(reason) = detect_html_comment_injection(trimmed)
-        {
-            return Some(format!(
-                "hidden Markdown reference-comment prompt injection ({reason})"
-            ));
-        }
-    }
-
     None
 }
 
 fn scan_markdown_links(rel_label: &str, text: &str, violations: &mut Vec<QuarantineViolation>) {
+    // 1. Inline `[label](destination)` and `![alt](destination)` links (including `<...>` destinations).
     let mut rest = text;
     while let Some(idx) = rest.find("](") {
         let after = &rest[idx + 2..];
-        if let Some(end) = after.find(')') {
-            let target = after[..end].trim();
-            if !target.starts_with("http://")
-                && !target.starts_with("https://")
-                && !target.starts_with("mailto:")
-                && !target.starts_with('#')
-                && Path::new(target)
-                    .components()
-                    .any(|c| matches!(c, Component::ParentDir))
-            {
+        let trimmed_after = after.trim_start();
+        if let Some(angle_body) = trimmed_after.strip_prefix('<') {
+            if let Some(close_angle) = angle_body.find('>') {
+                let target = angle_body[..close_angle].trim();
+                if let Some(reason) = check_markdown_link_target(target) {
+                    violations.push(QuarantineViolation::new(
+                        SecurityGate::InertAstParse,
+                        rel_label,
+                        reason,
+                    ));
+                    return;
+                }
+                rest = &angle_body[close_angle + 1..];
+                continue;
+            }
+            violations.push(QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                rel_label,
+                "unclosed angle-bracket Markdown link destination",
+            ));
+            return;
+        }
+
+        // Parse balanced parentheses up to closing `)` (including single-newline CommonMark wrapping)
+        let mut depth = 1usize;
+        let mut end_idx = None;
+        let mut prev_was_nl = false;
+        for (i, ch) in after.char_indices() {
+            if i > 1024 || (ch == '\n' && prev_was_nl) {
+                break;
+            }
+            prev_was_nl = ch == '\n';
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(end) = end_idx {
+            let raw_inside = after[..end].trim();
+            // Strip optional Markdown link title after whitespace (`path "title"` / `path 'title'`)
+            let target = raw_inside
+                .split_whitespace()
+                .next()
+                .unwrap_or(raw_inside)
+                .trim_matches(|c| c == '<' || c == '>');
+            if let Some(reason) = check_markdown_link_target(target) {
                 violations.push(QuarantineViolation::new(
                     SecurityGate::InertAstParse,
                     rel_label,
-                    format!("Markdown link '{target}' escapes bundle root via '..'"),
+                    reason,
                 ));
                 return;
             }
             rest = &after[end + 1..];
         } else {
-            break;
+            rest = after;
         }
+    }
+
+    // 2. Reference-style link definitions (`[label]: destination` and CommonMark § 4.7 multi-line continuations)
+    for ref_def in extract_commonmark_ref_definitions(text) {
+        if ref_def.is_comment_target || ref_def.destination.is_empty() {
+            continue;
+        }
+        if let Some(reason) = check_markdown_link_target(&ref_def.destination) {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::InertAstParse,
+                rel_label,
+                reason,
+            ));
+            return;
+        }
+    }
+}
+
+struct CommonMarkRefDef {
+    destination: String,
+    is_comment_target: bool,
+    title_slice: String,
+    combined_rest: String,
+}
+
+fn extract_commonmark_ref_definitions(text: &str) -> Vec<CommonMarkRefDef> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut defs = Vec::new();
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        let line = lines[idx];
+        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+        let trimmed = &line[leading_spaces..];
+        if leading_spaces > 3 || !trimmed.starts_with('[') {
+            idx += 1;
+            continue;
+        }
+
+        let (after_colon, mut cursor) = if let Some((head, rest)) = trimmed.split_once("]:")
+            && !head[1..].contains('[')
+            && !head[1..].contains(']')
+        {
+            (rest, idx)
+        } else if !trimmed[1..].contains('[')
+            && !trimmed[1..].contains(']')
+            && idx + 1 < lines.len()
+            && let Some((head2, rest2)) = lines[idx + 1].trim_start().split_once("]:")
+            && !head2.contains('[')
+            && !head2.contains(']')
+        {
+            (rest2, idx + 1)
+        } else {
+            idx += 1;
+            continue;
+        };
+
+        let mut rem = after_colon.trim();
+        if rem.is_empty() {
+            if cursor + 1 < lines.len() {
+                let next_candidate = lines[cursor + 1].trim();
+                let next_starts_ref = next_candidate.starts_with('[')
+                    && (next_candidate.contains("]:") || !next_candidate[1..].contains(']'));
+                if !next_candidate.is_empty() && !next_starts_ref {
+                    cursor += 1;
+                    rem = next_candidate;
+                } else {
+                    idx += 1;
+                    continue;
+                }
+            } else {
+                idx += 1;
+                continue;
+            }
+        }
+
+        let is_comment_target = rem.starts_with('#') || rem.starts_with("<>");
+        let (destination, inline_title) = if let Some(angle) = rem.strip_prefix('<') {
+            if let Some((inside, after_gt)) = angle.split_once('>') {
+                (inside.trim().to_owned(), after_gt.trim())
+            } else {
+                (angle.trim().to_owned(), "")
+            }
+        } else {
+            let dest_tok = rem.split_whitespace().next().unwrap_or(rem);
+            let rest_after = rem[dest_tok.len()..].trim();
+            (dest_tok.to_owned(), rest_after)
+        };
+
+        let mut title_slice = inline_title.to_owned();
+        if title_slice.is_empty() && cursor + 1 < lines.len() {
+            let next_line = lines[cursor + 1].trim();
+            if next_line.starts_with('"')
+                || next_line.starts_with('\'')
+                || next_line.starts_with('(')
+            {
+                let mut gathered = Vec::new();
+                for extra in &lines[cursor + 1..(cursor + 4).min(lines.len())] {
+                    let t = extra.trim();
+                    if t.is_empty() {
+                        break;
+                    }
+                    gathered.push(t);
+                }
+                title_slice = gathered.join(" ");
+            }
+        }
+
+        let combined_rest = if title_slice.is_empty() || rem.contains(&title_slice) {
+            rem.to_owned()
+        } else {
+            format!("{rem} {title_slice}")
+        };
+
+        defs.push(CommonMarkRefDef {
+            destination,
+            is_comment_target,
+            title_slice,
+            combined_rest,
+        });
+        idx += 1;
+    }
+
+    defs
+}
+
+fn check_markdown_link_target(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    if trimmed.contains("&#") {
+        let low_raw = trimmed.to_ascii_lowercase();
+        if !low_raw.starts_with("https://") && !low_raw.starts_with("http://") {
+            return Some(format!(
+                "Markdown link '{trimmed}' uses forbidden HTML numeric character entity obfuscation"
+            ));
+        }
+    }
+
+    let html_decoded = decode_html_entities_lossy(trimmed);
+    let unescaped = strip_commonmark_backslash_escapes(&html_decoded);
+    let pct_once = percent_decode_lossy(&unescaped);
+    let decoded = decode_html_entities_lossy(&percent_decode_lossy(&pct_once));
+
+    if decoded.chars().any(char::is_control) {
+        return Some(format!(
+            "Markdown link '{trimmed}' decodes to forbidden control character"
+        ));
+    }
+
+    let lower = decoded.to_ascii_lowercase();
+    let lower_compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:")
+    {
+        return None;
+    }
+
+    // Reject dangerous or local URI schemes (`file:`, `javascript:`, `data:`, `ssh:`, etc.)
+    for scheme_probe in [lower.as_str(), lower_compact.as_str()] {
+        if let Some((scheme, _)) = scheme_probe.split_once(':')
+            && !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        {
+            return Some(format!(
+                "Markdown link '{trimmed}' uses forbidden URI scheme '{scheme}:'"
+            ));
+        }
+    }
+
+    for candidate in [
+        trimmed,
+        html_decoded.as_str(),
+        unescaped.as_str(),
+        decoded.as_str(),
+    ] {
+        if candidate.starts_with('/')
+            || candidate.starts_with('\\')
+            || Path::new(candidate).is_absolute()
+        {
+            return Some(format!(
+                "Markdown link '{trimmed}' targets forbidden absolute host path"
+            ));
+        }
+        if candidate == "~" || candidate.starts_with("~/") || candidate.starts_with("~\\") {
+            return Some(format!(
+                "Markdown link '{trimmed}' targets forbidden home-relative path"
+            ));
+        }
+        if candidate == ".."
+            || candidate.contains("../")
+            || candidate.contains("..\\")
+            || Path::new(candidate)
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Some(format!(
+                "Markdown link '{trimmed}' escapes bundle root via '..'"
+            ));
+        }
+    }
+    None
+}
+
+fn decode_html_entities_lossy(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp_idx) = rest.find('&') {
+        out.push_str(&rest[..amp_idx]);
+        let after_amp = &rest[amp_idx + 1..];
+        let semi_rel = after_amp.find(';').filter(|&pos| pos <= 16);
+        if let Some(end_semi) = semi_rel {
+            let entity = &after_amp[..end_semi];
+            let decoded_ch = if let Some(hex) = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+            {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                dec.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                match entity.to_ascii_lowercase().as_str() {
+                    "colon" => Some(':'),
+                    "sol" | "slash" => Some('/'),
+                    "bsol" => Some('\\'),
+                    "period" => Some('.'),
+                    "tilde" => Some('~'),
+                    "tab" => Some('\t'),
+                    "newline" => Some('\n'),
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    _ => None,
+                }
+            };
+            if let Some(ch) = decoded_ch {
+                out.push(ch);
+                rest = &after_amp[end_semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after_amp;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_commonmark_backslash_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(&next_ch) = chars.peek()
+            && next_ch.is_ascii_punctuation()
+        {
+            out.push(next_ch);
+            chars.next();
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
 fn parse_agent_json(
     raw: &str,
     agent_name: &str,
+    allowed_mcp_commands: &BTreeSet<String>,
     metadata: &mut AgentMetadata,
     mcp_servers: &mut Vec<SanitizedMcpServer>,
     placeholders: &mut Vec<PhantomVaultPlaceholder>,
@@ -1523,6 +2381,14 @@ fn parse_agent_json(
         return;
     };
 
+    // Gate 1e post-decode scan on all non-MCP fields first (`\u001b`, `\u202e`, `~/.ssh`, prompt injections).
+    for (k, v) in obj {
+        scan_gate_1e_text("agent.json", k, true, violations);
+        if k != "mcpServers" && k != "mcp" {
+            scan_decoded_json_value("agent.json", v, true, violations);
+        }
+    }
+
     for path_key in [
         "instructions",
         "toolsDir",
@@ -1531,12 +2397,14 @@ fn parse_agent_json(
         "channelsDir",
     ] {
         if let Some(val) = obj.get(path_key).and_then(Value::as_str)
-            && (Path::new(val).is_absolute() || contains_parent_traversal_or_control(val))
+            && (Path::new(val).is_absolute()
+                || val.starts_with('~')
+                || contains_parent_traversal_or_control(val))
         {
             violations.push(QuarantineViolation::new(
                 SecurityGate::InertAstParse,
                 "agent.json",
-                format!("field '{path_key}' contains forbidden absolute or '..' path"),
+                format!("field '{path_key}' contains forbidden absolute, '~', or '..' path"),
             ));
         }
     }
@@ -1546,22 +2414,56 @@ fn parse_agent_json(
         .or_else(|| obj.get("title"))
         .and_then(Value::as_str)
     {
-        metadata.role = Some(sanitize_single_line(role));
+        metadata.role = Some(scrub_agent_metadata_field(
+            role,
+            "role",
+            agent_name,
+            placeholders,
+        ));
     }
-    if let Some(desc) = obj.get("description").and_then(Value::as_str) {
-        metadata.summary = Some(sanitize_single_line(desc));
+    if let Some(summary_val) = obj
+        .get("description")
+        .or_else(|| obj.get("summary"))
+        .and_then(Value::as_str)
+    {
+        metadata.summary = Some(scrub_agent_metadata_field(
+            summary_val,
+            "description",
+            agent_name,
+            placeholders,
+        ));
     }
     if let Some(dept) = obj.get("department").and_then(Value::as_str) {
-        metadata.department = Some(sanitize_single_line(dept));
+        metadata.department = Some(scrub_agent_metadata_field(
+            dept,
+            "department",
+            agent_name,
+            placeholders,
+        ));
     }
     if let Some(rep) = obj.get("reports_to").and_then(Value::as_str) {
-        metadata.reports_to = Some(sanitize_single_line(rep));
+        metadata.reports_to = Some(scrub_agent_metadata_field(
+            rep,
+            "reports_to",
+            agent_name,
+            placeholders,
+        ));
     }
     if let Some(room) = obj.get("room").and_then(Value::as_str) {
-        metadata.room = Some(sanitize_single_line(room));
+        metadata.room = Some(scrub_agent_metadata_field(
+            room,
+            "room",
+            agent_name,
+            placeholders,
+        ));
     }
     if let Some(updated) = obj.get("updated").and_then(Value::as_str) {
-        metadata.updated = Some(sanitize_single_line(updated));
+        metadata.updated = Some(scrub_agent_metadata_field(
+            updated,
+            "updated",
+            agent_name,
+            placeholders,
+        ));
     }
 
     if let Some(env_val) = obj.get("env") {
@@ -1585,6 +2487,7 @@ fn parse_agent_json(
                     server_name,
                     entry,
                     agent_name,
+                    allowed_mcp_commands,
                     mcp_servers,
                     placeholders,
                     violations,
@@ -1597,7 +2500,35 @@ fn parse_agent_json(
                 "'mcpServers' in agent.json must be a JSON object",
             ));
         }
+        scan_decoded_json_value("agent.json", mcp_block, true, violations);
     }
+}
+
+fn scrub_agent_metadata_field(
+    raw_val: &str,
+    field_name: &str,
+    agent_name: &str,
+    placeholders: &mut Vec<PhantomVaultPlaceholder>,
+) -> String {
+    let trimmed = raw_val.trim();
+    if !trimmed.starts_with("vault://") && is_high_entropy_secret(trimmed) {
+        let key = format!("AGENT_{}", normalize_vault_key(field_name));
+        let placeholder = format!("vault://{agent_name}/{key}");
+        placeholders.push(PhantomVaultPlaceholder {
+            location: format!("agent.json:{field_name}"),
+            key,
+            placeholder: placeholder.clone(),
+            redaction: "phantom-vault-v1".to_owned(),
+        });
+        return placeholder;
+    }
+    let scrubbed = scrub_inline_secrets_in_prose(
+        raw_val,
+        agent_name,
+        &format!("agent.json:{field_name}"),
+        placeholders,
+    );
+    sanitize_single_line(&scrubbed)
 }
 
 fn collect_cursor_rules(
@@ -1790,10 +2721,79 @@ fn parse_inert_frontmatter(
     Some((map, body))
 }
 
+const FORBIDDEN_SHELL_AND_EXEC_COMMANDS: &[&str] = &[
+    "env",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "fish",
+    "ash",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "wscript",
+    "cscript",
+    "mshta",
+    "eval",
+    "exec",
+    "source",
+    "su",
+    "sudo",
+    "doas",
+    "osascript",
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "curl",
+    "wget",
+    "awk",
+    "gawk",
+    "nawk",
+    "perl",
+    "ruby",
+    "php",
+    "lua",
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "bun",
+    "deno",
+    "xargs",
+    "find",
+    "expect",
+    "tclsh",
+    "nohup",
+    "setsid",
+    "chroot",
+    "screen",
+    "tmux",
+    "script",
+    "lldb",
+    "gdb",
+];
+
+fn strip_executable_ext_lower(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat", ".ps1", ".sh"] {
+        if let Some(stem) = lower.strip_suffix(ext) {
+            return stem.to_owned();
+        }
+    }
+    lower
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_mcp_connections(
     root: &Path,
     dir: &Path,
     agent_name: &str,
+    allowed_mcp_commands: &BTreeSet<String>,
     source_artifacts: &mut BTreeSet<String>,
     mcp_servers: &mut Vec<SanitizedMcpServer>,
     placeholders: &mut Vec<PhantomVaultPlaceholder>,
@@ -1820,6 +2820,7 @@ fn collect_mcp_connections(
                 root,
                 &path,
                 agent_name,
+                allowed_mcp_commands,
                 source_artifacts,
                 mcp_servers,
                 placeholders,
@@ -1844,6 +2845,7 @@ fn collect_mcp_connections(
             Some(default_name),
             &raw,
             agent_name,
+            allowed_mcp_commands,
             mcp_servers,
             placeholders,
             violations,
@@ -1851,11 +2853,13 @@ fn collect_mcp_connections(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_mcp_file(
     rel_label: &str,
     fallback_server_name: Option<&str>,
     raw: &str,
     agent_name: &str,
+    allowed_mcp_commands: &BTreeSet<String>,
     mcp_servers: &mut Vec<SanitizedMcpServer>,
     placeholders: &mut Vec<PhantomVaultPlaceholder>,
     violations: &mut Vec<QuarantineViolation>,
@@ -1899,11 +2903,14 @@ fn parse_mcp_file(
                 server_name,
                 entry,
                 agent_name,
+                allowed_mcp_commands,
                 mcp_servers,
                 placeholders,
                 violations,
             );
         }
+        // Post-decode Gate 1e scan (`\u001b`, `\u202e`, `\u200b`, HTML comments, prose injections)
+        scan_decoded_json_value(rel_label, &parsed, true, violations);
         return;
     }
 
@@ -1923,10 +2930,12 @@ fn parse_mcp_file(
             server_name,
             &parsed,
             agent_name,
+            allowed_mcp_commands,
             mcp_servers,
             placeholders,
             violations,
         );
+        scan_decoded_json_value(rel_label, &parsed, true, violations);
         return;
     }
 
@@ -1937,18 +2946,22 @@ fn parse_mcp_file(
             server_name,
             entry,
             agent_name,
+            allowed_mcp_commands,
             mcp_servers,
             placeholders,
             violations,
         );
     }
+    scan_decoded_json_value(rel_label, &parsed, true, violations);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspect_mcp_server_entry(
     rel_label: &str,
     server_name: &str,
     entry: &Value,
     agent_name: &str,
+    allowed_mcp_commands: &BTreeSet<String>,
     mcp_servers: &mut Vec<SanitizedMcpServer>,
     placeholders: &mut Vec<PhantomVaultPlaceholder>,
     violations: &mut Vec<QuarantineViolation>,
@@ -2031,13 +3044,25 @@ fn inspect_mcp_server_entry(
 
     // Gate 1b (`McpShellMetacharQuarantine`) & inline Gate 1c checks on `command`, `args`, and `url`.
     if let Some(ref cmd) = command_opt {
-        validate_mcp_command_and_args(rel_label, server_name, cmd, &raw_args, violations);
+        validate_mcp_command_and_args(
+            rel_label,
+            server_name,
+            cmd,
+            &raw_args,
+            allowed_mcp_commands,
+            violations,
+        );
     }
     if let Some(ref u) = url_opt {
         validate_mcp_url(rel_label, server_name, u, violations);
     }
 
-    // Gate 1d (`PhantomVaultSecretConversion`) on inline CLI flags in `args`.
+    // Gate 1d (`PhantomVaultSecretConversion`) on `url` query/path/fragment secrets.
+    let sanitized_url = url_opt
+        .as_deref()
+        .map(|u| scrub_mcp_url(rel_label, server_name, u, agent_name, placeholders));
+
+    // Gate 1d (`PhantomVaultSecretConversion`) on inline CLI flags & composite headers in `args`.
     let sanitized_args =
         scrub_mcp_args(rel_label, server_name, &raw_args, agent_name, placeholders);
 
@@ -2074,7 +3099,7 @@ fn inspect_mcp_server_entry(
         source_file: rel_label.to_owned(),
         command: command_opt,
         args: sanitized_args,
-        url: url_opt,
+        url: sanitized_url,
         env: sanitized_env,
         headers: sanitized_headers,
     });
@@ -2086,6 +3111,7 @@ fn validate_mcp_command_and_args(
     server_name: &str,
     command: &str,
     args: &[String],
+    allowed_mcp_commands: &BTreeSet<String>,
     violations: &mut Vec<QuarantineViolation>,
 ) {
     let trimmed_cmd = command.trim();
@@ -2109,13 +3135,15 @@ fn validate_mcp_command_and_args(
         return;
     }
 
-    if trimmed_cmd.contains(char::is_whitespace) {
-        // E.g. `"command": "sh -c whoami"` or `"command": "bash -lc ..."`
+    if trimmed_cmd
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
         violations.push(QuarantineViolation::new(
             SecurityGate::McpShellMetacharQuarantine,
             rel_label,
             format!(
-                "MCP server '{server_name}' command contains whitespace/inline arguments ('{trimmed_cmd}'); pass executable without shell wrapper"
+                "MCP server '{server_name}' command contains whitespace or control characters ('{trimmed_cmd}')"
             ),
         ));
         return;
@@ -2132,55 +3160,42 @@ fn validate_mcp_command_and_args(
         return;
     }
 
-    let base_lower = Path::new(trimmed_cmd)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(trimmed_cmd)
-        .trim_end_matches(".exe")
-        .trim_end_matches(".cmd")
-        .trim_end_matches(".bat")
-        .to_ascii_lowercase();
-
-    const FORBIDDEN_SHELL_COMMANDS: &[&str] = &[
-        "sh",
-        "bash",
-        "zsh",
-        "dash",
-        "ksh",
-        "csh",
-        "tcsh",
-        "fish",
-        "ash",
-        "cmd",
-        "powershell",
-        "pwsh",
-        "wscript",
-        "cscript",
-        "mshta",
-        "eval",
-        "exec",
-        "source",
-        "su",
-        "sudo",
-        "osascript",
-        "nc",
-        "ncat",
-        "netcat",
-        "socat",
-        "curl",
-        "wget",
-    ];
-
-    if FORBIDDEN_SHELL_COMMANDS.contains(&base_lower.as_str()) {
+    // Reject bundle-local (`./tools/backdoor`), `/tmp/implant`, `/usr/bin/env`, or any path-qualified command.
+    if trimmed_cmd.contains('/') || trimmed_cmd.contains('\\') || trimmed_cmd.starts_with('.') {
         violations.push(QuarantineViolation::new(
             SecurityGate::McpShellMetacharQuarantine,
             rel_label,
             format!(
-                "MCP server '{server_name}' invokes forbidden shell/network interpreter '{base_lower}'"
+                "MCP server '{server_name}' command '{trimmed_cmd}' must be an allowlisted bare launcher without path separators"
             ),
         ));
         return;
     }
+
+    let base_lower = strip_executable_ext_lower(trimmed_cmd);
+    if FORBIDDEN_SHELL_AND_EXEC_COMMANDS.contains(&base_lower.as_str()) {
+        violations.push(QuarantineViolation::new(
+            SecurityGate::McpShellMetacharQuarantine,
+            rel_label,
+            format!(
+                "MCP server '{server_name}' invokes forbidden shell/interpreter '{base_lower}'"
+            ),
+        ));
+        return;
+    }
+
+    if !allowed_mcp_commands.contains(&base_lower) {
+        violations.push(QuarantineViolation::new(
+            SecurityGate::McpShellMetacharQuarantine,
+            rel_label,
+            format!(
+                "MCP server '{server_name}' command '{base_lower}' is not in the allowed MCP launcher list (pass --allow-mcp-command to authorize)"
+            ),
+        ));
+        return;
+    }
+
+    let is_container_launcher = matches!(base_lower.as_str(), "docker" | "podman");
 
     for (idx, arg) in args.iter().enumerate() {
         if let Some(tok) = find_shell_metachar(arg) {
@@ -2205,10 +3220,26 @@ fn validate_mcp_command_and_args(
             return;
         }
 
-        // Inline env injection via `env DYLD_INSERT_LIBRARIES=...`
-        if let Some((maybe_key, _)) = arg.split_once('=')
+        let arg_trimmed = arg.trim();
+        let arg_lower = arg_trimmed.to_ascii_lowercase();
+
+        // Reject 3+ hyphen normalization smuggling (`npx ---call=id`), bare `-` stdin scripts, and `--` option terminators
+        if arg_trimmed == "-" || arg_trimmed == "--" || arg_trimmed.starts_with("---") {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::McpShellMetacharQuarantine,
+                rel_label,
+                format!(
+                    "MCP server '{server_name}' args[{idx}] uses forbidden multi-hyphen or option-terminator token '{arg_trimmed}'"
+                ),
+            ));
+            return;
+        }
+
+        // Inline env injection via `DYLD_INSERT_LIBRARIES=...` or `PATH=...` in `args`
+        if let Some((maybe_key, _)) = arg_trimmed.split_once('=')
             && !maybe_key.starts_with('-')
-            && is_forbidden_dynamic_linker_env(maybe_key)
+            && (is_forbidden_dynamic_linker_env(maybe_key)
+                || maybe_key.eq_ignore_ascii_case("PATH"))
         {
             violations.push(QuarantineViolation::new(
                 SecurityGate::DynamicLinkerEnvScrub,
@@ -2220,52 +3251,63 @@ fn validate_mcp_command_and_args(
             return;
         }
 
-        let arg_trimmed = arg.trim();
-        let arg_lower = arg_trimmed.to_ascii_lowercase();
-
-        // Catch `/usr/bin/env sh -c ...`, `docker run ... bash -c ...`, `eval`, etc.
-        let arg_base = Path::new(arg_trimmed)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(arg_trimmed)
-            .trim_end_matches(".exe")
-            .to_ascii_lowercase();
-        if matches!(
-            arg_base.as_str(),
-            "sh" | "bash" | "zsh" | "dash" | "ksh" | "cmd" | "powershell" | "pwsh" | "eval"
-        ) {
-            violations.push(QuarantineViolation::new(
-                SecurityGate::McpShellMetacharQuarantine,
-                rel_label,
-                format!("MCP server '{server_name}' args[{idx}] invokes sub-shell '{arg_base}'"),
-            ));
-            return;
+        // Inspect multi-token whitespace-separated sub-tokens inside `args` (e.g. split-string smuggling)
+        if arg_trimmed.contains(char::is_whitespace) {
+            for sub_tok in arg_trimmed.split_whitespace() {
+                if let Some((k, _)) = sub_tok.split_once('=')
+                    && !k.starts_with('-')
+                    && (is_forbidden_dynamic_linker_env(k) || k.eq_ignore_ascii_case("PATH"))
+                {
+                    violations.push(QuarantineViolation::new(
+                        SecurityGate::DynamicLinkerEnvScrub,
+                        rel_label,
+                        format!(
+                            "MCP server '{server_name}' args[{idx}] smuggles forbidden runtime env '{k}'"
+                        ),
+                    ));
+                    return;
+                }
+                if !sub_tok.contains(':') {
+                    let sub_base = strip_executable_ext_lower(
+                        Path::new(sub_tok)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(sub_tok),
+                    );
+                    if FORBIDDEN_SHELL_AND_EXEC_COMMANDS.contains(&sub_base.as_str()) {
+                        violations.push(QuarantineViolation::new(
+                            SecurityGate::McpShellMetacharQuarantine,
+                            rel_label,
+                            format!(
+                                "MCP server '{server_name}' args[{idx}] smuggles forbidden sub-shell/interpreter '{sub_base}'"
+                            ),
+                        ));
+                        return;
+                    }
+                }
+            }
         }
 
-        // Catch inline script evaluation flags (`-c`, `/c`, `-e`, `--eval=...`, `-Command`, `-EncodedCommand=...`)
-        let flag_head = arg_lower.split('=').next().unwrap_or(&arg_lower);
-        if matches!(
-            flag_head,
-            "-c" | "/c"
-                | "/k"
-                | "-e"
-                | "--eval"
-                | "-command"
-                | "--command"
-                | "-encodedcommand"
-                | "-enc"
-        ) {
+        // Symmetric sub-shell / interpreter / network utility check on `args`
+        let arg_base = strip_executable_ext_lower(
+            Path::new(arg_trimmed)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(arg_trimmed),
+        );
+        if FORBIDDEN_SHELL_AND_EXEC_COMMANDS.contains(&arg_base.as_str()) {
             violations.push(QuarantineViolation::new(
                 SecurityGate::McpShellMetacharQuarantine,
                 rel_label,
                 format!(
-                    "MCP server '{server_name}' args[{idx}] uses inline code-execution flag '{arg_trimmed}'"
+                    "MCP server '{server_name}' args[{idx}] invokes forbidden sub-shell/interpreter '{arg_base}'"
                 ),
             ));
             return;
         }
 
-        // Catch `--env-file` or `--env=LD_PRELOAD=...` wrapper smuggling
+        // Catch `--env-file` or `--env=LD_PRELOAD=...` / `--env=PATH=...` wrapper smuggling first
+        let flag_head = arg_lower.split('=').next().unwrap_or(&arg_lower);
         if flag_head == "--env-file" {
             violations.push(QuarantineViolation::new(
                 SecurityGate::DynamicLinkerEnvScrub,
@@ -2280,12 +3322,7 @@ fn validate_mcp_command_and_args(
             && let Some((_, assign)) = arg_trimmed.split_once('=')
         {
             let env_key = assign.split('=').next().unwrap_or(assign);
-            if is_forbidden_dynamic_linker_env(env_key)
-                || (env_key.eq_ignore_ascii_case("PATH")
-                    && assign
-                        .split_once('=')
-                        .is_some_and(|(_, pv)| is_suspicious_path_override(pv)))
-            {
+            if is_forbidden_dynamic_linker_env(env_key) || env_key.eq_ignore_ascii_case("PATH") {
                 violations.push(QuarantineViolation::new(
                     SecurityGate::DynamicLinkerEnvScrub,
                     rel_label,
@@ -2297,25 +3334,397 @@ fn validate_mcp_command_and_args(
             }
         }
 
-        // Catch untrusted remote tarball/URL specifiers passed as package/command arguments
-        if !arg_trimmed.starts_with('-')
-            && (arg_lower.starts_with("http://")
-                || arg_lower.starts_with("https://")
-                || arg_lower.starts_with("git+ssh://")
-                || arg_lower.starts_with("git+https://")
-                || arg_lower.starts_with("ssh://")
-                || arg_lower.starts_with("file:"))
+        // Container launchers (`docker` / `podman`) forbid `-H` (`--host`) and `--context` outright
+        let raw_flag_head = arg_trimmed.split('=').next().unwrap_or(arg_trimmed);
+        if is_container_launcher
+            && (raw_flag_head == "-H" || matches!(flag_head, "--host" | "--context"))
         {
             violations.push(QuarantineViolation::new(
                 SecurityGate::McpShellMetacharQuarantine,
                 rel_label,
                 format!(
-                    "MCP server '{server_name}' args[{idx}] references untrusted remote/file package specifier"
+                    "MCP server '{server_name}' args[{idx}] uses forbidden remote container daemon flag '{arg_trimmed}'"
+                ),
+            ));
+            return;
+        }
+
+        // Validate `-H` / `--header` syntax strictly so URIs (`tcp://...`, `https://...`) cannot masquerade as HTTP headers
+        if raw_flag_head == "-H" || flag_head == "--header" {
+            if let Some((_, rhs)) = arg_trimmed.split_once('=') {
+                if !is_valid_http_header_pair(rhs) {
+                    violations.push(QuarantineViolation::new(
+                        SecurityGate::McpShellMetacharQuarantine,
+                        rel_label,
+                        format!(
+                            "MCP server '{server_name}' args[{idx}] passes invalid HTTP header or disguised URI in '{raw_flag_head}'"
+                        ),
+                    ));
+                    return;
+                }
+            } else {
+                let Some(next_hdr) = args.get(idx + 1) else {
+                    violations.push(QuarantineViolation::new(
+                        SecurityGate::McpShellMetacharQuarantine,
+                        rel_label,
+                        format!("MCP server '{server_name}' args[{idx}] missing header value after '{raw_flag_head}'"),
+                    ));
+                    return;
+                };
+                if !is_valid_http_header_pair(next_hdr) {
+                    violations.push(QuarantineViolation::new(
+                        SecurityGate::McpShellMetacharQuarantine,
+                        rel_label,
+                        format!(
+                            "MCP server '{server_name}' args[{}] passes invalid HTTP header or disguised URI after '{raw_flag_head}'",
+                            idx + 1
+                        ),
+                    ));
+                    return;
+                }
+            }
+        }
+
+        // Catch attached/clustered short flags (`-b`, `-c...`, `-e...`, `-iv`, `-itv`, `-p...`, `-r...`, `-S...`, `-w...`) & long escape flags
+        let has_forbidden_short_cluster = raw_flag_head.starts_with('-')
+            && !raw_flag_head.starts_with("--")
+            && raw_flag_head.len() > 1
+            && raw_flag_head[1..].chars().any(|ch| {
+                matches!(
+                    ch,
+                    'b' | 'B'
+                        | 'c'
+                        | 'C'
+                        | 'd'
+                        | 'D'
+                        | 'e'
+                        | 'E'
+                        | 'f'
+                        | 'F'
+                        | 'l'
+                        | 'L'
+                        | 'm'
+                        | 'M'
+                        | 'p'
+                        | 'P'
+                        | 'r'
+                        | 'R'
+                        | 's'
+                        | 'S'
+                        | 'u'
+                        | 'U'
+                        | 'v'
+                        | 'V'
+                        | 'w'
+                        | 'W'
+                        | 'x'
+                        | 'X'
+                )
+            });
+
+        if has_forbidden_short_cluster
+            || flag_head.starts_with("--config.")
+            || matches!(
+                flag_head,
+                "-c" | "/c"
+                    | "/k"
+                    | "-e"
+                    | "-E"
+                    | "--eval"
+                    | "--call"
+                    | "--shell-mode"
+                    | "--shell-auto-fallback"
+                    | "--script-shell"
+                    | "--shell"
+                    | "--node-options"
+                    | "--node-arg"
+                    | "-p"
+                    | "--print"
+                    | "--python"
+                    | "-r"
+                    | "--require"
+                    | "--preload"
+                    | "--import"
+                    | "--loader"
+                    | "--experimental-loader"
+                    | "--split-string"
+                    | "--config"
+                    | "--config-file"
+                    | "--userconfig"
+                    | "--globalconfig"
+                    | "--registry"
+                    | "--reg"
+                    | "--index"
+                    | "--default-index"
+                    | "--index-url"
+                    | "--extra-index-url"
+                    | "--find-links"
+                    | "--with-requirements"
+                    | "--requirements"
+                    | "--directory"
+                    | "--project"
+                    | "--with-editable"
+                    | "--editable"
+                    | "--constraints"
+                    | "--build-constraints"
+                    | "--overrides"
+                    | "--allow-insecure-host"
+                    | "--insecure-host"
+                    | "--cache-dir"
+                    | "--prefix"
+                    | "--workspace"
+                    | "--workspaces"
+                    | "--include-workspace-root"
+                    | "--iwr"
+                    | "--ws"
+                    | "--allow-scripts"
+                    | "--dangerously-allow-all-scripts"
+                    | "--foreground-scripts"
+                    | "--trust"
+                    | "--trusted-host"
+                    | "--ca"
+                    | "--cafile"
+                    | "--cert"
+                    | "--client-cert"
+                    | "--host"
+                    | "--context"
+                    | "-command"
+                    | "--command"
+                    | "-encodedcommand"
+                    | "-enc"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-v"
+                    | "--volume"
+                    | "--volumes-from"
+                    | "--mount"
+                    | "-w"
+                    | "--workdir"
+                    | "--cwd"
+                    | "--privileged"
+                    | "--cap-add"
+                    | "--security-opt"
+                    | "--pid"
+                    | "--net"
+                    | "--network"
+                    | "--ipc"
+                    | "--uts"
+                    | "--userns"
+                    | "--cgroupns"
+                    | "--device"
+                    | "--device-cgroup-rule"
+                    | "--gpus"
+                    | "--entrypoint"
+            )
+        {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::McpShellMetacharQuarantine,
+                rel_label,
+                format!(
+                    "MCP server '{server_name}' args[{idx}] uses forbidden code-execution/preload/mount flag '{arg_trimmed}'"
+                ),
+            ));
+            return;
+        }
+
+        // Exempt explicit two-arg secret-bearing values (`-H "Header: val"`, `--auth <secret>`) ONLY when `prev` is a standalone flag (`!prev.contains('=')`)
+        let prev_trimmed = idx
+            .checked_sub(1)
+            .and_then(|prev| args.get(prev))
+            .map(|s| s.trim());
+        let exempted_secret_arg = prev_trimmed.is_some_and(|prev| {
+            ((prev == "-H" || prev.eq_ignore_ascii_case("--header"))
+                && is_valid_http_header_pair(arg_trimmed))
+                || (prev.starts_with('-')
+                    && !prev.contains('=')
+                    && prev != "-H"
+                    && !prev.eq_ignore_ascii_case("--header")
+                    && is_secret_key_name(&normalize_vault_key(prev))
+                    && !arg_lower.contains("://")
+                    && !arg_lower.starts_with("git+")
+                    && !arg_lower.starts_with("file:")
+                    && !arg_trimmed.starts_with('/')
+                    && !arg_trimmed.starts_with("./")
+                    && arg_trimmed != ".")
+        });
+
+        // Catch untrusted remote/git/tarball/local-path specifiers in BOTH positional args AND `--flag=value` RHS
+        if !arg_trimmed.starts_with('-')
+            && !exempted_secret_arg
+            && is_untrusted_package_or_path_specifier(arg_trimmed)
+        {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::McpShellMetacharQuarantine,
+                rel_label,
+                format!(
+                    "MCP server '{server_name}' args[{idx}] references untrusted remote or local-path package specifier"
+                ),
+            ));
+            return;
+        }
+        if arg_trimmed.starts_with('-')
+            && let Some((opt_name, rhs)) = arg_trimmed.split_once('=')
+            && !opt_name.eq_ignore_ascii_case("--env")
+            && !((opt_name == "-H" || opt_name.eq_ignore_ascii_case("--header"))
+                && is_valid_http_header_pair(rhs))
+            && !(is_secret_key_name(&normalize_vault_key(opt_name))
+                && !rhs.to_ascii_lowercase().contains("://")
+                && !rhs.to_ascii_lowercase().starts_with("git+")
+                && !rhs.to_ascii_lowercase().starts_with("file:")
+                && !rhs.trim().starts_with('/')
+                && !rhs.trim().starts_with("./")
+                && rhs.trim() != ".")
+            && is_untrusted_package_or_path_specifier(rhs)
+        {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::McpShellMetacharQuarantine,
+                rel_label,
+                format!(
+                    "MCP server '{server_name}' args[{idx}] flag '{opt_name}' references untrusted remote or local-path specifier"
                 ),
             ));
             return;
         }
     }
+
+    // For `docker` / `podman`, enforce that the first non-flag subcommand is strictly `run` (blocking `compose`, `build`, `load`, etc.)
+    if is_container_launcher {
+        let first_subcommand = args.iter().map(|s| s.trim()).find(|s| !s.starts_with('-'));
+        if first_subcommand != Some("run") {
+            violations.push(QuarantineViolation::new(
+                SecurityGate::McpShellMetacharQuarantine,
+                rel_label,
+                format!(
+                    "MCP server '{server_name}' container launcher '{base_lower}' must use the 'run' subcommand"
+                ),
+            ));
+        }
+    }
+}
+
+fn is_valid_http_header_pair(raw: &str) -> bool {
+    if raw.contains("://") {
+        return false;
+    }
+    let Some((name, val)) = raw.split_once(':') else {
+        return false;
+    };
+    let name_trimmed = name.trim();
+    let val_trimmed = val.trim();
+    if name_trimmed.is_empty()
+        || val_trimmed.is_empty()
+        || val.starts_with("//")
+        || val_trimmed.starts_with("//")
+    {
+        return false;
+    }
+    let name_lower = name_trimmed.to_ascii_lowercase();
+    if matches!(
+        name_lower.as_str(),
+        "http" | "https" | "tcp" | "udp" | "unix" | "ssh" | "git" | "file" | "ftp" | "ws" | "wss"
+    ) {
+        return false;
+    }
+    name_trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn is_valid_scoped_package_specifier(trimmed: &str) -> bool {
+    if !trimmed.starts_with('@')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains(':')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    let mut parts = trimmed.split('/');
+    let (Some(scope_with_at), Some(pkg_and_ver), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let scope = &scope_with_at[1..];
+    if scope.is_empty()
+        || scope.starts_with('.')
+        || !scope
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    let (pkg_name, ver_opt) = match pkg_and_ver.split_once('@') {
+        Some((n, v)) => (n, Some(v)),
+        None => (pkg_and_ver, None),
+    };
+    if pkg_name.is_empty()
+        || pkg_name.starts_with('.')
+        || !pkg_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    if let Some(ver) = ver_opt
+        && (ver.is_empty()
+            || !ver
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')))
+    {
+        return false;
+    }
+    true
+}
+
+fn is_untrusted_package_or_path_specifier(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed == "."
+        || trimmed == ".."
+        || lower.contains("://")
+        || lower.starts_with("git+")
+        || lower.contains("@git+")
+        || lower.starts_with("file:")
+        || lower.contains("@file:")
+        || lower.starts_with("github:")
+        || lower.contains("@github:")
+        || lower.starts_with("gitlab:")
+        || lower.contains("@gitlab:")
+        || lower.starts_with("bitbucket:")
+        || lower.contains("@bitbucket:")
+        || trimmed.starts_with("./")
+        || trimmed.starts_with(".\\")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || Path::new(trimmed).is_absolute()
+        || trimmed.contains(":/")
+    {
+        return true;
+    }
+    for ext in [
+        ".tgz", ".tar.gz", ".tar", ".zip", ".whl", ".dylib", ".so", ".dll", ".sh", ".bash", ".zsh",
+        ".ps1", ".bat", ".cmd", ".exe", ".py", ".pyc", ".pyo", ".js", ".mjs", ".cjs", ".ts",
+        ".mts", ".cts", ".jsx", ".tsx", ".rb", ".pl", ".pm", ".php", ".lua", ".wasm", ".jar",
+    ] {
+        if lower.ends_with(ext) {
+            return true;
+        }
+    }
+    if (trimmed.contains('/') || trimmed.contains('\\'))
+        && !is_valid_scoped_package_specifier(trimmed)
+    {
+        return true;
+    }
+    if let Some((_, ver_spec)) = trimmed.strip_prefix('@').unwrap_or(trimmed).split_once('@')
+        && (ver_spec.is_empty()
+            || !ver_spec
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')))
+    {
+        return true;
+    }
+    false
 }
 
 fn validate_mcp_url(
@@ -2325,6 +3734,17 @@ fn validate_mcp_url(
     violations: &mut Vec<QuarantineViolation>,
 ) {
     let trimmed = url.trim();
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        violations.push(QuarantineViolation::new(
+            SecurityGate::McpShellMetacharQuarantine,
+            rel_label,
+            format!(
+                "MCP server '{server_name}' URL contains forbidden whitespace or control character"
+            ),
+        ));
+        return;
+    }
+
     let lower = trimmed.to_ascii_lowercase();
 
     let authority_and_rest = if let Some(rest) = lower.strip_prefix("https://") {
@@ -2384,9 +3804,7 @@ fn validate_mcp_url(
         return;
     }
 
-    for bad in [
-        ";", "|", "&&", "`", "$(", "${", ">", "<", "\n", "\r", "\0", " ",
-    ] {
+    for bad in [";", "|", "&&", "`", "$(", "${", ">", "<"] {
         if trimmed.contains(bad) {
             violations.push(QuarantineViolation::new(
                 SecurityGate::McpShellMetacharQuarantine,
@@ -2396,6 +3814,134 @@ fn validate_mcp_url(
             return;
         }
     }
+}
+
+fn scrub_mcp_url(
+    rel_label: &str,
+    server_name: &str,
+    url: &str,
+    agent_name: &str,
+    placeholders: &mut Vec<PhantomVaultPlaceholder>,
+) -> String {
+    let trimmed = url.trim();
+    let (without_frag, frag_opt) = match trimmed.split_once('#') {
+        Some((head, frag)) => (head, Some(frag)),
+        None => (trimmed, None),
+    };
+    let (base_and_path, query_opt) = match without_frag.split_once('?') {
+        Some((head, q)) => (head, Some(q)),
+        None => (without_frag, None),
+    };
+
+    let mut rebuilt = if let Some(scheme_sep) = base_and_path.find("://") {
+        let after_scheme = &base_and_path[scheme_sep + 3..];
+        if let Some(slash_idx) = after_scheme.find('/') {
+            let origin = &base_and_path[..scheme_sep + 3 + slash_idx];
+            let path_part = &after_scheme[slash_idx + 1..];
+            let mut scrubbed_segs = Vec::new();
+            for (seg_idx, seg) in path_part.split('/').enumerate() {
+                let decoded_seg = percent_decode_lossy(seg);
+                if !seg.is_empty()
+                    && !seg.starts_with("vault://")
+                    && (looks_like_secret_value(&decoded_seg)
+                        || is_high_entropy_secret(&decoded_seg))
+                {
+                    let key = format!("URL_PATH_SECRET_{}", seg_idx + 1);
+                    let placeholder = format!("vault://{agent_name}/{key}");
+                    placeholders.push(PhantomVaultPlaceholder {
+                        location: format!("{rel_label}:mcpServers.{server_name}.url.path"),
+                        key,
+                        placeholder: placeholder.clone(),
+                        redaction: "phantom-vault-v1".to_owned(),
+                    });
+                    scrubbed_segs.push(placeholder);
+                } else {
+                    scrubbed_segs.push(seg.to_owned());
+                }
+            }
+            format!("{origin}/{}", scrubbed_segs.join("/"))
+        } else {
+            base_and_path.to_owned()
+        }
+    } else {
+        base_and_path.to_owned()
+    };
+
+    if let Some(query) = query_opt {
+        let mut scrubbed_params = Vec::new();
+        for (p_idx, param) in query.split('&').enumerate() {
+            if let Some((k, v)) = param.split_once('=') {
+                let decoded_v = percent_decode_lossy(v);
+                let key_norm = normalize_vault_key(k);
+                if !v.is_empty()
+                    && !v.starts_with("vault://")
+                    && (is_secret_key_name(&key_norm)
+                        || looks_like_secret_value(&decoded_v)
+                        || is_high_entropy_secret(&decoded_v))
+                {
+                    let placeholder = format!("vault://{agent_name}/{key_norm}");
+                    placeholders.push(PhantomVaultPlaceholder {
+                        location: format!("{rel_label}:mcpServers.{server_name}.url.query.{k}"),
+                        key: key_norm,
+                        placeholder: placeholder.clone(),
+                        redaction: "phantom-vault-v1".to_owned(),
+                    });
+                    scrubbed_params.push(format!("{k}={placeholder}"));
+                } else {
+                    scrubbed_params.push(param.to_owned());
+                }
+            } else {
+                let decoded_p = percent_decode_lossy(param);
+                if !param.is_empty()
+                    && !param.starts_with("vault://")
+                    && (looks_like_secret_value(&decoded_p) || is_high_entropy_secret(&decoded_p))
+                {
+                    let key = format!("URL_QUERY_SECRET_{}", p_idx + 1);
+                    let placeholder = format!("vault://{agent_name}/{key}");
+                    placeholders.push(PhantomVaultPlaceholder {
+                        location: format!("{rel_label}:mcpServers.{server_name}.url.query"),
+                        key,
+                        placeholder: placeholder.clone(),
+                        redaction: "phantom-vault-v1".to_owned(),
+                    });
+                    scrubbed_params.push(placeholder);
+                } else {
+                    scrubbed_params.push(param.to_owned());
+                }
+            }
+        }
+        rebuilt.push('?');
+        rebuilt.push_str(&scrubbed_params.join("&"));
+    }
+
+    if let Some(frag) = frag_opt {
+        let decoded_frag = percent_decode_lossy(frag);
+        rebuilt.push('#');
+        if !frag.is_empty()
+            && !frag.starts_with("vault://")
+            && (looks_like_secret_value(&decoded_frag) || is_high_entropy_secret(&decoded_frag))
+        {
+            let key = "URL_FRAGMENT_SECRET".to_owned();
+            let placeholder = format!("vault://{agent_name}/{key}");
+            placeholders.push(PhantomVaultPlaceholder {
+                location: format!("{rel_label}:mcpServers.{server_name}.url.fragment"),
+                key,
+                placeholder: placeholder.clone(),
+                redaction: "phantom-vault-v1".to_owned(),
+            });
+            rebuilt.push_str(&placeholder);
+        } else {
+            let scrubbed_frag = scrub_inline_secrets_in_prose(
+                frag,
+                agent_name,
+                &format!("{rel_label}:mcpServers.{server_name}.url.fragment"),
+                placeholders,
+            );
+            rebuilt.push_str(&scrubbed_frag);
+        }
+    }
+
+    rebuilt
 }
 
 fn find_shell_metachar(input: &str) -> Option<&'static str> {
@@ -2473,15 +4019,6 @@ fn inspect_env_map(
             continue;
         };
 
-        if key.eq_ignore_ascii_case("PATH") && is_suspicious_path_override(val_str) {
-            violations.push(QuarantineViolation::new(
-                SecurityGate::DynamicLinkerEnvScrub,
-                rel_label,
-                format!("MCP server '{server_name}' overrides PATH with unsafe directory entry"),
-            ));
-            continue;
-        }
-
         if val_str.starts_with("vault://") {
             sanitized_out.insert(key.to_owned(), val_str.to_owned());
             continue;
@@ -2490,12 +4027,11 @@ fn inspect_env_map(
         if should_convert_env_to_phantom_vault(key, val_str) {
             let canonical_key = normalize_vault_key(key);
             let placeholder = format!("vault://{agent_name}/{canonical_key}");
-            let fingerprint = phantom_fingerprint(val_str);
             placeholders.push(PhantomVaultPlaceholder {
                 location: format!("{rel_label}:mcpServers.{server_name}.env.{key}"),
                 key: canonical_key,
                 placeholder: placeholder.clone(),
-                fingerprint,
+                redaction: "phantom-vault-v1".to_owned(),
             });
             sanitized_out.insert(key.to_owned(), placeholder);
         } else {
@@ -2545,7 +4081,7 @@ fn inspect_headers_map(
                 location: format!("{rel_label}:mcpServers.{server_name}.headers.{raw_key}"),
                 key: key_norm,
                 placeholder: placeholder.clone(),
-                fingerprint: phantom_fingerprint(val_str),
+                redaction: "phantom-vault-v1".to_owned(),
             });
             sanitized_out.insert(raw_key.clone(), placeholder);
         } else {
@@ -2565,10 +4101,61 @@ fn scrub_mcp_args(
     let mut idx = 0;
     while idx < args.len() {
         let current = &args[idx];
+
+        // 1. Composite HTTP header flags: `-H "Header: value"` / `--header "Header: value"`
+        if (current == "-H" || current.eq_ignore_ascii_case("--header"))
+            && let Some(next_val) = args.get(idx + 1)
+        {
+            out.push(current.clone());
+            let loc = format!("{rel_label}:mcpServers.{server_name}.args[{}]", idx + 1);
+            out.push(scrub_composite_header_arg(
+                next_val,
+                agent_name,
+                &loc,
+                placeholders,
+            ));
+            idx += 2;
+            continue;
+        }
+
+        // 2. Inline `--header=Header: value` or `-H=Header: value`
+        if let Some((flag, val)) = current.split_once('=')
+            && (flag == "-H" || flag.eq_ignore_ascii_case("--header"))
+        {
+            let loc = format!("{rel_label}:mcpServers.{server_name}.args[{idx}]");
+            let scrubbed_hdr = scrub_composite_header_arg(val, agent_name, &loc, placeholders);
+            out.push(format!("{flag}={scrubbed_hdr}"));
+            idx += 1;
+            continue;
+        }
+
+        // 3. Inline `--env=KEY=VAL` secret conversion
+        if let Some((flag, assign)) = current.split_once('=')
+            && flag.eq_ignore_ascii_case("--env")
+            && let Some((env_k, env_v)) = assign.split_once('=')
+            && !env_v.starts_with("vault://")
+            && should_convert_env_to_phantom_vault(env_k, env_v)
+        {
+            let vault_key = normalize_vault_key(env_k);
+            let placeholder = format!("vault://{agent_name}/{vault_key}");
+            placeholders.push(PhantomVaultPlaceholder {
+                location: format!("{rel_label}:mcpServers.{server_name}.args[{idx}]"),
+                key: vault_key,
+                placeholder: placeholder.clone(),
+                redaction: "phantom-vault-v1".to_owned(),
+            });
+            out.push(format!("{flag}={env_k}={placeholder}"));
+            idx += 1;
+            continue;
+        }
+
+        // 4. Inline `--flag=val` secret conversion (by flag name, secret pattern, or high entropy)
         if let Some((flag, val)) = current.split_once('=')
             && flag.starts_with('-')
             && !val.starts_with("vault://")
-            && (is_secret_key_name(&normalize_vault_key(flag)) || looks_like_secret_value(val))
+            && (is_secret_key_name(&normalize_vault_key(flag))
+                || looks_like_secret_value(val)
+                || is_high_entropy_secret(val))
         {
             let vault_key = normalize_vault_key(flag);
             let placeholder = format!("vault://{agent_name}/{vault_key}");
@@ -2576,13 +4163,14 @@ fn scrub_mcp_args(
                 location: format!("{rel_label}:mcpServers.{server_name}.args[{idx}]"),
                 key: vault_key,
                 placeholder: placeholder.clone(),
-                fingerprint: phantom_fingerprint(val),
+                redaction: "phantom-vault-v1".to_owned(),
             });
             out.push(format!("{flag}={placeholder}"));
             idx += 1;
             continue;
         }
 
+        // 5. Two-arg `--secret-flag <val>` (including `--auth <high-entropy>`)
         if current.starts_with('-')
             && is_secret_key_name(&normalize_vault_key(current))
             && let Some(next_val) = args.get(idx + 1)
@@ -2595,7 +4183,7 @@ fn scrub_mcp_args(
                 location: format!("{rel_label}:mcpServers.{server_name}.args[{}]", idx + 1),
                 key: vault_key,
                 placeholder: placeholder.clone(),
-                fingerprint: phantom_fingerprint(next_val),
+                redaction: "phantom-vault-v1".to_owned(),
             });
             out.push(current.clone());
             out.push(placeholder);
@@ -2603,9 +4191,35 @@ fn scrub_mcp_args(
             continue;
         }
 
+        // 6. Positional `KEY=VAL` env-like assignment or standalone secret / high-entropy token
+        if !current.starts_with('-')
+            && let Some((maybe_k, maybe_v)) = current.split_once('=')
+            && !maybe_k.is_empty()
+            && maybe_k
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !maybe_v.starts_with("vault://")
+            && should_convert_env_to_phantom_vault(maybe_k, maybe_v)
+        {
+            let vault_key = normalize_vault_key(maybe_k);
+            let placeholder = format!("vault://{agent_name}/{vault_key}");
+            placeholders.push(PhantomVaultPlaceholder {
+                location: format!("{rel_label}:mcpServers.{server_name}.args[{idx}]"),
+                key: vault_key,
+                placeholder: placeholder.clone(),
+                redaction: "phantom-vault-v1".to_owned(),
+            });
+            out.push(format!("{maybe_k}={placeholder}"));
+            idx += 1;
+            continue;
+        }
+
         if !current.starts_with('-')
             && !current.starts_with("vault://")
-            && looks_like_secret_value(current)
+            && (looks_like_secret_value(current)
+                || (!current.starts_with('@')
+                    && !current.contains('/')
+                    && is_high_entropy_secret(current)))
         {
             let vault_key = format!("ARG_{idx}");
             let placeholder = format!("vault://{agent_name}/{vault_key}");
@@ -2613,31 +4227,105 @@ fn scrub_mcp_args(
                 location: format!("{rel_label}:mcpServers.{server_name}.args[{idx}]"),
                 key: vault_key,
                 placeholder: placeholder.clone(),
-                fingerprint: phantom_fingerprint(current),
+                redaction: "phantom-vault-v1".to_owned(),
             });
             out.push(placeholder);
         } else {
-            out.push(current.clone());
+            let loc = format!("{rel_label}:mcpServers.{server_name}.args[{idx}]");
+            out.push(scrub_inline_secrets_in_prose(
+                current,
+                agent_name,
+                &loc,
+                placeholders,
+            ));
         }
         idx += 1;
     }
     out
 }
 
+fn scrub_composite_header_arg(
+    raw_header: &str,
+    agent_name: &str,
+    location: &str,
+    placeholders: &mut Vec<PhantomVaultPlaceholder>,
+) -> String {
+    if let Some((hdr_name, hdr_val)) = raw_header.split_once(':') {
+        let name_trimmed = hdr_name.trim();
+        let val_trimmed = hdr_val.trim();
+        if val_trimmed.starts_with("vault://") {
+            return raw_header.to_owned();
+        }
+        let hdr_key = normalize_vault_key(name_trimmed);
+        if !val_trimmed.is_empty()
+            && (is_secret_key_name(&hdr_key)
+                || looks_like_secret_value(val_trimmed)
+                || is_high_entropy_secret(val_trimmed))
+        {
+            let placeholder = format!("vault://{agent_name}/{hdr_key}");
+            placeholders.push(PhantomVaultPlaceholder {
+                location: location.to_owned(),
+                key: hdr_key,
+                placeholder: placeholder.clone(),
+                redaction: "phantom-vault-v1".to_owned(),
+            });
+            return format!("{name_trimmed}: {placeholder}");
+        }
+    }
+    scrub_inline_secrets_in_prose(raw_header, agent_name, location, placeholders)
+}
+
 fn is_forbidden_dynamic_linker_env(key: &str) -> bool {
     let upper = key.trim().to_ascii_uppercase();
-    if upper.starts_with("DYLD_") || upper.starts_with("LD_") {
+    if upper.starts_with("NPM_") && upper != "NPM_TOKEN" {
         return true;
+    }
+    for prefix in [
+        "DYLD_",
+        "LD_",
+        "PYTHON",
+        "NODE_",
+        "BUN_",
+        "COREPACK_",
+        "PNPM_",
+        "YARN_",
+        "UV_",
+        "PIP_",
+        "DOCKER_",
+        "PODMAN_",
+        "CONTAINER_",
+        "DENO_",
+        "GIT_",
+        "CARGO_",
+        "GEM_",
+        "BUNDLE_",
+        "PERL",
+        "RUBY",
+        "XDG_",
+        "SSH_",
+        "SSL_",
+        "JAVA_",
+        "_JAVA_",
+        "JDK_",
+        "DOTNET_",
+        "RUSTC_",
+        "OPENSSL_",
+    ] {
+        if upper.starts_with(prefix) {
+            return true;
+        }
     }
     matches!(
         upper.as_str(),
-        "NODE_OPTIONS"
-            | "NODE_REPL_EXTERNAL_MODULE"
-            | "NODE_PATH"
-            | "PYTHONSTARTUP"
-            | "PYTHONPATH"
-            | "PYTHONHOME"
-            | "PYTHONINSPECT"
+        "PATH"
+            | "HOME"
+            | "USERPROFILE"
+            | "APPDATA"
+            | "LOCALAPPDATA"
+            | "TMPDIR"
+            | "TMP"
+            | "TEMP"
+            | "TEMPDIR"
             | "BASH_ENV"
             | "ENV"
             | "ZDOTDIR"
@@ -2646,52 +4334,25 @@ fn is_forbidden_dynamic_linker_env(key: &str) -> bool {
             | "PROMPT_COMMAND"
             | "IFS"
             | "CDPATH"
-            | "RUBYOPT"
-            | "RUBYLIB"
-            | "PERL5OPT"
-            | "PERL5LIB"
-            | "PERL5DB"
-            | "JAVA_TOOL_OPTIONS"
-            | "_JAVA_OPTIONS"
-            | "JDK_JAVA_OPTIONS"
-            | "DOTNET_STARTUP_HOOKS"
-            | "SSH_ASKPASS"
-            | "SSH_ASKPASS_REQUIRE"
-            | "GIT_ASKPASS"
-            | "GIT_SSH"
-            | "GIT_SSH_COMMAND"
-            | "GIT_EXEC_PATH"
-            | "GIT_EXTERNAL_DIFF"
-            | "GIT_EDITOR"
-            | "GIT_SEQUENCE_EDITOR"
-            | "GIT_PAGER"
             | "EDITOR"
             | "VISUAL"
             | "PAGER"
             | "LESSOPEN"
             | "LESSCLOSE"
             | "BROWSER"
-            | "CARGO_BUILD_RUSTC_WRAPPER"
-            | "RUSTC_WRAPPER"
+            | "GCONV_PATH"
+            | "LOCPATH"
+            | "HOSTALIASES"
+            | "RES_OPTIONS"
+            | "LOCALDOMAIN"
+            | "GLIBC_TUNABLES"
+            | "MALLOC_TRACE"
+            | "REQUESTS_CA_BUNDLE"
+            | "CURL_CA_BUNDLE"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
     )
-}
-
-fn is_suspicious_path_override(path_val: &str) -> bool {
-    for segment in path_val.split(':') {
-        let trimmed = segment.trim();
-        if trimmed.is_empty()
-            || trimmed == "."
-            || trimmed.starts_with("./")
-            || trimmed.starts_with("../")
-            || trimmed.starts_with('~')
-            || trimmed.starts_with("/tmp")
-            || trimmed.starts_with("/var/tmp")
-            || trimmed.contains("..")
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn should_convert_env_to_phantom_vault(key: &str, value: &str) -> bool {
@@ -2704,8 +4365,6 @@ fn should_convert_env_to_phantom_vault(key: &str, value: &str) -> bool {
     }
     let norm_key = normalize_vault_key(key);
     if is_secret_key_name(&norm_key) {
-        // Ignore obvious empty/template placeholders like `${GITHUB_TOKEN}`? Actually converting even
-        // non-vault values under `*_TOKEN`/`*_KEY` to `vault://<NAME>/<KEY>` guarantees uniform PhantomVault wiring!
         return true;
     }
     is_high_entropy_secret(trimmed)
@@ -2714,33 +4373,62 @@ fn should_convert_env_to_phantom_vault(key: &str, value: &str) -> bool {
 fn is_secret_key_name(upper_key: &str) -> bool {
     if matches!(
         upper_key,
-        "AUTHORIZATION"
+        "AUTH"
+            | "AUTHORIZATION"
+            | "PROXY_AUTHORIZATION"
+            | "COOKIE"
+            | "SET_COOKIE"
             | "API_KEY"
             | "APIKEY"
+            | "X_API_KEY"
+            | "API_SECRET"
+            | "API_TOKEN"
+            | "ACCESS_KEY"
+            | "ACCESS_TOKEN"
+            | "REFRESH_TOKEN"
+            | "ID_TOKEN"
+            | "X_AUTH_TOKEN"
+            | "X_CSRF_TOKEN"
             | "TOKEN"
             | "SECRET"
             | "PASSWORD"
             | "PASSWD"
+            | "PASS"
+            | "PWD"
             | "BEARER"
             | "PRIVATE_KEY"
+            | "SESSION"
+            | "SESSION_ID"
+            | "SESSIONID"
+            | "SESSION_KEY"
+            | "SIGNING_KEY"
             | "CLIENT_SECRET"
             | "WEBHOOK_SECRET"
     ) {
         return true;
     }
     for suffix in [
+        "_AUTH",
+        "_AUTHORIZATION",
         "_KEY",
         "_API_KEY",
         "_APIKEY",
+        "_ACCESS_KEY",
+        "_PRIVATE_KEY",
         "_TOKEN",
         "_SECRET",
         "_PASSWORD",
         "_PASSWD",
+        "_PASS",
+        "_PWD",
         "_PAT",
         "_CREDENTIAL",
         "_CREDENTIALS",
         "_JWT",
         "_COOKIE",
+        "_SESSION",
+        "_SESSION_ID",
+        "_SID",
     ] {
         if upper_key.ends_with(suffix)
             && upper_key != "PUBLIC_KEY"
@@ -2752,8 +4440,16 @@ fn is_secret_key_name(upper_key: &str) -> bool {
     false
 }
 
+fn contains_private_key_pem_header(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    upper.contains("-----BEGIN ") && upper.contains("PRIVATE") && upper.contains("KEY-----")
+}
+
 fn looks_like_secret_value(value: &str) -> bool {
     let trimmed = value.trim();
+    if contains_private_key_pem_header(trimmed) {
+        return true;
+    }
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("bearer ") && trimmed.len() > 10 {
         return true;
@@ -2861,16 +4557,84 @@ fn shannon_entropy(input: &str) -> f64 {
     entropy
 }
 
+fn scrub_pem_private_key_blocks(
+    text: &str,
+    agent_name: &str,
+    rel_label: &str,
+    secret_counter: &mut usize,
+    placeholders: &mut Vec<PhantomVaultPlaceholder>,
+) -> String {
+    if !contains_private_key_pem_header(text) {
+        return text.to_owned();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(rel_begin) = text[cursor..].find("-----BEGIN ") {
+        let begin_idx = cursor + rel_begin;
+        out.push_str(&text[cursor..begin_idx]);
+
+        let after_begin = &text[begin_idx + "-----BEGIN ".len()..];
+        let Some(header_close_rel) = after_begin.find("-----") else {
+            out.push_str(&text[begin_idx..]);
+            return out;
+        };
+        let label = &after_begin[..header_close_rel];
+        let label_upper = label.to_ascii_uppercase();
+        if !(label_upper.contains("PRIVATE") && label_upper.contains("KEY")) {
+            let advance_end = begin_idx + "-----BEGIN ".len() + header_close_rel + 5;
+            out.push_str(&text[begin_idx..advance_end]);
+            cursor = advance_end;
+            continue;
+        }
+
+        let line_no = text[..begin_idx].bytes().filter(|&b| b == b'\n').count() + 1;
+        let body_search_start = begin_idx + "-----BEGIN ".len() + header_close_rel + 5;
+        let block_end = if let Some(end_rel) = text[body_search_start..].find("-----END ") {
+            let after_end_marker = body_search_start + end_rel + "-----END ".len();
+            if let Some(end_dashes) = text[after_end_marker..].find("-----") {
+                after_end_marker + end_dashes + 5
+            } else {
+                text.len()
+            }
+        } else {
+            text.len()
+        };
+
+        *secret_counter += 1;
+        let key = format!("PRIVATE_KEY_{secret_counter}");
+        let placeholder = format!("vault://{agent_name}/{key}");
+        placeholders.push(PhantomVaultPlaceholder {
+            location: format!("{rel_label}:line:{line_no}"),
+            key,
+            placeholder: placeholder.clone(),
+            redaction: "phantom-vault-v1".to_owned(),
+        });
+        out.push_str(&placeholder);
+        cursor = block_end;
+    }
+
+    out.push_str(&text[cursor..]);
+    out
+}
+
 fn scrub_inline_secrets_in_prose(
     text: &str,
     agent_name: &str,
     rel_label: &str,
     placeholders: &mut Vec<PhantomVaultPlaceholder>,
 ) -> String {
-    let mut result = String::with_capacity(text.len());
     let mut secret_counter: usize = 0;
+    let pem_scrubbed = scrub_pem_private_key_blocks(
+        text,
+        agent_name,
+        rel_label,
+        &mut secret_counter,
+        placeholders,
+    );
+    let mut result = String::with_capacity(pem_scrubbed.len());
 
-    for (line_no, line) in text.split('\n').enumerate() {
+    for (line_no, line) in pem_scrubbed.split('\n').enumerate() {
         if line_no > 0 {
             result.push('\n');
         }
@@ -2905,7 +4669,7 @@ fn scrub_inline_secrets_in_prose(
                         location: format!("{rel_label}:line:{}", line_no + 1),
                         key,
                         placeholder: placeholder.clone(),
-                        fingerprint: phantom_fingerprint(next_core),
+                        redaction: "phantom-vault-v1".to_owned(),
                     });
                     result.push_str(span);
                     // Normalize exotic whitespace separator (e.g. NBSP) next to scrubbed credential to single ASCII space or keep ASCII tab/space.
@@ -2921,6 +4685,144 @@ fn scrub_inline_secrets_in_prose(
                 }
             }
 
+            // Scrub `KEY: <secret_or_high_entropy>` two-token assignments in prose
+            if let Some(before_colon) = span.strip_suffix(':') {
+                let colon_key = strip_wrapping_token_punct(before_colon);
+                if is_env_or_config_identifier(colon_key)
+                    && is_secret_key_name(&normalize_vault_key(colon_key))
+                    && let Some((true, ws_span)) = spans.get(idx + 1).copied()
+                    && let Some((false, next_tok)) = spans.get(idx + 2).copied()
+                {
+                    let next_core = strip_wrapping_token_punct(next_tok);
+                    if !next_core.is_empty()
+                        && !next_core.starts_with("vault://")
+                        && !next_core.eq_ignore_ascii_case("Bearer")
+                        && !next_core.eq_ignore_ascii_case("Basic")
+                        && (looks_like_secret_value(next_core) || is_high_entropy_secret(next_core))
+                    {
+                        secret_counter += 1;
+                        let key = format!("INLINE_SECRET_{secret_counter}");
+                        let placeholder = format!("vault://{agent_name}/{key}");
+                        placeholders.push(PhantomVaultPlaceholder {
+                            location: format!("{rel_label}:line:{}", line_no + 1),
+                            key,
+                            placeholder: placeholder.clone(),
+                            redaction: "phantom-vault-v1".to_owned(),
+                        });
+                        result.push_str(span);
+                        if ws_span == " " || ws_span == "\t" {
+                            result.push_str(ws_span);
+                        } else {
+                            result.push(' ');
+                        }
+                        let replaced_next = next_tok.replacen(next_core, &placeholder, 1);
+                        result.push_str(&replaced_next);
+                        idx += 3;
+                        continue;
+                    }
+                }
+            }
+
+            // Scrub spaced `KEY = VALUE`, `KEY= VALUE`, and `KEY =VALUE` assignments in prose
+            if let Some(before_eq) = span.strip_suffix('=') {
+                let lhs_clean = strip_wrapping_token_punct(before_eq);
+                if is_env_or_config_identifier(lhs_clean)
+                    && let Some((true, ws_span)) = spans.get(idx + 1).copied()
+                    && let Some((false, rhs_tok)) = spans.get(idx + 2).copied()
+                {
+                    let rhs_core = strip_wrapping_token_punct(rhs_tok);
+                    let rhs_is_template = rhs_core.is_empty()
+                        || rhs_core.starts_with("vault://")
+                        || rhs_core.starts_with('$')
+                        || (rhs_core.starts_with('<') && rhs_core.ends_with('>'));
+                    if !rhs_is_template && should_convert_env_to_phantom_vault(lhs_clean, rhs_core)
+                    {
+                        secret_counter += 1;
+                        let key = format!("INLINE_SECRET_{secret_counter}");
+                        let placeholder = format!("vault://{agent_name}/{key}");
+                        placeholders.push(PhantomVaultPlaceholder {
+                            location: format!("{rel_label}:line:{}", line_no + 1),
+                            key,
+                            placeholder: placeholder.clone(),
+                            redaction: "phantom-vault-v1".to_owned(),
+                        });
+                        result.push_str(span);
+                        result.push_str(if ws_span == " " || ws_span == "\t" {
+                            ws_span
+                        } else {
+                            " "
+                        });
+                        result.push_str(&rhs_tok.replacen(rhs_core, &placeholder, 1));
+                        idx += 3;
+                        continue;
+                    }
+                }
+            }
+
+            let ident_candidate = strip_wrapping_token_punct(span);
+            if is_env_or_config_identifier(ident_candidate)
+                && let Some((true, ws1)) = spans.get(idx + 1).copied()
+                && let Some((false, mid_tok)) = spans.get(idx + 2).copied()
+            {
+                if mid_tok == "="
+                    && let Some((true, ws2)) = spans.get(idx + 3).copied()
+                    && let Some((false, rhs_tok)) = spans.get(idx + 4).copied()
+                {
+                    let rhs_core = strip_wrapping_token_punct(rhs_tok);
+                    let rhs_is_template = rhs_core.is_empty()
+                        || rhs_core.starts_with("vault://")
+                        || rhs_core.starts_with('$')
+                        || (rhs_core.starts_with('<') && rhs_core.ends_with('>'));
+                    if !rhs_is_template
+                        && should_convert_env_to_phantom_vault(ident_candidate, rhs_core)
+                    {
+                        secret_counter += 1;
+                        let key = format!("INLINE_SECRET_{secret_counter}");
+                        let placeholder = format!("vault://{agent_name}/{key}");
+                        placeholders.push(PhantomVaultPlaceholder {
+                            location: format!("{rel_label}:line:{}", line_no + 1),
+                            key,
+                            placeholder: placeholder.clone(),
+                            redaction: "phantom-vault-v1".to_owned(),
+                        });
+                        result.push_str(span);
+                        result.push_str(if ws1 == " " || ws1 == "\t" { ws1 } else { " " });
+                        result.push('=');
+                        result.push_str(if ws2 == " " || ws2 == "\t" { ws2 } else { " " });
+                        result.push_str(&rhs_tok.replacen(rhs_core, &placeholder, 1));
+                        idx += 5;
+                        continue;
+                    }
+                } else if let Some(after_eq) = mid_tok.strip_prefix('=')
+                    && !after_eq.is_empty()
+                {
+                    let rhs_core = strip_wrapping_token_punct(after_eq);
+                    let rhs_is_template = rhs_core.is_empty()
+                        || rhs_core.starts_with("vault://")
+                        || rhs_core.starts_with('$')
+                        || (rhs_core.starts_with('<') && rhs_core.ends_with('>'));
+                    if !rhs_is_template
+                        && should_convert_env_to_phantom_vault(ident_candidate, rhs_core)
+                    {
+                        secret_counter += 1;
+                        let key = format!("INLINE_SECRET_{secret_counter}");
+                        let placeholder = format!("vault://{agent_name}/{key}");
+                        placeholders.push(PhantomVaultPlaceholder {
+                            location: format!("{rel_label}:line:{}", line_no + 1),
+                            key,
+                            placeholder: placeholder.clone(),
+                            redaction: "phantom-vault-v1".to_owned(),
+                        });
+                        result.push_str(span);
+                        result.push_str(if ws1 == " " || ws1 == "\t" { ws1 } else { " " });
+                        result.push('=');
+                        result.push_str(&after_eq.replacen(rhs_core, &placeholder, 1));
+                        idx += 3;
+                        continue;
+                    }
+                }
+            }
+
             let trimmed_punct = strip_wrapping_token_punct(span);
             if !trimmed_punct.starts_with("vault://") && looks_like_secret_value(trimmed_punct) {
                 secret_counter += 1;
@@ -2930,25 +4832,44 @@ fn scrub_inline_secrets_in_prose(
                     location: format!("{rel_label}:line:{}", line_no + 1),
                     key,
                     placeholder: placeholder.clone(),
-                    fingerprint: phantom_fingerprint(trimmed_punct),
+                    redaction: "phantom-vault-v1".to_owned(),
                 });
                 let replaced = span.replacen(trimmed_punct, &placeholder, 1);
                 result.push_str(&replaced);
-            } else if let Some((_, rhs)) = trimmed_punct.split_once('=')
-                && !rhs.starts_with("vault://")
-                && looks_like_secret_value(rhs)
-            {
-                secret_counter += 1;
-                let key = format!("INLINE_SECRET_{secret_counter}");
-                let placeholder = format!("vault://{agent_name}/{key}");
-                placeholders.push(PhantomVaultPlaceholder {
-                    location: format!("{rel_label}:line:{}", line_no + 1),
-                    key,
-                    placeholder: placeholder.clone(),
-                    fingerprint: phantom_fingerprint(rhs),
-                });
-                let replaced = span.replacen(rhs, &placeholder, 1);
-                result.push_str(&replaced);
+            } else if let Some((raw_lhs, raw_rhs)) = trimmed_punct.split_once('=') {
+                let lhs_clean = strip_wrapping_token_punct(raw_lhs);
+                let rhs_clean = strip_wrapping_token_punct(raw_rhs);
+                let key_candidate = lhs_clean.rsplit(['?', '&']).next().unwrap_or(lhs_clean);
+                let lhs_is_ident = is_env_or_config_identifier(key_candidate);
+                let rhs_is_template = rhs_clean.is_empty()
+                    || rhs_clean.starts_with("vault://")
+                    || rhs_clean.starts_with('$')
+                    || (rhs_clean.starts_with('<') && rhs_clean.ends_with('>'));
+                if !rhs_is_template
+                    && (looks_like_secret_value(rhs_clean)
+                        || (lhs_is_ident
+                            && should_convert_env_to_phantom_vault(key_candidate, rhs_clean)))
+                {
+                    secret_counter += 1;
+                    let key = format!("INLINE_SECRET_{secret_counter}");
+                    let placeholder = format!("vault://{agent_name}/{key}");
+                    placeholders.push(PhantomVaultPlaceholder {
+                        location: format!("{rel_label}:line:{}", line_no + 1),
+                        key,
+                        placeholder: placeholder.clone(),
+                        redaction: "phantom-vault-v1".to_owned(),
+                    });
+                    if let Some(eq_idx) = span.find('=') {
+                        result.push_str(&span[..=eq_idx]);
+                        let replaced_rhs = span[eq_idx + 1..].replacen(rhs_clean, &placeholder, 1);
+                        result.push_str(&replaced_rhs);
+                    } else {
+                        let replaced = span.replacen(rhs_clean, &placeholder, 1);
+                        result.push_str(&replaced);
+                    }
+                } else {
+                    result.push_str(span);
+                }
             } else {
                 result.push_str(span);
             }
@@ -2956,6 +4877,15 @@ fn scrub_inline_secrets_in_prose(
         }
     }
     result
+}
+
+fn is_env_or_config_identifier(candidate: &str) -> bool {
+    let mut chars = candidate.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 fn split_preserving_unicode_whitespace(line: &str) -> Vec<(bool, &str)> {
@@ -3009,14 +4939,6 @@ fn normalize_vault_key(raw_key: &str) -> String {
     }
 }
 
-fn phantom_fingerprint(secret: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"chinwag-phantom-vault-v1:");
-    hasher.update(secret.as_bytes());
-    let digest = hex_lower(&hasher.finalize());
-    format!("chwg_phantom_{}", &digest[..12])
-}
-
 fn collect_inert_descriptors(
     root: &Path,
     dir: &Path,
@@ -3057,10 +4979,17 @@ fn collect_inert_descriptors(
             continue;
         };
         source_artifacts.insert(rel.clone());
-        // Check Trojan Source Unicode & HTML comment injections even in `.ts`/`.json`/`.yaml` descriptors
-        scan_gate_1e_text(&rel, &raw, false, violations);
+        // Gate 1e + prose injection + Markdown link scan across all `tools/` and `channels/` descriptors
+        scan_gate_1e_text(&rel, &raw, true, violations);
+        scan_markdown_links(&rel, &raw, violations);
+        if path.extension().and_then(|e| e.to_str()) == Some("json")
+            && let Ok(decoded_json) = serde_json::from_str::<Value>(&raw)
+        {
+            scan_decoded_json_value(&rel, &decoded_json, true, violations);
+        }
         let scrubbed = scrub_inline_secrets_in_prose(&raw, agent_name, &rel, placeholders);
         let summary = extract_inert_doc_summary(&scrubbed);
+        scan_gate_1e_text(&rel, &summary, true, violations);
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -3233,7 +5162,7 @@ fn render_soul_md(
         .unwrap_or("Imported Cursor Specialist Agent");
     let department = meta.department.as_deref().unwrap_or("Engineering");
     let reports_to = meta.reports_to.as_deref().unwrap_or("lead");
-    let updated = meta.updated.as_deref().unwrap_or("2026-01-01");
+    let updated = meta.updated.as_deref().unwrap_or("imported");
 
     let persona_excerpt = meta
         .summary
@@ -3295,8 +5224,8 @@ fn render_agent_md(
         .unwrap_or("Imported Cursor Specialist Agent");
     let department = meta.department.as_deref().unwrap_or("Engineering");
     let reports_to = meta.reports_to.as_deref().unwrap_or("lead");
-    let room = meta.room.as_deref().unwrap_or("#eng");
-    let updated = meta.updated.as_deref().unwrap_or("2026-01-01");
+    let room = meta.room.as_deref().unwrap_or("#general");
+    let updated = meta.updated.as_deref().unwrap_or("imported");
 
     let mut out = format!(
         "---\n\
@@ -3409,7 +5338,7 @@ fn render_tool_md(
         .as_deref()
         .unwrap_or("Imported Cursor Specialist Agent");
     let department = meta.department.as_deref().unwrap_or("Engineering");
-    let updated = meta.updated.as_deref().unwrap_or("2026-01-01");
+    let updated = meta.updated.as_deref().unwrap_or("imported");
 
     let mut out = format!(
         "---\n\
@@ -3427,7 +5356,7 @@ fn render_tool_md(
          ## 2. Chinwag CLI, Memory & Bus Tools\n\
          - **Instance Identity (`INV-THREAD-ID-01`):** `export CHINWAG_INSTANCE_ID=\"$(chinwag bus instance)\"` and `export CHINWAG_ACTOR=\"{agent_name}#$CHINWAG_INSTANCE_ID\"`.\n\
          - **Memory CLI:** `chinwag memory recall | retain | tombstone | stats --bank default`\n\
-         - **Bus CLI:** `chinwag bus send --repo \"$PWD\" --from \"$CHINWAG_ACTOR\" --room \"#eng\" --task \"<TASK-ID>\" \"<message>\"`\n\n\
+         - **Bus CLI:** `chinwag bus send --repo \"$PWD\" --from \"$CHINWAG_ACTOR\" --room \"#general\" --task \"<TASK-ID>\" \"<message>\"`\n\n\
          ## 3. Imported Tools & Sanitized MCP Servers (`INV-CURSOR-IMPORT-SAFE-01`)\n",
         escape_yaml_double_quoted(role),
         escape_yaml_double_quoted(department),
@@ -3657,6 +5586,8 @@ mod tests {
             agent_name: name.to_owned(),
             out_dir: out.to_path_buf(),
             json_output: true,
+            include_design: false,
+            allowed_mcp_commands: default_allowed_mcp_commands(),
         }
     }
 
@@ -3719,7 +5650,7 @@ mod tests {
         .unwrap();
         fs::write(
             src.join("DESIGN.md"),
-            "# Untrusted Design File\nShould be skipped for non-TYPE seats.\n",
+            "# Untrusted Design File\nSkipped unless --include-design is explicitly passed.\n",
         )
         .unwrap();
 
