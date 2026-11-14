@@ -133,6 +133,7 @@ fn main() -> ExitCode {
             ));
         }
         if matches!(raw_args.get(1).map(|s| s.as_str()), Some("tasks" | "task")) {
+            let _ = chinwag_cli::live_coord::emit_live_coord_delta_from_cwd(&mut std::io::stderr());
             let code = chinwag_cli::board::run_tasks_cli(
                 &raw_args[2..],
                 &mut std::io::stdout().lock(),
@@ -149,6 +150,7 @@ fn main() -> ExitCode {
             return ExitCode::from(code);
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("ci-report") {
+            let _ = chinwag_cli::live_coord::emit_live_coord_delta_from_cwd(&mut std::io::stderr());
             let code = chinwag_cli::board::run_ci_report_cli(
                 &raw_args[2..],
                 &mut std::io::stdout().lock(),
@@ -165,6 +167,7 @@ fn main() -> ExitCode {
             return ExitCode::from(code);
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("openspec") {
+            let _ = chinwag_cli::live_coord::emit_live_coord_delta_from_cwd(&mut std::io::stderr());
             let code = feature_cli_run::run_openspec_cli(
                 &raw_args[2..],
                 &mut std::io::stdout().lock(),
@@ -334,7 +337,7 @@ fn main() -> ExitCode {
             ))
         }
         chinwag_cli::Dispatch::AgentDispatch(request) => {
-            chinwag_cli::board::emit_active_crisis_alert_from_cwd(&mut std::io::stderr());
+            let _ = chinwag_cli::live_coord::emit_live_coord_delta_from_cwd(&mut std::io::stderr());
             ExitCode::from(chinwag_cli::run_agent_dispatch(
                 request,
                 &mut std::io::stdin().lock(),
@@ -343,7 +346,7 @@ fn main() -> ExitCode {
             ))
         }
         chinwag_cli::Dispatch::Memory(request) => {
-            chinwag_cli::board::emit_active_crisis_alert_from_cwd(&mut std::io::stderr());
+            let _ = chinwag_cli::live_coord::emit_live_coord_delta_from_cwd(&mut std::io::stderr());
             ExitCode::from(chinwag_cli::run_memory(
                 request,
                 &mut std::io::stdout().lock(),

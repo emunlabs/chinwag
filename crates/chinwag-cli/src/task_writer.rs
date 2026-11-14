@@ -2010,11 +2010,25 @@ pub fn commit_task_write(
     };
     let mut entry = match journal.reserve(journal_request)? {
         ReplayDispositionV1::Fresh(entry) => entry,
-        ReplayDispositionV1::Existing(entry) | ReplayDispositionV1::DuplicateRecorded(entry) => {
+        ReplayDispositionV1::Existing(mut entry)
+        | ReplayDispositionV1::DuplicateRecorded(mut entry) => {
             return match entry.state {
-                WriteOperationState::Recorded | WriteOperationState::Acknowledged => Ok(
-                    WriterWriteOutcome::DuplicateRecorded(WriterCommitProof::from_record(&entry)?),
-                ),
+                WriteOperationState::Recorded | WriteOperationState::Acknowledged => {
+                    let proof = WriterCommitProof::from_record(&entry)?;
+                    crate::live_coord::emit_task_writer_transition_beacon(
+                        &context.root.path,
+                        &request.operation_id,
+                        &request.admitted_task_ref.task_id,
+                        &request.admitted_task_ref.canonical_task_path,
+                        request.next_status.as_str(),
+                        &request.authenticated_signer_principal,
+                    )
+                    .map_err(std::io::Error::other)?;
+                    if entry.state == WriteOperationState::Recorded {
+                        journal_phase(journal, &mut entry, WriteOperationState::Acknowledged)?;
+                    }
+                    Ok(WriterWriteOutcome::DuplicateRecorded(proof))
+                }
                 WriteOperationState::Rejected => Ok(WriterWriteOutcome::Rejected),
                 WriteOperationState::Held => Ok(WriterWriteOutcome::Held),
                 WriteOperationState::FileCommitted => {
@@ -2026,6 +2040,15 @@ pub fn commit_task_write(
                         &mut record_projection,
                     )? {
                         RecoveredCommitOutcome::Committed(proof) => {
+                            crate::live_coord::emit_task_writer_transition_beacon(
+                                &context.root.path,
+                                &request.operation_id,
+                                &request.admitted_task_ref.task_id,
+                                &request.admitted_task_ref.canonical_task_path,
+                                request.next_status.as_str(),
+                                &request.authenticated_signer_principal,
+                            )
+                            .map_err(std::io::Error::other)?;
                             Ok(WriterWriteOutcome::DuplicateRecorded(*proof))
                         }
                         RecoveredCommitOutcome::RolledBack => Ok(WriterWriteOutcome::Rejected),
@@ -2223,7 +2246,18 @@ where
         _journal: &mut Journal,
         record: &JournalRecordV1,
     ) -> Result<WriterCommitProof, WriterError> {
-        WriterCommitProof::from_record(record)
+        let proof = WriterCommitProof::from_record(record)?;
+        let admitted = &self.request.admitted_task_ref;
+        crate::live_coord::emit_task_writer_transition_beacon(
+            &self.context.root.path,
+            &self.request.operation_id,
+            &admitted.task_id,
+            &admitted.canonical_task_path,
+            self.request.next_status.as_str(),
+            &self.request.authenticated_signer_principal,
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(proof)
     }
 }
 
@@ -3748,13 +3782,39 @@ pub fn classify_and_recover_prepared_operation(
     require_production_recovery_request(context, &entry)?;
     journal.lookup_request(&entry.request)?;
     let had_file_commit = journal.had_durable_file_commit(&entry.request);
-    if matches!(
-        entry.state,
-        WriteOperationState::Recorded | WriteOperationState::Acknowledged
-    ) {
+    if entry.state == WriteOperationState::Acknowledged {
         return Ok(RecoveredCommitOutcome::Committed(Box::new(
             WriterCommitProof::from_record(&entry)?,
         )));
+    }
+    if entry.state == WriteOperationState::Recorded {
+        let proof = WriterCommitProof::from_record(&entry)?;
+        if crate::live_coord::resolve_coord_store_root(&context.root.path)
+            .join(".chinwag")
+            .join("state.crdb")
+            .is_file()
+        {
+            let task_ref = TaskRefV1::decode(&entry.request.signed_task_ref)?;
+            let target = PinnedTarget::open(context.root, &lease.canonical_relative_path)?;
+            let (committed_bytes, _) = target.read()?;
+            let committed_doc = CanonicalTaskDocumentV1::from_bytes(&committed_bytes)?;
+            let task = committed_doc
+                .tasks
+                .iter()
+                .find(|t| t.task_id == task_ref.task_id)
+                .ok_or(WriterError::TargetTaskConflict)?;
+            crate::live_coord::emit_task_writer_transition_beacon(
+                &context.root.path,
+                &entry.request.operation_id,
+                &task_ref.task_id,
+                &task_ref.canonical_task_path,
+                task.status.as_str(),
+                &entry.request.signer_principal,
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        journal_phase(journal, &mut entry, WriteOperationState::Acknowledged)?;
+        return Ok(RecoveredCommitOutcome::Committed(Box::new(proof)));
     }
     if !matches!(
         entry.state,
@@ -3818,6 +3878,29 @@ pub fn classify_and_recover_prepared_operation(
                 ));
             }
             journal_phase(journal, &mut entry, WriteOperationState::Recorded)?;
+            if crate::live_coord::resolve_coord_store_root(&context.root.path)
+                .join(".chinwag")
+                .join("state.crdb")
+                .is_file()
+            {
+                let task_ref = TaskRefV1::decode(&entry.request.signed_task_ref)?;
+                let (committed_bytes, _) = target.read()?;
+                let committed_doc = CanonicalTaskDocumentV1::from_bytes(&committed_bytes)?;
+                let task = committed_doc
+                    .tasks
+                    .iter()
+                    .find(|t| t.task_id == task_ref.task_id)
+                    .ok_or(WriterError::TargetTaskConflict)?;
+                crate::live_coord::emit_task_writer_transition_beacon(
+                    &context.root.path,
+                    &entry.request.operation_id,
+                    &task_ref.task_id,
+                    &task_ref.canonical_task_path,
+                    task.status.as_str(),
+                    &entry.request.signer_principal,
+                )
+                .map_err(std::io::Error::other)?;
+            }
             journal_phase(journal, &mut entry, WriteOperationState::Acknowledged)?;
             Ok(RecoveredCommitOutcome::Committed(Box::new(proof)))
         }
@@ -6087,6 +6170,112 @@ mod tests {
                 .unwrap()
                 .file_cas_rev,
             1
+        );
+    }
+
+    #[test]
+    fn p0_writer_recorded_direct_recovery_retries_beacon_and_advances_acknowledged() {
+        let fixture = Fixture::new();
+        fs::set_permissions(&fixture.root.path, fs::Permissions::from_mode(0o700)).unwrap();
+        let chinwag_dir = fixture.root.path.join(".chinwag");
+        fs::create_dir(&chinwag_dir).unwrap();
+        fs::set_permissions(&chinwag_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // Seed an unreadable/corrupt `.chinwag/state.crdb` so `commit_task_write` reaches
+        // `WriteOperationState::Recorded` and fails during `emit_task_writer_transition_beacon`.
+        let crdb_path = chinwag_dir.join("state.crdb");
+        fs::write(&crdb_path, b"corrupt-crdb-before-recovery").unwrap();
+        fs::set_permissions(&crdb_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let request = fixture.request();
+        let mut journal = fixture.journal();
+        let first_attempt = commit_task_write(
+            &fixture.context(),
+            &mut journal,
+            &request,
+            &[],
+            || Ok(fixture.authority.clone()),
+            |_, _, _| Ok(()),
+            |_| Ok(()),
+        );
+        assert!(
+            first_attempt.is_err(),
+            "commit_task_write must surface post-Recorded beacon failure"
+        );
+        assert_eq!(
+            journal
+                .latest(
+                    "workspace",
+                    &fixture.lease.task_source_id,
+                    &request.operation_id
+                )
+                .unwrap()
+                .state,
+            WriteOperationState::Recorded
+        );
+
+        // Direct recovery while `.chinwag/state.crdb` is still broken MUST also fail closed
+        // and leave `entry.state == Recorded` (never returning false-positive success).
+        assert!(
+            classify_and_recover_prepared_operation(
+                &fixture.context(),
+                &mut journal,
+                &request.operation_id,
+                || Ok(fixture.authority.clone()),
+                |_| panic!("Recorded direct recovery must not re-project"),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            journal
+                .latest(
+                    "workspace",
+                    &fixture.lease.task_source_id,
+                    &request.operation_id
+                )
+                .unwrap()
+                .state,
+            WriteOperationState::Recorded
+        );
+
+        // Replace broken `.chinwag` directory with a valid initialized private CRDB store,
+        // then run direct recovery.
+        fs::remove_dir_all(&chinwag_dir).unwrap();
+        fs::create_dir(&chinwag_dir).unwrap();
+        fs::set_permissions(&chinwag_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        chinwag_snapshot_session_private::initial_create::fresh_empty_store_image_for_private_fixture()
+            .unwrap()
+            .begin_private_fixture(&fixture.root.path)
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        let recovered = classify_and_recover_prepared_operation(
+            &fixture.context(),
+            &mut journal,
+            &request.operation_id,
+            || Ok(fixture.authority.clone()),
+            |_| panic!("Recorded direct recovery must not re-project"),
+        )
+        .unwrap();
+        assert!(matches!(recovered, RecoveredCommitOutcome::Committed(_)));
+        assert_eq!(
+            journal
+                .latest(
+                    "workspace",
+                    &fixture.lease.task_source_id,
+                    &request.operation_id
+                )
+                .unwrap()
+                .state,
+            WriteOperationState::Acknowledged
+        );
+        let (_, _, _, _, beacons) =
+            crate::live_coord::read_live_coord_snapshot(&fixture.root.path).unwrap();
+        assert!(
+            beacons
+                .iter()
+                .any(|b| b.beacon_id == format!("bcn-tw-{}", request.operation_id)),
+            "direct recovery from Recorded must emit deterministic bcn-tw-<op_id>; got {beacons:?}"
         );
     }
     #[test]

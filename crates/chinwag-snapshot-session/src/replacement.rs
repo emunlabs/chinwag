@@ -11,7 +11,11 @@ mod qualified;
 use crate::{Error, NativeCounts, Rows, Value, native::Connection};
 #[cfg(feature = "private-probe")]
 pub use domain::SeedThread;
-pub use domain::{AgentDispatchRecord, MemoryPinRecord, PinRequest, ThreadStart, TombstoneRecord};
+pub use domain::{
+    AgentDispatchRecord, LIVE_COORD_BEACON_THREAD_ID, LIVE_SESSION_LEASE_CLAIM_ID,
+    LiveCoordBeaconRecord, LiveSessionLeaseRecord, MemoryPinRecord, PinRequest, ThreadStart,
+    TombstoneRecord,
+};
 pub use owner::WriteOwner;
 pub use qualified::{MigrationRequest, QualifiedMigrationSession, QualifiedWriteSession};
 use serde_json::Value as Json;
@@ -141,11 +145,23 @@ pub struct Observation {
     checked_owner_fds: usize,
     native_before_file_release: NativeCounts,
     replacement_identities: Option<Json>,
+    before_header_stamp: Option<crate::CrdbHeaderStamp>,
+    after_header_stamp: Option<crate::CrdbHeaderStamp>,
 }
 impl Observation {
     /// Checked held/named identity snapshots, never a descriptor or authority.
     pub fn replacement_identities(&self) -> Option<&Json> {
         self.replacement_identities.as_ref()
+    }
+    /// Exact SQLite header stamp of `.chinwag/state.crdb` captured under the exclusive write lock
+    /// prior to replacement.
+    pub fn before_header_stamp(&self) -> Option<crate::CrdbHeaderStamp> {
+        self.before_header_stamp
+    }
+    /// Exact SQLite header stamp of `.chinwag/state.crdb` captured under the exclusive write lock
+    /// after replacement and prior to lock release.
+    pub fn after_header_stamp(&self) -> Option<crate::CrdbHeaderStamp> {
+        self.after_header_stamp
     }
     pub fn kind(&self) -> &'static str {
         self.kind
@@ -408,6 +424,32 @@ impl WriteSession {
             "memory_pin_v1",
             digest,
             |native| domain::record_memory_pin(native, request),
+            cancelled,
+        )
+    }
+    pub fn prepare_live_coord_beacon(
+        self,
+        request: LiveCoordBeaconRecord,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedOutcome> {
+        let digest = request.digest();
+        self.prepare(
+            "live_coord_beacon_v1",
+            digest,
+            |native| domain::record_live_coord_beacon(native, request),
+            cancelled,
+        )
+    }
+    pub fn prepare_live_session_lease(
+        self,
+        request: LiveSessionLeaseRecord,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PreparedOutcome> {
+        let digest = request.digest();
+        self.prepare(
+            "live_session_lease_v1",
+            digest,
+            |native| domain::record_live_session_lease(native, request),
             cancelled,
         )
     }

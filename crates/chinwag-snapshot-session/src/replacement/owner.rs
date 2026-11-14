@@ -195,6 +195,7 @@ impl WriteOwner {
             .ok_or_else(|| retained("write_anchor_missing", false, false))?
             .close_all()
             .map_err(|e| retained(e, false, false))?;
+        let unchanged_stamp = self.original.header_stamp();
         let digest = Sha256::digest(&self.original.bytes).into();
         Ok(NoWriteReceipt {
             observation: Observation {
@@ -211,6 +212,8 @@ impl WriteOwner {
                 checked_owner_fds: checked + 2,
                 native_before_file_release: pending.native_closed,
                 replacement_identities: None,
+                before_header_stamp: unchanged_stamp,
+                after_header_stamp: unchanged_stamp,
             },
             response: pending.decision.response,
             is_error: pending.decision.is_error,
@@ -575,6 +578,8 @@ impl InstalledCompletion {
             .ok_or_else(|| retained("write_anchor_missing", true, true))?
             .close_all()
             .map_err(|e| retained(e, true, true))?;
+        let before_header_stamp = self.owner.original.header_stamp();
+        let after_header_stamp = self.post_new.header_stamp();
         let old_sha256 = Sha256::digest(&self.owner.original.bytes).into();
         let identities = serde_json::json!({
             "old_linked": identity_json(self.owner.original.id.observation()),
@@ -598,6 +603,8 @@ impl InstalledCompletion {
                 checked_owner_fds: checked + 4,
                 native_before_file_release: self.pending.native_closed,
                 replacement_identities: Some(identities),
+                before_header_stamp,
+                after_header_stamp,
             },
             response: self.pending.decision.response,
             is_error: self.pending.decision.is_error,

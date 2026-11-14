@@ -62,6 +62,8 @@ pub mod cursor_import;
 #[cfg(target_os = "macos")]
 pub mod execution_binding;
 #[cfg(target_os = "macos")]
+pub mod live_coord;
+#[cfg(target_os = "macos")]
 pub mod regression_ratchet;
 #[cfg(target_os = "macos")]
 pub mod release_sync;

@@ -3142,6 +3142,7 @@ pub fn publish_prebuilt_bus_message_sync(
 struct ResolvedReleasePublishRoute {
     daemon: Option<DaemonState>,
     explicit_route: bool,
+    publication_root: PathBuf,
 }
 
 fn resolve_release_publish_daemon_route(
@@ -3167,6 +3168,7 @@ fn resolve_release_publish_daemon_route_with_env(
         return Ok(ResolvedReleasePublishRoute {
             daemon: Some(route),
             explicit_route: true,
+            publication_root: exec_root.to_path_buf(),
         });
     }
     if let Some(local_daemon) = read_verified_daemon_state_from_selected_root(exec_root)
@@ -3175,6 +3177,7 @@ fn resolve_release_publish_daemon_route_with_env(
         return Ok(ResolvedReleasePublishRoute {
             daemon: Some(local_daemon),
             explicit_route: false,
+            publication_root: exec_root.to_path_buf(),
         });
     }
     if selected.is_linked_worktree() {
@@ -3197,23 +3200,37 @@ fn resolve_release_publish_daemon_route_with_env(
         {
             return Err(InstanceError::PublicationRejected);
         }
-        let Some(common_daemon) =
-            read_verified_daemon_state_from_selected_root(common_selected.execution_root())
-                .map_err(|_| InstanceError::PublicationRejected)?
+        let common_exec_root = common_selected.execution_root().to_path_buf();
+        let Some(common_daemon) = read_verified_daemon_state_from_selected_root(&common_exec_root)
+            .map_err(|_| InstanceError::PublicationRejected)?
         else {
-            // Linked worktree with neither a live local daemon nor a live primary
-            // checkout daemon must fail closed rather than creating an orphaned
-            // split-brain `messages.jsonl` inside the linked worktree.
+            // Single-host daemon-free coordination (`INV-UNIVERSAL-COORDINATION-01`):
+            // when the verified primary checkout owns `.chinwag/state.crdb` and has no
+            // tampered `daemon.json`, route publication to `common_exec_root` so no
+            // split-brain `linked/.chinwag/bus/messages.jsonl` is ever created.
+            if common_exec_root
+                .join(".chinwag")
+                .join("state.crdb")
+                .is_file()
+            {
+                return Ok(ResolvedReleasePublishRoute {
+                    daemon: None,
+                    explicit_route: false,
+                    publication_root: common_exec_root,
+                });
+            }
             return Err(InstanceError::PublicationRejected);
         };
         return Ok(ResolvedReleasePublishRoute {
             daemon: Some(common_daemon),
             explicit_route: false,
+            publication_root: common_exec_root,
         });
     }
     Ok(ResolvedReleasePublishRoute {
         daemon: None,
         explicit_route: false,
+        publication_root: exec_root.to_path_buf(),
     })
 }
 
@@ -3435,6 +3452,12 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 watcher.changed(observed_len, observed_inode, timeout_secs)
             },
         );
+    }
+    if matches!(
+        sub,
+        "check-claims" | "emit-beacon" | "session-lease" | "install-hooks"
+    ) {
+        return chinwag_cli::live_coord::run_bus_live_coord_cli(sub, &args[1..], stdout, stderr);
     }
     if sub == "--help" || sub == "-h" || sub == "help" {
         return print_bus_help(stdout);
@@ -3726,7 +3749,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
     }
     let repo_root = selected.execution_root().to_path_buf();
     if !matches!(sub, "receipt" | "network-status" | "crisis" | "all-stop") {
-        chinwag_cli::board::emit_active_crisis_alert_if_any(&repo_root, stderr);
+        let _ = chinwag_cli::live_coord::emit_live_coord_delta_if_any(&repo_root, stderr);
     }
 
     match sub {
@@ -3807,7 +3830,36 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             let body = format!(
                 "[TASK-START BEACON] {sender} started {ticket_id} | worktree: {worktree} | branch: {branch} | surfaces: {surfaces_joined}"
             );
-            let (msg, ack) = match send_bus_message_sync(
+            let has_crdb = chinwag_cli::live_coord::resolve_coord_store_root(&repo_root)
+                .join(".chinwag")
+                .join("state.crdb")
+                .is_file();
+            let crdb_beacon = if has_crdb {
+                match chinwag_cli::live_coord::emit_transactional_beacon(
+                    &repo_root,
+                    &chinwag_cli::live_coord::AutoBeaconRequest {
+                        kind: Some(chinwag_cli::live_coord::BeaconKind::ClaimAcquired),
+                        actor: Some(sender.clone()),
+                        ticket_id: ticket_id.clone(),
+                        worktree: Some(worktree.clone()),
+                        branch_ref: Some(branch.clone()),
+                        claimed_paths: surface_globs.clone(),
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(receipt) => Some(receipt),
+                    Err(err) => {
+                        let _ = writeln!(
+                            stderr,
+                            "chinwag bus beacon: CRDB claim acquisition failed: {err}"
+                        );
+                        return 2;
+                    }
+                }
+            } else {
+                None
+            };
+            let (msg_id, msg_seq, msg_sig_verified, formatted_line) = match send_bus_message_sync(
                 &repo_root,
                 &sender,
                 "#all",
@@ -3815,10 +3867,22 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 Some(ticket_id.clone()),
                 &body,
             ) {
-                Ok(v) => v,
+                Ok((msg, ack)) => {
+                    let line = format_bus_line(&msg);
+                    (msg.id, ack.seq, ack.sig_verified, line)
+                }
                 Err(error) => {
-                    let _ = writeln!(stderr, "chinwag bus beacon: {error}");
-                    return 2;
+                    if let Some(ref receipt) = crdb_beacon {
+                        (
+                            receipt.beacon_id.clone(),
+                            receipt.seq,
+                            receipt.sig_verified,
+                            format!("[#{} · crdb] {body}", receipt.seq),
+                        )
+                    } else {
+                        let _ = writeln!(stderr, "chinwag bus beacon: {error}");
+                        return 2;
+                    }
                 }
             };
             let collisions = chinwag_cli::board::detect_in_flight_surface_collisions(
@@ -3854,6 +3918,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
             let out = json!({
                 "ok": true,
                 "invariant": "INV-LIVE-THREAD-WORKTREE-BEACON-01",
+                "universal_coordination_invariant": chinwag_cli::live_coord::INV_UNIVERSAL_COORDINATION,
                 "command": "chinwag bus beacon",
                 "sender": sender,
                 "ticket_id": ticket_id,
@@ -3863,9 +3928,10 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 "notified_live_threads": live_threads,
                 "surface_collisions": collisions,
                 "collision_warning_message_ids": collision_warnings,
-                "message_id": msg.id,
-                "seq": ack.seq,
-                "sig_verified": ack.sig_verified,
+                "message_id": msg_id,
+                "seq": msg_seq,
+                "sig_verified": msg_sig_verified,
+                "crdb_beacon_seq": crdb_beacon.as_ref().map(|r| r.seq),
             });
             if is_json {
                 let _ = writeln!(
@@ -3877,7 +3943,7 @@ pub fn run_bus_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wri
                 let _ = writeln!(
                     stdout,
                     "{}\n  ↳ Broadcast to {} live thread(s) ({} surface collision warning(s))",
-                    format_bus_line(&msg),
+                    formatted_line,
                     live_threads.len(),
                     collisions.len()
                 );
@@ -4782,18 +4848,62 @@ pub fn run_release_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn
             match chinwag_cli::release_sync::publish_release(req, &store, |msg| {
                 let route =
                     resolve_release_publish_daemon_route(&selected).map_err(|e| e.to_string())?;
+                let pub_root = &route.publication_root;
+                let has_crdb = pub_root.join(".chinwag").join("state.crdb").is_file();
                 let transport_secret = actor_transport_secret(&msg.sender);
-                publish_prebuilt_bus_message_sync_over_resolved_route(
-                    &repo_root,
+                let bus_res = publish_prebuilt_bus_message_sync_over_resolved_route(
+                    pub_root,
                     msg.clone(),
                     transport_secret,
-                    route.daemon,
+                    route.daemon.clone(),
                     route.explicit_route,
-                )
-                .map(|(_, ack)| ack.seq)
-                .map_err(|e| e.to_string())
+                );
+                match bus_res {
+                    Ok((_, ack)) => Ok(ack.seq),
+                    Err(err) => {
+                        if route.daemon.is_none() && !route.explicit_route && has_crdb {
+                            let beacon = chinwag_cli::live_coord::emit_transactional_beacon(
+                                pub_root,
+                                &chinwag_cli::live_coord::AutoBeaconRequest {
+                                    id: Some(format!("rel-{}", msg.id)),
+                                    kind: Some(chinwag_cli::live_coord::BeaconKind::ReleaseBuilt),
+                                    actor: Some(msg.sender.clone()),
+                                    worktree: Some(repo_root.to_string_lossy().into_owned()),
+                                    release_binary: Some(binary.to_owned()),
+                                    summary: Some(msg.body.clone()),
+                                    ..Default::default()
+                                },
+                            )?;
+                            Ok(beacon.seq)
+                        } else {
+                            Err(err.to_string())
+                        }
+                    }
+                }
             }) {
                 Ok(outcome) => {
+                    let store_root = chinwag_cli::live_coord::resolve_coord_store_root(&repo_root);
+                    if store_root.join(".chinwag").join("state.crdb").is_file()
+                        && let Err(e) = chinwag_cli::live_coord::emit_transactional_beacon(
+                            &store_root,
+                            &chinwag_cli::live_coord::AutoBeaconRequest {
+                                id: Some(format!("rel-{}", outcome.release_built_message.id)),
+                                kind: Some(chinwag_cli::live_coord::BeaconKind::ReleaseBuilt),
+                                actor: Some(outcome.release_built_message.sender.clone()),
+                                worktree: Some(repo_root.to_string_lossy().into_owned()),
+                                commit_sha: Some(outcome.manifest.git_commit.clone()),
+                                release_binary: Some(outcome.manifest.binary.clone()),
+                                summary: Some(format!("sha256:{}", outcome.manifest.sha256)),
+                                ..Default::default()
+                            },
+                        )
+                    {
+                        let _ = writeln!(
+                            stderr,
+                            "chinwag release publish: live-coord RELEASE_BUILT beacon failed: {e}"
+                        );
+                        return 1;
+                    }
                     if is_json {
                         let out = json!({
                             "ok": true,
