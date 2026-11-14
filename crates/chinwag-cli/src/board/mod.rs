@@ -3138,9 +3138,9 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
                 issue.surv_status = SurvStatus::Pending168h;
                 issue.surv_expires_at_ms = issue.t_ship_ms + SURV_WINDOW_MS;
 
-                let minted = bridge.record_ci_pass(issue.first_pass_ci_eligible);
+                let mut candidate_bridge = bridge.clone();
+                let minted = candidate_bridge.record_ci_pass(issue.first_pass_ci_eligible);
                 issue.chips_minted += minted;
-                let _ = bridge.save(&tasks_dir);
 
                 let proof = compute_velocity_proof_for_deliverable(
                     claimed_tier,
@@ -3157,9 +3157,20 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
                     "SurfaceSyncReceiptV1: status=PASS pillar=12 subtasks=4/4 speedup={:.1}x chips=+{}",
                     proof.metric_b_active_speedup, minted
                 ));
-                let _ = fs::write(&path, issue.to_markdown());
-                if let Some(repo_root) = tasks_dir.parent().and_then(|p| p.parent()) {
-                    let _ = crate::live_coord::emit_transactional_beacon(
+                if let Err(e) = fs::write(&path, issue.to_markdown()) {
+                    let _ = writeln!(
+                        stderr,
+                        "chinwag board sync-loop: failed to write {}: {e}",
+                        path.display()
+                    );
+                    return 1;
+                }
+                if let Some(repo_root) = tasks_dir.parent().and_then(|p| p.parent())
+                    && crate::live_coord::resolve_coord_store_root(repo_root)
+                        .join(".chinwag")
+                        .join("state.crdb")
+                        .is_file()
+                    && let Err(e) = crate::live_coord::emit_transactional_beacon(
                         repo_root,
                         &crate::live_coord::AutoBeaconRequest {
                             kind: Some(crate::live_coord::BeaconKind::PrMerged),
@@ -3168,8 +3179,18 @@ pub fn run_board_sync_loop(args: &[String], stdout: &mut dyn Write, stderr: &mut
                             summary: Some(crate::live_coord::scrub_coord_text(&issue.title)),
                             ..Default::default()
                         },
+                    )
+                {
+                    let _ = fs::write(&path, &raw);
+                    let _ = writeln!(
+                        stderr,
+                        "chinwag board sync-loop: live-coord PR_MERGED beacon failed for {}: {e}",
+                        issue.id
                     );
+                    return 1;
                 }
+                bridge = candidate_bridge;
+                let _ = bridge.save(&tasks_dir);
 
                 tribunal_promotions.push(json!({
                     "issue_id": issue.id,

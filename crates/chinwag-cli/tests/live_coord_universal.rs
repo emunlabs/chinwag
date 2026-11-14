@@ -1133,4 +1133,194 @@ fn rename_escape_no_verify_ref_tx_linked_worktree_rel_hooks_and_interleaved_curs
         head_before, head_after,
         "HEAD must not advance when reference-transaction prepared blocks conflicting commit!"
     );
+
+    // 5. Detached linked worktree (`git worktree add --detach`) `git commit --no-verify`
+    // updates `HEAD` directly (not `refs/heads/*`) and MUST ALSO fail closed in
+    // `reference-transaction prepared` without advancing detached `HEAD`!
+    let wt_detached = ws.base.join("wt-detached-fenced");
+    assert!(
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                wt_detached.to_str().unwrap(),
+                "HEAD",
+            ])
+            .current_dir(&ws.repo)
+            .env_clear()
+            .env("HOME", &ws.home)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("CHINWAG_BIN", env!("CARGO_BIN_EXE_chinwag"))
+            .status()
+            .unwrap()
+            .success(),
+        "detached git worktree add must succeed cleanly"
+    );
+    let detached_head_before = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt_detached)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+    fs::write(
+        wt_detached.join("src/engine/core.rs"),
+        "pub fn v() -> u32 { 777 }\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["add", "src/engine/core.rs"])
+            .current_dir(&wt_detached)
+            .env("HOME", &ws.home)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let detached_no_verify = Command::new("git")
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-verify",
+            "-m",
+            "detached bypass pre-commit attempt",
+        ])
+        .current_dir(&wt_detached)
+        .env_clear()
+        .env("HOME", &ws.home)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("CHINWAG_BIN", env!("CARGO_BIN_EXE_chinwag"))
+        .output()
+        .unwrap();
+    assert!(
+        !detached_no_verify.status.success(),
+        "detached-worktree git commit --no-verify on claimed surface must fail closed!"
+    );
+    let detached_head_after = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt_detached)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+    assert_eq!(
+        detached_head_before, detached_head_after,
+        "detached HEAD must not advance when reference-transaction prepared blocks conflicting commit!"
+    );
+}
+
+#[test]
+fn beacon_byte_bounds_25_large_summaries_and_board_sync_write_failure_preserve_claims() {
+    let ws = IsolatedWorkspace::new("byte-bound-and-board-sync");
+    let init = ws.run_chinwag(
+        &ws.repo,
+        None,
+        &[
+            "init",
+            "--repo",
+            ws.repo.to_str().unwrap(),
+            "--principal",
+            "fixture@chinwag.test",
+        ],
+    );
+    assert!(init.status.success());
+
+    // 1. Emit 25 beacons each with a 60,000-byte summary (25 * 60,000 = 1.5 MB > 1 MiB raw).
+    // Write-side + SQL read-side byte caps MUST keep `read_live_coord_snapshot` strictly < 1 MiB!
+    let huge_summary = "S".repeat(60_000);
+    let actor_owner = "PEER-BOUND#0123456789abcdef0123456789abcdef";
+    for idx in 0..25 {
+        let rcpt = emit_transactional_beacon(
+            &ws.repo,
+            &AutoBeaconRequest {
+                kind: Some(BeaconKind::TaskCreated),
+                actor: Some(actor_owner.to_owned()),
+                ticket_id: format!("CHWG-{:04}", 500 + idx),
+                summary: Some(huge_summary.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("bounded beacon emission must succeed for 60KB caller summary");
+        assert_eq!(rcpt.seq, (idx + 1) as u64);
+    }
+    let (_, _, _, _, beacons) =
+        read_live_coord_snapshot(&ws.repo).expect("snapshot read must stay well under 1 MiB!");
+    assert_eq!(beacons.len(), 25);
+
+    // 2. Acquire active claim on `src/engine/**` for `CHWG-0250` owned by `actor_owner`,
+    // stage a `04_TRIBUNAL_GATE` card whose `CHWG-0250.md` is read-only (`0400`) so persistence
+    // fails during `chinwag board sync-loop`, and prove `PR_MERGED` is NOT emitted and the claim stays active!
+    let claim_out = ws.run_chinwag(
+        &ws.repo,
+        Some(actor_owner),
+        &[
+            "bus",
+            "beacon",
+            "--task",
+            "CHWG-0250",
+            "--surfaces",
+            "src/engine/**",
+            "--json",
+        ],
+    );
+    assert!(
+        claim_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&claim_out.stderr)
+    );
+    let (_, _, active_before_sync, _, _) = read_live_coord_snapshot(&ws.repo).unwrap();
+    assert_eq!(active_before_sync.len(), 1);
+
+    let issues_dir = ws.repo.join(".chinwag/tasks/issues");
+    fs::create_dir_all(&issues_dir).unwrap();
+    let issue_md_path = issues_dir.join("CHWG-0250.md");
+    let card_md = format!(
+        "---\n\
+id: CHWG-0250\n\
+title: Universal Live Coordination\n\
+status: 04_TRIBUNAL_GATE\n\
+dora_tier: M\n\
+deliverable_kind: code\n\
+file_scope: src/engine/**\n\
+assigned_seats: [RUST]\n\
+author_instance: {actor_owner}\n\
+visibility: private\n\
+item_type: Issue\n\
+---\n\n\
+# CHWG-0250 — Universal Live Coordination\n\n\
+- [x] #CHWG-0250.1 Code\n\
+- [x] #CHWG-0250.2 Docs\n\
+- [x] #CHWG-0250.3 Site\n\
+- [x] #CHWG-0250.4 QA & UI Gate\n"
+    );
+    fs::write(&issue_md_path, &card_md).unwrap();
+    // Make CHWG-0250.md read-only (`0400`) so `fs::write(&path, ...)` inside `board sync-loop` fails!
+    fs::set_permissions(&issue_md_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+    let sync_out = ws.run_chinwag(&ws.repo, Some(actor_owner), &["board", "sync-loop"]);
+    // Restore permissions before assertions so Drop cleans up cleanly.
+    let _ = fs::set_permissions(&issue_md_path, fs::Permissions::from_mode(0o600));
+    assert!(
+        !sync_out.status.success(),
+        "board sync-loop must fail closed when issue persistence fails!"
+    );
+    let (_, _, active_claims_after, _, beacons_after) = read_live_coord_snapshot(&ws.repo).unwrap();
+    assert!(
+        !active_claims_after.is_empty(),
+        "failed card write in board sync-loop must NOT release active claims!"
+    );
+    assert!(
+        !beacons_after
+            .iter()
+            .any(|b| b.kind == "PR_MERGED" && b.ticket_id == "CHWG-0250"),
+        "failed card write in board sync-loop must NOT emit PR_MERGED!"
+    );
 }

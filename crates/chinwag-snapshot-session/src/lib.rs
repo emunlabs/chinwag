@@ -187,7 +187,7 @@ impl SnapshotSession {
     pub fn live_coord_beacons(&self) -> SessionResult<Rows> {
         self.connection()?
             .query(
-                c"SELECT id,author_key_id,role,body,created_at_ms FROM messages WHERE thread_id='chinwag-live-coord-beacons' ORDER BY role DESC, id DESC LIMIT 256",
+                c"SELECT CASE WHEN LENGTH(CAST(id AS BLOB)) <= 256 THEN id ELSE SUBSTR(id, 1, 64) END, CASE WHEN LENGTH(CAST(author_key_id AS BLOB)) <= 256 THEN author_key_id ELSE SUBSTR(author_key_id, 1, 64) END, CASE WHEN LENGTH(CAST(role AS BLOB)) <= 128 THEN role ELSE SUBSTR(role, 1, 32) END, CASE WHEN LENGTH(CAST(body AS BLOB)) <= 3584 THEN body ELSE '{}' END, created_at_ms FROM messages WHERE thread_id='chinwag-live-coord-beacons' ORDER BY role DESC, id DESC LIMIT 200",
                 &[],
             )
             .map_err(SessionError::Native)
@@ -196,13 +196,13 @@ impl SnapshotSession {
         let conn = self.connection()?;
         let claims = conn
             .query(
-                c"SELECT id,file_path,symbol_hash,owner_key_id,authority_event_hash,observed_at_ms FROM agent_claims WHERE id IN (SELECT claim_id FROM leases WHERE observed_expires_at_ms >= ?1) ORDER BY observed_at_ms DESC, id ASC LIMIT 512",
+                c"SELECT CASE WHEN LENGTH(CAST(id AS BLOB)) <= 256 THEN id ELSE SUBSTR(id, 1, 64) END, CASE WHEN LENGTH(CAST(file_path AS BLOB)) <= 512 THEN file_path ELSE SUBSTR(file_path, 1, 128) END, CASE WHEN LENGTH(CAST(symbol_hash AS BLOB)) <= 256 THEN symbol_hash ELSE SUBSTR(symbol_hash, 1, 64) END, CASE WHEN LENGTH(CAST(owner_key_id AS BLOB)) <= 256 THEN owner_key_id ELSE SUBSTR(owner_key_id, 1, 64) END, CASE WHEN LENGTH(CAST(authority_event_hash AS BLOB)) <= 256 THEN authority_event_hash ELSE SUBSTR(authority_event_hash, 1, 64) END, observed_at_ms FROM agent_claims WHERE id IN (SELECT claim_id FROM leases WHERE observed_expires_at_ms >= ?1) ORDER BY observed_at_ms DESC, id ASC LIMIT 256",
                 &[Value::Integer(now_ms)],
             )
             .map_err(SessionError::Native)?;
         let leases = conn
             .query(
-                c"SELECT id,claim_id,owner_key_id,authority_event_hash,observed_expires_at_ms,observed_at_ms FROM leases WHERE observed_expires_at_ms >= ?1 ORDER BY observed_at_ms DESC, id ASC LIMIT 512",
+                c"SELECT CASE WHEN LENGTH(CAST(id AS BLOB)) <= 256 THEN id ELSE SUBSTR(id, 1, 64) END, CASE WHEN LENGTH(CAST(claim_id AS BLOB)) <= 256 THEN claim_id ELSE SUBSTR(claim_id, 1, 64) END, CASE WHEN LENGTH(CAST(owner_key_id AS BLOB)) <= 256 THEN owner_key_id ELSE SUBSTR(owner_key_id, 1, 64) END, CASE WHEN LENGTH(CAST(authority_event_hash AS BLOB)) <= 1024 THEN authority_event_hash ELSE '{}' END, observed_expires_at_ms, observed_at_ms FROM leases WHERE observed_expires_at_ms >= ?1 ORDER BY observed_at_ms DESC, id ASC LIMIT 256",
                 &[Value::Integer(now_ms)],
             )
             .map_err(SessionError::Native)?;

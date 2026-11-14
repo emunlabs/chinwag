@@ -843,6 +843,17 @@ fn mirror_verified_beacon_to_journal(store_root: &Path, msg: &BusMessage) -> boo
     )
 }
 
+fn truncate_utf8_bytes(raw: &str, max_bytes: usize) -> String {
+    if raw.len() <= max_bytes {
+        return raw.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw[..end].to_owned()
+}
+
 /// Atomically emits a signed coordination beacon (`TASK_CREATED`, `CLAIM_ACQUIRED`,
 /// `PR_OPENED`, `PR_MERGED`, `RELEASE_BUILT`) into `.chinwag/state.crdb`, updates
 /// `agent_claims` + `leases` in the same SQLite transaction, mirrors to `.chinwag/bus/messages.jsonl`
@@ -868,61 +879,93 @@ pub fn emit_transactional_beacon(
         .unwrap_or_else(|| {
             fs::canonicalize(repo_or_worktree).unwrap_or_else(|_| repo_or_worktree.to_path_buf())
         });
-    let worktree_label = sanitize_worktree_label(&store_root, &worktree_path);
+    let worktree_label =
+        truncate_utf8_bytes(&sanitize_worktree_label(&store_root, &worktree_path), 192);
     let raw_branch = req
         .branch_ref
         .clone()
         .unwrap_or_else(|| infer_branch_ref(&worktree_path));
-    let branch_ref = scrub_coord_text(&raw_branch);
-    let clean_ticket = scrub_coord_text(req.ticket_id.trim());
-    let clean_summary = req.summary.as_deref().map(scrub_coord_text);
-    let clean_pr_url = req.pr_url.as_deref().map(scrub_coord_text);
-    let repo_id = scrub_coord_text(&infer_repo_id(&store_root));
+    let branch_ref = truncate_utf8_bytes(&scrub_coord_text(&raw_branch), 192);
+    let clean_ticket = truncate_utf8_bytes(&scrub_coord_text(req.ticket_id.trim()), 96);
+    let clean_summary = req
+        .summary
+        .as_deref()
+        .map(|s| truncate_utf8_bytes(&scrub_coord_text(s), 256));
+    let clean_pr_url = req
+        .pr_url
+        .as_deref()
+        .map(|s| truncate_utf8_bytes(&scrub_coord_text(s), 256));
+    let clean_commit_sha = req
+        .commit_sha
+        .as_deref()
+        .map(|s| truncate_utf8_bytes(&scrub_coord_text(s), 64));
+    let clean_release_bin = req
+        .release_binary
+        .as_deref()
+        .map(|s| truncate_utf8_bytes(&scrub_coord_text(s), 192));
+    let repo_id = truncate_utf8_bytes(&scrub_coord_text(&infer_repo_id(&store_root)), 192);
     let created_at_ms = now_ms();
     let ts_unix = unix_secs();
     let ttl_ms = req.lease_ttl_ms.unwrap_or(DEFAULT_CLAIM_TTL_MS).max(1_000);
     let expires_at_ms = created_at_ms.saturating_add(ttl_ms);
 
-    let mut claimed_paths: Vec<String> = req
+    let mut raw_paths: Vec<String> = req
         .claimed_paths
         .iter()
-        .map(|s| scrub_coord_text(s.trim()))
+        .map(|s| truncate_utf8_bytes(&scrub_coord_text(s.trim()), 192))
         .filter(|s| !s.is_empty())
         .collect();
-    claimed_paths.sort();
-    claimed_paths.dedup();
-
-    let beacon_id = req.id.clone().unwrap_or_else(|| {
-        let mut h = Sha256::new();
-        h.update(kind.as_str().as_bytes());
-        h.update(b"|");
-        h.update(actor.as_bytes());
-        h.update(b"|");
-        h.update(clean_ticket.as_bytes());
-        h.update(b"|");
-        h.update(worktree_label.as_bytes());
-        h.update(created_at_ms.to_be_bytes());
-        let d = h.finalize();
-        format!("bcn-{}-{}", created_at_ms, hex_bytes(&d[..6]))
-    });
-
-    let human_body = format!(
-        "[AUTO-BEACON · {}] {} {} | actor={} | worktree={} | branch={} | paths={}",
-        INV_UNIVERSAL_COORDINATION,
-        kind.as_str(),
-        if clean_ticket.is_empty() {
-            "-"
-        } else {
-            &clean_ticket
-        },
-        actor,
-        worktree_label,
-        branch_ref,
-        if claimed_paths.is_empty() {
-            "-".to_owned()
-        } else {
-            claimed_paths.join(",")
+    raw_paths.sort();
+    raw_paths.dedup();
+    let mut claimed_paths = Vec::new();
+    let mut claimed_bytes = 0_usize;
+    for p in raw_paths {
+        if claimed_paths.len() >= 32 || claimed_bytes.saturating_add(p.len()) > 1_024 {
+            break;
         }
+        claimed_bytes += p.len();
+        claimed_paths.push(p);
+    }
+
+    let beacon_id = req
+        .id
+        .as_deref()
+        .map(|id| truncate_utf8_bytes(&scrub_coord_text(id.trim()), 192))
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            let mut h = Sha256::new();
+            h.update(kind.as_str().as_bytes());
+            h.update(b"|");
+            h.update(actor.as_bytes());
+            h.update(b"|");
+            h.update(clean_ticket.as_bytes());
+            h.update(b"|");
+            h.update(worktree_label.as_bytes());
+            h.update(created_at_ms.to_be_bytes());
+            let d = h.finalize();
+            format!("bcn-{}-{}", created_at_ms, hex_bytes(&d[..6]))
+        });
+
+    let human_body = truncate_utf8_bytes(
+        &format!(
+            "[AUTO-BEACON · {}] {} {} | actor={} | worktree={} | branch={} | paths={}",
+            INV_UNIVERSAL_COORDINATION,
+            kind.as_str(),
+            if clean_ticket.is_empty() {
+                "-"
+            } else {
+                &clean_ticket
+            },
+            actor,
+            worktree_label,
+            branch_ref,
+            if claimed_paths.is_empty() {
+                "-".to_owned()
+            } else {
+                claimed_paths.join(",")
+            }
+        ),
+        384,
     );
     let (bus_msg, authorized_merger) = build_and_verify_beacon_bus_message(
         &store_root,
@@ -946,8 +989,8 @@ pub fn emit_transactional_beacon(
         "claimed_paths": &claimed_paths,
         "pr_number": req.pr_number,
         "pr_url": clean_pr_url,
-        "commit_sha": req.commit_sha,
-        "release_binary": req.release_binary,
+        "commit_sha": clean_commit_sha,
+        "release_binary": clean_release_bin,
         "summary": clean_summary,
         "body": &human_body,
         "pubkey_ed25519": &bus_msg.pubkey_ed25519,
@@ -998,10 +1041,10 @@ pub fn emit_transactional_beacon(
     let new_db_version = completion.observation().new_db_version();
 
     // Advance the emitter's own CLI cursor ONLY when there are no unread intervening beacons
-    // from peers (`prev_seq + 1 == seq`); otherwise preserve `prev_seq` so external beacons
-    // in `(prev_seq..seq)` are delivered on the next delta check while `b.actor != actor`
-    // still suppresses self-echo.
-    if let Some(stamp) = fast_crdb_header_stamp(&store_root) {
+    // from peers (`prev_seq + 1 == seq`), using the exact SQLite header stamp captured while
+    // `.chinwag/state.crdb.lock` was still exclusively held (`after_header_stamp`) so a
+    // concurrent peer commit `#2` after unlock can never be masked under cursor `1`.
+    if let Some(stamp) = completion.observation().after_header_stamp() {
         let cursors = load_cli_cursors(&store_root);
         let key = worktree_cursor_key(&actor, &worktree_path);
         let prev_seq = cursors.cursors.get(&key).map(|c| c.last_seen_seq);
@@ -1276,9 +1319,10 @@ pub fn register_session_lease_crdb(
 ) -> Result<Value, String> {
     let store_root = resolve_coord_store_root(repo_or_worktree);
     clear_stale_crdb_locks(&store_root);
-    let actor = resolve_verified_actor(actor_override)?.to_string();
+    let actor = truncate_utf8_bytes(&resolve_verified_actor(actor_override)?.to_string(), 256);
     let pid = std::process::id();
-    let worktree = sanitize_worktree_label(&store_root, repo_or_worktree);
+    let worktree =
+        truncate_utf8_bytes(&sanitize_worktree_label(&store_root, repo_or_worktree), 192);
     let seq = match last_seen_seq_override {
         Some(s) => s,
         None => {
@@ -2250,19 +2294,94 @@ fn diff_tree_paths(worktree: &Path, old_oid: &str, new_oid: &str) -> Vec<String>
     parse_nul_name_status(&out.stdout)
 }
 
+fn is_all_zero_oid(oid: &str) -> bool {
+    let trimmed = oid.trim();
+    trimmed.len() >= 7 && trimmed.len() <= 64 && trimmed.bytes().all(|b| b == b'0')
+}
+
+fn is_unreferenced_commit(worktree: &Path, oid: &str) -> bool {
+    if !is_valid_non_zero_oid(oid) {
+        return false;
+    }
+    let Ok(out) = Command::new(git_bin())
+        .args([
+            "-C",
+            &worktree.to_string_lossy(),
+            "rev-list",
+            "-n",
+            "1",
+            oid,
+            "--not",
+            "--branches",
+            "--tags",
+            "--remotes",
+        ])
+        .output()
+    else {
+        return true;
+    };
+    if !out.status.success() {
+        return true;
+    }
+    !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+}
+
+fn root_commit_paths(worktree: &Path, new_oid: &str) -> Vec<String> {
+    if !is_valid_non_zero_oid(new_oid) {
+        return Vec::new();
+    }
+    let Ok(out) = Command::new(git_bin())
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "-C",
+            &worktree.to_string_lossy(),
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-z",
+            new_oid,
+            "--",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_nul_name_status(&out.stdout)
+}
+
 fn ref_tx_stdin_paths(worktree: &Path) -> Vec<String> {
     let mut buf = String::new();
     let _ = std::io::stdin().take(256 * 1024).read_to_string(&mut buf);
     let mut paths = Vec::new();
     for line in buf.lines() {
-        let mut parts = line.split_whitespace();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.contains("ref:") {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
         let (Some(old_oid), Some(new_oid), Some(refname)) =
             (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
         if refname.starts_with("refs/heads/") {
-            paths.extend(diff_tree_paths(worktree, old_oid, new_oid));
+            if is_all_zero_oid(old_oid) && is_unreferenced_commit(worktree, new_oid) {
+                paths.extend(root_commit_paths(worktree, new_oid));
+            } else {
+                paths.extend(diff_tree_paths(worktree, old_oid, new_oid));
+            }
+        } else if refname == "HEAD" && is_unreferenced_commit(worktree, new_oid) {
+            if is_all_zero_oid(old_oid) {
+                paths.extend(root_commit_paths(worktree, new_oid));
+            } else {
+                paths.extend(diff_tree_paths(worktree, old_oid, new_oid));
+            }
         }
     }
     paths

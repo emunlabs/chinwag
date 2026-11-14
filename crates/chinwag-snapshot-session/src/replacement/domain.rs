@@ -881,6 +881,12 @@ fn short_hex_digest(parts: &[&str]) -> String {
     bytes[..12].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+pub const MAX_LIVE_COORD_BEACON_BODY_BYTES: usize = 3_584;
+const MAX_LIVE_COORD_FIELD_BYTES: usize = 256;
+const MAX_LIVE_COORD_PATH_BYTES: usize = 256;
+const MAX_LIVE_COORD_CLAIMED_PATHS: usize = 32;
+const MAX_LIVE_COORD_CLAIMED_PATHS_TOTAL_BYTES: usize = 1_536;
+
 pub struct LiveCoordBeaconRecord {
     id: String,
     kind: String,
@@ -920,23 +926,21 @@ impl LiveCoordBeaconRecord {
         {
             return Err("live_coord_beacon_required_fields");
         }
-        if [
-            &id,
-            &kind,
-            &actor,
-            &repo_id,
-            &branch_ref,
-            &worktree,
-            &ticket_id,
-            &payload_json,
-            &authority_event_hash,
-        ]
-        .iter()
-        .any(|s| s.len() > crate::MAX_VALUE_BYTES)
-            || claimed_paths.len() > 256
+        let claimed_total_bytes: usize = claimed_paths.iter().map(String::len).sum();
+        if id.len() > MAX_LIVE_COORD_FIELD_BYTES
+            || kind.len() > 64
+            || actor.len() > MAX_LIVE_COORD_FIELD_BYTES
+            || repo_id.len() > MAX_LIVE_COORD_FIELD_BYTES
+            || branch_ref.len() > MAX_LIVE_COORD_FIELD_BYTES
+            || worktree.len() > MAX_LIVE_COORD_FIELD_BYTES
+            || ticket_id.len() > MAX_LIVE_COORD_FIELD_BYTES
+            || authority_event_hash.len() > MAX_LIVE_COORD_FIELD_BYTES
+            || payload_json.len() > MAX_LIVE_COORD_BEACON_BODY_BYTES
+            || claimed_paths.len() > MAX_LIVE_COORD_CLAIMED_PATHS
+            || claimed_total_bytes > MAX_LIVE_COORD_CLAIMED_PATHS_TOTAL_BYTES
             || claimed_paths
                 .iter()
-                .any(|p| p.is_empty() || p.len() > crate::MAX_VALUE_BYTES)
+                .any(|p| p.is_empty() || p.len() > MAX_LIVE_COORD_PATH_BYTES)
         {
             return Err("live_coord_beacon_value_limit");
         }
@@ -1032,7 +1036,7 @@ pub(super) fn record_live_coord_beacon(
     }
     let stored_body =
         serde_json::to_string(&payload_val).map_err(|_| Error::Contract("Beacon JSON encode"))?;
-    if stored_body.len() > crate::MAX_VALUE_BYTES {
+    if stored_body.len() > MAX_LIVE_COORD_BEACON_BODY_BYTES {
         return Ok(refused("beacon_body_limit", "Beacon payload exceeds limit"));
     }
 
@@ -1245,8 +1249,8 @@ impl LiveSessionLeaseRecord {
             || pid == 0
             || updated_at_ms < 0
             || expires_at_ms < updated_at_ms
-            || actor_instance.len() > crate::MAX_VALUE_BYTES
-            || worktree.len() > crate::MAX_VALUE_BYTES
+            || actor_instance.len() > MAX_LIVE_COORD_FIELD_BYTES
+            || worktree.len() > MAX_LIVE_COORD_FIELD_BYTES
         {
             return Err("live_session_lease_fields");
         }
