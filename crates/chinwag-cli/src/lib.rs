@@ -64,6 +64,8 @@ pub mod execution_binding;
 #[cfg(target_os = "macos")]
 pub mod release_sync;
 #[cfg(target_os = "macos")]
+pub mod slack;
+#[cfg(target_os = "macos")]
 pub mod task_acceptance;
 #[cfg(target_os = "macos")]
 pub mod task_dependency;
