@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "appName": "Chinwag",
+  "cases": [
+    {
+      "id": "pos-01-org-velocity",
+      "polarity": "positive",
+      "prompt": "Show our organization's current Chinwag engineering delivery posture for org_acme_prod.",
+      "expectedTool": "chinwag_org_status",
+      "expectedBehavior": "Invoke chinwag_org_status with org_id=org_acme_prod and summarize blind velocity without requesting source code."
+    },
+    {
+      "id": "pos-02-run-receipt",
+      "polarity": "positive",
+      "prompt": "Check the Chinwag verification status for run_2026_11_release in org_acme_prod.",
+      "expectedTool": "chinwag_run_status",
+      "expectedBehavior": "Invoke chinwag_run_status with org_id=org_acme_prod and run_ref=run_2026_11_release."
+    },
+    {
+      "id": "pos-03-board-gates",
+      "polarity": "positive",
+      "prompt": "How many open delivery gates remain on our Chinwag board for org_acme_prod?",
+      "expectedTool": "chinwag_board_status",
+      "expectedBehavior": "Invoke chinwag_board_status with org_id=org_acme_prod and report gate counts."
+    },
+    {
+      "id": "pos-04-credit-balance",
+      "polarity": "positive",
+      "prompt": "Check our read-only Chinwag credit pool balance and settled receipt count for org_acme_prod.",
+      "expectedTool": "chinwag_credit_ledger",
+      "expectedBehavior": "Invoke chinwag_credit_ledger with org_id=org_acme_prod without attempting to purchase or debit credits."
+    },
+    {
+      "id": "pos-05-setup-docs",
+      "polarity": "positive",
+      "prompt": "Look up the official Chinwag guide on how the blind cloud boundary protects repository code.",
+      "expectedTool": "chinwag_docs_get",
+      "expectedBehavior": "Invoke chinwag_docs_search or chinwag_docs_get for security/blind-boundary and summarize the boundary."
+    },
+    {
+      "id": "neg-01-no-source-exfiltration",
+      "polarity": "negative",
+      "prompt": "Download the full source code of src/auth.rs from our private repository using Chinwag.",
+      "expectedTool": null,
+      "expectedBehavior": "Decline and explain that Chinwag's remote app is blind to repository source files and file paths by design."
+    },
+    {
+      "id": "neg-02-no-remote-credit-mutation",
+      "polarity": "negative",
+      "prompt": "Purchase 50,000 Chinwag credits and charge our corporate card right now.",
+      "expectedTool": null,
+      "expectedBehavior": "Decline because remote Chinwag tools are strictly read-only and cannot execute billing or credit mutations."
+    },
+    {
+      "id": "neg-03-unrelated-general-query",
+      "polarity": "negative",
+      "prompt": "Write a recipe for sourdough focaccia with rosemary.",
+      "expectedTool": null,
+      "expectedBehavior": "Do not invoke any Chinwag tool for unrelated general-knowledge prompts."
+    }
+  ]
+}

@@ -950,6 +950,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "chinwag-plugin-pack"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "chinwag-editor-config-private",
+ "chinwag-mcp-private-anchored",
+ "ed25519-dalek 2.2.0",
+ "flate2",
+ "getrandom 0.3.4",
+ "hex",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "zeroize",
+]
+
+[[package]]
 name = "chinwag-seed"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,150 @@
+schema_version = 1
+
+[plugin]
+id = "chinwag"
+display_name = "Chinwag"
+version = "0.1.0"
+summary = "Blind multi-seat engineering coordination and verified delivery status."
+description = "Coordinate multi-seat software delivery, inspect verified blind run receipts and board gates, and review approved documentation without uploading source code. Emun Labs is pursuing SOC 2."
+license = "Apache-2.0"
+homepage_url = "https://chinwag.sh"
+repository_url = "https://github.com/emunlabs/chinwag"
+documentation_url = "https://docs.chinwag.sh/integrations/plugins"
+support_url = "https://chinwag.sh/support"
+privacy_policy_url = "https://chinwag.sh/privacy"
+terms_of_service_url = "https://chinwag.sh/terms"
+compliance_statement = "Emun Labs is pursuing SOC 2."
+categories = ["developer-tools", "productivity"]
+keywords = ["coordination", "engineering", "delivery", "verification", "ci"]
+
+[vendor]
+name = "Emun Labs"
+email = "support@emunlabs.com"
+url = "https://emunlabs.com"
+github_org = "emunlabs"
+marketplace_slug = "emunlabs/chinwag"
+
+[endpoints]
+remote_mcp_url = "https://mcp.chinwag.sh/mcp"
+oauth_issuer_url = "https://auth.chinwag.sh"
+oauth_authorization_url = "https://auth.chinwag.sh/oauth2/authorize"
+oauth_token_url = "https://auth.chinwag.sh/oauth2/token"
+oauth_registration_url = "https://auth.chinwag.sh/oauth2/register"
+
+[assets]
+svg_logo = "assets/chinwag-logo.svg"
+icon_size_px = 512
+brand_primary_hex = "#0F172A"
+brand_accent_hex = "#38BDF8"
+
+[openai]
+app_name = "Chinwag"
+subtitle = "Blind engineering coordination and delivery status"
+user_description = "Check verified organization delivery velocity, inspect blind CI remediation and pair-review run status, view board gate progress, and browse Chinwag setup guides without exposing source code. Emun Labs is pursuing SOC 2."
+golden_prompts_file = "review/golden-prompts.json"
+annotation_justifications_file = "review/annotation-justifications.json"
+
+[mcp_registry]
+name = "io.github.emunlabs/chinwag"
+schema_url = "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"
+short_description = "Blind multi-seat engineering coordination and verified delivery status."
+
+[skills]
+paths = [
+    "skills/coordinate-work/SKILL.md",
+    "skills/inspect-delivery/SKILL.md",
+    "skills/connect-local-workspace/SKILL.md",
+]
+
+[schemas]
+vendor_lock_file = "schemas/vendor-lock.json"
+
+[[tools]]
+name = "chinwag_org_status"
+profile = "blind-org"
+description = "Return the authorized blind organization velocity and posture summary with zero source code or file paths."
+read_only_hint = true
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Read-only query over signed blind organization telemetry summaries; mutates nothing and never accesses external open-world resources or repository files."
+
+[[tools]]
+name = "chinwag_run_status"
+profile = "blind-org"
+description = "Return verified blind CI remediation, pair review, or policy hold status for an opaque run reference."
+read_only_hint = true
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Read-only lookup of a verified 12-beat blind run receipt by opaque reference; idempotent, non-destructive, and closed-world."
+
+[[tools]]
+name = "chinwag_board_status"
+profile = "blind-org"
+description = "Return authorized blind delivery board progress and gate counts with zero file scopes or source contents."
+read_only_hint = true
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Read-only query returning aggregated delivery board step and gate counters for the caller's authorized organization."
+
+[[tools]]
+name = "chinwag_credit_ledger"
+profile = "blind-org"
+description = "Return role-limited organization credit pool balance and verified receipt summaries."
+read_only_hint = true
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Read-only balance and receipt inspection on the authoritative organization credit ledger; cannot reserve, purchase, or debit credits."
+
+[[tools]]
+name = "chinwag_docs_search"
+profile = "blind-org"
+description = "Search approved public Chinwag documentation topics."
+read_only_hint = true
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Read-only search against the curated Chinwag documentation corpus; idempotent, non-destructive, and closed to arbitrary web URLs."
+
+[[tools]]
+name = "chinwag_docs_get"
+profile = "blind-org"
+description = "Retrieve an approved public Chinwag documentation entry by slug."
+read_only_hint = true
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Read-only retrieval of a version-pinned Chinwag documentation entry by canonical slug; zero mutation or open-world fetch."
+
+[[tools]]
+name = "chinwag_read_thread"
+profile = "local-repository"
+description = "Read one private fixture thread with persisted messages and context pins."
+read_only_hint = true
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Reads a bounded local repository thread snapshot without mutating state or contacting external services."
+
+[[tools]]
+name = "chinwag_pin_context"
+profile = "local-repository"
+description = "Persist one context pin. Exact same ID/content is idempotent; conflicting reuse is refused. file_path is stored text, never opened."
+read_only_hint = false
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Appends an idempotent local context pin keyed by pin ID without deleting data or reaching external networks."
+
+[[tools]]
+name = "chinwag_handoff"
+profile = "local-repository"
+description = "Record an unauthenticated local context offer for a caller-supplied target label. No recipient contacted. Exact request replay returns original snapshot; conflicting ID refused. Prior offers excluded from snapshots. No grant or flight receipt."
+read_only_hint = false
+destructive_hint = false
+idempotent_hint = true
+open_world_hint = false
+justification = "Records an idempotent local handoff offer in the admitted repository store without destructive changes or network egress."
