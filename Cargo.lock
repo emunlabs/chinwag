@@ -847,10 +847,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "chinwag-cleanroom-vm"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "ed25519-dalek 2.2.0",
+ "getrandom 0.3.4",
+ "hex",
+ "hpke 0.15.1",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
 name = "chinwag-cli"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chinwag-cleanroom-vm",
  "chinwag-confirmed-initial-private",
  "chinwag-editor-config-private",
  "chinwag-history-archive",
@@ -862,6 +885,7 @@ dependencies = [
  "chinwag-swarm",
  "chinwag-test-fixtures",
  "ed25519-dalek 2.2.0",
+ "hex",
  "iroh",
  "rand 0.9.5",
  "rustix",

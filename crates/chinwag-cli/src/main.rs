@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bus_run;
+mod cleanroom_cli_run;
 mod feature_cli_run;
 mod relay_run;
 mod ui_auth;
@@ -89,6 +90,22 @@ fn main() -> ExitCode {
                  → Launch Full-Screen First-Run Wizard: {wizard_url}"
             );
             return ExitCode::SUCCESS;
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("env") {
+            let code = cleanroom_cli_run::run_env_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("runner") {
+            let code = cleanroom_cli_run::run_runner_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
         }
         if raw_args.get(1).map(|s| s.as_str()) == Some("bus") {
             // The daemon's async handlers also write diagnostics. Holding a
