@@ -1424,7 +1424,8 @@ fn run_openai_loop(
         .max_output_tokens_override
         .unwrap_or(tools.max_output_tokens.unwrap_or(32_768));
     let tools_active = tools.enabled && !context.tools_disabled;
-    let allow_writes = plan.write_mode != WriteMode::ReadOnly;
+    let allow_writes =
+        plan.write_mode != WriteMode::ReadOnly || !tools.allowed_write_roots.is_empty();
     let lock_effort = is_effort_locked(plan);
     let configured_effort = plan
         .model
@@ -1628,7 +1629,8 @@ fn run_gemini_loop(
         .max_output_tokens_override
         .unwrap_or(tools.max_output_tokens.unwrap_or(32_768));
     let tools_active = tools.enabled && !context.tools_disabled;
-    let allow_writes = plan.write_mode != WriteMode::ReadOnly;
+    let allow_writes =
+        plan.write_mode != WriteMode::ReadOnly || !tools.allowed_write_roots.is_empty();
     let lock_effort = is_effort_locked(plan);
     let configured_thinking = plan
         .model
@@ -1816,7 +1818,8 @@ fn run_anthropic_loop(
         .max_output_tokens_override
         .unwrap_or(tools.max_output_tokens.unwrap_or(16_384));
     let tools_active = tools.enabled && !context.tools_disabled;
-    let allow_writes = plan.write_mode != WriteMode::ReadOnly;
+    let allow_writes =
+        plan.write_mode != WriteMode::ReadOnly || !tools.allowed_write_roots.is_empty();
 
     let mut headers = vec![
         ("x-api-key".to_owned(), api_key.to_owned()),
@@ -1944,6 +1947,8 @@ fn run_anthropic_loop(
     )))
 }
 
+const RUN_COMMAND_TOOL_DESCRIPTION: &str = "Run a bounded non-interactive command in cwd. Prefer passing {\"command\": \"<shell script>\"} alone, OR {\"program\": \"<bin>\", \"args\": [\"...\"]} without 'command'.";
+
 fn openai_tool_declarations(allow_writes: bool) -> Value {
     let mut decls = vec![json!({
         "type": "function",
@@ -1997,7 +2002,7 @@ fn openai_tool_declarations(allow_writes: bool) -> Value {
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Run a bounded non-interactive command in the task cwd.",
+                "description": RUN_COMMAND_TOOL_DESCRIPTION,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2054,7 +2059,7 @@ fn gemini_tool_declarations(allow_writes: bool) -> Value {
         }),
         json!({
             "name": "run_command",
-            "description": "Run a bounded non-interactive command in the task cwd.",
+            "description": RUN_COMMAND_TOOL_DESCRIPTION,
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
@@ -2110,7 +2115,7 @@ fn anthropic_tool_declarations(allow_writes: bool) -> Value {
         }),
         json!({
             "name": "run_command",
-            "description": "Run a bounded non-interactive command in the task cwd.",
+            "description": RUN_COMMAND_TOOL_DESCRIPTION,
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -2210,7 +2215,7 @@ fn tool_read_file(args: &Value, cwd: &Path) -> Value {
 }
 
 fn tool_write_file(args: &Value, plan: &ResolvedDispatchPlan, tools: &HttpToolConfig) -> Value {
-    if plan.write_mode == WriteMode::ReadOnly {
+    if plan.write_mode == WriteMode::ReadOnly && tools.allowed_write_roots.is_empty() {
         return json!({"ok": false, "error": "read-only seat cannot write files"});
     }
     let Some(raw_path) = args.get("path").and_then(Value::as_str) else {
@@ -2405,35 +2410,86 @@ fn tool_fetch_url(args: &Value, tools: &HttpToolConfig) -> Value {
     }
 }
 
+const AMBIGUOUS_RUN_CMD_ERROR: &str =
+    "ambiguous run_command: supply either 'command' or ('program' + non-empty 'args'), not both";
+
 fn tool_run_command(
     args: &Value,
     plan: &ResolvedDispatchPlan,
     context: &ExecutionContext,
     tools: &HttpToolConfig,
 ) -> Value {
-    let mut cmd = if let Some(program) = args.get("program").and_then(Value::as_str) {
-        if program.trim().is_empty() || program.contains('\0') {
-            return json!({"ok": false, "error": "invalid program"});
+    if let Some(v) = args.get("program")
+        && !v.is_null()
+    {
+        let Some(s) = v.as_str() else {
+            return json!({"ok": false, "error": "invalid program: expected string"});
+        };
+        if s.contains('\0') {
+            return json!({"ok": false, "error": "invalid program: contains NUL byte"});
         }
-        let prog_args: Vec<String> = args
-            .get("args")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut c = Command::new(program);
-        c.args(&prog_args);
-        c
-    } else if let Some(shell_cmd) = args.get("command").and_then(Value::as_str) {
-        if shell_cmd.trim().is_empty() || shell_cmd.contains('\0') {
-            return json!({"ok": false, "error": "empty or invalid command"});
+    }
+    if let Some(v) = args.get("command")
+        && !v.is_null()
+    {
+        let Some(s) = v.as_str() else {
+            return json!({"ok": false, "error": "invalid command: expected string"});
+        };
+        if s.contains('\0') {
+            return json!({"ok": false, "error": "invalid command: contains NUL byte"});
         }
-        let mut c = Command::new("/bin/sh");
+    }
+    let raw_program = args
+        .get("program")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let raw_command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let prog_args: Option<Vec<String>> = match args.get("args") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(s) = item.as_str() else {
+                    return json!({"ok": false, "error": "invalid args: every element must be a string"});
+                };
+                if s.contains('\0') {
+                    return json!({"ok": false, "error": "invalid args: contains NUL byte"});
+                }
+                out.push(s.to_owned());
+            }
+            Some(out)
+        }
+        Some(_) => {
+            return json!({"ok": false, "error": "invalid args: expected array of strings"});
+        }
+    };
+
+    let mut cmd = if let Some(shell_cmd) = raw_command {
+        if prog_args.as_ref().is_some_and(|a| !a.is_empty()) {
+            return json!({"ok": false, "error": AMBIGUOUS_RUN_CMD_ERROR});
+        }
+        let shell = match raw_program {
+            Some(prog) => {
+                let basename = Path::new(prog).file_name().and_then(|n| n.to_str());
+                if matches!(basename, Some("sh" | "bash" | "zsh")) {
+                    prog
+                } else {
+                    return json!({"ok": false, "error": AMBIGUOUS_RUN_CMD_ERROR});
+                }
+            }
+            None => "/bin/sh",
+        };
+        let mut c = Command::new(shell);
         c.args(["-c", shell_cmd]);
+        c
+    } else if let Some(program) = raw_program {
+        let mut c = Command::new(program);
+        c.args(prog_args.unwrap_or_default());
         c
     } else {
         return json!({"ok": false, "error": "missing program or command"});
@@ -2442,7 +2498,19 @@ fn tool_run_command(
     cmd.current_dir(&plan.cwd);
     cmd.env_clear();
     for key in [
-        "HOME", "PATH", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "TERM",
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "SSH_AUTH_SOCK",
+        "CHINWAG_PRIVATE_CRSQL_INPUTS",
     ] {
         if let Some(val) = std::env::var_os(key) {
             cmd.env(key, val);
@@ -2486,7 +2554,7 @@ fn tool_run_command(
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
-            Ok(None) if start.elapsed() >= Duration::from_secs(120) => {
+            Ok(None) if start.elapsed() >= Duration::from_secs(300) => {
                 #[cfg(unix)]
                 if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
                     let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
@@ -4231,5 +4299,185 @@ mod tests {
                 .unwrap()
                 .contains("\"transport\"")
         );
+    }
+
+    #[test]
+    fn tool_run_command_executes_command_when_program_bash_also_passed_and_returns_nonzero_exit() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let plan = build_openai_test_plan(
+            &root,
+            "https://gateway.example.invalid/v1",
+            "none",
+            true,
+            Some("high"),
+            None,
+        );
+        let ctx = ExecutionContext::default();
+        let tools = HttpToolConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let exit7 = tool_run_command(
+            &json!({"program": "bash", "command": "exit 7"}),
+            &plan,
+            &ctx,
+            &tools,
+        );
+        assert_eq!(exit7["ok"], false, "unexpected exit7 result: {exit7}");
+        assert_eq!(exit7["exit_code"], 7, "unexpected exit7 result: {exit7}");
+
+        let hello = tool_run_command(
+            &json!({"program": "sh", "args": [], "command": "printf hello"}),
+            &plan,
+            &ctx,
+            &tools,
+        );
+        assert_eq!(hello["ok"], true, "unexpected hello result: {hello}");
+        assert_eq!(hello["exit_code"], 0, "unexpected hello result: {hello}");
+        assert_eq!(hello["stdout"], "hello", "unexpected hello result: {hello}");
+    }
+
+    #[test]
+    fn tool_run_command_rejects_ambiguous_non_shell_program_or_args_with_command() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let plan = build_openai_test_plan(
+            &root,
+            "https://gateway.example.invalid/v1",
+            "none",
+            true,
+            Some("high"),
+            None,
+        );
+        let ctx = ExecutionContext::default();
+        let tools = HttpToolConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        for payload in [
+            json!({"program": "git", "args": ["status"], "command": "pwd"}),
+            json!({"program": "git", "command": "status"}),
+            json!({"program": "bash", "args": ["-c", "echo a"], "command": "echo b"}),
+        ] {
+            let res = tool_run_command(&payload, &plan, &ctx, &tools);
+            assert_eq!(res["ok"], false, "expected ambiguity failure for {payload}");
+            assert!(
+                res["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("ambiguous run_command")),
+                "unexpected error for {payload}: {res}"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_seat_with_explicit_allowed_write_roots_writes_inside_root_and_denies_cwd() {
+        let repo_tmp = TempDir::new().unwrap();
+        let repo_dir = repo_tmp.path().canonicalize().unwrap();
+        let report_tmp = TempDir::new().unwrap();
+        let report_dir = report_tmp.path().canonicalize().unwrap();
+
+        let plan = build_openai_test_plan(
+            &repo_dir,
+            "https://gateway.example.invalid/v1",
+            "none",
+            true,
+            Some("high"),
+            None,
+        );
+        assert_eq!(plan.write_mode, WriteMode::ReadOnly);
+
+        let decl_names = |decls: &Value, ptr: &str| -> Vec<String> {
+            decls
+                .pointer(ptr)
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(|v| {
+                    v.pointer("/function/name")
+                        .or_else(|| v.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        };
+
+        let empty_tools = HttpToolConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            !decl_names(&openai_tool_declarations(false), "")
+                .iter()
+                .any(|n| n == "write_file")
+        );
+        let denied_empty = tool_write_file(
+            &json!({"path": report_dir.join("blocked.md").display().to_string(), "content": "nope"}),
+            &plan,
+            &empty_tools,
+        );
+        assert_eq!(denied_empty["ok"], false);
+        assert_eq!(denied_empty["error"], "read-only seat cannot write files");
+
+        let scoped_tools = HttpToolConfig {
+            enabled: true,
+            allowed_write_roots: vec![report_dir.clone()],
+            ..Default::default()
+        };
+        assert!(
+            decl_names(&openai_tool_declarations(true), "")
+                .iter()
+                .any(|n| n == "write_file")
+        );
+        assert!(
+            decl_names(&gemini_tool_declarations(true), "/0/functionDeclarations")
+                .iter()
+                .any(|n| n == "write_file")
+        );
+        assert!(
+            decl_names(&anthropic_tool_declarations(true), "")
+                .iter()
+                .any(|n| n == "write_file")
+        );
+
+        let report_path = report_dir.join("sub/report.md");
+        let allowed = tool_write_file(
+            &json!({"path": report_path.display().to_string(), "content": "# QA Pass\n"}),
+            &plan,
+            &scoped_tools,
+        );
+        assert_eq!(allowed["ok"], true, "unexpected write failure: {allowed}");
+        assert_eq!(fs::read_to_string(&report_path).unwrap(), "# QA Pass\n");
+
+        let cwd_rel = tool_write_file(
+            &json!({"path": "in_repo.txt", "content": "bad"}),
+            &plan,
+            &scoped_tools,
+        );
+        assert_eq!(cwd_rel["ok"], false);
+        assert!(
+            cwd_rel["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("outside allowed write roots")),
+            "unexpected error for relative cwd write: {cwd_rel}"
+        );
+        assert!(!repo_dir.join("in_repo.txt").exists());
+
+        let cwd_abs = tool_write_file(
+            &json!({"path": repo_dir.join("in_repo.txt").display().to_string(), "content": "bad"}),
+            &plan,
+            &scoped_tools,
+        );
+        assert_eq!(cwd_abs["ok"], false);
+        assert!(
+            cwd_abs["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("outside allowed write roots")),
+            "unexpected error for absolute cwd write: {cwd_abs}"
+        );
+        assert!(!repo_dir.join("in_repo.txt").exists());
     }
 }
