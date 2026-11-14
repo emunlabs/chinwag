@@ -145,6 +145,24 @@ chinwag configure-editor --repo "$PWD" --editor gemini
 chinwag mcp-serve --repo "$PWD" --transport stdio
 ```
 
+#### Safe 1-Command Cursor Agent & Project Rules Importer (`chinwag agent import-cursor`)
+
+Deterministically migrate any Cursor `Agent SDK` folder or `.cursor/` repository configuration (`instructions.md`, `.cursorrules`, `.cursor/rules/*.mdc`, `tools/`, `skills/`, `mcp-connections/`, `.cursor/mcp.json`, `channels/`) into a local `SOP-BOOT-01` agent bundle (`SOUL.md`, `AGENT.md`, `TOOL.md`, `SKILLS.md`, `MEMORY.md`, `skills/**/SKILL.md`, `import-receipt.json`) in `<500ms` while enforcing the 5-gate `INV-CURSOR-IMPORT-SAFE-01` static security sanitizer (exiting `78` on quarantine):
+
+```sh
+# Translate a Cursor project or Agent SDK folder into .chinwag/agents/BACKEND_REVIEWER
+chinwag agent import-cursor "$PWD" --name BACKEND_REVIEWER --json
+
+# Or write to an explicit destination directory (with optional DESIGN.md import or custom launcher allowlist)
+chinwag agent import-cursor ./cursor-agent --name BACKEND_REVIEWER --out ./.chinwag/agents/BACKEND_REVIEWER --include-design
+```
+
+- **Gate 1a (`InertAstParse`):** Strictly inert JSON/YAML/Markdown parsing with zero script execution, atomic `O_NOFOLLOW` temp-file output staging, and symlink / hardlink (`nlink > 1`) / `..` / `file://` path-traversal refusal (`exit 78`).
+- **Gate 1b (`McpShellMetacharQuarantine`):** Enforces a bare-basename MCP package launcher allowlist (`npx`, `uvx`, `bunx`, `pnpx`, `docker`, `podman`, extensible via `--allow-mcp-command <CMD>`) and quarantines shell/interpreter wrappers (`env -S`, `sh -c`, `bash -c`, `npx --call`, `pnpx --shell-mode`, `node -p/--require/--import`, `osascript`), container host-mount/namespace flags, unscoped/remote package tarballs, local bundle scripts, and shell metacharacters (`;`, `|`, `&&`, `` ` ``, `$(`) (`exit 78`).
+- **Gate 1c (`DynamicLinkerEnvScrub`):** Quarantines dynamic linker, `PATH`, launcher config/registry, and runtime startup environment injections (`DYLD_*`, `LD_*`, `PATH`, `NODE_OPTIONS`, `BUN_*`, `NPM_CONFIG_*`, `UV_*`, `PIP_*`, `OPENSSL_CONF`, `PYTHONSTARTUP`, `BASH_ENV`) across both `env` maps and `args` (`exit 78`).
+- **Gate 1d (`PhantomVaultSecretConversion`):** Strips inline bearer tokens, API keys, PEM private keys, MCP URL query credentials, composite `-H`/`--auth` CLI arguments, and high-entropy secrets across configs and prose, emitting non-reversible `PhantomVault` placeholders (`vault://<NAME>/<KEY>`) without writing raw secrets or secret hashes to disk.
+- **Gate 1e (`UnicodeBidiAndInjectionScan`):** Quarantines both raw and post-JSON-decoded Trojan Source Unicode bidi/zero-width/variation-selector/CGJ/ANSI-ESC controls (`U+001B`, `U+034F`, `U+200B..U+200F`, `U+202A..U+202E`, `U+2060..U+206F`, `U+FE00..U+FE0F`, `U+E0000..U+E01EF`, lone `\r`, mid-line `U+FEFF`) and hidden HTML/CommonMark-comment prompt-injection payloads (`exit 78`).
+
 ---
 
 ### 7. Real-Time GitHub Projects v2 & Linear Card-Move Execution (`chinwag tasks` & `chinwag board`)
@@ -178,6 +196,7 @@ Usage:
   chinwag ci-report --issue <ID> --status <pass|fail> [--push-boards] [--delivery-licensed]
   chinwag bus <send | inbox | tail | status | instance | wait | recovery> [options]
   chinwag memory <recall | retain | tombstone | stats> [options]
+  chinwag agent import-cursor <src-dir> --name <NAME> [--out <dest-dir>] [--include-design] [--allow-mcp-command <CMD>] [--json]
   chinwag agent-dispatch --agent <SEAT> --sender <SEAT#INSTANCE> --item <TASK-ID> --crdb <path> --body <text>
   chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>
   chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]

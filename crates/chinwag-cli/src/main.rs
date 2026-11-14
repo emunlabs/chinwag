@@ -140,6 +140,14 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(code);
         }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("agent") {
+            let code = chinwag_cli::cursor_import::run_agent_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
         if raw_args.get(1).map(|s| s.as_str()) == Some("openspec") {
             let code = feature_cli_run::run_openspec_cli(
                 &raw_args[2..],
