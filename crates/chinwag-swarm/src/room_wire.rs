@@ -154,7 +154,7 @@ pub fn sign_daemon_advertisement<S: RoomSigner + ?Sized>(
     now: u64,
     policy: &RelayPolicy,
 ) -> Result<Advertisement, Error> {
-    let allow_empty = matches!(policy, RelayPolicy::Own(_));
+    let allow_empty = policy.has_relay();
     sign_advertisement_profile(identity, ch, revision, addresses, now, allow_empty)
 }
 
@@ -219,7 +219,7 @@ pub fn verify_daemon_advertisement(
     now: u64,
     policy: &RelayPolicy,
 ) -> Result<Vec<SocketAddr>, Error> {
-    verify_advertisement_profile(wire, expected, now, matches!(policy, RelayPolicy::Own(_)))
+    verify_advertisement_profile(wire, expected, now, policy.has_relay())
 }
 
 fn verify_advertisement_profile(

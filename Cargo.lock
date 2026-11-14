@@ -981,6 +981,7 @@ dependencies = [
  "chinwag-host-process",
  "chinwag-swarm",
  "chinwag-test-fixtures",
+ "ed25519-dalek 2.2.0",
  "futures-util",
  "hpke 0.13.0",
  "iroh",
@@ -1039,9 +1040,14 @@ name = "chinwag-swarm"
 version = "0.0.1"
 dependencies = [
  "bao-tree",
+ "blake3",
  "chinwag-claim",
+ "crc",
  "ed25519-dalek 2.2.0",
  "futures-util",
+ "getrandom 0.3.4",
+ "hex",
+ "hpke 0.15.1",
  "http",
  "iroh",
  "iroh-blobs",

@@ -107,7 +107,7 @@ pub const GROKBOT_MGMT_ROSTER: &[GrokBotSeat] = &[
         is_group: false,
         slack_channel: "#mgmt (MGMT c5a97346-e424-44bf-90d2-9caaa7594c11)",
         webhook_env: "product.env",
-        agentmail_inbox: "brian@emunlabs.com",
+        agentmail_inbox: "ops-pa@agentmail.to",
         direct_reports: &["FOUNDER-CHECKLIST", "VIP-CISO-CALENDAR", "APPLE-JOURNAL"],
     },
 ];
@@ -143,15 +143,31 @@ fn detect_local_hostname() -> String {
             return h;
         }
     }
-    "brians-mac-studio-468".to_string()
+    "localhost".to_string()
+}
+
+fn configured_fallback_hub_urls() -> Vec<String> {
+    env::var("CHINWAG_FALLBACK_HUB_URLS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn resolve_identity_config() -> IdentityConfig {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let local_host = detect_local_hostname();
-    let is_studio_host = local_host
-        .to_ascii_lowercase()
-        .starts_with("brians-mac-studio");
+    let is_studio_host = env::var("CHINWAG_PRIMARY_HUB_HOST")
+        .ok()
+        .map(|prefix| {
+            let clean = prefix.trim().to_ascii_lowercase();
+            !clean.is_empty() && local_host.to_ascii_lowercase().starts_with(&clean)
+        })
+        .unwrap_or(false);
 
     let identity_path = env::var("CHINWAG_IDENTITY_FILE")
         .ok()
@@ -298,7 +314,11 @@ pub fn resolve_identity_config() -> IdentityConfig {
     mission_control_url = mission_control_url.trim_end_matches('/').to_string();
 
     if fallback_hub_url.is_empty() {
-        fallback_hub_url = "http://192.168.1.166:5487".to_string();
+        fallback_hub_url = env::var("CHINWAG_FALLBACK_HUB_URL")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:5487".to_string());
     } else {
         fallback_hub_url = fallback_hub_url.trim_end_matches('/').to_string();
     }
@@ -408,11 +428,11 @@ fn curl_post_json_endpoint(
         "-H",
         "Content-Type: application/json",
     ]);
-    if use_tailnet_resolve && endpoint_url.contains("brians-mac-studio-468.tail23ad5.ts.net:5487") {
-        cmd.args([
-            "--resolve",
-            "brians-mac-studio-468.tail23ad5.ts.net:5487:100.66.156.76",
-        ]);
+    if use_tailnet_resolve
+        && let Ok(resolve_spec) = env::var("CHINWAG_CURL_RESOLVE")
+        && !resolve_spec.trim().is_empty()
+    {
+        cmd.args(["--resolve", resolve_spec.trim()]);
     }
     if !identity.api_key.is_empty() {
         cmd.args(["-H", &format!("Authorization: Bearer {}", identity.api_key)]);
@@ -464,14 +484,12 @@ fn post_mission_control_with_fallback(
             fallbacks.push((fb_ep, false));
         }
     }
-    for lan_base in [
-        "http://192.168.1.166:5487",
-        "http://192.168.1.161:5487",
-        "https://brians-mac-studio-468.tail23ad5.ts.net:5487",
-        "http://127.0.0.1:5487",
-    ] {
-        let ep = format!("{lan_base}{path}");
-        let use_resolve = lan_base.starts_with("https://");
+    for extra_base in configured_fallback_hub_urls()
+        .into_iter()
+        .chain(std::iter::once("http://127.0.0.1:5487".to_string()))
+    {
+        let ep = format!("{extra_base}{path}");
+        let use_resolve = extra_base.starts_with("https://");
         if ep != primary_endpoint || use_resolve {
             fallbacks.push((ep, use_resolve));
         }
@@ -689,11 +707,11 @@ fn beam_curl_exchange(
     } else {
         cmd.args(["-X", method]);
     }
-    if use_tailnet_resolve && url.contains("brians-mac-studio-468.tail23ad5.ts.net:5487") {
-        cmd.args([
-            "--resolve",
-            "brians-mac-studio-468.tail23ad5.ts.net:5487:100.66.156.76",
-        ]);
+    if use_tailnet_resolve
+        && let Ok(resolve_spec) = env::var("CHINWAG_CURL_RESOLVE")
+        && !resolve_spec.trim().is_empty()
+    {
+        cmd.args(["--resolve", resolve_spec.trim()]);
     }
     if !identity.api_key.is_empty() {
         cmd.args(["-H", &format!("Authorization: Bearer {}", identity.api_key)]);
@@ -801,23 +819,17 @@ fn forward_beam_http_request(
         }
     };
 
-    if !hub_url.contains("tail23ad5.ts.net") {
-        push_candidate(&mut candidates, hub_url, false);
+    push_candidate(&mut candidates, hub_url, false);
+    if hub_url.starts_with("https://") {
+        push_candidate(&mut candidates, hub_url, true);
     }
     if !fallback_hub_url.is_empty() {
         push_candidate(&mut candidates, fallback_hub_url, false);
     }
-    push_candidate(&mut candidates, "http://192.168.1.166:5487", false);
-    push_candidate(&mut candidates, "http://192.168.1.161:5487", false);
-    if hub_url.contains("tail23ad5.ts.net") {
-        push_candidate(&mut candidates, hub_url, true);
-        push_candidate(&mut candidates, hub_url, false);
+    for extra in configured_fallback_hub_urls() {
+        let use_res = extra.starts_with("https://");
+        push_candidate(&mut candidates, &extra, use_res);
     }
-    push_candidate(
-        &mut candidates,
-        "https://brians-mac-studio-468.tail23ad5.ts.net:5487",
-        true,
-    );
 
     for (cand, use_resolve) in candidates {
         if let Some((status_line, headers, body)) =
@@ -981,7 +993,7 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
     let mut listen_addr = "127.0.0.1:5487".to_string();
     let mut explicit_listen = false;
     let mut hub_url = if identity.mission_control_url.contains("127.0.0.1:5487") {
-        "https://brians-mac-studio-468.tail23ad5.ts.net:5487".to_string()
+        identity.fallback_hub_url.clone()
     } else {
         identity.mission_control_url.clone()
     };
@@ -1133,10 +1145,9 @@ pub fn run_beam_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn Wr
         Ok(l) => l,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::AddrInUse
-                && identity
-                    .machine_name
-                    .to_ascii_lowercase()
-                    .starts_with("brians-mac-studio")
+                && env::var("CHINWAG_IS_PRIMARY_HUB")
+                    .map(|v| matches!(v.trim(), "1" | "true"))
+                    .unwrap_or(false)
             {
                 let msg = json!({
                     "ok": true,
@@ -1234,7 +1245,7 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
             let report = json!({
                 "ok": true,
                 "engine": "chinwag-rust-relay",
-                "binary": "/opt/homebrew/bin/chinwag",
+                "binary": "chinwag",
                 "legacy_python_bridge_retired": true,
                 "mgmt_group_channel": {
                     "name": "MGMT",
@@ -1284,10 +1295,10 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                     Run: {}   Wake reason: issue_assigned (chinwag-rust-relay)\n\
                     Receipt marker (include in any receipt comment): [relay-receipt run={}]\n\n\
                     ACTION REQUIRED FROM BRIAN SPECTOR & GEMINI-PM — POST YOUR RECEIPT IN GROK BOT `MGMT` GROUP CHANNEL ({}):\n\
-                    1. UNPAUSE YOUR SLACK CHANNEL LISTENER FOR CHINWAG RUST RELAY: Do NOT call the retired Paperclip HTTP API (:3110), DO keep your Slack channel listener ({}) and AgentMail listener ({}) ACTIVE for `[Paperclip] {} |` messages dispatched by our native Rust `/opt/homebrew/bin/chinwag relay` binary.\n\
-                    2. POST CONFIRMATION IN `MGMT` ({}): Immediately post a short confirmation message in the Grok Bot `MGMT` group room (`{}`) confirming your seat (`{}` / `{}`), your direct reports {:?}, and that you are running on Chinwag Mission Control (`https://brians-mac-studio-468.tail23ad5.ts.net:5487/`).\n\
+                    1. UNPAUSE YOUR SLACK CHANNEL LISTENER FOR CHINWAG RUST RELAY: Do NOT call the retired Paperclip HTTP API (:3110), DO keep your Slack channel listener ({}) and AgentMail listener ({}) ACTIVE for `[Paperclip] {} |` messages dispatched by our native Rust `chinwag relay` binary.\n\
+                    2. POST CONFIRMATION IN `MGMT` ({}): Immediately post a short confirmation message in the Grok Bot `MGMT` group room (`{}`) confirming your seat (`{}` / `{}`), your direct reports {:?}, and that you are running on Chinwag Mission Control.\n\
                     3. INFRA BOT (`407d2c36-b5c3-491a-9e08-527ad7f18a06`): Because `eng`, `bizfin`, `product`, and `s-and-m` paused their routines earlier today, please immediately post this Management Charter briefing directly into the Grok Bot `MGMT` group conversation (`c5a97346-e424-44bf-90d2-9caaa7594c11`) AND send a direct agent message to `eng` (`a692d662-495c-4def-896b-6a787087de01`), `bizfin` (`e484d158-8f4d-41f3-a7c9-b2bf8167cbcb`), `product` (`382e7010-ea4d-48f7-a1bb-96dca02a0921`), `s-and-m` (`16593278-278d-4a2b-9e94-3a189bcaf599`), and `Personal Bot` (`419c9d1d-f01c-4d3c-9972-93e56f95c5d9`) telling them to post their readiness check-in in `MGMT` (`c5a97346-e424-44bf-90d2-9caaa7594c11`)!\n\
-                    4. PURE CHINWAG STACK: Hindsight (:8888) and Wiki.js (:4320) are retired. Use `/opt/homebrew/bin/chinwag memory recall | retain | tombstone` (`.chinwag/state.crdb` + `.chinwag/memory.crdb.leann`) and Docus Wiki (`:8795` / `:5487` `Docs · Wiki`).\n\
+                    4. PURE CHINWAG STACK: Hindsight (:8888) and Wiki.js (:4320) are retired. Use `chinwag memory recall | retain | tombstone` (`.chinwag/state.crdb` + `.chinwag/memory.crdb.leann`) and Docus Wiki (`:8795` / `:5487` `Docs · Wiki`).\n\
                     5. MANAGEMENT SLA: Always delegate to your specialist direct reports {:?}, triage blockers within 15m, post daily `#mgmt` standups (`What's working / What's not`), and enforce the 14-Slide Initiative Sign-Off Deck Gate (`INV-INIT-01`, including `INIT-07` Cloudflare Livestream Shorts + `chinwag.tv` `AXEL` vs `RANDO`) + `chinwag ui-gate` (`SOP-QA-02`).",
                     subj,
                     run_id,
@@ -1606,12 +1617,12 @@ pub fn run_relay_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn W
                     "{}\n\
                     Run: {}   Wake reason: issue_assigned (chinwag-rust-relay)\n\
                     Receipt marker (include in any receipt comment): [relay-receipt run={}]\n\
-                    Task: {} — https://brians-mac-studio-468.tail23ad5.ts.net:5487/\n\n\
-                    MESSAGE FROM BRIAN SPECTOR (CEO) IN CHINWAG MISSION CONTROL (:5487):\n\
+                    Task: {}\n\n\
+                    MESSAGE FROM CHINWAG MISSION CONTROL (:5487):\n\
                     {}\n\n\
-                    HOW TO REPLY DIRECTLY IN CHINWAG UI (SO BRIAN DOES NOT HAVE TO OPEN GROK BOT):\n\
-                    Run this command on Mac Studio to post your reply directly into Chinwag Mission Control (:5487):\n\
-                    `/opt/homebrew/bin/chinwag reply --channel \"{}\" --from \"{}\" --run \"{}\" --ticket \"{}\" --message \"<your reply>\"`",
+                    HOW TO REPLY DIRECTLY IN CHINWAG UI:\n\
+                    Run this command to post your reply directly into Chinwag Mission Control (:5487):\n\
+                    `chinwag reply --channel \"{}\" --from \"{}\" --run \"{}\" --ticket \"{}\" --message \"<your reply>\"`",
                     subj, run_id, run_id, ticket, message, reply_channel, seat.seat, run_id, ticket
                 );
 
@@ -1721,10 +1732,10 @@ mod tests {
         let base = IdentityConfig {
             actor_id: "actor-brian".to_string(),
             handle: "● Brian".to_string(),
-            display_name: "Brian Spector".to_string(),
-            machine_name: "brians-mac-studio-468".to_string(),
+            display_name: "Founder".to_string(),
+            machine_name: "hub-node-01".to_string(),
             mission_control_url: "http://127.0.0.1:5487".to_string(),
-            fallback_hub_url: "http://192.168.1.166:5487".to_string(),
+            fallback_hub_url: "http://127.0.0.1:5488".to_string(),
             api_key: "fallback-test-key".to_string(),
         };
         let infra_id = resolve_agent_relay_identity("INFRA", &base);

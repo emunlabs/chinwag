@@ -7,11 +7,13 @@ pub mod attempt_journal;
 pub mod dispatch_wire;
 pub mod identity;
 pub mod lan;
+pub mod relay_failover;
 pub mod relay_policy;
 pub mod review;
 pub mod room;
 pub mod room_binding;
 pub mod room_wire;
+pub mod signed_hpke;
 pub mod transport;
 
 use identity::Identity;

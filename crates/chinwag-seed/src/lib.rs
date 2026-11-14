@@ -21,6 +21,7 @@ pub mod edit_mcp;
 pub mod five_host;
 pub mod receiver_driver;
 mod relay_config;
+pub mod relay_resumption;
 pub mod write_gate;
 
 pub mod send_owner;

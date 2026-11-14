@@ -1,11 +1,10 @@
-//! Local relay route policy. Not a listener, not room verification, and not
-//! Genesis admission. Both origins absent selects Disabled. One side, a
-//! malformed origin, or two different canonical origins is an error and must
-//! not change the route. Matching strings are not approval of a manifest.
+//! Local relay route policy (`Disabled`, `Own`, and `MultiRegion`). Not a
+//! listener, not room verification, and not Genesis admission. Both origins
+//! absent selects `Disabled`. One side, a malformed origin, or mismatched
+//! canonical origins is an error and must never silently fall back to `Disabled`.
 //!
 //! `attach_verified_peer` only matches the configured expected peer and keeps
-//! the direct sockets. The caller must already have checked signature, actor
-//! and node pin, expiry, and revision or session.
+//! all direct IP sockets alongside approved `HTTPS/WSS :443` relay URLs.
 
 #![forbid(unsafe_code)]
 
@@ -15,6 +14,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, TransportAddr};
+
+/// Maximum number of ordered regional `WSS :443` relays in a `MultiRegion` failover ring.
+pub const MAX_REGIONAL_RELAYS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyError {
@@ -39,24 +41,44 @@ impl fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
-/// What an endpoint address currently advertises. `OwnNotAdvertised` is not
-/// home-relay readiness and is not permission to fall back to Disabled.
+/// What an endpoint address currently advertises. `OwnNotAdvertised` and
+/// `MultiRegionNotAdvertised` are not home-relay readiness and never permit
+/// falling back to `Disabled`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservedRelaySet {
     Disabled,
     OwnNotAdvertised,
     OwnUrlOnly,
+    MultiRegionNotAdvertised,
+    MultiRegionSubset,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnRelayPolicy {
     url: RelayUrl,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiRegionRelayPolicy {
+    ordered_urls: Vec<RelayUrl>,
+}
+
+impl MultiRegionRelayPolicy {
+    pub fn ordered_urls(&self) -> &[RelayUrl] {
+        &self.ordered_urls
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayPolicy {
     Disabled,
     Own(OwnRelayPolicy),
+    MultiRegion(MultiRegionRelayPolicy),
+}
+
+/// Validates and normalizes an approved `https://<host>:443/` relay origin.
+pub fn canonical_relay_origin(raw: &str) -> Result<RelayUrl, PolicyError> {
+    canonical_origin(raw)
 }
 
 fn canonical_origin(raw: &str) -> Result<RelayUrl, PolicyError> {
@@ -153,52 +175,124 @@ impl RelayPolicy {
         }
     }
 
+    /// Constructs a validated multi-region `WSS :443` failover policy from
+    /// ordered `selected_origins` and operator-approved `approved_origins`.
+    pub fn from_multi_region_manifest<S: AsRef<str>, A: AsRef<str>>(
+        selected_origins: &[S],
+        approved_origins: &[A],
+    ) -> Result<Self, PolicyError> {
+        if selected_origins.is_empty() || approved_origins.is_empty() {
+            return Err(PolicyError::Incomplete);
+        }
+        if selected_origins.len() != approved_origins.len() {
+            return Err(PolicyError::Mismatch);
+        }
+        if selected_origins.len() > MAX_REGIONAL_RELAYS {
+            return Err(PolicyError::Url);
+        }
+
+        let mut ordered = Vec::with_capacity(selected_origins.len());
+        let mut seen = BTreeSet::new();
+        for (sel_raw, app_raw) in selected_origins.iter().zip(approved_origins.iter()) {
+            let sel = canonical_origin(sel_raw.as_ref())?;
+            let app = canonical_origin(app_raw.as_ref())?;
+            if sel != app {
+                return Err(PolicyError::Mismatch);
+            }
+            if !seen.insert(sel.as_str().to_owned()) {
+                return Err(PolicyError::Url);
+            }
+            ordered.push(sel);
+        }
+
+        if ordered.len() == 1 {
+            return Ok(Self::Own(OwnRelayPolicy {
+                url: ordered.remove(0),
+            }));
+        }
+        Ok(Self::MultiRegion(MultiRegionRelayPolicy {
+            ordered_urls: ordered,
+        }))
+    }
+
+    pub const fn has_relay(&self) -> bool {
+        matches!(self, Self::Own(_) | Self::MultiRegion(_))
+    }
+
     pub fn relay_url(&self) -> Option<&RelayUrl> {
         match self {
             Self::Disabled => None,
             Self::Own(policy) => Some(&policy.url),
+            Self::MultiRegion(policy) => policy.ordered_urls.first(),
+        }
+    }
+
+    pub fn ordered_relay_urls(&self) -> Vec<RelayUrl> {
+        match self {
+            Self::Disabled => Vec::new(),
+            Self::Own(policy) => vec![policy.url.clone()],
+            Self::MultiRegion(policy) => policy.ordered_urls.clone(),
         }
     }
 
     pub fn relay_mode(&self) -> Result<RelayMode, PolicyError> {
-        let Self::Own(policy) = self else {
+        let urls = self.ordered_relay_urls();
+        if urls.is_empty() {
             return Ok(RelayMode::Disabled);
-        };
-        let url = policy.url.clone();
-        let config = RelayConfig::new(url.clone(), None);
-        if config.quic.is_some() || config.auth_token.is_some() {
-            return Err(PolicyError::Url);
         }
         let map = RelayMap::empty();
-        map.insert(url.clone(), Arc::new(config));
-        if map.len() != 1
-            || map
-                .get(&url)
-                .is_none_or(|stored| stored.quic.is_some() || stored.auth_token.is_some())
-        {
+        for url in &urls {
+            let config = RelayConfig::new(url.clone(), None);
+            if config.quic.is_some() || config.auth_token.is_some() {
+                return Err(PolicyError::Url);
+            }
+            map.insert(url.clone(), Arc::new(config));
+        }
+        if map.len() != urls.len() {
             return Err(PolicyError::Url);
+        }
+        for url in &urls {
+            if map
+                .get(url)
+                .is_none_or(|stored| stored.quic.is_some() || stored.auth_token.is_some())
+            {
+                return Err(PolicyError::Url);
+            }
         }
         Ok(RelayMode::Custom(map))
     }
 
-    /// Classify advertised relay URLs. An empty Own set is `OwnNotAdvertised`.
+    /// Classify advertised relay URLs. An empty Own/MultiRegion set is `NotAdvertised`.
     pub fn observe_relay_urls<'a>(
         &self,
         observed: impl IntoIterator<Item = &'a RelayUrl>,
     ) -> Result<ObservedRelaySet, PolicyError> {
-        let mut observed = observed.into_iter();
-        let first = observed.next();
-        if observed.next().is_some() {
-            return Err(PolicyError::Transport);
-        }
-        match (self, first) {
-            (Self::Disabled, None) => Ok(ObservedRelaySet::Disabled),
-            (Self::Disabled, Some(_)) => Err(PolicyError::Transport),
-            (Self::Own(_), None) => Ok(ObservedRelaySet::OwnNotAdvertised),
-            (Self::Own(policy), Some(url)) if url == &policy.url => {
-                Ok(ObservedRelaySet::OwnUrlOnly)
+        let collected: Vec<&RelayUrl> = observed.into_iter().collect();
+        match self {
+            Self::Disabled => {
+                if collected.is_empty() {
+                    Ok(ObservedRelaySet::Disabled)
+                } else {
+                    Err(PolicyError::Transport)
+                }
             }
-            (Self::Own(_), Some(_)) => Err(PolicyError::Transport),
+            Self::Own(policy) => match collected.as_slice() {
+                [] => Ok(ObservedRelaySet::OwnNotAdvertised),
+                [single] if *single == &policy.url => Ok(ObservedRelaySet::OwnUrlOnly),
+                _ => Err(PolicyError::Transport),
+            },
+            Self::MultiRegion(policy) => {
+                if collected.is_empty() {
+                    return Ok(ObservedRelaySet::MultiRegionNotAdvertised);
+                }
+                let mut seen = BTreeSet::new();
+                for url in collected {
+                    if !policy.ordered_urls.contains(url) || !seen.insert(url.as_str()) {
+                        return Err(PolicyError::Transport);
+                    }
+                }
+                Ok(ObservedRelaySet::MultiRegionSubset)
+            }
         }
     }
 
@@ -209,24 +303,62 @@ impl RelayPolicy {
         peer: EndpointAddr,
         expected_peer: EndpointId,
     ) -> Result<EndpointAddr, PolicyError> {
+        self.attach_verified_peer_with_order(peer, expected_peer, None)
+    }
+
+    /// Attaches either all policy-approved regional relays or a caller-supplied
+    /// health-scored subset while preserving every direct IP socket address.
+    pub fn attach_verified_peer_with_order(
+        &self,
+        peer: EndpointAddr,
+        expected_peer: EndpointId,
+        healthy_subset: Option<&[RelayUrl]>,
+    ) -> Result<EndpointAddr, PolicyError> {
         if peer.id != expected_peer {
             return Err(PolicyError::Peer);
         }
         ip_only(&peer.addrs)?;
-        let Self::Own(policy) = self else {
+        let allowed = self.ordered_relay_urls();
+        if allowed.is_empty() {
+            if healthy_subset.is_some_and(|s| !s.is_empty()) {
+                return Err(PolicyError::Transport);
+            }
             return Ok(peer);
+        }
+
+        let target_urls: Vec<RelayUrl> = match healthy_subset {
+            Some(subset) => {
+                if subset.is_empty() {
+                    return Err(PolicyError::Incomplete);
+                }
+                let mut dedup = BTreeSet::new();
+                let mut validated = Vec::with_capacity(subset.len());
+                for u in subset {
+                    if !allowed.contains(u) || !dedup.insert(u.as_str()) {
+                        return Err(PolicyError::Transport);
+                    }
+                    validated.push(u.clone());
+                }
+                validated
+            }
+            None => allowed,
         };
+
         let direct = peer.addrs.clone();
-        let url = policy.url.clone();
-        let attached = peer.with_relay_url(url.clone());
+        let mut attached = peer;
+        for url in &target_urls {
+            attached = attached.with_relay_url(url.clone());
+        }
         let relays = attached
             .addrs
             .iter()
             .filter(|addr| matches!(addr, TransportAddr::Relay(_)))
             .count();
         if attached.id != expected_peer
-            || relays != 1
-            || !attached.addrs.contains(&TransportAddr::Relay(url))
+            || relays != target_urls.len()
+            || !target_urls
+                .iter()
+                .all(|u| attached.addrs.contains(&TransportAddr::Relay(u.clone())))
             || !direct.iter().all(|addr| attached.addrs.contains(addr))
         {
             return Err(PolicyError::Transport);
@@ -417,6 +549,78 @@ mod tests {
         assert_eq!(
             disabled.observe_relay_urls([&url]).err().unwrap(),
             PolicyError::Transport
+        );
+    }
+
+    #[test]
+    fn multi_region_manifest_populates_custom_map_and_healthy_subset_attachment() {
+        let regions = [
+            "https://us-east.relay-example.invalid:443/",
+            "https://eu-west.relay-example.invalid/",
+            "https://ap-northeast.relay-example.invalid:443",
+        ];
+        let multi = RelayPolicy::from_multi_region_manifest(&regions, &regions).unwrap();
+        assert!(multi.has_relay());
+        let urls = multi.ordered_relay_urls();
+        assert_eq!(urls.len(), 3);
+        assert_eq!(
+            multi.relay_url().unwrap().as_str(),
+            "https://us-east.relay-example.invalid/"
+        );
+
+        let RelayMode::Custom(map) = multi.relay_mode().unwrap() else {
+            panic!("expected custom multi-region RelayMap");
+        };
+        assert_eq!(map.len(), 3);
+
+        assert_eq!(
+            multi.observe_relay_urls(std::iter::empty()).unwrap(),
+            ObservedRelaySet::MultiRegionNotAdvertised
+        );
+        assert_eq!(
+            multi.observe_relay_urls([&urls[1], &urls[2]]).unwrap(),
+            ObservedRelaySet::MultiRegionSubset
+        );
+        let unapproved: RelayUrl = "https://rogue.relay-example.invalid/".parse().unwrap();
+        assert_eq!(
+            multi.observe_relay_urls([&urls[0], &unapproved]),
+            Err(PolicyError::Transport)
+        );
+
+        let peer_id = synthetic(0x42);
+        let direct = ip("198.51.100.7:9443");
+        let base_peer = EndpointAddr::new(peer_id).with_ip_addr(direct);
+        let failover_peer = multi
+            .attach_verified_peer_with_order(base_peer, peer_id, Some(&urls[1..]))
+            .unwrap();
+        assert!(failover_peer.addrs.contains(&TransportAddr::Ip(direct)));
+        assert!(
+            !failover_peer
+                .addrs
+                .contains(&TransportAddr::Relay(urls[0].clone()))
+        );
+        assert!(
+            failover_peer
+                .addrs
+                .contains(&TransportAddr::Relay(urls[1].clone()))
+        );
+        assert!(
+            failover_peer
+                .addrs
+                .contains(&TransportAddr::Relay(urls[2].clone()))
+        );
+
+        // Duplicate or mismatched multi-region lists must fail closed
+        assert_eq!(
+            RelayPolicy::from_multi_region_manifest(
+                &[regions[0], regions[0]],
+                &[regions[0], regions[0]]
+            ),
+            Err(PolicyError::Url)
+        );
+        assert_eq!(
+            RelayPolicy::from_multi_region_manifest(&[regions[0], regions[1]], &[regions[0]]),
+            Err(PolicyError::Mismatch)
         );
     }
 }
