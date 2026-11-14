@@ -1734,10 +1734,10 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
             "GET / missing Delivery-2 shell DOM marker '{required_dom}'"
         );
     }
-    for voice_stub in ["d2-btn-mic", "d2-voice", "voice-call", "Start voice"] {
+    for voice_inline_stub in ["voice-call", "Start voice"] {
         assert!(
-            !root_html.contains(voice_stub),
-            "Phase 1 (CHWG-0254) must render zero Duplex Voice stubs ('{voice_stub}')"
+            !root_html.contains(voice_inline_stub),
+            "index.html shell must mount Duplex Voice dynamically via app.js ('{voice_inline_stub}')"
         );
     }
     let (cookie_pair, csrf) = extract_cookie_and_csrf(&root_hdr, &root_html, ui_port);
@@ -1999,9 +1999,34 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
         );
     }
 
+    // Unverified or danger=false bypass attempts on `decision: "approve"` must unconditionally fail closed (403)
+    let (unverified_hitl_hdr, _, unverified_hitl_json) = post_json(
+        "/api/v1/delivery2/approval",
+        json!({
+            "id": "hitl-CHWG-4201",
+            "item_id": "CHWG-4201",
+            "decision": "approve",
+            "danger": false
+        }),
+    );
+    assert!(
+        unverified_hitl_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+        "{unverified_hitl_hdr}"
+    );
+    assert_eq!(
+        unverified_hitl_json["error_code"],
+        "VoiceDangerApprovalForbidden"
+    );
+
     let (hitl1_hdr, _, hitl1_json) = post_json(
         "/api/v1/delivery2/approval",
-        json!({ "id": "hitl-CHWG-4201", "item_id": "CHWG-4201", "decision": "approve" }),
+        json!({
+            "id": "hitl-CHWG-4201",
+            "item_id": "CHWG-4201",
+            "decision": "approve",
+            "source": "physical_click",
+            "physical_click_verified": true
+        }),
     );
     assert!(hitl1_hdr.starts_with("HTTP/1.1 200 OK"), "{hitl1_hdr}");
     assert_eq!(hitl1_json["decision"], "approved");
@@ -2200,6 +2225,423 @@ fn ui_v4_4_delivery2_panel_routes_scrubber_csrf_and_phase1_contracts_pass_end_to
     assert!(mf_hdr.starts_with("HTTP/1.1 200 OK"), "{mf_hdr}");
     assert_eq!(mf_json["state"]["morning_focus"]["seen"], true);
     assert_eq!(mf_json["state"]["morning_focus"]["collapsed"], true);
+
+    // 8. CHWG-0255 Duplex Live Voice HTTP E2E Gate (/api/delivery2/voice/* + /api/v1/delivery2/voice/*):
+    //    - CSRF/Origin enforcement on all 4 voice endpoints
+    //    - 600s server-owned TTL + 40 Cr server-enforced session cap + Credits receipt deduction
+    //    - 75s silence warning + 90s auto-pause + 8s hold park + durable transcript across reload
+    //    - Mandatory physical button press (`physical_click_verified: true`) on danger-class merges
+    for (voice_route, sample_voice_body) in [
+        ("/api/delivery2/voice/session", r#"{"action":"start"}"#),
+        ("/api/delivery2/voice/heartbeat", r#"{"idle_secs":5}"#),
+        ("/api/delivery2/voice/turn", r#"{"utterance":"status"}"#),
+        ("/api/delivery2/voice/park", r#"{"reason":"user_paused"}"#),
+    ] {
+        let unauth_voice_raw = send_raw_http(
+            ui_addr,
+            &format!(
+                "POST {voice_route} HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{ui_port}\r\n\
+                 Sec-Fetch-Site: same-origin\r\n\
+                 Origin: http://127.0.0.1:{ui_port}\r\n\
+                 Content-Type: application/json\r\n\
+                 Cookie: {cookie_pair}\r\n\
+                 Content-Length: {}\r\n\r\n{sample_voice_body}",
+                sample_voice_body.len()
+            ),
+        );
+        let (unauth_voice_hdr, _) = split_headers_and_body(&unauth_voice_raw);
+        assert!(
+            unauth_voice_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+            "{voice_route} without CSRF header must return 403: {unauth_voice_hdr}"
+        );
+    }
+
+    // Start session in Connecting -> Ready (Listening) and verify 600s TTL & 40 Cr cap
+    let (vs_hdr, vs_str, vs_json) = post_json(
+        "/api/delivery2/voice/session",
+        json!({ "action": "start", "connecting": true, "thread_id": "thr-main" }),
+    );
+    assert!(vs_hdr.starts_with("HTTP/1.1 200 OK"), "{vs_hdr}");
+    assert_zero_customer_jargon("POST /api/delivery2/voice/session", &vs_str);
+    assert_eq!(vs_json["voice"]["state"], "connecting");
+    assert_eq!(vs_json["voice"]["credits_cap"], 40);
+    assert_eq!(vs_json["voice"]["max_duration_secs"], 600);
+    let first_voice_sid = vs_json["voice"]["session_id"]
+        .as_str()
+        .expect("voice session_id")
+        .to_string();
+    assert!(!first_voice_sid.is_empty());
+    let opened_unix = vs_json["voice"]["opened_at_unix"].as_u64().unwrap();
+    let expires_unix = vs_json["voice"]["expires_at_unix"].as_u64().unwrap();
+    assert_eq!(expires_unix - opened_unix, 600);
+
+    // Validate thread_id length/secret-shape/existence on /voice/session & terminated-session revival guard (409)
+    for (bad_tid, expected_code) in [
+        ("t".repeat(129), "invalid_thread_id"),
+        (
+            "sk-live-1234567890abcdefghijklmnop".to_string(),
+            "secret_rejected",
+        ),
+    ] {
+        let (bad_vs_hdr, _, bad_vs_json) = post_json(
+            "/api/delivery2/voice/session",
+            json!({ "action": "start", "thread_id": bad_tid }),
+        );
+        assert!(
+            bad_vs_hdr.starts_with("HTTP/1.1 400 Bad Request"),
+            "expected 400 for invalid thread_id on voice/session: {bad_vs_hdr}"
+        );
+        assert_eq!(bad_vs_json["error_code"], expected_code);
+    }
+    let (missing_vs_hdr, _, missing_vs_json) = post_json(
+        "/api/delivery2/voice/session",
+        json!({ "action": "start", "thread_id": "thr-nonexistent-999" }),
+    );
+    assert!(
+        missing_vs_hdr.starts_with("HTTP/1.1 404 Not Found"),
+        "{missing_vs_hdr}"
+    );
+    assert_eq!(missing_vs_json["error_code"], "thread_not_found");
+
+    // Start & user-end a preliminary session; verify neither `ready` nor `resume` can revive an ended session (409 VoiceSessionEnded)
+    let (_, _, pre_vs_json) = post_json(
+        "/api/delivery2/voice/session",
+        json!({ "action": "start", "connecting": false, "thread_id": "thr-main" }),
+    );
+    let pre_sid = pre_vs_json["voice"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (end_hdr, _, end_json) =
+        post_json("/api/delivery2/voice/session", json!({ "action": "end" }));
+    assert!(end_hdr.starts_with("HTTP/1.1 200 OK"), "{end_hdr}");
+    assert_eq!(end_json["voice"]["ended"], true);
+    for revive_action in ["ready", "resume"] {
+        let (rev_hdr, _, rev_json) = post_json(
+            "/api/delivery2/voice/session",
+            json!({ "action": revive_action, "thread_id": "thr-main" }),
+        );
+        assert!(
+            rev_hdr.starts_with("HTTP/1.1 409 Conflict"),
+            "ended session must reject {revive_action} with 409: {rev_hdr}"
+        );
+        assert_eq!(rev_json["error_code"], "VoiceSessionEnded");
+    }
+
+    let (vs2_hdr, vs2_str, vs2_json) = post_json(
+        "/api/delivery2/voice/session",
+        json!({ "action": "start", "connecting": true, "thread_id": "thr-main" }),
+    );
+    assert!(vs2_hdr.starts_with("HTTP/1.1 200 OK"), "{vs2_hdr}");
+    assert_zero_customer_jargon("POST /api/delivery2/voice/session fresh", &vs2_str);
+    let voice_sid = vs2_json["voice"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(voice_sid, first_voice_sid);
+    assert_ne!(voice_sid, pre_sid);
+
+    let (vr_hdr, _, vr_json) = post_json(
+        "/api/v1/delivery2/voice/session",
+        json!({ "action": "ready" }),
+    );
+    assert!(vr_hdr.starts_with("HTTP/1.1 200 OK"), "{vr_hdr}");
+    assert_eq!(vr_json["voice"]["state"], "listening");
+
+    // Validate thread_id checks on `/api/delivery2/voice/turn` as well (400 / 404, 0 Cr charged)
+    let (bad_vt_hdr, _, bad_vt_json) = post_json(
+        "/api/delivery2/voice/turn",
+        json!({
+            "session_id": voice_sid,
+            "thread_id": "sk-live-1234567890abcdefghijklmnop",
+            "utterance": "What did I miss?"
+        }),
+    );
+    assert!(
+        bad_vt_hdr.starts_with("HTTP/1.1 400 Bad Request"),
+        "{bad_vt_hdr}"
+    );
+    assert_eq!(bad_vt_json["error_code"], "secret_rejected");
+
+    let (missing_vt_hdr, _, missing_vt_json) = post_json(
+        "/api/delivery2/voice/turn",
+        json!({
+            "session_id": voice_sid,
+            "thread_id": "thr-nonexistent-999",
+            "utterance": "What did I miss?"
+        }),
+    );
+    assert!(
+        missing_vt_hdr.starts_with("HTTP/1.1 404 Not Found"),
+        "{missing_vt_hdr}"
+    );
+    assert_eq!(missing_vt_json["error_code"], "thread_not_found");
+
+    // Switch active thread to `new_tid` and verify cross-thread + imperative danger phrases & danger `options`
+    // all fail closed (`403 VoiceDangerApprovalForbidden`) with `0 Cr` charged!
+    let _ = post_json(
+        "/api/v1/delivery2/thread",
+        json!({ "action": "switch", "thread_id": new_tid }),
+    );
+    for danger_turn_payload in [
+        json!({
+            "session_id": voice_sid,
+            "thread_id": "thr-main",
+            "utterance": "Approve this"
+        }),
+        json!({
+            "session_id": voice_sid,
+            "thread_id": new_tid,
+            "utterance": "Merge PR 96"
+        }),
+        json!({
+            "session_id": voice_sid,
+            "thread_id": "thr-main",
+            "utterance": "Approve",
+            "options": ["Approve", "Skip"]
+        }),
+    ] {
+        let (d_hdr, d_str, d_json) =
+            post_json("/api/delivery2/voice/turn", danger_turn_payload.clone());
+        assert!(
+            d_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+            "danger voice turn must return 403 for {danger_turn_payload}: {d_hdr}"
+        );
+        assert_zero_customer_jargon("voice imperative/options danger reject", &d_str);
+        assert_eq!(d_json["error_code"], "VoiceDangerApprovalForbidden");
+    }
+    let _ = post_json(
+        "/api/v1/delivery2/thread",
+        json!({ "action": "switch", "thread_id": "thr-main" }),
+    );
+
+    // Cross-surface `/api/v4/inbox/action` MUST also reject unverified / voice-originated `approve` & `apply_locally` (403)
+    for bad_inbox_payload in [
+        json!({ "id": "item-voice-1", "action": "approve", "is_sample": false }),
+        json!({ "id": "item-voice-1", "action": "approve", "is_sample": false, "source": "voice", "voice_originated": true, "physical_click_verified": false, "danger": false }),
+        json!({ "id": "item-voice-1", "action": "apply_locally", "is_sample": false, "physical_click_verified": true }),
+    ] {
+        let (ib_hdr, _, ib_json) = post_json("/api/v4/inbox/action", bad_inbox_payload.clone());
+        assert!(
+            ib_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+            "ungated inbox action must return 403 for {bad_inbox_payload}: {ib_hdr}"
+        );
+        assert_eq!(ib_json["error_code"], "VoiceDangerApprovalForbidden");
+    }
+
+    // Danger-class merge approval via voice MUST fail closed (403 VoiceDangerApprovalForbidden)
+    // both on `/voice/turn` AND on `/approval` without `physical_click_verified: true`!
+    let (v_danger_hdr, v_danger_str, v_danger_json) = post_json(
+        "/api/delivery2/voice/turn",
+        json!({
+            "session_id": voice_sid,
+            "thread_id": "thr-main",
+            "utterance": "Approve and merge please"
+        }),
+    );
+    assert!(
+        v_danger_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+        "{v_danger_hdr}"
+    );
+    assert_zero_customer_jargon("voice danger reject", &v_danger_str);
+    assert_eq!(v_danger_json["error_code"], "VoiceDangerApprovalForbidden");
+    assert_eq!(
+        v_danger_json["error"],
+        "Press Approve to confirm. Voice can't approve this one."
+    );
+
+    let (hitl_voice_hdr, _, hitl_voice_json) = post_json(
+        "/api/delivery2/approval",
+        json!({
+            "id": "hitl-voice-gate-1",
+            "item_id": "CHWG-4202",
+            "decision": "approve",
+            "source": "voice",
+            "voice_originated": true,
+            "physical_click_verified": false,
+            "danger": false
+        }),
+    );
+    assert!(
+        hitl_voice_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+        "{hitl_voice_hdr}"
+    );
+    assert_eq!(
+        hitl_voice_json["error"],
+        "Press Approve to confirm. Voice can't approve this one."
+    );
+
+    // Even an unverified approval request while voice session is live fails closed!
+    let (hitl_missing_click_hdr, _, _) = post_json(
+        "/api/delivery2/approval",
+        json!({
+            "id": "hitl-voice-gate-1",
+            "item_id": "CHWG-4202",
+            "decision": "approve"
+        }),
+    );
+    assert!(
+        hitl_missing_click_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+        "live voice session must require physical_click_verified=true: {hitl_missing_click_hdr}"
+    );
+
+    // Physical button click (`physical_click_verified: true`) succeeds cleanly!
+    let (hitl_phys_hdr, _, hitl_phys_json) = post_json(
+        "/api/delivery2/approval",
+        json!({
+            "id": "hitl-voice-gate-1",
+            "item_id": "CHWG-4202",
+            "decision": "approve",
+            "physical_click_verified": true,
+            "source": "physical_click"
+        }),
+    );
+    assert!(
+        hitl_phys_hdr.starts_with("HTTP/1.1 200 OK"),
+        "{hitl_phys_hdr}"
+    );
+    assert_eq!(hitl_phys_json["decision"], "approved");
+
+    // Spoken grounded turn scrubs jargon, ignores client undercharge attempts, emits silent thinking + <=1500 spoken commentary, & persists across reload
+    let (vt_hdr, vt_str, vt_json) = post_json(
+        "/api/delivery2/voice/turn",
+        json!({
+            "session_id": voice_sid,
+            "thread_id": "thr-main",
+            "utterance": format!("Ask {} what is on the board", concat!("WORK", "HORSE")),
+            "requested_credits": 0
+        }),
+    );
+    assert!(vt_hdr.starts_with("HTTP/1.1 200 OK"), "{vt_hdr}");
+    assert_zero_customer_jargon("POST /api/delivery2/voice/turn", &vt_str);
+    assert_eq!(
+        vt_json["credits_charged"], 4,
+        "server must ignore client undercharge fields and enforce 4 Cr per turn"
+    );
+    assert_eq!(vt_json["voice"]["credits_used"], 4);
+    let commentary_str = vt_json["spoken_commentary"].as_str().unwrap();
+    assert!(commentary_str.chars().count() <= 1500);
+    assert_eq!(vt_json["delegate_events"][0]["channel"], "thinking");
+    assert_eq!(vt_json["delegate_events"][0]["spoken"], false);
+    assert_eq!(vt_json["delegate_events"][1]["channel"], "commentary");
+    assert_eq!(vt_json["delegate_events"][1]["spoken"], true);
+
+    // Verify 75s silence warning -> 90s auto-pause -> Reload persistence -> Resume -> 8s hold park
+    let (_, _, hb_warn_json) = post_json(
+        "/api/delivery2/voice/heartbeat",
+        json!({ "session_id": voice_sid, "idle_secs": 75 }),
+    );
+    assert_eq!(hb_warn_json["voice"]["state"], "silence_warning");
+    assert_eq!(
+        hb_warn_json["voice"]["status_label"],
+        "Still there? Pausing in 15s"
+    );
+
+    let (_, _, hb_park_json) = post_json(
+        "/api/delivery2/voice/heartbeat",
+        json!({ "session_id": voice_sid, "idle_secs": 90 }),
+    );
+    assert_eq!(hb_park_json["voice"]["state"], "paused");
+    assert_eq!(hb_park_json["voice"]["credits_rate_per_min"], 0);
+    assert_eq!(hb_park_json["voice"]["park_reason"], "silence_timeout");
+
+    // Verify reload state (`GET /api/delivery2/state`) preserves full voice transcript + board tasks untouched
+    let (reload_hdr, reload_str, reload_json) = get_auth_json("/api/delivery2/state");
+    assert!(reload_hdr.starts_with("HTTP/1.1 200 OK"), "{reload_hdr}");
+    assert_zero_customer_jargon("GET /api/delivery2/state reload", &reload_str);
+    assert_eq!(reload_json["voice"]["session_id"], voice_sid);
+    assert_eq!(reload_json["voice"]["state"], "paused");
+    assert!(
+        reload_json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == vt_json["entry"]["id"]),
+        "durable voice transcript entry must persist across page reload"
+    );
+
+    // Resume, verify 8s tool/approval hold parks audio leg at 0 Cr, then resume and hit 40 Cr server cap
+    let (_, _, _) = post_json(
+        "/api/delivery2/voice/session",
+        json!({ "action": "resume", "thread_id": "thr-main" }),
+    );
+    let (_, _, hb_hold_json) = post_json(
+        "/api/delivery2/voice/heartbeat",
+        json!({ "session_id": voice_sid, "hold_secs": 8 }),
+    );
+    assert_eq!(hb_hold_json["voice"]["state"], "paused");
+    assert_eq!(hb_hold_json["voice"]["credits_rate_per_min"], 0);
+    assert_eq!(hb_hold_json["voice"]["park_reason"], "hold_park");
+
+    // Even while parked in 8s `hold_park`, unverified approval MUST fail closed (403 VoiceDangerApprovalForbidden)
+    let (parked_hitl_hdr, _, parked_hitl_json) = post_json(
+        "/api/delivery2/approval",
+        json!({
+            "id": "hitl-hold-park-1",
+            "item_id": "CHWG-4209",
+            "decision": "approve",
+            "danger": false
+        }),
+    );
+    assert!(
+        parked_hitl_hdr.starts_with("HTTP/1.1 403 Forbidden"),
+        "8s hold_park must NOT weaken physical click requirement: {parked_hitl_hdr}"
+    );
+    assert_eq!(
+        parked_hitl_json["error_code"],
+        "VoiceDangerApprovalForbidden"
+    );
+
+    let (_, _, _) = post_json(
+        "/api/delivery2/voice/session",
+        json!({ "action": "resume", "thread_id": "thr-main" }),
+    );
+    let mut last_turn_json = json!({});
+    for idx in 2..=10 {
+        let (hdr, turn_str, turn_json) = post_json(
+            "/api/delivery2/voice/turn",
+            json!({
+                "session_id": voice_sid,
+                "thread_id": "thr-main",
+                "utterance": format!("Today's Credits check {idx}")
+            }),
+        );
+        assert!(hdr.starts_with("HTTP/1.1 200 OK"), "{hdr}");
+        assert_zero_customer_jargon("POST /api/delivery2/voice/turn loop", &turn_str);
+        assert_eq!(turn_json["credits_charged"], 4);
+        last_turn_json = turn_json;
+    }
+    assert_eq!(last_turn_json["session_capped"], true);
+    assert_eq!(last_turn_json["voice"]["credits_used"], 40);
+    assert_eq!(last_turn_json["voice"]["ended"], true);
+
+    // Further turn after 40 Cr cap must fail closed (402 VoiceCreditsCapReached)
+    let (vt3_hdr, _, vt3_json) = post_json(
+        "/api/delivery2/voice/turn",
+        json!({
+            "session_id": voice_sid,
+            "thread_id": "thr-main",
+            "utterance": "One more question"
+        }),
+    );
+    assert!(
+        vt3_hdr.starts_with("HTTP/1.1 402 Payment Required"),
+        "{vt3_hdr}"
+    );
+    assert_eq!(vt3_json["error_code"], "VoiceCreditsCapReached");
+
+    // Verify workspace `/api/v4/bootstrap` credits ledger reflects the exact 40 Cr voice deduction + receipt
+    let (_, boot_after_str, boot_after_json) = get_auth_json("/api/v4/bootstrap");
+    assert_zero_customer_jargon("/api/v4/bootstrap after voice", &boot_after_str);
+    assert!(
+        boot_after_json["credits"]["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "rcpt-voice-live" && r["delta_credits"] == -40),
+        "Credits tab receipts must record -40 Cr live voice receipt"
+    );
 
     let _ = fs::remove_dir_all(&temp_repo);
 }

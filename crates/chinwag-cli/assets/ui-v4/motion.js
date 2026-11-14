@@ -194,7 +194,7 @@ export function insertBanner(prev, insert) {
 }
 
 // ── Hold pulse and the shared heartbeat ────────────────────────────────────
-const LOOPS = new Set(["live-breathe", "hold-pulse", "skeleton-breathe"]);
+const LOOPS = new Set(["live-breathe", "hold-pulse", "skeleton-breathe", "voice-travel"]);
 export function stopPulse(scope) {
   if (!scope) return;
   scope.querySelectorAll("[data-pulse]").forEach((n) => n.removeAttribute("data-pulse"));
@@ -572,4 +572,58 @@ export function createProportionalStreamer({ onTick, onFinish } = {}) {
     },
     flushNow: commitAll,
   };
+}
+
+// ── Duplex Live Voice 9-Bar Golden-Ratio Waveform (zero random calls) ──────
+const WAVEFORM_S_MIN = 0.12;
+const GOLDEN_CONJUGATE = 0.6180339887;
+const TAU = Math.PI * 2;
+
+export function voiceFrame(t, A, { T = 2200, d = 0.5 } = {}, out = new Float32Array(9)) {
+  const safeT = Number.isFinite(t) ? t : 0;
+  const safePeriod = Number.isFinite(T) && T > 0 ? T : 2200;
+  const clampedA = Number.isFinite(A) ? Math.min(1, Math.max(0, A)) : 0;
+  const clampedD = Number.isFinite(d) ? Math.min(1, Math.max(0, d)) : 0.5;
+  for (let i = 0; i < 9; i += 1) {
+    const cHalf = Math.cos((Math.PI * (i - 4)) / 9);
+    const w = 0.4 + 0.6 * cHalf * cHalf;
+    const phi = (i * GOLDEN_CONJUGATE) % 1;
+    const th = TAU * (safeT / safePeriod + phi);
+    const c = 0.5 + 0.3 * Math.sin(th) + 0.2 * Math.sin(2 * th + TAU * phi);
+    const inner = Math.min(1, Math.max(0, clampedA * w * (1 - clampedD + clampedD * c)));
+    out[i] = WAVEFORM_S_MIN + (1 - WAVEFORM_S_MIN) * inner;
+  }
+  return out;
+}
+
+export function ampFromRms(rms) {
+  const safe = Number.isFinite(rms) ? Math.max(1e-6, rms) : 1e-6;
+  const norm = (20 * Math.log10(safe) + 55) / 40;
+  return Math.min(1, Math.max(0, norm));
+}
+
+export function smoothAmp(current, target, dtMs) {
+  const dt = Number.isFinite(dtMs) && dtMs > 0 ? dtMs : 0;
+  const tau = target > current ? 40 : 180;
+  return current + (target - current) * (1 - Math.exp(-dt / tau));
+}
+
+export function applyVoiceBarsFrame(barsContainer, scales) {
+  if (!barsContainer || prefersReducedMotion() || !scales) return;
+  const children = barsContainer.children;
+  if (!children) return;
+  const count = Math.min(9, children.length, scales.length);
+  for (let i = 0; i < count; i += 1) {
+    const bar = children[i];
+    if (!bar || typeof bar.animate !== "function") continue;
+    const rawS = Number(scales[i]);
+    const clampedS = Number.isFinite(rawS) ? Math.min(1, Math.max(WAVEFORM_S_MIN, rawS)) : WAVEFORM_S_MIN;
+    const tf = `scaleY(${clampedS.toFixed(4)})`;
+    if (bar._d2VoiceSnap && typeof bar._d2VoiceSnap.cancel === "function") {
+      bar._d2VoiceSnap.cancel();
+    }
+    const snap = bar.animate([{ transform: tf }, { transform: tf }], { duration: 0, fill: "forwards" });
+    snap.id = "voice-bar-frame";
+    bar._d2VoiceSnap = snap;
+  }
 }

@@ -98,6 +98,8 @@ pub mod task_write_journal;
 #[cfg(target_os = "macos")]
 pub mod task_writer;
 #[cfg(target_os = "macos")]
+pub mod ui_delivery2_voice;
+#[cfg(target_os = "macos")]
 pub mod ui_telemetry;
 #[cfg(target_os = "macos")]
 pub mod workspace_capability_inventory;

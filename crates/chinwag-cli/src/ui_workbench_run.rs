@@ -27,6 +27,10 @@ use chinwag_cli::execution_binding::{
     ExecutionAuthority, RepositorySelection, StoreSelector, WorkspaceExecutionBinding,
     bind_execution,
 };
+use chinwag_cli::ui_delivery2_voice::{
+    self, Delivery2VoiceStore, VOICE_DEFAULT_TURN_CREDITS, VOICE_THINKING_HOLD_MS,
+    VoiceDelegateTracker, VoiceSessionState,
+};
 use chinwag_cli::ui_telemetry;
 use rustix::fs::{AtFlags, CWD, Mode, OFlags, fsync, mkdirat, openat, renameat, statat, unlinkat};
 use serde::{Deserialize, Serialize};
@@ -267,6 +271,8 @@ struct Delivery2Store {
     approvals: BTreeMap<String, Delivery2ApprovalRecord>,
     #[serde(default)]
     connections: BTreeMap<String, Delivery2ConnectionPref>,
+    #[serde(default)]
+    voice: Delivery2VoiceStore,
 }
 
 fn default_d2_seq() -> u64 {
@@ -291,6 +297,7 @@ impl Default for Delivery2Store {
             memories: BTreeMap::new(),
             approvals: BTreeMap::new(),
             connections: BTreeMap::new(),
+            voice: Delivery2VoiceStore::default(),
         }
     }
 }
@@ -3474,14 +3481,20 @@ fn fixed_function_schedule_json() -> Vec<Value> {
     ]
 }
 
-fn build_credits_json(repo_root: &Path, shipped_count: usize) -> Value {
-    let state = load_ui_v4_state(repo_root);
-    let available = if shipped_count == 0 {
+fn base_workspace_credits_for_shipped(shipped_count: usize) -> u64 {
+    if shipped_count == 0 {
         500u64
     } else {
         let spent_estimate = (shipped_count as u64).saturating_mul(150).min(1_850);
         2_500u64.saturating_sub(spent_estimate)
-    };
+    }
+}
+
+fn build_credits_json(repo_root: &Path, shipped_count: usize) -> Value {
+    let state = load_ui_v4_state(repo_root);
+    let base_available = base_workspace_credits_for_shipped(shipped_count);
+    let voice_spent = state.delivery2.voice.total_voice_credits_used;
+    let available = base_available.saturating_sub(voice_spent);
 
     let mut receipts = vec![
         json!({
@@ -3511,6 +3524,14 @@ fn build_credits_json(repo_root: &Path, shipped_count: usize) -> Value {
             "delta_credits": 500,
             "created_at": "Included"
         });
+    }
+    if voice_spent > 0 {
+        receipts.push(json!({
+            "id": "rcpt-voice-live",
+            "title": "Live voice conversation (40 Cr session cap)",
+            "delta_credits": -(voice_spent as i64),
+            "created_at": "Today"
+        }));
     }
 
     json!({
@@ -4844,6 +4865,14 @@ fn handle_inbox_action(repo_root: &Path, body: &[u8]) -> (&'static str, Value) {
 
     let (status_code, resp_val) = mutate_ui_v4_state(repo_root, |state| {
         let now = unix_now();
+        if matches!(action, "approve" | "apply_locally") {
+            let voice_active = state.delivery2.voice.has_open_session(now);
+            ui_delivery2_voice::enforce_physical_merge_button_gate(
+                &parsed,
+                "approve",
+                voice_active,
+            )?;
+        }
         let hh_mm = format_utc_hh_mm(now);
         let hitl_key = format!("hitl-{item_id}");
 
@@ -6658,6 +6687,24 @@ pub fn build_delivery2_state_json_with_cursor(
             && !e.get("settled").and_then(Value::as_bool).unwrap_or(false)
     });
 
+    let now_unix = unix_now();
+    let mut voice_view = state.delivery2.voice.clone();
+    let mut current_seq = state.delivery2.seq.max(1);
+    if voice_view.reconcile_at(now_unix, has_unsettled_hitl, true) {
+        let _ = mutate_ui_v4_state(repo_root, |st| {
+            if st
+                .delivery2
+                .voice
+                .reconcile_at(now_unix, has_unsettled_hitl, true)
+            {
+                st.delivery2.seq = st.delivery2.seq.max(1).saturating_add(1);
+            }
+            Ok(json!({ "ok": true }))
+        });
+        current_seq = load_ui_v4_state(repo_root).delivery2.seq.max(current_seq);
+    }
+    let voice_json = voice_view.to_client_json(now_unix);
+
     let (status_code, status_label) =
         if state.delivery2.active_turn_id.is_some() || running_count > 0 {
             ("working", "Working")
@@ -6742,7 +6789,6 @@ pub fn build_delivery2_state_json_with_cursor(
         }));
     }
 
-    let current_seq = state.delivery2.seq.max(1);
     let (unchanged, delta_entries) = if let Some(cursor) = since_seq {
         if cursor >= current_seq {
             (true, Vec::new())
@@ -6776,6 +6822,7 @@ pub fn build_delivery2_state_json_with_cursor(
         "status": status_code,
         "status_label": status_label,
         "active_thread_id": active_thread_id,
+        "voice": voice_json,
         "sync_radar": {
             "latency_ms": elapsed_ms,
             "latency_label": latency_label,
@@ -7964,6 +8011,10 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
     }
 
     let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        let now_gate = unix_now();
+        let voice_active = state.delivery2.voice.has_open_session(now_gate);
+        ui_delivery2_voice::enforce_physical_merge_button_gate(&parsed, &decision, voice_active)?;
+
         // First-answer-wins idempotency across both `delivery2.approvals` and `item_decisions`.
         if let Some(existing) = state
             .delivery2
@@ -8083,6 +8134,10 @@ fn handle_delivery2_approval(repo_root: &Path, port: u16, body: &[u8]) -> (&'sta
                     updated_at_unix: now,
                 },
             );
+        }
+
+        if let Some(sess) = state.delivery2.voice.active_session.as_mut() {
+            sess.hold_started_unix = None;
         }
 
         Ok(json!({
@@ -8341,36 +8396,23 @@ fn handle_delivery2_thread(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
             }))
         }),
         "switch" => {
-            let target_id = parsed
-                .get("thread_id")
-                .or_else(|| parsed.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if target_id.is_empty() {
-                return (
-                    "400 Bad Request",
-                    json!({
-                        "ok": false,
-                        "error_code": "missing_thread_id",
-                        "error": "thread_id is required to switch threads."
-                    }),
-                );
-            }
-            mutate_ui_v4_state(repo_root, |state| {
-                let exists = target_id == "thr-main"
-                    || state.delivery2.threads.iter().any(|t| t.id == target_id);
-                if !exists {
-                    return Err((
-                        "404 Not Found",
+            let target_id = match parse_optional_delivery2_thread_id(&parsed, true) {
+                Ok(Some(tid)) => tid,
+                Ok(None) => {
+                    return (
+                        "400 Bad Request",
                         json!({
                             "ok": false,
-                            "error_code": "thread_not_found",
-                            "error": "Requested Delivery-2 thread was not found."
+                            "error_code": "missing_thread_id",
+                            "error": "thread_id is required to switch threads."
                         }),
-                    ));
+                    );
                 }
-                state.delivery2.active_thread_id = target_id.to_string();
+                Err(err_resp) => return err_resp,
+            };
+            mutate_ui_v4_state(repo_root, |state| {
+                ensure_delivery2_thread_exists(state, &target_id)?;
+                state.delivery2.active_thread_id = target_id.clone();
                 state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
                 Ok(json!({
                     "ok": true,
@@ -8460,6 +8502,775 @@ fn handle_delivery2_thread(repo_root: &Path, port: u16, body: &[u8]) -> (&'stati
         obj.insert(
             "state".to_string(),
             build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+fn parse_optional_delivery2_thread_id(
+    parsed: &Value,
+    allow_id_alias: bool,
+) -> Result<Option<String>, (&'static str, Value)> {
+    let raw_val = parsed.get("thread_id").or_else(|| {
+        if allow_id_alias {
+            parsed.get("id")
+        } else {
+            None
+        }
+    });
+    let Some(val) = raw_val else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(None);
+    }
+    let Some(raw_str) = val.as_str() else {
+        return Err((
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "invalid_thread_id",
+                "error": "thread_id must be a string."
+            }),
+        ));
+    };
+    let trimmed = raw_str.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 128 || trimmed.chars().count() > 128 || trimmed.chars().any(char::is_control)
+    {
+        return Err((
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "invalid_thread_id",
+                "error": "thread_id must be at most 128 printable characters."
+            }),
+        ));
+    }
+    if contains_secret_shaped_token(trimmed) {
+        return Err((
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "secret_rejected",
+                "error": "Refused thread_id that looks like an API key, token, or password."
+            }),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn ensure_delivery2_thread_exists(
+    state: &LocalUiV4State,
+    tid: &str,
+) -> Result<(), (&'static str, Value)> {
+    let exists = tid == "thr-main" || state.delivery2.threads.iter().any(|t| t.id == tid);
+    if !exists {
+        return Err((
+            "404 Not Found",
+            json!({
+                "ok": false,
+                "error_code": "thread_not_found",
+                "error": "Requested Delivery-2 thread was not found."
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn thread_or_workspace_has_unsettled_hitl(
+    state: &LocalUiV4State,
+    target_tid: &str,
+    seeded_entries: &[Value],
+    inbox: &Value,
+) -> bool {
+    let thread_has_unsettled = |tid: &str| -> bool {
+        let entries_slice: &[Value] =
+            if let Some(found) = state.delivery2.threads.iter().find(|t| t.id == tid) {
+                if found.entries.is_empty() && tid == "thr-main" {
+                    seeded_entries
+                } else {
+                    &found.entries
+                }
+            } else if tid == "thr-main" {
+                seeded_entries
+            } else {
+                &[]
+            };
+        entries_slice.iter().any(|e| {
+            is_entry_unsettled_workflow(state, tid, e)
+                && e.get("kind").and_then(Value::as_str) == Some("approval_card")
+        })
+    };
+
+    if thread_has_unsettled(target_tid) || thread_has_unsettled("thr-main") {
+        return true;
+    }
+    if state
+        .delivery2
+        .threads
+        .iter()
+        .any(|t| thread_has_unsettled(&t.id))
+    {
+        return true;
+    }
+
+    // Also inspect workspace-global real Inbox items awaiting review/permission.
+    if let Some(items) = inbox.get("items").and_then(Value::as_array) {
+        for item in items {
+            let is_sample = item
+                .get("is_sample")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_sample {
+                continue;
+            }
+            let Some(item_id) = item.get("id").and_then(Value::as_str).map(str::trim) else {
+                continue;
+            };
+            if item_id.is_empty() || item_id.starts_with("sample-") {
+                continue;
+            }
+            let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+            if !matches!(
+                status,
+                "needs_review" | "needs_permission" | "paused_for_approval"
+            ) {
+                continue;
+            }
+            let hitl_key = format!("hitl-{item_id}");
+            let settled_in_d2 = state.delivery2.approvals.contains_key(&hitl_key)
+                || state.delivery2.approvals.contains_key(item_id);
+            let settled_in_inbox = state
+                .item_decisions
+                .get(item_id)
+                .is_some_and(|d| matches!(d.status.as_str(), "done" | "rejected"));
+            if !settled_in_d2 && !settled_in_inbox {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn handle_delivery2_voice_session(
+    repo_root: &Path,
+    port: u16,
+    body: &[u8],
+) -> (&'static str, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_json",
+                    "error": "Request body must be valid JSON."
+                }),
+            );
+        }
+    };
+
+    let action = parsed
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("start")
+        .trim()
+        .to_ascii_lowercase();
+    let initial_connecting = parsed
+        .get("connecting")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let req_thread_id = match parse_optional_delivery2_thread_id(&parsed, false) {
+        Ok(opt) => opt,
+        Err(err_resp) => return err_resp,
+    };
+
+    let (_, _, shipped_count) = build_inbox_and_board(repo_root);
+    let base_avail_cr = base_workspace_credits_for_shipped(shipped_count);
+    let now_unix = unix_now();
+
+    let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        if let Some(ref tid) = req_thread_id {
+            ensure_delivery2_thread_exists(state, tid)?;
+        }
+        let target_tid = req_thread_id.clone().unwrap_or_else(|| {
+            if state.delivery2.active_thread_id.trim().is_empty() {
+                "thr-main".to_string()
+            } else {
+                state.delivery2.active_thread_id.clone()
+            }
+        });
+        ensure_delivery2_thread_exists(state, &target_tid)?;
+        // Compute remaining workspace credits while holding `UI_V4_STATE_MUTEX` (eliminating TOCTOU overdraw).
+        let avail_cr = base_avail_cr.saturating_sub(state.delivery2.voice.total_voice_credits_used);
+        let seed = csprng_hex(4);
+        let voice_json = state.delivery2.voice.start_or_control_session(
+            &action,
+            &seed,
+            &target_tid,
+            initial_connecting,
+            avail_cr,
+            now_unix,
+        )?;
+        state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+        Ok(json!({
+            "ok": true,
+            "action": action,
+            "voice": voice_json,
+            "seq": state.delivery2.seq
+        }))
+    });
+
+    if status != "200 OK"
+        && matches!(
+            resp.get("error_code").and_then(Value::as_str),
+            Some("VoiceSessionExpired" | "VoiceCreditsCapReached")
+        )
+    {
+        let _ = mutate_ui_v4_state(repo_root, |st| {
+            let _ = st.delivery2.voice.reconcile_at(now_unix, false, false);
+            st.delivery2.seq = st.delivery2.seq.max(1).saturating_add(1);
+            Ok(json!({ "ok": true }))
+        });
+    }
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+fn handle_delivery2_voice_heartbeat(
+    repo_root: &Path,
+    port: u16,
+    body: &[u8],
+) -> (&'static str, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_json",
+                    "error": "Request body must be valid JSON."
+                }),
+            );
+        }
+    };
+
+    let req_session_id = parsed
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let idle_secs = parsed.get("idle_secs").and_then(Value::as_u64);
+    let hold_secs = parsed.get("hold_secs").and_then(Value::as_u64);
+    let speech_active = parsed
+        .get("speech_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let barge_in = parsed
+        .get("barge_in")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let repo_info = discover_repo_info(repo_root);
+    let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
+    let workflow = load_workflow_config(repo_root);
+    let credits = build_credits_json(repo_root, shipped_count);
+    let now_unix = unix_now();
+
+    let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        let seeded =
+            build_seeded_delivery2_entries(&repo_info, &inbox, &board, &credits, &workflow, state);
+        let hb_tid = state
+            .delivery2
+            .voice
+            .active_session
+            .as_ref()
+            .map(|s| s.thread_id.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if state.delivery2.active_thread_id.trim().is_empty() {
+                    "thr-main"
+                } else {
+                    state.delivery2.active_thread_id.as_str()
+                }
+            });
+        let unsettled_hitl = thread_or_workspace_has_unsettled_hitl(state, hb_tid, &seeded, &inbox);
+        let voice_json =
+            state
+                .delivery2
+                .voice
+                .heartbeat(ui_delivery2_voice::VoiceHeartbeatInput {
+                    requested_session_id: req_session_id.as_deref(),
+                    client_idle_secs: idle_secs,
+                    client_hold_secs: hold_secs,
+                    speech_active,
+                    barge_in,
+                    has_unsettled_hold: unsettled_hitl,
+                    now_unix,
+                })?;
+        state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+        Ok(json!({
+            "ok": true,
+            "voice": voice_json,
+            "seq": state.delivery2.seq
+        }))
+    });
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+fn handle_delivery2_voice_park(repo_root: &Path, port: u16, body: &[u8]) -> (&'static str, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_json",
+                    "error": "Request body must be valid JSON."
+                }),
+            );
+        }
+    };
+
+    let req_session_id = parsed
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let reason = parsed
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("user_paused")
+        .trim()
+        .to_string();
+    let now_unix = unix_now();
+
+    let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        let voice_json =
+            state
+                .delivery2
+                .voice
+                .park(req_session_id.as_deref(), &reason, now_unix)?;
+        state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+        Ok(json!({
+            "ok": true,
+            "parked": true,
+            "credits_while_paused": 0,
+            "voice": voice_json,
+            "seq": state.delivery2.seq
+        }))
+    });
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+    }
+    scrub_customer_ui_json(&mut resp);
+    (status, resp)
+}
+
+fn handle_delivery2_voice_turn(repo_root: &Path, port: u16, body: &[u8]) -> (&'static str, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                json!({
+                    "ok": false,
+                    "error_code": "invalid_json",
+                    "error": "Request body must be valid JSON."
+                }),
+            );
+        }
+    };
+
+    let raw_utterance = parsed
+        .get("utterance")
+        .or_else(|| parsed.get("transcript"))
+        .or_else(|| parsed.get("prompt"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if raw_utterance.is_empty() {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "empty_utterance",
+                "error": "Speak a question or option for Delivery-2."
+            }),
+        );
+    }
+    if raw_utterance.chars().count() > MAX_DELIVERY2_PROMPT_CHARS {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "utterance_too_long",
+                "error": format!("Voice turns must be at most {MAX_DELIVERY2_PROMPT_CHARS} characters.")
+            }),
+        );
+    }
+    if contains_secret_shaped_token(raw_utterance) {
+        return (
+            "400 Bad Request",
+            json!({
+                "ok": false,
+                "error_code": "secret_rejected",
+                "error": "Refused to save speech that looks like an API key, token, or password."
+            }),
+        );
+    }
+
+    let req_session_id = parsed
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let requested_thread_id = match parse_optional_delivery2_thread_id(&parsed, false) {
+        Ok(opt) => opt,
+        Err(err_resp) => return err_resp,
+    };
+    let interrupted = parsed
+        .get("interrupted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let explicit_danger = parsed
+        .get("danger")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let option_strings: Vec<String> = parsed
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .take(12)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let repo_info = discover_repo_info(repo_root);
+    let (inbox, board, shipped_count) = build_inbox_and_board(repo_root);
+    let workflow = load_workflow_config(repo_root);
+    let base_avail_cr = base_workspace_credits_for_shipped(shipped_count);
+    let now_unix = unix_now();
+    let now_ms = unix_now_ms();
+
+    let (status, mut resp) = mutate_ui_v4_state(repo_root, |state| {
+        if let Some(ref req_sid) = req_session_id
+            && let Some(ref sess) = state.delivery2.voice.active_session
+            && sess.session_id != *req_sid
+        {
+            return Err((
+                "409 Conflict",
+                json!({
+                    "ok": false,
+                    "error_code": "voice_session_mismatch",
+                    "error": "Voice session ID did not match the active session."
+                }),
+            ));
+        }
+
+        if let Some(ref tid) = requested_thread_id {
+            ensure_delivery2_thread_exists(state, tid)?;
+        }
+        let resolved_tid = requested_thread_id
+            .clone()
+            .or_else(|| {
+                state
+                    .delivery2
+                    .voice
+                    .active_session
+                    .as_ref()
+                    .map(|s| s.thread_id.clone())
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_else(|| {
+                if state.delivery2.active_thread_id.trim().is_empty() {
+                    "thr-main".to_string()
+                } else {
+                    state.delivery2.active_thread_id.clone()
+                }
+            });
+        ensure_delivery2_thread_exists(state, &resolved_tid)?;
+
+        // Compute remaining workspace credits while holding `UI_V4_STATE_MUTEX` (eliminating TOCTOU overdraw).
+        let avail_before =
+            base_avail_cr.saturating_sub(state.delivery2.voice.total_voice_credits_used);
+        let credits_for_seed = json!({
+            "available_credits": avail_before,
+            "plan_tier": if shipped_count == 0 { "Free Starter Trial" } else { "Team Pack" }
+        });
+
+        let seeded = build_seeded_delivery2_entries(
+            &repo_info,
+            &inbox,
+            &board,
+            &credits_for_seed,
+            &workflow,
+            state,
+        );
+        let has_unsettled_danger_card =
+            thread_or_workspace_has_unsettled_hitl(state, &resolved_tid, &seeded, &inbox);
+
+        let all_opt_refs: Vec<&str> = option_strings.iter().map(String::as_str).collect();
+        let danger_opt_refs: Vec<&str> = all_opt_refs
+            .iter()
+            .copied()
+            .filter(|opt| ui_delivery2_voice::option_contains_danger_verb(opt))
+            .collect();
+        let matched_danger_option = !danger_opt_refs.is_empty()
+            && ui_delivery2_voice::spoken_option(raw_utterance, &danger_opt_refs).is_some();
+
+        // Hard safety gate: danger-class merges/deploys/approvals can NEVER be approved via voice (`CHWG-0255` Pillar 3).
+        // Evaluated strictly BEFORE `charge_turn_credits` so rejected danger attempts charge 0 Cr.
+        if explicit_danger
+            || matched_danger_option
+            || ui_delivery2_voice::is_voice_danger_approval_attempt(
+                raw_utterance,
+                has_unsettled_danger_card,
+            )
+        {
+            return Err((
+                "403 Forbidden",
+                json!({
+                    "ok": false,
+                    "error_code": "VoiceDangerApprovalForbidden",
+                    "credits_charged": 0,
+                    "physical_click_required": true,
+                    "physical_click_verified": false,
+                    "error": ui_delivery2_voice::DANGER_VOICE_REJECT_COPY,
+                    "message": ui_delivery2_voice::DANGER_VOICE_REJECT_COPY,
+                    "spoken_reply": ui_delivery2_voice::DANGER_VOICE_REJECT_COPY
+                }),
+            ));
+        }
+
+        if let Some(sess) = state.delivery2.voice.active_session.as_mut() {
+            let max_possible = sess.credits_used.saturating_add(avail_before);
+            if max_possible < sess.credits_cap {
+                sess.credits_cap = max_possible;
+            }
+        }
+
+        // Server-determined per-turn credit charge (`VOICE_DEFAULT_TURN_CREDITS`); client fields cannot override.
+        let (charged, hit_cap) = state
+            .delivery2
+            .voice
+            .charge_turn_credits(VOICE_DEFAULT_TURN_CREDITS, now_unix)?;
+
+        let clean_utterance = scrub_customer_ui_text(raw_utterance);
+        let lower = raw_utterance.to_ascii_lowercase();
+
+        let safe_opt_refs = ui_delivery2_voice::filter_safe_voice_options(&all_opt_refs);
+        let matched_option = if !safe_opt_refs.is_empty() {
+            ui_delivery2_voice::spoken_option(raw_utterance, &safe_opt_refs)
+        } else {
+            None
+        };
+
+        let driver_lbl = friendly_workflow_tool_label(&workflow.driver_tool);
+        let reviewer_lbl = friendly_workflow_tool_label(&workflow.reviewer_tool);
+        let thinking_step_label = if lower.contains("what did i miss") || lower.contains("morning")
+        {
+            "Checking Inbox and Board summary"
+        } else if lower.contains("credit") || lower.contains("balance") || lower.contains("cost") {
+            "Checking workspace credit balance"
+        } else {
+            "Scoping change against protected path rules"
+        };
+
+        let mut delegate = VoiceDelegateTracker::new();
+        let prev_hold_until = state
+            .delivery2
+            .voice
+            .active_session
+            .as_ref()
+            .map_or(0, |s| s.thinking_hold_until_ms);
+        let thinking_ev = if now_ms >= prev_hold_until {
+            let ev = delegate.observe_thinking(thinking_step_label, now_ms);
+            if let Some(ref e) = ev
+                && let Some(sess) = state.delivery2.voice.active_session.as_mut()
+            {
+                sess.thinking_label = Some(e.text.clone());
+                sess.thinking_hold_until_ms = now_ms.saturating_add(VOICE_THINKING_HOLD_MS);
+            }
+            ev
+        } else {
+            None
+        };
+
+        let avail_after = avail_before.saturating_sub(charged);
+
+        let raw_spoken_reply = if let Some(ref chosen) = matched_option {
+            format!("Selected \"{chosen}\" in your thread. Workspace balance is {avail_after} Cr.")
+        } else if lower.contains("what did i miss") || lower.contains("morning") {
+            let ready = inbox["counts"]["needs_decision"].as_u64().unwrap_or(0);
+            let running = inbox["counts"]["running"].as_u64().unwrap_or(0);
+            let shipped = board["summary"]["shipped_count"].as_u64().unwrap_or(0);
+            format!(
+                "You have {ready} {} waiting in Inbox, {running} active check {}, and {shipped} shipped. Workspace balance is {avail_after} Cr.",
+                if ready == 1 { "diff" } else { "diffs" },
+                if running == 1 { "run" } else { "runs" }
+            )
+        } else if lower.contains("credit") || lower.contains("balance") || lower.contains("cost") {
+            let used_voice = state
+                .delivery2
+                .voice
+                .active_session
+                .as_ref()
+                .map_or(charged, |s| s.credits_used);
+            format!(
+                "Your workspace has {avail_after} Cr remaining. This voice call has used {used_voice} of its 40 Cr cap, and paused calls always cost 0 Cr."
+            )
+        } else {
+            let excerpt: String = clean_utterance.chars().take(120).collect();
+            format!(
+                "Scoped \"{excerpt}\" with {driver_lbl} and {reviewer_lbl} verification. Tests run in an isolated sandbox before you click Approve."
+            )
+        };
+
+        let commentary_ev = delegate.observe_commentary(&raw_spoken_reply, interrupted);
+        let spoken_text = commentary_ev
+            .as_ref()
+            .map(|e| e.text.clone())
+            .unwrap_or_else(|| "[Interrupted]".to_string());
+
+        if let Some(sess) = state.delivery2.voice.active_session.as_mut() {
+            if let Some(ref ce) = commentary_ev {
+                sess.last_spoken_commentary = Some(ce.text.clone());
+            }
+            if !hit_cap && !sess.audio_leg_parked && !sess.ended {
+                sess.state = if commentary_ev.is_some() {
+                    VoiceSessionState::Speaking
+                } else {
+                    VoiceSessionState::Listening
+                };
+            }
+        }
+
+        state.delivery2.seq = state.delivery2.seq.max(1).saturating_add(1);
+        let next_seq = state.delivery2.seq;
+
+        let user_entry = json!({
+            "id": format!("entry-voice-user-{next_seq}"),
+            "kind": "user_message",
+            "source": "voice",
+            "seq": next_seq,
+            "role": "user",
+            "author": "You",
+            "body": clean_utterance
+        });
+        let qa_entry = json!({
+            "id": format!("entry-voice-qa-{next_seq}"),
+            "kind": "qa_card",
+            "source": "voice",
+            "seq": next_seq,
+            "role": "assistant",
+            "author": "Delivery-2",
+            "body": spoken_text,
+            "interrupted": interrupted,
+            "sources": []
+        });
+
+        let thr = ensure_named_or_active_thread_mut(
+            &mut state.delivery2,
+            Some(resolved_tid.as_str()),
+            seeded,
+        );
+        if thr.title == "New thread" {
+            thr.title = clean_utterance.chars().take(48).collect();
+        }
+        thr.updated_at_unix = now_unix;
+        thr.entries.push(user_entry);
+        thr.entries.push(qa_entry.clone());
+
+        let mut delegate_events = Vec::with_capacity(2);
+        if let Some(ref te) = thinking_ev {
+            delegate_events.push(serde_json::to_value(te).unwrap_or(Value::Null));
+        }
+        if let Some(ref ce) = commentary_ev {
+            delegate_events.push(serde_json::to_value(ce).unwrap_or(Value::Null));
+        }
+
+        Ok(json!({
+            "ok": true,
+            "seq": next_seq,
+            "credits_charged": charged,
+            "cap_reached": hit_cap,
+            "session_capped": hit_cap,
+            "matched_option": matched_option,
+            "spoken_commentary": spoken_text,
+            "delegate_events": delegate_events,
+            "delegate": {
+                "thinking": thinking_ev,
+                "commentary": commentary_ev
+            },
+            "entry": qa_entry,
+            "voice": state.delivery2.voice.to_client_json(now_unix)
+        }))
+    });
+
+    if status != "200 OK"
+        && matches!(
+            resp.get("error_code").and_then(Value::as_str),
+            Some("VoiceSessionExpired" | "VoiceCreditsCapReached")
+        )
+    {
+        let _ = mutate_ui_v4_state(repo_root, |st| {
+            let _ = st.delivery2.voice.reconcile_at(now_unix, false, false);
+            st.delivery2.seq = st.delivery2.seq.max(1).saturating_add(1);
+            Ok(json!({ "ok": true }))
+        });
+    }
+
+    if status == "200 OK"
+        && let Some(obj) = resp.as_object_mut()
+    {
+        obj.insert(
+            "state".to_string(),
+            build_delivery2_state_json(repo_root, port),
+        );
+        obj.insert(
+            "credits".to_string(),
+            build_credits_json(repo_root, shipped_count),
         );
     }
     scrub_customer_ui_json(&mut resp);
@@ -8976,7 +9787,7 @@ fn handle_workbench_http_connection_inner(
                 None,
             );
         }
-        ("GET", "/api/v1/delivery2/state") => {
+        ("GET", "/api/v1/delivery2/state" | "/api/delivery2/state") => {
             let since_seq = req
                 .query_param("since_seq")
                 .and_then(|s| s.parse::<u64>().ok());
@@ -8991,7 +9802,7 @@ fn handle_workbench_http_connection_inner(
                 None,
             );
         }
-        ("POST", "/api/v1/delivery2/message") => {
+        ("POST", "/api/v1/delivery2/message" | "/api/delivery2/message") => {
             if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
                 let payload = serde_json::to_vec(&held).unwrap_or_default();
                 write_hardened_response(
@@ -9015,7 +9826,7 @@ fn handle_workbench_http_connection_inner(
                 None,
             );
         }
-        ("POST", "/api/v1/delivery2/cancel") => {
+        ("POST", "/api/v1/delivery2/cancel" | "/api/delivery2/cancel") => {
             if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
                 let payload = serde_json::to_vec(&held).unwrap_or_default();
                 write_hardened_response(
@@ -9039,7 +9850,7 @@ fn handle_workbench_http_connection_inner(
                 None,
             );
         }
-        ("POST", "/api/v1/delivery2/approval") => {
+        ("POST", "/api/v1/delivery2/approval" | "/api/delivery2/approval") => {
             if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
                 let payload = serde_json::to_vec(&held).unwrap_or_default();
                 write_hardened_response(
@@ -9063,7 +9874,7 @@ fn handle_workbench_http_connection_inner(
                 None,
             );
         }
-        ("POST", "/api/v1/delivery2/memory") => {
+        ("POST", "/api/v1/delivery2/memory" | "/api/delivery2/memory") => {
             if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
                 let payload = serde_json::to_vec(&held).unwrap_or_default();
                 write_hardened_response(
@@ -9087,7 +9898,7 @@ fn handle_workbench_http_connection_inner(
                 None,
             );
         }
-        ("POST", "/api/v1/delivery2/thread") => {
+        ("POST", "/api/v1/delivery2/thread" | "/api/delivery2/thread") => {
             if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
                 let payload = serde_json::to_vec(&held).unwrap_or_default();
                 write_hardened_response(
@@ -9101,6 +9912,102 @@ fn handle_workbench_http_connection_inner(
                 return;
             }
             let (status, val) = handle_delivery2_thread(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/delivery2/voice/session" | "/api/v1/delivery2/voice/session") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_voice_session(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/delivery2/voice/heartbeat" | "/api/v1/delivery2/voice/heartbeat") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_voice_heartbeat(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/delivery2/voice/turn" | "/api/v1/delivery2/voice/turn") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_voice_turn(repo_root, auth.port(), &req.body);
+            let payload = serde_json::to_vec(&val).unwrap_or_default();
+            write_hardened_response(
+                &mut stream,
+                status,
+                "application/json; charset=utf-8",
+                &payload,
+                None,
+                None,
+            );
+        }
+        ("POST", "/api/delivery2/voice/park" | "/api/v1/delivery2/voice/park") => {
+            if let Err(held) = revalidate_mutation_workspace(selection, repo_root) {
+                let payload = serde_json::to_vec(&held).unwrap_or_default();
+                write_hardened_response(
+                    &mut stream,
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &payload,
+                    None,
+                    None,
+                );
+                return;
+            }
+            let (status, val) = handle_delivery2_voice_park(repo_root, auth.port(), &req.body);
             let payload = serde_json::to_vec(&val).unwrap_or_default();
             write_hardened_response(
                 &mut stream,
@@ -10000,7 +10907,7 @@ mod tests {
         let (st_app1, val_app1) = handle_delivery2_approval(
             &repo,
             5487,
-            br#"{"id":"hitl-run-local-1","item_id":"run-local-1","decision":"approve"}"#,
+            br#"{"id":"hitl-run-local-1","item_id":"run-local-1","decision":"approve","source":"physical_click","physical_click_verified":true}"#,
         );
         assert_eq!(st_app1, "200 OK");
         assert_eq!(val_app1["decision"], "approved");
@@ -11160,7 +12067,7 @@ mod tests {
         let (st_app, val_app) = handle_delivery2_approval(
             &repo,
             5487,
-            br#"{"id":"hitl-CHWG-777","item_id":"CHWG-777","decision":"approve"}"#,
+            br#"{"id":"hitl-CHWG-777","item_id":"CHWG-777","decision":"approve","source":"physical_click","physical_click_verified":true}"#,
         );
         assert_eq!(st_app, "200 OK");
         let seq_after_approve = val_app["seq"].as_u64().unwrap();
@@ -11213,7 +12120,7 @@ mod tests {
         let (st_d2_after_rej, val_d2_after_rej) = handle_delivery2_approval(
             &repo,
             5487,
-            br#"{"id":"hitl-CHWG-778","item_id":"CHWG-778","decision":"approve"}"#,
+            br#"{"id":"hitl-CHWG-778","item_id":"CHWG-778","decision":"approve","source":"physical_click","physical_click_verified":true}"#,
         );
         assert_eq!(st_d2_after_rej, "200 OK");
         assert_eq!(val_d2_after_rej["already_settled"], true);
@@ -11226,8 +12133,10 @@ mod tests {
         assert_eq!(st_unpref_deny, "200 OK");
         assert_eq!(val_unpref_deny["decision"], "denied");
 
-        let (st_stale_inb_app, val_stale_inb_app) =
-            handle_inbox_action(&repo, br#"{"id":"CHWG-779","action":"approve"}"#);
+        let (st_stale_inb_app, val_stale_inb_app) = handle_inbox_action(
+            &repo,
+            br#"{"id":"CHWG-779","action":"approve","source":"physical_click","physical_click_verified":true}"#,
+        );
         assert_eq!(st_stale_inb_app, "409 Conflict");
         assert_eq!(val_stale_inb_app["error_code"], "already_rejected");
 
@@ -11235,8 +12144,22 @@ mod tests {
             handle_inbox_action(&repo, br#"{"id":"CHWG-779","action":"undo_reject"}"#);
         assert_eq!(st_undo_rej, "200 OK");
 
-        let (st_reapprove, val_reapprove) =
-            handle_delivery2_approval(&repo, 5487, br#"{"id":"CHWG-779","decision":"approve"}"#);
+        for bad_inb_body in [
+            br#"{"id":"CHWG-779","action":"approve"}"#.as_slice(),
+            br#"{"id":"CHWG-779","action":"apply_locally"}"#.as_slice(),
+            br#"{"id":"CHWG-779","action":"approve","source":"voice","voice_originated":true,"physical_click_verified":false,"danger":false}"#.as_slice(),
+            br#"{"id":"CHWG-779","action":"apply_locally","physical_click_verified":true}"#.as_slice(),
+        ] {
+            let (st_bad_inb, val_bad_inb) = handle_inbox_action(&repo, bad_inb_body);
+            assert_eq!(st_bad_inb, "403 Forbidden");
+            assert_eq!(val_bad_inb["error_code"], "VoiceDangerApprovalForbidden");
+        }
+
+        let (st_reapprove, val_reapprove) = handle_delivery2_approval(
+            &repo,
+            5487,
+            br#"{"id":"CHWG-779","decision":"approve","source":"physical_click","physical_click_verified":true}"#,
+        );
         assert_eq!(st_reapprove, "200 OK");
         assert_eq!(val_reapprove["already_settled"], false);
         assert_eq!(val_reapprove["decision"], "approved");
