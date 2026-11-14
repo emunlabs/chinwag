@@ -34,9 +34,11 @@ pub mod authorization;
 mod capture_read;
 #[cfg(unix)]
 pub mod custody;
+pub mod diagnostics_triage;
 pub mod envelope;
 #[cfg(unix)]
 pub mod execution;
+pub mod flywheel;
 pub mod github;
 #[cfg(unix)]
 mod http_diagnostics;
@@ -50,6 +52,7 @@ mod owner_http;
 mod owner_lifecycle;
 #[cfg(unix)]
 pub mod owner_supervisor;
+pub mod packet;
 #[cfg(unix)]
 pub mod preparation;
 #[cfg(unix)]
@@ -64,6 +67,7 @@ pub mod runner_identity;
 #[cfg(unix)]
 pub mod runtime;
 pub mod transport;
+pub mod unified_gates;
 // Only the descriptor-bound Darwin ACL adapter needs FFI. Crypto paths deny it.
 #[cfg(unix)]
 pub mod agent_read;
