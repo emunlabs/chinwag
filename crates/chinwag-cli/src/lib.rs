@@ -104,6 +104,8 @@ pub mod task_write_journal;
 #[cfg(target_os = "macos")]
 pub mod task_writer;
 #[cfg(target_os = "macos")]
+pub mod tool_grammar_gate;
+#[cfg(target_os = "macos")]
 pub mod ui_delivery2_voice;
 #[cfg(target_os = "macos")]
 pub mod ui_gate_run;
