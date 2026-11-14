@@ -128,6 +128,16 @@ const ICONS = {
   stop: () => svgIcon([
     { tag: "rect", x: "4.2", y: "4.2", width: "7.6", height: "7.6", rx: "1.4" },
   ], { className: "icon-svg sm" }),
+  mic: () => svgIcon([
+    { tag: "rect", x: "5.8", y: "2.2", width: "4.4", height: "7.2", rx: "2.2" },
+    { d: "M3.8 7.6a4.2 4.2 0 0 0 8.4 0" },
+    { d: "M8 11.8v2.2M5.8 14h4.4" },
+  ], { className: "icon-svg sm" }),
+  micOff: () => svgIcon([
+    { tag: "rect", x: "5.8", y: "2.2", width: "4.4", height: "7.2", rx: "2.2" },
+    { d: "M3.8 7.6a4.2 4.2 0 0 0 8.4 0" },
+    { d: "M2.6 2.6l10.8 10.8" },
+  ], { className: "icon-svg sm" }),
 };
 
 function healUnclosedInlineMarkdown(raw) {
@@ -710,7 +720,9 @@ async function apiRequest(method, path, bodyObj = null, extraOpts = null) {
     json = null;
   }
   const isGuardrailForbidden = Boolean(
-    json && json.error_code === "SampleWalkthroughShipForbidden",
+    json &&
+      (json.error_code === "SampleWalkthroughShipForbidden" ||
+        json.error_code === "VoiceDangerApprovalForbidden"),
   );
   if ((res.status === 401 || res.status === 403) && !isGuardrailForbidden) {
     showSessionExpiredBanner();
@@ -720,6 +732,7 @@ async function apiRequest(method, path, bodyObj = null, extraOpts = null) {
     const err = new Error(msg);
     err.status = res.status;
     err.code = json && json.error_code ? json.error_code : "request_failed";
+    err.payload = json || null;
     throw err;
   }
   return json || { ok: true };
@@ -903,6 +916,17 @@ const state = {
   d2ExpandedSources: new Set(),
   d2EditingMemId: null,
   d2EditingMemDraft: "",
+  d2VoiceClientLive: false,
+  d2VoiceConnectingTimer: 0,
+  d2VoiceHeartbeatTimer: 0,
+  d2VoiceClockTimer: 0,
+  d2VoiceRafId: 0,
+  d2VoiceAmp: 0,
+  d2VoiceLastFrameMs: 0,
+  d2VoiceLastActivityMs: 0,
+  d2VoiceHoldStartMs: 0,
+  d2VoiceDangerNotice: null,
+  d2VoiceDelegate: null,
   data: createEmptyData(),
 };
 
@@ -1009,6 +1033,38 @@ function buildDefaultStepLadder(activeOneBased = 10, completedAll = false) {
   });
 }
 
+function createDefaultVoiceState() {
+  return {
+    session_id: null,
+    thread_id: "thr-main",
+    state: "idle",
+    status_label: "Idle",
+    timer_label: "00:00 / 10:00",
+    elapsed_secs: 0,
+    remaining_secs: 600,
+    max_duration_secs: 600,
+    opened_at_unix: null,
+    expires_at_unix: null,
+    credits_used: 0,
+    credits_cap: 40,
+    credits_rate_per_min: 0,
+    pause_badge: "Paused · 0 Cr",
+    muted: false,
+    audio_leg_parked: true,
+    ended: false,
+    park_reason: null,
+    ended_reason: null,
+    thinking_label: null,
+    last_spoken_commentary: null,
+    silence_warning_secs: 75,
+    silence_park_secs: 90,
+    hold_park_secs: 8,
+    heartbeat_interval_secs: 5,
+    heartbeat_orphan_secs: 15,
+    danger_reject_copy: "Press Approve to confirm. Voice can't approve this one.",
+  };
+}
+
 function createDefaultDelivery2State() {
   const portNum = Number(SERVER_PORT) || 5487;
   return {
@@ -1017,6 +1073,7 @@ function createDefaultDelivery2State() {
     status: "waiting_for_you",
     status_label: "Waiting for you",
     active_thread_id: "thr-main",
+    voice: createDefaultVoiceState(),
     sync_radar: {
       latency_ms: 42,
       latency_label: "<200ms",
@@ -1777,8 +1834,99 @@ function normalizeDelivery2State(rawD2, baseData = null) {
     };
   }
 
+  out.voice = normalizeDelivery2VoiceState(rawD2.voice, out.active_thread_id);
+
   reconcileCancelledDelivery2State(out);
   return out;
+}
+
+function normalizeDelivery2VoiceState(rawVoice, fallbackThreadId = "thr-main") {
+  const def = createDefaultVoiceState();
+  def.thread_id = fallbackThreadId || "thr-main";
+  if (!rawVoice || typeof rawVoice !== "object") {
+    const prevVoice =
+      state && state.data && state.data.delivery2 && state.data.delivery2.voice
+        ? state.data.delivery2.voice
+        : null;
+    if (prevVoice && prevVoice.session_id) {
+      return { ...prevVoice };
+    }
+    return def;
+  }
+  const validStates = new Set([
+    "idle",
+    "connecting",
+    "listening",
+    "thinking",
+    "speaking",
+    "silence_warning",
+    "paused",
+  ]);
+  const rawStateStr = String(rawVoice.state || "idle").toLowerCase();
+  let normState = validStates.has(rawStateStr) ? rawStateStr : "idle";
+  const sessionId = !isAbsent(rawVoice.session_id) ? String(rawVoice.session_id) : null;
+  let audioLegParked =
+    typeof rawVoice.audio_leg_parked === "boolean" ? rawVoice.audio_leg_parked : normState === "idle" || normState === "paused";
+  const ended = Boolean(rawVoice.ended);
+  let statusLabel = !isAbsent(rawVoice.status_label) ? String(rawVoice.status_label) : def.status_label;
+  let ratePerMin = Number.isFinite(Number(rawVoice.credits_rate_per_min))
+    ? Math.max(0, Number(rawVoice.credits_rate_per_min))
+    : 0;
+  let parkReason = !isAbsent(rawVoice.park_reason) ? String(rawVoice.park_reason) : null;
+
+  // Cold page reload rehydration: if server holds an unended session while this browser tab has not
+  // opened a live audio leg yet, present it cleanly in Paused · 0 Cr so the user can Resume safely.
+  if (sessionId && !state.d2VoiceClientLive && normState !== "idle" && normState !== "paused") {
+    normState = "paused";
+    audioLegParked = true;
+    ratePerMin = 0;
+    parkReason = parkReason || "page_reload";
+    statusLabel = ended ? statusLabel : "Voice paused · 0 Cr while paused";
+  }
+
+  if (sessionId && state.d2VoiceClientLive && (normState === "paused" || audioLegParked || ended)) {
+    state.d2VoiceClientLive = false;
+  }
+
+  const maxDur = Math.max(60, Number(rawVoice.max_duration_secs) || 600);
+  const elapsedSecs = Math.min(maxDur, Math.max(0, Number(rawVoice.elapsed_secs) || 0));
+  const remainingSecs = Math.min(maxDur, Math.max(0, Number(rawVoice.remaining_secs ?? maxDur - elapsedSecs)));
+
+  return {
+    session_id: sessionId,
+    thread_id: !isAbsent(rawVoice.thread_id) ? String(rawVoice.thread_id) : fallbackThreadId || "thr-main",
+    state: normState,
+    status_label: statusLabel,
+    timer_label: !isAbsent(rawVoice.timer_label)
+      ? String(rawVoice.timer_label)
+      : formatVoiceTimer(elapsedSecs, maxDur),
+    elapsed_secs: elapsedSecs,
+    remaining_secs: remainingSecs,
+    max_duration_secs: maxDur,
+    opened_at_unix: Number.isFinite(Number(rawVoice.opened_at_unix)) ? Number(rawVoice.opened_at_unix) : null,
+    expires_at_unix: Number.isFinite(Number(rawVoice.expires_at_unix)) ? Number(rawVoice.expires_at_unix) : null,
+    credits_used: Math.max(0, Number(rawVoice.credits_used) || 0),
+    credits_cap: Math.max(1, Number(rawVoice.credits_cap) || 40),
+    credits_rate_per_min: ratePerMin,
+    pause_badge: !isAbsent(rawVoice.pause_badge) ? String(rawVoice.pause_badge) : "Paused · 0 Cr",
+    muted: Boolean(rawVoice.muted),
+    audio_leg_parked: audioLegParked,
+    ended,
+    park_reason: parkReason,
+    ended_reason: !isAbsent(rawVoice.ended_reason) ? String(rawVoice.ended_reason) : null,
+    thinking_label: !isAbsent(rawVoice.thinking_label) ? String(rawVoice.thinking_label) : null,
+    last_spoken_commentary: !isAbsent(rawVoice.last_spoken_commentary)
+      ? String(rawVoice.last_spoken_commentary)
+      : null,
+    silence_warning_secs: Number(rawVoice.silence_warning_secs) || 75,
+    silence_park_secs: Number(rawVoice.silence_park_secs) || 90,
+    hold_park_secs: Number(rawVoice.hold_park_secs) || 8,
+    heartbeat_interval_secs: Number(rawVoice.heartbeat_interval_secs) || 5,
+    heartbeat_orphan_secs: Number(rawVoice.heartbeat_orphan_secs) || 15,
+    danger_reject_copy: !isAbsent(rawVoice.danger_reject_copy)
+      ? String(rawVoice.danger_reject_copy)
+      : "Press Approve to confirm. Voice can't approve this one.",
+  };
 }
 
 function parseHunkLines(hunk) {
@@ -3993,6 +4141,8 @@ function buildSplitDiffTable(file) {
   );
 }
 
+const trustedKeyboardApprovals = new WeakMap();
+
 function renderSheetFooter(detail, sheetFoot, armPrimary = false) {
   clearNode(sheetFoot);
   const mdSummary = buildPrMarkdownSummary(detail);
@@ -4211,42 +4361,52 @@ function renderSheetFooter(detail, sheetFoot, armPrimary = false) {
     },
   });
 
+  const onTrustedSheetApprove = async (ev) => {
+    if (!ev || ev.isTrusted !== true) return;
+    if (approveBtn.getAttribute("aria-disabled") === "true") return;
+    try {
+      const res = await Motion.guardAction(
+        approveBtn,
+        () =>
+          apiRequest("POST", "/api/v4/inbox/action", {
+            id: detail.id,
+            action: "approve",
+            is_sample: false,
+            source: "physical_click",
+            physical_click_verified: true,
+          }),
+        { group: actionsGroup, busyLabel: "Pushing…" },
+      );
+      if (!res) return;
+      trackUiEvent("ui_diff_approved_and_pushed", {
+        driver_tool_kind: normalizeToolKind(detail.tool_label),
+        reviewer_tool_kind: normalizeToolKind(detail.reviewer_label || "codex_cli"),
+        is_cross_model_verified: Boolean(detail.independent_review && detail.independent_review.passed),
+        sandbox_tests_passed: detail.test_passed !== false,
+        decision_latency_bucket: decisionLatencyBucket(Date.now() - state.sheetOpenedAtMs),
+        is_sample_walkthrough: false,
+      });
+      toaster.show(res.value.message || `Approved and pushed to ${targetBranch}`);
+      announce(`Approved and pushed ${detail.title}`);
+      await refreshBootstrapQuietly();
+      closeReviewSheetAndNavigate();
+    } catch (err) {
+      trackUiEvent("ui_action_failed", {
+        failed_action: "approve_and_push",
+        error_category: "git_conflict",
+      });
+      toaster.show(err.message || "Could not push changes — check git status");
+    }
+  };
   const approveBtn = actionBtn({
     label: "Approve & push to PR",
     variant: "primary",
     id: "sheet-primary-action",
     keycap: "⌘↵",
     disabled: blockedByHold,
-    onClick: async () => {
-      if (approveBtn.getAttribute("aria-disabled") === "true") return;
-      try {
-        const res = await Motion.guardAction(
-          approveBtn,
-          () => apiRequest("POST", "/api/v4/inbox/action", { id: detail.id, action: "approve", is_sample: false }),
-          { group: actionsGroup, busyLabel: "Pushing…" },
-        );
-        if (!res) return;
-        trackUiEvent("ui_diff_approved_and_pushed", {
-          driver_tool_kind: normalizeToolKind(detail.tool_label),
-          reviewer_tool_kind: normalizeToolKind(detail.reviewer_label || "codex_cli"),
-          is_cross_model_verified: Boolean(detail.independent_review && detail.independent_review.passed),
-          sandbox_tests_passed: detail.test_passed !== false,
-          decision_latency_bucket: decisionLatencyBucket(Date.now() - state.sheetOpenedAtMs),
-          is_sample_walkthrough: false,
-        });
-        toaster.show(res.value.message || `Approved and pushed to ${targetBranch}`);
-        announce(`Approved and pushed ${detail.title}`);
-        await refreshBootstrapQuietly();
-        closeReviewSheetAndNavigate();
-      } catch (err) {
-        trackUiEvent("ui_action_failed", {
-          failed_action: "approve_and_push",
-          error_category: "git_conflict",
-        });
-        toaster.show(err.message || "Could not push changes — check git status");
-      }
-    },
+    onClick: onTrustedSheetApprove,
   });
+  trustedKeyboardApprovals.set(approveBtn, onTrustedSheetApprove);
 
   if (armPrimary && !blockedByHold) {
     Motion.arm(approveBtn);
@@ -5982,38 +6142,59 @@ async function triggerSurfaceOAuthFlow(surfaceId, decision = "connect", cardNode
   }
 }
 
-async function submitDelivery2Approval(cardNode, btnEl, groupEl, entry, decision) {
+async function submitDelivery2Approval(cardNode, btnEl, groupEl, entry, decision, opts = null) {
   const approvalId = entry.approval_id || entry.id;
   const itemId = entry.item_id || approvalId;
+  const source = opts && opts.source ? String(opts.source) : "physical_click";
+  const physicalClickVerified =
+    opts && typeof opts.physicalClickVerified === "boolean"
+      ? opts.physicalClickVerified
+      : source === "physical_click";
   try {
-    const wrapped = await Motion.guardAction(
-      btnEl,
-      () =>
-        apiRequest("POST", "/api/v1/delivery2/approval", {
-          id: approvalId,
-          item_id: itemId,
-          decision,
-          is_sample: Boolean(entry.is_sample),
-        }),
-      { group: groupEl, busyLabel: decision === "approve" ? "Approving…" : "Denying…" },
-    );
-    if (!wrapped) return;
+    const runReq = () =>
+      apiRequest("POST", "/api/v1/delivery2/approval", {
+        id: approvalId,
+        item_id: itemId,
+        decision,
+        is_sample: Boolean(entry.is_sample),
+        source,
+        voice_originated: source === "voice",
+        physical_click_verified: physicalClickVerified,
+      });
+    const wrapped = btnEl
+      ? await Motion.guardAction(btnEl, runReq, {
+          group: groupEl,
+          busyLabel: decision === "approve" ? "Approving…" : "Denying…",
+        })
+      : { value: await runReq() };
+    if (!wrapped) return false;
     const res = wrapped.value;
+    state.d2VoiceDangerNotice = null;
+    state.d2VoiceHoldStartMs = 0;
     const receipt =
       (res && res.receipt) ||
       (decision === "approve"
         ? "Approved by you · 0 Cr while paused"
         : "Denied by you · 0 Cr while paused");
     if (res && res.state) applyDelivery2ServerPayload(res.state);
-    await Motion.resolveBanner(cardNode, () => {
-      clearNode(cardNode);
-      cardNode.setAttribute("data-resolved", "");
-      cardNode.append(ICONS.check(), el("span", null, receipt));
-    });
+    if (cardNode) {
+      await Motion.resolveBanner(cardNode, () => {
+        clearNode(cardNode);
+        cardNode.setAttribute("data-resolved", "");
+        cardNode.append(ICONS.check(), el("span", null, receipt));
+      });
+    }
     renderDelivery2Panel();
     await refreshBootstrapQuietly();
+    return true;
   } catch (err) {
-    toaster.show(err && err.message ? err.message : "Could not record approval decision.");
+    const msg = err && err.message ? err.message : "Could not record approval decision.";
+    if (err && err.code === "VoiceDangerApprovalForbidden") {
+      state.d2VoiceDangerNotice = msg;
+      renderDelivery2Panel();
+    }
+    toaster.show(msg);
+    return false;
   }
 }
 
@@ -6350,6 +6531,1038 @@ function buildDelivery2ConnectionsPopover(d2) {
   );
 }
 
+// ── 9C · Duplex Live Voice Controller, VoiceDelegate & Fail-Closed spokenOption ─
+
+const VOICE_STATES = [
+  "idle",
+  "connecting",
+  "listening",
+  "thinking",
+  "speaking",
+  "silence_warning",
+  "paused",
+];
+const VOICE_THINKING_HOLD_MS = 3000;
+const VOICE_MAX_COMMENTARY_CHARS = 1500;
+const VOICE_CONNECTING_TIMEOUT_MS = 8000;
+const DANGER_VOICE_REJECT_COPY = "Press Approve to confirm. Voice can't approve this one.";
+const SILENCE_WARNING_COPY = "Still there? Pausing in 15s";
+const VOICE_PAUSED_COPY = "Voice paused · 0 Cr while paused";
+const VOICE_TTL_ENDED_COPY = "Voice ended at the 10-minute limit. Your thread is saved.";
+const VOICE_CAP_ENDED_COPY = "Voice paused at the 40 Cr session cap. Your thread is saved.";
+
+const VOICE_FILLER_WORDS = new Set([
+  "it",
+  "ok",
+  "okay",
+  "please",
+  "that",
+  "yeah",
+  "yes",
+  "yep",
+  "uh",
+  "um",
+  "now",
+]);
+
+const VOICE_NEGATION_WORDS = new Set([
+  "don't",
+  "dont",
+  "not",
+  "never",
+  "no",
+  "can't",
+  "cant",
+  "cannot",
+  "won't",
+  "wont",
+  "neither",
+  "unless",
+  "without",
+  "wait",
+  "stop",
+  "hold",
+  "cancel",
+]);
+
+const VOICE_DANGER_VERBS = new Set(["approve", "merge", "deploy", "ship", "push", "apply"]);
+
+const VOICE_IMPERATIVE_LEAD_INS = new Set([
+  "please",
+  "ok",
+  "okay",
+  "yes",
+  "yeah",
+  "yep",
+  "sure",
+  "alright",
+  "right",
+  "now",
+  "just",
+  "go",
+  "ahead",
+  "and",
+  "then",
+  "lets",
+  "let's",
+  "let",
+  "us",
+  "can",
+  "could",
+  "would",
+  "will",
+  "you",
+  "i",
+  "we",
+  "lgtm",
+  "looks",
+  "good",
+  "uh",
+  "um",
+  "hey",
+  "delivery",
+]);
+
+function optionContainsDangerVerb(option) {
+  return tokenizeSpeechWords(option).some((w) => VOICE_DANGER_VERBS.has(w));
+}
+
+function filterSafeVoiceOptions(options) {
+  if (!Array.isArray(options)) return [];
+  return options.filter((opt) => !optionContainsDangerVerb(opt));
+}
+
+function isVoiceDangerApprovalAttempt(utterance, hasUnsettledDangerCard = false) {
+  const words = tokenizeSpeechWords(utterance);
+  if (words.length === 0 || words.some((w) => VOICE_NEGATION_WORDS.has(w))) {
+    return false;
+  }
+  const clauses = String(utterance ?? "").split(/[,;.!?]+/);
+  for (const clause of clauses) {
+    const clauseWords = tokenizeSpeechWords(clause);
+    if (clauseWords.length === 0 || clauseWords.some((w) => VOICE_NEGATION_WORDS.has(w))) {
+      continue;
+    }
+    let idx = 0;
+    while (idx < clauseWords.length) {
+      const w = clauseWords[idx];
+      if (VOICE_IMPERATIVE_LEAD_INS.has(w)) {
+        idx += 1;
+        if (w === "delivery" && clauseWords[idx] === "2") {
+          idx += 1;
+        }
+        continue;
+      }
+      break;
+    }
+    if (idx < clauseWords.length && VOICE_DANGER_VERBS.has(clauseWords[idx])) {
+      return true;
+    }
+  }
+  const hasExplicitShipVerb = words.some(
+    (w) => w === "merge" || w === "deploy" || w === "ship" || w === "push" || w === "apply",
+  );
+  const matchedApprove =
+    spokenOption(utterance, [
+      "approve",
+      "approve merge",
+      "approve and merge",
+      "merge",
+      "deploy",
+      "ship",
+      "push",
+      "apply",
+      "apply locally",
+    ]) !== null;
+  return matchedApprove && (Boolean(hasUnsettledDangerCard) || hasExplicitShipVerb);
+}
+
+function formatVoiceTimer(elapsedSecs, maxSecs = 600) {
+  const safeMax = Math.max(1, Math.floor(Number(maxSecs) || 600));
+  const clamped = Math.min(safeMax, Math.max(0, Math.floor(Number(elapsedSecs) || 0)));
+  const eMin = String(Math.floor(clamped / 60)).padStart(2, "0");
+  const eSec = String(clamped % 60).padStart(2, "0");
+  const mMin = String(Math.floor(safeMax / 60)).padStart(2, "0");
+  const mSec = String(safeMax % 60).padStart(2, "0");
+  return `${eMin}:${eSec} / ${mMin}:${mSec}`;
+}
+
+function canTransitionVoiceState(fromState, toState) {
+  if (fromState === toState) return true;
+  switch (fromState) {
+    case "idle":
+      return toState === "connecting" || toState === "listening" || toState === "paused";
+    case "connecting":
+      return toState === "listening" || toState === "paused" || toState === "idle";
+    case "listening":
+      return (
+        toState === "thinking" ||
+        toState === "speaking" ||
+        toState === "silence_warning" ||
+        toState === "paused" ||
+        toState === "idle"
+      );
+    case "thinking":
+      return toState === "speaking" || toState === "listening" || toState === "paused" || toState === "idle";
+    case "speaking":
+      return (
+        toState === "listening" ||
+        toState === "thinking" ||
+        toState === "silence_warning" ||
+        toState === "paused" ||
+        toState === "idle"
+      );
+    case "silence_warning":
+      return (
+        toState === "listening" ||
+        toState === "thinking" ||
+        toState === "speaking" ||
+        toState === "paused" ||
+        toState === "idle"
+      );
+    case "paused":
+      return toState === "connecting" || toState === "listening" || toState === "idle";
+    default:
+      return false;
+  }
+}
+
+function tokenizeSpeechWords(raw) {
+  const normalized = String(raw ?? "").replace(/[\u2018\u2019]/g, "'");
+  const tokens = [];
+  let cur = "";
+  for (let i = 0; i < normalized.length; i += 1) {
+    const ch = normalized[i];
+    const nextCh = i + 1 < normalized.length ? normalized[i + 1] : "";
+    const isAlnum = /[a-zA-Z0-9]/.test(ch);
+    const isInnerApostrophe = ch === "'" && cur.length > 0 && /[a-zA-Z0-9]/.test(nextCh);
+    if (isAlnum || isInnerApostrophe) {
+      cur += ch.toLowerCase();
+    } else if (cur.length > 0) {
+      tokens.push(cur);
+      cur = "";
+    }
+  }
+  if (cur.length > 0) tokens.push(cur);
+  return tokens;
+}
+
+function spokenOption(utterance, options) {
+  if (!Array.isArray(options) || options.length === 0) return null;
+  const words = tokenizeSpeechWords(utterance);
+  if (words.length === 0) return null;
+  for (const w of words) {
+    if (VOICE_NEGATION_WORDS.has(w)) return null;
+    if (w === "or" || w === "maybe" || w === "if" || w === "whether") return null;
+  }
+  const filtered = words.filter((w) => !VOICE_FILLER_WORDS.has(w));
+  if (filtered.length === 0) return null;
+  const candidate = filtered.join(" ");
+
+  let matched = null;
+  for (const opt of options) {
+    const optWords = tokenizeSpeechWords(opt).filter((w) => !VOICE_FILLER_WORDS.has(w));
+    if (optWords.length === 0) continue;
+    const normOpt = optWords.join(" ");
+    if (normOpt === candidate) {
+      if (matched !== null) return null;
+      matched = normOpt;
+    }
+  }
+  return matched;
+}
+
+function truncateCommentaryAtSentence(input, maxChars = VOICE_MAX_COMMENTARY_CHARS) {
+  const trimmed = String(input ?? "").trim();
+  const limit = Math.max(0, Math.floor(Number(maxChars) || 0));
+  if (limit === 0 || !trimmed) return "";
+  const chars = Array.from(trimmed);
+  if (chars.length <= limit) return trimmed;
+
+  const windowChars = chars.slice(0, limit);
+  let lastSentenceEnd = -1;
+  for (let i = 0; i < windowChars.length; i += 1) {
+    const ch = windowChars[i];
+    if (ch === "." || ch === "!" || ch === "?") {
+      const next = i + 1 < windowChars.length ? windowChars[i + 1] : "";
+      const nextOk = !next || /\s/.test(next) || next === '"' || next === "'" || next === ")";
+      if (nextOk) {
+        let end = i + 1;
+        if (end < windowChars.length && (windowChars[end] === '"' || windowChars[end] === "'" || windowChars[end] === ")")) {
+          end += 1;
+        }
+        lastSentenceEnd = end;
+      }
+    }
+  }
+  if (lastSentenceEnd >= 2) {
+    return windowChars.slice(0, lastSentenceEnd).join("").trim();
+  }
+
+  const budget = Math.max(0, limit - 1);
+  if (budget === 0) return ".";
+  const sub = chars.slice(0, budget);
+  let lastWs = -1;
+  for (let i = sub.length - 1; i >= 0; i -= 1) {
+    if (/\s/.test(sub[i])) {
+      lastWs = i;
+      break;
+    }
+  }
+  if (lastWs >= 1) {
+    return `${sub.slice(0, lastWs).join("").trimEnd()}.`;
+  }
+  return `${sub.join("")}.`;
+}
+
+function createVoiceDelegate({ onThinkingLabel = null, onSpeakCommentary = null, nowFn = () => Date.now() } = {}) {
+  let thinkingLabel = null;
+  let thinkingHoldUntilMs = 0;
+  const events = [];
+
+  return {
+    observeThinking(cleanToolLabel, explicitNowMs = null) {
+      const trimmed = String(cleanToolLabel ?? "").trim();
+      if (!trimmed) return null;
+      const nowMs = explicitNowMs !== null ? Number(explicitNowMs) : Number(nowFn());
+      if (thinkingLabel !== null && nowMs < thinkingHoldUntilMs) {
+        return null;
+      }
+      const text = truncateCommentaryAtSentence(trimmed, 240);
+      thinkingLabel = text;
+      thinkingHoldUntilMs = nowMs + VOICE_THINKING_HOLD_MS;
+      const ev = {
+        channel: "thinking",
+        spoken: false,
+        text,
+        min_hold_ms: VOICE_THINKING_HOLD_MS,
+      };
+      events.push(ev);
+      if (typeof onThinkingLabel === "function") onThinkingLabel(ev);
+      return ev;
+    },
+    observeCommentary(rawReply, { interrupted = false } = {}) {
+      if (interrupted) return null;
+      const text = truncateCommentaryAtSentence(rawReply, VOICE_MAX_COMMENTARY_CHARS);
+      if (!text) return null;
+      const ev = {
+        channel: "commentary",
+        spoken: true,
+        text,
+        min_hold_ms: 0,
+      };
+      events.push(ev);
+      if (typeof onSpeakCommentary === "function") onSpeakCommentary(ev);
+      return ev;
+    },
+    activeThinkingLabel: () => thinkingLabel,
+    events: () => [...events],
+  };
+}
+
+function getDelivery2Voice() {
+  if (!state.data || !state.data.delivery2) return createDefaultVoiceState();
+  if (!state.data.delivery2.voice) {
+    state.data.delivery2.voice = createDefaultVoiceState();
+  }
+  return state.data.delivery2.voice;
+}
+
+function ensureSharedVoiceDelegate() {
+  if (!state.d2VoiceDelegate) {
+    state.d2VoiceDelegate = createVoiceDelegate({
+      onThinkingLabel: (ev) => {
+        const v = getDelivery2Voice();
+        v.thinking_label = ev.text;
+        if (v.state === "thinking") {
+          v.status_label = ev.text;
+          syncVoiceDomInPlace();
+        }
+      },
+      onSpeakCommentary: (ev) => {
+        const v = getDelivery2Voice();
+        v.last_spoken_commentary = ev.text;
+      },
+    });
+  }
+  return state.d2VoiceDelegate;
+}
+
+function hasUnsettledDelivery2Hold() {
+  const entries =
+    state.data && state.data.delivery2 && Array.isArray(state.data.delivery2.entries)
+      ? state.data.delivery2.entries
+      : [];
+  return entries.some(
+    (e) => e && (e.kind === "approval_card" || e.kind === "oauth_card") && !e.settled,
+  );
+}
+
+function findUnsettledDangerApprovalCard() {
+  const d2 = state.data && state.data.delivery2 ? state.data.delivery2 : null;
+  const entries = d2 && Array.isArray(d2.entries) ? d2.entries : [];
+  const direct = entries.find((e) => e && e.kind === "approval_card" && !e.settled);
+  if (direct) return direct;
+  const threads = d2 && Array.isArray(d2.threads) ? d2.threads : [];
+  for (const thr of threads) {
+    if (thr && Array.isArray(thr.entries)) {
+      const card = thr.entries.find((e) => e && e.kind === "approval_card" && !e.settled);
+      if (card) return card;
+    }
+  }
+  return null;
+}
+
+function hasWorkspaceUnsettledMergeOrApproval() {
+  if (findUnsettledDangerApprovalCard()) return true;
+  const inboxItems =
+    state.data && state.data.inbox && Array.isArray(state.data.inbox.items)
+      ? state.data.inbox.items
+      : [];
+  return inboxItems.some(
+    (it) => it && !it.is_sample && it.status !== "shipped" && it.status !== "rejected",
+  );
+}
+
+function isVoiceLiveAudioState(voiceState) {
+  return (
+    voiceState === "connecting" ||
+    voiceState === "listening" ||
+    voiceState === "thinking" ||
+    voiceState === "speaking" ||
+    voiceState === "silence_warning"
+  );
+}
+
+function stopDelivery2VoiceLoops() {
+  if (state.d2VoiceConnectingTimer) {
+    clearTimeout(state.d2VoiceConnectingTimer);
+    state.d2VoiceConnectingTimer = 0;
+  }
+  if (state.d2VoiceHeartbeatTimer) {
+    clearTimeout(state.d2VoiceHeartbeatTimer);
+    state.d2VoiceHeartbeatTimer = 0;
+  }
+  if (state.d2VoiceClockTimer) {
+    clearTimeout(state.d2VoiceClockTimer);
+    state.d2VoiceClockTimer = 0;
+  }
+  if (state.d2VoiceRafId && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(state.d2VoiceRafId);
+  }
+  state.d2VoiceRafId = 0;
+  state.d2VoiceLastFrameMs = 0;
+}
+
+function syncVoiceDomInPlace() {
+  if (typeof document === "undefined") return;
+  const barEl = document.getElementById("d2-voice-bar");
+  if (!barEl) return;
+  const v = getDelivery2Voice();
+  barEl.dataset.state = v.state;
+  const barsNode = barEl.querySelector(".voice-bars");
+  if (barsNode) barsNode.dataset.state = v.state;
+  const statusEl = barEl.querySelector(".d2-voice-status");
+  if (statusEl && statusEl.textContent !== v.status_label) {
+    statusEl.textContent = v.status_label;
+  }
+  const timerEl = barEl.querySelector(".d2-voice-timer");
+  if (timerEl && timerEl.textContent !== v.timer_label) {
+    timerEl.textContent = v.timer_label;
+  }
+}
+
+function stepVoiceWaveformFrame(nowPerfMs) {
+  state.d2VoiceRafId = 0;
+  const v = getDelivery2Voice();
+  if (!state.d2VoiceClientLive || (v.state !== "listening" && v.state !== "speaking" && v.state !== "silence_warning")) {
+    return;
+  }
+  const ts = Number.isFinite(nowPerfMs) ? nowPerfMs : Date.now();
+  const dtMs = state.d2VoiceLastFrameMs > 0 ? Math.min(100, Math.max(0, ts - state.d2VoiceLastFrameMs)) : 16;
+  state.d2VoiceLastFrameMs = ts;
+
+  const targetAmp = v.muted ? 0 : v.state === "speaking" ? 0.8 : 0.1;
+  state.d2VoiceAmp =
+    typeof Motion.smoothAmp === "function"
+      ? Motion.smoothAmp(state.d2VoiceAmp, targetAmp, dtMs)
+      : targetAmp;
+
+  if (typeof document !== "undefined" && typeof Motion.voiceFrame === "function" && typeof Motion.applyVoiceBarsFrame === "function") {
+    const barEl = document.getElementById("d2-voice-bar");
+    const barsNode = barEl ? barEl.querySelector(".voice-bars") : null;
+    if (barsNode) {
+      const params = v.state === "speaking" ? { T: 550, d: 0.45 } : { T: 2200, d: 0.5 };
+      const scales = Motion.voiceFrame(ts, state.d2VoiceAmp, params);
+      Motion.applyVoiceBarsFrame(barsNode, scales);
+    }
+  }
+
+  if (typeof requestAnimationFrame === "function") {
+    state.d2VoiceRafId = requestAnimationFrame(stepVoiceWaveformFrame);
+  }
+}
+
+function scheduleVoiceClockTick() {
+  clearTimeout(state.d2VoiceClockTimer);
+  const v = getDelivery2Voice();
+  if (!state.d2VoiceClientLive || !isVoiceLiveAudioState(v.state)) return;
+
+  state.d2VoiceClockTimer = setTimeout(() => {
+    const cur = getDelivery2Voice();
+    if (!state.d2VoiceClientLive || !isVoiceLiveAudioState(cur.state)) return;
+
+    const nowMs = Date.now();
+    const nowUnix = Math.floor(nowMs / 1000);
+    const maxDur = Number(cur.max_duration_secs) || 600;
+    if (Number.isFinite(cur.expires_at_unix) && cur.expires_at_unix !== null) {
+      const rem = Math.max(0, cur.expires_at_unix - nowUnix);
+      cur.remaining_secs = rem;
+      cur.elapsed_secs = Math.min(maxDur, Math.max(0, maxDur - rem));
+      cur.timer_label = formatVoiceTimer(cur.elapsed_secs, maxDur);
+      if (rem === 0) {
+        state.d2VoiceClientLive = false;
+        cur.state = "paused";
+        cur.audio_leg_parked = true;
+        cur.ended = true;
+        cur.ended_reason = "ttl_expired";
+        cur.status_label = VOICE_TTL_ENDED_COPY;
+        cur.credits_rate_per_min = 0;
+        stopDelivery2VoiceLoops();
+        renderDelivery2Panel();
+        return;
+      }
+    }
+
+    if (hasUnsettledDelivery2Hold()) {
+      if (!state.d2VoiceHoldStartMs) state.d2VoiceHoldStartMs = nowMs;
+      const holdSecs = Math.floor((nowMs - state.d2VoiceHoldStartMs) / 1000);
+      if (holdSecs >= (Number(cur.hold_park_secs) || 8)) {
+        parkDelivery2Voice("hold_park");
+        return;
+      }
+    } else {
+      state.d2VoiceHoldStartMs = 0;
+    }
+
+    if (state.d2VoiceLastActivityMs > 0) {
+      const idleSecs = Math.floor((nowMs - state.d2VoiceLastActivityMs) / 1000);
+      if (idleSecs >= (Number(cur.silence_park_secs) || 90)) {
+        parkDelivery2Voice("silence_timeout");
+        return;
+      }
+      if (idleSecs >= (Number(cur.silence_warning_secs) || 75) && cur.state !== "silence_warning") {
+        cur.state = "silence_warning";
+        cur.status_label = SILENCE_WARNING_COPY;
+        renderDelivery2Panel();
+        scheduleVoiceClockTick();
+        return;
+      }
+    }
+
+    syncVoiceDomInPlace();
+    scheduleVoiceClockTick();
+  }, 1000);
+}
+
+function scheduleVoiceHeartbeat() {
+  clearTimeout(state.d2VoiceHeartbeatTimer);
+  const v = getDelivery2Voice();
+  if (!state.d2VoiceClientLive || !isVoiceLiveAudioState(v.state) || !v.session_id) return;
+  const intervalMs = Math.max(1000, (Number(v.heartbeat_interval_secs) || 5) * 1000);
+  state.d2VoiceHeartbeatTimer = setTimeout(async () => {
+    await tickDelivery2VoiceHeartbeat();
+    scheduleVoiceHeartbeat();
+  }, intervalMs);
+}
+
+function ensureDelivery2VoiceLoops() {
+  const v = getDelivery2Voice();
+  if (!state.d2VoiceClientLive || !isVoiceLiveAudioState(v.state)) {
+    stopDelivery2VoiceLoops();
+    return;
+  }
+  scheduleVoiceClockTick();
+  scheduleVoiceHeartbeat();
+  if (
+    (v.state === "listening" || v.state === "speaking" || v.state === "silence_warning") &&
+    !state.d2VoiceRafId &&
+    typeof requestAnimationFrame === "function"
+  ) {
+    state.d2VoiceRafId = requestAnimationFrame(stepVoiceWaveformFrame);
+  }
+}
+
+function persistLocalVoiceMeta(voiceObj) {
+  try {
+    if (voiceObj && voiceObj.session_id && !voiceObj.ended) {
+      localStorage.setItem(
+        "chinwag.ui.voice.session",
+        JSON.stringify({ session_id: voiceObj.session_id, thread_id: voiceObj.thread_id || "thr-main" }),
+      );
+    } else {
+      localStorage.removeItem("chinwag.ui.voice.session");
+    }
+  } catch (e) {}
+}
+
+async function startDelivery2Voice(opts = {}) {
+  const skipConnectingHandshake = Boolean(opts && opts.immediateListening);
+  const activeThreadId = String(
+    (state.data && state.data.delivery2 && state.data.delivery2.active_thread_id) || "thr-main",
+  );
+  stopDelivery2VoiceLoops();
+  state.d2VoiceDangerNotice = null;
+  state.d2VoiceClientLive = true;
+  state.d2VoiceLastActivityMs = Date.now();
+  state.d2VoiceHoldStartMs = hasUnsettledDelivery2Hold() ? Date.now() : 0;
+
+  const v = getDelivery2Voice();
+  if (canTransitionVoiceState(v.state, "connecting")) {
+    v.state = "connecting";
+    v.status_label = "Connecting…";
+    v.audio_leg_parked = false;
+    v.ended = false;
+  }
+  if (!isDelivery2RailExpanded()) {
+    setDelivery2RailExpanded(true, { persist: true, animate: true });
+  } else {
+    renderDelivery2Panel();
+  }
+
+  let handshakeTimedOut = false;
+  state.d2VoiceConnectingTimer = setTimeout(() => {
+    const cur = getDelivery2Voice();
+    if (cur.state === "connecting") {
+      handshakeTimedOut = true;
+      state.d2VoiceClientLive = false;
+      cur.state = "paused";
+      cur.audio_leg_parked = true;
+      cur.credits_rate_per_min = 0;
+      cur.status_label = VOICE_PAUSED_COPY;
+      stopDelivery2VoiceLoops();
+      renderDelivery2Panel();
+    }
+  }, VOICE_CONNECTING_TIMEOUT_MS);
+
+  try {
+    const startRes = await apiRequest("POST", "/api/v1/delivery2/voice/session", {
+      action: "start",
+      connecting: !skipConnectingHandshake,
+      thread_id: activeThreadId,
+    });
+    if (handshakeTimedOut) {
+      return false;
+    }
+    clearTimeout(state.d2VoiceConnectingTimer);
+    state.d2VoiceConnectingTimer = 0;
+
+    if (startRes && startRes.state) {
+      applyDelivery2ServerPayload(startRes.state);
+    }
+
+    if (!skipConnectingHandshake) {
+      const readyRes = await apiRequest("POST", "/api/v1/delivery2/voice/session", {
+        action: "ready",
+        thread_id: activeThreadId,
+      });
+      if (readyRes && readyRes.state) {
+        applyDelivery2ServerPayload(readyRes.state);
+      }
+    }
+
+    const liveV = getDelivery2Voice();
+    persistLocalVoiceMeta(liveV);
+    ensureDelivery2VoiceLoops();
+    renderDelivery2Panel();
+    return true;
+  } catch (err) {
+    clearTimeout(state.d2VoiceConnectingTimer);
+    state.d2VoiceConnectingTimer = 0;
+    state.d2VoiceClientLive = false;
+    stopDelivery2VoiceLoops();
+    if (err && err.payload && err.payload.voice) {
+      state.data.delivery2.voice = normalizeDelivery2VoiceState(err.payload.voice, activeThreadId);
+    } else {
+      const cur = getDelivery2Voice();
+      cur.state = "paused";
+      cur.audio_leg_parked = true;
+      cur.credits_rate_per_min = 0;
+      cur.status_label = err && err.message ? err.message : VOICE_PAUSED_COPY;
+    }
+    renderDelivery2Panel();
+    toaster.show(err && err.message ? err.message : "Could not start voice session.");
+    return false;
+  }
+}
+
+async function resumeDelivery2Voice() {
+  const v = getDelivery2Voice();
+  if (!v.session_id || v.ended) {
+    return startDelivery2Voice();
+  }
+  state.d2VoiceClientLive = true;
+  state.d2VoiceLastActivityMs = Date.now();
+  state.d2VoiceHoldStartMs = hasUnsettledDelivery2Hold() ? Date.now() : 0;
+  try {
+    const res = await apiRequest("POST", "/api/v1/delivery2/voice/session", {
+      action: "resume",
+      thread_id: v.thread_id || "thr-main",
+    });
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    persistLocalVoiceMeta(getDelivery2Voice());
+    ensureDelivery2VoiceLoops();
+    renderDelivery2Panel();
+    return true;
+  } catch (err) {
+    state.d2VoiceClientLive = false;
+    stopDelivery2VoiceLoops();
+    if (err && err.payload && err.payload.voice) {
+      state.data.delivery2.voice = normalizeDelivery2VoiceState(err.payload.voice, v.thread_id);
+    }
+    renderDelivery2Panel();
+    toaster.show(err && err.message ? err.message : "Could not resume voice session.");
+    return false;
+  }
+}
+
+async function toggleDelivery2VoiceMute() {
+  const v = getDelivery2Voice();
+  if (!v.session_id) return false;
+  const nextMuted = !v.muted;
+  try {
+    const res = await apiRequest("POST", "/api/v1/delivery2/voice/session", {
+      action: nextMuted ? "mute" : "unmute",
+    });
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    renderDelivery2Panel();
+    return true;
+  } catch (err) {
+    toaster.show(err && err.message ? err.message : "Could not update microphone mute state.");
+    return false;
+  }
+}
+
+async function parkDelivery2Voice(reason = "user_paused") {
+  const v = getDelivery2Voice();
+  state.d2VoiceClientLive = false;
+  stopDelivery2VoiceLoops();
+  v.state = "paused";
+  v.audio_leg_parked = true;
+  v.credits_rate_per_min = 0;
+  v.park_reason = reason;
+  v.status_label = reason === "user_ended" ? "Call ended · 0 Cr" : VOICE_PAUSED_COPY;
+  if (reason === "user_ended") {
+    v.ended = true;
+    v.ended_reason = "user_ended";
+  }
+  renderDelivery2Panel();
+  if (!v.session_id) return true;
+  try {
+    const res = await apiRequest("POST", "/api/v1/delivery2/voice/park", {
+      session_id: v.session_id,
+      reason,
+    });
+    if (res && res.state) applyDelivery2ServerPayload(res.state);
+    persistLocalVoiceMeta(getDelivery2Voice());
+    renderDelivery2Panel();
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+async function endDelivery2Voice() {
+  const v = getDelivery2Voice();
+  state.d2VoiceClientLive = false;
+  state.d2VoiceDangerNotice = null;
+  stopDelivery2VoiceLoops();
+  try {
+    if (v.session_id) {
+      const res = await apiRequest("POST", "/api/v1/delivery2/voice/session", {
+        action: "end",
+      });
+      if (res && res.state) applyDelivery2ServerPayload(res.state);
+    }
+  } catch (err) {
+    // Clean local teardown even on transient network drop
+  }
+  const nextV = getDelivery2Voice();
+  nextV.state = "idle";
+  nextV.session_id = null;
+  nextV.audio_leg_parked = true;
+  nextV.ended = false;
+  nextV.credits_rate_per_min = 0;
+  persistLocalVoiceMeta(null);
+  renderDelivery2Panel();
+  return true;
+}
+
+async function tickDelivery2VoiceHeartbeat(extra = {}) {
+  const v = getDelivery2Voice();
+  if (!v.session_id) return null;
+  const nowMs = Date.now();
+  const speechActive = Boolean(extra && extra.speech_active);
+  const bargeIn = Boolean(extra && extra.barge_in);
+  if (speechActive || bargeIn) {
+    state.d2VoiceLastActivityMs = nowMs;
+  }
+  const computedIdleSecs =
+    extra && Number.isFinite(Number(extra.idle_secs))
+      ? Math.max(0, Math.floor(Number(extra.idle_secs)))
+      : state.d2VoiceLastActivityMs > 0
+        ? Math.max(0, Math.floor((nowMs - state.d2VoiceLastActivityMs) / 1000))
+        : 0;
+  const computedHoldSecs =
+    extra && Number.isFinite(Number(extra.hold_secs))
+      ? Math.max(0, Math.floor(Number(extra.hold_secs)))
+      : hasUnsettledDelivery2Hold() && state.d2VoiceHoldStartMs > 0
+        ? Math.max(0, Math.floor((nowMs - state.d2VoiceHoldStartMs) / 1000))
+        : 0;
+
+  try {
+    const res = await apiRequest("POST", "/api/v1/delivery2/voice/heartbeat", {
+      session_id: v.session_id,
+      idle_secs: computedIdleSecs,
+      hold_secs: computedHoldSecs,
+      speech_active: speechActive,
+      barge_in: bargeIn,
+    });
+    if (res && res.state) {
+      applyDelivery2ServerPayload(res.state);
+    } else if (res && res.voice) {
+      state.data.delivery2.voice = normalizeDelivery2VoiceState(res.voice, v.thread_id);
+    }
+    const updated = getDelivery2Voice();
+    if (!state.d2VoiceClientLive || updated.state === "paused" || updated.audio_leg_parked || updated.ended) {
+      stopDelivery2VoiceLoops();
+    }
+    renderDelivery2Panel();
+    return updated;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function sendDelivery2VoiceTurn(rawUtterance, opts = {}) {
+  const utterance = String(rawUtterance ?? "").trim();
+  if (!utterance) return null;
+  const v = getDelivery2Voice();
+  const delegate = ensureSharedVoiceDelegate();
+  const activeThreadId = String(
+    (opts && opts.threadId) ||
+      (state.data && state.data.delivery2 && state.data.delivery2.active_thread_id) ||
+      "thr-main",
+  );
+
+  // Strip danger-class options before spokenOption so caller options can never route around the physical merge gate
+  const rawCallerOptions = opts && Array.isArray(opts.options) ? opts.options : null;
+  const safeCallerOptions = rawCallerOptions ? filterSafeVoiceOptions(rawCallerOptions) : null;
+  const dangerCallerOptions = rawCallerOptions
+    ? rawCallerOptions.filter((opt) => optionContainsDangerVerb(opt))
+    : [];
+
+  // Fast client-side check for spoken HITL option matching (fail-closed on negations & bare "yes")
+  const dangerCard = findUnsettledDangerApprovalCard();
+  const hasDangerTarget = Boolean(dangerCard) || hasWorkspaceUnsettledMergeOrApproval();
+  if (dangerCard && spokenOption(utterance, ["Deny"]) === "deny") {
+    state.d2VoiceLastActivityMs = Date.now();
+    await submitDelivery2Approval(null, null, null, dangerCard, "deny", {
+      source: "voice",
+      physicalClickVerified: false,
+    });
+    return { ok: true, handled: "spoken_deny" };
+  }
+
+  const matchedStrippedDangerOpt =
+    dangerCallerOptions.length > 0 && spokenOption(utterance, dangerCallerOptions) !== null;
+  if (matchedStrippedDangerOpt || isVoiceDangerApprovalAttempt(utterance, hasDangerTarget)) {
+    state.d2VoiceDangerNotice = DANGER_VOICE_REJECT_COPY;
+    delegate.observeCommentary(DANGER_VOICE_REJECT_COPY);
+    try {
+      await apiRequest("POST", "/api/v1/delivery2/voice/turn", {
+        utterance,
+        session_id: v.session_id,
+        thread_id: activeThreadId,
+        ...(rawCallerOptions ? { options: rawCallerOptions } : {}),
+      });
+    } catch (err) {
+      if (err && err.message) {
+        state.d2VoiceDangerNotice = err.message;
+      }
+    }
+    renderDelivery2Panel();
+    return {
+      ok: false,
+      error_code: "VoiceDangerApprovalForbidden",
+      physical_click_required: true,
+      message: state.d2VoiceDangerNotice,
+    };
+  }
+
+  state.d2VoiceDangerNotice = null;
+  state.d2VoiceLastActivityMs = Date.now();
+  if (canTransitionVoiceState(v.state, "thinking")) {
+    v.state = "thinking";
+    const toolLabel =
+      opts && opts.toolLabel ? String(opts.toolLabel) : "Checking repository & board status";
+    const tEv = delegate.observeThinking(toolLabel);
+    v.status_label = tEv ? tEv.text : v.thinking_label || "Thinking";
+    renderDelivery2Panel();
+  }
+
+  try {
+    const reqBody = {
+      utterance,
+      session_id: v.session_id,
+      thread_id: activeThreadId,
+    };
+    if (opts && opts.toolLabel) reqBody.tool_label = String(opts.toolLabel);
+    if (safeCallerOptions && safeCallerOptions.length > 0) reqBody.options = safeCallerOptions;
+    if (opts && Number.isFinite(Number(opts.turnCredits))) {
+      reqBody.turn_credits = Number(opts.turnCredits);
+    }
+    const res = await apiRequest("POST", "/api/v1/delivery2/voice/turn", reqBody);
+    if (res && res.state) {
+      applyDelivery2ServerPayload(res.state);
+    }
+    const spokenText =
+      res && res.spoken_commentary
+        ? String(res.spoken_commentary)
+        : res && res.entry && res.entry.body
+          ? String(res.entry.body)
+          : "";
+    if (spokenText) {
+      delegate.observeCommentary(spokenText, { interrupted: Boolean(opts && opts.interrupted) });
+    }
+    const afterV = getDelivery2Voice();
+    persistLocalVoiceMeta(afterV);
+    ensureDelivery2VoiceLoops();
+    renderDelivery2Panel();
+    await refreshBootstrapQuietly();
+    return res;
+  } catch (err) {
+    if (err && err.code === "VoiceDangerApprovalForbidden") {
+      state.d2VoiceDangerNotice = err.message || DANGER_VOICE_REJECT_COPY;
+      delegate.observeCommentary(state.d2VoiceDangerNotice);
+      const cur = getDelivery2Voice();
+      if (state.d2VoiceClientLive && cur.session_id && !cur.ended) {
+        cur.state = "listening";
+        cur.status_label = cur.muted ? "Muted" : "Listening";
+      }
+      renderDelivery2Panel();
+      return {
+        ok: false,
+        error_code: "VoiceDangerApprovalForbidden",
+        physical_click_required: true,
+        message: state.d2VoiceDangerNotice,
+      };
+    }
+    if (err && err.payload && err.payload.voice) {
+      state.data.delivery2.voice = normalizeDelivery2VoiceState(err.payload.voice, activeThreadId);
+      state.d2VoiceClientLive = false;
+      stopDelivery2VoiceLoops();
+    }
+    renderDelivery2Panel();
+    toaster.show(err && err.message ? err.message : "Voice turn could not complete.");
+    return null;
+  }
+}
+
+function buildDelivery2VoiceCallBar(d2) {
+  const v = (d2 && d2.voice) || createDefaultVoiceState();
+  if (v.state === "idle" && !v.session_id) return null;
+
+  const barsNode = el(
+    "span",
+    {
+      className: "voice-bars",
+      "aria-hidden": "true",
+      dataset: { state: v.state },
+    },
+    Array.from({ length: 9 }, () => el("i")),
+  );
+  if (v.state === "connecting" || v.state === "thinking") {
+    Motion.observeLoop(barsNode);
+  }
+
+  const controls = [];
+  if (v.state === "paused" && !v.ended) {
+    controls.push(
+      el(
+        "button",
+        {
+          type: "button",
+          className: "d2-micro-btn",
+          id: "d2-voice-btn-resume",
+          onClick: () => resumeDelivery2Voice(),
+        },
+        "Resume",
+      ),
+    );
+  } else if (!v.ended) {
+    controls.push(
+      el(
+        "button",
+        {
+          type: "button",
+          className: "d2-micro-btn",
+          id: "d2-voice-btn-mute",
+          "aria-pressed": v.muted ? "true" : "false",
+          onClick: () => toggleDelivery2VoiceMute(),
+        },
+        v.muted ? "Unmute" : "Mute",
+      ),
+    );
+  }
+  controls.push(
+    el(
+      "button",
+      {
+        type: "button",
+        className: "d2-micro-btn",
+        id: "d2-voice-btn-end",
+        onClick: () => endDelivery2Voice(),
+      },
+      "End",
+    ),
+  );
+
+  const subCopy = state.d2VoiceDangerNotice
+    ? state.d2VoiceDangerNotice
+    : v.state === "paused"
+      ? `${v.pause_badge || "Paused · 0 Cr"} · ${v.credits_used}/${v.credits_cap} Cr used`
+      : `Say "Deny" or click Approve · ${v.credits_used}/${v.credits_cap} Cr cap · 90s idle`;
+
+  return el(
+    "div",
+    {
+      className: "d2-voice-bar",
+      id: "d2-voice-bar",
+      role: "region",
+      "aria-label": "Live voice call",
+      dataset: { state: v.state },
+    },
+    el(
+      "div",
+      { className: "d2-voice-row" },
+      el(
+        "div",
+        { className: "d2-voice-left" },
+        barsNode,
+        el("span", { className: "d2-voice-status", id: "d2-voice-status" }, v.status_label || "Listening"),
+      ),
+      el("span", { className: "d2-voice-timer", id: "d2-voice-timer" }, v.timer_label || "00:00 / 10:00"),
+      el("div", { className: "d2-voice-actions" }, controls),
+    ),
+    el(
+      "div",
+      { className: "d2-voice-sub" },
+      el("span", { className: "d2-voice-sub-text" }, subCopy),
+    ),
+  );
+}
+
 function renderDelivery2Entry(entry) {
   const kind = entry.kind;
 
@@ -6491,18 +7704,30 @@ function renderDelivery2Entry(entry) {
     }
 
     const actionsGroup = el("div", { className: "d2-hitl-actions" });
+    const onTrustedHitlApprove = (ev) => {
+      if (!ev || ev.isTrusted !== true) return;
+      return submitDelivery2Approval(cardNode, approveBtn, actionsGroup, entry, "approve", {
+        source: "physical_click",
+        physicalClickVerified: true,
+      });
+    };
     const approveBtn = actionBtn({
       label: "Approve & merge",
       variant: "primary",
       size: "sm",
       extraClass: "d2-hitl-primary",
-      onClick: () => submitDelivery2Approval(cardNode, approveBtn, actionsGroup, entry, "approve"),
+      onClick: onTrustedHitlApprove,
     });
+    trustedKeyboardApprovals.set(approveBtn, onTrustedHitlApprove);
     const denyBtn = actionBtn({
       label: "Deny",
       variant: "secondary",
       size: "sm",
-      onClick: () => submitDelivery2Approval(cardNode, denyBtn, actionsGroup, entry, "deny"),
+      onClick: () =>
+        submitDelivery2Approval(cardNode, denyBtn, actionsGroup, entry, "deny", {
+          source: "physical_click",
+          physicalClickVerified: true,
+        }),
     });
     const viewDiffBtn = actionBtn({
       label: "View diff →",
@@ -6527,6 +7752,13 @@ function renderDelivery2Entry(entry) {
         entry.diff_summary ? el("span", null, entry.diff_summary) : null,
         entry.check_proof ? el("span", null, entry.check_proof) : null,
       ),
+      state.d2VoiceDangerNotice
+        ? el(
+            "div",
+            { className: "d2-hitl-voice-notice", role: "alert" },
+            state.d2VoiceDangerNotice,
+          )
+        : null,
       actionsGroup,
     );
     return cardNode;
@@ -6915,7 +8147,10 @@ function renderDelivery2Panel() {
   if (!track) return;
   clearNode(track);
 
-  // 2. Render Zone 1: Header & 4-Surface <200ms Sync Radar (Zero voice stubs in Phase 1)
+  // 2. Render Zone 1: Header, 4-Surface <200ms Sync Radar & Duplex Live Voice Call Bar (CHWG-0255)
+  const voiceObj = d2.voice || createDefaultVoiceState();
+  const isVoiceCallMounted = voiceObj.state !== "idle" || Boolean(voiceObj.session_id);
+  const isVoiceLive = isVoiceLiveAudioState(voiceObj.state);
   const liveDot = el("span", {
     className: "d2-status-dot",
     "aria-hidden": "true",
@@ -6962,6 +8197,35 @@ function renderDelivery2Panel() {
       el(
         "div",
         { className: "d2-head-actions" },
+        el(
+          "button",
+          {
+            type: "button",
+            className: "d2-icon-btn",
+            id: "d2-btn-mic",
+            "aria-pressed": isVoiceLive ? "true" : "false",
+            "aria-label": isVoiceLive
+              ? "Pause live voice"
+              : isVoiceCallMounted && !voiceObj.ended
+                ? "Resume live voice"
+                : "Start live voice",
+            title: isVoiceLive
+              ? "Pause live voice"
+              : isVoiceCallMounted && !voiceObj.ended
+                ? "Resume live voice"
+                : "Start live voice (40 Cr cap · 10 min)",
+            onClick: () => {
+              if (isVoiceLive) {
+                parkDelivery2Voice("user_paused");
+              } else if (isVoiceCallMounted && !voiceObj.ended) {
+                resumeDelivery2Voice();
+              } else {
+                startDelivery2Voice();
+              }
+            },
+          },
+          voiceObj.muted ? ICONS.micOff() : ICONS.mic(),
+        ),
         el(
           "button",
           {
@@ -7028,6 +8292,7 @@ function renderDelivery2Panel() {
       ),
       el("span", { className: "d2-sync-latency" }, (d2.sync_radar && d2.sync_radar.latency_label) || "<200ms"),
     ),
+    buildDelivery2VoiceCallBar(d2),
     state.d2Popover === "history" ? buildDelivery2HistoryPopover(d2) : null,
   );
 
@@ -7221,7 +8486,32 @@ function renderDelivery2Panel() {
           },
           "+ Connections",
         ),
-        el("div", { className: "d2-composer-right" }, actionButton),
+        el(
+          "div",
+          { className: "d2-composer-right" },
+          el(
+            "button",
+            {
+              type: "button",
+              id: "d2-composer-mic",
+              className: "d2-mic-btn",
+              "aria-pressed": isVoiceLive ? "true" : "false",
+              "aria-label": isVoiceLive ? "Pause live voice" : "Start live voice",
+              title: isVoiceLive ? "Pause live voice" : "Talk with Delivery-2 (40 Cr cap)",
+              onClick: () => {
+                if (isVoiceLive) {
+                  parkDelivery2Voice("user_paused");
+                } else if (isVoiceCallMounted && !voiceObj.ended) {
+                  resumeDelivery2Voice();
+                } else {
+                  startDelivery2Voice();
+                }
+              },
+            },
+            voiceObj.muted ? ICONS.micOff() : ICONS.mic(),
+          ),
+          actionButton,
+        ),
       ),
     ),
     state.d2ComposerError
@@ -7487,7 +8777,12 @@ function handleGlobalKeydown(ev) {
         const hitlBtn = hitlCard.querySelector(".d2-hitl-primary");
         if (hitlBtn && hitlBtn.getAttribute("aria-disabled") !== "true" && !Motion.isArming(hitlBtn)) {
           ev.preventDefault();
-          hitlBtn.click();
+          const trustedApprove = ev && ev.isTrusted === true ? trustedKeyboardApprovals.get(hitlBtn) : null;
+          if (trustedApprove) {
+            trustedApprove(ev);
+          } else {
+            hitlBtn.click();
+          }
         }
       }
       return;
@@ -7496,7 +8791,12 @@ function handleGlobalKeydown(ev) {
       const primary = document.getElementById("sheet-primary-action");
       if (primary && primary.getAttribute("aria-disabled") !== "true" && !Motion.isArming(primary)) {
         ev.preventDefault();
-        primary.click();
+        const trustedApprove = ev && ev.isTrusted === true ? trustedKeyboardApprovals.get(primary) : null;
+        if (trustedApprove) {
+          trustedApprove(ev);
+        } else {
+          primary.click();
+        }
       }
       return;
     }
@@ -7806,6 +9106,21 @@ async function boot() {
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && state.booted) {
       resumeDelivery2FromCursor();
+    }
+  });
+
+  window.addEventListener("pagehide", () => {
+    const v = getDelivery2Voice();
+    if (v && v.session_id && state.d2VoiceClientLive && !v.ended) {
+      try {
+        fetch("/api/v1/delivery2/voice/park", {
+          method: "POST",
+          headers: buildSecurityHeaders(true),
+          credentials: "same-origin",
+          keepalive: true,
+          body: JSON.stringify({ session_id: v.session_id, reason: "page_reload" }),
+        }).catch(() => {});
+      } catch (e) {}
     }
   });
 

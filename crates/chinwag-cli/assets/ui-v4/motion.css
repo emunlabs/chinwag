@@ -7,6 +7,7 @@
   --ease-out-expo: cubic-bezier(0.22, 1, 0.36, 1);   /* travel */
   --ease-standard: cubic-bezier(0.2, 0, 0, 1);       /* state  */
   --ease-in-crisp: cubic-bezier(0.4, 0, 1, 1);       /* exit   */
+  --ease-sine:     cubic-bezier(0.37, 0, 0.63, 1);   /* voice  */
 
   --dur-instant: 90ms;
   --dur-fast:    150ms;
@@ -225,6 +226,46 @@ nav.tabs, .tabrow, .segmented { position: relative; }
 
 .d2-status-dot[data-live] { animation: live-breathe var(--dur-heartbeat) ease-in-out infinite; }
 
+/* ── 6B · Duplex Live Voice 9-bar waveform (scaleY only, zero inline styles) ─ */
+.voice-bars > i {
+  display: block;
+  inline-size: 2px;
+  block-size: 16px;
+  border-radius: 1px;
+  background: var(--ink-primary);
+  transform: scaleY(0.12);
+  transform-origin: 50% 50%;
+  will-change: transform;
+}
+.voice-bars > i:nth-child(1) { --i: 0; }
+.voice-bars > i:nth-child(2) { --i: 1; }
+.voice-bars > i:nth-child(3) { --i: 2; }
+.voice-bars > i:nth-child(4) { --i: 3; }
+.voice-bars > i:nth-child(5) { --i: 4; }
+.voice-bars > i:nth-child(6) { --i: 5; }
+.voice-bars > i:nth-child(7) { --i: 6; }
+.voice-bars > i:nth-child(8) { --i: 7; }
+.voice-bars > i:nth-child(9) { --i: 8; }
+.voice-bars[data-state="idle"] > i,
+.voice-bars[data-state="paused"] > i {
+  background: var(--ink-muted);
+  transform: scaleY(0.12);
+  transition: transform var(--dur-fast) var(--ease-standard);
+}
+.voice-bars[data-state="silence_warning"] > i {
+  background: var(--status-warning-ink);
+}
+.voice-bars[data-state="connecting"] > i,
+.voice-bars[data-state="thinking"] > i {
+  background: var(--ink-secondary);
+  animation: voice-travel var(--dur-heartbeat) var(--ease-sine) infinite;
+  animation-delay: calc(var(--i, 0) * -120ms);
+}
+@keyframes voice-travel {
+  0%, 100% { transform: scaleY(0.12); }
+  50%      { transform: scaleY(0.49); }
+}
+
 /* ── 7 · The one heartbeat: live dot, hold pulse, skeleton ──────────────── */
 .pill-status[data-live] .dot                 { animation: live-breathe     var(--dur-heartbeat) ease-in-out infinite; }
 .banner-warning .banner-head svg[data-pulse] { animation: hold-pulse       var(--dur-heartbeat) ease-in-out infinite; }
@@ -270,6 +311,14 @@ html[data-theme-switching] *::after { transition: none !important; }
   [data-arrived]::after,
   .d2-card[data-handoff-flash="true"]::after { animation: none !important; display: none; }
   .tooltip[data-state="open"] { transition-delay: 0ms !important; }
+  .voice-bars > i { animation: none !important; transition: none !important; }
+  .voice-bars[data-state="idle"] > i,
+  .voice-bars[data-state="paused"] > i { transform: scaleY(0.12) !important; }
+  .voice-bars[data-state="connecting"] > i,
+  .voice-bars[data-state="listening"] > i,
+  .voice-bars[data-state="silence_warning"] > i { transform: scaleY(0.28) !important; }
+  .voice-bars[data-state="thinking"] > i { transform: scaleY(0.42) !important; }
+  .voice-bars[data-state="speaking"] > i { transform: scaleY(0.62) !important; }
 }
 
 /* ── 11 · Forced colors: redraw motion-owned fills with system colors ───── */
@@ -278,5 +327,8 @@ html[data-theme-switching] *::after { transition: none !important; }
   .seg-thumb { forced-color-adjust: none; background: Canvas; box-shadow: none; outline: 2px solid Highlight; outline-offset: -2px; }
   [data-arrived]::after { border-color: Highlight; }
   .btn-spinner { forced-color-adjust: none; border-color: ButtonText; border-inline-end-color: transparent; }
-  .sheet, .modal, .popover, .toast { border: 1px solid CanvasText; }
+  .voice-bars > i { forced-color-adjust: none; background: Highlight; }
+  .voice-bars[data-state="idle"] > i,
+  .voice-bars[data-state="paused"] > i { background: GrayText; }
+  .sheet, .modal, .popover, .toast, .d2-voice-bar { border: 1px solid CanvasText; }
 }

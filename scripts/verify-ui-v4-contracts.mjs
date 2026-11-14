@@ -109,11 +109,78 @@ assert.equal(
   false,
   "app.js must not expose client-side 'Mark connected' OAuth self-assertion bypass",
 );
-for (const phase2VoiceStub of ["d2-btn-mic", "d2-voice", "voice-call", "Start voice", "Mute mic"]) {
+// CHWG-0255 Phase 2 Duplex Live Voice static & deterministic golden-ratio waveform contracts
+assert.equal(
+  motionJs.includes("Math.random"),
+  false,
+  "motion.js must contain zero Math.random() calls (deterministic golden-ratio waveform only)",
+);
+assert.equal(
+  indexHtml.includes("style=") || appJs.includes(".style."),
+  false,
+  "index.html and app.js must respect STRICT_UI_CSP (zero inline style attributes or .style mutations)",
+);
+for (const voiceCssContract of [
+  "--ease-sine:",
+  ".voice-bars > i",
+  "@keyframes voice-travel",
+]) {
   assert.equal(
-    indexHtml.includes(phase2VoiceStub) || appJs.includes(phase2VoiceStub),
-    false,
-    `CHWG-0254 Phase 1 must contain zero Phase 2 Duplex Voice stubs ('${phase2VoiceStub}')`,
+    motionCss.includes(voiceCssContract),
+    true,
+    `motion.css missing Duplex Voice contract '${voiceCssContract}'`,
+  );
+}
+for (const voiceStyleContract of [
+  ".d2-voice-bar",
+  ".voice-bars",
+  ".d2-voice-timer",
+  "font-variant-numeric: tabular-nums;",
+  ".d2-hitl-voice-notice",
+]) {
+  assert.equal(
+    stylesCss.includes(voiceStyleContract),
+    true,
+    `styles.css missing Duplex Voice contract '${voiceStyleContract}'`,
+  );
+}
+const RealMotion = (() => {
+  const motionCjs = `${motionJs.replace(/^export\s+/gm, "")}\nmodule.exports = { voiceFrame, ampFromRms, smoothAmp, applyVoiceBarsFrame };`;
+  const mSandbox = { module: { exports: {} }, Math, Number, Float32Array, WeakSet, WeakMap, Set, Map, Promise, setTimeout, clearTimeout };
+  vm.runInNewContext(motionCjs, mSandbox);
+  return mSandbox.module.exports;
+})();
+assert.equal(typeof RealMotion.voiceFrame, "function", "motion.js must export voiceFrame");
+assert.equal(typeof RealMotion.ampFromRms, "function", "motion.js must export ampFromRms");
+assert.equal(typeof RealMotion.smoothAmp, "function", "motion.js must export smoothAmp");
+{
+  const listeningVec = RealMotion.voiceFrame(0, 0.1, { T: 2200, d: 0.5 });
+  const expectedListening = [0.148, 0.148, 0.173, 0.169, 0.193, 0.196, 0.165, 0.162, 0.143];
+  assert.equal(listeningVec.length, 9);
+  expectedListening.forEach((want, idx) => {
+    assert.ok(
+      Math.abs(listeningVec[idx] - want) <= 0.001,
+      `Motion.voiceFrame listening bar ${idx}: got ${listeningVec[idx]}, expected ${want} (±0.001)`,
+    );
+  });
+  const speakingT0 = RealMotion.voiceFrame(0, 0.8, { T: 550, d: 0.45 });
+  const speakingT550 = RealMotion.voiceFrame(550, 0.8, { T: 550, d: 0.45 });
+  const expectedSpeaking = [0.348, 0.357, 0.556, 0.535, 0.714, 0.733, 0.495, 0.462, 0.311];
+  expectedSpeaking.forEach((want, idx) => {
+    assert.ok(
+      Math.abs(speakingT0[idx] - want) <= 0.001,
+      `Motion.voiceFrame speaking t=0 bar ${idx}: got ${speakingT0[idx]}, expected ${want} (±0.001)`,
+    );
+    assert.ok(
+      Math.abs(speakingT0[idx] - speakingT550[idx]) <= 1e-5,
+      `Motion.voiceFrame bar ${idx} must loop seamlessly at t=T`,
+    );
+  });
+  assert.ok(RealMotion.ampFromRms(0) <= 0.001);
+  assert.ok(RealMotion.ampFromRms(0.2) > 0.5);
+  assert.ok(
+    RealMotion.smoothAmp(0.1, 0.9, 40) - 0.1 > 0.9 - RealMotion.smoothAmp(0.9, 0.1, 40),
+    "Motion.smoothAmp 40ms attack must outpace 180ms release",
   );
 }
 
@@ -343,6 +410,18 @@ class StubNode {
   click() {
     const ev = {
       type: "click",
+      isTrusted: false,
+      target: this,
+      preventDefault() {},
+      stopPropagation() {},
+    };
+    if (typeof this.onclick === "function") this.onclick(ev);
+    for (const fn of this.listeners.get("click") || []) fn(ev);
+  }
+  clickTrusted() {
+    const ev = {
+      type: "click",
+      isTrusted: true,
       target: this,
       preventDefault() {},
       stopPropagation() {},
@@ -540,6 +619,8 @@ const sandbox = {
   setTimeout,
   clearTimeout,
   requestAnimationFrame: (fn) => setTimeout(fn, 0),
+  cancelAnimationFrame: clearTimeout,
+  Float32Array,
   Date,
   Math,
   JSON,
@@ -607,11 +688,56 @@ const sandbox = {
     }
     if (url === "/api/v1/delivery2/approval") {
       d2ApprovalCalls.push(body);
+      if (
+        body.decision === "approve" &&
+        (body.source !== "physical_click" ||
+          body.voice_originated === true ||
+          body.physical_click_verified !== true)
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          json: async () => ({
+            ok: false,
+            error_code: "VoiceDangerApprovalForbidden",
+            physical_click_required: true,
+            physical_click_verified: false,
+            error: "Press Approve to confirm. Voice can't approve this one.",
+            message: "Press Approve to confirm. Voice can't approve this one.",
+          }),
+        };
+      }
       return { ok: true, status: 200, json: async () => ({ ok: true, decision: body.decision, authorized: true }) };
+    }
+    if (url === "/api/v4/inbox/action") {
+      if (Array.isArray(globalThis.__inboxActionCalls)) {
+        globalThis.__inboxActionCalls.push(body);
+      }
+      if (
+        (body.action === "approve" || body.action === "apply_locally") &&
+        (body.source !== "physical_click" || body.physical_click_verified !== true)
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          json: async () => ({
+            ok: false,
+            error_code: "VoiceDangerApprovalForbidden",
+            error: "Press Approve to confirm. Voice can't approve this one.",
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, message: "Approved and pushed" }) };
     }
     if (url === "/api/v1/delivery2/memory") {
       d2MemoryCalls.push(body);
       return { ok: true, status: 200, json: async () => ({ ok: true, memory: { id: body.id, note: body.note || "", status: "saved" } }) };
+    }
+    if (url.startsWith("/api/v1/delivery2/voice/")) {
+      if (typeof globalThis.__mockD2VoiceHandler === "function") {
+        return globalThis.__mockD2VoiceHandler(url, body);
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
     }
     return { ok: true, status: 202, json: async () => ({ ok: true, telemetry_enabled: true }) };
   },
@@ -619,7 +745,7 @@ const sandbox = {
 
 vm.createContext(sandbox);
 vm.runInContext(
-  `${transformedSrc}\nglobalThis.__test = { state, normalizeBootstrap, safeChinwagOutboundUrl, applyDelivery2ServerPayload, resumeDelivery2FromCursor, refreshBootstrapQuietly, syncDelivery2DrawerDom, syncRailForOverlaySheet, saveWorkflowSettings, openPrivacyPopover, openMobileMenuPopover, openInviteModal, closePopover, closeModal, wizardPackSlugForSku, renderDelivery2Panel, toggleDelivery2Rail, setDelivery2RailExpanded, openD2Popover, closeD2Popover, submitDelivery2Prompt, cancelDelivery2Turn, handleGlobalKeydown, applyRouteFromLocation, bounceToDelivery2Run };`,
+  `${transformedSrc}\nglobalThis.__test = { state, normalizeBootstrap, safeChinwagOutboundUrl, applyDelivery2ServerPayload, resumeDelivery2FromCursor, refreshBootstrapQuietly, syncDelivery2DrawerDom, syncRailForOverlaySheet, saveWorkflowSettings, openPrivacyPopover, openMobileMenuPopover, openInviteModal, closePopover, closeModal, wizardPackSlugForSku, renderSheetFooter, renderDelivery2Panel, toggleDelivery2Rail, setDelivery2RailExpanded, openD2Popover, closeD2Popover, submitDelivery2Prompt, cancelDelivery2Turn, handleGlobalKeydown, applyRouteFromLocation, bounceToDelivery2Run, VOICE_STATES, canTransitionVoiceState, formatVoiceTimer, spokenOption, filterSafeVoiceOptions, isVoiceDangerApprovalAttempt, truncateCommentaryAtSentence, createVoiceDelegate, startDelivery2Voice, resumeDelivery2Voice, toggleDelivery2VoiceMute, parkDelivery2Voice, endDelivery2Voice, tickDelivery2VoiceHeartbeat, sendDelivery2VoiceTurn, submitDelivery2Approval, stopDelivery2VoiceLoops };`,
   sandbox,
 );
 
@@ -1491,6 +1617,8 @@ const motionCtx = {
   setTimeout,
   clearTimeout,
   requestAnimationFrame: (fn) => setTimeout(fn, 0),
+  cancelAnimationFrame: clearTimeout,
+  Float32Array,
   Date,
   Math,
   Number,
@@ -2312,7 +2440,7 @@ assert.ok(renderedHeadEl, "Rendered Delivery-2 header must contain .d2-head");
 const renderedActionIds = Array.from(renderedHeadEl.querySelector(".d2-head-actions").children).map((b) => b.id);
 assert.deepEqual(
   renderedActionIds,
-  ["d2-btn-new-thread", "d2-btn-history", "d2-btn-collapse"],
+  ["d2-btn-mic", "d2-btn-new-thread", "d2-btn-history", "d2-btn-collapse"],
   "Rendered .d2-head-actions buttons must match bounded layout model IDs",
 );
 assert.ok(d2Track.querySelector("#d2-head-toggle"), "In-flow #d2-head-toggle must exist for <960px drawer");
@@ -2529,10 +2657,427 @@ for (const invalidCalcExpr of [
   );
 }
 
+// Suite M: CHWG-0255 Duplex Live Voice 7-State Machine, VoiceDelegate, spokenOption & H1–H7 Safety Guards
+{
+  // M1: 7-state machine & tabular timer formatting
+  assert.deepEqual([...T.VOICE_STATES], [
+    "idle",
+    "connecting",
+    "listening",
+    "thinking",
+    "speaking",
+    "silence_warning",
+    "paused",
+  ]);
+  assert.equal(T.canTransitionVoiceState("idle", "connecting"), true);
+  assert.equal(T.canTransitionVoiceState("connecting", "listening"), true);
+  assert.equal(T.canTransitionVoiceState("listening", "thinking"), true);
+  assert.equal(T.canTransitionVoiceState("thinking", "speaking"), true);
+  assert.equal(T.canTransitionVoiceState("listening", "silence_warning"), true);
+  assert.equal(T.canTransitionVoiceState("silence_warning", "paused"), true);
+  assert.equal(T.canTransitionVoiceState("paused", "listening"), true);
+  assert.equal(T.canTransitionVoiceState("idle", "speaking"), false);
+  assert.equal(T.formatVoiceTimer(42, 600), "00:42 / 10:00");
+  assert.equal(T.formatVoiceTimer(620, 600), "10:00 / 10:00");
+
+  // M2: Fail-closed spokenOption() parser
+  const hitlOpts = ["Approve", "Deny", "Skip"];
+  assert.equal(T.spokenOption("Approve please", hitlOpts), "approve");
+  assert.equal(T.spokenOption("Yes, approve it, please!", hitlOpts), "approve");
+  assert.equal(T.spokenOption("Okay skip that please", hitlOpts), "skip");
+  for (const badUtterance of [
+    "don't approve",
+    "Don’t approve please",
+    "do not approve",
+    "never approve",
+    "no approve",
+    "wait don't approve",
+    "yes",
+    "yeah",
+    "ok",
+    "okay",
+    "please",
+    "approve or deny",
+    "maybe approve",
+    "",
+  ]) {
+    assert.equal(
+      T.spokenOption(badUtterance, hitlOpts),
+      null,
+      `spokenOption must fail closed on '${badUtterance}'`,
+    );
+  }
+  assert.equal(T.spokenOption("approve", ["Approve", "Approve please"]), null);
+  assert.deepEqual(
+    T.filterSafeVoiceOptions(["Approve & merge", "Deploy", "Push branch", "Skip", "Wait"]),
+    ["Skip", "Wait"],
+  );
+  for (const dangerPhrase of [
+    "Approve this",
+    "Approve the PR",
+    "Merge PR 96",
+    "Merge it",
+    "Go ahead and deploy it",
+    "Let's ship this",
+    "Push the branch",
+    "Apply locally",
+  ]) {
+    assert.equal(
+      T.isVoiceDangerApprovalAttempt(dangerPhrase, false),
+      true,
+      `imperative danger phrase '${dangerPhrase}' must be flagged`,
+    );
+  }
+  assert.equal(T.isVoiceDangerApprovalAttempt("Don't approve this", true), false);
+  assert.equal(T.isVoiceDangerApprovalAttempt("Did we merge PR 96?", true), false);
+
+  // M3: VoiceDelegate dual-channel split (>=3000ms thinking hold + <=1500 sentence-boundary commentary)
+  let fakeNow = 1000;
+  const delegateThinking = [];
+  const delegateSpoken = [];
+  const vDelegate = T.createVoiceDelegate({
+    nowFn: () => fakeNow,
+    onThinkingLabel: (ev) => delegateThinking.push(ev),
+    onSpeakCommentary: (ev) => delegateSpoken.push(ev),
+  });
+  const th1 = vDelegate.observeThinking("Running cleanroom test suite");
+  assert.equal(th1.channel, "thinking");
+  assert.equal(th1.spoken, false);
+  assert.equal(th1.min_hold_ms, 3000);
+  fakeNow = 2500;
+  assert.equal(vDelegate.observeThinking("Checking diff hunks"), null, "must suppress rapid update <3000ms");
+  fakeNow = 4000;
+  const th2 = vDelegate.observeThinking("Checking diff hunks");
+  assert.equal(th2.text, "Checking diff hunks");
+  assert.equal(delegateThinking.length, 2);
+
+  assert.equal(vDelegate.observeCommentary("Interrupted partial text.", { interrupted: true }), null);
+  const longSentence = "Verified four modified files and confirmed every test passed cleanly. ";
+  const commEv = vDelegate.observeCommentary(longSentence.repeat(30));
+  assert.equal(commEv.channel, "commentary");
+  assert.equal(commEv.spoken, true);
+  assert.ok(Array.from(commEv.text).length <= 1500);
+  assert.ok(commEv.text.endsWith("."), "truncated commentary must end cleanly at a sentence boundary");
+  assert.equal(delegateSpoken.length, 1);
+
+  // M4: Full UI Call Bar lifecycle, 75s/90s silence park, 40 Cr cap, reload rehydration & danger merge gate
+  let mockVoiceSeq = 50;
+  const baseUnix = Math.floor(Date.now() / 1000);
+  let serverVoice = {
+    session_id: null,
+    thread_id: "thr-main",
+    state: "idle",
+    status_label: "Idle",
+    timer_label: "00:00 / 10:00",
+    elapsed_secs: 0,
+    remaining_secs: 600,
+    max_duration_secs: 600,
+    opened_at_unix: null,
+    expires_at_unix: null,
+    credits_used: 0,
+    credits_cap: 40,
+    credits_rate_per_min: 0,
+    pause_badge: "Paused · 0 Cr",
+    muted: false,
+    audio_leg_parked: true,
+    ended: false,
+    park_reason: null,
+    ended_reason: null,
+  };
+  let serverEntries = [
+    {
+      id: "entry-hitl-danger-1",
+      kind: "approval_card",
+      seq: 50,
+      approval_id: "hitl-danger-1",
+      item_id: "run-danger-1",
+      is_sample: false,
+      status_badge: "Waiting for you",
+      pause_badge: "Paused · 0 Cr",
+      title: "Merge feature branch into main",
+      question: "Approve merge into `main`?",
+      settled: false,
+    },
+  ];
+
+  const makeD2Envelope = () => ({
+    seq: ++mockVoiceSeq,
+    active_thread_id: "thr-main",
+    status: "waiting_for_you",
+    status_label: "Waiting for you",
+    entries: serverEntries.map((e) => ({ ...e })),
+    voice: { ...serverVoice },
+  });
+
+  globalThis.__mockD2VoiceHandler = async (url, body) => {
+    if (url === "/api/v1/delivery2/voice/session") {
+      if (body.action === "start") {
+        serverVoice = {
+          ...serverVoice,
+          session_id: "voice-test0255",
+          state: body.connecting ? "connecting" : "listening",
+          status_label: body.connecting ? "Connecting…" : "Listening",
+          timer_label: "00:42 / 10:00",
+          elapsed_secs: 42,
+          remaining_secs: 558,
+          opened_at_unix: baseUnix - 42,
+          expires_at_unix: baseUnix + 558,
+          credits_used: 0,
+          credits_cap: 40,
+          credits_rate_per_min: 4,
+          muted: false,
+          audio_leg_parked: false,
+          ended: false,
+          park_reason: null,
+          ended_reason: null,
+        };
+      } else if (body.action === "ready" || body.action === "resume") {
+        serverVoice = {
+          ...serverVoice,
+          state: "listening",
+          status_label: serverVoice.muted ? "Muted" : "Listening",
+          audio_leg_parked: false,
+          credits_rate_per_min: 4,
+          park_reason: null,
+        };
+      } else if (body.action === "mute" || body.action === "unmute") {
+        serverVoice = {
+          ...serverVoice,
+          muted: body.action === "mute",
+          status_label: body.action === "mute" ? "Muted" : "Listening",
+        };
+      } else if (body.action === "end") {
+        serverVoice = {
+          ...serverVoice,
+          state: "paused",
+          status_label: "Call ended · 0 Cr",
+          audio_leg_parked: true,
+          ended: true,
+          ended_reason: "user_ended",
+          credits_rate_per_min: 0,
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, voice: serverVoice, state: makeD2Envelope() }) };
+    }
+    if (url === "/api/v1/delivery2/voice/heartbeat") {
+      if (Number(body.idle_secs) >= 90) {
+        serverVoice = {
+          ...serverVoice,
+          state: "paused",
+          status_label: "Voice paused · 0 Cr while paused",
+          audio_leg_parked: true,
+          park_reason: "silence_timeout",
+          credits_rate_per_min: 0,
+        };
+      } else if (Number(body.idle_secs) >= 75) {
+        serverVoice = {
+          ...serverVoice,
+          state: "silence_warning",
+          status_label: "Still there? Pausing in 15s",
+        };
+      } else if (Number(body.hold_secs) >= 8) {
+        serverVoice = {
+          ...serverVoice,
+          state: "paused",
+          status_label: "Voice paused · 0 Cr while paused",
+          audio_leg_parked: true,
+          park_reason: "hold_park",
+          credits_rate_per_min: 0,
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true, voice: serverVoice, state: makeD2Envelope() }) };
+    }
+    if (url === "/api/v1/delivery2/voice/park") {
+      serverVoice = {
+        ...serverVoice,
+        state: "paused",
+        status_label: "Voice paused · 0 Cr while paused",
+        audio_leg_parked: true,
+        park_reason: body.reason || "user_paused",
+        credits_rate_per_min: 0,
+      };
+      return { ok: true, status: 200, json: async () => ({ ok: true, voice: serverVoice, state: makeD2Envelope() }) };
+    }
+    if (url === "/api/v1/delivery2/voice/turn") {
+      const low = String(body.utterance || "").toLowerCase();
+      if (low.includes("approve")) {
+        return {
+          ok: false,
+          status: 403,
+          json: async () => ({
+            ok: false,
+            error_code: "VoiceDangerApprovalForbidden",
+            physical_click_required: true,
+            physical_click_verified: false,
+            error: "Press Approve to confirm. Voice can't approve this one.",
+            message: "Press Approve to confirm. Voice can't approve this one.",
+          }),
+        };
+      }
+      const addCr = Number(body.turn_credits) || 4;
+      const nextUsed = Math.min(40, serverVoice.credits_used + addCr);
+      const hitCap = nextUsed >= 40;
+      serverVoice = {
+        ...serverVoice,
+        state: hitCap ? "paused" : "speaking",
+        status_label: hitCap ? "Voice paused at the 40 Cr session cap. Your thread is saved." : "Speaking",
+        credits_used: nextUsed,
+        audio_leg_parked: hitCap,
+        ended: hitCap,
+        ended_reason: hitCap ? "credits_cap_reached" : null,
+        credits_rate_per_min: hitCap ? 0 : 4,
+      };
+      const qaEntry = {
+        id: `entry-voice-qa-${mockVoiceSeq}`,
+        kind: "qa_card",
+        seq: mockVoiceSeq + 1,
+        author: "Delivery-2",
+        body: `Spoken summary for: ${body.utterance}.`,
+      };
+      serverEntries.push({ id: `entry-voice-u-${mockVoiceSeq}`, kind: "user_message", seq: mockVoiceSeq + 1, body: body.utterance }, qaEntry);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          entry: qaEntry,
+          spoken_commentary: qaEntry.body,
+          voice: serverVoice,
+          state: makeD2Envelope(),
+        }),
+      };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+
+  mockBootstrapPayload = () => ({ delivery2: makeD2Envelope() });
+  await T.refreshBootstrapQuietly();
+  T.renderDelivery2Panel();
+  assert.equal(stubDocument.getElementById("d2-voice-bar"), null, "Idle voice state must not render Call Bar");
+  assert.ok(stubDocument.getElementById("d2-composer-mic"), "Composer mic button must mount in Zone 4");
+
+  // Start voice -> mounts Call Bar with 9 waveform bars, tabular 00:42 / 10:00 timer, Mute & End
+  const startedOk = await T.startDelivery2Voice();
+  assert.equal(startedOk, true);
+  let callBar = stubDocument.getElementById("d2-voice-bar");
+  assert.ok(callBar, "Active voice session must mount #d2-voice-bar in Zone 1");
+  assert.equal(callBar.dataset.state, "listening");
+  assert.equal(
+    callBar.querySelector(".voice-bars").querySelectorAll("i").length,
+    9,
+    "Call bar must render 9 deterministic waveform bars",
+  );
+  assert.equal(stubDocument.getElementById("d2-voice-timer").textContent, "00:42 / 10:00");
+  assert.ok(stubDocument.getElementById("d2-voice-btn-mute"));
+  assert.ok(stubDocument.getElementById("d2-voice-btn-end"));
+
+  // Mute / Unmute toggle
+  await T.toggleDelivery2VoiceMute();
+  assert.equal(stubDocument.getElementById("d2-voice-status").textContent, "Muted");
+  await T.toggleDelivery2VoiceMute();
+  assert.equal(stubDocument.getElementById("d2-voice-status").textContent, "Listening");
+
+  // Spoken "Approve please" against unsettled danger merge card -> blocked with exact copy!
+  const blockedRes = await T.sendDelivery2VoiceTurn("Approve please");
+  assert.equal(blockedRes.ok, false);
+  assert.equal(blockedRes.error_code, "VoiceDangerApprovalForbidden");
+  assert.equal(blockedRes.message, "Press Approve to confirm. Voice can't approve this one.");
+  const hitlNotice = d2Track.querySelector(".d2-hitl-voice-notice");
+  assert.ok(hitlNotice, "Danger HITL card must display physical-click requirement notice");
+  assert.equal(hitlNotice.textContent, "Press Approve to confirm. Voice can't approve this one.");
+
+  // Normal voice question -> appends durable transcript entries & transitions to Speaking
+  const turnOk = await T.sendDelivery2VoiceTurn("What did I miss?");
+  assert.ok(turnOk && turnOk.ok);
+  assert.equal(stubDocument.getElementById("d2-voice-bar").dataset.state, "speaking");
+
+  // 75s idle -> SilenceWarning ("Still there? Pausing in 15s")
+  await T.tickDelivery2VoiceHeartbeat({ idle_secs: 75 });
+  assert.equal(stubDocument.getElementById("d2-voice-bar").dataset.state, "silence_warning");
+  assert.equal(stubDocument.getElementById("d2-voice-status").textContent, "Still there? Pausing in 15s");
+
+  // 90s idle -> Auto-paused at 0 Cr ("Voice paused · 0 Cr while paused") with Resume button
+  await T.tickDelivery2VoiceHeartbeat({ idle_secs: 90 });
+  assert.equal(stubDocument.getElementById("d2-voice-bar").dataset.state, "paused");
+  assert.equal(stubDocument.getElementById("d2-voice-status").textContent, "Voice paused · 0 Cr while paused");
+  assert.ok(stubDocument.getElementById("d2-voice-btn-resume"), "Paused session must expose Resume button");
+
+  // Resume & simulate cold page reload (`d2VoiceClientLive = false` while server has active session)
+  await T.resumeDelivery2Voice();
+  assert.equal(stubDocument.getElementById("d2-voice-bar").dataset.state, "listening");
+  T.stopDelivery2VoiceLoops();
+  T.state.d2VoiceClientLive = false;
+  await T.refreshBootstrapQuietly();
+  T.renderDelivery2Panel();
+  assert.equal(
+    stubDocument.getElementById("d2-voice-bar").dataset.state,
+    "paused",
+    "Cold page reload must rehydrate active server session safely into Paused · 0 Cr",
+  );
+  assert.equal(
+    d2Track.textContent.includes("Spoken summary for: What did I miss?."),
+    true,
+    "Durable voice transcript entries must persist across page reload",
+  );
+
+  // Resume & hit 40 Cr server cap -> ends session cleanly
+  await T.resumeDelivery2Voice();
+  await T.sendDelivery2VoiceTurn("Summarize board status", { turnCredits: 40 });
+  assert.equal(stubDocument.getElementById("d2-voice-bar").dataset.state, "paused");
+  assert.equal(stubDocument.getElementById("d2-voice-btn-resume"), null, "Capped session must not expose Resume");
+
+  // Untrusted synthetic `.click()` (`isTrusted === false`) on Approve & merge MUST be ignored!
+  d2ApprovalCalls = [];
+  const physicalApproveBtn = d2Track.querySelector(".d2-hitl-primary");
+  assert.ok(physicalApproveBtn, "Approve & merge button must remain mounted for physical click");
+  physicalApproveBtn.click();
+  await sleep(40);
+  assert.equal(d2ApprovalCalls.length, 0, "Untrusted synthetic click() must NOT submit HITL approval");
+
+  // Trusted physical click (`isTrusted === true`) on Approve & merge settles the HITL card cleanly!
+  physicalApproveBtn.clickTrusted();
+  await sleep(40);
+  assert.equal(d2ApprovalCalls.length, 1);
+  assert.equal(d2ApprovalCalls[0].physical_click_verified, true);
+  assert.equal(d2ApprovalCalls[0].source, "physical_click");
+
+  // Inbox review sheet `Approve & push to PR` ALSO blocks untrusted `.click()` and sends physical_click_verified=true on trusted click!
+  globalThis.__inboxActionCalls = [];
+  const inboxTestFoot = stubDocument.createElement("div");
+  T.renderSheetFooter(
+    {
+      id: "item-inbox-gate-1",
+      title: "Harden merge gate",
+      is_sample: false,
+      target_branch: "main",
+      tool_label: "Codex",
+      reviewer_label: "Gemini",
+      files: [],
+    },
+    inboxTestFoot,
+    false,
+  );
+  const inboxApproveBtn = inboxTestFoot.querySelector("#sheet-primary-action");
+  assert.ok(inboxApproveBtn, "Inbox Approve & push to PR button must mount");
+  inboxApproveBtn.click();
+  await sleep(40);
+  assert.equal(globalThis.__inboxActionCalls.length, 0, "Untrusted synthetic click() must NOT trigger Inbox approve");
+  inboxApproveBtn.clickTrusted();
+  await sleep(40);
+  assert.equal(globalThis.__inboxActionCalls.length, 1);
+  assert.equal(globalThis.__inboxActionCalls[0].action, "approve");
+  assert.equal(globalThis.__inboxActionCalls[0].source, "physical_click");
+  assert.equal(globalThis.__inboxActionCalls[0].physical_click_verified, true);
+
+  // End call removes Call Bar cleanly
+  await T.endDelivery2Voice();
+  assert.equal(stubDocument.getElementById("d2-voice-bar"), null);
+}
+
 console.log(
   JSON.stringify({
     ok: true,
     script: "verify-ui-v4-contracts.mjs",
-    suites_passed: 12,
+    suites_passed: 13,
   }),
 );

@@ -3601,6 +3601,146 @@ col.diff-col-split-code {
   flex-shrink: 0;
 }
 
+/* Zone 1 Row C: Duplex Live Voice Call Bar */
+.d2-icon-btn[aria-pressed="true"] {
+  background: var(--bg-selected);
+  color: var(--ink-primary);
+  border-color: var(--border-subtle);
+}
+
+.d2-voice-bar {
+  margin: 0 var(--rail-inset) 6px;
+  padding: 6px 8px;
+  background: var(--d2-digest-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.d2-voice-bar[data-state="silence_warning"] {
+  border-color: var(--status-warning-ink);
+}
+
+.d2-voice-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.d2-voice-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.voice-bars {
+  display: inline-grid;
+  grid-template-columns: repeat(9, 2px);
+  column-gap: 2px;
+  inline-size: 34px;
+  block-size: 16px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.d2-voice-status {
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 600;
+  color: var(--ink-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.d2-voice-bar[data-state="paused"] .d2-voice-status {
+  color: var(--ink-secondary);
+}
+
+.d2-voice-bar[data-state="silence_warning"] .d2-voice-status {
+  color: var(--status-warning-ink);
+}
+
+.d2-voice-timer {
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.d2-voice-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.d2-voice-sub {
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--ink-muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.d2-voice-sub-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.d2-mic-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  background: var(--bg-surface);
+  color: var(--ink-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.d2-mic-btn:hover {
+  background: var(--bg-hover);
+  color: var(--ink-primary);
+}
+
+.d2-mic-btn[aria-pressed="true"] {
+  background: var(--bg-selected);
+  color: var(--ink-primary);
+  border-color: var(--ink-primary);
+}
+
+.d2-hitl-voice-notice {
+  font-size: 11px;
+  line-height: 15px;
+  font-weight: 500;
+  color: var(--status-warning-ink);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  padding: 4px 7px;
+}
+
 /* Zone 2: Morning Focus Deterministic Digest Card */
 .d2-zone-digest {
   padding: 8px var(--rail-inset) 6px;
@@ -4320,6 +4460,8 @@ col.diff-col-split-code {
   .card,
   .tile,
   .d2-card,
+  .d2-voice-bar,
+  .d2-mic-btn,
   .d2-composer-box,
   .d2-pop,
   .d2-sync-pill,
