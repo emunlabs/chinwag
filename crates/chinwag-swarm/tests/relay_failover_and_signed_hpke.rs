@@ -5,8 +5,8 @@
 #![forbid(unsafe_code)]
 
 use chinwag_swarm::relay_failover::{
-    BASE_OUTAGE_COOLDOWN_MS, FailoverError, MAX_OUTAGE_COOLDOWN_MS, OrderedEndpointFallback,
-    ReplayWindow, SessionResumptionTicketV1, TransportCandidate,
+    BASE_OUTAGE_COOLDOWN_MS, FailoverError, MAX_CANDIDATE_DIAL_TIMEOUT_MS, MAX_OUTAGE_COOLDOWN_MS,
+    OrderedEndpointFallback, ReplayWindow, SessionResumptionTicketV1, TransportCandidate,
 };
 use chinwag_swarm::relay_policy::RelayPolicy;
 use chinwag_swarm::signed_hpke::{
@@ -216,6 +216,14 @@ async fn four_region_failover_orders_lan_wan_then_health_scored_relays_with_expo
         "https://ap-south.mesh-example.invalid/",
     ];
     let policy = RelayPolicy::from_multi_region_manifest(&regions, &regions).unwrap();
+    let capped = OrderedEndpointFallback::new(policy.clone())
+        .with_candidate_timeout(Duration::from_secs(10));
+    assert_eq!(
+        capped.candidate_timeout(),
+        Duration::from_millis(MAX_CANDIDATE_DIAL_TIMEOUT_MS)
+    );
+    assert!(capped.candidate_timeout() < Duration::from_millis(250));
+
     let mut fb =
         OrderedEndpointFallback::new(policy).with_candidate_timeout(Duration::from_millis(40));
 
@@ -242,20 +250,38 @@ async fn four_region_failover_orders_lan_wan_then_health_scored_relays_with_expo
         assert!(u <= now_ms + MAX_OUTAGE_COOLDOWN_MS);
     }
 
-    // Simulate simultaneous failure of LAN, WAN, `us-east`, and `us-west`, landing on `eu-west`
+    // Quarantined `us-east` MUST NOT appear in `ordered_candidates` before cooldown expires!
+    let active_ring = fb.ordered_candidates(&[lan], &[wan], now_ms + 100);
+    assert!(
+        !active_ring.contains(&TransportCandidate::RelayWss443(us_east.clone())),
+        "quarantined relay must be excluded from dial candidates during active cooldown"
+    );
+
+    // Simulate simultaneous failure of LAN, WAN, and `us-west`, landing on `eu-west` (`us-east` skipped by quarantine)
+    let dialed_us_east = AtomicUsize::new(0);
     let (chosen, label) = fb
-        .connect_with_failover(&[lan], &[wan], now_ms + 100, |cand| async move {
-            match cand {
-                TransportCandidate::RelayWss443(ref u)
-                    if u.as_str() == "https://eu-west.mesh-example.invalid/" =>
-                {
-                    Ok::<(&'static str, u64), &'static str>(("eu-west-ok", 22))
+        .connect_with_failover(&[lan], &[wan], now_ms + 100, |cand| {
+            let counter_ref = &dialed_us_east;
+            async move {
+                match cand {
+                    TransportCandidate::RelayWss443(ref u)
+                        if u.as_str() == "https://us-east.mesh-example.invalid/" =>
+                    {
+                        counter_ref.fetch_add(1, Ordering::SeqCst);
+                        Err::<(&'static str, u64), &'static str>("quarantined_should_not_dial")
+                    }
+                    TransportCandidate::RelayWss443(ref u)
+                        if u.as_str() == "https://eu-west.mesh-example.invalid/" =>
+                    {
+                        Ok(("eu-west-ok", 22))
+                    }
+                    _ => Err("unreachable"),
                 }
-                _ => Err("unreachable"),
             }
         })
         .await
         .unwrap();
+    assert_eq!(dialed_us_east.load(Ordering::SeqCst), 0);
     assert_eq!(label, "eu-west-ok");
     assert_eq!(
         chosen,
@@ -272,8 +298,10 @@ fn resumption_ticket_rejects_transcript_divergence_and_peer_mismatch() {
     let transcript_1 = [0x11; 32];
     let transcript_2 = [0x22; 32];
 
+    let win = ReplayWindow::from_resumed_checkpoint(100);
     let ticket =
-        SessionResumptionTicketV1::issue(peer_a, 2, 100, transcript_1, 10_000, 5_000, &sk).unwrap();
+        SessionResumptionTicketV1::issue(peer_a, 2, &win, transcript_1, 10_000, 5_000, &sk)
+            .unwrap();
     assert!(
         ticket
             .verify_and_resume(&pk, &peer_b, &transcript_1, 2, 11_000)

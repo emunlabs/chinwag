@@ -24,8 +24,11 @@ use subtle::ConstantTimeEq;
 /// Sliding anti-replay window width in sequence numbers (`128` packets).
 pub const REPLAY_WINDOW_BITS: u64 = 128;
 
-/// Default per-candidate dial timeout (ms) enabling sub-second multi-region failover.
-pub const DEFAULT_CANDIDATE_DIAL_TIMEOUT_MS: u64 = 250;
+/// Default per-candidate dial timeout (`200ms`, strictly `< 250ms`) enabling sub-second multi-region failover.
+pub const DEFAULT_CANDIDATE_DIAL_TIMEOUT_MS: u64 = 200;
+
+/// Hard upper bound (`249ms`, strictly `< 250ms`) on per-candidate dial timeout.
+pub const MAX_CANDIDATE_DIAL_TIMEOUT_MS: u64 = 249;
 
 /// Base quarantine cooldown (ms) applied when a regional relay fails or times out.
 pub const BASE_OUTAGE_COOLDOWN_MS: u64 = 1_000;
@@ -102,6 +105,38 @@ impl ReplayWindow {
 
     pub const fn highest_seq(&self) -> u64 {
         self.highest_seq
+    }
+
+    pub const fn seen_bitmap(&self) -> u128 {
+        self.bitmap
+    }
+
+    /// Restores the exact `(highest_seq, seen_bitmap)` 128-packet sliding replay
+    /// window across a regional failover without marking in-flight sequence gaps
+    /// as already processed.
+    pub fn from_state(highest_seq: u64, seen_bitmap: u128) -> Result<Self, FailoverError> {
+        if highest_seq == 0 {
+            if seen_bitmap != 0 {
+                return Err(FailoverError::ResumptionRejected(
+                    "non-zero seen_bitmap with highest_seq == 0",
+                ));
+            }
+            return Ok(Self::new());
+        }
+        if (seen_bitmap & 1) == 0 {
+            return Err(FailoverError::ResumptionRejected(
+                "seen_bitmap LSB must be set when highest_seq >= 1",
+            ));
+        }
+        if highest_seq < REPLAY_WINDOW_BITS && (seen_bitmap >> highest_seq) != 0 {
+            return Err(FailoverError::ResumptionRejected(
+                "seen_bitmap contains impossible sequence bits below 1",
+            ));
+        }
+        Ok(Self {
+            highest_seq,
+            bitmap: seen_bitmap,
+        })
     }
 
     /// Read-only check verifying `seq` (`>= 1`) has not been seen and is not stale.
@@ -299,19 +334,23 @@ impl RelayHealthScorer {
         items.into_iter().map(|ep| ep.url.clone()).collect()
     }
 
-    /// Returns only currently non-quarantined relays; if all regions are simultaneously
-    /// quarantined (global local Wi-Fi blip), falls back to the full ranked ring so
-    /// recovery probes can still proceed without deadlocking.
-    pub fn healthy_or_fallback_relays(&self, now_ms: u64) -> Vec<RelayUrl> {
-        let healthy: Vec<RelayUrl> = self
-            .ranked_relays(now_ms)
+    /// Returns strictly currently non-quarantined relays ordered by health score.
+    pub fn active_healthy_relays(&self, now_ms: u64) -> Vec<RelayUrl> {
+        self.ranked_relays(now_ms)
             .into_iter()
             .filter(|u| {
                 self.endpoints
                     .get(u.as_str())
                     .is_some_and(|ep| !ep.is_quarantined(now_ms))
             })
-            .collect();
+            .collect()
+    }
+
+    /// Returns only currently non-quarantined relays; if all regions are simultaneously
+    /// quarantined (global local Wi-Fi blip), falls back to the full ranked ring so
+    /// recovery probes can still proceed without deadlocking.
+    pub fn healthy_or_fallback_relays(&self, now_ms: u64) -> Vec<RelayUrl> {
+        let healthy = self.active_healthy_relays(now_ms);
         if healthy.is_empty() {
             self.ranked_relays(now_ms)
         } else {
@@ -353,8 +392,15 @@ impl OrderedEndpointFallback {
     }
 
     pub fn with_candidate_timeout(mut self, timeout: Duration) -> Self {
-        self.candidate_timeout = timeout.max(Duration::from_millis(10));
+        self.candidate_timeout = timeout.clamp(
+            Duration::from_millis(10),
+            Duration::from_millis(MAX_CANDIDATE_DIAL_TIMEOUT_MS),
+        );
         self
+    }
+
+    pub const fn candidate_timeout(&self) -> Duration {
+        self.candidate_timeout
     }
 
     pub fn scorer(&self) -> &RelayHealthScorer {
@@ -368,7 +414,8 @@ impl OrderedEndpointFallback {
     /// Produces the deterministic connection attempt order:
     /// 1. `DirectLanQuic` (`loopback` / RFC 1918 / link-local / ULA sockets),
     /// 2. `DirectWanQuic` (routable direct sockets),
-    /// 3. `RelayWss443` ordered by live `RelayHealthScorer` score at `now_ms`.
+    /// 3. Non-quarantined `RelayWss443` endpoints ordered by live `RelayHealthScorer`
+    ///    score at `now_ms` (quarantined relays are strictly skipped until cooldown expires).
     pub fn ordered_candidates(
         &self,
         lan_addrs: &[SocketAddr],
@@ -390,7 +437,7 @@ impl OrderedEndpointFallback {
                 out.push(cand);
             }
         }
-        for relay in self.scorer.ranked_relays(now_ms) {
+        for relay in self.scorer.active_healthy_relays(now_ms) {
             out.push(TransportCandidate::RelayWss443(relay));
         }
         out
@@ -459,14 +506,16 @@ impl OrderedEndpointFallback {
 // ============================================================================
 
 /// Cryptographically signed session resumption state allowing an interrupted
-/// encrypted stream to resume immediately on a surviving regional relay from
-/// `last_acked_seq + 1` without resetting replay state or re-handshaking from zero.
+/// encrypted stream to resume immediately on a surviving regional relay while
+/// preserving the exact 128-packet sliding `ReplayWindow` bitmap (including any
+/// out-of-order sequence gaps still in flight).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionResumptionTicketV1 {
     pub peer_id: [u8; 32],
     pub session_epoch: u64,
     pub last_acked_seq: u64,
+    pub seen_bitmap_hex: String,
     pub transcript_sha256: [u8; 32],
     pub issued_unix_ms: u64,
     pub expires_unix_ms: u64,
@@ -478,7 +527,7 @@ impl SessionResumptionTicketV1 {
     pub fn issue(
         peer_id: [u8; 32],
         session_epoch: u64,
-        last_acked_seq: u64,
+        replay_window: &ReplayWindow,
         transcript_sha256: [u8; 32],
         issued_unix_ms: u64,
         ttl_ms: u64,
@@ -493,12 +542,15 @@ impl SessionResumptionTicketV1 {
         if vk.is_weak() {
             return Err(FailoverError::ResumptionRejected("weak issuer Ed25519 key"));
         }
+        let last_acked_seq = replay_window.highest_seq();
+        let seen_bitmap = replay_window.seen_bitmap();
         let expires_unix_ms = issued_unix_ms.saturating_add(ttl_ms);
         let issuer_pubkey = vk.to_bytes();
         let preimage = ticket_preimage(
             &peer_id,
             session_epoch,
             last_acked_seq,
+            seen_bitmap,
             &transcript_sha256,
             issued_unix_ms,
             expires_unix_ms,
@@ -509,6 +561,7 @@ impl SessionResumptionTicketV1 {
             peer_id,
             session_epoch,
             last_acked_seq,
+            seen_bitmap_hex: hex::encode(seen_bitmap.to_be_bytes()),
             transcript_sha256,
             issued_unix_ms,
             expires_unix_ms,
@@ -518,7 +571,8 @@ impl SessionResumptionTicketV1 {
     }
 
     /// Strictly verifies the `Ed25519` ticket signature, pinned issuer key, peer
-    /// binding, transcript commitment, monotonic epoch, and expiry before resuming.
+    /// binding, transcript commitment, monotonic epoch, expiry, and 128-packet
+    /// sliding replay bitmap before resuming.
     pub fn verify_and_resume(
         &self,
         expected_issuer_pubkey: &[u8; 32],
@@ -550,6 +604,13 @@ impl SessionResumptionTicketV1 {
                 "session transcript SHA-256 mismatch",
             ));
         }
+        let bitmap_raw = hex::decode(&self.seen_bitmap_hex)
+            .map_err(|_| FailoverError::ResumptionRejected("malformed seen_bitmap_hex"))?;
+        let bitmap_arr: [u8; 16] = bitmap_raw
+            .try_into()
+            .map_err(|_| FailoverError::ResumptionRejected("seen_bitmap_hex must be 16 bytes"))?;
+        let seen_bitmap = u128::from_be_bytes(bitmap_arr);
+
         let vk = VerifyingKey::from_bytes(&self.issuer_pubkey)
             .map_err(|_| FailoverError::ResumptionRejected("invalid issuer Ed25519 key"))?;
         if vk.is_weak() {
@@ -566,6 +627,7 @@ impl SessionResumptionTicketV1 {
             &self.peer_id,
             self.session_epoch,
             self.last_acked_seq,
+            seen_bitmap,
             &self.transcript_sha256,
             self.issued_unix_ms,
             self.expires_unix_ms,
@@ -576,24 +638,27 @@ impl SessionResumptionTicketV1 {
                 FailoverError::ResumptionRejected("Ed25519 verify_strict rejected ticket")
             })?;
 
-        Ok(ReplayWindow::from_resumed_checkpoint(self.last_acked_seq))
+        ReplayWindow::from_state(self.last_acked_seq, seen_bitmap)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ticket_preimage(
     peer_id: &[u8; 32],
     session_epoch: u64,
     last_acked_seq: u64,
+    seen_bitmap: u128,
     transcript_sha256: &[u8; 32],
     issued_unix_ms: u64,
     expires_unix_ms: u64,
     issuer_pubkey: &[u8; 32],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(168);
+    let mut out = Vec::with_capacity(184);
     out.extend_from_slice(RESUMPTION_TICKET_DOMAIN);
     out.extend_from_slice(peer_id);
     out.extend_from_slice(&session_epoch.to_be_bytes());
     out.extend_from_slice(&last_acked_seq.to_be_bytes());
+    out.extend_from_slice(&seen_bitmap.to_be_bytes());
     out.extend_from_slice(transcript_sha256);
     out.extend_from_slice(&issued_unix_ms.to_be_bytes());
     out.extend_from_slice(&expires_unix_ms.to_be_bytes());
@@ -711,33 +776,51 @@ mod tests {
     }
 
     #[test]
-    fn session_resumption_ticket_enforces_ed25519_verify_strict_and_restores_replay_checkpoint() {
+    fn session_resumption_ticket_enforces_ed25519_verify_strict_and_preserves_replay_bitmap_gaps() {
         let sk = SigningKey::from_bytes(&[0x77u8; 32]);
         let pk = sk.verifying_key().to_bytes();
         let peer_id = [0x12u8; 32];
         let transcript = [0xab; 32];
         let now_ms = 1_790_000_000_000u64;
 
-        let ticket =
-            SessionResumptionTicketV1::issue(peer_id, 3, 42, transcript, now_ms, 60_000, &sk)
-                .unwrap();
+        // Receive packets 1 and 3 out-of-order (packet 2 still in flight during regional failover!)
+        let mut pre_outage_win = ReplayWindow::new();
+        pre_outage_win.record_verified(1).unwrap();
+        pre_outage_win.record_verified(3).unwrap();
+
+        let ticket = SessionResumptionTicketV1::issue(
+            peer_id,
+            3,
+            &pre_outage_win,
+            transcript,
+            now_ms,
+            60_000,
+            &sk,
+        )
+        .unwrap();
 
         let mut resumed_win = ticket
             .verify_and_resume(&pk, &peer_id, &transcript, 3, now_ms + 500)
             .unwrap();
-        assert_eq!(resumed_win.highest_seq(), 42);
-        // Frames `<= 42` were already acked before the outage and MUST be rejected as replays!
-        assert_eq!(
-            resumed_win.check_unseen(42),
-            Err(FailoverError::DuplicateReplay(42))
-        );
+        assert_eq!(resumed_win.highest_seq(), 3);
+        // Packets 1 and 3 were already received and MUST be rejected as replays!
         assert_eq!(
             resumed_win.check_unseen(1),
             Err(FailoverError::DuplicateReplay(1))
         );
-        // Frame `43` seamlessly continues on the new regional relay!
-        resumed_win.record_verified(43).unwrap();
-        assert_eq!(resumed_win.highest_seq(), 43);
+        assert_eq!(
+            resumed_win.check_unseen(3),
+            Err(FailoverError::DuplicateReplay(3))
+        );
+        // In-flight missing packet 2 MUST still be accepted upon retransmission after failover!
+        resumed_win.record_verified(2).unwrap();
+        assert_eq!(
+            resumed_win.check_unseen(2),
+            Err(FailoverError::DuplicateReplay(2))
+        );
+        // Frame 4 seamlessly continues on the new regional relay!
+        resumed_win.record_verified(4).unwrap();
+        assert_eq!(resumed_win.highest_seq(), 4);
 
         // Expired ticket fails closed
         assert!(
@@ -753,7 +836,7 @@ mod tests {
                 .is_err()
         );
 
-        // Tampered `last_acked_seq` rejected by Ed25519 `verify_strict`
+        // Tampered `last_acked_seq` or `seen_bitmap_hex` rejected by Ed25519 `verify_strict`
         let mut tampered = ticket;
         tampered.last_acked_seq = 10;
         assert!(

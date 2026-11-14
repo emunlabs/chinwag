@@ -199,9 +199,7 @@ mod tests {
         let mut stream = resolve_peer(peer, receiver, peer).unwrap();
         let info = EndpointInfo::from_parts(
             peer,
-            EndpointData::from_iter([iroh::TransportAddr::Ip(
-                "192.168.1.161:45001".parse().unwrap(),
-            )]),
+            EndpointData::from_iter([iroh::TransportAddr::Ip("192.0.2.10:45001".parse().unwrap())]),
         );
         let expected = info.clone();
         let received = async { stream.next().await.unwrap().unwrap() };
@@ -224,9 +222,7 @@ mod tests {
         assert_eq!(expired.endpoint_info().data.ip_addrs().count(), 0);
         let replacement = EndpointInfo::from_parts(
             peer,
-            EndpointData::from_iter([iroh::TransportAddr::Ip(
-                "192.168.1.161:45002".parse().unwrap(),
-            )]),
+            EndpointData::from_iter([iroh::TransportAddr::Ip("192.0.2.10:45002".parse().unwrap())]),
         );
         updates.send_replace(Some(replacement.clone()));
         let received = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -250,7 +246,7 @@ mod tests {
             [
                 "192.168.1.150:45001",
                 "192.168.2.150:45001",
-                "100.108.108.25:45001",
+                "198.51.100.25:45001",
             ]
             .map(|s| iroh::TransportAddr::Ip(s.parse().unwrap())),
         );

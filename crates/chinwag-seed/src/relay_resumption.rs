@@ -68,8 +68,10 @@ pub fn seal_compressed_capsule_frame(
     }
     let plain_len_u32 = u32::try_from(params.chunk_plaintext.len())
         .map_err(|_| CapsuleResumptionError::ChunkTooLarge)?;
-    let zstd_bytes = zstd::stream::encode_all(Cursor::new(params.chunk_plaintext), 3)
-        .map_err(|_| CapsuleResumptionError::Compression)?;
+    let zstd_bytes = Zeroizing::new(
+        zstd::stream::encode_all(Cursor::new(params.chunk_plaintext), 3)
+            .map_err(|_| CapsuleResumptionError::Compression)?,
+    );
 
     let mut framed = Zeroizing::new(Vec::with_capacity(8 + zstd_bytes.len()));
     framed.extend_from_slice(ZSTD_CAPSULE_MAGIC);
@@ -203,7 +205,7 @@ impl ResumableCapsuleReceiver {
         Ok(SessionResumptionTicketV1::issue(
             self.peer_id,
             self.session_epoch,
-            self.replay_window.highest_seq(),
+            &self.replay_window,
             self.transcript_sha256,
             issued_unix_ms,
             ttl_ms,
