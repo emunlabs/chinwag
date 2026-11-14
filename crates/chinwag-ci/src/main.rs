@@ -36,6 +36,22 @@ fn main() {
 
 #[cfg(unix)]
 async fn async_main(args: Vec<std::ffi::OsString>) {
+    if args.get(1).is_some_and(|a| a == "ui-gate") {
+        let Some(utf8_args) = args[2..]
+            .iter()
+            .map(|s| s.to_str().map(str::to_owned))
+            .collect::<Option<Vec<String>>>()
+        else {
+            eprintln!("chinwag-ci ui-gate: invalid UTF-8 argument");
+            std::process::exit(2);
+        };
+        let code = chinwag_ci::ui_gate::run_cli(
+            &utf8_args,
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+        );
+        std::process::exit(code);
+    }
     let mut result: Result<(), ()> = match args.as_slice() {
         [_, action, config, public] if action == "owner-init" || action == "owner-verify" => {
             let result = if action == "owner-init" {
