@@ -1,0 +1,892 @@
+{
+  "suite": "CHWG-0253.01-02-adversarial-fail-closed",
+  "signed_beat_rejections": [
+    {
+      "id": "adv-01-unexpected-root-diff-field",
+      "reason": "deny_unknown_fields rejects beat.diff",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_compact_strict_01",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_compact_strict_901",
+          "source": {
+            "kind": "ci",
+            "provider": "github_actions",
+            "runner_lease_ref": "lease_gha_901",
+            "run_ref": "run_901"
+          },
+          "source_sequence": "12",
+          "attempt": 1,
+          "occurred_at_ms": "1794400500000",
+          "progress": {
+            "scene": "ci_remediation",
+            "step": "passed"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:75eee90642707a93ba86c9047cceacc76f0eeb05ef9b8ff0ad71d584e6688946",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_compact_strict_901_12"
+          },
+          "metadata": {
+            "mode": "strict_zk",
+            "summary": {
+              "queue_status": "terminal_green",
+              "specs_passed": 148,
+              "specs_total": 148,
+              "gates_passed": 6,
+              "gates_total": 6,
+              "loc_added": 14,
+              "loc_removed": 3,
+              "duration_ms": "19400",
+              "est_minutes_saved": 18,
+              "credits_charged": "50",
+              "command_exit_code": 0,
+              "credit_receipt_ref": "lrcpt_op_compact_strict_901_12"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:00e70e4562051fee27c748b42ff4a491e7535cb33069b4751aeeda579c0235de",
+          "diff": "@@ -10,4 +10,4 @@ -const secret = 'leak';"
+        },
+        "k1_signature": "ed25519:4f5a40ea1eb964bd7a99346b67b1ade86e8fb6dd3f61cbfc53f535507abd63e6f1984b84c3233c97ac4303da4a5eb3d7e15a371ee0f662e8933db9ebf8c53e0b"
+      }
+    },
+    {
+      "id": "adv-02-unexpected-evidence-source-code-field",
+      "reason": "deny_unknown_fields rejects beat.evidence.source_code",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_compact_strict_01",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_compact_strict_901",
+          "source": {
+            "kind": "ci",
+            "provider": "github_actions",
+            "runner_lease_ref": "lease_gha_901",
+            "run_ref": "run_901"
+          },
+          "source_sequence": "12",
+          "attempt": 1,
+          "occurred_at_ms": "1794400500000",
+          "progress": {
+            "scene": "ci_remediation",
+            "step": "passed"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:75eee90642707a93ba86c9047cceacc76f0eeb05ef9b8ff0ad71d584e6688946",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_compact_strict_901_12",
+            "source_code": "pub fn verify_token() { /* proprietary */ }"
+          },
+          "metadata": {
+            "mode": "strict_zk",
+            "summary": {
+              "queue_status": "terminal_green",
+              "specs_passed": 148,
+              "specs_total": 148,
+              "gates_passed": 6,
+              "gates_total": 6,
+              "loc_added": 14,
+              "loc_removed": 3,
+              "duration_ms": "19400",
+              "est_minutes_saved": 18,
+              "credits_charged": "50",
+              "command_exit_code": 0,
+              "credit_receipt_ref": "lrcpt_op_compact_strict_901_12"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:00e70e4562051fee27c748b42ff4a491e7535cb33069b4751aeeda579c0235de"
+        },
+        "k1_signature": "ed25519:4f5a40ea1eb964bd7a99346b67b1ade86e8fb6dd3f61cbfc53f535507abd63e6f1984b84c3233c97ac4303da4a5eb3d7e15a371ee0f662e8933db9ebf8c53e0b"
+      }
+    },
+    {
+      "id": "adv-03-unexpected-source-raw-log-field",
+      "reason": "deny_unknown_fields rejects beat.source.raw_log",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_compact_strict_01",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_compact_strict_901",
+          "source": {
+            "kind": "ci",
+            "provider": "github_actions",
+            "runner_lease_ref": "lease_gha_901",
+            "run_ref": "run_901",
+            "raw_log": "thread 'main' panicked at src/auth.rs:42"
+          },
+          "source_sequence": "12",
+          "attempt": 1,
+          "occurred_at_ms": "1794400500000",
+          "progress": {
+            "scene": "ci_remediation",
+            "step": "passed"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:75eee90642707a93ba86c9047cceacc76f0eeb05ef9b8ff0ad71d584e6688946",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_compact_strict_901_12"
+          },
+          "metadata": {
+            "mode": "strict_zk",
+            "summary": {
+              "queue_status": "terminal_green",
+              "specs_passed": 148,
+              "specs_total": 148,
+              "gates_passed": 6,
+              "gates_total": 6,
+              "loc_added": 14,
+              "loc_removed": 3,
+              "duration_ms": "19400",
+              "est_minutes_saved": 18,
+              "credits_charged": "50",
+              "command_exit_code": 0,
+              "credit_receipt_ref": "lrcpt_op_compact_strict_901_12"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:00e70e4562051fee27c748b42ff4a491e7535cb33069b4751aeeda579c0235de"
+        },
+        "k1_signature": "ed25519:4f5a40ea1eb964bd7a99346b67b1ade86e8fb6dd3f61cbfc53f535507abd63e6f1984b84c3233c97ac4303da4a5eb3d7e15a371ee0f662e8933db9ebf8c53e0b"
+      }
+    },
+    {
+      "id": "adv-04-slack-channel-mention-injection",
+      "reason": "<!channel> rejected in symbol token",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_scene04_deliv_06",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_scene04_epic482",
+          "source": {
+            "kind": "daemon",
+            "device_ref": "dev_seat_03",
+            "session_ref": "sess_deliv_482"
+          },
+          "source_sequence": "6",
+          "attempt": 1,
+          "occurred_at_ms": "1794400770000",
+          "progress": {
+            "scene": "delivery",
+            "step": "gating"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:3f42f1cbbc4752db2f5834b0002cf069cacb98b53b21740719be226b070dda11",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_scene04_epic482_6",
+            "policy_gate_id": "VG-COPY-06"
+          },
+          "metadata": {
+            "mode": "rich_symbols",
+            "summary": {
+              "queue_status": "active",
+              "specs_passed": 398,
+              "specs_total": 412,
+              "gates_passed": 11,
+              "gates_total": 12,
+              "loc_added": 118,
+              "loc_removed": 24,
+              "duration_ms": "570000",
+              "est_minutes_saved": 0,
+              "credits_charged": "0"
+            },
+            "symbols": {
+              "repo_label": "acme/<!channel>",
+              "branch_label": "feat/epic-482-delivery",
+              "pr_number": 482,
+              "approved_pr_url": "https://github.com/acme/platform/pull/482",
+              "short_revision": "e81b44a",
+              "gate_display_name": "Visual Geometry & Copy Gate"
+            },
+            "passkey_attestation": {
+              "grant": {
+                "schema_version": 1,
+                "org_id": "org_01JCHINWAG8899AABBCCDD",
+                "disclosure_grant_ref": "grant_passkey_rich_01",
+                "config_digest": "blake3:dcc2eb51376a3583629ad30d7a826944c2fa523793f795d96c6f2bb4554b0fc7",
+                "webauthn_credential_id": "webauthn_fido2_cred_01",
+                "authorization_epoch": "1",
+                "expires_at_ms": "1794486400000",
+                "admin_k1_pubkey": "ed25519:8ed2e8710630cb1624b2f7cf9ce9fef1295696270341b17a7621ed08d44dd055"
+              },
+              "admin_k1_signature": "ed25519:3b445e549f2290f33865e3a3061a195755e58a224c40559ed286e6fd52755b58cf9eb0efdc58b0042bf2ba399ba268cebf778358da265cdaa03c8012833bb50a"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:ae6625dca255566df2a89f2b7d9cba82cf3b39f52c9c2da9df0fa3b8881f295a"
+        },
+        "k1_signature": "ed25519:f4e9527fad1e7cdf4fa81bf16763f570e74bf47f93352cbafbd8f19a976936a4ed6172db31ded207ab8896185567ddad39edddc11bf876985988592fb74d1b0a"
+      }
+    },
+    {
+      "id": "adv-05-unicode-bidi-override-spoof",
+      "reason": "U+202E RLO rejected in symbol_label",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_scene04_deliv_06",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_scene04_epic482",
+          "source": {
+            "kind": "daemon",
+            "device_ref": "dev_seat_03",
+            "session_ref": "sess_deliv_482"
+          },
+          "source_sequence": "6",
+          "attempt": 1,
+          "occurred_at_ms": "1794400770000",
+          "progress": {
+            "scene": "delivery",
+            "step": "gating"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:3f42f1cbbc4752db2f5834b0002cf069cacb98b53b21740719be226b070dda11",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_scene04_epic482_6",
+            "policy_gate_id": "VG-COPY-06"
+          },
+          "metadata": {
+            "mode": "rich_symbols",
+            "summary": {
+              "queue_status": "active",
+              "specs_passed": 398,
+              "specs_total": 412,
+              "gates_passed": 11,
+              "gates_total": 12,
+              "loc_added": 118,
+              "loc_removed": 24,
+              "duration_ms": "570000",
+              "est_minutes_saved": 0,
+              "credits_charged": "0"
+            },
+            "symbols": {
+              "repo_label": "acme/platform",
+              "branch_label": "feat/epic-482-delivery",
+              "pr_number": 482,
+              "approved_pr_url": "https://github.com/acme/platform/pull/482",
+              "short_revision": "e81b44a",
+              "gate_display_name": "Visual Geometry & Copy Gate",
+              "symbol_label": "auth‮txt.exe · spoof"
+            },
+            "passkey_attestation": {
+              "grant": {
+                "schema_version": 1,
+                "org_id": "org_01JCHINWAG8899AABBCCDD",
+                "disclosure_grant_ref": "grant_passkey_rich_01",
+                "config_digest": "blake3:dcc2eb51376a3583629ad30d7a826944c2fa523793f795d96c6f2bb4554b0fc7",
+                "webauthn_credential_id": "webauthn_fido2_cred_01",
+                "authorization_epoch": "1",
+                "expires_at_ms": "1794486400000",
+                "admin_k1_pubkey": "ed25519:8ed2e8710630cb1624b2f7cf9ce9fef1295696270341b17a7621ed08d44dd055"
+              },
+              "admin_k1_signature": "ed25519:3b445e549f2290f33865e3a3061a195755e58a224c40559ed286e6fd52755b58cf9eb0efdc58b0042bf2ba399ba268cebf778358da265cdaa03c8012833bb50a"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:ae6625dca255566df2a89f2b7d9cba82cf3b39f52c9c2da9df0fa3b8881f295a"
+        },
+        "k1_signature": "ed25519:f4e9527fad1e7cdf4fa81bf16763f570e74bf47f93352cbafbd8f19a976936a4ed6172db31ded207ab8896185567ddad39edddc11bf876985988592fb74d1b0a"
+      }
+    },
+    {
+      "id": "adv-06-banned-tribunal-copy",
+      "reason": "Banned legacy copy term 'tribunal' rejected",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_scene04_deliv_06",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_scene04_epic482",
+          "source": {
+            "kind": "daemon",
+            "device_ref": "dev_seat_03",
+            "session_ref": "sess_deliv_482"
+          },
+          "source_sequence": "6",
+          "attempt": 1,
+          "occurred_at_ms": "1794400770000",
+          "progress": {
+            "scene": "delivery",
+            "step": "gating"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:3f42f1cbbc4752db2f5834b0002cf069cacb98b53b21740719be226b070dda11",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_scene04_epic482_6",
+            "policy_gate_id": "VG-COPY-06"
+          },
+          "metadata": {
+            "mode": "rich_symbols",
+            "summary": {
+              "queue_status": "active",
+              "specs_passed": 398,
+              "specs_total": 412,
+              "gates_passed": 11,
+              "gates_total": 12,
+              "loc_added": 118,
+              "loc_removed": 24,
+              "duration_ms": "570000",
+              "est_minutes_saved": 0,
+              "credits_charged": "0"
+            },
+            "symbols": {
+              "repo_label": "acme/platform",
+              "branch_label": "feat/epic-482-delivery",
+              "pr_number": 482,
+              "approved_pr_url": "https://github.com/acme/platform/pull/482",
+              "short_revision": "e81b44a",
+              "gate_display_name": "Visual Tribunal Gate"
+            },
+            "passkey_attestation": {
+              "grant": {
+                "schema_version": 1,
+                "org_id": "org_01JCHINWAG8899AABBCCDD",
+                "disclosure_grant_ref": "grant_passkey_rich_01",
+                "config_digest": "blake3:dcc2eb51376a3583629ad30d7a826944c2fa523793f795d96c6f2bb4554b0fc7",
+                "webauthn_credential_id": "webauthn_fido2_cred_01",
+                "authorization_epoch": "1",
+                "expires_at_ms": "1794486400000",
+                "admin_k1_pubkey": "ed25519:8ed2e8710630cb1624b2f7cf9ce9fef1295696270341b17a7621ed08d44dd055"
+              },
+              "admin_k1_signature": "ed25519:3b445e549f2290f33865e3a3061a195755e58a224c40559ed286e6fd52755b58cf9eb0efdc58b0042bf2ba399ba268cebf778358da265cdaa03c8012833bb50a"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:ae6625dca255566df2a89f2b7d9cba82cf3b39f52c9c2da9df0fa3b8881f295a"
+        },
+        "k1_signature": "ed25519:f4e9527fad1e7cdf4fa81bf16763f570e74bf47f93352cbafbd8f19a976936a4ed6172db31ded207ab8896185567ddad39edddc11bf876985988592fb74d1b0a"
+      }
+    },
+    {
+      "id": "adv-07-expired-passkey-grant",
+      "reason": "Passkey disclosure grant expires_at_ms <= occurred_at_ms",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_scene04_deliv_06",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_scene04_epic482",
+          "source": {
+            "kind": "daemon",
+            "device_ref": "dev_seat_03",
+            "session_ref": "sess_deliv_482"
+          },
+          "source_sequence": "6",
+          "attempt": 1,
+          "occurred_at_ms": "1794499999999",
+          "progress": {
+            "scene": "delivery",
+            "step": "gating"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:3f42f1cbbc4752db2f5834b0002cf069cacb98b53b21740719be226b070dda11",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_scene04_epic482_6",
+            "policy_gate_id": "VG-COPY-06"
+          },
+          "metadata": {
+            "mode": "rich_symbols",
+            "summary": {
+              "queue_status": "active",
+              "specs_passed": 398,
+              "specs_total": 412,
+              "gates_passed": 11,
+              "gates_total": 12,
+              "loc_added": 118,
+              "loc_removed": 24,
+              "duration_ms": "570000",
+              "est_minutes_saved": 0,
+              "credits_charged": "0"
+            },
+            "symbols": {
+              "repo_label": "acme/platform",
+              "branch_label": "feat/epic-482-delivery",
+              "pr_number": 482,
+              "approved_pr_url": "https://github.com/acme/platform/pull/482",
+              "short_revision": "e81b44a",
+              "gate_display_name": "Visual Geometry & Copy Gate"
+            },
+            "passkey_attestation": {
+              "grant": {
+                "schema_version": 1,
+                "org_id": "org_01JCHINWAG8899AABBCCDD",
+                "disclosure_grant_ref": "grant_passkey_rich_01",
+                "config_digest": "blake3:dcc2eb51376a3583629ad30d7a826944c2fa523793f795d96c6f2bb4554b0fc7",
+                "webauthn_credential_id": "webauthn_fido2_cred_01",
+                "authorization_epoch": "1",
+                "expires_at_ms": "1794486400000",
+                "admin_k1_pubkey": "ed25519:8ed2e8710630cb1624b2f7cf9ce9fef1295696270341b17a7621ed08d44dd055"
+              },
+              "admin_k1_signature": "ed25519:3b445e549f2290f33865e3a3061a195755e58a224c40559ed286e6fd52755b58cf9eb0efdc58b0042bf2ba399ba268cebf778358da265cdaa03c8012833bb50a"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:ae6625dca255566df2a89f2b7d9cba82cf3b39f52c9c2da9df0fa3b8881f295a"
+        },
+        "k1_signature": "ed25519:f4e9527fad1e7cdf4fa81bf16763f570e74bf47f93352cbafbd8f19a976936a4ed6172db31ded207ab8896185567ddad39edddc11bf876985988592fb74d1b0a"
+      }
+    },
+    {
+      "id": "adv-08-passkey-org-mismatch",
+      "reason": "Passkey disclosure grant org_id != beat.org_id",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_scene04_deliv_06",
+          "org_id": "org_01JOTHERORG9999999999",
+          "operation_id": "op_scene04_epic482",
+          "source": {
+            "kind": "daemon",
+            "device_ref": "dev_seat_03",
+            "session_ref": "sess_deliv_482"
+          },
+          "source_sequence": "6",
+          "attempt": 1,
+          "occurred_at_ms": "1794400770000",
+          "progress": {
+            "scene": "delivery",
+            "step": "gating"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:3f42f1cbbc4752db2f5834b0002cf069cacb98b53b21740719be226b070dda11",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_scene04_epic482_6",
+            "policy_gate_id": "VG-COPY-06"
+          },
+          "metadata": {
+            "mode": "rich_symbols",
+            "summary": {
+              "queue_status": "active",
+              "specs_passed": 398,
+              "specs_total": 412,
+              "gates_passed": 11,
+              "gates_total": 12,
+              "loc_added": 118,
+              "loc_removed": 24,
+              "duration_ms": "570000",
+              "est_minutes_saved": 0,
+              "credits_charged": "0"
+            },
+            "symbols": {
+              "repo_label": "acme/platform",
+              "branch_label": "feat/epic-482-delivery",
+              "pr_number": 482,
+              "approved_pr_url": "https://github.com/acme/platform/pull/482",
+              "short_revision": "e81b44a",
+              "gate_display_name": "Visual Geometry & Copy Gate"
+            },
+            "passkey_attestation": {
+              "grant": {
+                "schema_version": 1,
+                "org_id": "org_01JCHINWAG8899AABBCCDD",
+                "disclosure_grant_ref": "grant_passkey_rich_01",
+                "config_digest": "blake3:dcc2eb51376a3583629ad30d7a826944c2fa523793f795d96c6f2bb4554b0fc7",
+                "webauthn_credential_id": "webauthn_fido2_cred_01",
+                "authorization_epoch": "1",
+                "expires_at_ms": "1794486400000",
+                "admin_k1_pubkey": "ed25519:8ed2e8710630cb1624b2f7cf9ce9fef1295696270341b17a7621ed08d44dd055"
+              },
+              "admin_k1_signature": "ed25519:3b445e549f2290f33865e3a3061a195755e58a224c40559ed286e6fd52755b58cf9eb0efdc58b0042bf2ba399ba268cebf778358da265cdaa03c8012833bb50a"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:ae6625dca255566df2a89f2b7d9cba82cf3b39f52c9c2da9df0fa3b8881f295a"
+        },
+        "k1_signature": "ed25519:f4e9527fad1e7cdf4fa81bf16763f570e74bf47f93352cbafbd8f19a976936a4ed6172db31ded207ab8896185567ddad39edddc11bf876985988592fb74d1b0a"
+      }
+    },
+    {
+      "id": "adv-09-leading-zero-canonical-u64",
+      "reason": "CanonicalU64 rejects leading zero '050'",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_compact_strict_01",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_compact_strict_901",
+          "source": {
+            "kind": "ci",
+            "provider": "github_actions",
+            "runner_lease_ref": "lease_gha_901",
+            "run_ref": "run_901"
+          },
+          "source_sequence": "12",
+          "attempt": 1,
+          "occurred_at_ms": "1794400500000",
+          "progress": {
+            "scene": "ci_remediation",
+            "step": "passed"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:75eee90642707a93ba86c9047cceacc76f0eeb05ef9b8ff0ad71d584e6688946",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_compact_strict_901_12"
+          },
+          "metadata": {
+            "mode": "strict_zk",
+            "summary": {
+              "queue_status": "terminal_green",
+              "specs_passed": 148,
+              "specs_total": 148,
+              "gates_passed": 6,
+              "gates_total": 6,
+              "loc_added": 14,
+              "loc_removed": 3,
+              "duration_ms": "19400",
+              "est_minutes_saved": 18,
+              "credits_charged": "050",
+              "command_exit_code": 0,
+              "credit_receipt_ref": "lrcpt_op_compact_strict_901_12"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:00e70e4562051fee27c748b42ff4a491e7535cb33069b4751aeeda579c0235de"
+        },
+        "k1_signature": "ed25519:4f5a40ea1eb964bd7a99346b67b1ade86e8fb6dd3f61cbfc53f535507abd63e6f1984b84c3233c97ac4303da4a5eb3d7e15a371ee0f662e8933db9ebf8c53e0b"
+      }
+    },
+    {
+      "id": "adv-10-laptop-sleep-nonzero-credits",
+      "reason": "queued_laptop_asleep forbids non-zero credits_charged",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_laptop_sleep_01",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_sleep_hold_777",
+          "source": {
+            "kind": "ci",
+            "provider": "github_actions",
+            "runner_lease_ref": "lease_gha_777",
+            "run_ref": "run_777"
+          },
+          "source_sequence": "7",
+          "attempt": 1,
+          "occurred_at_ms": "1794400600000",
+          "progress": {
+            "scene": "ci_remediation",
+            "step": "waking"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:a6ea5c81e4c427f3917f5c6142835292defe8ce3b978cb9b53fce81353156469",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 1,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_sleep_hold_777_7"
+          },
+          "metadata": {
+            "mode": "strict_zk",
+            "summary": {
+              "queue_status": "queued_laptop_asleep",
+              "specs_passed": 147,
+              "specs_total": 148,
+              "gates_passed": 5,
+              "gates_total": 6,
+              "loc_added": 0,
+              "loc_removed": 0,
+              "duration_ms": "4200",
+              "est_minutes_saved": 0,
+              "credits_charged": "50",
+              "command_exit_code": 101
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:00e70e4562051fee27c748b42ff4a491e7535cb33069b4751aeeda579c0235de"
+        },
+        "k1_signature": "ed25519:8e4131d732fa84edc31d87ae0f0208d7a3bfa7cf87c85d2ef930444681a3428a4da7e1398bdf9b594846cec91e5a42e7f12bcc5e6cc796cceb39b20c57b6b503"
+      }
+    },
+    {
+      "id": "adv-11-nonzero-plaintext-source-bytes",
+      "reason": "plaintext_source_bytes must equal 0",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_compact_strict_01",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_compact_strict_901",
+          "source": {
+            "kind": "ci",
+            "provider": "github_actions",
+            "runner_lease_ref": "lease_gha_901",
+            "run_ref": "run_901"
+          },
+          "source_sequence": "12",
+          "attempt": 1,
+          "occurred_at_ms": "1794400500000",
+          "progress": {
+            "scene": "ci_remediation",
+            "step": "passed"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:75eee90642707a93ba86c9047cceacc76f0eeb05ef9b8ff0ad71d584e6688946",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 4,
+            "sealed_locator_ref": "obj_cwcard_op_compact_strict_901_12"
+          },
+          "metadata": {
+            "mode": "strict_zk",
+            "summary": {
+              "queue_status": "terminal_green",
+              "specs_passed": 148,
+              "specs_total": 148,
+              "gates_passed": 6,
+              "gates_total": 6,
+              "loc_added": 14,
+              "loc_removed": 3,
+              "duration_ms": "19400",
+              "est_minutes_saved": 18,
+              "credits_charged": "50",
+              "command_exit_code": 0,
+              "credit_receipt_ref": "lrcpt_op_compact_strict_901_12"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:00e70e4562051fee27c748b42ff4a491e7535cb33069b4751aeeda579c0235de"
+        },
+        "k1_signature": "ed25519:4f5a40ea1eb964bd7a99346b67b1ade86e8fb6dd3f61cbfc53f535507abd63e6f1984b84c3233c97ac4303da4a5eb3d7e15a371ee0f662e8933db9ebf8c53e0b"
+      }
+    },
+    {
+      "id": "adv-12-high-entropy-token-in-branch",
+      "reason": "High-entropy credential-like token rejected in branch_label",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_scene04_deliv_06",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_scene04_epic482",
+          "source": {
+            "kind": "daemon",
+            "device_ref": "dev_seat_03",
+            "session_ref": "sess_deliv_482"
+          },
+          "source_sequence": "6",
+          "attempt": 1,
+          "occurred_at_ms": "1794400770000",
+          "progress": {
+            "scene": "delivery",
+            "step": "gating"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:3f42f1cbbc4752db2f5834b0002cf069cacb98b53b21740719be226b070dda11",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_scene04_epic482_6",
+            "policy_gate_id": "VG-COPY-06"
+          },
+          "metadata": {
+            "mode": "rich_symbols",
+            "summary": {
+              "queue_status": "active",
+              "specs_passed": 398,
+              "specs_total": 412,
+              "gates_passed": 11,
+              "gates_total": 12,
+              "loc_added": 118,
+              "loc_removed": 24,
+              "duration_ms": "570000",
+              "est_minutes_saved": 0,
+              "credits_charged": "0"
+            },
+            "symbols": {
+              "repo_label": "acme/platform",
+              "branch_label": "0123456789abcdefghijklmnop",
+              "pr_number": 482,
+              "approved_pr_url": "https://github.com/acme/platform/pull/482",
+              "short_revision": "e81b44a",
+              "gate_display_name": "Visual Geometry & Copy Gate"
+            },
+            "passkey_attestation": {
+              "grant": {
+                "schema_version": 1,
+                "org_id": "org_01JCHINWAG8899AABBCCDD",
+                "disclosure_grant_ref": "grant_passkey_rich_01",
+                "config_digest": "blake3:dcc2eb51376a3583629ad30d7a826944c2fa523793f795d96c6f2bb4554b0fc7",
+                "webauthn_credential_id": "webauthn_fido2_cred_01",
+                "authorization_epoch": "1",
+                "expires_at_ms": "1794486400000",
+                "admin_k1_pubkey": "ed25519:8ed2e8710630cb1624b2f7cf9ce9fef1295696270341b17a7621ed08d44dd055"
+              },
+              "admin_k1_signature": "ed25519:3b445e549f2290f33865e3a3061a195755e58a224c40559ed286e6fd52755b58cf9eb0efdc58b0042bf2ba399ba268cebf778358da265cdaa03c8012833bb50a"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:ae6625dca255566df2a89f2b7d9cba82cf3b39f52c9c2da9df0fa3b8881f295a"
+        },
+        "k1_signature": "ed25519:f4e9527fad1e7cdf4fa81bf16763f570e74bf47f93352cbafbd8f19a976936a4ed6172db31ded207ab8896185567ddad39edddc11bf876985988592fb74d1b0a"
+      }
+    },
+    {
+      "id": "adv-13-env-interpolation-in-symbol",
+      "reason": "${...} env interpolation rejected",
+      "payload": {
+        "beat": {
+          "schema_version": 1,
+          "event_id": "ev_scene04_deliv_06",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "operation_id": "op_scene04_epic482",
+          "source": {
+            "kind": "daemon",
+            "device_ref": "dev_seat_03",
+            "session_ref": "sess_deliv_482"
+          },
+          "source_sequence": "6",
+          "attempt": 1,
+          "occurred_at_ms": "1794400770000",
+          "progress": {
+            "scene": "delivery",
+            "step": "gating"
+          },
+          "evidence": {
+            "cwcard_digest": "blake3:3f42f1cbbc4752db2f5834b0002cf069cacb98b53b21740719be226b070dda11",
+            "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+            "ed25519_attestation_count": 2,
+            "plaintext_source_bytes": 0,
+            "sealed_locator_ref": "obj_cwcard_op_scene04_epic482_6",
+            "policy_gate_id": "VG-COPY-06"
+          },
+          "metadata": {
+            "mode": "rich_symbols",
+            "summary": {
+              "queue_status": "active",
+              "specs_passed": 398,
+              "specs_total": 412,
+              "gates_passed": 11,
+              "gates_total": 12,
+              "loc_added": 118,
+              "loc_removed": 24,
+              "duration_ms": "570000",
+              "est_minutes_saved": 0,
+              "credits_charged": "0"
+            },
+            "symbols": {
+              "repo_label": "acme/platform",
+              "branch_label": "feat/epic-482-delivery",
+              "pr_number": 482,
+              "approved_pr_url": "https://github.com/acme/platform/pull/482",
+              "short_revision": "e81b44a",
+              "gate_display_name": "Visual Geometry & Copy Gate",
+              "symbol_label": "${GITHUB_TOKEN}_leak"
+            },
+            "passkey_attestation": {
+              "grant": {
+                "schema_version": 1,
+                "org_id": "org_01JCHINWAG8899AABBCCDD",
+                "disclosure_grant_ref": "grant_passkey_rich_01",
+                "config_digest": "blake3:dcc2eb51376a3583629ad30d7a826944c2fa523793f795d96c6f2bb4554b0fc7",
+                "webauthn_credential_id": "webauthn_fido2_cred_01",
+                "authorization_epoch": "1",
+                "expires_at_ms": "1794486400000",
+                "admin_k1_pubkey": "ed25519:8ed2e8710630cb1624b2f7cf9ce9fef1295696270341b17a7621ed08d44dd055"
+              },
+              "admin_k1_signature": "ed25519:3b445e549f2290f33865e3a3061a195755e58a224c40559ed286e6fd52755b58cf9eb0efdc58b0042bf2ba399ba268cebf778358da265cdaa03c8012833bb50a"
+            }
+          },
+          "authorization_ref": "auth_bind_T01TENANTA1_01",
+          "k1_key_id": "ed25519:ae6625dca255566df2a89f2b7d9cba82cf3b39f52c9c2da9df0fa3b8881f295a"
+        },
+        "k1_signature": "ed25519:f4e9527fad1e7cdf4fa81bf16763f570e74bf47f93352cbafbd8f19a976936a4ed6172db31ded207ab8896185567ddad39edddc11bf876985988592fb74d1b0a"
+      }
+    }
+  ],
+  "dispatch_envelope_rejections": [
+    {
+      "id": "adv-14-k2-receipt-bound-to-wrong-k1-beat",
+      "reason": "K2 receipt beat_digest/event_id does not match K1 beat",
+      "payload": {
+        "signed_beat": {
+          "beat": {
+            "schema_version": 1,
+            "event_id": "ev_compact_strict_01",
+            "org_id": "org_01JCHINWAG8899AABBCCDD",
+            "operation_id": "op_compact_strict_901",
+            "source": {
+              "kind": "ci",
+              "provider": "github_actions",
+              "runner_lease_ref": "lease_gha_901",
+              "run_ref": "run_901"
+            },
+            "source_sequence": "12",
+            "attempt": 1,
+            "occurred_at_ms": "1794400500000",
+            "progress": {
+              "scene": "ci_remediation",
+              "step": "passed"
+            },
+            "evidence": {
+              "cwcard_digest": "blake3:75eee90642707a93ba86c9047cceacc76f0eeb05ef9b8ff0ad71d584e6688946",
+              "hpke_suite": "X25519-MLKEM768-HKDF-SHA256-ChaCha20Poly1305",
+              "ed25519_attestation_count": 2,
+              "plaintext_source_bytes": 0,
+              "sealed_locator_ref": "obj_cwcard_op_compact_strict_901_12"
+            },
+            "metadata": {
+              "mode": "strict_zk",
+              "summary": {
+                "queue_status": "terminal_green",
+                "specs_passed": 148,
+                "specs_total": 148,
+                "gates_passed": 6,
+                "gates_total": 6,
+                "loc_added": 14,
+                "loc_removed": 3,
+                "duration_ms": "19400",
+                "est_minutes_saved": 18,
+                "credits_charged": "50",
+                "command_exit_code": 0,
+                "credit_receipt_ref": "lrcpt_op_compact_strict_901_12"
+              }
+            },
+            "authorization_ref": "auth_bind_T01TENANTA1_01",
+            "k1_key_id": "ed25519:00e70e4562051fee27c748b42ff4a491e7535cb33069b4751aeeda579c0235de"
+          },
+          "k1_signature": "ed25519:4f5a40ea1eb964bd7a99346b67b1ade86e8fb6dd3f61cbfc53f535507abd63e6f1984b84c3233c97ac4303da4a5eb3d7e15a371ee0f662e8933db9ebf8c53e0b"
+        },
+        "receipt": {
+          "schema_version": 1,
+          "dispatch_id": "disp_op_sleep_hold_777_07",
+          "beat_digest": "blake3:6f61ee024fae75d67f4c4c9697c0c6fda3a8ca777b169f6c0b37017ee32b641b",
+          "org_id": "org_01JCHINWAG8899AABBCCDD",
+          "event_id": "ev_laptop_sleep_01",
+          "coordinator_sequence": "502",
+          "ledger_receipt_ref": "lrcpt_op_sleep_hold_777_07",
+          "ledger_action": "laptop_sleep_hold",
+          "credits_charged": "0",
+          "remaining_credits": "450",
+          "authorization_epoch": "1",
+          "destination_binding_ref": "dest_slack_T01TENANTA1_C01CIBUILDS",
+          "dispatch_audience": "https://slack.chinwag.sh/api/slack/receipts",
+          "dispatched_at_ms": "1794400600120",
+          "k2_key_id": "ed25519:21c48f713b5def69aae0fae39c2fc82eb6d44b9fd44d1658fc1608ae0f628d7f"
+        },
+        "k2_signature": "ed25519:8d5dd96eb18ac6886aa1aea78d6c465e393748503cdfa862274a8ec127eb3282ea55a3abaa8f1a5a99fd5d5ab3d6bdbb2ff0cbcedd37a622131414c0c8974102"
+      }
+    }
+  ]
+}

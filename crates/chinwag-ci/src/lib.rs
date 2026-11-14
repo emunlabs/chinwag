@@ -63,6 +63,8 @@ pub mod runner_binding;
 pub mod runner_identity;
 #[cfg(unix)]
 pub mod runtime;
+#[cfg(unix)]
+pub mod slack;
 pub mod transport;
 // Only the descriptor-bound Darwin ACL adapter needs FFI. Crypto paths deny it.
 #[cfg(unix)]

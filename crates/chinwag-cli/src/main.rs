@@ -240,6 +240,14 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(code);
         }
+        if raw_args.get(1).map(|s| s.as_str()) == Some("slack") {
+            let code = chinwag_cli::slack::run_slack_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
         if raw_args.get(1).map(|s| s.as_str()) == Some("reply")
             || raw_args.get(1).map(|s| s.as_str()) == Some("post")
         {
