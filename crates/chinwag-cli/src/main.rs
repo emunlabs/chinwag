@@ -5,7 +5,6 @@ mod cleanroom_cli_run;
 mod feature_cli_run;
 mod relay_run;
 mod ui_auth;
-mod ui_gate_run;
 mod ui_sse;
 mod ui_workbench_run;
 
@@ -216,8 +215,19 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(code);
         }
+        if matches!(
+            raw_args.get(1).map(|s| s.as_str()),
+            Some("regression" | "regressions")
+        ) {
+            let code = chinwag_cli::regression_ratchet::run_regression_cli(
+                &raw_args[2..],
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            );
+            return ExitCode::from(code);
+        }
         if raw_args.get(1).map(|s| s.as_str()) == Some("ui-gate") {
-            let code = ui_gate_run::run_ui_gate(
+            let code = chinwag_cli::ui_gate_run::run_ui_gate(
                 &raw_args[2..],
                 &mut std::io::stdout().lock(),
                 &mut std::io::stderr().lock(),

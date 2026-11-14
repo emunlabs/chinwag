@@ -66,6 +66,7 @@ pub mod runtime;
 #[cfg(unix)]
 pub mod slack;
 pub mod transport;
+pub mod ui_gate;
 // Only the descriptor-bound Darwin ACL adapter needs FFI. Crypto paths deny it.
 #[cfg(unix)]
 pub mod agent_read;

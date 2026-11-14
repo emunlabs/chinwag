@@ -35,11 +35,69 @@ fn user_home() -> String {
 fn default_repo_root() -> String {
     format!("{}/WORKSPACE/chinwag", user_home())
 }
-fn default_planner_db() -> String {
-    format!(
+fn default_planner_db_for_repo(repo_root: &Path, explicit_repo: bool) -> String {
+    if explicit_repo {
+        return repo_root
+            .join(".chinwag")
+            .join("memory_fts.sqlite")
+            .to_string_lossy()
+            .into_owned();
+    }
+    let legacy = format!(
         "{}/WORKSPACE/delivery-planner/data/planner.sqlite",
         user_home()
-    )
+    );
+    if Path::new(&legacy)
+        .parent()
+        .is_some_and(|parent| parent.is_dir())
+    {
+        legacy
+    } else {
+        repo_root
+            .join(".chinwag")
+            .join("memory_fts.sqlite")
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+fn default_planner_db() -> String {
+    default_planner_db_for_repo(&PathBuf::from(default_repo_root()), false)
+}
+fn infer_repo_id(repo_root: &Path) -> String {
+    let git_bin = std::env::var("CHINWAG_GIT_BIN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "git".to_owned());
+    if let Ok(out) = Command::new(git_bin)
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "config",
+            "--get",
+            "remote.origin.url",
+        ])
+        .output()
+        && out.status.success()
+    {
+        let raw = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let trimmed = raw.trim_end_matches('/').trim_end_matches(".git");
+        if let Some(idx) = trimmed.rfind(':') {
+            let tail = &trimmed[idx + 1..];
+            if !tail.starts_with("//") && tail.contains('/') {
+                return tail.to_owned();
+            }
+        }
+        let parts: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 {
+            return format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+        }
+    }
+    repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("local/repo")
+        .to_owned()
 }
 fn default_leann_path() -> String {
     format!(
@@ -177,7 +235,7 @@ fn persist_tombstone_to_crdb(repo_root: &Path, write: &TombstoneWrite<'_>) -> Re
     let ev_hash = short_hash(&[id, file_scope, reason, source_commit], ts_ms);
     let record = TombstoneRecord::try_new(
         id.to_owned(),
-        "emunlabs/chinwag".to_owned(),
+        infer_repo_id(repo_root),
         "refs/heads/main".to_owned(),
         source_commit.to_owned(),
         file_scope.to_owned(),
@@ -222,7 +280,7 @@ fn persist_memory_pin_to_crdb(repo_root: &Path, write: &MemoryPinWrite<'_>) -> R
     let record = MemoryPinRecord::try_new(
         id.to_owned(),
         thread_id,
-        "emunlabs/chinwag".to_owned(),
+        infer_repo_id(repo_root),
         "refs/heads/main".to_owned(),
         format!("Chinwag 3-Tier Memory · {bank}"),
         file_scope.to_owned(),
@@ -961,14 +1019,53 @@ pub fn run_memory(request: MemoryRequest, out: &mut dyn Write, err: &mut dyn Wri
             attempted_action,
             failure,
             alternative,
+            promote_regression,
+            forbidden_patterns,
+            required_patterns,
         } => {
+            let explicit_repo = request.crdb.is_some();
+            let regression_commit = commit
+                .clone()
+                .unwrap_or_else(|| crate::regression_ratchet::infer_head_commit(&repo_root));
             let source_commit = commit.unwrap_or_else(|| DEFAULT_COMMIT_SHA.to_owned());
-            let act = attempted_action
+            let raw_reason = reason;
+            let raw_act = attempted_action
                 .unwrap_or_else(|| format!("Modifying {file_scope} with rejected pattern"));
-            let fail = failure.unwrap_or_else(|| reason.clone());
-            let alt = alternative.unwrap_or_else(|| {
+            let raw_fail = failure.unwrap_or_else(|| raw_reason.clone());
+            let raw_alt = alternative.unwrap_or_else(|| {
                 "Follow active verified_invariants in .chinwag/state.crdb".to_owned()
             });
+
+            let promotion_receipt = if promote_regression {
+                match crate::regression_ratchet::promote_tombstone_regression(
+                    &repo_root,
+                    &crate::regression_ratchet::PromoteRegressionInput {
+                        id: &id,
+                        source_commit: &regression_commit,
+                        file_scope: &file_scope,
+                        attempted_action: &raw_act,
+                        failure: &raw_fail,
+                        reason: &raw_reason,
+                        alternative: &raw_alt,
+                        forbidden_patterns,
+                        required_patterns,
+                    },
+                ) {
+                    Ok(rec) => Some(rec),
+                    Err(e) => {
+                        let _ = writeln!(err, "chinwag: promote_regression failed: {e}");
+                        return 1;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let (reason, red_r) = crate::regression_ratchet::scrub_secrets(&raw_reason);
+            let (act, red_act) = crate::regression_ratchet::scrub_secrets(&raw_act);
+            let (fail, red_f) = crate::regression_ratchet::scrub_secrets(&raw_fail);
+            let (alt, red_alt) = crate::regression_ratchet::scrub_secrets(&raw_alt);
+            let total_secret_redactions = red_r + red_act + red_f + red_alt;
             let ev_hash = format!(
                 "sha256:{}",
                 short_hash(&[&id, &file_scope, &reason, &source_commit], ts_ms)
@@ -995,9 +1092,10 @@ pub fn run_memory(request: MemoryRequest, out: &mut dyn Write, err: &mut dyn Wri
                 }
             };
 
+            let planner_db_path = default_planner_db_for_repo(&repo_root, explicit_repo);
             let payload = json!({
                 "op": "tombstone",
-                "db_path": &default_planner_db(),
+                "db_path": &planner_db_path,
                 "tombstone": {
                     "id": id,
                     "source_commit": source_commit,
@@ -1013,12 +1111,16 @@ pub fn run_memory(request: MemoryRequest, out: &mut dyn Write, err: &mut dyn Wri
             let sqlite_res = match run_python_sqlite(PY_SCHEMA_AND_OPS, &payload) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = writeln!(err, "chinwag: {e}");
-                    return 1;
+                    if explicit_repo {
+                        json!({"csr_edges_added": 0})
+                    } else {
+                        let _ = writeln!(err, "chinwag: {e}");
+                        return 1;
+                    }
                 }
             };
 
-            let output = json!({
+            let mut output = json!({
                 "ok": true,
                 "action": "tombstone",
                 "id": id,
@@ -1028,11 +1130,25 @@ pub fn run_memory(request: MemoryRequest, out: &mut dyn Write, err: &mut dyn Wri
                 "alternative": alt,
                 "source_commit": source_commit,
                 "evidence_hash": ev_hash,
+                "secret_redactions_applied": total_secret_redactions,
                 "crdb_status": crdb_status,
                 "crdb_db_version": crdb_version,
                 "fts5_indexed": true,
-                "csr_edges_added": sqlite_res.get("csr_edges_added").and_then(Json::as_u64).unwrap_or(0)
+                "csr_edges_added": sqlite_res.get("csr_edges_added").and_then(Json::as_u64).unwrap_or(0),
+                "regression_promoted": promotion_receipt.is_some(),
             });
+            if let Some(rec) = promotion_receipt
+                && let Some(obj) = output.as_object_mut()
+            {
+                obj.insert("regression_invariant".to_owned(), json!(rec.invariant));
+                obj.insert("regression_path".to_owned(), json!(rec.regression_path));
+                obj.insert("cassette_path".to_owned(), json!(rec.cassette_path));
+                obj.insert("spec_jcs_sha256".to_owned(), json!(rec.spec_jcs_sha256));
+                obj.insert(
+                    "cassette_jcs_sha256".to_owned(),
+                    json!(rec.cassette_jcs_sha256),
+                );
+            }
             let _ = serde_json::to_writer(&mut *out, &output);
             let _ = out.write_all(b"\n");
             let _ = out.flush();

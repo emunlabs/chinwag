@@ -62,6 +62,8 @@ pub mod cursor_import;
 #[cfg(target_os = "macos")]
 pub mod execution_binding;
 #[cfg(target_os = "macos")]
+pub mod regression_ratchet;
+#[cfg(target_os = "macos")]
 pub mod release_sync;
 #[cfg(target_os = "macos")]
 pub mod slack;
@@ -103,6 +105,8 @@ pub mod task_write_journal;
 pub mod task_writer;
 #[cfg(target_os = "macos")]
 pub mod ui_delivery2_voice;
+#[cfg(target_os = "macos")]
+pub mod ui_gate_run;
 #[cfg(target_os = "macos")]
 pub mod ui_telemetry;
 #[cfg(target_os = "macos")]
@@ -349,6 +353,9 @@ pub enum MemoryAction {
         attempted_action: Option<String>,
         failure: Option<String>,
         alternative: Option<String>,
+        promote_regression: bool,
+        forbidden_patterns: Vec<String>,
+        required_patterns: Vec<String>,
     },
     Stats {
         bank: Option<String>,
@@ -802,6 +809,9 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
     let mut attempted_action = None;
     let mut failure = None;
     let mut alternative = None;
+    let mut promote_regression = false;
+    let mut forbidden_patterns: Vec<String> = Vec::new();
+    let mut required_patterns: Vec<String> = Vec::new();
     let mut url = None;
     let mut crdb = None;
     let mut positionals: Vec<String> = Vec::new();
@@ -811,6 +821,15 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
         let raw_flag = rest[idx].to_str()?;
         if !raw_flag.starts_with('-') {
             positionals.push(raw_flag.to_owned());
+            idx += 1;
+            continue;
+        }
+        if raw_flag == "--promote-regression" {
+            promote_regression = true;
+            idx += 1;
+            continue;
+        }
+        if raw_flag == "--json" {
             idx += 1;
             continue;
         }
@@ -838,6 +857,11 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
             "--attempted-action" | "--action" => attempted_action = Some(val),
             "--failure" => failure = Some(val),
             "--alternative" | "--alt" => alternative = Some(val),
+            "--promote-regression" => {
+                promote_regression = matches!(val.as_str(), "1" | "true" | "yes");
+            }
+            "--forbidden-pattern" | "--forbid" => forbidden_patterns.push(val),
+            "--required-pattern" | "--require" => required_patterns.push(val),
             "--url" => url = Some(val),
             "--crdb" | "--repo" => crdb = Some(PathBuf::from(val)),
             _ => return None,
@@ -873,6 +897,9 @@ fn parse_memory(args: &[OsString]) -> Option<MemoryRequest> {
             attempted_action,
             failure,
             alternative,
+            promote_regression,
+            forbidden_patterns,
+            required_patterns,
         },
         "stats" => MemoryAction::Stats { bank },
         "migrate-hindsight" => MemoryAction::MigrateHindsight { url, bank },
