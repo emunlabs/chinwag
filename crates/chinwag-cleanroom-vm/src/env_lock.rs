@@ -238,6 +238,21 @@ pub fn parse_openssh_allowed_signers_ed25519(content: &str) -> Result<Vec<[u8; 3
     Ok(keys)
 }
 
+/// Formats a 32-byte `Ed25519` public key as a canonical OpenSSH `allowed_signers` line.
+pub fn format_openssh_allowed_signer_line(
+    principal: &str,
+    ed25519_pubkey: &[u8; 32],
+    comment: &str,
+) -> String {
+    let mut wire = Vec::with_capacity(51);
+    wire.extend_from_slice(SSH_ED25519_WIRE_PREFIX);
+    wire.extend_from_slice(ed25519_pubkey);
+    format!(
+        "{principal} ssh-ed25519 {} {comment}\n",
+        BASE64_STANDARD.encode(&wire)
+    )
+}
+
 /// Loads pinned `Ed25519` public keys from a regular (non-symlink) OpenSSH `allowed_signers` file.
 pub fn load_allowed_signers_file(path: &Path) -> Result<Vec<[u8; 32]>, EnvLockError> {
     let bytes = read_non_symlink(path)?;

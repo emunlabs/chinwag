@@ -388,7 +388,9 @@ fn env_lock_rejects_nix_expression_files_in_root_and_dot_chinwag() {
     fs::create_dir_all(dir.path().join(".chinwag")).unwrap();
     fs::write(dir.path().join(".chinwag/shell.nix"), "{}").unwrap();
     let err2 = compile_workspace_env_lock(dir.path()).unwrap_err();
-    assert!(matches!(err2, EnvLockError::ForbiddenNixSyntaxFile(ref f) if f == "shell.nix"));
+    assert!(
+        matches!(err2, EnvLockError::ForbiddenNixSyntaxFile(ref f) if f == ".chinwag/shell.nix")
+    );
 }
 
 #[test]

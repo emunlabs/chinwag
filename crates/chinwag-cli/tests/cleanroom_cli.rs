@@ -5,10 +5,9 @@
 #![cfg(target_os = "macos")]
 #![forbid(unsafe_code)]
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chinwag_cleanroom_vm::{
-    ReleaseSignerAttestation, SealedFailureBundleV1, generate_recipient_kem_keypair,
-    open_failure_diagnostic_bundle,
+    ReleaseSignerAttestation, SealedFailureBundleV1, format_openssh_allowed_signer_line,
+    generate_recipient_kem_keypair, open_failure_diagnostic_bundle,
 };
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
@@ -73,15 +72,9 @@ fn cli_env_lock_and_check_enforces_pinned_signers_by_default_and_detects_drift()
     assert!(!unpinned_out.status.success());
 
     // 3. Populate `.chinwag/allowed_signers` -> `--check` verifies pinned signer automatically!
-    let mut ssh_wire = Vec::with_capacity(51);
-    ssh_wire.extend_from_slice(b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20");
-    ssh_wire.extend_from_slice(&pk);
     fs::write(
         tmp.path().join(".chinwag/allowed_signers"),
-        format!(
-            "ci@example.invalid ssh-ed25519 {} test\n",
-            BASE64_STANDARD.encode(&ssh_wire)
-        ),
+        format_openssh_allowed_signer_line("ci@example.invalid", &pk, "test"),
     )
     .unwrap();
 
@@ -203,16 +196,10 @@ fn cli_runner_start_ephemeral_enforces_seatbelt_exec_release_attestation_and_fai
     // 3. Valid `--profile release` with customer `ReleaseRefPolicy` + `ReleaseSignerAttestation` succeeds
     let rel_sk = SigningKey::from_bytes(&[0x62u8; 32]);
     let rel_pk = rel_sk.verifying_key().to_bytes();
-    let mut ssh_wire = Vec::with_capacity(51);
-    ssh_wire.extend_from_slice(b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20");
-    ssh_wire.extend_from_slice(&rel_pk);
     let signers_path = tmp.path().join("allowed_signers");
     fs::write(
         &signers_path,
-        format!(
-            "rel@example.invalid ssh-ed25519 {} rel\n",
-            BASE64_STANDARD.encode(&ssh_wire)
-        ),
+        format_openssh_allowed_signer_line("rel@example.invalid", &rel_pk, "rel"),
     )
     .unwrap();
     let oid = "e".repeat(40);
