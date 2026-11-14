@@ -360,6 +360,21 @@ impl FleetManifest {
                     ));
                 }
             }
+            match &seat.driver {
+                DriverSpec::OpenAiCompatibleHttp {
+                    stream_mode,
+                    transport,
+                    ..
+                } => {
+                    crate::http_driver::OpenAiStreamMode::parse(stream_mode)?;
+                    crate::http_driver::validate_transport_policy(transport.as_ref())?;
+                }
+                DriverSpec::GoogleGenAiHttp { transport, .. }
+                | DriverSpec::AnthropicMessagesHttp { transport, .. } => {
+                    crate::http_driver::validate_transport_policy(transport.as_ref())?;
+                }
+                DriverSpec::CliSubprocess { .. } => {}
+            }
         }
         let mut nodes = BTreeSet::new();
         for node in &self.nodes {

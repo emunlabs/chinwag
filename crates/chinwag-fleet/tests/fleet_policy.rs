@@ -285,6 +285,7 @@ fn http_egress_denies_all_and_prefix_confusion() {
         timeout_secs: 5,
         auth_isolation: CredentialIsolation::NoneLocal,
         tools: Default::default(),
+        transport: None,
     };
     for policy in [
         EgressPolicy::DenyAll,

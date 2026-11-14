@@ -46,6 +46,8 @@ pub enum DriverSpec {
         auth_isolation: CredentialIsolation,
         #[serde(default)]
         tools: crate::http_driver::HttpToolConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<crate::http_driver::HttpTransportPolicy>,
     },
     GoogleGenAiHttp {
         endpoint_mode: String,
@@ -58,6 +60,8 @@ pub enum DriverSpec {
         auth_isolation: CredentialIsolation,
         #[serde(default)]
         tools: crate::http_driver::HttpToolConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<crate::http_driver::HttpTransportPolicy>,
     },
     AnthropicMessagesHttp {
         base_url: String,
@@ -71,6 +75,8 @@ pub enum DriverSpec {
         auth_isolation: CredentialIsolation,
         #[serde(default)]
         tools: crate::http_driver::HttpToolConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<crate::http_driver::HttpTransportPolicy>,
     },
 }
 fn stdin_framing() -> String {
@@ -351,16 +357,11 @@ pub fn resolve_dispatch_plan(
         }
         DriverSpec::OpenAiCompatibleHttp {
             base_url,
+            stream_mode,
             timeout_secs,
             auth_isolation,
             tools,
-            ..
-        }
-        | DriverSpec::AnthropicMessagesHttp {
-            base_url,
-            timeout_secs,
-            auth_isolation,
-            tools,
+            transport,
             ..
         } => {
             if *timeout_secs == 0 {
@@ -368,6 +369,25 @@ pub fn resolve_dispatch_plan(
                     "timeout_secs must be positive".into(),
                 ));
             }
+            crate::http_driver::OpenAiStreamMode::parse(stream_mode)?;
+            crate::http_driver::validate_transport_policy(transport.as_ref())?;
+            check_egress(&manifest.policy.egress_policy, base_url)?;
+            resolve_driver_credentials(manifest, &request.cwd, auth_isolation, tools)?;
+        }
+        DriverSpec::AnthropicMessagesHttp {
+            base_url,
+            timeout_secs,
+            auth_isolation,
+            tools,
+            transport,
+            ..
+        } => {
+            if *timeout_secs == 0 {
+                return Err(FleetPolicyError::InvalidManifest(
+                    "timeout_secs must be positive".into(),
+                ));
+            }
+            crate::http_driver::validate_transport_policy(transport.as_ref())?;
             check_egress(&manifest.policy.egress_policy, base_url)?;
             resolve_driver_credentials(manifest, &request.cwd, auth_isolation, tools)?;
         }
@@ -376,6 +396,7 @@ pub fn resolve_dispatch_plan(
             timeout_secs,
             auth_isolation,
             tools,
+            transport,
             ..
         } => {
             if *timeout_secs == 0 {
@@ -383,6 +404,7 @@ pub fn resolve_dispatch_plan(
                     "timeout_secs must be positive".into(),
                 ));
             }
+            crate::http_driver::validate_transport_policy(transport.as_ref())?;
             check_egress(&manifest.policy.egress_policy, base_url_or_region)?;
             resolve_driver_credentials(manifest, &request.cwd, auth_isolation, tools)?;
         }
@@ -501,6 +523,8 @@ pub struct HttpUsageSummary {
     pub gross_tokens: Option<u64>,
     #[serde(default)]
     pub observed_partial_gross_tokens: u64,
+    #[serde(default)]
+    pub transport_retries: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1007,16 +1031,15 @@ pub(crate) fn build_ssh_command(
 
     let mut remote_parts = Vec::new();
     if !expanded_workdir.is_empty() && expanded_workdir != "." {
-        remote_parts.push(format!("cd -- {} &&", posix_shell_quote(&expanded_workdir)?));
+        remote_parts.push(format!(
+            "cd -- {} &&",
+            posix_shell_quote(&expanded_workdir)?
+        ));
     }
     if !remote_env.is_empty() {
         remote_parts.push("env".to_owned());
         for (k, v) in &remote_env {
-            if k.is_empty()
-                || !k
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            {
+            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
                 return Err(FleetPolicyError::InvalidManifest(format!(
                     "invalid remote env var name: {k}"
                 )));

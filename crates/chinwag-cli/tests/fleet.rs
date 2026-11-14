@@ -546,7 +546,11 @@ fn multicall_status_flag_and_prompt_file_and_locked_model_effort_enforced() {
     }
     let root = temp.path().canonicalize().unwrap();
     fs::create_dir_all(root.join(".chinwag")).unwrap();
-    fs::write(root.join(".chinwag/fleet.toml"), manifest.to_toml().unwrap()).unwrap();
+    fs::write(
+        root.join(".chinwag/fleet.toml"),
+        manifest.to_toml().unwrap(),
+    )
+    .unwrap();
     let prompt_file = root.join("task_prompt.txt");
     fs::write(&prompt_file, "prompt loaded from file\n").unwrap();
 
@@ -683,7 +687,11 @@ fn multicall_aliases_and_anti_spoofing_and_seat_actions_work_via_manifest() {
     );
 
     fs::create_dir_all(root.join(".chinwag")).unwrap();
-    fs::write(root.join(".chinwag/fleet.toml"), manifest.to_toml().unwrap()).unwrap();
+    fs::write(
+        root.join(".chinwag/fleet.toml"),
+        manifest.to_toml().unwrap(),
+    )
+    .unwrap();
 
     let alias_bin = root.join("mercury-agent");
     let direct_bin = root.join("target-seat-agent");
@@ -807,11 +815,8 @@ fn spawn_mock_status_server(
                     Ok(0) => break,
                     Ok(n) => {
                         raw.extend_from_slice(&buf[..n]);
-                        if let Some(hdr_end) =
-                            raw.windows(4).position(|w| w == b"\r\n\r\n")
-                        {
-                            let headers_str =
-                                String::from_utf8_lossy(&raw[..hdr_end]);
+                        if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers_str = String::from_utf8_lossy(&raw[..hdr_end]);
                             let content_len = headers_str
                                 .lines()
                                 .find_map(|line| {
@@ -823,11 +828,8 @@ fn spawn_mock_status_server(
                                 })
                                 .unwrap_or(0);
                             if raw.len() >= hdr_end + 4 + content_len {
-                                let json_bytes =
-                                    &raw[hdr_end + 4..hdr_end + 4 + content_len];
-                                if let Ok(v) =
-                                    serde_json::from_slice::<Value>(json_bytes)
-                                {
+                                let json_bytes = &raw[hdr_end + 4..hdr_end + 4 + content_len];
+                                if let Ok(v) = serde_json::from_slice::<Value>(json_bytes) {
                                     cap_clone.lock().unwrap().push(v);
                                 }
                                 break;
@@ -854,6 +856,16 @@ fn setup_openai_http_manifest(
     base_url: &str,
     lock_effort: bool,
 ) -> (PathBuf, PathBuf) {
+    setup_openai_http_manifest_with_stream(root, base_url, lock_effort, "none", None)
+}
+
+fn setup_openai_http_manifest_with_stream(
+    root: &Path,
+    base_url: &str,
+    lock_effort: bool,
+    stream_mode: &str,
+    transport: Option<chinwag_fleet::HttpTransportPolicy>,
+) -> (PathBuf, PathBuf) {
     let mut manifest = FleetManifest::starter_profile("solo").unwrap();
     let seat = &mut manifest.seats[0];
     seat.id = chinwag_fleet::SeatId::new("QA").unwrap();
@@ -872,7 +884,7 @@ fn setup_openai_http_manifest(
         base_url: base_url.to_owned(),
         api_key_env: "VERCEL_API_KEY".into(),
         wire_mode: "chat_completions".into(),
-        stream_mode: "none".into(),
+        stream_mode: stream_mode.to_owned(),
         timeout_secs: 30,
         auth_isolation: CredentialIsolation::SecretEnvFile {
             path: env_path,
@@ -887,11 +899,9 @@ fn setup_openai_http_manifest(
             max_tool_calls: Some(8),
             max_output_tokens: Some(1024),
         },
+        transport,
     };
-    manifest.pubkey_map = BTreeMap::from([(
-        seat.id.clone(),
-        "01".repeat(32),
-    )]);
+    manifest.pubkey_map = BTreeMap::from([(seat.id.clone(), "01".repeat(32))]);
     manifest.allowed_signers = manifest.pubkey_map.clone();
     fs::create_dir_all(root.join(".chinwag")).unwrap();
     let manifest_path = root.join(".chinwag/fleet.toml");
@@ -948,8 +958,7 @@ fn http_usage_multiturn_counted_and_readonly_tools_and_receipt_file() {
     })
     .to_string();
 
-    let (base_url, captured, handle) =
-        spawn_mock_status_server(vec![(200, turn1), (200, turn2)]);
+    let (base_url, captured, handle) = spawn_mock_status_server(vec![(200, turn1), (200, turn2)]);
     let (_manifest_path, qa_bin) = setup_openai_http_manifest(&root, &base_url, true);
     let receipt_path = root.join("usage-receipt.json");
 
@@ -962,7 +971,11 @@ fn http_usage_multiturn_counted_and_readonly_tools_and_receipt_file() {
         .env_remove("CHINWAG_ACTOR")
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = handle.join();
 
     let payload: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -975,8 +988,7 @@ fn http_usage_multiturn_counted_and_readonly_tools_and_receipt_file() {
     assert_eq!(payload["usage"]["reasoning_tokens"], 12);
     assert_eq!(payload["usage"]["gross_tokens"], 300);
 
-    let receipt: Value =
-        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    let receipt: Value = serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
     assert_eq!(receipt["usage_status"], "COUNTED");
     assert_eq!(receipt["gross_tokens"], 300);
 
@@ -1041,7 +1053,11 @@ fn http_usage_missing_turn2_fails_closed_to_unknown() {
         .env_remove("CHINWAG_ACTOR")
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = handle.join();
 
     let payload: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -1081,8 +1097,7 @@ fn http_lock_effort_refuses_400_strip_and_env_override() {
     assert_eq!(err_payload["ok"], false);
     assert_eq!(err_payload["usage"]["usage_status"], "UNKNOWN");
     assert_eq!(err_payload["usage"]["turns"], 1);
-    let receipt: Value =
-        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    let receipt: Value = serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
     assert_eq!(receipt["usage_status"], "UNKNOWN");
 
     // CHINWAG_EFFORT_OVERRIDE mismatch fails before egress
@@ -1112,7 +1127,11 @@ fn multicall_explain_does_not_read_nontty_stdin() {
     manifest.seats[0].id = chinwag_fleet::SeatId::new("MOTION").unwrap();
     let root = temp.path().canonicalize().unwrap();
     fs::create_dir_all(root.join(".chinwag")).unwrap();
-    fs::write(root.join(".chinwag/fleet.toml"), manifest.to_toml().unwrap()).unwrap();
+    fs::write(
+        root.join(".chinwag/fleet.toml"),
+        manifest.to_toml().unwrap(),
+    )
+    .unwrap();
     let motion_bin = root.join("motion-agent");
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_chinwag"), &motion_bin).unwrap();
 
@@ -1327,13 +1346,7 @@ fn multicall_flags_before_explain_and_status_never_hit_network_and_explain_inclu
 
     // Literal prompt "explain" after `--` runs against HTTP as a prompt
     let prompt_out = Command::new(&qa_bin)
-        .args([
-            "--cwd",
-            root.to_str().unwrap(),
-            "--json",
-            "--",
-            "explain",
-        ])
+        .args(["--cwd", root.to_str().unwrap(), "--json", "--", "explain"])
         .current_dir(&root)
         .env("HOME", &root)
         .env_remove("CHINWAG_FLEET_MANIFEST")
@@ -1347,4 +1360,129 @@ fn multicall_flags_before_explain_and_status_never_hit_network_and_explain_inclu
     );
     let _ = handle.join();
     assert_eq!(captured.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn qa_agent_sse_tool_turn_and_truncated_stream_retry_reports_unknown_and_retry_count() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    fs::write(root.join("sample.txt"), "hello sse cli\n").unwrap();
+
+    let sse_turn1 = concat!(
+        ": keep-alive\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"tc_sse_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"sample.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+    let sse_turn2_truncated = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"PARTIAL\"}}]}\n\n".to_owned();
+    let sse_turn2_ok = concat!(
+        ": keep-alive\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"CLI_SSE_RECOVERED\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":140,\"completion_tokens\":10,\"total_tokens\":150}}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+    let cap_clone = Arc::clone(&captured);
+    let responses = vec![sse_turn1, sse_turn2_truncated, sse_turn2_ok];
+    let handle = std::thread::spawn(move || {
+        for body in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let hdrs = String::from_utf8_lossy(&raw[..hdr_end]).into_owned();
+                    let content_len = hdrs
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= hdr_end + 4 + content_len {
+                        let json_val: Value =
+                            serde_json::from_slice(&raw[hdr_end + 4..hdr_end + 4 + content_len])
+                                .unwrap();
+                        cap_clone.lock().unwrap().push((hdrs, json_val));
+                        break;
+                    }
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+
+    let base_url = format!("http://{addr}/v1");
+    let transport = Some(chinwag_fleet::HttpTransportPolicy {
+        max_retries: Some(2),
+        initial_backoff_ms: Some(10),
+        max_backoff_ms: Some(20),
+        connect_timeout_secs: Some(5),
+        keepalive_time_secs: Some(5),
+        stall_timeout_secs: None,
+        force_http1_1: Some(false),
+    });
+    let (_manifest_path, qa_bin) =
+        setup_openai_http_manifest_with_stream(&root, &base_url, true, "sse", transport);
+    let receipt_path = root.join("sse-receipt.json");
+
+    let out = Command::new(&qa_bin)
+        .args(["--cwd", root.to_str().unwrap(), "--json", "-p", "check"])
+        .current_dir(&root)
+        .env("HOME", &root)
+        .env("CHINWAG_USAGE_RECEIPT_PATH", &receipt_path)
+        .env_remove("CHINWAG_FLEET_MANIFEST")
+        .env_remove("CHINWAG_ACTOR")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = handle.join();
+
+    let payload: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["stdout"], "CLI_SSE_RECOVERED");
+    assert_eq!(payload["usage"]["usage_status"], "UNKNOWN");
+    assert_eq!(payload["usage"]["turns"], 2);
+    assert_eq!(payload["usage"]["tool_calls"], 1);
+    assert_eq!(payload["usage"]["transport_retries"], 1);
+    assert_eq!(payload["usage"]["observed_partial_gross_tokens"], 270);
+
+    let receipt: Value = serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["transport_retries"], 1);
+    assert_eq!(receipt["usage_status"], "UNKNOWN");
+
+    let reqs = captured.lock().unwrap();
+    assert_eq!(reqs.len(), 3);
+    assert!(
+        reqs[0]
+            .0
+            .to_ascii_lowercase()
+            .contains("accept: text/event-stream")
+    );
+    assert_eq!(reqs[0].1["stream"], true);
+    assert_eq!(reqs[0].1["stream_options"]["include_usage"], true);
+    assert_eq!(reqs[1].1, reqs[2].1);
 }

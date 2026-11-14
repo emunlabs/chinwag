@@ -488,14 +488,22 @@ impl HostedTransport for CurlTransport {
         let body_path = run_dir.join("body.json");
         let result = (|| -> Result<HttpResponse, HostedAgentError> {
             let mut cmd = Command::new(&self.curl_bin);
+            let max_time_secs = req.timeout_secs.max(1);
+            let connect_timeout_secs = max_time_secs.min(30);
+            let connect_timeout_str = connect_timeout_secs.to_string();
+            let max_time_str = max_time_secs.to_string();
             // `-q` MUST be the first argument so curl ignores ~/.curlrc;
             // `-g` (`--globoff`) disables curl `[]{}` URL glob expansion.
             cmd.args([
                 "-q",
                 "-g",
                 "-sS",
+                "--connect-timeout",
+                &connect_timeout_str,
+                "--keepalive-time",
+                "15",
                 "--max-time",
-                &req.timeout_secs.to_string(),
+                &max_time_str,
                 "-K",
                 "-",
                 "-X",
@@ -1707,6 +1715,14 @@ mod tests {
         assert!(
             argv_text.starts_with("-q\n"),
             "first curl argument must be -q: {argv_text}"
+        );
+        assert!(
+            argv_text.contains("--connect-timeout\n30\n"),
+            "curl argv must include --connect-timeout 30: {argv_text}"
+        );
+        assert!(
+            argv_text.contains("--keepalive-time\n15\n"),
+            "curl argv must include --keepalive-time 15: {argv_text}"
         );
         assert!(
             !argv_text.contains("SUPER_SECRET_SENTINEL_999"),

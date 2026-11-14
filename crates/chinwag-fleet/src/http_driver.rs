@@ -22,6 +22,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+#[cfg(test)]
 use tempfile::TempDir;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +67,72 @@ pub struct HttpToolConfig {
     pub max_tool_calls: Option<usize>,
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpTransportPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_backoff_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_backoff_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_time_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_http1_1: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenAiStreamMode {
+    None,
+    Sse,
+}
+
+impl OpenAiStreamMode {
+    pub(crate) fn parse(raw: &str) -> FleetResult<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+            Ok(Self::None)
+        } else if trimmed.eq_ignore_ascii_case("sse") {
+            Ok(Self::Sse)
+        } else {
+            Err(FleetPolicyError::InvalidManifest(format!(
+                "unsupported OpenAI stream_mode: {raw}"
+            )))
+        }
+    }
+
+    pub(crate) fn is_sse(self) -> bool {
+        matches!(self, Self::Sse)
+    }
+}
+
+pub(crate) fn validate_transport_policy(policy: Option<&HttpTransportPolicy>) -> FleetResult<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    if policy.connect_timeout_secs == Some(0) {
+        return Err(FleetPolicyError::InvalidManifest(
+            "transport.connect_timeout_secs must be positive".into(),
+        ));
+    }
+    if policy.keepalive_time_secs == Some(0) {
+        return Err(FleetPolicyError::InvalidManifest(
+            "transport.keepalive_time_secs must be positive".into(),
+        ));
+    }
+    if policy.stall_timeout_secs == Some(0) {
+        return Err(FleetPolicyError::InvalidManifest(
+            "transport.stall_timeout_secs must be positive".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validates that the configured credential isolation path/binary is ready without leaking keys.
@@ -209,7 +276,274 @@ fn resolve_driver_api_key(
 
 struct CurlHttpResponse {
     status: u16,
+    headers: Vec<(String, String)>,
     body: String,
+}
+
+#[derive(Debug)]
+enum CurlCallError {
+    Transport {
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+    TruncatedStream {
+        detail: String,
+    },
+    MissingStatusLine,
+    InvalidStatusCode(String),
+    IoOrPolicy(FleetPolicyError),
+}
+
+impl CurlCallError {
+    fn into_policy_error(self) -> FleetPolicyError {
+        match self {
+            Self::Transport { exit_code, stderr } => {
+                let trimmed = stderr.trim();
+                let msg = if trimmed.is_empty() {
+                    format!("HTTP transport failure: curl exited with {exit_code:?}")
+                } else {
+                    format!("HTTP transport failure: {trimmed}")
+                };
+                FleetPolicyError::DriverExecutionFailed(msg)
+            }
+            Self::TruncatedStream { detail } => FleetPolicyError::DriverExecutionFailed(format!(
+                "HTTP transport failure: truncated SSE stream ({detail})"
+            )),
+            Self::MissingStatusLine => FleetPolicyError::DriverExecutionFailed(
+                "curl output missing HTTP status line".into(),
+            ),
+            Self::InvalidStatusCode(code) => FleetPolicyError::DriverExecutionFailed(format!(
+                "unparseable HTTP status code: {code}"
+            )),
+            Self::IoOrPolicy(err) => err,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CurlRequestOptions<'a> {
+    accept_header: &'a str,
+    no_buffer: bool,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+    keepalive_time_secs: u64,
+    stall_timeout_secs: Option<u64>,
+    force_http1_1: bool,
+}
+
+impl<'a> CurlRequestOptions<'a> {
+    fn default_json(timeout_secs: u64) -> Self {
+        Self::from_policy(timeout_secs, None, false)
+    }
+
+    fn from_policy(timeout_secs: u64, policy: Option<&HttpTransportPolicy>, sse: bool) -> Self {
+        let max_time = timeout_secs.max(1);
+        let connect = policy
+            .and_then(|p| p.connect_timeout_secs)
+            .unwrap_or(30)
+            .max(1)
+            .min(max_time);
+        let keepalive = policy
+            .and_then(|p| p.keepalive_time_secs)
+            .unwrap_or(15)
+            .max(1);
+        let stall = policy
+            .and_then(|p| p.stall_timeout_secs)
+            .map(|s| s.max(1).min(max_time));
+        let force_http1_1 = policy.and_then(|p| p.force_http1_1).unwrap_or(false);
+        Self {
+            accept_header: if sse {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+            no_buffer: sse,
+            timeout_secs: max_time,
+            connect_timeout_secs: connect,
+            keepalive_time_secs: keepalive,
+            stall_timeout_secs: stall,
+            force_http1_1,
+        }
+    }
+}
+
+trait CurlInvoker {
+    fn invoke(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        opts: CurlRequestOptions<'_>,
+    ) -> Result<CurlHttpResponse, CurlCallError>;
+}
+
+struct SystemCurlInvoker;
+
+impl CurlInvoker for SystemCurlInvoker {
+    fn invoke(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        opts: CurlRequestOptions<'_>,
+    ) -> Result<CurlHttpResponse, CurlCallError> {
+        curl_request_raw(method, url, headers, body, opts)
+    }
+}
+
+fn parse_dump_headers(raw: &str) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.starts_with("HTTP/") {
+            headers.clear();
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        }
+    }
+    headers
+}
+
+fn curl_request_raw(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    opts: CurlRequestOptions<'_>,
+) -> Result<CurlHttpResponse, CurlCallError> {
+    if url.contains(['\0', '\r', '\n']) {
+        return Err(CurlCallError::IoOrPolicy(
+            FleetPolicyError::EgressViolation("invalid characters in URL".into()),
+        ));
+    }
+    if opts.accept_header.contains(['\0', '\r', '\n']) {
+        return Err(CurlCallError::IoOrPolicy(
+            FleetPolicyError::InvalidManifest("control character in Accept header".into()),
+        ));
+    }
+    let curl_bin = if Path::new("/usr/bin/curl").is_file() {
+        PathBuf::from("/usr/bin/curl")
+    } else {
+        resolve_binary("curl").map_err(CurlCallError::IoOrPolicy)?
+    };
+    let temp_dir = tempfile::Builder::new()
+        .prefix("cw-http-")
+        .tempdir_in(std::env::temp_dir())
+        .map_err(|e| CurlCallError::IoOrPolicy(FleetPolicyError::Io(e)))?;
+    #[cfg(unix)]
+    fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o700))
+        .map_err(|e| CurlCallError::IoOrPolicy(FleetPolicyError::Io(e)))?;
+
+    let dump_headers_path = temp_dir.path().join("resp.hdr");
+    let mut cfg = String::new();
+    cfg.push_str(&format!("url = \"{}\"\n", escape_curl_cfg(url)));
+    cfg.push_str(&format!("request = \"{}\"\n", escape_curl_cfg(method)));
+    cfg.push_str(&format!(
+        "header = \"Accept: {}\"\n",
+        escape_curl_cfg(opts.accept_header)
+    ));
+    for (k, v) in headers {
+        if k.contains(['\0', '\r', '\n']) || v.contains(['\0', '\r', '\n']) {
+            return Err(CurlCallError::IoOrPolicy(
+                FleetPolicyError::InvalidManifest("control character in HTTP header".into()),
+            ));
+        }
+        cfg.push_str(&format!(
+            "header = \"{}: {}\"\n",
+            escape_curl_cfg(k),
+            escape_curl_cfg(v)
+        ));
+    }
+    if let Some(payload) = body {
+        let body_path = temp_dir.path().join("req.json");
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&body_path)
+            .map_err(|e| CurlCallError::IoOrPolicy(FleetPolicyError::Io(e)))?;
+        f.write_all(payload.as_bytes())
+            .map_err(|e| CurlCallError::IoOrPolicy(FleetPolicyError::Io(e)))?;
+        cfg.push_str("header = \"Content-Type: application/json\"\n");
+        cfg.push_str(&format!(
+            "data-binary = \"@{}\"\n",
+            escape_curl_cfg(&body_path.to_string_lossy())
+        ));
+    }
+
+    let timeout_str = opts.timeout_secs.max(1).to_string();
+    let connect_str = opts
+        .connect_timeout_secs
+        .max(1)
+        .min(opts.timeout_secs.max(1))
+        .to_string();
+    let keepalive_str = opts.keepalive_time_secs.max(1).to_string();
+    let mut cmd = Command::new(curl_bin);
+    cmd.args(["-q", "-g", "--silent", "--show-error", "--location"]);
+    if opts.no_buffer {
+        cmd.arg("-N");
+    }
+    if opts.force_http1_1 {
+        cmd.arg("--http1.1");
+    }
+    cmd.args([
+        "--connect-timeout",
+        &connect_str,
+        "--keepalive-time",
+        &keepalive_str,
+    ]);
+    if let Some(stall) = opts.stall_timeout_secs {
+        let stall_str = stall.max(1).min(opts.timeout_secs.max(1)).to_string();
+        cmd.args(["--speed-limit", "1", "--speed-time", &stall_str]);
+    }
+    cmd.args(["--max-time", &timeout_str, "--dump-header"])
+        .arg(&dump_headers_path)
+        .args(["-w", "\n%{http_code}", "-K", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| CurlCallError::IoOrPolicy(FleetPolicyError::Io(e)))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(cfg.as_bytes())
+            .map_err(|e| CurlCallError::IoOrPolicy(FleetPolicyError::Io(e)))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| CurlCallError::IoOrPolicy(FleetPolicyError::Io(e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(CurlCallError::Transport {
+            exit_code: output.status.code(),
+            stderr,
+        });
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let (resp_body, code_str) = raw
+        .rsplit_once('\n')
+        .ok_or(CurlCallError::MissingStatusLine)?;
+    let status = code_str
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| CurlCallError::InvalidStatusCode(code_str.trim().to_owned()))?;
+    let resp_headers = fs::read_to_string(&dump_headers_path)
+        .map(|raw_hdrs| parse_dump_headers(&raw_hdrs))
+        .unwrap_or_default();
+    Ok(CurlHttpResponse {
+        status,
+        headers: resp_headers,
+        body: resp_body.to_owned(),
+    })
 }
 
 fn curl_request(
@@ -219,93 +553,14 @@ fn curl_request(
     body: Option<&str>,
     timeout_secs: u64,
 ) -> FleetResult<CurlHttpResponse> {
-    if url.contains(['\0', '\r', '\n']) {
-        return Err(FleetPolicyError::EgressViolation(
-            "invalid characters in URL".into(),
-        ));
-    }
-    let curl_bin = if Path::new("/usr/bin/curl").is_file() {
-        PathBuf::from("/usr/bin/curl")
-    } else {
-        resolve_binary("curl")?
-    };
-    let mut dir_builder = tempfile::Builder::new();
-    dir_builder.prefix("cw-http-");
-    let temp_dir = TempDir::new_in(std::env::temp_dir())?;
-    #[cfg(unix)]
-    fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o700))?;
-
-    let mut cfg = String::new();
-    cfg.push_str(&format!("url = \"{}\"\n", escape_curl_cfg(url)));
-    cfg.push_str(&format!("request = \"{}\"\n", escape_curl_cfg(method)));
-    cfg.push_str("header = \"Accept: application/json\"\n");
-    for (k, v) in headers {
-        if k.contains(['\0', '\r', '\n']) || v.contains(['\0', '\r', '\n']) {
-            return Err(FleetPolicyError::InvalidManifest(
-                "control character in HTTP header".into(),
-            ));
-        }
-        cfg.push_str(&format!("header = \"{}: {}\"\n", escape_curl_cfg(k), escape_curl_cfg(v)));
-    }
-    if let Some(payload) = body {
-        let body_path = temp_dir.path().join("req.json");
-        let mut f = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&body_path)?;
-        f.write_all(payload.as_bytes())?;
-        cfg.push_str("header = \"Content-Type: application/json\"\n");
-        cfg.push_str(&format!(
-            "data-binary = \"@{}\"\n",
-            escape_curl_cfg(&body_path.to_string_lossy())
-        ));
-    }
-
-    let timeout_str = timeout_secs.max(1).to_string();
-    let mut cmd = Command::new(curl_bin);
-    cmd.arg("-q")
-        .args([
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time",
-            &timeout_str,
-            "-w",
-            "\n%{http_code}",
-            "-K",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(cfg.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FleetPolicyError::DriverExecutionFailed(format!(
-            "HTTP transport failure: {}",
-            stderr.trim()
-        )));
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let (resp_body, code_str) = raw.rsplit_once('\n').ok_or_else(|| {
-        FleetPolicyError::DriverExecutionFailed("curl output missing HTTP status line".into())
-    })?;
-    let status = code_str.trim().parse::<u16>().map_err(|_| {
-        FleetPolicyError::DriverExecutionFailed(format!(
-            "unparseable HTTP status code: {}",
-            code_str.trim()
-        ))
-    })?;
-    Ok(CurlHttpResponse {
-        status,
-        body: resp_body.to_owned(),
-    })
+    curl_request_raw(
+        method,
+        url,
+        headers,
+        body,
+        CurlRequestOptions::default_json(timeout_secs),
+    )
+    .map_err(CurlCallError::into_policy_error)
 }
 
 fn escape_curl_cfg(val: &str) -> String {
@@ -333,6 +588,7 @@ pub fn take_last_failed_http_usage() -> Option<HttpUsageSummary> {
 #[derive(Default)]
 struct UsageAccumulator {
     turns: u32,
+    transport_retries: u32,
     unknown: bool,
     any_prompt: bool,
     any_completion: bool,
@@ -363,7 +619,8 @@ impl UsageAccumulator {
             .or_else(|| prompt.and_then(|p| completion.map(|c| p.saturating_add(c))));
         if usage.get("prompt_tokens").is_some() && prompt.is_none()
             || usage.get("completion_tokens").is_some() && completion.is_none()
-            || usage.get("total_tokens").is_some() && usage.get("total_tokens").and_then(Value::as_u64).is_none()
+            || usage.get("total_tokens").is_some()
+                && usage.get("total_tokens").and_then(Value::as_u64).is_none()
         {
             self.unknown = true;
             return;
@@ -474,6 +731,7 @@ impl UsageAccumulator {
                 reasoning_tokens: Some(self.reasoning_sum),
                 gross_tokens: Some(self.gross_sum),
                 observed_partial_gross_tokens: self.gross_sum,
+                transport_retries: self.transport_retries,
             }
         } else {
             HttpUsageSummary {
@@ -486,6 +744,7 @@ impl UsageAccumulator {
                 reasoning_tokens: None,
                 gross_tokens: None,
                 observed_partial_gross_tokens: self.gross_sum,
+                transport_retries: self.transport_retries,
             }
         }
     }
@@ -515,11 +774,7 @@ fn write_usage_receipt(context: &ExecutionContext, summary: &HttpUsageSummary) {
     }
 }
 
-fn record_http_failure(
-    context: &ExecutionContext,
-    acc: &UsageAccumulator,
-    tool_calls: usize,
-) {
+fn record_http_failure(context: &ExecutionContext, acc: &UsageAccumulator, tool_calls: usize) {
     if acc.turns == 0 {
         return;
     }
@@ -553,6 +808,16 @@ pub(crate) fn execute_http_driver(
     context: &ExecutionContext,
     on_started: impl FnOnce(u32),
 ) -> FleetResult<ExecutionOutcome> {
+    let mut invoker = SystemCurlInvoker;
+    execute_http_driver_with_invoker(plan, context, on_started, &mut invoker)
+}
+
+fn execute_http_driver_with_invoker(
+    plan: &ResolvedDispatchPlan,
+    context: &ExecutionContext,
+    on_started: impl FnOnce(u32),
+    invoker: &mut dyn CurlInvoker,
+) -> FleetResult<ExecutionOutcome> {
     on_started(std::process::id());
     LAST_FAILED_HTTP_USAGE.with(|cell| {
         *cell.borrow_mut() = None;
@@ -569,15 +834,21 @@ pub(crate) fn execute_http_driver(
         DriverSpec::OpenAiCompatibleHttp {
             base_url,
             api_key_env,
-            stream_mode: _,
+            stream_mode,
             wire_mode: _,
             timeout_secs,
             auth_isolation,
             tools,
+            transport,
         } => {
+            let parsed_stream_mode = OpenAiStreamMode::parse(stream_mode)?;
+            validate_transport_policy(transport.as_ref())?;
             let eff_timeout = context.timeout_override_secs.unwrap_or(*timeout_secs);
             let api_key = resolve_driver_api_key(auth_isolation, api_key_env)?;
-            let endpoint = if base_url.trim_end_matches('/').ends_with("/chat/completions") {
+            let endpoint = if base_url
+                .trim_end_matches('/')
+                .ends_with("/chat/completions")
+            {
                 base_url.trim_end_matches('/').to_owned()
             } else {
                 format!("{}/chat/completions", base_url.trim_end_matches('/'))
@@ -587,10 +858,13 @@ pub(crate) fn execute_http_driver(
                 context,
                 &endpoint,
                 api_key.as_deref(),
+                parsed_stream_mode,
                 &system_prompt,
                 user_prompt,
                 eff_timeout,
                 tools,
+                transport.as_ref(),
+                invoker,
             )
         }
         DriverSpec::GoogleGenAiHttp {
@@ -601,10 +875,13 @@ pub(crate) fn execute_http_driver(
             timeout_secs,
             auth_isolation,
             tools,
+            transport,
         } => {
+            validate_transport_policy(transport.as_ref())?;
             let eff_timeout = context.timeout_override_secs.unwrap_or(*timeout_secs);
-            let api_key = resolve_driver_api_key(auth_isolation, auth_env)?
-                .ok_or_else(|| FleetPolicyError::DriverExecutionFailed("missing Gemini API key".into()))?;
+            let api_key = resolve_driver_api_key(auth_isolation, auth_env)?.ok_or_else(|| {
+                FleetPolicyError::DriverExecutionFailed("missing Gemini API key".into())
+            })?;
             let url = format!(
                 "{}/models/{}:generateContent",
                 base_url_or_region.trim_end_matches('/'),
@@ -619,6 +896,8 @@ pub(crate) fn execute_http_driver(
                 user_prompt,
                 eff_timeout,
                 tools,
+                transport.as_ref(),
+                invoker,
             )
         }
         DriverSpec::AnthropicMessagesHttp {
@@ -629,10 +908,13 @@ pub(crate) fn execute_http_driver(
             timeout_secs,
             auth_isolation,
             tools,
+            transport,
         } => {
+            validate_transport_policy(transport.as_ref())?;
             let eff_timeout = context.timeout_override_secs.unwrap_or(*timeout_secs);
-            let api_key = resolve_driver_api_key(auth_isolation, auth_env)?
-                .ok_or_else(|| FleetPolicyError::DriverExecutionFailed("missing Anthropic API key".into()))?;
+            let api_key = resolve_driver_api_key(auth_isolation, auth_env)?.ok_or_else(|| {
+                FleetPolicyError::DriverExecutionFailed("missing Anthropic API key".into())
+            })?;
             let endpoint = if base_url.trim_end_matches('/').ends_with("/messages") {
                 base_url.trim_end_matches('/').to_owned()
             } else {
@@ -648,6 +930,8 @@ pub(crate) fn execute_http_driver(
                 user_prompt,
                 eff_timeout,
                 tools,
+                transport.as_ref(),
+                invoker,
             )
         }
         DriverSpec::CliSubprocess { .. } => unreachable!(),
@@ -669,16 +953,468 @@ fn compose_system_instruction(
     Ok(text)
 }
 
+#[derive(Default)]
+struct SseToolCallAccum {
+    id: Option<String>,
+    call_type: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+fn parse_openai_sse_transcript(body: &str) -> Result<Value, CurlCallError> {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut role: Option<String> = None;
+    let mut content_buf = String::new();
+    let mut saw_nonempty_content = false;
+    let mut tool_calls: BTreeMap<usize, SseToolCallAccum> = BTreeMap::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage: Option<Value> = None;
+    let mut saw_done = false;
+    let mut saw_data_line = false;
+    let mut current_event: Option<String> = None;
+
+    for (line_idx, raw_line) in lines.iter().enumerate() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            if current_event
+                .as_deref()
+                .is_some_and(|ev| ev.eq_ignore_ascii_case("error"))
+            {
+                return Err(CurlCallError::IoOrPolicy(
+                    FleetPolicyError::DriverExecutionFailed("OpenAI SSE error event".into()),
+                ));
+            }
+            current_event = None;
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(ev) = line.strip_prefix("event:") {
+            current_event = Some(ev.trim().to_owned());
+            continue;
+        }
+        if line.starts_with("id:") || line.starts_with("retry:") {
+            continue;
+        }
+        let Some(raw_data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        saw_data_line = true;
+        let payload = raw_data.strip_prefix(' ').unwrap_or(raw_data).trim();
+        if current_event
+            .as_deref()
+            .is_some_and(|ev| ev.eq_ignore_ascii_case("error"))
+        {
+            return Err(CurlCallError::IoOrPolicy(
+                FleetPolicyError::DriverExecutionFailed(format!(
+                    "OpenAI SSE error event: {}",
+                    payload.chars().take(400).collect::<String>()
+                )),
+            ));
+        }
+        if payload.is_empty() {
+            continue;
+        }
+        if payload == "[DONE]" {
+            saw_done = true;
+            break;
+        }
+        if current_event
+            .as_deref()
+            .is_some_and(|ev| ev.eq_ignore_ascii_case("ping"))
+        {
+            continue;
+        }
+        let chunk: Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(err) => {
+                let has_later_data = lines[line_idx + 1..]
+                    .iter()
+                    .any(|later| later.trim_end_matches('\r').starts_with("data:"));
+                if !has_later_data {
+                    return Err(CurlCallError::TruncatedStream {
+                        detail: format!("incomplete SSE JSON frame at EOF: {err}"),
+                    });
+                }
+                return Err(CurlCallError::IoOrPolicy(
+                    FleetPolicyError::DriverExecutionFailed(format!(
+                        "invalid OpenAI SSE JSON chunk: {err}"
+                    )),
+                ));
+            }
+        };
+        if let Some(err_val) = chunk.get("error").filter(|v| !v.is_null()) {
+            return Err(CurlCallError::IoOrPolicy(
+                FleetPolicyError::DriverExecutionFailed(format!("OpenAI SSE error: {err_val}")),
+            ));
+        }
+        if let Some(u) = chunk.get("usage").filter(|v| v.is_object()) {
+            usage = Some(u.clone());
+        }
+        if let Some(choice0) = chunk.pointer("/choices/0") {
+            if let Some(fr) = choice0
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                finish_reason = Some(fr.to_owned());
+            }
+            if let Some(delta) = choice0
+                .get("delta")
+                .or_else(|| choice0.get("message"))
+                .and_then(Value::as_object)
+            {
+                if let Some(r) = delta
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    role = Some(r.to_owned());
+                }
+                if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                    content_buf.push_str(text);
+                    if !text.is_empty() {
+                        saw_nonempty_content = true;
+                    }
+                }
+                if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                    for (pos, tc) in calls.iter().enumerate() {
+                        let idx = tc
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                            .unwrap_or(pos);
+                        let acc = tool_calls.entry(idx).or_default();
+                        if acc.id.is_none()
+                            && let Some(id) = tc
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                        {
+                            acc.id = Some(id.to_owned());
+                        }
+                        if acc.call_type.is_none()
+                            && let Some(kind) = tc
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                        {
+                            acc.call_type = Some(kind.to_owned());
+                        }
+                        if let Some(func) = tc.get("function").and_then(Value::as_object) {
+                            if let Some(name) = func
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
+                                if acc.name.is_empty() {
+                                    acc.name = name.to_owned();
+                                } else if acc.name != name {
+                                    acc.name.push_str(name);
+                                }
+                            }
+                            if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                                acc.arguments.push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if current_event
+        .as_deref()
+        .is_some_and(|ev| ev.eq_ignore_ascii_case("error"))
+    {
+        return Err(CurlCallError::IoOrPolicy(
+            FleetPolicyError::DriverExecutionFailed("OpenAI SSE error event".into()),
+        ));
+    }
+
+    if !saw_data_line {
+        if body.trim_start().starts_with('{') {
+            let parsed: Value = serde_json::from_str(body).map_err(|err| {
+                CurlCallError::IoOrPolicy(FleetPolicyError::DriverExecutionFailed(format!(
+                    "invalid OpenAI JSON: {err}"
+                )))
+            })?;
+            if let Some(err_val) = parsed.get("error").filter(|v| !v.is_null()) {
+                return Err(CurlCallError::IoOrPolicy(
+                    FleetPolicyError::DriverExecutionFailed(format!(
+                        "OpenAI error response: {err_val}"
+                    )),
+                ));
+            }
+            return Ok(parsed);
+        }
+        return Err(CurlCallError::TruncatedStream {
+            detail: "empty SSE stream without data frames".into(),
+        });
+    }
+
+    if !saw_done && finish_reason.is_none() {
+        return Err(CurlCallError::TruncatedStream {
+            detail: "SSE stream closed at EOF without [DONE] or finish_reason".into(),
+        });
+    }
+
+    let mut message = Map::new();
+    message.insert(
+        "role".into(),
+        Value::String(role.unwrap_or_else(|| "assistant".into())),
+    );
+    if tool_calls.is_empty() || saw_nonempty_content {
+        message.insert("content".into(), Value::String(content_buf));
+    } else {
+        message.insert("content".into(), Value::Null);
+    }
+    if !tool_calls.is_empty() {
+        let assembled_calls: Vec<Value> = tool_calls
+            .into_iter()
+            .map(|(idx, acc)| {
+                let id = acc.id.unwrap_or_else(|| format!("call_{idx}"));
+                let call_type = acc.call_type.unwrap_or_else(|| "function".into());
+                let arguments = if acc.arguments.is_empty() {
+                    "{}".to_owned()
+                } else {
+                    acc.arguments
+                };
+                json!({
+                    "id": id,
+                    "type": call_type,
+                    "function": {
+                        "name": acc.name,
+                        "arguments": arguments,
+                    }
+                })
+            })
+            .collect();
+        message.insert("tool_calls".into(), Value::Array(assembled_calls));
+    }
+
+    let mut choice = Map::new();
+    choice.insert("index".into(), json!(0));
+    choice.insert("message".into(), Value::Object(message));
+    if let Some(fr) = finish_reason {
+        choice.insert("finish_reason".into(), Value::String(fr));
+    }
+
+    let mut out = Map::new();
+    out.insert("choices".into(), Value::Array(vec![Value::Object(choice)]));
+    if let Some(u) = usage {
+        out.insert("usage".into(), u);
+    }
+    Ok(Value::Object(out))
+}
+
+#[derive(Clone, Copy)]
+enum ResponseParseMode {
+    OpenAiSse,
+    Json { provider_label: &'static str },
+}
+
+enum TurnHttpResult {
+    ParsedJson(Value),
+    NonSuccessStatus { status: u16, body: String },
+}
+
+fn is_pre_send_retryable_curl_exit(code: Option<i32>) -> bool {
+    matches!(code, Some(6 | 7 | 35))
+}
+
+fn is_post_send_retryable_curl_exit(code: Option<i32>) -> bool {
+    matches!(code, Some(16 | 18 | 28 | 52 | 55 | 56 | 92))
+}
+
+fn is_retryable_http_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 502 | 503 | 504)
+}
+
+fn parse_retry_after_ms(headers: &[(String, String)]) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs <= 15)
+        .map(|secs| secs.saturating_mul(1_000))
+}
+
+fn try_schedule_retry(
+    attempt: u32,
+    max_retries: u32,
+    turn_deadline: Instant,
+    sleep_ms: u64,
+    min_retry_budget: Duration,
+    usage_acc: &mut UsageAccumulator,
+) -> bool {
+    if attempt >= max_retries {
+        return false;
+    }
+    let sleep_dur = Duration::from_millis(sleep_ms);
+    let remaining = turn_deadline.saturating_duration_since(Instant::now());
+    if remaining <= sleep_dur || remaining.saturating_sub(sleep_dur) < min_retry_budget {
+        return false;
+    }
+    std::thread::sleep(sleep_dur);
+    usage_acc.transport_retries = usage_acc.transport_retries.saturating_add(1);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_turn_with_retry(
+    invoker: &mut dyn CurlInvoker,
+    endpoint: &str,
+    headers: &[(String, String)],
+    payload: &str,
+    timeout_secs: u64,
+    policy: Option<&HttpTransportPolicy>,
+    parse_mode: ResponseParseMode,
+    usage_acc: &mut UsageAccumulator,
+) -> FleetResult<TurnHttpResult> {
+    let total_timeout = timeout_secs.max(1);
+    let max_retries = policy.and_then(|p| p.max_retries).unwrap_or(2);
+    let initial_backoff_ms = policy.and_then(|p| p.initial_backoff_ms).unwrap_or(1_000);
+    let max_backoff_ms = policy
+        .and_then(|p| p.max_backoff_ms)
+        .unwrap_or(8_000)
+        .max(initial_backoff_ms);
+    let raw_connect_secs = policy
+        .and_then(|p| p.connect_timeout_secs)
+        .unwrap_or(30)
+        .max(1);
+    let min_retry_budget = if total_timeout > raw_connect_secs {
+        Duration::from_secs(raw_connect_secs)
+    } else {
+        Duration::from_secs(1)
+    };
+    let turn_deadline = Instant::now() + Duration::from_secs(total_timeout);
+    let sse = matches!(parse_mode, ResponseParseMode::OpenAiSse);
+
+    let mut attempt: u32 = 0;
+    loop {
+        let remaining = turn_deadline.saturating_duration_since(Instant::now());
+        let attempt_timeout_secs = if attempt == 0 {
+            total_timeout
+        } else {
+            total_timeout.min(remaining.as_secs().max(1))
+        };
+        let opts = CurlRequestOptions::from_policy(attempt_timeout_secs, policy, sse);
+        let backoff_ms = initial_backoff_ms
+            .saturating_mul(1u64 << attempt.min(16))
+            .min(max_backoff_ms);
+
+        match invoker.invoke("POST", endpoint, headers, Some(payload), opts) {
+            Err(err) => {
+                let (retryable, post_send_ambiguous) = match &err {
+                    CurlCallError::Transport { exit_code, .. } => {
+                        if is_pre_send_retryable_curl_exit(*exit_code) {
+                            (true, false)
+                        } else if is_post_send_retryable_curl_exit(*exit_code) {
+                            (true, true)
+                        } else {
+                            (false, true)
+                        }
+                    }
+                    CurlCallError::TruncatedStream { .. } => (true, true),
+                    CurlCallError::MissingStatusLine
+                    | CurlCallError::InvalidStatusCode(_)
+                    | CurlCallError::IoOrPolicy(_) => (false, true),
+                };
+                if post_send_ambiguous {
+                    usage_acc.unknown = true;
+                }
+                if !retryable
+                    || !try_schedule_retry(
+                        attempt,
+                        max_retries,
+                        turn_deadline,
+                        backoff_ms,
+                        min_retry_budget,
+                        usage_acc,
+                    )
+                {
+                    return Err(err.into_policy_error());
+                }
+                attempt += 1;
+            }
+            Ok(resp) if !(200..300).contains(&resp.status) => {
+                if !is_retryable_http_status(resp.status) {
+                    return Ok(TurnHttpResult::NonSuccessStatus {
+                        status: resp.status,
+                        body: resp.body,
+                    });
+                }
+                if resp.status != 429 {
+                    usage_acc.unknown = true;
+                }
+                let sleep_ms = if resp.status == 429 {
+                    parse_retry_after_ms(&resp.headers).unwrap_or(backoff_ms)
+                } else {
+                    backoff_ms
+                };
+                if !try_schedule_retry(
+                    attempt,
+                    max_retries,
+                    turn_deadline,
+                    sleep_ms,
+                    min_retry_budget,
+                    usage_acc,
+                ) {
+                    return Ok(TurnHttpResult::NonSuccessStatus {
+                        status: resp.status,
+                        body: resp.body,
+                    });
+                }
+                attempt += 1;
+            }
+            Ok(resp) => match parse_mode {
+                ResponseParseMode::OpenAiSse => match parse_openai_sse_transcript(&resp.body) {
+                    Ok(parsed) => return Ok(TurnHttpResult::ParsedJson(parsed)),
+                    Err(CurlCallError::TruncatedStream { detail }) => {
+                        usage_acc.unknown = true;
+                        let err = CurlCallError::TruncatedStream { detail };
+                        if !try_schedule_retry(
+                            attempt,
+                            max_retries,
+                            turn_deadline,
+                            backoff_ms,
+                            min_retry_budget,
+                            usage_acc,
+                        ) {
+                            return Err(err.into_policy_error());
+                        }
+                        attempt += 1;
+                    }
+                    Err(other) => return Err(other.into_policy_error()),
+                },
+                ResponseParseMode::Json { provider_label } => {
+                    let parsed: Value = serde_json::from_str(&resp.body).map_err(|e| {
+                        FleetPolicyError::DriverExecutionFailed(format!(
+                            "invalid {provider_label} JSON: {e}"
+                        ))
+                    })?;
+                    return Ok(TurnHttpResult::ParsedJson(parsed));
+                }
+            },
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_openai_loop(
     plan: &ResolvedDispatchPlan,
     context: &ExecutionContext,
     endpoint: &str,
     api_key: Option<&str>,
+    stream_mode: OpenAiStreamMode,
     system_prompt: &str,
     user_prompt: &str,
     timeout_secs: u64,
     tools: &HttpToolConfig,
+    transport_policy: Option<&HttpTransportPolicy>,
+    invoker: &mut dyn CurlInvoker,
 ) -> FleetResult<ExecutionOutcome> {
     let max_turns = context
         .max_turns_override
@@ -722,54 +1458,44 @@ fn run_openai_loop(
     }
     let mut tool_calls_used = 0usize;
     let mut usage_acc = UsageAccumulator::default();
-    let mut send_reasoning_effort = matches!(
-        effort.as_deref(),
-        Some("low" | "medium" | "high")
-    );
+    let mut send_reasoning_effort = matches!(effort.as_deref(), Some("low" | "medium" | "high"));
+    let mut send_stream_options = stream_mode.is_sse();
 
     for _turn in 0..max_turns {
-        let mut resp = {
+        let parsed = loop {
             let mut payload = json!({
                 "model": plan.model.model_id,
                 "messages": messages,
                 "max_tokens": max_tokens,
             });
+            if stream_mode.is_sse() {
+                payload["stream"] = Value::Bool(true);
+                if send_stream_options {
+                    payload["stream_options"] = json!({"include_usage": true});
+                }
+            }
             if send_reasoning_effort && let Some(eff) = &effort {
                 payload["reasoning_effort"] = Value::String(eff.clone());
             }
             if tools_active {
                 payload["tools"] = openai_tool_declarations(allow_writes);
             }
-            match curl_request("POST", endpoint, &headers, Some(&payload.to_string()), timeout_secs) {
-                Ok(r) => r,
-                Err(err) => {
-                    usage_acc.mark_egress_failed();
-                    record_http_failure(context, &usage_acc, tool_calls_used);
-                    return Err(err);
+            let parse_mode = if stream_mode.is_sse() {
+                ResponseParseMode::OpenAiSse
+            } else {
+                ResponseParseMode::Json {
+                    provider_label: "OpenAI",
                 }
-            }
-        };
-
-        if resp.status == 400
-            && send_reasoning_effort
-            && !lock_effort
-            && resp.body.contains("reasoning_effort")
-        {
-            send_reasoning_effort = false;
-            let mut payload = json!({
-                "model": plan.model.model_id,
-                "messages": messages,
-                "max_tokens": max_tokens,
-            });
-            if tools_active {
-                payload["tools"] = openai_tool_declarations(allow_writes);
-            }
-            resp = match curl_request(
-                "POST",
+            };
+            let turn_res = match send_turn_with_retry(
+                invoker,
                 endpoint,
                 &headers,
-                Some(&payload.to_string()),
+                &payload.to_string(),
                 timeout_secs,
+                transport_policy,
+                parse_mode,
+                &mut usage_acc,
             ) {
                 Ok(r) => r,
                 Err(err) => {
@@ -778,26 +1504,31 @@ fn run_openai_loop(
                     return Err(err);
                 }
             };
-        }
-
-        if !(200..300).contains(&resp.status) {
-            usage_acc.mark_egress_failed();
-            record_http_failure(context, &usage_acc, tool_calls_used);
-            return Err(FleetPolicyError::DriverExecutionFailed(format!(
-                "OpenAI-compatible HTTP {} from {} (zero failover): {}",
-                resp.status,
-                endpoint,
-                resp.body.chars().take(400).collect::<String>()
-            )));
-        }
-        let parsed: Value = match serde_json::from_str(&resp.body) {
-            Ok(v) => v,
-            Err(e) => {
-                usage_acc.mark_egress_failed();
-                record_http_failure(context, &usage_acc, tool_calls_used);
-                return Err(FleetPolicyError::DriverExecutionFailed(format!(
-                    "invalid OpenAI JSON: {e}"
-                )));
+            match turn_res {
+                TurnHttpResult::ParsedJson(parsed) => break parsed,
+                TurnHttpResult::NonSuccessStatus { status: 400, body }
+                    if !lock_effort
+                        && send_reasoning_effort
+                        && body.contains("reasoning_effort") =>
+                {
+                    send_reasoning_effort = false;
+                }
+                TurnHttpResult::NonSuccessStatus { status: 400, body }
+                    if !lock_effort
+                        && stream_mode.is_sse()
+                        && send_stream_options
+                        && body.contains("stream_options") =>
+                {
+                    send_stream_options = false;
+                }
+                TurnHttpResult::NonSuccessStatus { status, body } => {
+                    usage_acc.mark_egress_failed();
+                    record_http_failure(context, &usage_acc, tool_calls_used);
+                    return Err(FleetPolicyError::DriverExecutionFailed(format!(
+                        "OpenAI-compatible HTTP {status} from {endpoint} (zero failover): {}",
+                        body.chars().take(400).collect::<String>()
+                    )));
+                }
             }
         };
         usage_acc.record_openai_turn(&parsed);
@@ -886,6 +1617,8 @@ fn run_gemini_loop(
     user_prompt: &str,
     timeout_secs: u64,
     tools: &HttpToolConfig,
+    transport_policy: Option<&HttpTransportPolicy>,
+    invoker: &mut dyn CurlInvoker,
 ) -> FleetResult<ExecutionOutcome> {
     let max_turns = context
         .max_turns_override
@@ -947,32 +1680,31 @@ fn run_gemini_loop(
         if tools_active {
             payload["tools"] = gemini_tool_declarations(allow_writes);
         }
-        let resp = match curl_request("POST", endpoint, &headers, Some(&payload.to_string()), timeout_secs) {
-            Ok(r) => r,
+        let parsed = match send_turn_with_retry(
+            invoker,
+            endpoint,
+            &headers,
+            &payload.to_string(),
+            timeout_secs,
+            transport_policy,
+            ResponseParseMode::Json {
+                provider_label: "Gemini",
+            },
+            &mut usage_acc,
+        ) {
+            Ok(TurnHttpResult::ParsedJson(v)) => v,
+            Ok(TurnHttpResult::NonSuccessStatus { status, body }) => {
+                usage_acc.mark_egress_failed();
+                record_http_failure(context, &usage_acc, tool_calls_used);
+                return Err(FleetPolicyError::DriverExecutionFailed(format!(
+                    "Gemini HTTP {status} from {endpoint} (zero failover): {}",
+                    body.chars().take(400).collect::<String>()
+                )));
+            }
             Err(err) => {
                 usage_acc.mark_egress_failed();
                 record_http_failure(context, &usage_acc, tool_calls_used);
                 return Err(err);
-            }
-        };
-        if !(200..300).contains(&resp.status) {
-            usage_acc.mark_egress_failed();
-            record_http_failure(context, &usage_acc, tool_calls_used);
-            return Err(FleetPolicyError::DriverExecutionFailed(format!(
-                "Gemini HTTP {} from {} (zero failover): {}",
-                resp.status,
-                endpoint,
-                resp.body.chars().take(400).collect::<String>()
-            )));
-        }
-        let parsed: Value = match serde_json::from_str(&resp.body) {
-            Ok(v) => v,
-            Err(e) => {
-                usage_acc.mark_egress_failed();
-                record_http_failure(context, &usage_acc, tool_calls_used);
-                return Err(FleetPolicyError::DriverExecutionFailed(format!(
-                    "invalid Gemini JSON: {e}"
-                )));
             }
         };
         usage_acc.record_gemini_turn(&parsed);
@@ -1073,6 +1805,8 @@ fn run_anthropic_loop(
     user_prompt: &str,
     timeout_secs: u64,
     tools: &HttpToolConfig,
+    transport_policy: Option<&HttpTransportPolicy>,
+    invoker: &mut dyn CurlInvoker,
 ) -> FleetResult<ExecutionOutcome> {
     let max_turns = context
         .max_turns_override
@@ -1105,32 +1839,31 @@ fn run_anthropic_loop(
         if tools_active {
             payload["tools"] = anthropic_tool_declarations(allow_writes);
         }
-        let resp = match curl_request("POST", endpoint, &headers, Some(&payload.to_string()), timeout_secs) {
-            Ok(r) => r,
+        let parsed = match send_turn_with_retry(
+            invoker,
+            endpoint,
+            &headers,
+            &payload.to_string(),
+            timeout_secs,
+            transport_policy,
+            ResponseParseMode::Json {
+                provider_label: "Anthropic",
+            },
+            &mut usage_acc,
+        ) {
+            Ok(TurnHttpResult::ParsedJson(v)) => v,
+            Ok(TurnHttpResult::NonSuccessStatus { status, body }) => {
+                usage_acc.mark_egress_failed();
+                record_http_failure(context, &usage_acc, tool_calls_used);
+                return Err(FleetPolicyError::DriverExecutionFailed(format!(
+                    "Anthropic HTTP {status} from {endpoint} (zero failover): {}",
+                    body.chars().take(400).collect::<String>()
+                )));
+            }
             Err(err) => {
                 usage_acc.mark_egress_failed();
                 record_http_failure(context, &usage_acc, tool_calls_used);
                 return Err(err);
-            }
-        };
-        if !(200..300).contains(&resp.status) {
-            usage_acc.mark_egress_failed();
-            record_http_failure(context, &usage_acc, tool_calls_used);
-            return Err(FleetPolicyError::DriverExecutionFailed(format!(
-                "Anthropic HTTP {} from {} (zero failover): {}",
-                resp.status,
-                endpoint,
-                resp.body.chars().take(400).collect::<String>()
-            )));
-        }
-        let parsed: Value = match serde_json::from_str(&resp.body) {
-            Ok(v) => v,
-            Err(e) => {
-                usage_acc.mark_egress_failed();
-                record_http_failure(context, &usage_acc, tool_calls_used);
-                return Err(FleetPolicyError::DriverExecutionFailed(format!(
-                    "invalid Anthropic JSON: {e}"
-                )));
             }
         };
         usage_acc.record_anthropic_turn(&parsed);
@@ -1212,23 +1945,21 @@ fn run_anthropic_loop(
 }
 
 fn openai_tool_declarations(allow_writes: bool) -> Value {
-    let mut decls = vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a UTF-8 text file or inspect media metadata on disk.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "max_chars": {"type": "integer"}
-                    },
-                    "required": ["path"]
-                }
+    let mut decls = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file or inspect media metadata on disk.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "max_chars": {"type": "integer"}
+                },
+                "required": ["path"]
             }
-        }),
-    ];
+        }
+    })];
     if allow_writes {
         decls.push(json!({
             "type": "function",
@@ -1282,20 +2013,18 @@ fn openai_tool_declarations(allow_writes: bool) -> Value {
 }
 
 fn gemini_tool_declarations(allow_writes: bool) -> Value {
-    let mut decls = vec![
-        json!({
-            "name": "read_file",
-            "description": "Read a UTF-8 text file from disk.",
-            "parameters": {
-                "type": "OBJECT",
-                "properties": {
-                    "path": {"type": "STRING"},
-                    "max_chars": {"type": "INTEGER"}
-                },
-                "required": ["path"]
-            }
-        }),
-    ];
+    let mut decls = vec![json!({
+        "name": "read_file",
+        "description": "Read a UTF-8 text file from disk.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": {"type": "STRING"},
+                "max_chars": {"type": "INTEGER"}
+            },
+            "required": ["path"]
+        }
+    })];
     if allow_writes {
         decls.push(json!({
             "name": "write_file",
@@ -1340,20 +2069,18 @@ fn gemini_tool_declarations(allow_writes: bool) -> Value {
 }
 
 fn anthropic_tool_declarations(allow_writes: bool) -> Value {
-    let mut decls = vec![
-        json!({
-            "name": "read_file",
-            "description": "Read a UTF-8 text file from disk.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "max_chars": {"type": "integer"}
-                },
-                "required": ["path"]
-            }
-        }),
-    ];
+    let mut decls = vec![json!({
+        "name": "read_file",
+        "description": "Read a UTF-8 text file from disk.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "max_chars": {"type": "integer"}
+            },
+            "required": ["path"]
+        }
+    })];
     if allow_writes {
         decls.push(json!({
             "name": "write_file",
@@ -1446,7 +2173,18 @@ fn tool_read_file(args: &Value, cwd: &Path) -> Value {
         .unwrap_or_default();
     if matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "webp" | "gif" | "wav" | "mp3" | "ogg" | "flac" | "mp4" | "mov" | "pdf"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "gif"
+            | "wav"
+            | "mp3"
+            | "ogg"
+            | "flac"
+            | "mp4"
+            | "mov"
+            | "pdf"
     ) {
         let len = fs::metadata(&canon).map(|m| m.len()).unwrap_or(0);
         return json!({
@@ -1620,7 +2358,9 @@ fn path_matches_prefix(normalized_pq: &str, prefix: &str) -> bool {
     if !path_only.starts_with(prefix) {
         return false;
     }
-    prefix.ends_with('/') || path_only.len() == prefix.len() || path_only[prefix.len()..].starts_with('/')
+    prefix.ends_with('/')
+        || path_only.len() == prefix.len()
+        || path_only[prefix.len()..].starts_with('/')
 }
 
 fn tool_fetch_url(args: &Value, tools: &HttpToolConfig) -> Value {
@@ -1678,7 +2418,12 @@ fn tool_run_command(
         let prog_args: Vec<String> = args
             .get("args")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
             .unwrap_or_default();
         let mut c = Command::new(program);
         c.args(&prog_args);
@@ -1725,7 +2470,9 @@ fn tool_run_command(
     let (Ok(out_dup), Ok(err_dup)) = (stdout_f.try_clone(), stderr_f.try_clone()) else {
         return json!({"ok": false, "error": "fd clone failed"});
     };
-    cmd.stdin(Stdio::null()).stdout(Stdio::from(out_dup)).stderr(Stdio::from(err_dup));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(out_dup))
+        .stderr(Stdio::from(err_dup));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1810,7 +2557,9 @@ pub fn execute_manifest_seat_action(
 
     match kind {
         "workers_ai_structured" => run_workers_ai_structured(manifest, spec, cwd, options),
-        "openai_json_scrutinizer" => run_openai_json_scrutinizer(manifest, seat_id, spec, cwd, options, context),
+        "openai_json_scrutinizer" => {
+            run_openai_json_scrutinizer(manifest, seat_id, spec, cwd, options, context)
+        }
         "composite_telemetry_gate" => {
             run_composite_telemetry_gate(manifest, seat_id, spec, cwd, options, context)
         }
@@ -1856,7 +2605,9 @@ fn run_workers_ai_structured(
     let env_file = spec
         .get("secret_env_file")
         .and_then(Value::as_str)
-        .ok_or_else(|| FleetPolicyError::InvalidManifest("action missing secret_env_file".into()))?;
+        .ok_or_else(|| {
+            FleetPolicyError::InvalidManifest("action missing secret_env_file".into())
+        })?;
     let resolved_env = manifest.resolve_path(Path::new(env_file), cwd);
     let secret_key = spec
         .get("secret_key")
@@ -1893,10 +2644,9 @@ fn run_workers_ai_structured(
             "state".into(),
             Value::String(options.input_text.chars().take(32_000).collect()),
         );
-        let fields = spec
-            .get("fields")
-            .cloned()
-            .ok_or_else(|| FleetPolicyError::InvalidManifest("clairic_text missing fields".into()))?;
+        let fields = spec.get("fields").cloned().ok_or_else(|| {
+            FleetPolicyError::InvalidManifest("clairic_text missing fields".into())
+        })?;
         payload.insert("fields".into(), fields);
     } else {
         let state_val: Value = if options.input_text.trim().starts_with('{') {
@@ -1906,10 +2656,9 @@ fn run_workers_ai_structured(
             json!({"text": options.input_text})
         };
         payload.insert("state".into(), state_val);
-        let questions = spec
-            .get("questions")
-            .cloned()
-            .ok_or_else(|| FleetPolicyError::InvalidManifest("clef_state missing questions".into()))?;
+        let questions = spec.get("questions").cloned().ok_or_else(|| {
+            FleetPolicyError::InvalidManifest("clef_state missing questions".into())
+        })?;
         payload.insert("questions".into(), questions);
     }
 
@@ -1954,7 +2703,9 @@ fn run_openai_json_scrutinizer(
     let system_prompt = spec
         .get("system_prompt")
         .and_then(Value::as_str)
-        .ok_or_else(|| FleetPolicyError::InvalidManifest("scrutinizer missing system_prompt".into()))?;
+        .ok_or_else(|| {
+            FleetPolicyError::InvalidManifest("scrutinizer missing system_prompt".into())
+        })?;
     let raw_cwcard = options.cwcard.as_deref().unwrap_or(&options.input_text);
     let card_text = if !raw_cwcard.trim().starts_with('{') && Path::new(raw_cwcard).is_file() {
         fs::read_to_string(raw_cwcard)?
@@ -1967,6 +2718,7 @@ fn run_openai_json_scrutinizer(
         api_key_env,
         timeout_secs,
         auth_isolation,
+        transport,
         ..
     } = &seat_def.driver
     else {
@@ -1974,12 +2726,16 @@ fn run_openai_json_scrutinizer(
             "openai_json_scrutinizer requires OpenAiCompatibleHttp seat driver".into(),
         ));
     };
+    validate_transport_policy(transport.as_ref())?;
     check_egress_policy(&manifest.policy.egress_policy, base_url)?;
     let mut iso = auth_isolation.clone();
     let mut dummy_tools = HttpToolConfig::default();
     crate::resolve_driver_credentials(manifest, cwd, &mut iso, &mut dummy_tools)?;
     let api_key = resolve_driver_api_key(&iso, api_key_env)?;
-    let endpoint = if base_url.trim_end_matches('/').ends_with("/chat/completions") {
+    let endpoint = if base_url
+        .trim_end_matches('/')
+        .ends_with("/chat/completions")
+    {
         base_url.trim_end_matches('/').to_owned()
     } else {
         format!("{}/chat/completions", base_url.trim_end_matches('/'))
@@ -2001,13 +2757,18 @@ fn run_openai_json_scrutinizer(
         "max_tokens": max_tokens,
         "temperature": 0.0
     });
-    let resp = curl_request(
+    let eff_timeout = context
+        .timeout_override_secs
+        .or(options.timeout_secs)
+        .unwrap_or(*timeout_secs);
+    let resp = curl_request_raw(
         "POST",
         &endpoint,
         &headers,
         Some(&payload.to_string()),
-        context.timeout_override_secs.or(options.timeout_secs).unwrap_or(*timeout_secs),
-    )?;
+        CurlRequestOptions::from_policy(eff_timeout, transport.as_ref(), false),
+    )
+    .map_err(CurlCallError::into_policy_error)?;
     if !(200..300).contains(&resp.status) {
         return Err(FleetPolicyError::DriverExecutionFailed(format!(
             "scrutinizer HTTP {}: {}",
@@ -2064,8 +2825,10 @@ fn run_composite_telemetry_gate(
         .and_then(Value::as_f64)
         .unwrap_or(150.0);
 
-    let clef_res = execute_manifest_seat_action(manifest, seat_id, clef_action, cwd, options, context)?;
-    let clairic_res = execute_manifest_seat_action(manifest, seat_id, clairic_action, cwd, options, context)?;
+    let clef_res =
+        execute_manifest_seat_action(manifest, seat_id, clef_action, cwd, options, context)?;
+    let clairic_res =
+        execute_manifest_seat_action(manifest, seat_id, clairic_action, cwd, options, context)?;
     let res_body = clef_res.get("result").unwrap_or(&clef_res);
     let answers_map = res_body
         .get("answers")
@@ -2103,7 +2866,8 @@ fn run_composite_telemetry_gate(
         .or_else(|| clef_res.get("ok"))
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let needs_escalation = !clef_ok || max_trigger >= options.ambiguity_threshold || loc_p90 > loc_p90_threshold;
+    let needs_escalation =
+        !clef_ok || max_trigger >= options.ambiguity_threshold || loc_p90 > loc_p90_threshold;
     if !needs_escalation {
         return Ok(json!({
             "ok": true,
@@ -2150,7 +2914,10 @@ fn run_composite_telemetry_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExecutionTarget, ModelBinding, OrgFleetPolicy, SeatDefinition, SeatId, SeatLifecycle, SkillConfig, SkillPolicyRef};
+    use crate::{
+        ExecutionTarget, ModelBinding, OrgFleetPolicy, SeatDefinition, SeatId, SeatLifecycle,
+        SkillConfig, SkillPolicyRef,
+    };
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::thread;
@@ -2213,7 +2980,8 @@ mod tests {
         write_0600_secret(&env_path, "GATEWAY_KEY=secret-test-123\n");
 
         let turn1 = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"sample.txt\"}"}}]}}]}"#;
-        let turn2 = r#"{"choices":[{"message":{"role":"assistant","content":"VERIFIED_TOOL_LOOP"}}]}"#;
+        let turn2 =
+            r#"{"choices":[{"message":{"role":"assistant","content":"VERIFIED_TOOL_LOOP"}}]}"#;
         let base_url = mock_http_server(vec![turn1, turn2]);
 
         let manifest = FleetManifest {
@@ -2238,6 +3006,7 @@ mod tests {
                         enabled: true,
                         ..Default::default()
                     },
+                    transport: None,
                 },
                 model: ModelBinding {
                     provider: "custom-gw".into(),
@@ -2314,11 +3083,15 @@ mod tests {
                         key_map: BTreeMap::new(),
                     },
                     tools: HttpToolConfig::default(),
+                    transport: None,
                 },
                 model: ModelBinding {
                     provider: "google-gemini".into(),
                     model_id: "gemini-4-carbon".into(),
-                    params: BTreeMap::from([("thinking_level".into(), Value::String("HIGH".into()))]),
+                    params: BTreeMap::from([(
+                        "thinking_level".into(),
+                        Value::String("HIGH".into()),
+                    )]),
                     failover_policy: None,
                 },
                 write_mode: WriteMode::ReadOnly,
@@ -2367,7 +3140,9 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let env_path = root.join("cf.env");
         write_0600_secret(&env_path, "CF_TOKEN=tok-123\n");
-        let base_url = mock_http_server(vec![r#"{"success":true,"result":{"answers":{"flag":0.1}}}"#]);
+        let base_url = mock_http_server(vec![
+            r#"{"success":true,"result":{"answers":{"flag":0.1}}}"#,
+        ]);
 
         let mut manifest = FleetManifest::starter_profile("solo").unwrap();
         manifest.extensions.insert(
@@ -2401,5 +3176,1060 @@ mod tests {
         .unwrap();
         assert_eq!(out["success"], true);
         assert_eq!(out["result"]["answers"]["flag"], 0.1);
+    }
+
+    #[derive(Clone)]
+    struct RecordedCurlCall {
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+        accept_header: String,
+        no_buffer: bool,
+        timeout_secs: u64,
+        connect_timeout_secs: u64,
+        keepalive_time_secs: u64,
+        stall_timeout_secs: Option<u64>,
+        force_http1_1: bool,
+    }
+
+    struct MockCurlInvoker {
+        scripts: std::collections::VecDeque<Result<CurlHttpResponse, CurlCallError>>,
+        calls: Vec<RecordedCurlCall>,
+    }
+
+    impl MockCurlInvoker {
+        fn new(scripts: Vec<Result<CurlHttpResponse, CurlCallError>>) -> Self {
+            Self {
+                scripts: scripts.into_iter().collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl CurlInvoker for MockCurlInvoker {
+        fn invoke(
+            &mut self,
+            method: &str,
+            url: &str,
+            headers: &[(String, String)],
+            body: Option<&str>,
+            opts: CurlRequestOptions<'_>,
+        ) -> Result<CurlHttpResponse, CurlCallError> {
+            self.calls.push(RecordedCurlCall {
+                method: method.to_string(),
+                url: url.to_string(),
+                headers: headers.to_vec(),
+                body: body.map(ToOwned::to_owned),
+                accept_header: opts.accept_header.to_string(),
+                no_buffer: opts.no_buffer,
+                timeout_secs: opts.timeout_secs,
+                connect_timeout_secs: opts.connect_timeout_secs,
+                keepalive_time_secs: opts.keepalive_time_secs,
+                stall_timeout_secs: opts.stall_timeout_secs,
+                force_http1_1: opts.force_http1_1,
+            });
+            self.scripts
+                .pop_front()
+                .expect("MockCurlInvoker exhausted scripted responses")
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturedHttpRequest {
+        headers_raw: String,
+        body_raw: String,
+    }
+
+    impl CapturedHttpRequest {
+        fn has_header_ci(&self, name: &str, expected_value: &str) -> bool {
+            let needle_name = name.to_ascii_lowercase();
+            let needle_val = expected_value.to_ascii_lowercase();
+            self.headers_raw.lines().skip(1).any(|line| {
+                let Some((k, v)) = line.split_once(':') else {
+                    return false;
+                };
+                k.trim().eq_ignore_ascii_case(&needle_name)
+                    && v.trim().to_ascii_lowercase().contains(&needle_val)
+            })
+        }
+
+        fn body_json(&self) -> serde_json::Value {
+            serde_json::from_str(&self.body_raw).expect("captured HTTP body should be JSON")
+        }
+    }
+
+    enum MockTcpScript {
+        Http {
+            status_line: String,
+            headers: Vec<(String, String)>,
+            chunks: Vec<Vec<u8>>,
+            drop_without_closing_gracefully: bool,
+        },
+        RawBytes(Vec<u8>),
+    }
+
+    fn read_http_request_from_stream(stream: &mut std::net::TcpStream) -> CapturedHttpRequest {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut temp = [0u8; 4096];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+
+        loop {
+            let n = stream.read(&mut temp).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&temp[..n]);
+            if header_end.is_none()
+                && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                header_end = Some(pos + 4);
+                let header_str = String::from_utf8_lossy(&buf[..pos]);
+                for line in header_str.lines() {
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = v.trim().parse::<usize>().unwrap_or(0);
+                    }
+                }
+            }
+            if let Some(end) = header_end
+                && buf.len() >= end + content_length
+            {
+                break;
+            }
+        }
+
+        let end = header_end.unwrap_or(buf.len());
+        let headers_raw = String::from_utf8_lossy(&buf[..end]).into_owned();
+        let body_slice = &buf[end..buf.len().min(end + content_length)];
+        let body_raw = String::from_utf8_lossy(body_slice).into_owned();
+        CapturedHttpRequest {
+            headers_raw,
+            body_raw,
+        }
+    }
+
+    fn spawn_mock_script_server(
+        scripts: Vec<MockTcpScript>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<CapturedHttpRequest>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = std::sync::Arc::clone(&captured);
+
+        let handle = std::thread::spawn(move || {
+            for script in scripts {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = read_http_request_from_stream(&mut stream);
+                captured_clone.lock().unwrap().push(req);
+
+                match script {
+                    MockTcpScript::RawBytes(bytes) => {
+                        let _ = stream.write_all(&bytes);
+                        let _ = stream.flush();
+                    }
+                    MockTcpScript::Http {
+                        status_line,
+                        headers,
+                        chunks,
+                        drop_without_closing_gracefully,
+                    } => {
+                        let mut head = format!("HTTP/1.1 {status_line}\r\nConnection: close\r\n");
+                        for (k, v) in headers {
+                            head.push_str(&format!("{k}: {v}\r\n"));
+                        }
+                        head.push_str("\r\n");
+                        let _ = stream.write_all(head.as_bytes());
+                        for chunk in chunks {
+                            let _ = stream.write_all(&chunk);
+                            let _ = stream.flush();
+                        }
+                        if !drop_without_closing_gracefully {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                    }
+                }
+            }
+        });
+
+        (format!("http://{addr}"), captured, handle)
+    }
+
+    fn zero_backoff_transport_policy(max_retries: u32) -> HttpTransportPolicy {
+        HttpTransportPolicy {
+            max_retries: Some(max_retries),
+            initial_backoff_ms: Some(0),
+            max_backoff_ms: Some(0),
+            connect_timeout_secs: Some(30),
+            keepalive_time_secs: Some(15),
+            stall_timeout_secs: None,
+            force_http1_1: Some(false),
+        }
+    }
+
+    fn build_openai_test_plan(
+        root: &std::path::Path,
+        base_url: &str,
+        stream_mode: &str,
+        lock_effort: bool,
+        reasoning_effort: Option<&str>,
+        transport: Option<HttpTransportPolicy>,
+    ) -> ResolvedDispatchPlan {
+        let env_path = root.join("openai.env");
+        write_0600_secret(&env_path, "OPENAI_KEY=test-secret-123\n");
+        let mut params = BTreeMap::new();
+        params.insert("lock_effort".into(), json!(lock_effort));
+        if let Some(effort) = reasoning_effort {
+            params.insert("reasoning_effort".into(), json!(effort));
+        }
+
+        let manifest = FleetManifest {
+            schema_version: 1,
+            nodes: vec![],
+            seats: vec![SeatDefinition {
+                id: SeatId::new("TEST-QA").unwrap(),
+                display_name: None,
+                lifecycle: SeatLifecycle::ActiveStanding,
+                target_selector: ExecutionTarget::LocalProcess,
+                driver: DriverSpec::OpenAiCompatibleHttp {
+                    base_url: base_url.to_string(),
+                    api_key_env: "OPENAI_KEY".into(),
+                    wire_mode: "chat_completions".into(),
+                    stream_mode: stream_mode.to_string(),
+                    timeout_secs: 60,
+                    auth_isolation: crate::CredentialIsolation::SecretEnvFile {
+                        path: env_path,
+                        key_map: BTreeMap::new(),
+                    },
+                    tools: HttpToolConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    transport,
+                },
+                model: ModelBinding {
+                    provider: "custom-gw".into(),
+                    model_id: "vendor/custom-model".into(),
+                    params,
+                    failover_policy: None,
+                },
+                write_mode: crate::WriteMode::ReadOnly,
+                isolation: crate::IsolationSpec::ReadOnly,
+                allowed_write_roots: vec![],
+                allowed_rooms: None,
+                skills: SkillPolicyRef::default(),
+                boot_files: vec![],
+                profile_dir: None,
+            }],
+            policy: OrgFleetPolicy::default(),
+            skills: SkillConfig::default(),
+            pubkey_map: BTreeMap::new(),
+            allowed_signers: BTreeMap::new(),
+            private_key_paths: BTreeMap::new(),
+            pin: None,
+            extensions: BTreeMap::new(),
+            task_profiles: BTreeMap::new(),
+            source_dir: None,
+        };
+        manifest.validate().unwrap();
+        resolve_dispatch_plan(
+            &manifest,
+            &crate::DispatchRequest {
+                seat: "TEST-QA".into(),
+                cwd: root.to_path_buf(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn openai_sse_reassembles_chunked_tool_calls_heartbeat_comments_and_final_usage() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("note.txt"), "hello from sse note\n").unwrap();
+
+        let turn1_chunks = vec![
+            b": ping\n\n: keepalive\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\n".to_vec(),
+            br#"data: {"id":"cmpl-1","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\""}}]},"finish_reason":null}]}"#.to_vec(),
+            b"\n\n: mid-stream heartbeat\n\n".to_vec(),
+            br#"data: {"id":"cmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"note.txt\"}"}}]},"finish_reason":null}]}"#.to_vec(),
+            b"\n\n".to_vec(),
+            br#"data: {"id":"cmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_vec(),
+            b"\n\n".to_vec(),
+            br#"data: {"id":"cmpl-1","choices":[],"usage":{"prompt_tokens":40,"completion_tokens":20,"total_tokens":60}}"#.to_vec(),
+            b"\n\ndata: [DONE]\n\n".to_vec(),
+        ];
+
+        let turn2_chunks = vec![
+            b": keepalive before final answer\n\n".to_vec(),
+            br#"data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"content":"Read "},"finish_reason":null}]}"#.to_vec(),
+            b"\n\n".to_vec(),
+            br#"data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"content":"done."},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":10,"total_tokens":60}}"#.to_vec(),
+            b"\n\ndata: [DONE]\n\n".to_vec(),
+        ];
+
+        let (base_url, captured, handle) = spawn_mock_script_server(vec![
+            MockTcpScript::Http {
+                status_line: "200 OK".to_string(),
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+                chunks: turn1_chunks,
+                drop_without_closing_gracefully: false,
+            },
+            MockTcpScript::Http {
+                status_line: "200 OK".to_string(),
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+                chunks: turn2_chunks,
+                drop_without_closing_gracefully: false,
+            },
+        ]);
+
+        let plan = build_openai_test_plan(&root, &base_url, "sse", true, Some("high"), None);
+        let ctx = ExecutionContext {
+            prompt: Some("Read note.txt and confirm.".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = execute_http_driver(&plan, &ctx, |_| {}).unwrap();
+        handle.join().unwrap();
+
+        assert!(outcome.stdout.contains("Read done."));
+        let usage = outcome.usage.expect("http usage summary recorded");
+        assert_eq!(usage.usage_status, "COUNTED");
+        assert_eq!(usage.turns, 2);
+        assert_eq!(usage.tool_calls, 1);
+        assert_eq!(usage.transport_retries, 0);
+        assert_eq!(usage.prompt_tokens, Some(90));
+        assert_eq!(usage.completion_tokens, Some(30));
+        assert_eq!(usage.gross_tokens, Some(120));
+        assert_eq!(usage.observed_partial_gross_tokens, 120);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].has_header_ci("accept", "text/event-stream"));
+        let b0 = reqs[0].body_json();
+        assert_eq!(b0["stream"], json!(true));
+        assert_eq!(b0["stream_options"], json!({"include_usage": true}));
+        let b1 = reqs[1].body_json();
+        assert!(
+            b1["messages"].to_string().contains("hello from sse note"),
+            "Turn 2 should receive the Turn 1 read_file tool result: {b1}"
+        );
+    }
+
+    #[test]
+    fn openai_sse_truncated_without_done_retries_same_route_and_recovers() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("note.txt"), "note payload\n").unwrap();
+
+        let turn1 = MockTcpScript::Http {
+            status_line: "200 OK".to_string(),
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            chunks: vec![
+                br#"data: {"id":"t1","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_t1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"note.txt\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":70,"completion_tokens":30,"total_tokens":100}}"#.to_vec(),
+                b"\n\ndata: [DONE]\n\n".to_vec(),
+            ],
+            drop_without_closing_gracefully: false,
+        };
+
+        // Turn 2 Attempt 1: 200 SSE with partial delta.tool_calls and immediate EOF (no [DONE], no finish_reason)
+        let turn2_attempt1_truncated = MockTcpScript::Http {
+            status_line: "200 OK".to_string(),
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            chunks: vec![
+                br#"data: {"id":"t2_bad","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_partial","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}"#.to_vec(),
+                b"\n\n".to_vec(),
+            ],
+            drop_without_closing_gracefully: true,
+        };
+
+        // Turn 2 Attempt 2: Complete SSE reply + [DONE]
+        let turn2_attempt2_ok = MockTcpScript::Http {
+            status_line: "200 OK".to_string(),
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            chunks: vec![
+                br#"data: {"id":"t2_ok","choices":[{"index":0,"delta":{"content":"Recovered after stream drop"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}"#.to_vec(),
+                b"\n\ndata: [DONE]\n\n".to_vec(),
+            ],
+            drop_without_closing_gracefully: false,
+        };
+
+        let (base_url, captured, handle) =
+            spawn_mock_script_server(vec![turn1, turn2_attempt1_truncated, turn2_attempt2_ok]);
+
+        let plan = build_openai_test_plan(
+            &root,
+            &base_url,
+            "sse",
+            true,
+            Some("high"),
+            Some(zero_backoff_transport_policy(2)),
+        );
+        let ctx = ExecutionContext {
+            prompt: Some("Inspect note.txt".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = execute_http_driver(&plan, &ctx, |_| {}).unwrap();
+        handle.join().unwrap();
+
+        assert!(outcome.stdout.contains("Recovered after stream drop"));
+        let usage = outcome.usage.expect("http usage summary recorded");
+        assert_eq!(usage.usage_status, "UNKNOWN");
+        assert_eq!(usage.turns, 2);
+        assert_eq!(usage.tool_calls, 1);
+        assert_eq!(usage.transport_retries, 1);
+        assert_eq!(usage.gross_tokens, None);
+        assert_eq!(usage.observed_partial_gross_tokens, 250);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(
+            reqs[1].body_raw, reqs[2].body_raw,
+            "Turn 2 retry must re-send identical JSON payload without partial Turn 2 tool state"
+        );
+        assert!(!reqs[2].body_raw.contains("call_partial"));
+    }
+
+    #[test]
+    fn curl_exit_56_retries_bounded_same_endpoint_preserves_prior_turns_and_marks_unknown_usage() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("note.txt"), "data for curl 56 test\n").unwrap();
+
+        let turn1_json = serde_json::json!({
+            "id": "r1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"note.txt\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 70, "completion_tokens": 30, "total_tokens": 100}
+        })
+        .to_string();
+
+        let turn2_ok_json = serde_json::json!({
+            "id": "r2",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Recovered from 56"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+        })
+        .to_string();
+
+        // (a) MockCurlInvoker curl exit 56 on Turn 2 Attempt 1 -> recovers on Turn 2 Attempt 2
+        let plan_mock = build_openai_test_plan(
+            &root,
+            "https://gateway.example.invalid/v1",
+            "none",
+            true,
+            Some("high"),
+            Some(zero_backoff_transport_policy(2)),
+        );
+        let ctx_mock = ExecutionContext {
+            prompt: Some("Read note.txt".to_string()),
+            ..Default::default()
+        };
+        let mut invoker_ok = MockCurlInvoker::new(vec![
+            Ok(CurlHttpResponse {
+                status: 200,
+                headers: vec![],
+                body: turn1_json.clone(),
+            }),
+            Err(CurlCallError::Transport {
+                exit_code: Some(56),
+                stderr: "curl: (56) Recv failure: Operation timed out".to_string(),
+            }),
+            Ok(CurlHttpResponse {
+                status: 200,
+                headers: vec![],
+                body: turn2_ok_json.clone(),
+            }),
+        ]);
+
+        let outcome =
+            execute_http_driver_with_invoker(&plan_mock, &ctx_mock, |_| {}, &mut invoker_ok)
+                .unwrap();
+        assert!(outcome.stdout.contains("Recovered from 56"));
+        let usage = outcome.usage.unwrap();
+        assert_eq!(usage.turns, 2);
+        assert_eq!(usage.tool_calls, 1);
+        assert_eq!(usage.transport_retries, 1);
+        assert_eq!(usage.usage_status, "UNKNOWN");
+        assert_eq!(usage.gross_tokens, None);
+        assert_eq!(usage.observed_partial_gross_tokens, 250);
+
+        assert_eq!(invoker_ok.calls.len(), 3);
+        for c in &invoker_ok.calls {
+            assert_eq!(c.method, "POST");
+            assert_eq!(c.accept_header, "application/json");
+            assert!(!c.no_buffer);
+            assert!((55..=60).contains(&c.timeout_secs));
+            assert_eq!(c.connect_timeout_secs, 30);
+            assert_eq!(c.keepalive_time_secs, 15);
+            assert_eq!(c.stall_timeout_secs, None);
+            assert!(!c.force_http1_1);
+        }
+        assert_eq!(invoker_ok.calls[1].url, invoker_ok.calls[2].url);
+        assert_eq!(invoker_ok.calls[1].headers, invoker_ok.calls[2].headers);
+        assert_eq!(invoker_ok.calls[1].body, invoker_ok.calls[2].body);
+
+        // (b) Bounded exhaustion: max_retries = 2 -> 3 Turn-2 attempts fail closed preserving Turn 1
+        let _ = take_last_failed_http_usage();
+        let mut invoker_exhaust = MockCurlInvoker::new(vec![
+            Ok(CurlHttpResponse {
+                status: 200,
+                headers: vec![],
+                body: turn1_json.clone(),
+            }),
+            Err(CurlCallError::Transport {
+                exit_code: Some(56),
+                stderr: "curl: (56) Recv failure: Operation timed out".to_string(),
+            }),
+            Err(CurlCallError::Transport {
+                exit_code: Some(56),
+                stderr: "curl: (56) Recv failure: Operation timed out".to_string(),
+            }),
+            Err(CurlCallError::Transport {
+                exit_code: Some(56),
+                stderr: "curl: (56) Recv failure: Operation timed out".to_string(),
+            }),
+        ]);
+
+        let err =
+            execute_http_driver_with_invoker(&plan_mock, &ctx_mock, |_| {}, &mut invoker_exhaust)
+                .unwrap_err();
+        assert_eq!(invoker_exhaust.calls.len(), 4);
+        assert!(
+            err.to_string()
+                .starts_with("DriverExecutionFailed: HTTP transport failure: curl: (56) Recv failure: Operation timed out"),
+            "unexpected error format: {err}"
+        );
+        let failed_usage = take_last_failed_http_usage().expect("failed usage summary captured");
+        assert_eq!(failed_usage.turns, 2);
+        assert_eq!(failed_usage.tool_calls, 1);
+        assert_eq!(failed_usage.transport_retries, 2);
+        assert_eq!(failed_usage.usage_status, "UNKNOWN");
+        assert_eq!(failed_usage.gross_tokens, None);
+        assert_eq!(failed_usage.observed_partial_gross_tokens, 100);
+
+        // (c) Real /usr/bin/curl premature TCP EOF mid-body on Turn 2 Attempt 1 -> recovers on Attempt 2
+        let (base_url, captured, handle) = spawn_mock_script_server(vec![
+            MockTcpScript::Http {
+                status_line: "200 OK".to_string(),
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    (
+                        "Content-Length".to_string(),
+                        turn1_json.len().to_string(),
+                    ),
+                ],
+                chunks: vec![turn1_json.into_bytes()],
+                drop_without_closing_gracefully: false,
+            },
+            MockTcpScript::RawBytes(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"id\":\"partial\",\"ch".to_vec(),
+            ),
+            MockTcpScript::Http {
+                status_line: "200 OK".to_string(),
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    (
+                        "Content-Length".to_string(),
+                        turn2_ok_json.len().to_string(),
+                    ),
+                ],
+                chunks: vec![turn2_ok_json.into_bytes()],
+                drop_without_closing_gracefully: false,
+            },
+        ]);
+
+        let plan_real = build_openai_test_plan(
+            &root,
+            &base_url,
+            "none",
+            true,
+            Some("high"),
+            Some(zero_backoff_transport_policy(2)),
+        );
+        let outcome_real = execute_http_driver(&plan_real, &ctx_mock, |_| {}).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(captured.lock().unwrap().len(), 3);
+        let usage_real = outcome_real.usage.unwrap();
+        assert_eq!(usage_real.turns, 2);
+        assert_eq!(usage_real.tool_calls, 1);
+        assert_eq!(usage_real.transport_retries, 1);
+        assert_eq!(usage_real.usage_status, "UNKNOWN");
+        assert_eq!(usage_real.gross_tokens, None);
+        assert_eq!(usage_real.observed_partial_gross_tokens, 250);
+    }
+
+    #[test]
+    fn non_retryable_http_401_400_and_locked_effort_never_retry_or_failover() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // 1. HTTP 401 never retries even with max_retries = 3
+        let _ = take_last_failed_http_usage();
+        let err_401 = r#"{"error":{"message":"bad api key"}}"#;
+        let (url_401, cap_401, h_401) = spawn_mock_script_server(vec![MockTcpScript::Http {
+            status_line: "401 Unauthorized".to_string(),
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Content-Length".to_string(), err_401.len().to_string()),
+            ],
+            chunks: vec![err_401.as_bytes().to_vec()],
+            drop_without_closing_gracefully: false,
+        }]);
+        let plan_401 = build_openai_test_plan(
+            &root,
+            &url_401,
+            "none",
+            true,
+            Some("high"),
+            Some(zero_backoff_transport_policy(3)),
+        );
+        let ctx = ExecutionContext {
+            prompt: Some("hello".to_string()),
+            ..Default::default()
+        };
+        let res_401 = execute_http_driver(&plan_401, &ctx, |_| {});
+        h_401.join().unwrap();
+        assert!(res_401.is_err());
+        assert_eq!(cap_401.lock().unwrap().len(), 1);
+        let u_401 = take_last_failed_http_usage().unwrap();
+        assert_eq!(u_401.turns, 1);
+        assert_eq!(u_401.transport_retries, 0);
+        assert_eq!(u_401.usage_status, "UNKNOWN");
+
+        // 2. Locked effort HTTP 400 fails closed in 1 attempt (never strips/downgrades effort or retries)
+        let _ = take_last_failed_http_usage();
+        let err_400 = r#"{"error":{"message":"unsupported parameter: reasoning_effort"}}"#;
+        let (url_400, cap_400, h_400) = spawn_mock_script_server(vec![MockTcpScript::Http {
+            status_line: "400 Bad Request".to_string(),
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Content-Length".to_string(), err_400.len().to_string()),
+            ],
+            chunks: vec![err_400.as_bytes().to_vec()],
+            drop_without_closing_gracefully: false,
+        }]);
+        let plan_400 = build_openai_test_plan(
+            &root,
+            &url_400,
+            "sse",
+            true,
+            Some("high"),
+            Some(zero_backoff_transport_policy(3)),
+        );
+        let res_400 = execute_http_driver(&plan_400, &ctx, |_| {});
+        h_400.join().unwrap();
+        assert!(res_400.is_err());
+        assert_eq!(cap_400.lock().unwrap().len(), 1);
+        let u_400 = take_last_failed_http_usage().unwrap();
+        assert_eq!(u_400.turns, 1);
+        assert_eq!(u_400.transport_retries, 0);
+        assert_eq!(u_400.usage_status, "UNKNOWN");
+
+        // 3. CHINWAG_EFFORT_OVERRIDE fails pre-egress with EffortSwitchDenied (0 HTTP requests)
+        let mut override_env = BTreeMap::new();
+        override_env.insert("CHINWAG_EFFORT_OVERRIDE".to_string(), "low".to_string());
+        let ctx_override = ExecutionContext {
+            prompt: Some("hello".to_string()),
+            env: override_env,
+            ..Default::default()
+        };
+        let err_override = execute_http_driver(&plan_400, &ctx_override, |_| {}).unwrap_err();
+        assert!(
+            err_override.to_string().contains("EffortSwitchDenied"),
+            "expected EffortSwitchDenied, got {err_override}"
+        );
+
+        // 4. Invalid stream_mode scoped to OpenAiCompatibleHttp fails validate() and resolve_dispatch_plan
+        let env_path = root.join("openai.env");
+        let bad_manifest = FleetManifest {
+            schema_version: 1,
+            nodes: vec![],
+            seats: vec![SeatDefinition {
+                id: SeatId::new("BAD-OPENAI").unwrap(),
+                display_name: None,
+                lifecycle: SeatLifecycle::ActiveStanding,
+                target_selector: ExecutionTarget::LocalProcess,
+                driver: DriverSpec::OpenAiCompatibleHttp {
+                    base_url: "https://gateway.example.invalid/v1".to_string(),
+                    api_key_env: "OPENAI_KEY".to_string(),
+                    wire_mode: "chat_completions".to_string(),
+                    stream_mode: "websocket".to_string(),
+                    timeout_secs: 30,
+                    auth_isolation: crate::CredentialIsolation::SecretEnvFile {
+                        path: env_path.clone(),
+                        key_map: BTreeMap::new(),
+                    },
+                    tools: HttpToolConfig::default(),
+                    transport: None,
+                },
+                model: ModelBinding {
+                    provider: "custom-gw".into(),
+                    model_id: "gpt-test".into(),
+                    params: BTreeMap::new(),
+                    failover_policy: None,
+                },
+                write_mode: crate::WriteMode::ReadOnly,
+                isolation: crate::IsolationSpec::ReadOnly,
+                allowed_write_roots: vec![],
+                allowed_rooms: None,
+                skills: SkillPolicyRef::default(),
+                boot_files: vec![],
+                profile_dir: None,
+            }],
+            policy: OrgFleetPolicy::default(),
+            skills: SkillConfig::default(),
+            pubkey_map: BTreeMap::new(),
+            allowed_signers: BTreeMap::new(),
+            private_key_paths: BTreeMap::new(),
+            pin: None,
+            extensions: BTreeMap::new(),
+            task_profiles: BTreeMap::new(),
+            source_dir: None,
+        };
+        assert!(matches!(
+            bad_manifest.validate(),
+            Err(FleetPolicyError::InvalidManifest(_))
+        ));
+        assert!(matches!(
+            resolve_dispatch_plan(
+                &bad_manifest,
+                &crate::DispatchRequest {
+                    seat: "BAD-OPENAI".into(),
+                    cwd: root.clone(),
+                    ..Default::default()
+                },
+            ),
+            Err(FleetPolicyError::InvalidManifest(_))
+        ));
+
+        // GoogleGenAiHttp & AnthropicMessagesHttp remain unaffected and validate cleanly
+        let multi_manifest = FleetManifest {
+            schema_version: 1,
+            nodes: vec![],
+            seats: vec![
+                SeatDefinition {
+                    id: SeatId::new("GEM-SEAT").unwrap(),
+                    display_name: None,
+                    lifecycle: SeatLifecycle::ActiveStanding,
+                    target_selector: ExecutionTarget::LocalProcess,
+                    driver: DriverSpec::GoogleGenAiHttp {
+                        endpoint_mode: "gemini_api".to_string(),
+                        base_url_or_region: "https://generativelanguage.googleapis.com".to_string(),
+                        auth_env: "OPENAI_KEY".to_string(),
+                        stream_mode: "none".to_string(),
+                        timeout_secs: 30,
+                        auth_isolation: crate::CredentialIsolation::SecretEnvFile {
+                            path: env_path.clone(),
+                            key_map: BTreeMap::new(),
+                        },
+                        tools: HttpToolConfig::default(),
+                        transport: None,
+                    },
+                    model: ModelBinding {
+                        provider: "google".into(),
+                        model_id: "gemini-test".into(),
+                        params: BTreeMap::new(),
+                        failover_policy: None,
+                    },
+                    write_mode: crate::WriteMode::ReadOnly,
+                    isolation: crate::IsolationSpec::ReadOnly,
+                    allowed_write_roots: vec![],
+                    allowed_rooms: None,
+                    skills: SkillPolicyRef::default(),
+                    boot_files: vec![],
+                    profile_dir: None,
+                },
+                SeatDefinition {
+                    id: SeatId::new("ANT-SEAT").unwrap(),
+                    display_name: None,
+                    lifecycle: SeatLifecycle::ActiveStanding,
+                    target_selector: ExecutionTarget::LocalProcess,
+                    driver: DriverSpec::AnthropicMessagesHttp {
+                        base_url: "https://api.anthropic.com".to_string(),
+                        auth_env: "OPENAI_KEY".to_string(),
+                        beta_headers: vec![],
+                        stream_mode: "none".to_string(),
+                        timeout_secs: 30,
+                        auth_isolation: crate::CredentialIsolation::SecretEnvFile {
+                            path: env_path,
+                            key_map: BTreeMap::new(),
+                        },
+                        tools: HttpToolConfig::default(),
+                        transport: None,
+                    },
+                    model: ModelBinding {
+                        provider: "anthropic".into(),
+                        model_id: "claude-test".into(),
+                        params: BTreeMap::new(),
+                        failover_policy: None,
+                    },
+                    write_mode: crate::WriteMode::ReadOnly,
+                    isolation: crate::IsolationSpec::ReadOnly,
+                    allowed_write_roots: vec![],
+                    allowed_rooms: None,
+                    skills: SkillPolicyRef::default(),
+                    boot_files: vec![],
+                    profile_dir: None,
+                },
+            ],
+            policy: OrgFleetPolicy::default(),
+            skills: SkillConfig::default(),
+            pubkey_map: BTreeMap::new(),
+            allowed_signers: BTreeMap::new(),
+            private_key_paths: BTreeMap::new(),
+            pin: None,
+            extensions: BTreeMap::new(),
+            task_profiles: BTreeMap::new(),
+            source_dir: None,
+        };
+        multi_manifest.validate().unwrap();
+
+        // 5. Pre-send HTTP 429 with Retry-After: 0 retries cleanly and counts usage
+        let ok_429_json = serde_json::json!({
+            "id": "r429",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok after 429"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40}
+        })
+        .to_string();
+        let mut invoker_429 = MockCurlInvoker::new(vec![
+            Ok(CurlHttpResponse {
+                status: 429,
+                headers: vec![("retry-after".to_string(), "0".to_string())],
+                body: r#"{"error":{"message":"rate limited"}}"#.to_string(),
+            }),
+            Ok(CurlHttpResponse {
+                status: 200,
+                headers: vec![],
+                body: ok_429_json,
+            }),
+        ]);
+        let outcome_429 =
+            execute_http_driver_with_invoker(&plan_401, &ctx, |_| {}, &mut invoker_429).unwrap();
+        assert!(outcome_429.stdout.contains("ok after 429"));
+        let usage_429 = outcome_429.usage.unwrap();
+        assert_eq!(usage_429.turns, 1);
+        assert_eq!(usage_429.transport_retries, 1);
+        assert_eq!(usage_429.usage_status, "COUNTED");
+        assert_eq!(usage_429.gross_tokens, Some(40));
+    }
+
+    #[test]
+    fn manifest_digest_unchanged_when_optional_transport_policy_omitted() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let env_path = root.join("secret.env");
+        write_0600_secret(&env_path, "API_KEY=secret\n");
+
+        let mut manifest = FleetManifest {
+            schema_version: 1,
+            nodes: vec![],
+            seats: vec![
+                SeatDefinition {
+                    id: SeatId::new("CLI-SEAT").unwrap(),
+                    display_name: None,
+                    lifecycle: SeatLifecycle::ActiveStanding,
+                    target_selector: ExecutionTarget::LocalProcess,
+                    driver: DriverSpec::CliSubprocess {
+                        executable: "/usr/bin/true".into(),
+                        argv_template: vec![],
+                        auth_isolation: crate::CredentialIsolation::default(),
+                        env_allowlist: vec![],
+                        env_overrides: BTreeMap::new(),
+                        framing: "stdin".into(),
+                        timeout_secs: 30,
+                    },
+                    model: ModelBinding {
+                        provider: "local".into(),
+                        model_id: "local-cli".into(),
+                        params: BTreeMap::new(),
+                        failover_policy: None,
+                    },
+                    write_mode: crate::WriteMode::ReadOnly,
+                    isolation: crate::IsolationSpec::ReadOnly,
+                    allowed_write_roots: vec![],
+                    allowed_rooms: None,
+                    skills: SkillPolicyRef::default(),
+                    boot_files: vec![],
+                    profile_dir: None,
+                },
+                SeatDefinition {
+                    id: SeatId::new("OAI-SEAT").unwrap(),
+                    display_name: None,
+                    lifecycle: SeatLifecycle::ActiveStanding,
+                    target_selector: ExecutionTarget::LocalProcess,
+                    driver: DriverSpec::OpenAiCompatibleHttp {
+                        base_url: "https://gateway.example.invalid/v1".to_string(),
+                        api_key_env: "API_KEY".to_string(),
+                        wire_mode: "chat_completions".to_string(),
+                        stream_mode: String::new(),
+                        timeout_secs: 60,
+                        auth_isolation: crate::CredentialIsolation::SecretEnvFile {
+                            path: env_path.clone(),
+                            key_map: BTreeMap::new(),
+                        },
+                        tools: HttpToolConfig::default(),
+                        transport: None,
+                    },
+                    model: ModelBinding {
+                        provider: "openai".into(),
+                        model_id: "model-o".into(),
+                        params: BTreeMap::new(),
+                        failover_policy: None,
+                    },
+                    write_mode: crate::WriteMode::ReadOnly,
+                    isolation: crate::IsolationSpec::ReadOnly,
+                    allowed_write_roots: vec![],
+                    allowed_rooms: None,
+                    skills: SkillPolicyRef::default(),
+                    boot_files: vec![],
+                    profile_dir: None,
+                },
+                SeatDefinition {
+                    id: SeatId::new("GEM-SEAT").unwrap(),
+                    display_name: None,
+                    lifecycle: SeatLifecycle::ActiveStanding,
+                    target_selector: ExecutionTarget::LocalProcess,
+                    driver: DriverSpec::GoogleGenAiHttp {
+                        endpoint_mode: "gemini_api".to_string(),
+                        base_url_or_region: "https://generativelanguage.googleapis.com".to_string(),
+                        auth_env: "API_KEY".to_string(),
+                        stream_mode: String::new(),
+                        timeout_secs: 60,
+                        auth_isolation: crate::CredentialIsolation::SecretEnvFile {
+                            path: env_path.clone(),
+                            key_map: BTreeMap::new(),
+                        },
+                        tools: HttpToolConfig::default(),
+                        transport: None,
+                    },
+                    model: ModelBinding {
+                        provider: "google".into(),
+                        model_id: "model-g".into(),
+                        params: BTreeMap::new(),
+                        failover_policy: None,
+                    },
+                    write_mode: crate::WriteMode::ReadOnly,
+                    isolation: crate::IsolationSpec::ReadOnly,
+                    allowed_write_roots: vec![],
+                    allowed_rooms: None,
+                    skills: SkillPolicyRef::default(),
+                    boot_files: vec![],
+                    profile_dir: None,
+                },
+                SeatDefinition {
+                    id: SeatId::new("ANT-SEAT").unwrap(),
+                    display_name: None,
+                    lifecycle: SeatLifecycle::ActiveStanding,
+                    target_selector: ExecutionTarget::LocalProcess,
+                    driver: DriverSpec::AnthropicMessagesHttp {
+                        base_url: "https://api.anthropic.com".to_string(),
+                        auth_env: "API_KEY".to_string(),
+                        beta_headers: vec![],
+                        stream_mode: String::new(),
+                        timeout_secs: 60,
+                        auth_isolation: crate::CredentialIsolation::SecretEnvFile {
+                            path: env_path,
+                            key_map: BTreeMap::new(),
+                        },
+                        tools: HttpToolConfig::default(),
+                        transport: None,
+                    },
+                    model: ModelBinding {
+                        provider: "anthropic".into(),
+                        model_id: "model-a".into(),
+                        params: BTreeMap::new(),
+                        failover_policy: None,
+                    },
+                    write_mode: crate::WriteMode::ReadOnly,
+                    isolation: crate::IsolationSpec::ReadOnly,
+                    allowed_write_roots: vec![],
+                    allowed_rooms: None,
+                    skills: SkillPolicyRef::default(),
+                    boot_files: vec![],
+                    profile_dir: None,
+                },
+            ],
+            policy: OrgFleetPolicy::default(),
+            skills: SkillConfig::default(),
+            pubkey_map: BTreeMap::new(),
+            allowed_signers: BTreeMap::new(),
+            private_key_paths: BTreeMap::new(),
+            pin: None,
+            extensions: BTreeMap::new(),
+            task_profiles: BTreeMap::new(),
+            source_dir: None,
+        };
+        manifest.validate().unwrap();
+
+        let serialized_json = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !serialized_json.contains("\"transport\""),
+            "omitted transport policy must not appear in serialized JSON: {serialized_json}"
+        );
+        let baseline_digest = manifest.digest().unwrap();
+
+        let toml_text = toml::to_string(&manifest).unwrap();
+        assert!(
+            !toml_text.contains("transport"),
+            "omitted transport policy must not appear in TOML: {toml_text}"
+        );
+        let parsed_from_toml: FleetManifest = toml::from_str(&toml_text).unwrap();
+        assert_eq!(parsed_from_toml.digest().unwrap(), baseline_digest);
+
+        let parsed_from_json: FleetManifest = serde_json::from_str(&serialized_json).unwrap();
+        assert_eq!(parsed_from_json.digest().unwrap(), baseline_digest);
+
+        if let Some(seat) = manifest
+            .seats
+            .iter_mut()
+            .find(|s| s.id.as_str() == "OAI-SEAT")
+            && let DriverSpec::OpenAiCompatibleHttp { transport, .. } = &mut seat.driver
+        {
+            *transport = Some(zero_backoff_transport_policy(2));
+        }
+        manifest.validate().unwrap();
+        let with_transport_digest = manifest.digest().unwrap();
+        assert_ne!(with_transport_digest, baseline_digest);
+        assert!(
+            serde_json::to_string(&manifest)
+                .unwrap()
+                .contains("\"transport\"")
+        );
     }
 }
