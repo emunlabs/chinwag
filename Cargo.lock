@@ -784,12 +784,15 @@ dependencies = [
 name = "chinwag-acu"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "bls12_381",
  "chacha20poly1305 0.10.1",
  "ed25519-dalek 2.2.0",
  "ff",
  "group",
  "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "hpke 0.15.1",
  "pairing",
  "rand_core 0.6.4",
  "serde",
