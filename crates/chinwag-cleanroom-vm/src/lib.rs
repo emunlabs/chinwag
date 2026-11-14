@@ -17,17 +17,20 @@ pub mod tart;
 
 pub use env_lock::{
     CompiledEnvLock, EnvLockError, EnvLockReceiptV1, FlakeLockV7, ManifestDigestRecord,
-    compile_workspace_env_lock, generate_receipt_signing_key, sign_env_lock_receipt,
-    signing_key_from_seed_file, verify_env_lock_bundle, verify_env_lock_receipt,
-    verify_zero_nix_syntax, write_env_lock_bundle,
+    StoreClosureEntry, compile_workspace_env_lock, generate_receipt_signing_key,
+    load_allowed_signers_file, parse_openssh_allowed_signers_ed25519, sign_env_lock_receipt,
+    signing_key_from_seed_file, verify_env_lock_bundle, verify_env_lock_bundle_with_signers,
+    verify_env_lock_receipt, verify_zero_nix_syntax, write_env_lock_bundle,
 };
 pub use runner_pool::{
-    CleanroomDiagnosticInput, HostHardwareTelemetry, JobTriggerContext, MAX_DRAIN_BUDGET_MS,
-    MAX_VMS_PER_MAC_HOST, NetworkEgressPolicy, PoolAdmissionDecision, PoolAdmissionPolicy,
-    ReleaseSignerAttestation, RunnerPoolController, RunnerPoolMode, RunnerTrustDecision,
-    RunnerTrustProfile, SealedFailureBundleV1, ThermalPressure, TrustPoolError,
-    evaluate_trust_gate, generate_recipient_kem_keypair, open_failure_diagnostic_bundle,
-    scrub_diagnostic_secrets, seal_failure_diagnostic_bundle,
+    CleanroomDiagnosticInput, HostHardwareTelemetry, HostVmSlotLease, JobTriggerContext,
+    MAX_DRAIN_BUDGET_MS, MAX_VMS_PER_MAC_HOST, NetworkEgressPolicy, PoolAdmissionDecision,
+    PoolAdmissionPolicy, ReleaseRefPolicy, ReleaseSignerAttestation, RunnerPoolController,
+    RunnerPoolMode, RunnerTrustDecision, RunnerTrustProfile, SealedFailureBundleV1,
+    ThermalPressure, TrustPoolError, acquire_host_vm_slot, count_active_slot_leases,
+    evaluate_trust_gate, evaluate_trust_gate_with_policy, generate_recipient_kem_keypair,
+    open_failure_diagnostic_bundle, probe_host_hardware_telemetry, scrub_diagnostic_secrets,
+    seal_failure_diagnostic_bundle,
 };
 pub use seatbelt::{
     CleanroomSeatbeltSpec, SeatbeltError, SeatbeltProfile, SeatbeltSignalMode,

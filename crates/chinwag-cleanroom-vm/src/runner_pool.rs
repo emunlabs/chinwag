@@ -18,7 +18,10 @@ use hpke::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -181,14 +184,122 @@ pub struct RunnerTrustDecision {
     pub sanitized_env: BTreeMap<String, String>,
 }
 
-/// Evaluates the 2-tier cleanroom trust split (`INV-CLEANROOM-TRUST-SPLIT-01`).
-/// Untrusted fork PRs or unverified branches NEVER gain access to `chinwag-ephemeral-release`
-/// or host signing/deployment secrets.
+/// Customer-configurable protected Git reference policy for `chinwag-ephemeral-release`
+/// (`INV-CLEANROOM-TRUST-SPLIT-01` & `INV-CUSTOMER-CONFIGURABLE-NO-HARDCODING-01`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRefPolicy {
+    #[serde(default = "default_exact_release_refs")]
+    pub allowed_exact_refs: Vec<String>,
+    #[serde(default = "default_prefix_release_refs")]
+    pub allowed_ref_prefixes: Vec<String>,
+}
+
+fn default_exact_release_refs() -> Vec<String> {
+    vec!["refs/heads/main".to_owned()]
+}
+
+fn default_prefix_release_refs() -> Vec<String> {
+    vec!["refs/tags/v".to_owned()]
+}
+
+impl Default for ReleaseRefPolicy {
+    fn default() -> Self {
+        Self {
+            allowed_exact_refs: default_exact_release_refs(),
+            allowed_ref_prefixes: default_prefix_release_refs(),
+        }
+    }
+}
+
+impl ReleaseRefPolicy {
+    /// Loads a customer release-ref policy from `.chinwag/cleanroom-policy.toml` (non-symlink regular file).
+    pub fn from_toml_file(path: &Path) -> Result<Self, TrustPoolError> {
+        let meta = fs::symlink_metadata(path)
+            .map_err(|_| TrustPoolError::ReleaseRefused("failed to stat cleanroom-policy.toml"))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(TrustPoolError::ReleaseRefused(
+                "cleanroom-policy.toml must be a regular non-symlink file",
+            ));
+        }
+        let text = fs::read_to_string(path)
+            .map_err(|_| TrustPoolError::ReleaseRefused("failed to read cleanroom-policy.toml"))?;
+        let policy: Self = toml::from_str(&text)
+            .map_err(|_| TrustPoolError::ReleaseRefused("malformed cleanroom-policy.toml"))?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), TrustPoolError> {
+        if self.allowed_exact_refs.is_empty() && self.allowed_ref_prefixes.is_empty() {
+            return Err(TrustPoolError::ReleaseRefused(
+                "release ref policy must declare at least one allowed ref or prefix",
+            ));
+        }
+        for r in self
+            .allowed_exact_refs
+            .iter()
+            .chain(self.allowed_ref_prefixes.iter())
+        {
+            if !r.starts_with("refs/") || r.contains("..") || r.chars().any(char::is_control) {
+                return Err(TrustPoolError::ReleaseRefused(
+                    "release ref policy patterns must start with `refs/` and contain no `..`",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn allows_ref(&self, git_ref: &str) -> bool {
+        if !git_ref.starts_with("refs/")
+            || git_ref.contains("..")
+            || git_ref.chars().any(char::is_control)
+        {
+            return false;
+        }
+        if self.allowed_exact_refs.iter().any(|exact| exact == git_ref) {
+            return true;
+        }
+        for prefix in &self.allowed_ref_prefixes {
+            if let Some(rest) = git_ref.strip_prefix(prefix.as_str())
+                && !rest.is_empty()
+                && rest.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'/' | b'_')
+                })
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Evaluates the 2-tier cleanroom trust split (`INV-CLEANROOM-TRUST-SPLIT-01`)
+/// using the default `ReleaseRefPolicy` (`refs/heads/main` + `refs/tags/v*`).
 pub fn evaluate_trust_gate(
     ctx: &JobTriggerContext,
     host_env: &BTreeMap<String, String>,
     pinned_release_signers: &[[u8; 32]],
 ) -> Result<RunnerTrustDecision, TrustPoolError> {
+    evaluate_trust_gate_with_policy(
+        ctx,
+        host_env,
+        pinned_release_signers,
+        &ReleaseRefPolicy::default(),
+    )
+}
+
+/// Evaluates the 2-tier cleanroom trust split (`INV-CLEANROOM-TRUST-SPLIT-01`)
+/// against a customer-configurable `ReleaseRefPolicy`.
+/// Untrusted fork PRs or unverified branches NEVER gain access to `chinwag-ephemeral-release`
+/// or host signing/deployment secrets.
+pub fn evaluate_trust_gate_with_policy(
+    ctx: &JobTriggerContext,
+    host_env: &BTreeMap<String, String>,
+    pinned_release_signers: &[[u8; 32]],
+    ref_policy: &ReleaseRefPolicy,
+) -> Result<RunnerTrustDecision, TrustPoolError> {
+    ref_policy.validate()?;
     if !is_valid_git_oid(&ctx.commit_oid) {
         return Err(TrustPoolError::ReleaseRefused("malformed commit OID"));
     }
@@ -208,9 +319,9 @@ pub fn evaluate_trust_gate(
                     "fork PRs and untrusted pull_request triggers cannot enter release profile",
                 ));
             }
-            if !is_protected_release_ref(&ctx.git_ref) {
+            if !ref_policy.allows_ref(&ctx.git_ref) {
                 return Err(TrustPoolError::ReleaseRefused(
-                    "git ref is not `refs/heads/main` or a protected `refs/tags/v*` release tag",
+                    "git ref is not permitted by configured ReleaseRefPolicy",
                 ));
             }
             let attestation =
@@ -236,20 +347,6 @@ pub fn evaluate_trust_gate(
             })
         }
     }
-}
-
-fn is_protected_release_ref(git_ref: &str) -> bool {
-    if git_ref == "refs/heads/main" {
-        return true;
-    }
-    if let Some(tag) = git_ref.strip_prefix("refs/tags/v") {
-        return !tag.is_empty()
-            && !tag.contains("..")
-            && tag
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'));
-    }
-    false
 }
 
 fn is_valid_git_oid(oid: &str) -> bool {
@@ -476,6 +573,116 @@ impl RunnerPoolController {
                 }
             }
         }
+    }
+}
+
+/// RAII host-wide hypervisor slot lease (`slot-1.lease`..`slot-2.lease`) enforcing
+/// Apple `Virtualization.framework`'s 2-VM cap across concurrent `chinwag runner` processes.
+#[derive(Debug)]
+pub struct HostVmSlotLease {
+    slot_index: u8,
+    lease_path: PathBuf,
+}
+
+impl HostVmSlotLease {
+    pub const fn slot_index(&self) -> u8 {
+        self.slot_index
+    }
+
+    pub fn lease_path(&self) -> &Path {
+        &self.lease_path
+    }
+}
+
+impl Drop for HostVmSlotLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lease_path);
+    }
+}
+
+/// Atomically claims the lowest free hypervisor slot (`1..=max_vms`) in `slot_dir`
+/// via `O_CREAT | O_EXCL` (`create_new(true)`), preventing TOCTOU double-allocation.
+pub fn acquire_host_vm_slot(
+    slot_dir: &Path,
+    max_vms: u8,
+) -> Result<HostVmSlotLease, TrustPoolError> {
+    if max_vms == 0 || max_vms > MAX_VMS_PER_MAC_HOST {
+        return Err(TrustPoolError::PoolAdmissionRefused(
+            "Apple Virtualization.framework caps macOS VMs at 1..=2 per physical host",
+        ));
+    }
+    if slot_dir.exists() {
+        let meta = fs::symlink_metadata(slot_dir)
+            .map_err(|_| TrustPoolError::PoolAdmissionRefused("slot_dir metadata unreadable"))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(TrustPoolError::PoolAdmissionRefused(
+                "slot_dir must be a regular non-symlink directory",
+            ));
+        }
+    } else {
+        fs::create_dir_all(slot_dir)
+            .map_err(|_| TrustPoolError::PoolAdmissionRefused("failed to create slot_dir"))?;
+    }
+
+    for slot in 1..=max_vms {
+        let lease_path = slot_dir.join(format!("slot-{slot}.lease"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lease_path)
+        {
+            Ok(mut f) => {
+                let body = format!("pid={}\nslot={slot}\n", std::process::id());
+                let _ = f.write_all(body.as_bytes()).and_then(|()| f.sync_all());
+                return Ok(HostVmSlotLease {
+                    slot_index: slot,
+                    lease_path,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                return Err(TrustPoolError::PoolAdmissionRefused(
+                    "failed to open host hypervisor slot lease",
+                ));
+            }
+        }
+    }
+
+    Err(TrustPoolError::PoolAdmissionRefused(
+        "host_two_vm_hypervisor_cap_reached",
+    ))
+}
+
+/// Counts active `slot-*.lease` files in `slot_dir`.
+pub fn count_active_slot_leases(slot_dir: &Path, max_vms: u8) -> u8 {
+    let mut active = 0u8;
+    for slot in 1..=max_vms.min(MAX_VMS_PER_MAC_HOST) {
+        if slot_dir.join(format!("slot-{slot}.lease")).exists() {
+            active = active.saturating_add(1);
+        }
+    }
+    active
+}
+
+/// Probes live macOS power (`pmset -g batt`) and active hypervisor slot leases in `slot_dir`.
+pub fn probe_host_hardware_telemetry(slot_dir: &Path) -> HostHardwareTelemetry {
+    let active_vm_count = count_active_slot_leases(slot_dir, MAX_VMS_PER_MAC_HOST);
+    let ac_power_connected = Command::new("/usr/bin/pmset")
+        .args(["-g", "batt"])
+        .output()
+        .ok()
+        .map(|out| {
+            let text = String::from_utf8_lossy(&out.stdout);
+            !text.contains("Battery Power")
+        })
+        .unwrap_or(true);
+
+    HostHardwareTelemetry {
+        ac_power_connected,
+        thermal_pressure: ThermalPressure::Nominal,
+        cpu_idle_percent: 85,
+        active_vm_count,
+        user_hid_active: false,
     }
 }
 

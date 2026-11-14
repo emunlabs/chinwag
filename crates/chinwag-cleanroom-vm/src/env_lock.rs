@@ -6,9 +6,10 @@
 //!
 //! Synthesizes `.chinwag/flake.lock` (Nix flake lock schema `version: 7`) directly
 //! from repository manifests (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`,
-//! `package.json`, `pyproject.toml`, `go.mod`, and optional `.chinwag/env.ts`)
+//! `package.json`, `pyproject.toml`, `go.mod`, optional `.chinwag/env.ts`, and
+//! optional resolved store closure pins in `.chinwag/store-closures.json`)
 //! with content-addressed SRI `narHash` (`sha256-<base64>`), SHA-256 closure
-//! pinning, and `Ed25519` `verify_strict` verification receipts.
+//! pinning, and pinned `Ed25519` `verify_strict` verification receipts.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -24,13 +25,16 @@ use zeroize::Zeroizing;
 pub const FLAKE_LOCK_SCHEMA_VERSION: u8 = 7;
 pub const ENV_LOCK_RECEIPT_SCHEMA: &str = "chinwag.env.lock.receipt.v1";
 const RECEIPT_SIGNING_DOMAIN: &[u8] = b"chinwag-env-lock-receipt/v1\0";
+const SSH_ED25519_WIRE_PREFIX: &[u8; 19] = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnvLockError {
     #[error("repository root `{0}` is invalid or contains a symlink at a protected boundary")]
     InvalidRepositoryRoot(String),
-    #[error("forbidden `.nix` expression file detected at `{0}` (INV-NIX-ZERO-SYNTAX-01)")]
+    #[error(
+        "forbidden `.nix` expression file or symlink detected at `{0}` (INV-NIX-ZERO-SYNTAX-01)"
+    )]
     ForbiddenNixSyntaxFile(String),
     #[error(
         "no supported workspace manifest found in `{0}` (expected Cargo.toml, rust-toolchain.toml, package.json, pyproject.toml, go.mod, or .chinwag/env.ts)"
@@ -53,6 +57,18 @@ pub struct ManifestDigestRecord {
     pub size_bytes: u64,
 }
 
+/// Optional resolved `/nix/store/<hash>-...` closure record in `.chinwag/store-closures.json`,
+/// binding realized Nix store artifact NAR digests alongside workspace manifests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreClosureEntry {
+    pub store_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nar_sha256_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_file: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlakeLockedRef {
     #[serde(rename = "type")]
@@ -60,6 +76,8 @@ pub struct FlakeLockedRef {
     pub ecosystem: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_pin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_path: Option<String>,
     #[serde(rename = "narHash")]
     pub nar_hash: String,
     pub closure_sha256: String,
@@ -108,48 +126,124 @@ pub struct EnvLockReceiptV1 {
     pub signature_hex: String,
 }
 
-/// Scans `.chinwag/` (if present) and root to ensure no `.nix` expression files
-/// violate `INV-NIX-ZERO-SYNTAX-01`.
+/// Recursively walks the repository tree (skipping `.git`, `target`, and `node_modules`)
+/// and fails closed on ANY `.nix` file OR `.nix` symlink (`INV-NIX-ZERO-SYNTAX-01`).
 pub fn verify_zero_nix_syntax(repo_root: &Path) -> Result<(), EnvLockError> {
-    check_no_nix_in_dir(repo_root, false)?;
     let dot_chinwag = repo_root.join(".chinwag");
-    if dot_chinwag.exists() {
-        let meta = fs::symlink_metadata(&dot_chinwag)
-            .map_err(|e| EnvLockError::Io(format!(".chinwag metadata: {e}")))?;
+    if let Ok(meta) = fs::symlink_metadata(&dot_chinwag)
+        && meta.file_type().is_symlink()
+    {
+        return Err(EnvLockError::InvalidRepositoryRoot(
+            dot_chinwag.display().to_string(),
+        ));
+    }
+    check_no_nix_recursive(repo_root, repo_root)
+}
+
+fn check_no_nix_recursive(repo_root: &Path, dir: &Path) -> Result<(), EnvLockError> {
+    let entries = fs::read_dir(dir).map_err(|e| EnvLockError::Io(e.to_string()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| EnvLockError::Io(e.to_string()))?;
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if matches!(file_name, ".git" | "target" | "node_modules") {
+            continue;
+        }
+        let rel_display = path
+            .strip_prefix(repo_root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let meta = fs::symlink_metadata(&path).map_err(|e| EnvLockError::Io(e.to_string()))?;
         if meta.file_type().is_symlink() {
-            return Err(EnvLockError::InvalidRepositoryRoot(
-                dot_chinwag.display().to_string(),
-            ));
+            let link_is_nix = fs::read_link(&path)
+                .ok()
+                .and_then(|target| {
+                    target
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|ext| ext.eq_ignore_ascii_case("nix"))
+                })
+                .unwrap_or(false);
+            let name_is_nix = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("nix"));
+            if name_is_nix || link_is_nix {
+                return Err(EnvLockError::ForbiddenNixSyntaxFile(rel_display));
+            }
+            continue;
+        }
+        if meta.is_file()
+            && path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("nix"))
+        {
+            return Err(EnvLockError::ForbiddenNixSyntaxFile(rel_display));
         }
         if meta.is_dir() {
-            check_no_nix_in_dir(&dot_chinwag, true)?;
+            check_no_nix_recursive(repo_root, &path)?;
         }
     }
     Ok(())
 }
 
-fn check_no_nix_in_dir(dir: &Path, recursive: bool) -> Result<(), EnvLockError> {
-    let entries = fs::read_dir(dir).map_err(|e| EnvLockError::Io(e.to_string()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| EnvLockError::Io(e.to_string()))?;
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path).map_err(|e| EnvLockError::Io(e.to_string()))?;
-        if meta.file_type().is_symlink() {
+/// Parses OpenSSH `allowed_signers` lines (`<principal> [opts] ssh-ed25519 <base64> [comment]`)
+/// into validated non-weak 32-byte `Ed25519` public keys.
+pub fn parse_openssh_allowed_signers_ed25519(content: &str) -> Result<Vec<[u8; 32]>, EnvLockError> {
+    let mut keys = Vec::new();
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if meta.is_file() && path.extension().and_then(|s| s.to_str()) == Some("nix") {
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown.nix")
-                .to_owned();
-            return Err(EnvLockError::ForbiddenNixSyntaxFile(file_name));
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(pos) = tokens.iter().position(|t| *t == "ssh-ed25519") else {
+            continue;
+        };
+        let b64 = tokens
+            .get(pos + 1)
+            .ok_or(EnvLockError::ReceiptVerification(
+                "malformed ssh-ed25519 entry in allowed_signers",
+            ))?;
+        let wire = BASE64_STANDARD
+            .decode(b64)
+            .map_err(|_| EnvLockError::ReceiptVerification("invalid base64 in allowed_signers"))?;
+        if wire.len() != 51 || &wire[..19] != SSH_ED25519_WIRE_PREFIX {
+            return Err(EnvLockError::ReceiptVerification(
+                "invalid ssh-ed25519 wire framing in allowed_signers",
+            ));
         }
-        if recursive && meta.is_dir() {
-            check_no_nix_in_dir(&path, true)?;
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&wire[19..51]);
+        let vk = VerifyingKey::from_bytes(&pk).map_err(|_| {
+            EnvLockError::ReceiptVerification("invalid Ed25519 point in allowed_signers")
+        })?;
+        if vk.is_weak() {
+            return Err(EnvLockError::ReceiptVerification(
+                "weak Ed25519 public key rejected in allowed_signers",
+            ));
         }
+        keys.push(pk);
     }
-    Ok(())
+    if keys.is_empty() {
+        return Err(EnvLockError::ReceiptVerification(
+            "allowed_signers contained zero ssh-ed25519 keys",
+        ));
+    }
+    Ok(keys)
+}
+
+/// Loads pinned `Ed25519` public keys from a regular (non-symlink) OpenSSH `allowed_signers` file.
+pub fn load_allowed_signers_file(path: &Path) -> Result<Vec<[u8; 32]>, EnvLockError> {
+    let bytes = read_non_symlink(path)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| EnvLockError::ReceiptVerification("allowed_signers must be UTF-8"))?;
+    parse_openssh_allowed_signers_ed25519(text)
 }
 
 /// Deterministically compiles `.chinwag/flake.lock` from repository manifests (`INV-NIX-ZERO-SYNTAX-01`).
@@ -174,6 +268,7 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
         "pyproject.toml",
         "go.mod",
         ".chinwag/env.ts",
+        ".chinwag/store-closures.json",
     ];
 
     let mut raw_manifests: BTreeMap<String, Vec<u8>> = BTreeMap::new();
@@ -212,6 +307,16 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
         });
         raw_manifests.insert(rel.to_owned(), bytes);
     }
+
+    let store_closures: BTreeMap<String, StoreClosureEntry> =
+        if let Some(closure_bytes) = raw_manifests.get(".chinwag/store-closures.json") {
+            serde_json::from_slice(closure_bytes).map_err(|e| EnvLockError::ManifestParse {
+                path: ".chinwag/store-closures.json".to_owned(),
+                detail: e.to_string(),
+            })?
+        } else {
+            BTreeMap::new()
+        };
 
     if manifests.is_empty() {
         return Err(EnvLockError::NoSupportedManifests(
@@ -271,12 +376,25 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
                     .map(str::to_owned);
             }
         }
-        let sources: Vec<String> = ["rust-toolchain.toml", "Cargo.toml", "Cargo.lock"]
-            .into_iter()
-            .filter(|k| raw_manifests.contains_key(*k))
-            .map(str::to_owned)
-            .collect();
-        let locked = build_closure_node("rust", rust_pin, &sources, &raw_manifests);
+        let sources: Vec<String> = [
+            "rust-toolchain.toml",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".chinwag/store-closures.json",
+        ]
+        .into_iter()
+        .filter(|k| raw_manifests.contains_key(*k))
+        .map(str::to_owned)
+        .collect();
+        let locked = build_closure_node(
+            repo_root,
+            "rust-toolchain",
+            "rust",
+            rust_pin,
+            &sources,
+            &raw_manifests,
+            &store_closures,
+        )?;
         node_nar_hashes.insert("rust-toolchain".to_owned(), locked.nar_hash.clone());
         nodes.insert(
             "rust-toolchain".to_owned(),
@@ -305,12 +423,25 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
                     .and_then(|v| v.as_str())
             })
             .map(str::to_owned);
-        let sources: Vec<String> = ["package.json", "package-lock.json", "pnpm-lock.yaml"]
-            .into_iter()
-            .filter(|k| raw_manifests.contains_key(*k))
-            .map(str::to_owned)
-            .collect();
-        let locked = build_closure_node("nodejs", node_pin, &sources, &raw_manifests);
+        let sources: Vec<String> = [
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            ".chinwag/store-closures.json",
+        ]
+        .into_iter()
+        .filter(|k| raw_manifests.contains_key(*k))
+        .map(str::to_owned)
+        .collect();
+        let locked = build_closure_node(
+            repo_root,
+            "nodejs-runtime",
+            "nodejs",
+            node_pin,
+            &sources,
+            &raw_manifests,
+            &store_closures,
+        )?;
         node_nar_hashes.insert("nodejs-runtime".to_owned(), locked.nar_hash.clone());
         nodes.insert(
             "nodejs-runtime".to_owned(),
@@ -338,8 +469,20 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
             .and_then(|p| p.get("requires-python"))
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let sources = vec!["pyproject.toml".to_owned()];
-        let locked = build_closure_node("python", py_pin, &sources, &raw_manifests);
+        let sources: Vec<String> = ["pyproject.toml", ".chinwag/store-closures.json"]
+            .into_iter()
+            .filter(|k| raw_manifests.contains_key(*k))
+            .map(str::to_owned)
+            .collect();
+        let locked = build_closure_node(
+            repo_root,
+            "python-runtime",
+            "python",
+            py_pin,
+            &sources,
+            &raw_manifests,
+            &store_closures,
+        )?;
         node_nar_hashes.insert("python-runtime".to_owned(), locked.nar_hash.clone());
         nodes.insert(
             "python-runtime".to_owned(),
@@ -361,8 +504,20 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
             .lines()
             .find_map(|l| l.trim().strip_prefix("go "))
             .map(|v| v.trim().to_owned());
-        let sources = vec!["go.mod".to_owned()];
-        let locked = build_closure_node("go", go_pin, &sources, &raw_manifests);
+        let sources: Vec<String> = ["go.mod", ".chinwag/store-closures.json"]
+            .into_iter()
+            .filter(|k| raw_manifests.contains_key(*k))
+            .map(str::to_owned)
+            .collect();
+        let locked = build_closure_node(
+            repo_root,
+            "go-toolchain",
+            "go",
+            go_pin,
+            &sources,
+            &raw_manifests,
+            &store_closures,
+        )?;
         node_nar_hashes.insert("go-toolchain".to_owned(), locked.nar_hash.clone());
         nodes.insert(
             "go-toolchain".to_owned(),
@@ -380,13 +535,20 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
             path: ".chinwag/env.ts".to_owned(),
             detail: e.to_string(),
         })?;
-        let sources = vec![".chinwag/env.ts".to_owned()];
+        let sources: Vec<String> = [".chinwag/env.ts", ".chinwag/store-closures.json"]
+            .into_iter()
+            .filter(|k| raw_manifests.contains_key(*k))
+            .map(str::to_owned)
+            .collect();
         let locked = build_closure_node(
+            repo_root,
+            "chinwag-env-ts",
             "jinx-nixpkgs-ts",
             Some("v1".to_owned()),
             &sources,
             &raw_manifests,
-        );
+            &store_closures,
+        )?;
         node_nar_hashes.insert("chinwag-env-ts".to_owned(), locked.nar_hash.clone());
         nodes.insert(
             "chinwag-env-ts".to_owned(),
@@ -426,11 +588,15 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
 
     let mut closure_hasher = Sha256::new();
     closure_hasher.update(b"chinwag-cleanroom-closure-merkle/v1\0");
-    for (node_id, nar_hash) in &node_nar_hashes {
-        closure_hasher.update((node_id.len() as u32).to_be_bytes());
-        closure_hasher.update(node_id.as_bytes());
-        closure_hasher.update((nar_hash.len() as u32).to_be_bytes());
-        closure_hasher.update(nar_hash.as_bytes());
+    for (node_id, node) in &flake_lock.nodes {
+        if let Some(ref locked) = node.locked {
+            closure_hasher.update((node_id.len() as u32).to_be_bytes());
+            closure_hasher.update(node_id.as_bytes());
+            closure_hasher.update((locked.nar_hash.len() as u32).to_be_bytes());
+            closure_hasher.update(locked.nar_hash.as_bytes());
+            closure_hasher.update((locked.closure_sha256.len() as u32).to_be_bytes());
+            closure_hasher.update(locked.closure_sha256.as_bytes());
+        }
     }
     let closure_sha256_hex = hex::encode(closure_hasher.finalize());
 
@@ -444,40 +610,131 @@ pub fn compile_workspace_env_lock(repo_root: &Path) -> Result<CompiledEnvLock, E
     })
 }
 
+fn resolve_store_nar_digest(
+    repo_root: &Path,
+    entry: &StoreClosureEntry,
+) -> Result<[u8; 32], EnvLockError> {
+    if !entry.store_path.starts_with("/nix/store/")
+        || entry.store_path.contains("..")
+        || entry.store_path.chars().any(char::is_control)
+    {
+        return Err(EnvLockError::ManifestParse {
+            path: ".chinwag/store-closures.json".to_owned(),
+            detail: format!("invalid `/nix/store/` path `{}`", entry.store_path),
+        });
+    }
+
+    let declared_digest = match entry.nar_sha256_hex {
+        Some(ref hex_str) => {
+            let decoded = hex::decode(hex_str.trim()).map_err(|_| EnvLockError::ManifestParse {
+                path: ".chinwag/store-closures.json".to_owned(),
+                detail: "nar_sha256_hex must be 64 hex chars".to_owned(),
+            })?;
+            let arr: [u8; 32] = decoded
+                .try_into()
+                .map_err(|_| EnvLockError::ManifestParse {
+                    path: ".chinwag/store-closures.json".to_owned(),
+                    detail: "nar_sha256_hex must decode to 32 bytes".to_owned(),
+                })?;
+            Some(arr)
+        }
+        None => None,
+    };
+
+    let artifact_digest = match entry.artifact_file {
+        Some(ref rel_file) => {
+            if rel_file.starts_with('/') || rel_file.contains("..") {
+                return Err(EnvLockError::ManifestParse {
+                    path: ".chinwag/store-closures.json".to_owned(),
+                    detail: "artifact_file must be a clean repo-relative path".to_owned(),
+                });
+            }
+            let bytes = read_non_symlink(&repo_root.join(rel_file))?;
+            let arr: [u8; 32] = Sha256::digest(&bytes).into();
+            Some(arr)
+        }
+        None => None,
+    };
+
+    match (declared_digest, artifact_digest) {
+        (Some(decl), Some(actual)) => {
+            if !bool::from(decl.ct_eq(&actual)) {
+                return Err(EnvLockError::ManifestParse {
+                    path: ".chinwag/store-closures.json".to_owned(),
+                    detail: "artifact_file SHA-256 does not match declared nar_sha256_hex"
+                        .to_owned(),
+                });
+            }
+            Ok(actual)
+        }
+        (Some(decl), None) => Ok(decl),
+        (None, Some(actual)) => Ok(actual),
+        (None, None) => Err(EnvLockError::ManifestParse {
+            path: ".chinwag/store-closures.json".to_owned(),
+            detail: "store closure entry requires `nar_sha256_hex` or `artifact_file`".to_owned(),
+        }),
+    }
+}
+
 fn build_closure_node(
+    repo_root: &Path,
+    node_name: &str,
     ecosystem: &str,
     version_pin: Option<String>,
     sources: &[String],
     raw_manifests: &BTreeMap<String, Vec<u8>>,
-) -> FlakeLockedRef {
-    let mut nar_hasher = Sha256::new();
-    nar_hasher.update(b"chinwag-nar-closure/v1\0");
-    nar_hasher.update(ecosystem.as_bytes());
-    nar_hasher.update([0]);
+    store_closures: &BTreeMap<String, StoreClosureEntry>,
+) -> Result<FlakeLockedRef, EnvLockError> {
+    let mut closure_hasher = Sha256::new();
+    closure_hasher.update(b"chinwag-nar-closure/v1\0");
+    closure_hasher.update(ecosystem.as_bytes());
+    closure_hasher.update([0]);
     if let Some(ref pin) = version_pin {
-        nar_hasher.update(pin.as_bytes());
+        closure_hasher.update(pin.as_bytes());
     }
-    nar_hasher.update([0]);
+    closure_hasher.update([0]);
     for src in sources {
-        nar_hasher.update((src.len() as u32).to_be_bytes());
-        nar_hasher.update(src.as_bytes());
+        closure_hasher.update((src.len() as u32).to_be_bytes());
+        closure_hasher.update(src.as_bytes());
         if let Some(bytes) = raw_manifests.get(src) {
             let digest = Sha256::digest(bytes);
-            nar_hasher.update(digest);
+            closure_hasher.update(digest);
         }
     }
-    let digest_bytes: [u8; 32] = nar_hasher.finalize().into();
-    let nar_hash = format!("sha256-{}", BASE64_STANDARD.encode(digest_bytes));
-    let closure_sha256 = hex::encode(digest_bytes);
 
-    FlakeLockedRef {
+    let resolved_entry = store_closures
+        .get(node_name)
+        .or_else(|| store_closures.get(ecosystem));
+    let (store_path, nar_hash) = if let Some(entry) = resolved_entry {
+        let store_digest = resolve_store_nar_digest(repo_root, entry)?;
+        closure_hasher.update(b"store-nar\0");
+        closure_hasher.update((entry.store_path.len() as u32).to_be_bytes());
+        closure_hasher.update(entry.store_path.as_bytes());
+        closure_hasher.update(store_digest);
+        (
+            Some(entry.store_path.clone()),
+            format!("sha256-{}", BASE64_STANDARD.encode(store_digest)),
+        )
+    } else {
+        let fallback_digest: [u8; 32] = closure_hasher.clone().finalize().into();
+        (
+            None,
+            format!("sha256-{}", BASE64_STANDARD.encode(fallback_digest)),
+        )
+    };
+
+    let closure_digest_bytes: [u8; 32] = closure_hasher.finalize().into();
+    let closure_sha256 = hex::encode(closure_digest_bytes);
+
+    Ok(FlakeLockedRef {
         kind: "chinwag-cleanroom-closure".to_owned(),
         ecosystem: ecosystem.to_owned(),
         version_pin,
+        store_path,
         nar_hash,
         closure_sha256,
         source_manifests: sources.to_vec(),
-    }
+    })
 }
 
 fn canonical_receipt_preimage(
@@ -585,6 +842,24 @@ pub fn verify_env_lock_receipt(
     expected_flake_lock_bytes: &[u8],
     expected_signer: Option<&[u8; 32]>,
 ) -> Result<(), EnvLockError> {
+    let slice: &[[u8; 32]] = match expected_signer {
+        Some(k) => std::slice::from_ref(k),
+        None => &[],
+    };
+    verify_env_lock_receipt_against_allowlist(receipt, expected_flake_lock_bytes, slice, false)
+}
+
+fn verify_env_lock_receipt_against_allowlist(
+    receipt: &EnvLockReceiptV1,
+    expected_flake_lock_bytes: &[u8],
+    pinned_signers: &[[u8; 32]],
+    require_pinned: bool,
+) -> Result<(), EnvLockError> {
+    if require_pinned && pinned_signers.is_empty() {
+        return Err(EnvLockError::ReceiptVerification(
+            "no pinned Ed25519 signers configured for receipt verification",
+        ));
+    }
     if receipt.schema != ENV_LOCK_RECEIPT_SCHEMA || !receipt.zero_nix_syntax {
         return Err(EnvLockError::ReceiptVerification(
             "unsupported receipt schema or zero_nix_syntax=false",
@@ -606,12 +881,18 @@ pub fn verify_env_lock_receipt(
     let pub_arr: [u8; 32] = pub_raw
         .try_into()
         .map_err(|_| EnvLockError::ReceiptVerification("invalid signer public key length"))?;
-    if let Some(pinned) = expected_signer
-        && !bool::from(pub_arr.ct_eq(pinned))
-    {
-        return Err(EnvLockError::ReceiptVerification(
-            "receipt signer does not match pinned Ed25519 key",
-        ));
+    if !pinned_signers.is_empty() {
+        let mut matched = false;
+        for pin in pinned_signers {
+            if bool::from(pub_arr.ct_eq(pin)) {
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(EnvLockError::ReceiptVerification(
+                "receipt signer does not match pinned Ed25519 key",
+            ));
+        }
     }
     let vk = VerifyingKey::from_bytes(&pub_arr)
         .map_err(|_| EnvLockError::ReceiptVerification("invalid Ed25519 public key"))?;
@@ -672,10 +953,32 @@ pub fn write_env_lock_bundle(
 }
 
 /// Re-compiles workspace manifests, verifies zero `.nix` syntax, checks `.chinwag/flake.lock`
+/// byte-for-byte parity, and verifies the detached `Ed25519` receipt against a non-empty
+/// allowlist of pinned `Ed25519` signers.
+pub fn verify_env_lock_bundle_with_signers(
+    repo_root: &Path,
+    pinned_signers: &[[u8; 32]],
+) -> Result<EnvLockReceiptV1, EnvLockError> {
+    verify_env_lock_bundle_inner(repo_root, pinned_signers, true)
+}
+
+/// Re-compiles workspace manifests, verifies zero `.nix` syntax, checks `.chinwag/flake.lock`
 /// byte-for-byte parity, and verifies the detached `Ed25519` receipt.
 pub fn verify_env_lock_bundle(
     repo_root: &Path,
     expected_signer: Option<&[u8; 32]>,
+) -> Result<EnvLockReceiptV1, EnvLockError> {
+    let slice: &[[u8; 32]] = match expected_signer {
+        Some(k) => std::slice::from_ref(k),
+        None => &[],
+    };
+    verify_env_lock_bundle_inner(repo_root, slice, false)
+}
+
+fn verify_env_lock_bundle_inner(
+    repo_root: &Path,
+    pinned_signers: &[[u8; 32]],
+    require_pinned: bool,
 ) -> Result<EnvLockReceiptV1, EnvLockError> {
     let compiled = compile_workspace_env_lock(repo_root)?;
     let lock_path = repo_root.join(".chinwag").join("flake.lock");
@@ -691,7 +994,12 @@ pub fn verify_env_lock_bundle(
     let on_disk_receipt_bytes = read_non_symlink(&receipt_path)?;
     let receipt: EnvLockReceiptV1 = serde_json::from_slice(&on_disk_receipt_bytes)
         .map_err(|_| EnvLockError::ReceiptVerification("malformed env-lock.receipt.json"))?;
-    verify_env_lock_receipt(&receipt, &on_disk_lock, expected_signer)?;
+    verify_env_lock_receipt_against_allowlist(
+        &receipt,
+        &on_disk_lock,
+        pinned_signers,
+        require_pinned,
+    )?;
     if receipt.closure_sha256 != compiled.closure_sha256_hex {
         return Err(EnvLockError::LockfileDrift(
             "closure_sha256 mismatch between workspace manifests and receipt".to_owned(),

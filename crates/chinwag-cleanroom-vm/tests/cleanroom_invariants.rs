@@ -8,13 +8,16 @@ use chinwag_cleanroom_vm::{
     CleanroomDiagnosticInput, CleanroomSeatbeltSpec, CleanroomVmError, EnvLockError,
     EphemeralTartSession, HostHardwareTelemetry, JobTriggerContext, MAX_DRAIN_BUDGET_MS,
     MAX_VIRTIOFS_MOUNT_LATENCY_MS, MAX_VMS_PER_MAC_HOST, NetworkEgressPolicy, PoolAdmissionPolicy,
-    ReleaseSignerAttestation, RunnerPoolController, RunnerTrustProfile, SeatbeltError,
-    SeatbeltSignalMode, TartCleanroomSpec, TartCommandRecord, TartExecutor, ThermalPressure,
-    TrustPoolError, VirtioFsAccess, VirtioFsMount, compile_seatbelt_profile,
-    compile_workspace_env_lock, evaluate_trust_gate, generate_receipt_signing_key,
-    generate_recipient_kem_keypair, open_failure_diagnostic_bundle, scrub_diagnostic_secrets,
+    ReleaseRefPolicy, ReleaseSignerAttestation, RunnerPoolController, RunnerTrustProfile,
+    SeatbeltError, SeatbeltSignalMode, StoreClosureEntry, TartCleanroomSpec, TartCommandRecord,
+    TartExecutor, ThermalPressure, TrustPoolError, VirtioFsAccess, VirtioFsMount,
+    acquire_host_vm_slot, compile_seatbelt_profile, compile_workspace_env_lock,
+    count_active_slot_leases, evaluate_trust_gate, evaluate_trust_gate_with_policy,
+    generate_receipt_signing_key, generate_recipient_kem_keypair, open_failure_diagnostic_bundle,
+    parse_openssh_allowed_signers_ed25519, scrub_diagnostic_secrets,
     seal_failure_diagnostic_bundle, sign_env_lock_receipt, signing_key_from_seed_file,
-    verify_env_lock_bundle, verify_env_lock_receipt, write_env_lock_bundle,
+    verify_env_lock_bundle, verify_env_lock_bundle_with_signers, verify_env_lock_receipt,
+    write_env_lock_bundle,
 };
 use ed25519_dalek::SigningKey;
 use std::cell::RefCell;
@@ -964,4 +967,202 @@ fn release_trust_gate_rejects_malformed_commit_oid() {
         evaluate_trust_gate(&ctx, &BTreeMap::new(), &[]),
         Err(TrustPoolError::ReleaseRefused("malformed commit OID"))
     );
+}
+
+#[test]
+fn ephemeral_tart_session_with_seatbelt_executes_guest_sandbox_exec_and_deletes_on_failure() {
+    let spec = TartCleanroomSpec::new(
+        "base-v1",
+        "sandboxed-run-1",
+        "/nix/store",
+        "/var/tmp/sccache",
+    )
+    .unwrap();
+    let sb_spec = CleanroomSeatbeltSpec::new(
+        RunnerTrustProfile::Public,
+        "/nix/store",
+        "/var/tmp/sccache",
+        "/private/tmp/worktree-sb",
+        "/private/tmp/scratch-sb",
+    )
+    .unwrap();
+    let seatbelt = compile_seatbelt_profile(&sb_spec).unwrap();
+    let cmd = vec![
+        "cargo".to_owned(),
+        "test".to_owned(),
+        "--offline".to_owned(),
+    ];
+
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let exec = RecordingTartExecutor {
+        log: Rc::clone(&log),
+        fail_on_step: None,
+    };
+    let mut session = EphemeralTartSession::clone_and_arm(spec.clone(), exec).unwrap();
+    session
+        .run_ephemeral_with_seatbelt(&seatbelt, &cmd)
+        .unwrap();
+    let (_, del_res) = session.finish();
+    del_res.unwrap();
+
+    let records = log.borrow();
+    let steps: Vec<&str> = records.iter().map(|r| r.step.as_str()).collect();
+    assert_eq!(steps, vec!["clone", "set", "run", "exec", "delete"]);
+    assert_eq!(records[3].argv[0], "exec");
+    assert_eq!(records[3].argv[1], "sandboxed-run-1");
+    assert_eq!(records[3].argv[2], "/usr/bin/sandbox-exec");
+    assert_eq!(records[3].argv[3], "-p");
+    assert!(records[3].argv[4].contains("(deny file-write* (subpath \"/nix/store\")"));
+    assert_eq!(&records[3].argv[5..], &["--", "cargo", "test", "--offline"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn env_lock_recursively_rejects_nested_nix_files_and_nix_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"nested-check\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("crates/sub/nix")).unwrap();
+    fs::write(dir.path().join("crates/sub/nix/overlay.nix"), "{}").unwrap();
+    assert!(matches!(
+        compile_workspace_env_lock(dir.path()),
+        Err(EnvLockError::ForbiddenNixSyntaxFile(_))
+    ));
+    fs::remove_file(dir.path().join("crates/sub/nix/overlay.nix")).unwrap();
+
+    let innocent = dir.path().join("Cargo.toml");
+    symlink(&innocent, dir.path().join("crates/sub/sneaky.nix")).unwrap();
+    assert!(matches!(
+        compile_workspace_env_lock(dir.path()),
+        Err(EnvLockError::ForbiddenNixSyntaxFile(_))
+    ));
+}
+
+#[test]
+fn env_lock_pins_resolved_store_closures_nar_hash_and_verifies_openssh_allowed_signers() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use sha2::{Digest, Sha256};
+
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"store-pin\"\nversion = \"0.1.0\"\nrust-version = \"1.97.1\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join(".chinwag")).unwrap();
+
+    let nar_bytes = b"simulated-nix-nar-archive-bytes-for-rust-1.97.1";
+    fs::write(dir.path().join(".chinwag/rust.nar"), nar_bytes).unwrap();
+    let expected_nar_sha = hex::encode(Sha256::digest(nar_bytes));
+    let expected_sri = format!(
+        "sha256-{}",
+        BASE64_STANDARD.encode(Sha256::digest(nar_bytes))
+    );
+
+    let mut map = BTreeMap::new();
+    map.insert(
+        "rust-toolchain".to_owned(),
+        StoreClosureEntry {
+            store_path: "/nix/store/00000000000000000000000000000000-rust-1.97.1".to_owned(),
+            nar_sha256_hex: Some(expected_nar_sha),
+            artifact_file: Some(".chinwag/rust.nar".to_owned()),
+        },
+    );
+    fs::write(
+        dir.path().join(".chinwag/store-closures.json"),
+        serde_json::to_vec_pretty(&map).unwrap(),
+    )
+    .unwrap();
+
+    let compiled = compile_workspace_env_lock(dir.path()).unwrap();
+    let locked = compiled.flake_lock.nodes["rust-toolchain"]
+        .locked
+        .as_ref()
+        .unwrap();
+    assert_eq!(locked.nar_hash, expected_sri);
+    assert_eq!(
+        locked.store_path.as_deref(),
+        Some("/nix/store/00000000000000000000000000000000-rust-1.97.1")
+    );
+
+    // Encode signer key in OpenSSH `allowed_signers` format and verify strict pinned check
+    let sk = SigningKey::from_bytes(&[0x73u8; 32]);
+    let pk = sk.verifying_key().to_bytes();
+    let mut ssh_wire = Vec::with_capacity(51);
+    ssh_wire.extend_from_slice(b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20");
+    ssh_wire.extend_from_slice(&pk);
+    let allowed_signers_text = format!(
+        "maintainer@example.invalid ssh-ed25519 {} cleanroom\n",
+        BASE64_STANDARD.encode(&ssh_wire)
+    );
+    let parsed_signers = parse_openssh_allowed_signers_ed25519(&allowed_signers_text).unwrap();
+    assert_eq!(parsed_signers, vec![pk]);
+
+    let receipt = sign_env_lock_receipt(&compiled, &sk).unwrap();
+    write_env_lock_bundle(dir.path(), &compiled, &receipt).unwrap();
+
+    // Empty allowlist MUST fail closed when pinned verification is required
+    assert!(verify_env_lock_bundle_with_signers(dir.path(), &[]).is_err());
+    // Enrolled OpenSSH signer succeeds
+    assert!(verify_env_lock_bundle_with_signers(dir.path(), &parsed_signers).is_ok());
+}
+
+#[test]
+fn atomic_host_vm_slot_reservation_caps_at_two_concurrent_leases_and_releases_on_drop() {
+    let dir = TempDir::new().unwrap();
+    let slot_dir = dir.path().join("slots");
+
+    let lease1 = acquire_host_vm_slot(&slot_dir, 2).unwrap();
+    assert_eq!(lease1.slot_index(), 1);
+    let lease2 = acquire_host_vm_slot(&slot_dir, 2).unwrap();
+    assert_eq!(lease2.slot_index(), 2);
+    assert_eq!(count_active_slot_leases(&slot_dir, 2), 2);
+
+    // Third concurrent reservation MUST fail closed at 2-VM cap
+    assert_eq!(
+        acquire_host_vm_slot(&slot_dir, 2).unwrap_err(),
+        TrustPoolError::PoolAdmissionRefused("host_two_vm_hypervisor_cap_reached")
+    );
+
+    // Dropping slot 1 immediately frees slot 1 for the next caller
+    drop(lease1);
+    assert_eq!(count_active_slot_leases(&slot_dir, 2), 1);
+    let lease1_reacquired = acquire_host_vm_slot(&slot_dir, 2).unwrap();
+    assert_eq!(lease1_reacquired.slot_index(), 1);
+}
+
+#[test]
+fn custom_release_ref_policy_supports_customer_release_branches_and_prefixes() {
+    let dir = TempDir::new().unwrap();
+    let policy_path = dir.path().join("cleanroom-policy.toml");
+    fs::write(
+        &policy_path,
+        "allowed_exact_refs = [\"refs/heads/trunk\"]\nallowed_ref_prefixes = [\"refs/heads/release/\", \"refs/tags/rel-\"]\n",
+    )
+    .unwrap();
+    let policy = ReleaseRefPolicy::from_toml_file(&policy_path).unwrap();
+    assert!(policy.allows_ref("refs/heads/trunk"));
+    assert!(policy.allows_ref("refs/heads/release/2026.11"));
+    assert!(policy.allows_ref("refs/tags/rel-1.0.0"));
+    assert!(!policy.allows_ref("refs/heads/main"));
+
+    let sk = SigningKey::from_bytes(&[0x51u8; 32]);
+    let pk = sk.verifying_key().to_bytes();
+    let oid = "d".repeat(40);
+    let att = ReleaseSignerAttestation::sign("refs/heads/release/2026.11", &oid, &sk);
+    let ctx = JobTriggerContext {
+        requested_profile: RunnerTrustProfile::Release,
+        git_ref: "refs/heads/release/2026.11".to_owned(),
+        commit_oid: oid,
+        is_fork_pr: false,
+        is_untrusted_pr_event: false,
+        release_attestation: Some(att),
+    };
+    let dec = evaluate_trust_gate_with_policy(&ctx, &BTreeMap::new(), &[pk], &policy).unwrap();
+    assert!(dec.allow_release_keys);
 }

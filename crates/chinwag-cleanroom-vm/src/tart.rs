@@ -9,6 +9,7 @@
 //! Enforces `INV-NIX-VIRTIOFS-01` (sub-200ms read-only VirtioFS mount budget) and
 //! `INV-NIX-RO-STORE-01` (hypervisor `:ro` tag enforcement on `/nix/store` and `sccache`).
 
+use crate::seatbelt::SeatbeltProfile;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -54,6 +55,8 @@ pub enum CleanroomVmError {
         "VirtioFS mount latency {observed_ms}ms exceeded budget {budget_ms}ms (INV-NIX-VIRTIOFS-01)"
     )]
     MountLatencyExceeded { observed_ms: u64, budget_ms: u64 },
+    #[error("cleanroom guest command cannot be empty")]
+    EmptyGuestCommand,
     #[error("tart subcommand `{step}` failed: {detail}")]
     TartExecutionFailed { step: &'static str, detail: String },
 }
@@ -259,6 +262,27 @@ impl TartCleanroomSpec {
         args
     }
 
+    /// Exact `tart exec <run-vm> /usr/bin/sandbox-exec -p <sbpl> -- <guest_command...>` argv
+    /// applying the compiled XNU Seatbelt profile at runtime inside the guest (`INV-NIX-RO-STORE-01`).
+    pub fn guest_sandbox_exec_argv(
+        &self,
+        seatbelt: &SeatbeltProfile,
+        guest_command: &[String],
+    ) -> Result<Vec<String>, CleanroomVmError> {
+        if guest_command.is_empty() || guest_command[0].trim().is_empty() {
+            return Err(CleanroomVmError::EmptyGuestCommand);
+        }
+        let mut argv = Vec::with_capacity(6 + guest_command.len());
+        argv.push("exec".to_owned());
+        argv.push(self.run_vm_name.clone());
+        argv.push("/usr/bin/sandbox-exec".to_owned());
+        argv.push("-p".to_owned());
+        argv.push(seatbelt.sbpl.clone());
+        argv.push("--".to_owned());
+        argv.extend(guest_command.iter().cloned());
+        Ok(argv)
+    }
+
     /// Exact `tart delete <run-vm>` cleanup argument vector.
     pub fn delete_argv(&self) -> Vec<String> {
         vec!["delete".to_owned(), self.run_vm_name.clone()]
@@ -377,6 +401,26 @@ impl<E: TartExecutor> EphemeralTartSession<E> {
                 detail: "session already finalized".to_owned(),
             })?;
         exec.exec_tart("run", &run_argv)
+    }
+
+    /// Boots the headless cleanroom VM (`tart run`) AND executes `guest_command` inside
+    /// `/usr/bin/sandbox-exec -p <sbpl>` (`tart exec`), enforcing XNU Seatbelt store/socket
+    /// immutability at runtime while guaranteeing `defer tart delete` on any failure.
+    pub fn run_ephemeral_with_seatbelt(
+        &mut self,
+        seatbelt: &SeatbeltProfile,
+        guest_command: &[String],
+    ) -> Result<(), CleanroomVmError> {
+        let exec_argv = self.spec.guest_sandbox_exec_argv(seatbelt, guest_command)?;
+        self.run_ephemeral()?;
+        let exec = self
+            .executor
+            .as_mut()
+            .ok_or_else(|| CleanroomVmError::TartExecutionFailed {
+                step: "exec",
+                detail: "session already finalized".to_owned(),
+            })?;
+        exec.exec_tart("exec", &exec_argv)
     }
 
     /// Explicitly destroys the ephemeral VM and returns any underlying executor + teardown result.
