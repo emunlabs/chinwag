@@ -58,6 +58,8 @@ pub mod bus_wait_message;
 pub mod bus_wait_store;
 pub mod canonical_seat_pubkeys;
 #[cfg(target_os = "macos")]
+pub mod cursor_import;
+#[cfg(target_os = "macos")]
 pub mod execution_binding;
 #[cfg(target_os = "macos")]
 pub mod release_sync;

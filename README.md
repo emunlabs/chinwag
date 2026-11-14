@@ -144,6 +144,24 @@ chinwag configure-editor --repo "$PWD" --editor gemini
 chinwag mcp-serve --repo "$PWD" --transport stdio
 ```
 
+#### Safe 1-Command Cursor Agent & Project Rules Importer (`chinwag agent import-cursor`)
+
+Deterministically migrate any Cursor `Agent SDK` folder or `.cursor/` repository configuration (`instructions.md`, `.cursorrules`, `.cursor/rules/*.mdc`, `tools/`, `skills/`, `mcp-connections/`, `.cursor/mcp.json`, `channels/`) into a local `SOP-BOOT-01` agent bundle (`SOUL.md`, `AGENT.md`, `TOOL.md`, `SKILLS.md`, `MEMORY.md`, `skills/**/SKILL.md`, `import-receipt.json`) in `<500ms` while enforcing the 5-gate `INV-CURSOR-IMPORT-SAFE-01` static security sanitizer (exiting `78` on quarantine):
+
+```sh
+# Translate a Cursor project or Agent SDK folder into .chinwag/agents/BACKEND_REVIEWER
+chinwag agent import-cursor "$PWD" --name BACKEND_REVIEWER --json
+
+# Or write to an explicit destination directory
+chinwag agent import-cursor ./cursor-agent --name BACKEND_REVIEWER --out ./.chinwag/agents/BACKEND_REVIEWER
+```
+
+- **Gate 1a (`InertAstParse`):** Strictly inert JSON/YAML/Markdown parsing with zero script execution and symlink / `..` path-traversal refusal (`exit 78`).
+- **Gate 1b (`McpShellMetacharQuarantine`):** Quarantines MCP `command` or `args` invoking shell wrappers (`sh -c`, `bash -c`, `zsh -c`, `cmd /c`, `eval`) or shell metacharacters (`;`, `|`, `&&`, `` ` ``, `$(`) (`exit 78`).
+- **Gate 1c (`DynamicLinkerEnvScrub`):** Quarantines dynamic linker and runtime startup environment injections (`DYLD_*`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `BASH_ENV`) (`exit 78`).
+- **Gate 1d (`PhantomVaultSecretConversion`):** Strips inline bearer tokens, API keys, and high-entropy credentials from imported configs and emits `PhantomVault` placeholders (`vault://<NAME>/<KEY>`) without writing raw secrets to disk.
+- **Gate 1e (`UnicodeBidiAndInjectionScan`):** Quarantines Trojan Source Unicode bidi/zero-width control characters (`U+202A..U+202E`, `U+2066..U+2069`, `U+200B..U+200F`, mid-line `U+FEFF`) and hidden HTML-comment prompt-injection payloads (`exit 78`).
+
 ---
 
 ### 7. Real-Time GitHub Projects v2 & Linear Card-Move Execution (`chinwag tasks` & `chinwag board`)
@@ -177,6 +195,7 @@ Usage:
   chinwag ci-report --issue <ID> --status <pass|fail> [--push-boards] [--delivery-licensed]
   chinwag bus <send | inbox | tail | status | instance | wait | recovery> [options]
   chinwag memory <recall | retain | tombstone | stats> [options]
+  chinwag agent import-cursor <src-dir> --name <NAME> [--out <dest-dir>] [--json]
   chinwag agent-dispatch --agent <SEAT> --sender <SEAT#INSTANCE> --item <TASK-ID> --crdb <path> --body <text>
   chinwag configure-editor --repo <absolute-path> --editor <claude-code|cursor|codex|gemini>
   chinwag mcp-serve --repo <absolute-path> [--transport stdio|http]
