@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+use crate::profile::{McpProfile, rmcp_tools_for_profile};
 use chinwag_snapshot_read_owner_private::{ReadOwner, RepositoryAdmission};
 use chinwag_snapshot_session_private::{
     Rows, SnapshotSession, Value as SqlValue,
@@ -9,7 +10,7 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
         ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
-        Tool, ToolAnnotations,
+        Tool,
     },
     service::RequestContext,
 };
@@ -65,16 +66,38 @@ struct HandoffArgs {
     note: String,
     created_at_ms: i64,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrgOnlyArgs {
+    org_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunStatusArgs {
+    org_id: String,
+    run_ref: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocsSearchArgs {
+    query: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocsGetArgs {
+    slug: String,
+}
 pub struct Owner {
     sender: mpsc::Sender<Command>,
     join: JoinHandle<Result<(), String>>,
 }
 #[derive(Clone)]
 pub struct ContextServer {
-    sender: mpsc::Sender<Command>,
+    sender: Option<mpsc::Sender<Command>>,
     definitions: Arc<Vec<Tool>>,
     permits: Arc<Semaphore>,
     repository_mode: bool,
+    profile: McpProfile,
     #[cfg(feature = "private-http-probe")]
     http_lifetime: Option<Arc<crate::http_lifetime::HttpLifetime>>,
 }
@@ -254,7 +277,7 @@ impl Owner {
         if !repo.is_absolute() {
             return Err("Absolute repository required".into());
         }
-        let definitions = definitions()?;
+        let definitions = rmcp_tools_for_profile(McpProfile::LocalRepository)?;
         let (sender, mut receiver) = mpsc::channel(8);
         let (ready_tx, ready_rx) = oneshot::channel();
         let join = std::thread::spawn(move || {
@@ -326,10 +349,11 @@ impl Owner {
             outcome
         });
         let server = ContextServer {
-            sender: sender.clone(),
+            sender: Some(sender.clone()),
             definitions: Arc::new(definitions),
             permits: Arc::new(Semaphore::new(8)),
             repository_mode: require_repository,
+            profile: McpProfile::LocalRepository,
             #[cfg(feature = "private-http-probe")]
             http_lifetime: None,
         };
@@ -388,6 +412,24 @@ impl Owner {
         Ok(())
     }
 }
+impl ContextServer {
+    pub fn new_blind_org() -> Result<Self, Box<dyn Error>> {
+        Self::new_catalog_only(McpProfile::BlindOrg)
+    }
+
+    pub fn new_catalog_only(profile: McpProfile) -> Result<Self, Box<dyn Error>> {
+        let definitions = rmcp_tools_for_profile(profile)?;
+        Ok(Self {
+            sender: None,
+            definitions: Arc::new(definitions),
+            permits: Arc::new(Semaphore::new(8)),
+            repository_mode: false,
+            profile,
+            #[cfg(feature = "private-http-probe")]
+            http_lifetime: None,
+        })
+    }
+}
 #[cfg(feature = "private-http-probe")]
 impl ContextServer {
     pub(crate) fn require_modern_http(
@@ -407,16 +449,19 @@ impl ContextServer {
 }
 impl ServerHandler for ContextServer {
     fn get_info(&self) -> ServerConfig {
-        let (name, instructions) = if self.repository_mode {
-            (
+        let (name, instructions) = match self.profile {
+            McpProfile::BlindOrg => (
+                "chinwag-blind-org",
+                "Authorized blind organization telemetry and curated Chinwag documentation only. Zero source code, file paths, repository leases, or local filesystem access.",
+            ),
+            McpProfile::LocalRepository if self.repository_mode => (
                 "chinwag-context",
                 "Read and pin local repository decisions. For the first pin in a new thread, supply create_thread with your repo_id, branch_ref and title labels. Later pins omit create_thread; an identical first-pin retry is safe. Handoff stores a local offer and does not contact its target or grant file-edit authority.",
-            )
-        } else {
-            (
+            ),
+            McpProfile::LocalRepository => (
                 "chinwag-private-anchored-context",
                 "Private operator fixture context only. No file edits, grants, cloud handoff, editor setup or network transport.",
-            )
+            ),
         };
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(name, "0.0.1"))
@@ -457,6 +502,15 @@ impl ServerHandler for ContextServer {
             .try_acquire()
             .map_err(|_| ErrorData::invalid_params("Private context queue is full", None))?;
         let args = Value::Object(request.arguments.unwrap_or_default());
+        if self.profile == McpProfile::BlindOrg {
+            let value = execute_blind_org_tool(request.name.as_ref(), args)?;
+            drop(permit);
+            return Ok(CallToolResult::structured(value).into());
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("Private context owner unavailable", None))?;
         let (tx, rx) = oneshot::channel();
         let command = match request.name.as_ref() {
             "chinwag_read_thread" => {
@@ -521,7 +575,7 @@ impl ServerHandler for ContextServer {
                 if let Some(probe) = self.http_lifetime.as_ref().and_then(|life| life.probe.as_ref()) {
                     probe.before_enqueue().await;
                 }
-                self.sender.send(command).await.map_err(|_| ErrorData::internal_error("Private context owner unavailable", None))?;
+                sender.send(command).await.map_err(|_| ErrorData::internal_error("Private context owner unavailable", None))?;
                 rx.await.map_err(|_| ErrorData::internal_error("Private context result unavailable", None))
             } => result?,
         };
@@ -532,6 +586,205 @@ impl ServerHandler for ContextServer {
         }
         .into())
     }
+}
+
+const APPROVED_PUBLIC_DOCS: &[(&str, &str, &str)] = &[
+    (
+        "coordination/overview",
+        "Blind Multi-Seat Engineering Coordination",
+        "Chinwag coordinates verified delivery state, run receipts, and handoff gates across engineering seats while keeping source code inside local repositories.",
+    ),
+    (
+        "security/blind-boundary",
+        "Blind Cloud Capability Boundary",
+        "Remote blind-org MCP exposes organization status, opaque run receipts, delivery board progress, credit ledger summaries, and approved public documentation with zero source bytes, file paths, or leases. Emun Labs is pursuing SOC 2.",
+    ),
+    (
+        "setup/connect-local-workspace",
+        "Connecting a Local Workspace",
+        "Local repository threads and context pins run exclusively through an admitted local chinwag mcp-serve process configured explicitly by the developer.",
+    ),
+];
+
+fn validate_opaque_id(value: &str) -> Result<(), ErrorData> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(ErrorData::invalid_params(
+            "Expected bounded opaque identifier [A-Za-z0-9._:-]{1,128}",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn contains_interpolation(value: &str) -> bool {
+    if value.contains("${") || value.contains("$(") {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    for idx in 0..bytes.len() {
+        if bytes[idx] == b'$'
+            && let Some(next) = bytes.get(idx + 1)
+            && (next.is_ascii_uppercase() || *next == b'_')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_search_query(value: &str) -> Result<(), ErrorData> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.contains('\0')
+        || contains_interpolation(value)
+    {
+        return Err(ErrorData::invalid_params(
+            "Expected bounded search query without null bytes or environment interpolation",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_doc_slug(value: &str) -> Result<(), ErrorData> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.contains("//")
+        || !value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'/' | b'_' | b'-')
+        })
+    {
+        return Err(ErrorData::invalid_params(
+            "Expected canonical documentation slug [a-z0-9./_-]{1,128}",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn execute_blind_org_tool(name: &str, args: Value) -> Result<Value, ErrorData> {
+    let payload = match name {
+        "chinwag_org_status" => {
+            let parsed: OrgOnlyArgs = serde_json::from_value(args)
+                .map_err(|_| ErrorData::invalid_params("Expected exact org_id field", None))?;
+            validate_opaque_id(&parsed.org_id)?;
+            json!({
+                "profile": "blind-org",
+                "org_id": parsed.org_id,
+                "posture": "blind_metadata_only",
+                "source_bytes": 0,
+                "compliance_note": "Emun Labs is pursuing SOC 2."
+            })
+        }
+        "chinwag_run_status" => {
+            let parsed: RunStatusArgs = serde_json::from_value(args).map_err(|_| {
+                ErrorData::invalid_params("Expected exact org_id and run_ref fields", None)
+            })?;
+            validate_opaque_id(&parsed.org_id)?;
+            validate_opaque_id(&parsed.run_ref)?;
+            json!({
+                "profile": "blind-org",
+                "org_id": parsed.org_id,
+                "run_ref": parsed.run_ref,
+                "state": "verified_blind_receipt_lookup_ready",
+                "source_bytes": 0
+            })
+        }
+        "chinwag_board_status" => {
+            let parsed: OrgOnlyArgs = serde_json::from_value(args)
+                .map_err(|_| ErrorData::invalid_params("Expected exact org_id field", None))?;
+            validate_opaque_id(&parsed.org_id)?;
+            json!({
+                "profile": "blind-org",
+                "org_id": parsed.org_id,
+                "open_gates": 0,
+                "file_scopes_exposed": 0,
+                "source_bytes": 0
+            })
+        }
+        "chinwag_credit_ledger" => {
+            let parsed: OrgOnlyArgs = serde_json::from_value(args)
+                .map_err(|_| ErrorData::invalid_params("Expected exact org_id field", None))?;
+            validate_opaque_id(&parsed.org_id)?;
+            json!({
+                "profile": "blind-org",
+                "org_id": parsed.org_id,
+                "read_only": true,
+                "available_credits": 0,
+                "verified_receipts": 0
+            })
+        }
+        "chinwag_docs_search" => {
+            let parsed: DocsSearchArgs = serde_json::from_value(args)
+                .map_err(|_| ErrorData::invalid_params("Expected exact query field", None))?;
+            validate_search_query(&parsed.query)?;
+            let needle = parsed.query.to_ascii_lowercase();
+            let hits: Vec<Value> = APPROVED_PUBLIC_DOCS
+                .iter()
+                .filter(|(slug, title, summary)| {
+                    slug.to_ascii_lowercase().contains(&needle)
+                        || title.to_ascii_lowercase().contains(&needle)
+                        || summary.to_ascii_lowercase().contains(&needle)
+                })
+                .map(|(slug, title, summary)| {
+                    json!({
+                        "slug": slug,
+                        "title": title,
+                        "summary": summary
+                    })
+                })
+                .collect();
+            json!({
+                "profile": "blind-org",
+                "query": parsed.query,
+                "results": hits
+            })
+        }
+        "chinwag_docs_get" => {
+            let parsed: DocsGetArgs = serde_json::from_value(args)
+                .map_err(|_| ErrorData::invalid_params("Expected exact slug field", None))?;
+            validate_doc_slug(&parsed.slug)?;
+            let entry = APPROVED_PUBLIC_DOCS
+                .iter()
+                .find(|(slug, _, _)| *slug == parsed.slug)
+                .map(|(slug, title, summary)| {
+                    json!({
+                        "found": true,
+                        "slug": slug,
+                        "title": title,
+                        "body": summary
+                    })
+                })
+                .unwrap_or_else(|| {
+                    json!({
+                        "found": false,
+                        "slug": parsed.slug
+                    })
+                });
+            json!({
+                "profile": "blind-org",
+                "document": entry
+            })
+        }
+        _ => {
+            return Err(ErrorData::invalid_params(
+                "Tool is not available in blind-org profile",
+                None,
+            ));
+        }
+    };
+    bound_output(payload).map_err(|reason| ErrorData::internal_error(reason, None))
 }
 fn valid_text(text: &str, empty: bool) -> Result<(), ErrorData> {
     if (!empty && text.is_empty()) || text.len() > chinwag_snapshot_session_private::MAX_VALUE_BYTES
@@ -580,58 +833,4 @@ fn objects(rows: Rows, names: &[&str]) -> Result<Vec<Value>, String> {
             Ok(Value::Object(object))
         })
         .collect()
-}
-fn definitions() -> Result<Vec<Tool>, Box<dyn Error>> {
-    let read = json!({"type":"object","properties":{"thread_id":{"type":"string","minLength":1,"maxLength":65536}},"required":["thread_id"],"additionalProperties":false});
-    let pin = json!({"type":"object","properties":{
-        "id":{"type":"string","minLength":1,"maxLength":65536},"thread_id":{"type":"string","minLength":1,"maxLength":65536},"file_path":{"type":"string","minLength":1,"maxLength":65536},"symbol_hash":{"type":"string","minLength":1,"maxLength":65536},"source_commit":{"type":"string","minLength":1,"maxLength":65536},"body":{"type":"string","maxLength":65536},"created_at_ms":{"type":"integer","minimum":0},
-        "create_thread":{"type":"object","properties":{
-            "repo_id":{"type":"string","minLength":1,"maxLength":65536},
-            "branch_ref":{"type":"string","minLength":1,"maxLength":65536},
-            "title":{"type":"string","minLength":1,"maxLength":65536}},
-            "required":["repo_id","branch_ref","title"],"additionalProperties":false}},"required":["id","thread_id","file_path","symbol_hash","source_commit","body","created_at_ms"],"additionalProperties":false});
-    let mut result = Vec::new();
-    let handoff = json!({"type":"object","properties":{
-        "id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._-]+$"},
-        "thread_id":{"type":"string","minLength":1,"maxLength":65536},
-        "target_label":{"type":"string","minLength":1,"maxLength":65536},
-        "note":{"type":"string","maxLength":65536},
-        "created_at_ms":{"type":"integer","minimum":0}},
-        "required":["id","thread_id","target_label","note","created_at_ms"],"additionalProperties":false});
-    for (name, description, schema, read_only) in [
-        (
-            "chinwag_read_thread",
-            "Read one private fixture thread with persisted messages and context pins.",
-            read,
-            true,
-        ),
-        (
-            "chinwag_pin_context",
-            "Persist one context pin. Exact same ID/content is idempotent; conflicting reuse is refused. file_path is stored text, never opened.",
-            pin,
-            false,
-        ),
-        (
-            "chinwag_handoff",
-            "Record an unauthenticated local context offer for a caller-supplied target label. No recipient contacted. Exact request replay returns original snapshot; conflicting ID refused. Prior offers excluded from snapshots. No grant or flight receipt.",
-            handoff,
-            false,
-        ),
-    ] {
-        result.push(
-            Tool::new(
-                name,
-                description,
-                Arc::new(schema.as_object().ok_or("Tool schema object")?.clone()),
-            )
-            .with_annotations(
-                ToolAnnotations::new()
-                    .read_only(read_only)
-                    .destructive(false)
-                    .idempotent(true)
-                    .open_world(false),
-            ),
-        );
-    }
-    Ok(result)
 }

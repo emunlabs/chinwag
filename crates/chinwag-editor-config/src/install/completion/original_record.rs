@@ -12,12 +12,14 @@ pub(in crate::install) struct OriginalRecord {
     record_id: FileId,
 }
 /// Observation of this original successful finish, not a constructor or retry grant.
+#[cfg(target_os = "macos")]
 pub(in crate::install) struct Finalized {
     evidence: Evidence,
     record_sha256: [u8; 32],
     checked_file_fds: usize,
     checked_directory_fds: usize,
 }
+#[cfg(target_os = "macos")]
 impl Finalized {
     pub(in crate::install) fn evidence(&self) -> &Evidence {
         &self.evidence
@@ -57,6 +59,7 @@ impl OriginalRecord {
         }
     }
     /// A live normal outer guard is required throughout this original finish.
+    #[cfg(target_os = "macos")]
     pub(in crate::install) fn finish(
         mut self,
         guard: &crate::install::repository::OuterGuard,

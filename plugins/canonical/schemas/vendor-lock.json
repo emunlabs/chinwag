@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "claude": {
+      "marketplaceManifest": ".claude-plugin/marketplace.json",
+      "pluginManifest": "plugins/chinwag/.claude-plugin/plugin.json",
+      "mcpConfig": "plugins/chinwag/.mcp.json",
+      "iconFormat": "png-512x512",
+      "hooksAllowed": false
+    },
+    "cursor": {
+      "marketplaceManifest": ".cursor-plugin/marketplace.json",
+      "pluginManifest": "plugins/chinwag/.cursor-plugin/plugin.json",
+      "mcpConfig": "plugins/chinwag/mcp.json",
+      "hooksAllowed": false
+    },
+    "openai": {
+      "appManifest": "openai-app.json",
+      "codexPluginManifest": ".codex-plugin/plugin.json",
+      "forbidMcpTokenInUserCopy": true,
+      "goldenCasesRequired": 8
+    },
+    "google": {
+      "geminiExtensionManifest": "gemini/gemini-extension.json",
+      "antigravityPluginManifest": "antigravity/plugins/chinwag/plugin.json",
+      "antigravityMcpConfig": "antigravity/plugins/chinwag/mcp_config.json"
+    },
+    "vscode": {
+      "mcpConfig": ".vscode/mcp.json",
+      "rootContainerKey": "servers"
+    },
+    "mcp_registry": {
+      "serverManifest": "server.json",
+      "schemaUrl": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "descriptionMaxLength": 100
+    },
+    "grok": {
+      "pluginToml": "grok-plugin.toml",
+      "editorConfigToml": ".grok/config.toml",
+      "pluginManifest": ".claude-plugin/plugin.json"
+    }
+  }
+}

@@ -12,6 +12,11 @@ use std::{
 };
 
 pub(super) type Result<T> = std::result::Result<T, &'static str>;
+#[cfg(target_os = "macos")]
+pub type DevId = i32;
+#[cfg(not(target_os = "macos"))]
+pub type DevId = u64;
+
 const DIR: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -19,7 +24,7 @@ const DIR: OFlags = OFlags::RDONLY
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DirId {
-    pub dev: i32,
+    pub dev: DevId,
     pub ino: u64,
     uid: u32,
     gid: u32,
@@ -27,7 +32,7 @@ pub(super) struct DirId {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FileId {
-    pub dev: i32,
+    pub dev: DevId,
     pub ino: u64,
     uid: u32,
     gid: u32,
@@ -61,19 +66,21 @@ pub(super) struct Anchor {
     policy: Policy,
 }
 
+#[allow(clippy::unnecessary_cast)]
 fn directory_id(s: &rustix::fs::Stat) -> Result<DirId> {
     if FileType::from_raw_mode(s.st_mode) != FileType::Directory || s.st_mode & 0o022 != 0 {
         return Err("unsafe_directory");
     }
     Ok(DirId {
-        dev: s.st_dev,
-        ino: s.st_ino,
+        dev: s.st_dev as DevId,
+        ino: s.st_ino as u64,
         uid: s.st_uid,
         gid: s.st_gid,
-        mode: s.st_mode,
+        mode: (s.st_mode & 0o7777) as u16,
     })
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum Policy {
     Fixture,
     Repository,
@@ -94,6 +101,7 @@ fn private(id: DirId) -> Result<()> {
     }
     Ok(())
 }
+#[allow(clippy::unnecessary_cast)]
 fn file_id(s: &rustix::fs::Stat) -> Result<FileId> {
     if FileType::from_raw_mode(s.st_mode) != FileType::RegularFile
         || s.st_uid != rustix::process::geteuid().as_raw()
@@ -105,11 +113,11 @@ fn file_id(s: &rustix::fs::Stat) -> Result<FileId> {
         return Err("unsafe_fixture_file");
     }
     Ok(FileId {
-        dev: s.st_dev,
-        ino: s.st_ino,
+        dev: s.st_dev as DevId,
+        ino: s.st_ino as u64,
         uid: s.st_uid,
         gid: s.st_gid,
-        mode: s.st_mode,
+        mode: (s.st_mode & 0o7777) as u16,
         nlink: u64::from(s.st_nlink),
         size: s.st_size as u64,
     })
@@ -118,9 +126,11 @@ impl Anchor {
     pub fn open_fixture(repo: &Path, child: Option<&str>) -> Result<Self> {
         Self::open_policy(repo, child, Policy::Fixture)
     }
+    #[cfg(target_os = "macos")]
     pub(super) fn open_repository(repo: &Path, child: Option<&str>) -> Result<Self> {
         Self::open_policy(repo, child, Policy::Repository)
     }
+    #[cfg(target_os = "macos")]
     pub(super) fn open_private(repo: &Path) -> Result<Self> {
         Self::open_policy(repo, Some(".chinwag"), Policy::PrivateLeaf)
     }
@@ -194,12 +204,15 @@ impl Anchor {
         anchor.check()?;
         Ok(anchor)
     }
+    #[cfg(target_os = "macos")]
     pub(super) fn repository_child(
         mut self,
         name: &'static str,
         guard: &mut super::repository::OuterGuard,
     ) -> Result<Self> {
-        if self.policy != Policy::Repository || !matches!(name, ".cursor" | ".codex" | ".gemini") {
+        if self.policy != Policy::Repository
+            || !matches!(name, ".cursor" | ".codex" | ".gemini" | ".grok" | ".vscode")
+        {
             return Err("invalid_repository_child");
         }
         self.check()?;
@@ -243,6 +256,7 @@ impl Anchor {
         }
         Ok(self)
     }
+    #[cfg(target_os = "macos")]
     pub(super) fn repository_identity(&self) -> DirId {
         self.links[self.private_start].child
     }

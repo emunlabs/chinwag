@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "tools": [
+    {
+      "name": "chinwag_org_status",
+      "profile": "blind-org",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Read-only query over signed blind organization telemetry summaries; mutates nothing and never accesses external open-world resources or repository files."
+    },
+    {
+      "name": "chinwag_run_status",
+      "profile": "blind-org",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Read-only lookup of a verified 12-beat blind run receipt by opaque reference; idempotent, non-destructive, and closed-world."
+    },
+    {
+      "name": "chinwag_board_status",
+      "profile": "blind-org",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Read-only query returning aggregated delivery board step and gate counters for the caller's authorized organization."
+    },
+    {
+      "name": "chinwag_credit_ledger",
+      "profile": "blind-org",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Read-only balance and receipt inspection on the authoritative organization credit ledger; cannot reserve, purchase, or debit credits."
+    },
+    {
+      "name": "chinwag_docs_search",
+      "profile": "blind-org",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Read-only search against the curated Chinwag documentation corpus; idempotent, non-destructive, and closed to arbitrary web URLs."
+    },
+    {
+      "name": "chinwag_docs_get",
+      "profile": "blind-org",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Read-only retrieval of a version-pinned Chinwag documentation entry by canonical slug; zero mutation or open-world fetch."
+    },
+    {
+      "name": "chinwag_read_thread",
+      "profile": "local-repository",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Reads a bounded local repository thread snapshot without mutating state or contacting external services."
+    },
+    {
+      "name": "chinwag_pin_context",
+      "profile": "local-repository",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Appends an idempotent local context pin keyed by pin ID without deleting data or reaching external networks."
+    },
+    {
+      "name": "chinwag_handoff",
+      "profile": "local-repository",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "justification": "Records an idempotent local handoff offer in the admitted repository store without destructive changes or network egress."
+    }
+  ]
+}

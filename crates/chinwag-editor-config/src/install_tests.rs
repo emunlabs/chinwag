@@ -16,7 +16,7 @@ impl Fixture {
         let repo = root.join(label);
         fs::create_dir(&repo).unwrap();
         fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
-        for name in [".cursor", ".codex", ".gemini"] {
+        for name in [".cursor", ".codex", ".gemini", ".grok", ".vscode"] {
             fs::create_dir(repo.join(name)).unwrap();
             fs::set_permissions(repo.join(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -71,18 +71,10 @@ fn private_file(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
-fn four_editor_installs_read_back_and_retained_intent_prevents_replay() {
-    for (i, editor) in [
-        Editor::ClaudeCode,
-        Editor::Cursor,
-        Editor::Codex,
-        Editor::Gemini,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let fixture = Fixture::new(&format!("three-editors-{i}"), editor);
-        let original: &[u8] = if matches!(editor, Editor::Codex) {
+fn six_editor_installs_read_back_and_retained_intent_prevents_replay() {
+    for (i, editor) in Editor::ALL.into_iter().enumerate() {
+        let fixture = Fixture::new(&format!("six-editors-{i}"), editor);
+        let original: &[u8] = if editor.is_toml() {
             b"# keep spelling\nunknown = 'kept'\n"
         } else {
             b"{\"unknown\":\"kept\"}\n"
@@ -96,7 +88,7 @@ fn four_editor_installs_read_back_and_retained_intent_prevents_replay() {
         assert_eq!(evidence.original_sha256, Some(digest(original)));
         assert_eq!(evidence.staged_sha256, digest(&actual));
         match editor {
-            Editor::Codex => {
+            Editor::Codex | Editor::Grok => {
                 assert!(actual.starts_with(original));
                 let doc: toml_edit::DocumentMut =
                     std::str::from_utf8(&actual).unwrap().parse().unwrap();
@@ -105,6 +97,14 @@ fn four_editor_installs_read_back_and_retained_intent_prevents_replay() {
                     Some("/fixture/chinwag")
                 );
                 assert_eq!(doc["unknown"].as_str(), Some("kept"));
+            }
+            Editor::VsCode => {
+                let doc: serde_json::Value = serde_json::from_slice(&actual).unwrap();
+                assert_eq!(doc["unknown"], "kept");
+                assert_eq!(
+                    doc["servers"]["chinwag"],
+                    serde_json::json!({"type":"stdio","command":"/fixture/chinwag","args":[]})
+                );
             }
             _ => {
                 let doc: serde_json::Value = serde_json::from_slice(&actual).unwrap();
@@ -383,4 +383,46 @@ fn gemini_stale_preimage_and_custom_entry_preserve_originals() {
     );
     assert_eq!(fs::read(custom.path()).unwrap(), original);
     assert!(!custom.parent().join(LOCK).exists() && !custom.parent().join(INTENT).exists());
+}
+
+#[test]
+fn mid_flight_symlink_swap_and_six_editor_remote_installs_are_enforced() {
+    // Adversarial symlink-swap between prepare and commit MUST refuse before rename
+    let victim_root = Fixture::new("symlink-swap-victim", Editor::VsCode);
+    let outside = victim_root.repo.join("outside-secret.json");
+    private_file(&outside, b"{\"secret\":true}");
+    victim_root.seed(b"{}");
+    let prepared = victim_root.ready();
+    fs::remove_file(victim_root.path()).unwrap();
+    symlink(&outside, victim_root.path()).unwrap();
+    assert!(matches!(
+        prepared.commit(),
+        CommitOutcome::BeforeCommitRefused {
+            intent_created_no_cleanup: false,
+            ..
+        }
+    ));
+    assert_eq!(fs::read(&outside).unwrap(), b"{\"secret\":true}");
+
+    // Remote profile installs across all 6 editors via FixtureTarget::prepare_remote
+    for (i, editor) in Editor::ALL.into_iter().enumerate() {
+        let f = Fixture::new(&format!("six-remote-{i}"), editor);
+        let t = f.target();
+        let o = t.inspect().unwrap();
+        let Preparation::Ready(prepared) = t
+            .prepare_remote(
+                o,
+                Remote {
+                    url: "https://mcp.chinwag.sh/mcp",
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected remote staged preparation");
+        };
+        assert!(matches!(
+            prepared.commit(),
+            CommitOutcome::InstalledAndReadBack { .. }
+        ));
+    }
 }
