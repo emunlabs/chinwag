@@ -340,7 +340,7 @@ impl AcuCiphertext {
         self.matrix.encode_gates(&mut out);
 
         for row in &self.rows {
-            encode_ciphertext_row(&mut out, row, blind_seats);
+            encode_ciphertext_row(&mut out, row, blind_seats.then_some(&row.row_locator));
         }
 
         out.extend_from_slice(&(self.sbc_slots.len() as u32).to_be_bytes());
@@ -352,8 +352,13 @@ impl AcuCiphertext {
             out.extend_from_slice(&slot.nonce);
             out.extend_from_slice(&(slot.ciphertext.len() as u64).to_be_bytes());
             out.extend_from_slice(&slot.ciphertext);
-            for s_row in &slot.rows {
-                encode_ciphertext_row(&mut out, s_row, blind_seats);
+            for (idx, s_row) in slot.rows.iter().enumerate() {
+                let blind_loc = blind_seats.then(|| {
+                    self.rows
+                        .get(idx)
+                        .map_or(&s_row.row_locator, |m_row| &m_row.row_locator)
+                });
+                encode_ciphertext_row(&mut out, s_row, blind_loc);
             }
         }
         match &self.acu_epoch_auth {
@@ -710,12 +715,15 @@ fn blind_handle_from_locator(locator: &[u8; 32]) -> String {
     s
 }
 
-fn encode_ciphertext_row(out: &mut Vec<u8>, row: &CiphertextRow, blind_seats: bool) {
+fn encode_ciphertext_row(
+    out: &mut Vec<u8>,
+    row: &CiphertextRow,
+    blind_seat_locator: Option<&[u8; 32]>,
+) {
     out.extend_from_slice(&(row.row_index as u32).to_be_bytes());
-    let wire_seat = if blind_seats {
-        blind_handle_from_locator(&row.row_locator)
-    } else {
-        row.seat_id.clone()
+    let wire_seat = match blind_seat_locator {
+        Some(loc) => blind_handle_from_locator(loc),
+        None => row.seat_id.clone(),
     };
     lp64_str(out, &wire_seat);
     out.extend_from_slice(&row.row_locator);
@@ -895,6 +903,36 @@ pub fn acu_encrypt_with_g1_and_context(
     acu_pk: &SeatPublicKey,
     rng: &mut (impl RngCore + CryptoRng),
 ) -> Result<(AcuCiphertext, Gt), AcuError> {
+    acu_encrypt_with_g1_at_epoch(
+        payload_g1,
+        object_digest,
+        1,
+        locator_key,
+        matrix,
+        seat_keys,
+        acu_pk,
+        rng,
+    )
+}
+
+/// Internal epoch-parameterized `CHWGACU3` sealer used by initial encryption (`policy_epoch = 1`)
+/// and coalition-authorized `RotatePQKey` (`policy_epoch = E + 1`, `ACU-V2-F01`), stamping
+/// `row.init_epoch = policy_epoch` and `slot1.created_epoch = policy_epoch` so
+/// [`AcuCiphertext::verify_authenticity`] succeeds across online `CisoAcuFatClient` requests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn acu_encrypt_with_g1_at_epoch(
+    payload_g1: &G1Projective,
+    object_digest: &[u8; 32],
+    policy_epoch: u64,
+    locator_key: &[u8; 32],
+    matrix: &LsssMatrix,
+    seat_keys: &BTreeMap<String, SeatPublicKey>,
+    acu_pk: &SeatPublicKey,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Result<(AcuCiphertext, Gt), AcuError> {
+    if policy_epoch == 0 {
+        return Err(AcuError::SerializationError("invalid policy_epoch"));
+    }
     matrix.validate()?;
     let payload_aff = G1Affine::from(*payload_g1);
     if bool::from(payload_aff.is_identity()) || !bool::from(payload_aff.is_torsion_free()) {
@@ -931,13 +969,21 @@ pub fn acu_encrypt_with_g1_and_context(
     let payload_key = pairing(&payload_aff, &g2_aff);
     let c0 = pairing(&G1Affine::from(c0_g1), &g2_aff);
 
-    let rows = build_lsss_rows(object_digest, 1, locator_key, matrix, &v, seat_keys, rng)?;
+    let rows = build_lsss_rows(
+        object_digest,
+        policy_epoch,
+        locator_key,
+        matrix,
+        &v,
+        seat_keys,
+        rng,
+    )?;
 
     // Auxiliary commitments ONLY: V_1 = v_1 * G_1 .. V_{k-1} = v_{k-1} * G_1 (OMIT V_0 = s * G_1!).
     let mut v_aux: Vec<G1Projective> = v[1..].iter().map(|vm| g1 * vm).collect();
     let slot1 = seal_sbc_slot(
         object_digest,
-        1,
+        policy_epoch,
         1,
         &v_aux,
         locator_key,
@@ -951,7 +997,7 @@ pub fn acu_encrypt_with_g1_and_context(
 
     let ct = AcuCiphertext {
         object_digest: *object_digest,
-        policy_epoch: 1,
+        policy_epoch,
         acu_seat_id: acu_pk.seat_id.clone(),
         c0_g1,
         c0,
@@ -2350,6 +2396,9 @@ pub fn insert_authorized_seat(
     let new_seat_id = new_seat_id.into();
     if !is_valid_seat_id(&new_seat_id) {
         return Err(AcuError::InvalidSeatId);
+    }
+    if new_seat_id == ct.acu_seat_id {
+        return Err(AcuError::UnauthorizedPolicyOperator);
     }
     if new_row_vec.len() != ct.matrix.cols {
         return Err(AcuError::DimensionMismatch {

@@ -757,6 +757,7 @@ pub struct CisoAcuFatClient {
     acu_ed25519_sk: SigningKey,
     revoked_seats: BTreeSet<String>,
     archive_seats: BTreeSet<String>,
+    object_epoch_floor: BTreeMap<[u8; 32], u64>,
     replay_fence: BTreeMap<String, ([u8; 32], AcuShareResponse)>,
     audit_log: Vec<AuditLogEntry>,
 }
@@ -773,9 +774,25 @@ impl CisoAcuFatClient {
             acu_ed25519_sk,
             revoked_seats: BTreeSet::new(),
             archive_seats,
+            object_epoch_floor: BTreeMap::new(),
             replay_fence: BTreeMap::new(),
             audit_log: Vec::new(),
         }
+    }
+
+    /// Monotonically ratchet the minimum accepted `policy_epoch` for `object_digest` (`ACU-V2-F02`),
+    /// blocking any stale pre-escalation or pre-lockout header rollback on `iroh`.
+    pub fn advance_epoch_floor(&mut self, object_digest: [u8; 32], min_epoch: u64) {
+        self.object_epoch_floor
+            .entry(object_digest)
+            .and_modify(|cur| *cur = (*cur).max(min_epoch))
+            .or_insert(min_epoch);
+    }
+
+    /// Inspect the recorded monotonic `policy_epoch` floor for `object_digest`, if any.
+    #[must_use]
+    pub fn epoch_floor_for(&self, object_digest: &[u8; 32]) -> Option<u64> {
+        self.object_epoch_floor.get(object_digest).copied()
     }
 
     /// Register an Archive Unit seat identifier that is restricted exclusively to
@@ -813,7 +830,7 @@ impl CisoAcuFatClient {
     /// live in $\mathbb{G}_1$ from verified coalition shares (`0` pairings, never recovering $K_{\mathbb{G}_T}$),
     /// enforces non-ACU span exclusion, inserts `(new_seat_id, new_row)`, and compacts `sbc_slots`.
     pub fn insert_authorized_seat(
-        &self,
+        &mut self,
         ct: &mut AcuCiphertext,
         new_seat_id: impl Into<String>,
         new_row: Vec<Scalar>,
@@ -821,7 +838,7 @@ impl CisoAcuFatClient {
         seat_keys: &BTreeMap<String, SeatPublicKey>,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<usize, AcuError> {
-        insert_authorized_seat(
+        let idx = insert_authorized_seat(
             ct,
             &self.acu_sk,
             new_seat_id,
@@ -829,24 +846,28 @@ impl CisoAcuFatClient {
             coalition,
             seat_keys,
             rng,
-        )
+        )?;
+        self.advance_epoch_floor(ct.object_digest, ct.policy_epoch);
+        Ok(idx)
     }
 
     /// Attach a `Shadow-KV` warm-fork `OR` sibling leaf verified jointly by `self.acu_sk` and a
     /// custodian-issued [`WarmForkRequest`] (preserving strict `ACU`-blindness).
     pub fn insert_sibling_key(
-        &self,
+        &mut self,
         ct: &mut AcuCiphertext,
         warm_fork: &WarmForkRequest,
         seat_keys: &BTreeMap<String, SeatPublicKey>,
     ) -> Result<usize, AcuError> {
-        insert_sibling_key(ct, &self.acu_sk, warm_fork, seat_keys)
+        let idx = insert_sibling_key(ct, &self.acu_sk, warm_fork, seat_keys)?;
+        self.advance_epoch_floor(ct.object_digest, ct.policy_epoch);
+        Ok(idx)
     }
 
     /// Homomorphically escalate a gate threshold by `delta_t` with subtree-consistent Vandermonde
     /// evaluation points $x_{g,c}$ AND simultaneous $\Delta v$ rerandomization (`0` $V_0$ unsealing).
     pub fn escalate_threshold(
-        &self,
+        &mut self,
         ct: &mut AcuCiphertext,
         affected_row_indices: &[usize],
         delta_t: usize,
@@ -860,30 +881,36 @@ impl CisoAcuFatClient {
             delta_t,
             seat_keys,
             rng,
-        )
+        )?;
+        self.advance_epoch_floor(ct.object_digest, ct.policy_epoch);
+        Ok(())
     }
 
     /// Homomorphically prune `revoked_seat_ids` and rerandomize `c0_g1`, `sbc_slots`, and all surviving
     /// rows at `policy_epoch + 1`, refusing `2-of-2` self-lockout (`AcuError::PolicyUnsatisfiableAfterRevocation`).
     pub fn revoke_and_rerandomize(
-        &self,
+        &mut self,
         ct: &mut AcuCiphertext,
         revoked_seat_ids: &[&str],
         seat_keys: &BTreeMap<String, SeatPublicKey>,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<(), AcuError> {
-        revoke_and_rerandomize(ct, &self.acu_sk, revoked_seat_ids, seat_keys, rng)
+        revoke_and_rerandomize(ct, &self.acu_sk, revoked_seat_ids, seat_keys, rng)?;
+        self.advance_epoch_floor(ct.object_digest, ct.policy_epoch);
+        Ok(())
     }
 
     /// Explicit CISO kill-switch lockout & rerandomization on a `2-of-2` split-key ciphertext.
     pub fn emergency_lock_and_rerandomize(
-        &self,
+        &mut self,
         ct: &mut AcuCiphertext,
         revoked_seat_ids: &[&str],
         seat_keys: &BTreeMap<String, SeatPublicKey>,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<(), AcuError> {
-        emergency_lock_and_rerandomize(ct, &self.acu_sk, revoked_seat_ids, seat_keys, rng)
+        emergency_lock_and_rerandomize(ct, &self.acu_sk, revoked_seat_ids, seat_keys, rng)?;
+        self.advance_epoch_floor(ct.object_digest, u64::MAX);
+        Ok(())
     }
 
     /// Process an inbound live [`AcuShareRequest`] over the `iroh` P2P bus (`chinwag-mesh`).
@@ -1066,6 +1093,20 @@ impl CisoAcuFatClient {
             }
         }
 
+        // 5b. Enforce per-object monotonic `policy_epoch` floor BEFORE `replay_fence` (`ACU-V2-F02`,
+        // `ePrint v2` §5.2 & Table 2: blocks stale Epoch-1 rollback after `escalate_threshold` or lockout!).
+        if let Some(&min_epoch) = self
+            .object_epoch_floor
+            .get(&req.acu_ciphertext.object_digest)
+            && req.policy_epoch < min_epoch
+        {
+            self.record_audit(req, AcuAuditDecision::Denied, "stale_policy_epoch_rollback");
+            return Err(AcuError::EpochMismatch {
+                expected: min_epoch,
+                actual: req.policy_epoch,
+            });
+        }
+
         // 6. Require requester_seat_id to be an explicit non-ACU member of the authenticated LSSS policy.
         let requester_in_policy = req
             .acu_ciphertext
@@ -1106,7 +1147,9 @@ impl CisoAcuFatClient {
             return Ok(cached_resp.clone());
         }
 
-        // 9. Emit `48`-byte pure-G1 partial decryption share + Mode-A Chaum-Pedersen DLEQ proof (`0` pairings!).
+        // 9. Ratchet per-object monotonic `policy_epoch` floor and emit `48`-byte pure-G1 partial
+        // decryption share + Mode-A Chaum-Pedersen DLEQ proof (`0` pairings!).
+        self.advance_epoch_floor(req.acu_ciphertext.object_digest, req.policy_epoch);
         let partial_share =
             acu_partial_decrypt_at_epoch(&req.acu_row, &self.acu_sk, req.policy_epoch);
         let audit_entry = self.record_audit(req, grant_decision, grant_reason);

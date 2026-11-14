@@ -816,7 +816,30 @@ impl AcuEnvelopeV2Record {
 
         self.current_policy_sig
             .verify(&self.payload.acu_ciphertext, registry)?;
+        if (self.payload.acu_ciphertext.policy_epoch >= 2 || !self.evolution_receipts.is_empty())
+            && self.current_policy_sig.signer_seat_id != self.payload.acu_ciphertext.acu_seat_id
+        {
+            return Err(AcuError::UnauthorizedPolicyOperator);
+        }
+
+        let mut prev_to_epoch = 1u64;
         for receipt in &self.evolution_receipts {
+            if receipt.seq != self.header.seq {
+                return Err(AcuError::InvalidMetadata);
+            }
+            if receipt.from_epoch == 0
+                || receipt.from_epoch >= receipt.to_epoch
+                || receipt.from_epoch < prev_to_epoch
+                || receipt.to_epoch > self.payload.acu_ciphertext.policy_epoch
+            {
+                return Err(AcuError::EpochMismatch {
+                    expected: prev_to_epoch,
+                    actual: receipt.from_epoch,
+                });
+            }
+            if receipt.policy_signature.signer_seat_id != self.payload.acu_ciphertext.acu_seat_id {
+                return Err(AcuError::UnauthorizedPolicyOperator);
+            }
             if !bool::from(
                 receipt
                     .aead_immutable_blake3
@@ -826,7 +849,18 @@ impl AcuEnvelopeV2Record {
                     "evolution_receipt_immutable_mismatch",
                 ));
             }
+            prev_to_epoch = receipt.to_epoch;
         }
+
+        let acu_rec = registry.get_any(&self.payload.acu_ciphertext.acu_seat_id)?;
+        self.payload
+            .acu_ciphertext
+            .verify_authenticity(&acu_rec.acu_public_key, |seat_id| {
+                registry
+                    .get_any(seat_id)
+                    .ok()
+                    .map(|rec| &rec.acu_public_key)
+            })?;
         Ok(())
     }
 

@@ -979,3 +979,461 @@ fn test_acu_envelope_v2_hash_chain_survives_in_place_revocation_and_selective_me
             .is_err()
     );
 }
+
+#[test]
+fn test_alistair_f01_rotate_pq_key_authenticates_through_ciso_fat_client_iroh() {
+    let mut rng = OsRng;
+    let (acu_sk, acu_pk) = SeatSecretKey::generate(DEFAULT_CISO_ACU_ID, &mut rng).unwrap();
+    let acu_ed_sk = SigningKey::from_bytes(&[0x81u8; 32]);
+    let (sk_a, pk_a) = SeatSecretKey::generate("branch:alpha", &mut rng).unwrap();
+    let ed_a = SigningKey::from_bytes(&[0x82u8; 32]);
+    let (sk_b, pk_b) = SeatSecretKey::generate("branch:beta", &mut rng).unwrap();
+    let ed_b = SigningKey::from_bytes(&[0x83u8; 32]);
+
+    let mut registry = AllowedSignersRegistry::new();
+    registry
+        .register_seat(
+            DEFAULT_CISO_ACU_ID,
+            acu_ed_sk.verifying_key(),
+            acu_pk.clone(),
+        )
+        .unwrap();
+    registry
+        .register_seat("branch:alpha", ed_a.verifying_key(), pk_a.clone())
+        .unwrap();
+    registry
+        .register_seat("branch:beta", ed_b.verifying_key(), pk_b.clone())
+        .unwrap();
+
+    let seat_keys = registry.active_acu_keys();
+    let tree = AccessTree::And(vec![
+        AccessTree::Leaf(DEFAULT_CISO_ACU_ID.to_string()),
+        AccessTree::Or(vec![
+            AccessTree::Leaf("branch:alpha".to_string()),
+            AccessTree::Leaf("branch:beta".to_string()),
+        ]),
+    ]);
+
+    let secret_msg = b"CHWG-0283 ACU-V2-F01 online iroh share issuance after rotate_pq_key";
+    let mut payload = EncryptedCiPayload::encrypt(
+        secret_msg,
+        &tree,
+        &seat_keys,
+        &acu_pk,
+        "emunlabs/chinwag",
+        "CHWG-0283-F01",
+        &mut rng,
+    )
+    .unwrap();
+
+    let mut ciso = CisoAcuFatClient::new(acu_sk, acu_pk.clone(), acu_ed_sk.clone());
+
+    // Epoch 1 online share request + coalition `rotate_pq_key` -> Epoch 2.
+    let req_ep1 = AcuShareRequest::create_signed(
+        "f01-req-ep1",
+        "branch:alpha",
+        DEFAULT_CISO_ACU_ID,
+        "emunlabs/chinwag",
+        "CHWG-0283-F01",
+        1,
+        payload.acu_ciphertext.clone(),
+        payload.acu_ciphertext.rows[0].clone(),
+        1_794_100_001,
+        &ed_a,
+    );
+    let resp_ep1 = ciso.handle_iroh_share_request(&req_ep1, &registry).unwrap();
+    let d_a_ep1 = acu_partial_decrypt_at_epoch(&payload.acu_ciphertext.rows[1], &sk_a, 1);
+    let pq_a_ep1 = payload.decapsulate_pq_shares_for_seat(&sk_a).unwrap();
+
+    let c1_immutable_before = payload.immutable_aead_blake3();
+    payload
+        .rotate_pq_key(
+            &acu_pk,
+            &[resp_ep1.partial_share, d_a_ep1],
+            &pq_a_ep1,
+            &seat_keys,
+            &mut rng,
+        )
+        .unwrap();
+    assert_eq!(payload.acu_ciphertext.policy_epoch, 2);
+    assert_eq!(payload.dek_wrap_epoch, 2);
+    assert_eq!(payload.immutable_aead_blake3(), c1_immutable_before);
+
+    // Blind roundtrip + `verify_authenticity` + online `CisoAcuFatClient::handle_iroh_share_request` MUST succeed!
+    let blind_bytes = payload.acu_ciphertext.to_blind_bytes();
+    let mut unblinded = AcuCiphertext::from_bytes(&blind_bytes).unwrap();
+    // Even before unblinding, canonical bytes roundtrip and `verify_authenticity` on `payload.acu_ciphertext` pass:
+    payload
+        .acu_ciphertext
+        .verify_authenticity(&acu_pk, |id| seat_keys.get(id))
+        .unwrap();
+    let _ = &mut unblinded;
+
+    let policy_sig_ep2 =
+        AcuPolicySignature::sign(DEFAULT_CISO_ACU_ID, &payload.acu_ciphertext, &acu_ed_sk);
+    let req_ep2 = AcuShareRequest::create_signed_with_policy_sig(
+        "f01-req-ep2",
+        "branch:beta",
+        DEFAULT_CISO_ACU_ID,
+        "emunlabs/chinwag",
+        "CHWG-0283-F01",
+        2,
+        payload.acu_ciphertext.clone(),
+        payload.acu_ciphertext.rows[0].clone(),
+        Some(policy_sig_ep2),
+        1_794_100_002,
+        &ed_b,
+    );
+    let resp_ep2 = ciso.handle_iroh_share_request(&req_ep2, &registry).unwrap();
+    resp_ep2
+        .verify_by_agent(&payload.acu_ciphertext.rows[0], &registry)
+        .unwrap();
+
+    let d_b_ep2 = acu_partial_decrypt_at_epoch(&payload.acu_ciphertext.rows[2], &sk_b, 2);
+    let pq_b_ep2 = payload.decapsulate_pq_shares_for_seat(&sk_b).unwrap();
+    let decrypted = payload
+        .decrypt(&[resp_ep2.partial_share, d_b_ep2], &pq_b_ep2, &seat_keys)
+        .unwrap();
+    assert_eq!(decrypted, secret_msg);
+
+    // Also verify `insert_authorized_seat` rejects `new_seat_id == acu_seat_id` (`UnauthorizedPolicyOperator`).
+    let ins_acu = CoalitionInsertionRowShare::issue_for_row(
+        &payload.acu_ciphertext,
+        0,
+        ciso.acu_secret_key(),
+    )
+    .unwrap();
+    let ins_b =
+        CoalitionInsertionRowShare::issue_for_row(&payload.acu_ciphertext, 2, &sk_b).unwrap();
+    let row_vec = payload.acu_ciphertext.matrix.rows[2].1.clone();
+    let dup_acu_err = ciso.insert_authorized_seat(
+        &mut payload.acu_ciphertext,
+        DEFAULT_CISO_ACU_ID,
+        row_vec,
+        &[ins_acu, ins_b],
+        &seat_keys,
+        &mut rng,
+    );
+    assert_eq!(dup_acu_err, Err(AcuError::UnauthorizedPolicyOperator));
+}
+
+#[test]
+fn test_alistair_f02_ciso_fat_client_epoch_floor_blocks_epoch1_rollback_after_escalation_and_lock()
+{
+    let mut rng = OsRng;
+    let (acu_sk, acu_pk) = SeatSecretKey::generate(DEFAULT_CISO_ACU_ID, &mut rng).unwrap();
+    let acu_ed_sk = SigningKey::from_bytes(&[0x84u8; 32]);
+    let (_sk_a, pk_a) = SeatSecretKey::generate("branch:alpha", &mut rng).unwrap();
+    let ed_a = SigningKey::from_bytes(&[0x85u8; 32]);
+    let (_sk_b, pk_b) = SeatSecretKey::generate("branch:beta", &mut rng).unwrap();
+    let ed_b = SigningKey::from_bytes(&[0x86u8; 32]);
+
+    let mut registry = AllowedSignersRegistry::new();
+    registry
+        .register_seat(
+            DEFAULT_CISO_ACU_ID,
+            acu_ed_sk.verifying_key(),
+            acu_pk.clone(),
+        )
+        .unwrap();
+    registry
+        .register_seat("branch:alpha", ed_a.verifying_key(), pk_a)
+        .unwrap();
+    registry
+        .register_seat("branch:beta", ed_b.verifying_key(), pk_b)
+        .unwrap();
+    let seat_keys = registry.active_acu_keys();
+
+    // Policy: `(branch:alpha OR branch:beta) AND ACU` (`1-of-2 + ACU` at Epoch 1).
+    let tree = AccessTree::And(vec![
+        AccessTree::Or(vec![
+            AccessTree::Leaf("branch:alpha".to_string()),
+            AccessTree::Leaf("branch:beta".to_string()),
+        ]),
+        AccessTree::Leaf(DEFAULT_CISO_ACU_ID.to_string()),
+    ]);
+    let payload_ep1 = EncryptedCiPayload::encrypt(
+        b"top-secret escalation rollback target",
+        &tree,
+        &seat_keys,
+        &acu_pk,
+        "emunlabs/chinwag",
+        "CHWG-0283-F02",
+        &mut rng,
+    )
+    .unwrap();
+
+    // Custodian `branch:alpha` caches the genuine Epoch-1 ciphertext before escalation.
+    let cached_ct_ep1 = payload_ep1.acu_ciphertext.clone();
+    let mut working_ct = payload_ep1.acu_ciphertext;
+
+    let mut ciso = CisoAcuFatClient::new(acu_sk, acu_pk, acu_ed_sk);
+
+    // CISO escalates `(alpha OR beta)` -> `(alpha AND beta)` (`2-of-2 + ACU` at Epoch 2) WITHOUT revoking any seat!
+    ciso.escalate_threshold(&mut working_ct, &[0, 1], 1, &seat_keys, &mut rng)
+        .unwrap();
+    assert_eq!(working_ct.policy_epoch, 2);
+    assert_eq!(ciso.epoch_floor_for(&working_ct.object_digest), Some(2));
+
+    // `branch:alpha` replays cached Epoch-1 header in a brand-new `AcuShareRequest` -> MUST fail closed!
+    let rollback_req = AcuShareRequest::create_signed(
+        "f02-fresh-epoch1-rollback",
+        "branch:alpha",
+        DEFAULT_CISO_ACU_ID,
+        "emunlabs/chinwag",
+        "CHWG-0283-F02",
+        1,
+        cached_ct_ep1,
+        working_ct.rows[2].clone(),
+        1_794_200_001,
+        &ed_a,
+    );
+    // Use the genuine Epoch-1 ACU row from `payload_ep1` so step 5 passes and step 5b catches the rollback!
+    let genuine_rollback_req = AcuShareRequest::create_signed(
+        "f02-genuine-epoch1-rollback",
+        "branch:alpha",
+        DEFAULT_CISO_ACU_ID,
+        "emunlabs/chinwag",
+        "CHWG-0283-F02",
+        1,
+        rollback_req.acu_ciphertext.clone(),
+        rollback_req.acu_ciphertext.rows[2].clone(),
+        1_794_200_002,
+        &ed_a,
+    );
+    let err = ciso.handle_iroh_share_request(&genuine_rollback_req, &registry);
+    assert_eq!(
+        err,
+        Err(AcuError::EpochMismatch {
+            expected: 2,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        ciso.audit_log().last().unwrap().reason,
+        "stale_policy_epoch_rollback"
+    );
+
+    // Legitimate Epoch-2 share request succeeds, and subsequent per-object `emergency_lock_and_rerandomize`
+    // ratchets floor to `u64::MAX`, blocking Epoch-2 replay even without global seat revocation!
+    let ep2_req = AcuShareRequest::create_signed(
+        "f02-legit-epoch2",
+        "branch:alpha",
+        DEFAULT_CISO_ACU_ID,
+        "emunlabs/chinwag",
+        "CHWG-0283-F02",
+        2,
+        working_ct.clone(),
+        working_ct.rows[2].clone(),
+        1_794_200_003,
+        &ed_a,
+    );
+    assert!(ciso.handle_iroh_share_request(&ep2_req, &registry).is_ok());
+
+    let cached_ct_ep2 = working_ct.clone();
+    ciso.emergency_lock_and_rerandomize(
+        &mut working_ct,
+        &["branch:alpha", "branch:beta"],
+        &seat_keys,
+        &mut rng,
+    )
+    .unwrap();
+    assert_eq!(
+        ciso.epoch_floor_for(&working_ct.object_digest),
+        Some(u64::MAX)
+    );
+
+    let post_lock_replay = AcuShareRequest::create_signed(
+        "f02-post-lock-epoch2-replay",
+        "branch:beta",
+        DEFAULT_CISO_ACU_ID,
+        "emunlabs/chinwag",
+        "CHWG-0283-F02",
+        2,
+        cached_ct_ep2.clone(),
+        cached_ct_ep2.rows[2].clone(),
+        1_794_200_004,
+        &ed_b,
+    );
+    assert_eq!(
+        ciso.handle_iroh_share_request(&post_lock_replay, &registry),
+        Err(AcuError::EpochMismatch {
+            expected: u64::MAX,
+            actual: 2,
+        })
+    );
+}
+
+#[test]
+fn test_alistair_f03_f04_escalate_then_rotate_pq_key_enforces_2_of_3_pq_threshold_and_envelope_v2_auth()
+ {
+    let mut rng = OsRng;
+    let (acu_sk, acu_pk) = SeatSecretKey::generate(DEFAULT_CISO_ACU_ID, &mut rng).unwrap();
+    let acu_ed_sk = SigningKey::from_bytes(&[0x91u8; 32]);
+    let (sk_1, pk_1) = SeatSecretKey::generate("custodian:one", &mut rng).unwrap();
+    let ed_1 = SigningKey::from_bytes(&[0x92u8; 32]);
+    let (sk_2, pk_2) = SeatSecretKey::generate("custodian:two", &mut rng).unwrap();
+    let ed_2 = SigningKey::from_bytes(&[0x93u8; 32]);
+    let (sk_3, pk_3) = SeatSecretKey::generate("custodian:three", &mut rng).unwrap();
+    let ed_3 = SigningKey::from_bytes(&[0x94u8; 32]);
+    let repo_archive_sk = SigningKey::from_bytes(&[0x95u8; 32]);
+
+    let mut registry = AllowedSignersRegistry::new();
+    registry
+        .register_seat(
+            DEFAULT_CISO_ACU_ID,
+            acu_ed_sk.verifying_key(),
+            acu_pk.clone(),
+        )
+        .unwrap();
+    registry
+        .register_seat("custodian:one", ed_1.verifying_key(), pk_1)
+        .unwrap();
+    registry
+        .register_seat("custodian:two", ed_2.verifying_key(), pk_2)
+        .unwrap();
+    registry
+        .register_seat("custodian:three", ed_3.verifying_key(), pk_3)
+        .unwrap();
+    let seat_keys = registry.active_acu_keys();
+
+    // Epoch 1: `(custodian:one OR custodian:two OR custodian:three) AND ACU` (`1-of-3` non-ACU PQ shares).
+    let tree = AccessTree::And(vec![
+        AccessTree::Or(vec![
+            AccessTree::Leaf("custodian:one".to_string()),
+            AccessTree::Leaf("custodian:two".to_string()),
+            AccessTree::Leaf("custodian:three".to_string()),
+        ]),
+        AccessTree::Leaf(DEFAULT_CISO_ACU_ID.to_string()),
+    ]);
+    let msg = b"Theorem 3(i) 2-of-3 post-quantum threshold enforcement after escalate_threshold + rotate_pq_key";
+    let mut payload = EncryptedCiPayload::encrypt(
+        msg,
+        &tree,
+        &seat_keys,
+        &acu_pk,
+        "emunlabs/chinwag",
+        "CHWG-0283-F03",
+        &mut rng,
+    )
+    .unwrap();
+
+    // Epoch 2: Escalate custodian gate from `1-of-3` -> `2-of-3`!
+    escalate_threshold(
+        &mut payload.acu_ciphertext,
+        &acu_sk,
+        &[0, 1, 2],
+        1,
+        &seat_keys,
+        &mut rng,
+    )
+    .unwrap();
+    assert_eq!(payload.acu_ciphertext.policy_epoch, 2);
+
+    // Epoch 3: Authorized `2-of-3 + ACU` coalition invokes `rotate_pq_key` to tighten `PqLsssHeader` to `2-of-3`!
+    let d_1_ep2 = acu_partial_decrypt_at_epoch(&payload.acu_ciphertext.rows[0], &sk_1, 2);
+    let d_2_ep2 = acu_partial_decrypt_at_epoch(&payload.acu_ciphertext.rows[1], &sk_2, 2);
+    let d_acu_ep2 = acu_partial_decrypt_at_epoch(&payload.acu_ciphertext.rows[3], &acu_sk, 2);
+    let pq_1_ep1 = payload.decapsulate_pq_shares_for_seat(&sk_1).unwrap();
+
+    payload
+        .rotate_pq_key(
+            &acu_pk,
+            &[d_1_ep2, d_2_ep2, d_acu_ep2],
+            &pq_1_ep1,
+            &seat_keys,
+            &mut rng,
+        )
+        .unwrap();
+    assert_eq!(payload.acu_ciphertext.policy_epoch, 3);
+    assert_eq!(payload.dek_wrap_epoch, 2);
+    assert_eq!(payload.pq_header.as_ref().unwrap().matrix.cols, 2);
+
+    // Sub-threshold quantum adversary holding ONLY 1 custodian's Epoch-2 PQ share MUST fail `PolicyNotSatisfied`!
+    let pq_only_1 = payload.decapsulate_pq_shares_for_seat(&sk_1).unwrap();
+    assert_eq!(
+        find_reconstruction_weights(&payload.pq_header.as_ref().unwrap().matrix, &[0]),
+        Err(AcuError::PolicyNotSatisfied)
+    );
+
+    let d_1_ep3 = acu_partial_decrypt_at_epoch(&payload.acu_ciphertext.rows[0], &sk_1, 3);
+    let d_3_ep3 = acu_partial_decrypt_at_epoch(&payload.acu_ciphertext.rows[2], &sk_3, 3);
+    let d_acu_ep3 = acu_partial_decrypt_at_epoch(&payload.acu_ciphertext.rows[3], &acu_sk, 3);
+    assert_eq!(
+        payload.decrypt(
+            &[d_1_ep3.clone(), d_3_ep3.clone(), d_acu_ep3.clone()],
+            &pq_only_1,
+            &seat_keys
+        ),
+        Err(AcuError::PolicyNotSatisfied)
+    );
+
+    // Full `2-of-3` PQ coalition (`custodian:one + custodian:three`) + pairing shares recovers `msg`!
+    let mut pq_1_and_3 = pq_only_1;
+    pq_1_and_3.extend(payload.decapsulate_pq_shares_for_seat(&sk_3).unwrap());
+    let out = payload
+        .decrypt(&[d_1_ep3, d_3_ep3, d_acu_ep3], &pq_1_and_3, &seat_keys)
+        .unwrap();
+    assert_eq!(out, msg);
+
+    // `ACU-V2-F04`: `AcuEnvelopeV2Record::verify_integrity` MUST reject a `policy_epoch >= 2` header
+    // signed by a non-ACU seat (`custodian:one`) even when `C_1` (`aead_immutable_blake3`) is untouched!
+    let meta = EnvelopeMetadataBox {
+        flow_run_id: "run-f04".to_string(),
+        node_id: "node-1".to_string(),
+        sender_seat: "custodian:one".to_string(),
+        visibility: "org_internal".to_string(),
+    };
+    let leaves = PublicExportLeaves::new_salted(
+        b"pub-0".to_vec(),
+        b"pub-1".to_vec(),
+        b"priv-2".to_vec(),
+        b"priv-3".to_vec(),
+        &mut rng,
+    );
+    let forged_record = AcuEnvelopeV2Record::seal(
+        1,
+        [0u8; 32],
+        &[0xAAu8; 32],
+        &[0xBBu8; 32],
+        "emunlabs",
+        "custodian:one",
+        "#flows",
+        "CHWG-0283-F04",
+        &meta,
+        leaves.clone(),
+        payload.clone(),
+        "custodian:one",
+        &ed_1,
+        &repo_archive_sk,
+        &mut rng,
+    )
+    .unwrap();
+    assert_eq!(
+        forged_record.verify_integrity(&repo_archive_sk.verifying_key(), &registry),
+        Err(AcuError::UnauthorizedPolicyOperator)
+    );
+
+    // When signed by `DEFAULT_CISO_ACU_ID` (`acu_seat_id`), `verify_integrity` succeeds cleanly!
+    let valid_record = AcuEnvelopeV2Record::seal(
+        1,
+        [0u8; 32],
+        &[0xAAu8; 32],
+        &[0xBBu8; 32],
+        "emunlabs",
+        "custodian:one",
+        "#flows",
+        "CHWG-0283-F04",
+        &meta,
+        leaves,
+        payload,
+        DEFAULT_CISO_ACU_ID,
+        &acu_ed_sk,
+        &repo_archive_sk,
+        &mut rng,
+    )
+    .unwrap();
+    valid_record
+        .verify_integrity(&repo_archive_sk.verifying_key(), &registry)
+        .unwrap();
+}

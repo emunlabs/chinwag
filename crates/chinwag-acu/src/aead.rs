@@ -20,7 +20,7 @@
 use crate::AcuError;
 use crate::acu::{
     AcuCiphertext, acu_combine, acu_combine_unverified, acu_encrypt_with_g1_and_context,
-    compute_blind_row_locator,
+    acu_encrypt_with_g1_at_epoch, compute_blind_row_locator,
 };
 use crate::framing::{
     gt_canonical_bytes, lp64, lp64_str, read_lp64, read_lp64_str, read_scalar, read_u8,
@@ -1090,13 +1090,15 @@ impl EncryptedCiPayload {
         rng.fill_bytes(&mut loc_key[..]);
 
         // Re-seal fresh classical pairing header over the current `self.acu_ciphertext.matrix`
-        // preserving `self.acu_ciphertext.object_digest` and advancing `policy_epoch`.
+        // directly at `next_policy_epoch` so `row.init_epoch` and `slot.created_epoch` match
+        // `policy_epoch` (`ACU-V2-F01`).
         let mut k_scalar = sample_nonzero_scalar(rng);
         let mut payload_g1 = G1Projective::generator() * k_scalar;
         k_scalar.zeroize();
-        let (mut fresh_acu_ct, mut new_gt) = acu_encrypt_with_g1_and_context(
+        let (fresh_acu_ct, mut new_gt) = acu_encrypt_with_g1_at_epoch(
             &payload_g1,
             &self.acu_ciphertext.object_digest,
+            next_policy_epoch,
             &loc_key,
             &self.acu_ciphertext.matrix,
             seat_keys,
@@ -1104,35 +1106,29 @@ impl EncryptedCiPayload {
             rng,
         )?;
         payload_g1.zeroize();
-        fresh_acu_ct.policy_epoch = next_policy_epoch;
 
-        // Synchronize PQ matrix with currently active non-ACU seats and seal fresh 0x647a capsules!
-        let active_seats: BTreeSet<&str> = fresh_acu_ct
-            .rows
-            .iter()
-            .map(|r| r.seat_id.as_str())
-            .collect();
+        // Project the current classical LSSS matrix modulo span(M_ACU) so all prior revocations,
+        // threshold escalations, warm-forks, and seat insertions propagate to PqLsssHeader (`ACU-V2-F03`)!
         let (fresh_pq_hdr, mut new_pq) = match &self.pq_header {
             None => (None, Scalar::ZERO),
-            Some(existing_pq) => {
-                let keep_mask: Vec<bool> = existing_pq
-                    .rows
-                    .iter()
-                    .map(|r| active_seats.contains(r.seat_id.as_str()))
-                    .collect();
-                let mut next_pq_matrix = existing_pq.matrix.clone();
-                next_pq_matrix.retain_rows(&keep_mask)?;
-                let (hdr, secret_pq) = build_pq_lsss_header(
-                    &fresh_acu_ct.object_digest,
-                    next_wrap_epoch,
-                    &loc_key,
-                    &next_pq_matrix,
-                    &acu_pk.seat_id,
-                    seat_keys,
-                    rng,
-                )?;
-                (Some(hdr), secret_pq)
-            }
+            Some(_) => match fresh_acu_ct
+                .matrix
+                .project_non_acu_matrix(&acu_pk.seat_id)?
+            {
+                None => (None, Scalar::ZERO),
+                Some(next_pq_matrix) => {
+                    let (hdr, secret_pq) = build_pq_lsss_header(
+                        &fresh_acu_ct.object_digest,
+                        next_wrap_epoch,
+                        &loc_key,
+                        &next_pq_matrix,
+                        &acu_pk.seat_id,
+                        seat_keys,
+                        rng,
+                    )?;
+                    (Some(hdr), secret_pq)
+                }
+            },
         };
 
         let new_kek = derive_hybrid_kek(

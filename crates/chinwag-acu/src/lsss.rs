@@ -402,6 +402,115 @@ impl LsssMatrix {
         Ok(new_row_idx)
     }
 
+    /// Project any post-evolution classical [`LsssMatrix`] $(M_E, \rho_E)$ modulo the row span
+    /// $W = \mathrm{span}(\{M_{E,j} : \rho_E(j) = \text{acu\_seat\_id}\}) \subset \mathbb{F}_r^k$
+    /// to obtain the exact non-ACU post-quantum LSSS matrix $(M^{\mathsf{pq}}_{E}, \rho^{\mathsf{pq}}_{E})$
+    /// (`ePrint v2` §6.3 Op 4 & Theorem 3(i), `ACU-V2-F03`).
+    ///
+    /// A non-ACU custodian subset $S$ spans $(1, 0, \dots, 0)$ in the returned $(k - \dim W)$-column
+    /// matrix **if and only if** $e_0 \in \mathrm{span}(M_S \cup M_{\mathrm{ACU}})$, preserving every
+    /// prior revocation, threshold escalation, warm-fork, and authorized seat insertion identically
+    /// while assigning **zero** rows to `acu_seat_id`.
+    pub fn project_non_acu_matrix(&self, acu_seat_id: &str) -> Result<Option<Self>, AcuError> {
+        self.validate()?;
+        if !is_valid_seat_id(acu_seat_id) {
+            return Err(AcuError::InvalidSeatId);
+        }
+
+        let k = self.cols;
+        let mut acu_rows: Vec<Vec<Scalar>> = Vec::new();
+        let mut non_acu_rows: Vec<(String, Vec<Scalar>)> = Vec::new();
+        for (seat, vec) in &self.rows {
+            if seat == acu_seat_id {
+                acu_rows.push(vec.clone());
+            } else {
+                non_acu_rows.push((seat.clone(), vec.clone()));
+            }
+        }
+
+        if non_acu_rows.is_empty() || rows_span_target(k, &acu_rows) {
+            return Ok(None);
+        }
+        if acu_rows.is_empty() {
+            return Ok(Some(self.clone()));
+        }
+
+        // 1. Row-reduce M_ACU over F_r to a linearly independent basis w_1, ..., w_d of W.
+        let w_basis = row_echelon_basis(k, &acu_rows);
+        let d = w_basis.len();
+        if d == 0 {
+            let projected = Self {
+                cols: k,
+                rows: non_acu_rows,
+                gates: Vec::new(),
+            };
+            projected.validate()?;
+            return Ok(Some(projected));
+        }
+
+        // 2. Find the k - (d + 1) non-pivot columns of span(e_0, w_1, ..., w_d) so appending those
+        // standard unit vectors completes (e_0, w_1, ..., w_d) to an invertible k x k basis B.
+        let mut e0 = vec![Scalar::ZERO; k];
+        e0[0] = Scalar::ONE;
+        let mut u_rows = Vec::with_capacity(1 + d);
+        u_rows.push(e0.clone());
+        u_rows.extend(w_basis.iter().cloned());
+        let pivot_cols = rref_pivot_columns(k, &u_rows);
+        if pivot_cols.len() != 1 + d {
+            return Err(AcuError::PolicyNotSatisfied);
+        }
+
+        let mut b_rows: Vec<Vec<Scalar>> = Vec::with_capacity(k);
+        b_rows.push(e0);
+        b_rows.extend(w_basis);
+        for c in 0..k {
+            if !pivot_cols.contains(&c) {
+                let mut ec = vec![Scalar::ZERO; k];
+                ec[c] = Scalar::ONE;
+                b_rows.push(ec);
+            }
+        }
+        if b_rows.len() != k {
+            return Err(AcuError::PolicyNotSatisfied);
+        }
+
+        // 3. Invert B over F_r via [B | I_k] Gauss-Jordan elimination (k <= 128).
+        let b_inv = invert_square_matrix(k, &b_rows)?;
+
+        // 4. Map each non-ACU row m_j -> m_j * B^{-1} and drop W-coordinates 1..=d.
+        let proj_cols = k - d;
+        let mut projected_rows: Vec<(String, Vec<Scalar>)> = Vec::with_capacity(non_acu_rows.len());
+        for (seat, m_row) in non_acu_rows {
+            let mut tilde = vec![Scalar::ZERO; k];
+            for (r, &m_val) in m_row.iter().enumerate() {
+                if bool::from(m_val.is_zero()) {
+                    continue;
+                }
+                for (c, &inv_val) in b_inv[r].iter().enumerate() {
+                    tilde[c] += m_val * inv_val;
+                }
+            }
+            let mut proj_vec = Vec::with_capacity(proj_cols);
+            proj_vec.push(tilde[0]);
+            proj_vec.extend_from_slice(&tilde[(1 + d)..k]);
+            if proj_vec.iter().any(|s| !bool::from(s.is_zero())) {
+                projected_rows.push((seat, proj_vec));
+            }
+        }
+
+        if projected_rows.is_empty() {
+            return Err(AcuError::PolicyNotSatisfied);
+        }
+
+        let projected = Self {
+            cols: proj_cols,
+            rows: projected_rows,
+            gates: Vec::new(),
+        };
+        projected.validate()?;
+        Ok(Some(projected))
+    }
+
     /// Append a coalition-authorized row `(new_seat_id, new_row_vec)` (`ePrint v2` §6.3 Op 3),
     /// updating [`GateDescriptor`] metadata automatically when `new_row_vec` duplicates an existing
     /// sibling row or extends a root `1-of-n` gate.
@@ -970,4 +1079,114 @@ pub fn find_reconstruction_weights(
         .collect();
 
     Ok(weights)
+}
+
+fn row_echelon_basis(cols: usize, rows: &[Vec<Scalar>]) -> Vec<Vec<Scalar>> {
+    let mut work: Vec<Vec<Scalar>> = rows.to_vec();
+    let mut pivot_row = 0usize;
+    for col in 0..cols {
+        if pivot_row >= work.len() {
+            break;
+        }
+        let Some(found) = (pivot_row..work.len()).find(|&r| !bool::from(work[r][col].is_zero()))
+        else {
+            continue;
+        };
+        work.swap(pivot_row, found);
+        let inv: Option<Scalar> = work[pivot_row][col].invert().into();
+        let Some(inv) = inv else {
+            continue;
+        };
+        for entry in &mut work[pivot_row][col..cols] {
+            *entry *= inv;
+        }
+        let pivot_copy = work[pivot_row].clone();
+        for (r_idx, row_vals) in work.iter_mut().enumerate() {
+            if r_idx == pivot_row {
+                continue;
+            }
+            let factor = row_vals[col];
+            if !bool::from(factor.is_zero()) {
+                for (c, &p_val) in pivot_copy.iter().enumerate().skip(col) {
+                    row_vals[c] -= factor * p_val;
+                }
+            }
+        }
+        pivot_row += 1;
+    }
+    work.truncate(pivot_row);
+    work
+}
+
+fn rref_pivot_columns(cols: usize, rows: &[Vec<Scalar>]) -> BTreeSet<usize> {
+    let mut work: Vec<Vec<Scalar>> = rows.to_vec();
+    let mut pivots = BTreeSet::new();
+    let mut pivot_row = 0usize;
+    for col in 0..cols {
+        if pivot_row >= work.len() {
+            break;
+        }
+        let Some(found) = (pivot_row..work.len()).find(|&r| !bool::from(work[r][col].is_zero()))
+        else {
+            continue;
+        };
+        work.swap(pivot_row, found);
+        let inv: Option<Scalar> = work[pivot_row][col].invert().into();
+        let Some(inv) = inv else {
+            continue;
+        };
+        for entry in &mut work[pivot_row][col..cols] {
+            *entry *= inv;
+        }
+        let pivot_copy = work[pivot_row].clone();
+        for (r_idx, row_vals) in work.iter_mut().enumerate() {
+            if r_idx == pivot_row {
+                continue;
+            }
+            let factor = row_vals[col];
+            if !bool::from(factor.is_zero()) {
+                for (c, &p_val) in pivot_copy.iter().enumerate().skip(col) {
+                    row_vals[c] -= factor * p_val;
+                }
+            }
+        }
+        pivots.insert(col);
+        pivot_row += 1;
+    }
+    pivots
+}
+
+fn invert_square_matrix(k: usize, rows: &[Vec<Scalar>]) -> Result<Vec<Vec<Scalar>>, AcuError> {
+    let mut aug = vec![vec![Scalar::ZERO; 2 * k]; k];
+    for (r, row) in rows.iter().enumerate() {
+        aug[r][..k].copy_from_slice(&row[..k]);
+        aug[r][k + r] = Scalar::ONE;
+    }
+    for col in 0..k {
+        let found = (col..k)
+            .find(|&r| !bool::from(aug[r][col].is_zero()))
+            .ok_or(AcuError::PolicyNotSatisfied)?;
+        aug.swap(col, found);
+        let inv_opt: Option<Scalar> = aug[col][col].invert().into();
+        let inv = inv_opt.ok_or(AcuError::PolicyNotSatisfied)?;
+        for entry in &mut aug[col][col..(2 * k)] {
+            *entry *= inv;
+        }
+        let pivot_copy = aug[col].clone();
+        for (other, row_vals) in aug.iter_mut().enumerate() {
+            if other == col {
+                continue;
+            }
+            let factor = row_vals[col];
+            if !bool::from(factor.is_zero()) {
+                for (c, &p_val) in pivot_copy.iter().enumerate().skip(col) {
+                    row_vals[c] -= factor * p_val;
+                }
+            }
+        }
+    }
+    Ok(aug
+        .into_iter()
+        .map(|row| row[k..(2 * k)].to_vec())
+        .collect())
 }
