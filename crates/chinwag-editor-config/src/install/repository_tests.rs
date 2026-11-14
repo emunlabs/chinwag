@@ -29,10 +29,10 @@ fn ready(
     match target
         .prepare_owned(
             observation,
-            Launch {
+            ServerProfile::Local(Launch {
                 command: launcher.command(),
                 args: &args,
-            },
+            }),
             Some(guard),
         )
         .unwrap()
@@ -66,10 +66,10 @@ fn normal_observation_stale_preimage_keeps_outer_owner() {
     std::fs::write(&path, b"{\"changed\":true}").unwrap();
     let Err(error) = target.prepare_owned(
         observed,
-        Launch {
+        ServerProfile::Local(Launch {
             command: launcher.command(),
             args: &[],
-        },
+        }),
         Some(&guard),
     ) else {
         panic!("stale observation accepted")
@@ -211,10 +211,10 @@ fn normal_fixture_api_cannot_substitute_for_live_repository_guard() {
     let observed = target.inspect().unwrap();
     let Err(error) = target.prepare_owned(
         observed,
-        Launch {
+        ServerProfile::Local(Launch {
             command: launcher.command(),
             args: &[],
-        },
+        }),
         None,
     ) else {
         panic!("normal target lost its guard requirement")
@@ -305,4 +305,33 @@ fn normal_gemini_parent_creation_and_unchanged_call_keep_original_inode() {
     assert_eq!(std::fs::read(&settings).unwrap(), bytes);
     assert!(!path.join(".chinwag/editor-gemini.pending").exists());
     assert!(!path.join(".chinwag/state.crdb.lock").exists());
+}
+
+#[test]
+fn normal_all_six_editors_local_and_remote_configure_and_replay_unchanged() {
+    let local_repo = repo("unit-six-local");
+    for editor in Editor::ALL {
+        let first = configure(RepositoryRequest::new(&local_repo, editor).unwrap()).unwrap();
+        assert_eq!(first.value()["result"], "installed");
+        assert_eq!(first.value()["target"], editor.relative_path());
+        let second = configure(RepositoryRequest::new(&local_repo, editor).unwrap()).unwrap();
+        assert_eq!(second.value()["result"], "unchanged");
+    }
+
+    let remote_repo = repo("unit-six-remote");
+    for editor in Editor::ALL {
+        let first = configure_remote(
+            RepositoryRequest::new(&remote_repo, editor).unwrap(),
+            "https://mcp.chinwag.sh/mcp",
+        )
+        .unwrap();
+        assert_eq!(first.value()["result"], "installed");
+        assert_eq!(first.value()["target"], editor.relative_path());
+        let second = configure_remote(
+            RepositoryRequest::new(&remote_repo, editor).unwrap(),
+            "https://mcp.chinwag.sh/mcp",
+        )
+        .unwrap();
+        assert_eq!(second.value()["result"], "unchanged");
+    }
 }

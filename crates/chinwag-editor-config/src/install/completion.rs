@@ -1,5 +1,9 @@
 //! Only an original successful commit can own a completion writer.
-use super::{COMPLETED, Evidence, INTENT, LOCK, Prepared, digest, fs::FileId, hex};
+use super::{
+    COMPLETED, Evidence, INTENT, LOCK, Prepared, digest,
+    fs::{DevId, FileId},
+    hex,
+};
 use rustix::fs::fsync;
 mod original_record;
 pub(super) use original_record::OriginalRecord;
@@ -27,7 +31,7 @@ pub enum RecordOutcome {
     Recorded {
         evidence: Evidence,
         record_sha256: [u8; 32],
-        record_dev: i32,
+        record_dev: DevId,
         record_ino: u64,
     },
     BeforeRecordRefused {
@@ -90,6 +94,7 @@ impl Completed {
     }
     // Only this original successful writer can produce the live record owner.
     // Existing public metadata behavior deliberately retains all original guards.
+    #[cfg(target_os = "macos")]
     pub(super) fn record_original(
         self: Box<Self>,
         guard: &super::repository::OuterGuard,

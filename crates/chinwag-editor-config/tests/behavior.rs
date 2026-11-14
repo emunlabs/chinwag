@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
-use chinwag_editor_config_private::{Editor, Launch, MAX_BYTES, Plan, Refusal, plan};
+use chinwag_editor_config_private::{
+    Editor, Launch, MAX_BYTES, Plan, Refusal, Remote, ServerProfile, plan, plan_profile,
+    plan_remote,
+};
 
 const COMMAND: &str = "/private fixture/bin/chinwag";
 fn proposed(editor: Editor, input: Option<&[u8]>, args: &[String]) -> Vec<u8> {
@@ -290,5 +293,199 @@ fn gemini_conflicting_and_malformed_settings_are_refused() {
         let before = original.to_vec();
         assert!(plan(Editor::Gemini, Some(original), Launch { command: COMMAND, args: &[] }).is_err());
         assert_eq!(original, before);
+    }
+}
+
+#[test]
+fn six_editors_local_and_remote_profiles_round_trip_and_replay_unchanged() {
+    let local_args = vec![
+        "mcp-serve".to_owned(),
+        "--repo".to_owned(),
+        "/owned/repo".to_owned(),
+    ];
+    let remote = Remote {
+        url: "https://mcp.chinwag.sh/mcp",
+    };
+
+    for editor in Editor::ALL {
+        // Local profile
+        let bytes = proposed(editor, None, &local_args);
+        match editor {
+            Editor::ClaudeCode | Editor::Cursor | Editor::Gemini => {
+                let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    doc["mcpServers"]["chinwag"],
+                    serde_json::json!({"type":"stdio","command":COMMAND,"args":local_args})
+                );
+            }
+            Editor::VsCode => {
+                assert_eq!(editor.relative_path(), ".vscode/mcp.json");
+                let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(doc.get("mcpServers").is_none());
+                assert_eq!(
+                    doc["servers"]["chinwag"],
+                    serde_json::json!({"type":"stdio","command":COMMAND,"args":local_args})
+                );
+            }
+            Editor::Codex | Editor::Grok => {
+                let text = String::from_utf8(bytes).unwrap();
+                let doc: toml_edit::DocumentMut = text.parse().unwrap();
+                assert_eq!(
+                    doc["mcp_servers"]["chinwag"]["command"].as_str(),
+                    Some(COMMAND)
+                );
+            }
+        }
+
+        // Remote profile
+        let Plan::Proposed {
+            relative_path,
+            bytes: remote_bytes,
+        } = plan_remote(editor, None, remote).unwrap()
+        else {
+            panic!("expected remote proposal for {editor:?}");
+        };
+        assert_eq!(relative_path, editor.relative_path());
+        assert_eq!(
+            plan_remote(editor, Some(&remote_bytes), remote),
+            Ok(Plan::Unchanged)
+        );
+        match editor {
+            Editor::ClaudeCode | Editor::Cursor => {
+                let doc: serde_json::Value = serde_json::from_slice(&remote_bytes).unwrap();
+                assert_eq!(
+                    doc["mcpServers"]["chinwag"],
+                    serde_json::json!({"type":"http","url":"https://mcp.chinwag.sh/mcp"})
+                );
+            }
+            Editor::Gemini => {
+                let doc: serde_json::Value = serde_json::from_slice(&remote_bytes).unwrap();
+                assert_eq!(
+                    doc["mcpServers"]["chinwag"],
+                    serde_json::json!({"httpUrl":"https://mcp.chinwag.sh/mcp"})
+                );
+            }
+            Editor::VsCode => {
+                let doc: serde_json::Value = serde_json::from_slice(&remote_bytes).unwrap();
+                assert_eq!(
+                    doc["servers"]["chinwag"],
+                    serde_json::json!({"type":"http","url":"https://mcp.chinwag.sh/mcp"})
+                );
+            }
+            Editor::Codex | Editor::Grok => {
+                let doc: toml_edit::DocumentMut =
+                    String::from_utf8(remote_bytes).unwrap().parse().unwrap();
+                assert_eq!(
+                    doc["mcp_servers"]["chinwag"]["url"].as_str(),
+                    Some("https://mcp.chinwag.sh/mcp")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vscode_and_grok_preserve_unrelated_servers_and_refuse_shell_wrappers_or_env_vars() {
+    let vscode_existing =
+        br#"{"servers":{"github":{"type":"http","url":"https://api.githubcopilot.com/mcp"}},"inputs":[]}"#;
+    let Plan::Proposed { bytes: vs_out, .. } = plan_remote(
+        Editor::VsCode,
+        Some(vscode_existing),
+        Remote {
+            url: "https://mcp.chinwag.sh/mcp",
+        },
+    )
+    .unwrap() else {
+        panic!("expected vscode proposal");
+    };
+    let vs_doc: serde_json::Value = serde_json::from_slice(&vs_out).unwrap();
+    assert_eq!(
+        vs_doc["servers"]["github"]["url"],
+        "https://api.githubcopilot.com/mcp"
+    );
+    assert_eq!(
+        vs_doc["servers"]["chinwag"]["url"],
+        "https://mcp.chinwag.sh/mcp"
+    );
+
+    let grok_existing = b"# user comment\n[mcp_servers.other]\nurl = 'https://example.com/mcp'\n";
+    let Plan::Proposed {
+        bytes: grok_out, ..
+    } = plan_remote(
+        Editor::Grok,
+        Some(grok_existing),
+        Remote {
+            url: "https://mcp.chinwag.sh/mcp",
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected grok proposal");
+    };
+    assert!(grok_out.starts_with(grok_existing));
+
+    // Shell wrappers and $-interpolation / %-interpolation MUST fail closed
+    for bad_cmd in [
+        "/bin/sh",
+        "/bin/bash",
+        "/bin/zsh",
+        "/usr/bin/env",
+        "/usr/local/bin/pwsh",
+        "/owned/../bin/chinwag",
+        "/owned/$HOME/chinwag",
+    ] {
+        assert_eq!(
+            plan(
+                Editor::VsCode,
+                None,
+                Launch {
+                    command: bad_cmd,
+                    args: &[]
+                }
+            ),
+            Err(Refusal::InvalidLaunch),
+            "accepted forbidden command {bad_cmd}"
+        );
+    }
+    for bad_args in [
+        vec!["-c".to_owned(), "chinwag mcp-serve".to_owned()],
+        vec!["-lc".to_owned(), "chinwag".to_owned()],
+        vec!["$REPO_ROOT".to_owned()],
+        vec!["$(pwd)".to_owned()],
+        vec!["%USERPROFILE%\\repo".to_owned()],
+        vec!["${env:API_KEY}".to_owned()],
+        vec!["${workspaceFolder}".to_owned()],
+    ] {
+        assert_eq!(
+            plan(
+                Editor::Grok,
+                None,
+                Launch {
+                    command: COMMAND,
+                    args: &bad_args
+                }
+            ),
+            Err(Refusal::InvalidLaunch),
+            "accepted forbidden args {bad_args:?}"
+        );
+    }
+    for bad_url in [
+        "http://mcp.chinwag.sh/mcp",
+        "https://user:secret@mcp.chinwag.sh/mcp",
+        "https://mcp.chinwag.sh/mcp?token=secret",
+        "https://mcp.chinwag.sh/mcp#frag",
+        "https://mcp.chinwag.sh/${ORG}/mcp",
+        "https://mcp.chinwag.sh/$ORG/mcp",
+        "https://localhost/mcp",
+    ] {
+        assert_eq!(
+            plan_profile(
+                Editor::VsCode,
+                None,
+                ServerProfile::Remote(Remote { url: bad_url })
+            ),
+            Err(Refusal::InvalidLaunch),
+            "accepted forbidden url {bad_url}"
+        );
     }
 }

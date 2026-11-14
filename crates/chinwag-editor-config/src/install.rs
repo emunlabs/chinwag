@@ -5,11 +5,23 @@ mod checked_close;
 pub mod completion;
 mod fs;
 pub mod observer;
+#[cfg(target_os = "macos")]
 mod repository;
-use crate::{Editor, Launch, Plan, plan};
-use fs::{Anchor, DirId, FileId, Image};
+#[cfg(not(target_os = "macos"))]
+mod repository {
+    pub(super) enum OuterGuard {}
+    impl OuterGuard {
+        pub(super) fn verify_target(&self, _: &super::Target) -> super::fs::Result<()> {
+            match *self {}
+        }
+    }
+}
+use crate::{Editor, Launch, Plan, Remote, ServerProfile, plan_profile};
+use fs::{Anchor, DevId, DirId, FileId, Image};
+#[cfg(target_os = "macos")]
 pub use repository::{
     ConfigureFailure, ConfigureReceipt, RepositoryRequest, configure, configure_initialized,
+    configure_remote,
 };
 use rustix::fs::{Mode, fchmod, fsync, renameat};
 use sha2::{Digest, Sha256};
@@ -81,11 +93,11 @@ pub struct Prepared {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Evidence {
     pub target_basename: &'static str,
-    pub parent_dev: i32,
+    pub parent_dev: DevId,
     pub parent_ino: u64,
     pub original_sha256: Option<[u8; 32]>,
     pub staged_sha256: [u8; 32],
-    pub staged_dev: i32,
+    pub staged_dev: DevId,
     pub staged_ino: u64,
 }
 #[derive(Debug)]
@@ -112,6 +124,8 @@ impl FixtureTarget {
             Editor::Cursor => (Some(".cursor"), "mcp.json"),
             Editor::Codex => (Some(".codex"), "config.toml"),
             Editor::Gemini => (Some(".gemini"), "settings.json"),
+            Editor::Grok => (Some(".grok"), "config.toml"),
+            Editor::VsCode => (Some(".vscode"), "mcp.json"),
         };
         Ok(Self {
             inner: Target {
@@ -129,7 +143,21 @@ impl FixtureTarget {
         observation: Observation,
         launch: Launch<'_>,
     ) -> Result<Preparation, Refused> {
-        match self.inner.prepare_owned(observation, launch, None)? {
+        self.prepare_profile(observation, ServerProfile::Local(launch))
+    }
+    pub fn prepare_remote(
+        self,
+        observation: Observation,
+        remote: Remote<'_>,
+    ) -> Result<Preparation, Refused> {
+        self.prepare_profile(observation, ServerProfile::Remote(remote))
+    }
+    pub fn prepare_profile(
+        self,
+        observation: Observation,
+        profile: ServerProfile<'_>,
+    ) -> Result<Preparation, Refused> {
+        match self.inner.prepare_owned(observation, profile, None)? {
             OwnedPreparation::Unchanged { sha256, target, .. } => {
                 // Existing fixture API retains its old observational result.
                 drop(target);
@@ -163,7 +191,7 @@ impl Target {
     fn prepare_owned(
         self,
         observation: Observation,
-        launch: Launch<'_>,
+        profile: ServerProfile<'_>,
         guard: Option<&repository::OuterGuard>,
     ) -> Result<OwnedPreparation, Refused> {
         self.check_guard(guard).map_err(refused)?;
@@ -178,10 +206,10 @@ impl Target {
         if self.anchor.read(self.name).map_err(refused)? != observation.original {
             return Err(refused("stale_preimage"));
         }
-        let proposed = plan(
+        let proposed = plan_profile(
             self.editor,
             observation.original.as_ref().map(|x| x.bytes.as_slice()),
-            launch,
+            profile,
         )
         .map_err(|_| refused("planner_refused"))?;
         let Plan::Proposed {
@@ -259,6 +287,7 @@ impl Prepared {
     fn commit_inner(self, fault: Fault) -> CommitOutcome {
         self.commit_with_guard(fault, None)
     }
+    #[cfg(target_os = "macos")]
     fn commit_repository(self: Box<Self>, guard: &repository::OuterGuard) -> CommitOutcome {
         (*self).commit_with_guard(Fault::None, Some(guard))
     }

@@ -1,6 +1,6 @@
 //! Add one object member without reserializing unrelated input bytes or numbers.
 #![forbid(unsafe_code)]
-use crate::{Launch, MAX_BYTES, Refusal};
+use crate::{Editor, MAX_BYTES, Refusal, ServerProfile};
 use serde::{
     Deserialize, Deserializer,
     de::{MapAccess, Visitor},
@@ -57,12 +57,31 @@ fn unique(raw: &RawValue, depth: usize, nodes: &mut usize) -> Result<(), Refusal
     Ok(())
 }
 
-pub fn proposal(source: &str, launch: &Launch<'_>) -> Result<Option<String>, Refusal> {
+fn desired_json_entry(editor: Editor, profile: ServerProfile<'_>) -> Value {
+    match profile {
+        ServerProfile::Local(launch) => {
+            json!({"type":"stdio", "command":launch.command, "args":launch.args})
+        }
+        ServerProfile::Remote(remote) => match editor {
+            Editor::Gemini => json!({"httpUrl": remote.url}),
+            _ => json!({"type":"http", "url": remote.url}),
+        },
+    }
+}
+
+pub fn proposal(
+    editor: Editor,
+    source: &str,
+    profile: ServerProfile<'_>,
+) -> Result<Option<String>, Refusal> {
+    let container_key = editor
+        .json_container_key()
+        .ok_or(Refusal::UnsupportedLayout)?;
     let raw: &RawValue = serde_json::from_str(source).map_err(|_| Refusal::InvalidDocument)?;
     unique(raw, 0, &mut 0)?;
     let root = object(source)?;
-    let desired = json!({"type":"stdio", "command":launch.command, "args":launch.args});
-    let (container, empty, field) = match root.0.get("mcpServers") {
+    let desired = desired_json_entry(editor, profile);
+    let (container, empty, field) = match root.0.get(container_key) {
         Some(raw) => {
             let servers = object(raw.get()).map_err(|_| Refusal::UnsupportedLayout)?;
             if let Some(existing) = servers.0.get("chinwag") {
@@ -79,7 +98,7 @@ pub fn proposal(source: &str, launch: &Launch<'_>) -> Result<Option<String>, Ref
         None => (
             raw,
             root.0.is_empty(),
-            format!("\"mcpServers\":{{\"chinwag\":{desired}}}"),
+            format!("\"{container_key}\":{{\"chinwag\":{desired}}}"),
         ),
     };
     // Borrowed RawValue points into the supplied source, with no decoding/copy.

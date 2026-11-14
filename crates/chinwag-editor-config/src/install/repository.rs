@@ -1,9 +1,10 @@
 //! One original repository operation; unresolved artifacts never authorize adoption.
 mod launcher;
 use super::{
-    Anchor, CommitOutcome, DirId, Editor, FileId, Image, Launch, OwnedPreparation, Target,
-    checked_close, completion::RecordOutcome, hex,
+    Anchor, CommitOutcome, DirId, Editor, FileId, Image, Launch, OwnedPreparation, Remote,
+    ServerProfile, Target, checked_close, completion::RecordOutcome, hex,
 };
+use crate::contains_env_interpolation;
 use chinwag_confirmed_initial_private::InitializationHandoff;
 use chinwag_snapshot_read_owner_private::{ReadOwner, RepositoryAdmission};
 use chinwag_snapshot_session_private::SnapshotSession;
@@ -27,7 +28,7 @@ impl RepositoryRequest {
         let text = repo.to_str().ok_or("repository_utf8")?;
         if text.len() > 4096
             || text.contains(['\0', '\r', '\n'])
-            || text.contains("${")
+            || contains_env_interpolation(text)
             || !repo.is_absolute()
             || repo
                 .components()
@@ -109,6 +110,8 @@ fn layout(editor: Editor) -> (Option<&'static str>, &'static str, &'static str) 
         Editor::Cursor => (Some(".cursor"), "mcp.json", "editor-cursor.pending"),
         Editor::Codex => (Some(".codex"), "config.toml", "editor-codex.pending"),
         Editor::Gemini => (Some(".gemini"), "settings.json", "editor-gemini.pending"),
+        Editor::Grok => (Some(".grok"), "config.toml", "editor-grok.pending"),
+        Editor::VsCode => (Some(".vscode"), "mcp.json", "editor-vscode.pending"),
     }
 }
 struct OriginalGuard {
@@ -377,10 +380,19 @@ fn unchanged(target: Target, original: Image, guard: &OuterGuard) -> Result<usiz
     verified?;
     closed
 }
-/// Configure exactly one editor, preserving every other entry and existing mode.
+/// Configure exactly one editor with the local stdio launcher, preserving every other entry and existing mode.
 /// A later process can inspect retained artifacts, but cannot adopt this operation.
 pub fn configure(request: RepositoryRequest) -> Result<ConfigureReceipt, ConfigureFailure> {
-    configure_inner(request, None)
+    configure_inner(request, None, None)
+}
+
+/// Configure exactly one editor with a remote HTTPS MCP endpoint (`https://mcp.chinwag.sh/mcp`),
+/// preserving descriptor-anchored directory ownership, atomic rename, unrelated servers, and file mode.
+pub fn configure_remote(
+    request: RepositoryRequest,
+    remote_url: &str,
+) -> Result<ConfigureReceipt, ConfigureFailure> {
+    configure_inner(request, None, Some(remote_url))
 }
 
 /// Configure one editor while borrowing the actual original live initialization owner.
@@ -391,12 +403,13 @@ pub fn configure_initialized(
 ) -> Result<ConfigureReceipt, ConfigureFailure> {
     let request = RepositoryRequest::new(initial.repository(), editor)
         .map_err(|reason| Progress::new().failure(reason))?;
-    configure_inner(request, Some(initial))
+    configure_inner(request, Some(initial), None)
 }
 
 fn configure_inner(
     request: RepositoryRequest,
     initial: Option<&InitializationHandoff>,
+    remote_url: Option<&str>,
 ) -> Result<ConfigureReceipt, ConfigureFailure> {
     let mut progress = Progress::new();
     let outcome = (|| {
@@ -419,15 +432,15 @@ fn configure_inner(
             .map_or(0o600, |image| image.id.permissions());
         guard.verify_target(&target)?;
         progress.phase = "prepare";
+        let profile = match remote_url {
+            Some(url) => ServerProfile::Remote(Remote { url }),
+            None => ServerProfile::Local(Launch {
+                command: &command,
+                args: &args,
+            }),
+        };
         let prepared = target
-            .prepare_owned(
-                observed,
-                Launch {
-                    command: &command,
-                    args: &args,
-                },
-                Some(&guard),
-            )
+            .prepare_owned(observed, profile, Some(&guard))
             .map_err(|e| e.reason)?;
         let (result, sha256, inner) = match prepared {
             OwnedPreparation::Unchanged {
