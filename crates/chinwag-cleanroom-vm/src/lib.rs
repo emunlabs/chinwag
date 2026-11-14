@@ -19,7 +19,7 @@ pub use env_lock::{
     CompiledEnvLock, EnvLockError, EnvLockReceiptV1, FlakeLockV7, ManifestDigestRecord,
     StoreClosureEntry, compile_workspace_env_lock, format_openssh_allowed_signer_line,
     generate_receipt_signing_key, load_allowed_signers_file, parse_openssh_allowed_signers_ed25519,
-    sign_env_lock_receipt, signing_key_from_seed_file, verify_env_lock_bundle,
+    serialize_nar_v1, sign_env_lock_receipt, signing_key_from_seed_file, verify_env_lock_bundle,
     verify_env_lock_bundle_with_signers, verify_env_lock_receipt, verify_zero_nix_syntax,
     write_env_lock_bundle,
 };
@@ -39,5 +39,6 @@ pub use seatbelt::{
 };
 pub use tart::{
     CleanroomVmError, EphemeralTartSession, MAX_VIRTIOFS_MOUNT_LATENCY_MS, ProcessTartExecutor,
-    TartCleanroomSpec, TartCommandRecord, TartExecutor, VirtioFsAccess, VirtioFsMount,
+    RunningTartVm, TartCleanroomSpec, TartCommandRecord, TartExecutor, VirtioFsAccess,
+    VirtioFsMount,
 };

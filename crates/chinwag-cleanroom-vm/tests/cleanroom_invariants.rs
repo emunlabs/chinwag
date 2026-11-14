@@ -9,15 +9,15 @@ use chinwag_cleanroom_vm::{
     EphemeralTartSession, HostHardwareTelemetry, JobTriggerContext, MAX_DRAIN_BUDGET_MS,
     MAX_VIRTIOFS_MOUNT_LATENCY_MS, MAX_VMS_PER_MAC_HOST, NetworkEgressPolicy, PoolAdmissionPolicy,
     ReleaseRefPolicy, ReleaseSignerAttestation, RunnerPoolController, RunnerTrustProfile,
-    SeatbeltError, SeatbeltSignalMode, StoreClosureEntry, TartCleanroomSpec, TartCommandRecord,
-    TartExecutor, ThermalPressure, TrustPoolError, VirtioFsAccess, VirtioFsMount,
-    acquire_host_vm_slot, compile_seatbelt_profile, compile_workspace_env_lock,
+    RunningTartVm, SeatbeltError, SeatbeltSignalMode, StoreClosureEntry, TartCleanroomSpec,
+    TartCommandRecord, TartExecutor, ThermalPressure, TrustPoolError, VirtioFsAccess,
+    VirtioFsMount, acquire_host_vm_slot, compile_seatbelt_profile, compile_workspace_env_lock,
     count_active_slot_leases, evaluate_trust_gate, evaluate_trust_gate_with_policy,
     generate_receipt_signing_key, generate_recipient_kem_keypair, open_failure_diagnostic_bundle,
     parse_openssh_allowed_signers_ed25519, scrub_diagnostic_secrets,
-    seal_failure_diagnostic_bundle, sign_env_lock_receipt, signing_key_from_seed_file,
-    verify_env_lock_bundle, verify_env_lock_bundle_with_signers, verify_env_lock_receipt,
-    write_env_lock_bundle,
+    seal_failure_diagnostic_bundle, serialize_nar_v1, sign_env_lock_receipt,
+    signing_key_from_seed_file, verify_env_lock_bundle, verify_env_lock_bundle_with_signers,
+    verify_env_lock_receipt, write_env_lock_bundle,
 };
 use ed25519_dalek::SigningKey;
 use std::cell::RefCell;
@@ -28,18 +28,80 @@ use std::process::Command;
 use std::rc::Rc;
 use tempfile::TempDir;
 
+#[derive(Default)]
+struct SharedTartSimState {
+    log: Vec<TartCommandRecord>,
+    vm_running: bool,
+    ready_calls: u32,
+}
+
+struct MockRunningTartVm {
+    state: Rc<RefCell<SharedTartSimState>>,
+    premature_exit: Option<Result<(), String>>,
+}
+
+impl RunningTartVm for MockRunningTartVm {
+    fn try_poll_exited(&mut self) -> Result<Option<Result<(), String>>, CleanroomVmError> {
+        if let Some(outcome) = self.premature_exit.take() {
+            self.state.borrow_mut().vm_running = false;
+            return Ok(Some(outcome));
+        }
+        Ok(None)
+    }
+
+    fn reap(&mut self) -> Result<(), CleanroomVmError> {
+        let mut st = self.state.borrow_mut();
+        st.vm_running = false;
+        st.log.push(TartCommandRecord {
+            step: "reap-run".to_owned(),
+            argv: vec![],
+        });
+        Ok(())
+    }
+}
+
 #[derive(Clone, Default)]
 struct RecordingTartExecutor {
-    log: Rc<RefCell<Vec<TartCommandRecord>>>,
+    state: Rc<RefCell<SharedTartSimState>>,
     fail_on_step: Option<&'static str>,
+    ready_succeeds_on_attempt: u32,
+    premature_run_exit: Option<Result<(), String>>,
 }
 
 impl TartExecutor for RecordingTartExecutor {
     fn exec_tart(&mut self, step: &'static str, argv: &[String]) -> Result<(), CleanroomVmError> {
-        self.log.borrow_mut().push(TartCommandRecord {
-            step: step.to_owned(),
-            argv: argv.to_vec(),
-        });
+        {
+            let mut st = self.state.borrow_mut();
+            st.log.push(TartCommandRecord {
+                step: step.to_owned(),
+                argv: argv.to_vec(),
+            });
+            if matches!(step, "wait-ready" | "exec") {
+                assert!(
+                    st.vm_running,
+                    "`{step}` invoked while VM is NOT running (would deadlock or fail against real Tart)"
+                );
+            }
+            if step == "delete" {
+                assert!(
+                    !st.vm_running,
+                    "`tart delete` invoked while background `tart run` handle is still un-reaped"
+                );
+            }
+            if step == "wait-ready" {
+                st.ready_calls += 1;
+                let threshold = self.ready_succeeds_on_attempt.max(1);
+                if st.ready_calls < threshold {
+                    return Err(CleanroomVmError::TartExecutionFailed {
+                        step,
+                        detail: "guest agent not yet ready".to_owned(),
+                    });
+                }
+            }
+            if step == "stop" {
+                st.vm_running = false;
+            }
+        }
         if self.fail_on_step == Some(step) {
             return Err(CleanroomVmError::TartExecutionFailed {
                 step,
@@ -48,6 +110,54 @@ impl TartExecutor for RecordingTartExecutor {
         }
         Ok(())
     }
+
+    fn spawn_tart_run(
+        &mut self,
+        argv: &[String],
+    ) -> Result<Box<dyn RunningTartVm>, CleanroomVmError> {
+        {
+            let mut st = self.state.borrow_mut();
+            st.log.push(TartCommandRecord {
+                step: "spawn-run".to_owned(),
+                argv: argv.to_vec(),
+            });
+            if self.fail_on_step == Some("run") {
+                return Err(CleanroomVmError::TartExecutionFailed {
+                    step: "run",
+                    detail: "simulated tart run spawn failure".to_owned(),
+                });
+            }
+            st.vm_running = true;
+        }
+        Ok(Box::new(MockRunningTartVm {
+            state: Rc::clone(&self.state),
+            premature_exit: self.premature_run_exit.clone(),
+        }))
+    }
+}
+
+fn write_resolved_store_closures(repo_root: &Path, nodes_and_names: &[(&str, &str, u8)]) {
+    let dot_chinwag = repo_root.join(".chinwag");
+    fs::create_dir_all(&dot_chinwag).unwrap();
+    let mut map = BTreeMap::new();
+    for (node, store_suffix, fill) in nodes_and_names {
+        map.insert(
+            (*node).to_owned(),
+            StoreClosureEntry {
+                store_path: format!(
+                    "/nix/store/{}-{store_suffix}",
+                    "a".repeat(31) + &format!("{}", fill % 10)
+                ),
+                nar_sha256_hex: Some(hex::encode([*fill; 32])),
+                artifact_file: None,
+            },
+        );
+    }
+    fs::write(
+        dot_chinwag.join("store-closures.json"),
+        serde_json::to_vec_pretty(&map).unwrap(),
+    )
+    .unwrap();
 }
 
 // ============================================================================
@@ -146,37 +256,78 @@ fn ephemeral_tart_session_guarantees_defer_delete_on_success_and_run_failure() {
         "/nix/store",
         "/var/tmp/sccache",
     )
+    .unwrap()
+    .with_boot_readiness(3, 0);
+    let sb_spec = CleanroomSeatbeltSpec::new(
+        RunnerTrustProfile::Public,
+        "/nix/store",
+        "/var/tmp/sccache",
+        "/private/tmp/worktree-1",
+        "/private/tmp/scratch-1",
+    )
     .unwrap();
-    let log = Rc::new(RefCell::new(Vec::new()));
+    let seatbelt = compile_seatbelt_profile(&sb_spec).unwrap();
+    let guest_cmd = vec!["/usr/bin/true".to_owned()];
+
+    let state = Rc::new(RefCell::new(SharedTartSimState::default()));
     let exec = RecordingTartExecutor {
-        log: Rc::clone(&log),
+        state: Rc::clone(&state),
         fail_on_step: None,
+        ready_succeeds_on_attempt: 2,
+        premature_run_exit: None,
     };
 
     let mut session = EphemeralTartSession::clone_and_arm(spec.clone(), exec).unwrap();
-    session.run_ephemeral().unwrap();
+    session
+        .run_ephemeral_with_seatbelt(&seatbelt, &guest_cmd)
+        .unwrap();
     let (_, del_res) = session.finish();
     del_res.unwrap();
 
-    let steps: Vec<String> = log.borrow().iter().map(|r| r.step.clone()).collect();
-    assert_eq!(steps, vec!["clone", "set", "run", "delete"]);
+    let steps: Vec<String> = state.borrow().log.iter().map(|r| r.step.clone()).collect();
+    assert_eq!(
+        steps,
+        vec![
+            "clone",
+            "set",
+            "spawn-run",
+            "wait-ready",
+            "wait-ready",
+            "exec",
+            "stop",
+            "reap-run",
+            "delete"
+        ]
+    );
 
-    // Verify RAII Drop still executes `tart delete` once when `tart run` fails
-    let fail_log = Rc::new(RefCell::new(Vec::new()));
+    // Verify RAII Drop still reaps & executes `tart delete` once when background `tart run` exits early
+    let fail_state = Rc::new(RefCell::new(SharedTartSimState::default()));
     {
         let fail_exec = RecordingTartExecutor {
-            log: Rc::clone(&fail_log),
-            fail_on_step: Some("run"),
+            state: Rc::clone(&fail_state),
+            fail_on_step: None,
+            ready_succeeds_on_attempt: 1,
+            premature_run_exit: Some(Err("hypervisor boot crash".to_owned())),
         };
         let mut failing_session = EphemeralTartSession::clone_and_arm(spec, fail_exec).unwrap();
-        let err = failing_session.run_ephemeral().unwrap_err();
+        let err = failing_session
+            .run_ephemeral_with_seatbelt(&seatbelt, &guest_cmd)
+            .unwrap_err();
         assert!(matches!(
             err,
             CleanroomVmError::TartExecutionFailed { step: "run", .. }
         ));
     }
-    let fail_steps: Vec<String> = fail_log.borrow().iter().map(|r| r.step.clone()).collect();
-    assert_eq!(fail_steps, vec!["clone", "set", "run", "delete"]);
+    let fail_steps: Vec<String> = fail_state
+        .borrow()
+        .log
+        .iter()
+        .map(|r| r.step.clone())
+        .collect();
+    assert_eq!(
+        fail_steps,
+        vec!["clone", "set", "spawn-run", "reap-run", "delete"]
+    );
 }
 
 #[test]
@@ -345,6 +496,16 @@ fn env_lock_compiles_deterministic_flake_lock_v7_for_polyglot_workspace() {
         "export default { packages: ['ripgrep', 'sccache'] };\n",
     )
     .unwrap();
+    write_resolved_store_closures(
+        dir.path(),
+        &[
+            ("rust-toolchain", "rust-1.97.1", 0x11),
+            ("nodejs-runtime", "nodejs-22.14.0", 0x22),
+            ("python-runtime", "python3-3.12.9", 0x33),
+            ("go-toolchain", "go-1.24.1", 0x44),
+            ("chinwag-env-ts", "jinx-env-v1", 0x55),
+        ],
+    );
 
     let first = compile_workspace_env_lock(dir.path()).unwrap();
     let second = compile_workspace_env_lock(dir.path()).unwrap();
@@ -401,6 +562,7 @@ fn env_lock_bundle_roundtrip_and_tamper_or_drift_rejection() {
         "[package]\nname = \"cleanroom-demo\"\nversion = \"0.1.0\"\nrust-version = \"1.97.1\"\n",
     )
     .unwrap();
+    write_resolved_store_closures(dir.path(), &[("rust-toolchain", "rust-1.97.1", 0x61)]);
 
     let compiled = compile_workspace_env_lock(dir.path()).unwrap();
     let sk = generate_receipt_signing_key().unwrap();
@@ -857,6 +1019,7 @@ fn env_lock_rejects_weak_small_order_ed25519_public_key_in_receipt() {
         "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
     )
     .unwrap();
+    write_resolved_store_closures(dir.path(), &[("rust-toolchain", "rust-1.97.1", 0x71)]);
     let compiled = compile_workspace_env_lock(dir.path()).unwrap();
     let sk = generate_receipt_signing_key().unwrap();
     let mut receipt = sign_env_lock_receipt(&compiled, &sk).unwrap();
@@ -979,7 +1142,8 @@ fn ephemeral_tart_session_with_seatbelt_executes_guest_sandbox_exec_and_deletes_
         "/nix/store",
         "/var/tmp/sccache",
     )
-    .unwrap();
+    .unwrap()
+    .with_boot_readiness(2, 0);
     let sb_spec = CleanroomSeatbeltSpec::new(
         RunnerTrustProfile::Public,
         "/nix/store",
@@ -995,10 +1159,12 @@ fn ephemeral_tart_session_with_seatbelt_executes_guest_sandbox_exec_and_deletes_
         "--offline".to_owned(),
     ];
 
-    let log = Rc::new(RefCell::new(Vec::new()));
+    let state = Rc::new(RefCell::new(SharedTartSimState::default()));
     let exec = RecordingTartExecutor {
-        log: Rc::clone(&log),
+        state: Rc::clone(&state),
         fail_on_step: None,
+        ready_succeeds_on_attempt: 1,
+        premature_run_exit: None,
     };
     let mut session = EphemeralTartSession::clone_and_arm(spec.clone(), exec).unwrap();
     session
@@ -1007,20 +1173,68 @@ fn ephemeral_tart_session_with_seatbelt_executes_guest_sandbox_exec_and_deletes_
     let (_, del_res) = session.finish();
     del_res.unwrap();
 
-    let records = log.borrow();
-    let steps: Vec<&str> = records.iter().map(|r| r.step.as_str()).collect();
-    assert_eq!(steps, vec!["clone", "set", "run", "exec", "delete"]);
-    assert_eq!(records[3].argv[0], "exec");
-    assert_eq!(records[3].argv[1], "sandboxed-run-1");
-    assert_eq!(records[3].argv[2], "/usr/bin/sandbox-exec");
-    assert_eq!(records[3].argv[3], "-p");
-    assert!(records[3].argv[4].contains("(deny file-write* (subpath \"/nix/store\")"));
-    assert_eq!(&records[3].argv[5..], &["--", "cargo", "test", "--offline"]);
+    let st = state.borrow();
+    let steps: Vec<&str> = st.log.iter().map(|r| r.step.as_str()).collect();
+    assert_eq!(
+        steps,
+        vec![
+            "clone",
+            "set",
+            "spawn-run",
+            "wait-ready",
+            "exec",
+            "stop",
+            "reap-run",
+            "delete"
+        ]
+    );
+    assert_eq!(st.log[4].argv[0], "exec");
+    assert_eq!(st.log[4].argv[1], "sandboxed-run-1");
+    assert_eq!(st.log[4].argv[2], "/usr/bin/sandbox-exec");
+    assert_eq!(st.log[4].argv[3], "-p");
+    assert!(st.log[4].argv[4].contains("(deny file-write* (subpath \"/nix/store\")"));
+    assert_eq!(&st.log[4].argv[5..], &["--", "cargo", "test", "--offline"]);
+    drop(st);
+
+    // Also verify workload `exec` failure STILL runs `stop` + `reap-run` + `delete`
+    let fail_state = Rc::new(RefCell::new(SharedTartSimState::default()));
+    {
+        let fail_exec = RecordingTartExecutor {
+            state: Rc::clone(&fail_state),
+            fail_on_step: Some("exec"),
+            ready_succeeds_on_attempt: 1,
+            premature_run_exit: None,
+        };
+        let mut s2 = EphemeralTartSession::clone_and_arm(spec, fail_exec).unwrap();
+        assert!(matches!(
+            s2.run_ephemeral_with_seatbelt(&seatbelt, &cmd),
+            Err(CleanroomVmError::TartExecutionFailed { step: "exec", .. })
+        ));
+    }
+    let fail_steps: Vec<String> = fail_state
+        .borrow()
+        .log
+        .iter()
+        .map(|r| r.step.clone())
+        .collect();
+    assert_eq!(
+        fail_steps,
+        vec![
+            "clone",
+            "set",
+            "spawn-run",
+            "wait-ready",
+            "exec",
+            "stop",
+            "reap-run",
+            "delete"
+        ]
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn env_lock_recursively_rejects_nested_nix_files_and_nix_symlinks() {
+fn env_lock_recursively_rejects_nested_nix_files_in_target_node_modules_and_symlinks() {
     use std::os::unix::fs::symlink;
 
     let dir = TempDir::new().unwrap();
@@ -1029,13 +1243,16 @@ fn env_lock_recursively_rejects_nested_nix_files_and_nix_symlinks() {
         "[package]\nname = \"nested-check\"\nversion = \"0.1.0\"\n",
     )
     .unwrap();
-    fs::create_dir_all(dir.path().join("crates/sub/nix")).unwrap();
-    fs::write(dir.path().join("crates/sub/nix/overlay.nix"), "{}").unwrap();
-    assert!(matches!(
-        compile_workspace_env_lock(dir.path()),
-        Err(EnvLockError::ForbiddenNixSyntaxFile(_))
-    ));
-    fs::remove_file(dir.path().join("crates/sub/nix/overlay.nix")).unwrap();
+    for sneaky_dir in ["crates/sub/nix", "target/hidden", "node_modules/pkg"] {
+        fs::create_dir_all(dir.path().join(sneaky_dir)).unwrap();
+        let nix_file = dir.path().join(sneaky_dir).join("overlay.nix");
+        fs::write(&nix_file, "{}").unwrap();
+        assert!(matches!(
+            compile_workspace_env_lock(dir.path()),
+            Err(EnvLockError::ForbiddenNixSyntaxFile(_))
+        ));
+        fs::remove_file(&nix_file).unwrap();
+    }
 
     let innocent = dir.path().join("Cargo.toml");
     symlink(&innocent, dir.path().join("crates/sub/sneaky.nix")).unwrap();
@@ -1046,7 +1263,7 @@ fn env_lock_recursively_rejects_nested_nix_files_and_nix_symlinks() {
 }
 
 #[test]
-fn env_lock_pins_resolved_store_closures_nar_hash_and_verifies_openssh_allowed_signers() {
+fn env_lock_rejects_missing_store_closure_pins_and_verifies_canonical_nar_v1_archive() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use sha2::{Digest, Sha256};
 
@@ -1056,14 +1273,26 @@ fn env_lock_pins_resolved_store_closures_nar_hash_and_verifies_openssh_allowed_s
         "[package]\nname = \"store-pin\"\nversion = \"0.1.0\"\nrust-version = \"1.97.1\"\n",
     )
     .unwrap();
-    fs::create_dir_all(dir.path().join(".chinwag")).unwrap();
 
-    let nar_bytes = b"simulated-nix-nar-archive-bytes-for-rust-1.97.1";
-    fs::write(dir.path().join(".chinwag/rust.nar"), nar_bytes).unwrap();
-    let expected_nar_sha = hex::encode(Sha256::digest(nar_bytes));
+    // Missing `.chinwag/store-closures.json` MUST fail closed (never synthesize manifest narHash!)
+    assert!(matches!(
+        compile_workspace_env_lock(dir.path()),
+        Err(EnvLockError::UnresolvedStoreClosure { ref node, .. }) if node == "rust-toolchain"
+    ));
+
+    fs::create_dir_all(dir.path().join(".chinwag/payload")).unwrap();
+    fs::write(
+        dir.path().join(".chinwag/payload/rustc-meta"),
+        b"rustc 1.97.1 cleanroom closure",
+    )
+    .unwrap();
+    let nar_bytes = serialize_nar_v1(&dir.path().join(".chinwag/payload")).unwrap();
+    assert!(nar_bytes.starts_with(b"\x0d\x00\x00\x00\x00\x00\x00\x00nix-archive-1\x00\x00\x00"));
+    fs::write(dir.path().join(".chinwag/rust.nar"), &nar_bytes).unwrap();
+    let expected_nar_sha = hex::encode(Sha256::digest(&nar_bytes));
     let expected_sri = format!(
         "sha256-{}",
-        BASE64_STANDARD.encode(Sha256::digest(nar_bytes))
+        BASE64_STANDARD.encode(Sha256::digest(&nar_bytes))
     );
 
     let mut map = BTreeMap::new();
@@ -1088,11 +1317,10 @@ fn env_lock_pins_resolved_store_closures_nar_hash_and_verifies_openssh_allowed_s
         .unwrap();
     assert_eq!(locked.nar_hash, expected_sri);
     assert_eq!(
-        locked.store_path.as_deref(),
-        Some("/nix/store/00000000000000000000000000000000-rust-1.97.1")
+        locked.store_path,
+        "/nix/store/00000000000000000000000000000000-rust-1.97.1"
     );
 
-    // Encode signer key in OpenSSH `allowed_signers` format and verify strict pinned check
     let sk = SigningKey::from_bytes(&[0x73u8; 32]);
     let pk = sk.verifying_key().to_bytes();
     let mut ssh_wire = Vec::with_capacity(51);
@@ -1108,10 +1336,15 @@ fn env_lock_pins_resolved_store_closures_nar_hash_and_verifies_openssh_allowed_s
     let receipt = sign_env_lock_receipt(&compiled, &sk).unwrap();
     write_env_lock_bundle(dir.path(), &compiled, &receipt).unwrap();
 
-    // Empty allowlist MUST fail closed when pinned verification is required
     assert!(verify_env_lock_bundle_with_signers(dir.path(), &[]).is_err());
-    // Enrolled OpenSSH signer succeeds
     assert!(verify_env_lock_bundle_with_signers(dir.path(), &parsed_signers).is_ok());
+
+    // Removing `.chinwag/store-closures.json` after locking MUST cause `--check` verification to fail closed!
+    fs::remove_file(dir.path().join(".chinwag/store-closures.json")).unwrap();
+    assert!(matches!(
+        verify_env_lock_bundle_with_signers(dir.path(), &parsed_signers),
+        Err(EnvLockError::UnresolvedStoreClosure { .. })
+    ));
 }
 
 #[test]

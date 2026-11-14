@@ -530,6 +530,14 @@ pub fn run_runner_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
         return 2;
     }
 
+    if seal_failure_bundle_out.is_some() && diagnostic_recipient_pk_file.is_none() {
+        let _ = writeln!(
+            stderr,
+            "chinwag runner start: `--seal-failure-bundle` requires `--diagnostic-recipient-pubkey-file`"
+        );
+        return 2;
+    }
+
     if guest_command.is_empty() {
         guest_command.push("/usr/bin/true".to_owned());
     }
@@ -748,7 +756,9 @@ pub fn run_runner_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
                     "clone": tart_spec.clone_argv(),
                     "set": tart_spec.set_resources_argv(),
                     "run": tart_spec.run_argv(),
+                    "wait_ready": tart_spec.guest_readiness_argv(),
                     "exec_sandboxed": sandbox_exec_argv,
+                    "stop": tart_spec.stop_argv(),
                     "defer_delete": tart_spec.delete_argv(),
                 }
             });
@@ -770,6 +780,7 @@ pub fn run_runner_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
     let mut session = match EphemeralTartSession::clone_and_arm(tart_spec, executor) {
         Ok(s) => s,
         Err(err) => {
+            let detail = format!("clone failed: {err}");
             let sealed_path = maybe_emit_failure_bundle(
                 seal_failure_bundle_out.as_deref(),
                 diagnostic_recipient_pk_file.as_deref(),
@@ -777,13 +788,13 @@ pub fn run_runner_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
                 &worktree,
                 &vm_instance_name,
                 profile,
-                &err.to_string(),
+                &detail,
             );
             emit_runner_failure(
                 json_mode,
                 stdout,
                 stderr,
-                &format!("clone failed: {err}"),
+                &detail,
                 true,
                 sealed_path.as_deref(),
             );
@@ -811,6 +822,10 @@ pub fn run_runner_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
             0
         }
         (Err(run_err), del_outcome) => {
+            let combined_detail = match del_outcome {
+                Ok(()) => run_err.to_string(),
+                Err(ref del_err) => format!("{run_err}; teardown failed: {del_err}"),
+            };
             let sealed_path = maybe_emit_failure_bundle(
                 seal_failure_bundle_out.as_deref(),
                 diagnostic_recipient_pk_file.as_deref(),
@@ -818,20 +833,37 @@ pub fn run_runner_cli(args: &[String], stdout: &mut dyn Write, stderr: &mut dyn 
                 &worktree,
                 &vm_instance_name,
                 profile,
-                &run_err.to_string(),
+                &combined_detail,
             );
             emit_runner_failure(
                 json_mode,
                 stdout,
                 stderr,
-                &run_err.to_string(),
+                &combined_detail,
                 del_outcome.is_ok(),
                 sealed_path.as_deref(),
             );
             1
         }
         (Ok(()), Err(del_err)) => {
-            let _ = writeln!(stderr, "chinwag runner start teardown failed: {del_err}");
+            let teardown_detail = format!("teardown failed: {del_err}");
+            let sealed_path = maybe_emit_failure_bundle(
+                seal_failure_bundle_out.as_deref(),
+                diagnostic_recipient_pk_file.as_deref(),
+                runner_signing_seed_file.as_deref(),
+                &worktree,
+                &vm_instance_name,
+                profile,
+                &teardown_detail,
+            );
+            emit_runner_failure(
+                json_mode,
+                stdout,
+                stderr,
+                &teardown_detail,
+                false,
+                sealed_path.as_deref(),
+            );
             1
         }
     }

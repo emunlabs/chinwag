@@ -2,17 +2,21 @@
 // 1401 Lavaca St STE 81335, Austin, TX 78701
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ephemeral Tart cleanroom VM lifecycle (`tart clone` -> `tart run --no-graphics
-//! --dir=nix-store:/nix/store:ro --dir=sccache:<cache>:ro` -> deterministic
-//! `defer tart delete`).
+//! Ephemeral Tart cleanroom VM lifecycle (`tart clone` -> background `tart run --no-graphics
+//! --dir=nix-store:/nix/store:ro --dir=sccache:<cache>:ro` -> readiness probe ->
+//! `tart exec <run-vm> /usr/bin/sandbox-exec -p <sbpl> -- <cmd...>` -> `tart stop` + reap ->
+//! deterministic `defer tart delete`).
 //!
 //! Enforces `INV-NIX-VIRTIOFS-01` (sub-200ms read-only VirtioFS mount budget) and
-//! `INV-NIX-RO-STORE-01` (hypervisor `:ro` tag enforcement on `/nix/store` and `sccache`).
+//! `INV-NIX-RO-STORE-01` (hypervisor `:ro` tag enforcement + runtime guest Seatbelt).
 
 use crate::seatbelt::SeatbeltProfile;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 /// Maximum permitted VirtioFS mount latency budget in milliseconds (`INV-NIX-VIRTIOFS-01`).
 pub const MAX_VIRTIOFS_MOUNT_LATENCY_MS: u64 = 200;
@@ -28,6 +32,8 @@ pub const CANONICAL_NIX_STORE_PATH: &str = "/nix/store";
 
 const MAX_VM_NAME_LEN: usize = 128;
 const MAX_MOUNT_PATH_LEN: usize = 1024;
+const DEFAULT_BOOT_READY_ATTEMPTS: u32 = 60;
+const DEFAULT_BOOT_READY_POLL_MS: u64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CleanroomVmError {
@@ -120,6 +126,8 @@ pub struct TartCleanroomSpec {
     memory_mib: u32,
     no_graphics: bool,
     mount_latency_budget_ms: u64,
+    boot_ready_attempts: u32,
+    boot_ready_poll_ms: u64,
 }
 
 impl TartCleanroomSpec {
@@ -150,6 +158,8 @@ impl TartCleanroomSpec {
             memory_mib: 8192,
             no_graphics: true,
             mount_latency_budget_ms: MAX_VIRTIOFS_MOUNT_LATENCY_MS,
+            boot_ready_attempts: DEFAULT_BOOT_READY_ATTEMPTS,
+            boot_ready_poll_ms: DEFAULT_BOOT_READY_POLL_MS,
         })
     }
 
@@ -167,6 +177,12 @@ impl TartCleanroomSpec {
         self.cpu_cores = cpu_cores;
         self.memory_mib = memory_mib;
         Ok(self)
+    }
+
+    pub fn with_boot_readiness(mut self, max_attempts: u32, poll_interval_ms: u64) -> Self {
+        self.boot_ready_attempts = max_attempts.max(1);
+        self.boot_ready_poll_ms = poll_interval_ms;
+        self
     }
 
     pub fn with_graphics_enabled(self, enabled: bool) -> Result<Self, CleanroomVmError> {
@@ -262,8 +278,17 @@ impl TartCleanroomSpec {
         args
     }
 
+    /// Exact `tart exec <run-vm> /usr/bin/true` guest-agent readiness probe argument vector.
+    pub fn guest_readiness_argv(&self) -> Vec<String> {
+        vec![
+            "exec".to_owned(),
+            self.run_vm_name.clone(),
+            "/usr/bin/true".to_owned(),
+        ]
+    }
+
     /// Exact `tart exec <run-vm> /usr/bin/sandbox-exec -p <sbpl> -- <guest_command...>` argv
-    /// applying the compiled XNU Seatbelt profile at runtime inside the guest (`INV-NIX-RO-STORE-01`).
+    /// applying the compiled XNU Seatbelt profile at runtime inside the live guest (`INV-NIX-RO-STORE-01`).
     pub fn guest_sandbox_exec_argv(
         &self,
         seatbelt: &SeatbeltProfile,
@@ -283,6 +308,11 @@ impl TartCleanroomSpec {
         Ok(argv)
     }
 
+    /// Exact `tart stop <run-vm>` shutdown argument vector.
+    pub fn stop_argv(&self) -> Vec<String> {
+        vec!["stop".to_owned(), self.run_vm_name.clone()]
+    }
+
     /// Exact `tart delete <run-vm>` cleanup argument vector.
     pub fn delete_argv(&self) -> Vec<String> {
         vec!["delete".to_owned(), self.run_vm_name.clone()]
@@ -296,9 +326,111 @@ pub struct TartCommandRecord {
     pub argv: Vec<String>,
 }
 
+/// Handle to a concurrently running `tart run --no-graphics ...` hypervisor process.
+///
+/// Because `tart run` blocks for the lifetime of the booted guest VM, `EphemeralTartSession`
+/// spawns `tart run` in the background, probes guest readiness via `tart exec <vm> /usr/bin/true`,
+/// runs the workload via `tart exec <vm> /usr/bin/sandbox-exec -p <sbpl> -- ...`, issues
+/// `tart stop <vm>`, and reaps this handle before `tart delete <vm>`.
+pub trait RunningTartVm {
+    /// Non-blocking check for premature hypervisor exit.
+    /// Returns `Ok(None)` while the VM is still running, `Ok(Some(Ok(())))` if it exited `0`,
+    /// or `Ok(Some(Err(detail)))` if `tart run` exited non-zero.
+    fn try_poll_exited(&mut self) -> Result<Option<Result<(), String>>, CleanroomVmError>;
+
+    /// Reaps the background `tart run` process (killing + waiting if still alive after `tart stop`).
+    fn reap(&mut self) -> Result<(), CleanroomVmError>;
+}
+
 /// Abstract executor for `tart` hypervisor operations.
 pub trait TartExecutor {
     fn exec_tart(&mut self, step: &'static str, argv: &[String]) -> Result<(), CleanroomVmError>;
+
+    fn spawn_tart_run(
+        &mut self,
+        argv: &[String],
+    ) -> Result<Box<dyn RunningTartVm>, CleanroomVmError>;
+}
+
+struct ProcessRunningTartVm {
+    child: Option<Child>,
+}
+
+impl ProcessRunningTartVm {
+    fn collect_stderr(child: &mut Child) -> String {
+        let mut buf = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf.trim().to_owned()
+    }
+}
+
+impl RunningTartVm for ProcessRunningTartVm {
+    fn try_poll_exited(&mut self) -> Result<Option<Result<(), String>>, CleanroomVmError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(Some(Ok(())));
+        };
+        match child.try_wait() {
+            Ok(None) => Ok(None),
+            Ok(Some(status)) => {
+                let mut owned = self.child.take().expect("checked Some");
+                let stderr = Self::collect_stderr(&mut owned);
+                if status.success() {
+                    Ok(Some(Ok(())))
+                } else {
+                    let detail = if stderr.is_empty() {
+                        format!("exit status {status}")
+                    } else {
+                        stderr
+                    };
+                    Ok(Some(Err(detail)))
+                }
+            }
+            Err(e) => Err(CleanroomVmError::TartExecutionFailed {
+                step: "run",
+                detail: e.to_string(),
+            }),
+        }
+    }
+
+    fn reap(&mut self) -> Result<(), CleanroomVmError> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        // Allow brief grace window after `tart stop <vm>` before sending SIGKILL
+        for _ in 0..40 {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CleanroomVmError::TartExecutionFailed {
+                        step: "reap-run",
+                        detail: e.to_string(),
+                    });
+                }
+            }
+        }
+        let _ = child.kill();
+        child
+            .wait()
+            .map(|_| ())
+            .map_err(|e| CleanroomVmError::TartExecutionFailed {
+                step: "reap-run",
+                detail: e.to_string(),
+            })
+    }
+}
+
+impl Drop for ProcessRunningTartVm {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Subprocess executor invoking an explicit customer-configured `tart` binary path
@@ -314,6 +446,17 @@ impl ProcessTartExecutor {
             executable: executable.into(),
         }
     }
+
+    fn scrubbed_command(&self, argv: &[String]) -> Command {
+        let mut cmd = Command::new(&self.executable);
+        cmd.args(argv).env_clear();
+        for key in ["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"] {
+            if let Some(val) = std::env::var_os(key) {
+                cmd.env(key, val);
+            }
+        }
+        cmd
+    }
 }
 
 impl Default for ProcessTartExecutor {
@@ -326,19 +469,12 @@ impl Default for ProcessTartExecutor {
 
 impl TartExecutor for ProcessTartExecutor {
     fn exec_tart(&mut self, step: &'static str, argv: &[String]) -> Result<(), CleanroomVmError> {
-        let mut cmd = Command::new(&self.executable);
-        cmd.args(argv).env_clear();
-        for key in ["HOME", "PATH", "TMPDIR", "USER", "LOGNAME"] {
-            if let Some(val) = std::env::var_os(key) {
-                cmd.env(key, val);
-            }
-        }
-        let output = cmd
-            .output()
-            .map_err(|e| CleanroomVmError::TartExecutionFailed {
+        let output = self.scrubbed_command(argv).output().map_err(|e| {
+            CleanroomVmError::TartExecutionFailed {
                 step,
                 detail: e.to_string(),
-            })?;
+            }
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             return Err(CleanroomVmError::TartExecutionFailed {
@@ -351,6 +487,23 @@ impl TartExecutor for ProcessTartExecutor {
             });
         }
         Ok(())
+    }
+
+    fn spawn_tart_run(
+        &mut self,
+        argv: &[String],
+    ) -> Result<Box<dyn RunningTartVm>, CleanroomVmError> {
+        let child = self
+            .scrubbed_command(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| CleanroomVmError::TartExecutionFailed {
+                step: "run",
+                detail: e.to_string(),
+            })?;
+        Ok(Box::new(ProcessRunningTartVm { child: Some(child) }))
     }
 }
 
@@ -389,10 +542,22 @@ impl<E: TartExecutor> EphemeralTartSession<E> {
         &self.spec
     }
 
-    /// Executes `tart run --no-graphics --dir=nix-store:... --dir=sccache:... <run-vm>`.
-    /// Even if `tart run` fails, the `Drop` guard (or explicit `finish`) deletes `<run-vm>`.
-    pub fn run_ephemeral(&mut self) -> Result<(), CleanroomVmError> {
+    /// Spawns the headless cleanroom VM (`tart run`) in the background, waits for guest
+    /// readiness (`tart exec <vm> /usr/bin/true`), executes `guest_command` inside the
+    /// live running VM under `/usr/bin/sandbox-exec -p <sbpl>`, issues `tart stop <vm>`
+    /// + reaps the hypervisor handle, and guarantees `defer tart delete` on any failure.
+    pub fn run_ephemeral_with_seatbelt(
+        &mut self,
+        seatbelt: &SeatbeltProfile,
+        guest_command: &[String],
+    ) -> Result<(), CleanroomVmError> {
+        let exec_argv = self.spec.guest_sandbox_exec_argv(seatbelt, guest_command)?;
         let run_argv = self.spec.run_argv();
+        let readiness_argv = self.spec.guest_readiness_argv();
+        let stop_argv = self.spec.stop_argv();
+        let max_attempts = self.spec.boot_ready_attempts.max(1);
+        let poll_ms = self.spec.boot_ready_poll_ms;
+
         let exec = self
             .executor
             .as_mut()
@@ -400,27 +565,59 @@ impl<E: TartExecutor> EphemeralTartSession<E> {
                 step: "run",
                 detail: "session already finalized".to_owned(),
             })?;
-        exec.exec_tart("run", &run_argv)
-    }
 
-    /// Boots the headless cleanroom VM (`tart run`) AND executes `guest_command` inside
-    /// `/usr/bin/sandbox-exec -p <sbpl>` (`tart exec`), enforcing XNU Seatbelt store/socket
-    /// immutability at runtime while guaranteeing `defer tart delete` on any failure.
-    pub fn run_ephemeral_with_seatbelt(
-        &mut self,
-        seatbelt: &SeatbeltProfile,
-        guest_command: &[String],
-    ) -> Result<(), CleanroomVmError> {
-        let exec_argv = self.spec.guest_sandbox_exec_argv(seatbelt, guest_command)?;
-        self.run_ephemeral()?;
-        let exec = self
-            .executor
-            .as_mut()
-            .ok_or_else(|| CleanroomVmError::TartExecutionFailed {
-                step: "exec",
-                detail: "session already finalized".to_owned(),
-            })?;
-        exec.exec_tart("exec", &exec_argv)
+        let mut running_vm = exec.spawn_tart_run(&run_argv)?;
+
+        let mut readiness_res: Result<(), CleanroomVmError> = Ok(());
+        for attempt in 1..=max_attempts {
+            if let Some(exit_state) = running_vm.try_poll_exited()? {
+                let _ = running_vm.reap();
+                let detail = match exit_state {
+                    Ok(()) => "tart run exited prematurely before guest workload".to_owned(),
+                    Err(msg) => msg,
+                };
+                return Err(CleanroomVmError::TartExecutionFailed {
+                    step: "run",
+                    detail,
+                });
+            }
+            match exec.exec_tart("wait-ready", &readiness_argv) {
+                Ok(()) => {
+                    readiness_res = Ok(());
+                    break;
+                }
+                Err(err) => {
+                    readiness_res = Err(err);
+                    if attempt < max_attempts && poll_ms > 0 {
+                        thread::sleep(Duration::from_millis(poll_ms));
+                    }
+                }
+            }
+        }
+
+        if let Err(ready_err) = readiness_res {
+            let _ = exec.exec_tart("stop", &stop_argv);
+            let _ = running_vm.reap();
+            return Err(ready_err);
+        }
+
+        if let Some(exit_state) = running_vm.try_poll_exited()? {
+            let _ = running_vm.reap();
+            let detail = match exit_state {
+                Ok(()) => "tart run exited before guest sandbox-exec".to_owned(),
+                Err(msg) => msg,
+            };
+            return Err(CleanroomVmError::TartExecutionFailed {
+                step: "run",
+                detail,
+            });
+        }
+
+        let workload_res = exec.exec_tart("exec", &exec_argv);
+        let stop_res = exec.exec_tart("stop", &stop_argv);
+        let reap_res = running_vm.reap();
+
+        workload_res.and(stop_res).and(reap_res)
     }
 
     /// Explicitly destroys the ephemeral VM and returns any underlying executor + teardown result.
@@ -492,11 +689,8 @@ fn validate_clean_abs_path(path: &Path) -> Result<PathBuf, CleanroomVmError> {
         return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
     }
     for comp in path.components() {
-        match comp {
-            Component::RootDir | Component::Normal(_) => {}
-            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
-                return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
-            }
+        if matches!(comp, Component::ParentDir | Component::CurDir) {
+            return Err(CleanroomVmError::InvalidMountPath(text.to_owned()));
         }
     }
     Ok(path.to_path_buf())

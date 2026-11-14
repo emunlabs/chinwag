@@ -6,17 +6,20 @@
 #![forbid(unsafe_code)]
 
 use chinwag_cleanroom_vm::{
-    ReleaseSignerAttestation, SealedFailureBundleV1, format_openssh_allowed_signer_line,
-    generate_recipient_kem_keypair, open_failure_diagnostic_bundle,
+    ReleaseSignerAttestation, SealedFailureBundleV1, StoreClosureEntry,
+    format_openssh_allowed_signer_line, generate_recipient_kem_keypair,
+    open_failure_diagnostic_bundle,
 };
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use tempfile::TempDir;
 
 #[test]
-fn cli_env_lock_and_check_enforces_pinned_signers_by_default_and_detects_drift() {
+fn cli_env_lock_and_check_enforces_pinned_signers_store_closures_and_detects_drift() {
     let tmp = TempDir::new().unwrap();
     fs::write(
         tmp.path().join("rust-toolchain.toml"),
@@ -34,6 +37,36 @@ fn cli_env_lock_and_check_enforces_pinned_signers_by_default_and_detects_drift()
     fs::write(&seed_file, hex::encode(seed_bytes)).unwrap();
     let sk = SigningKey::from_bytes(&seed_bytes);
     let pk = sk.verifying_key().to_bytes();
+
+    // 0. Without resolved `.chinwag/store-closures.json`, `chinwag env lock` MUST fail closed!
+    let missing_closures = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+        .args([
+            "env",
+            "lock",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--signing-seed-file",
+            seed_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing_closures.status.success());
+
+    fs::create_dir_all(tmp.path().join(".chinwag")).unwrap();
+    let mut closures = BTreeMap::new();
+    closures.insert(
+        "rust-toolchain".to_owned(),
+        StoreClosureEntry {
+            store_path: "/nix/store/00000000000000000000000000000000-rust-1.97.1".to_owned(),
+            nar_sha256_hex: Some(hex::encode([0x42u8; 32])),
+            artifact_file: None,
+        },
+    );
+    fs::write(
+        tmp.path().join(".chinwag/store-closures.json"),
+        serde_json::to_vec_pretty(&closures).unwrap(),
+    )
+    .unwrap();
 
     // 1. `chinwag env lock --repo <tmp> --signing-seed-file <seed> --json`
     let out = Command::new(env!("CARGO_BIN_EXE_chinwag"))
@@ -280,4 +313,70 @@ fn cli_runner_start_ephemeral_enforces_seatbelt_exec_release_attestation_and_fai
     let opened =
         open_failure_diagnostic_bundle(&sealed, &recipient_sk, &expected_runner_pk).unwrap();
     assert_eq!(opened.exit_code, 1);
+
+    // 5. Concurrent background `tart run` (`sleep 30`) + live `tart exec` + teardown-only `delete` failure:
+    //    proves `spawn_tart_run` does NOT block `tart exec` AND teardown-only failure seals `SealedFailureBundleV1`!
+    let mock_tart = tmp.path().join("mock-tart.sh");
+    let trace_file = tmp.path().join("tart-trace.log");
+    fs::write(
+        &mock_tart,
+        format!(
+            "#!/bin/sh\necho \"$1\" >> \"{}\"\ncase \"$1\" in\n  clone|set|exec|stop) exit 0 ;;\n  run) exec /bin/sleep 30 ;;\n  delete) echo 'simulated delete failure' >&2; exit 1 ;;\n  *) exit 1 ;;\nesac\n",
+            trace_file.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&mock_tart).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&mock_tart, perms).unwrap();
+
+    let teardown_bundle = tmp.path().join("teardown-failure-bundle.json");
+    let teardown_fail = Command::new(env!("CARGO_BIN_EXE_chinwag"))
+        .args([
+            "runner",
+            "start",
+            "--ephemeral",
+            "--repo",
+            tmp.path().to_str().unwrap(),
+            "--slot-dir",
+            slot_dir.to_str().unwrap(),
+            "--tart-bin",
+            mock_tart.to_str().unwrap(),
+            "--seal-failure-bundle",
+            teardown_bundle.to_str().unwrap(),
+            "--diagnostic-recipient-pubkey-file",
+            pk_file.to_str().unwrap(),
+            "--runner-signing-seed-file",
+            runner_seed_file.to_str().unwrap(),
+            "--json",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+        ])
+        .output()
+        .unwrap();
+    assert!(!teardown_fail.status.success());
+    let td_json: Value = serde_json::from_slice(&teardown_fail.stdout).unwrap();
+    assert_eq!(td_json["ok"], false);
+    assert_eq!(td_json["cleanup_ok"], false);
+    assert!(teardown_bundle.is_file());
+    let td_sealed: SealedFailureBundleV1 =
+        serde_json::from_slice(&fs::read(&teardown_bundle).unwrap()).unwrap();
+    let td_opened =
+        open_failure_diagnostic_bundle(&td_sealed, &recipient_sk, &expected_runner_pk).unwrap();
+    assert!(td_opened.stderr_tail.contains("teardown failed"));
+
+    let trace = fs::read_to_string(&trace_file).unwrap();
+    let trace_lines: Vec<&str> = trace.lines().collect();
+    assert_eq!(trace_lines.len(), 7);
+    assert_eq!(&trace_lines[..2], &["clone", "set"]);
+    // `run` is spawned asynchronously in the background, so its shell append may land just
+    // before or alongside the concurrent `wait-ready` (`exec`) probe.
+    assert!(trace_lines[2..5].contains(&"run"));
+    assert_eq!(
+        trace_lines[2..5].iter().filter(|&&s| s == "exec").count(),
+        2
+    );
+    assert_eq!(&trace_lines[5..], &["stop", "delete"]);
 }
