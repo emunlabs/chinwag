@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signa
 rustix = { version = "1", features = ["fs", "process"] }
 rand.workspace = true
 chinwag-signing = { path = "../chinwag-signing" }
+chinwag-tool-grammar = { path = "../chinwag-tool-grammar" }
 chinwag-confirmed-initial-private = { path = "../confirmed-initial" }
 chinwag-mcp-private-anchored = { path = "../chinwag-mcp", features = ["private-loopback"] }
 chinwag-editor-config-private = { path = "../chinwag-editor-config" }

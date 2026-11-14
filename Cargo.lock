@@ -888,6 +888,7 @@ dependencies = [
  "chinwag-snapshot-session-private",
  "chinwag-swarm",
  "chinwag-test-fixtures",
+ "chinwag-tool-grammar",
  "ed25519-dalek 2.2.0",
  "hex",
  "iroh",
@@ -1125,6 +1126,15 @@ version = "0.0.1"
 dependencies = [
  "chinwag-snapshot-session-private",
  "tempfile",
+]
+
+[[package]]
+name = "chinwag-tool-grammar"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
