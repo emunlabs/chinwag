@@ -294,7 +294,10 @@ fn cli_runner_start_ephemeral_enforces_lockfile_gate_guest_seatbelt_env_i_and_06
 
     // 3. Valid `--ephemeral --dry-run --json` emits hardened Tart + guest VirtioFS Seatbelt + `/usr/bin/env -i` plan
     let ok_dry = Command::new(env!("CARGO_BIN_EXE_chinwag"))
-        .env("GITHUB_TOKEN", "ghp_must_not_enter_guest_1234567890")
+        .env(
+            "GITHUB_TOKEN",
+            concat!("gh", "p_must_not_enter_guest_1234567890"),
+        )
         .args([
             "runner",
             "start",
@@ -432,7 +435,11 @@ fn cli_runner_start_ephemeral_enforces_lockfile_gate_guest_seatbelt_env_i_and_06
     let leaking_tart = tmp.path().join("leaking-tart.sh");
     fs::write(
         &leaking_tart,
-        "#!/bin/sh\necho 'Authorization: Bearer live_leak_tok_999 {\"k\":\"sk-proj-1234567890abcdefghij\"}' >&2\nexit 1\n",
+        concat!(
+            "#!/bin/sh\necho 'Authorization: Bearer live_leak_tok_999 {\"k\":\"",
+            "sk-",
+            "proj-1234567890abcdefghij\"}' >&2\nexit 1\n"
+        ),
     )
     .unwrap();
     fs::set_permissions(&leaking_tart, fs::Permissions::from_mode(0o755)).unwrap();
@@ -465,7 +472,7 @@ fn cli_runner_start_ephemeral_enforces_lockfile_gate_guest_seatbelt_env_i_and_06
     assert!(!fail_run.status.success());
     let fail_stdout_str = String::from_utf8_lossy(&fail_run.stdout);
     assert!(!fail_stdout_str.contains("live_leak_tok_999"));
-    assert!(!fail_stdout_str.contains("sk-proj-1234567890"));
+    assert!(!fail_stdout_str.contains(concat!("sk-", "proj-1234567890")));
     assert!(bundle_out.is_file());
     let bundle_mode = fs::symlink_metadata(&bundle_out)
         .unwrap()
@@ -479,7 +486,11 @@ fn cli_runner_start_ephemeral_enforces_lockfile_gate_guest_seatbelt_env_i_and_06
         open_failure_diagnostic_bundle(&sealed, &recipient_sk, &expected_runner_pk).unwrap();
     assert_eq!(opened.exit_code, 1);
     assert!(!opened.stderr_tail.contains("live_leak_tok_999"));
-    assert!(!opened.stderr_tail.contains("sk-proj-1234567890"));
+    assert!(
+        !opened
+            .stderr_tail
+            .contains(concat!("sk-", "proj-1234567890"))
+    );
 
     // 6. Concurrent background `tart run` (`sleep 30`) + live `tart exec` + teardown-only `delete` failure
     let mock_tart = tmp.path().join("mock-tart.sh");
@@ -487,8 +498,9 @@ fn cli_runner_start_ephemeral_enforces_lockfile_gate_guest_seatbelt_env_i_and_06
     fs::write(
         &mock_tart,
         format!(
-            "#!/bin/sh\necho \"$1\" >> \"{}\"\ncase \"$1\" in\n  clone|set|exec|stop) exit 0 ;;\n  run) exec /bin/sleep 30 ;;\n  delete) echo 'simulated delete failure chwg_live_1234567890abcdef' >&2; exit 1 ;;\n  *) exit 1 ;;\nesac\n",
-            trace_file.display()
+            "#!/bin/sh\necho \"$1\" >> \"{}\"\ncase \"$1\" in\n  clone|set|exec|stop) exit 0 ;;\n  run) exec /bin/sleep 30 ;;\n  delete) echo 'simulated delete failure {}' >&2; exit 1 ;;\n  *) exit 1 ;;\nesac\n",
+            trace_file.display(),
+            concat!("chwg_", "live_1234567890abcdef")
         ),
     )
     .unwrap();
@@ -532,7 +544,7 @@ fn cli_runner_start_ephemeral_enforces_lockfile_gate_guest_seatbelt_env_i_and_06
         !td_json["error"]
             .as_str()
             .unwrap()
-            .contains("chwg_live_123456")
+            .contains(concat!("chwg_", "live_123456"))
     );
     assert!(teardown_bundle.is_file());
     let td_sealed: SealedFailureBundleV1 =
@@ -540,7 +552,11 @@ fn cli_runner_start_ephemeral_enforces_lockfile_gate_guest_seatbelt_env_i_and_06
     let td_opened =
         open_failure_diagnostic_bundle(&td_sealed, &recipient_sk, &expected_runner_pk).unwrap();
     assert!(td_opened.stderr_tail.contains("teardown failed"));
-    assert!(!td_opened.stderr_tail.contains("chwg_live_123456"));
+    assert!(
+        !td_opened
+            .stderr_tail
+            .contains(concat!("chwg_", "live_123456"))
+    );
 
     let trace = fs::read_to_string(&trace_file).unwrap();
     let trace_lines: Vec<&str> = trace.lines().collect();

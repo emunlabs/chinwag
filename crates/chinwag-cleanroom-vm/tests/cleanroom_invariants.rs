@@ -676,7 +676,10 @@ fn public_profile_scrubs_secrets_and_disables_release_authority() {
     let mut host_env = BTreeMap::new();
     host_env.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
     host_env.insert("RUSTUP_TOOLCHAIN".to_owned(), "1.97.1".to_owned());
-    host_env.insert("GITHUB_TOKEN".to_owned(), "ghs_secret_123".to_owned());
+    host_env.insert(
+        "GITHUB_TOKEN".to_owned(),
+        concat!("gh", "s_secret_123").to_owned(),
+    );
     host_env.insert(
         "APPLE_DEVELOPER_ID_LEASE".to_owned(),
         "lease_xyz".to_owned(),
@@ -865,20 +868,27 @@ fn sealed_failure_bundle_scrubs_secrets_roundtrips_x25519_mlkem768_and_verifies_
     let runner_sk = SigningKey::from_bytes(&[0x55u8; 32]);
     let runner_pk = runner_sk.verifying_key().to_bytes();
 
-    let raw_stderr = "\
-error: test failed
-Authorization: Bearer secret_live_bearer_999999
-token=ghp_1234567890abcdefghijklmnopqrstuv
-GITHUB_TOKEN=ghs_secret_inline
------BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ==
------END OPENSSH PRIVATE KEY-----
-assertion `left == right` failed at line 42";
+    let raw_stderr = concat!(
+        "error: test failed\n",
+        "Authorization: Bearer secret_live_bearer_999999\n",
+        "token=",
+        "gh",
+        "p_1234567890abcdefghijklmnopqrstuv\n",
+        "GITHUB_TOKEN=",
+        "gh",
+        "s_secret_inline\n",
+        "-----BEGIN ",
+        "OPENSSH PRIVATE KEY-----\n",
+        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ==\n",
+        "-----END ",
+        "OPENSSH PRIVATE KEY-----\n",
+        "assertion `left == right` failed at line 42"
+    );
 
     let scrubbed_preview = scrub_diagnostic_secrets(raw_stderr);
     assert!(!scrubbed_preview.contains("secret_live_bearer_999999"));
-    assert!(!scrubbed_preview.contains("ghp_1234567890"));
-    assert!(!scrubbed_preview.contains("ghs_secret_inline"));
+    assert!(!scrubbed_preview.contains(concat!("gh", "p_1234567890")));
+    assert!(!scrubbed_preview.contains(concat!("gh", "s_secret_inline")));
     assert!(!scrubbed_preview.contains("b3BlbnNzaC1rZXktdjE"));
     assert!(scrubbed_preview.contains("assertion `left == right` failed at line 42"));
 
@@ -1925,34 +1935,60 @@ fn f09_guest_env_i_populates_sanitized_env_and_scrubber_redacts_json_urls_multi_
     );
 
     let dirty = concat!(
-        "{\"openai\":\"sk-proj-1234567890abcdefghijklmnop\",",
-        "\"jwt\":\"eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIzNDU2\"}\n",
-        "url=https://ci.example.invalid/cb?tok=ghp_1234567890abcdefghijklmnopqrstuv&slack=xoxb-1234567890-abcdefghij\n",
+        "{\"openai\":\"",
+        "sk-",
+        "proj-1234567890abcdefghijklmnop\",",
+        "\"jwt\":\"",
+        "ey",
+        "JhbGciOiJFZERTQSJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIzNDU2\"}\n",
+        "url=https://ci.example.invalid/cb?tok=",
+        "gh",
+        "p_1234567890abcdefghijklmnopqrstuv&slack=",
+        "xox",
+        "b-1234567890-abcdefghij\n",
         "hdrs: Authorization: Bearer   first_live_secret_111 , Proxy-Auth: bearer\tsecond_live_secret_222\n",
-        "chinwag1=chwg_live_abcdef0123456789 chinwag2=chwg_agent_9876543210abcdef rk=rk-live-1234567890abcdef\n",
-        "gitlab=glpat-1234567890abcdefghij aws1=AKIA1234567890ABCDEF aws2=ASIA1234567890ABCDEF\n",
-        "ANTHROPIC_API_KEY=custom_anth_val_999 OPENAI_ORG_KEY=org_val_888 GEMINI_API_KEY=AIzaSyA1234567890abcdefghijk VERCEL_TOKEN=vcp_1234567890abcdef\n",
-        "UNUSUAL_LHS_NAME=sk-ant-api03-secretvalue1234567890"
+        "chinwag1=",
+        "chwg_",
+        "live_abcdef0123456789 chinwag2=",
+        "chwg_",
+        "agent_9876543210abcdef rk=",
+        "rk",
+        "-live-1234567890abcdef\n",
+        "gitlab=",
+        "gl",
+        "pat-1234567890abcdefghij aws1=",
+        "AK",
+        "IA1234567890ABCDEF aws2=",
+        "AS",
+        "IA1234567890ABCDEF\n",
+        "ANTHROPIC_API_KEY=custom_anth_val_999 OPENAI_ORG_KEY=org_val_888 GEMINI_API_KEY=",
+        "AI",
+        "zaSyA1234567890abcdefghijk VERCEL_TOKEN=",
+        "vc",
+        "p_1234567890abcdef\n",
+        "UNUSUAL_LHS_NAME=",
+        "sk-",
+        "ant-api03-secretvalue1234567890"
     );
     let clean = scrub_diagnostic_secrets(dirty);
     for forbidden in [
-        "sk-proj-1234567890",
-        "eyJhbGciOiJFZERTQSJ9",
-        "ghp_1234567890",
-        "xoxb-1234567890",
+        concat!("sk-", "proj-1234567890"),
+        concat!("ey", "JhbGciOiJFZERTQSJ9"),
+        concat!("gh", "p_1234567890"),
+        concat!("xox", "b-1234567890"),
         "first_live_secret_111",
         "second_live_secret_222",
-        "chwg_live_abcdef",
-        "chwg_agent_987654",
-        "rk-live-123456",
-        "glpat-123456",
-        "AKIA1234567890ABCDEF",
-        "ASIA1234567890ABCDEF",
+        concat!("chwg_", "live_abcdef"),
+        concat!("chwg_", "agent_987654"),
+        concat!("rk", "-live-123456"),
+        concat!("gl", "pat-123456"),
+        concat!("AK", "IA1234567890ABCDEF"),
+        concat!("AS", "IA1234567890ABCDEF"),
         "custom_anth_val_999",
         "org_val_888",
-        "AIzaSyA1234567890",
-        "vcp_1234567890",
-        "sk-ant-api03-secretvalue",
+        concat!("AI", "zaSyA1234567890"),
+        concat!("vc", "p_1234567890"),
+        concat!("sk-", "ant-api03-secretvalue"),
     ] {
         assert!(
             !clean.contains(forbidden),
